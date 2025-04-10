@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from typing import Generator, Literal, Protocol, overload
 
 import numpy as np
@@ -31,6 +33,7 @@ class GenoReader(Protocol):
         n_variants
             Shape: (regions). Number of variants in the given ranges.
         """
+        ...
 
     @overload
     def read(
