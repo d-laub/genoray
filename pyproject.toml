@@ -1,0 +1,36 @@
+[project]
+name = "variant-io"
+version = "0.0.0"
+description = "Add your description here"
+authors = [{ name = "David Laub", email = "dlaub@ucsd.edu" }]
+readme = "README.md"
+license = { file = "LICENSE.txt" }
+requires-python = ">=3.10"
+dependencies = ["numpy"]
+
+[tool.pixi.project]
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[tool.pixi.pypi-dependencies]
+variant-io = { path = ".", editable = true }
+
+[tool.pixi.feature.dev.dependencies]
+pytest = "*"
+commitizen = "*"
+pre-commit = "*"
+ruff = "*"
+
+[tool.pixi.tasks]
+
+[tool.commitizen]
+name = "cz_conventional_commits"
+tag_format = "v$version"
+version_scheme = "semver2"
+version_provider = "pep621"
+update_changelog_on_bump = true
+major_version_zero = true
+
+[build-system]
+requires = ["hatching"]
+build-backend = "hatching.build"
