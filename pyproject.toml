@@ -5,7 +5,7 @@ description = "Add your description here"
 authors = [{ name = "David Laub", email = "dlaub@ucsd.edu" }]
 readme = "README.md"
 license = { file = "LICENSE.txt" }
-requires-python = ">=3.10"
+requires-python = ">=3.9"
 dependencies = ["numpy"]
 
 [tool.pixi.project]
