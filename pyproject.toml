@@ -6,7 +6,12 @@ authors = [{ name = "David Laub", email = "dlaub@ucsd.edu" }]
 readme = "README.md"
 license = { file = "LICENSE.txt" }
 requires-python = ">=3.9"
-dependencies = ["numpy"]
+dependencies = [
+    "cyvcf2>=0.31.1",
+    "hirola>=0.3.0",
+    "numpy",
+    "typing-extensions>=4.13.2",
+]
 
 [tool.pixi.project]
 channels = ["conda-forge"]
@@ -16,7 +21,7 @@ platforms = ["linux-64"]
 variant-io = { path = ".", editable = true }
 
 [dependency-groups]
-dev = ["pytest", "commitizen", "pre-commit", "ruff"]
+dev = ["pytest", "commitizen", "pre-commit", "ruff", "pytest-cases>=3.8.6"]
 
 [tool.pixi.tasks]
 
