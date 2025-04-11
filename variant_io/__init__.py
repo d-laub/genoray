@@ -1,4 +1,4 @@
-from ._types import GenoReader
-from ._vcf import VCFReader
+from ._types import Reader
+from ._vcf import VCF
 
-__all__ = ["GenoReader", "VCFReader"]
+__all__ = ["Reader", "VCF"]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Callable, Generator, Literal, cast, overload
 
 import cyvcf2
@@ -7,14 +8,17 @@ import numpy as np
 from numpy.typing import ArrayLike, NDArray
 from typing_extensions import Self
 
-from ._types import GenoReader
-from ._utils import ContigNormalizer, parse_memory
+from ._types import Reader
+from ._utils import ContigNormalizer, format_memory, parse_memory
 
 
 class DosageFieldError(RuntimeError): ...
 
 
-class VCFReader(GenoReader):
+class VCF(Reader):
+    path: Path
+    available_samples: list[str]
+    contigs: list[str]
     ploidy = 2
     filter: Callable[[cyvcf2.Variant], bool] | None
     dosage_field: str | None = None
@@ -25,19 +29,24 @@ class VCFReader(GenoReader):
 
     def __init__(
         self,
-        path: str,
-        filter: Callable[[cyvcf2.Variant], bool] | None,
+        path: str | Path,
+        filter: Callable[[cyvcf2.Variant], bool] | None = None,
         dosage_field: str | None = None,
     ):
-        self.path = path
-        self.available_samples = self._vcf.samples
-        self.contigs = self._vcf.seqnames
+        self.path = Path(path)
         self.filter = filter
         if dosage_field is True:
             dosage_field = "DS"
         self.dosage_field = dosage_field
+
+        self._vcf = self._open()
+        self.available_samples = self._vcf.samples
+        self.contigs = self._vcf.seqnames
         self._c_norm = ContigNormalizer(self.contigs)
         self.set_samples(self._vcf.samples)
+
+    def _open(self, samples: list[str] | None = None) -> cyvcf2.VCF:
+        return cyvcf2.VCF(self.path, samples=samples, lazy=True)
 
     @property
     def current_samples(self) -> list[str]:
@@ -54,9 +63,6 @@ class VCFReader(GenoReader):
         self._samples = samples
         self._s_idx = s_idx
         return self
-
-    def _open(self, samples: list[str] | None = None) -> cyvcf2.VCF:
-        return cyvcf2.VCF(self.path, samples=samples, lazy=True)
 
     def __del__(self):
         self._vcf.close()
@@ -106,8 +112,8 @@ class VCFReader(GenoReader):
         start: int = 0,
         end: int | None = None,
         *,
-        genotypes: Literal[False] = ...,
-        dosages: Literal[True] = ...,
+        genotypes: Literal[False],
+        dosages: Literal[True],
         out: NDArray[np.float32] | None = ...,
     ) -> NDArray[np.float32]: ...
     @overload
@@ -118,7 +124,7 @@ class VCFReader(GenoReader):
         end: int | None = None,
         *,
         genotypes: Literal[True] = ...,
-        dosages: Literal[True] = ...,
+        dosages: Literal[True],
         out: tuple[NDArray[np.int8], NDArray[np.float32]] | None = ...,
     ) -> tuple[NDArray[np.int8], NDArray[np.float32]]: ...
     def read(
@@ -222,6 +228,7 @@ class VCFReader(GenoReader):
         contig: str,
         start: int = 0,
         end: int | None = None,
+        max_mem: int | str = "4g",
         *,
         genotypes: Literal[True] = ...,
         dosages: Literal[False] = ...,
@@ -232,9 +239,10 @@ class VCFReader(GenoReader):
         contig: str,
         start: int = 0,
         end: int | None = None,
+        max_mem: int | str = "4g",
         *,
-        genotypes: Literal[False] = ...,
-        dosages: Literal[True] = ...,
+        genotypes: Literal[False],
+        dosages: Literal[True],
     ) -> Generator[NDArray[np.float32]]: ...
     @overload
     def read_chunks(
@@ -242,9 +250,10 @@ class VCFReader(GenoReader):
         contig: str,
         start: int = 0,
         end: int | None = None,
+        max_mem: int | str = "4g",
         *,
         genotypes: Literal[True] = ...,
-        dosages: Literal[True] = ...,
+        dosages: Literal[True],
     ) -> Generator[tuple[NDArray[np.int8], NDArray[np.float32]]]: ...
     def read_chunks(
         self,
@@ -255,10 +264,11 @@ class VCFReader(GenoReader):
         *,
         genotypes: bool = True,
         dosages: bool = False,
-    ) -> (
-        Generator[NDArray[np.int8 | np.float32]]
-        | Generator[tuple[NDArray[np.int8], NDArray[np.float32]]]
-    ):
+    ) -> Generator[
+        NDArray[np.int8]
+        | NDArray[np.float32]
+        | tuple[NDArray[np.int8], NDArray[np.float32]]
+    ]:
         if not genotypes and not dosages:
             raise ValueError("Either genotypes or dosage_field must be specified.")
         if dosages and self.dosage_field is None:
@@ -285,8 +295,8 @@ class VCFReader(GenoReader):
         vars_per_chunk = min(max_mem // mem_per_v, n_variants)
         if vars_per_chunk == 0:
             raise ValueError(
-                f"Maximum memory {max_mem / 1e9:.2f} GB insufficient to read a single variant."
-                f" Memory per variant: {mem_per_v / 1e9:.2f} GB."
+                f"Maximum memory {format_memory(max_mem)} insufficient to read a single variant."
+                f" Memory per variant: {format_memory(mem_per_v)}."
             )
 
         n_chunks, final_chunk = divmod(n_variants, vars_per_chunk)
@@ -323,6 +333,7 @@ class VCFReader(GenoReader):
                     out,
                     self.dosage_field,  # type: ignore | guaranteed to be str by guard clause
                 )
+            yield out
 
     def _fill_genos(self, vcf: cyvcf2.VCF, out: NDArray[np.int8]):
         for i, v in enumerate(vcf):

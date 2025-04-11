@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 from typing import Iterable, TypeVar, overload
 
@@ -56,7 +57,12 @@ def is_dtype(array: NDArray, dtype: type[DTYPE]) -> TypeGuard[NDArray[DTYPE]]:
     return array.dtype.type == dtype
 
 
-_MEM_PARSER = re.compile(r"([0-9]+?)(.*)")
+_MEM_PARSER = re.compile(r"(?i)([0-9]+?)(.*)")
+_MEM_COEF = dict(zip(["", "k", "m", "g", "t", "p", "e"], 2 ** (np.arange(8) * 10)))
+_MEM_COEF |= {f"{unit}ib": mem for unit, mem in _MEM_COEF.items() if unit != ""}
+_MEM_COEF |= dict(
+    zip(["kb", "mb", "gb", "tb", "pb", "eb"], 10 ** (3 * np.arange(1, 8)))
+)
 
 
 def parse_memory(memory: int | str) -> int:
@@ -67,18 +73,21 @@ def parse_memory(memory: int | str) -> int:
     if n is None:
         raise ValueError(f"Couldn't parse maximum memory '{memory}'")
     n, unit = n.groups()
+    unit = unit.strip()
     mem_i = int(n)
-    if unit in {"T", "TB"}:
-        mem_i *= 2**40
-    elif unit in {"G", "GB"}:
-        mem_i *= 2**30
-    elif unit in {"M", "MB"}:
-        mem_i *= 2**20
-    elif unit in {"K", "KB"}:
-        mem_i *= 2**10
-    elif unit == "":
-        pass
-    else:
-        raise ValueError(f"Unknown memory unit '{unit}'. Use T, G, M, K or nothing.")
+    coef = _MEM_COEF.get(unit.lower(), None)
+    if coef is None:
+        raise ValueError(f"Unrecognized memory unit '{unit}'.")
 
-    return mem_i
+    return mem_i * coef
+
+
+def format_memory(memory: int):
+    """Format an integer as a human-readable memory size string."""
+    if memory < 1024:
+        return f"{memory} B"
+
+    units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"]
+    exponent = min(int(math.log2(memory) // 10), len(units) - 1)
+    value = memory / (1 << (10 * exponent))
+    return f"{value:.2f} {units[exponent]}"

@@ -7,7 +7,7 @@ from numpy.typing import ArrayLike, NDArray
 from typing_extensions import Self
 
 
-class GenoReader(Protocol):
+class Reader(Protocol):
     available_samples: list[str]
     """All samples in the file, in the order they exist on-disk."""
     ploidy: int
@@ -56,7 +56,7 @@ class GenoReader(Protocol):
         *,
         genotypes: Literal[True] = ...,
         dosages: Literal[False] = ...,
-        out: NDArray[np.int8] | None = ...,
+        out: NDArray[np.int8] | None,
     ) -> NDArray[np.int8]: ...
     @overload
     def read(
@@ -65,9 +65,9 @@ class GenoReader(Protocol):
         start: int = 0,
         end: int | None = None,
         *,
-        genotypes: Literal[False] = ...,
-        dosages: Literal[True] = ...,
-        out: NDArray[np.float32] | None = ...,
+        genotypes: Literal[False],
+        dosages: Literal[True],
+        out: NDArray[np.float32] | None,
     ) -> NDArray[np.float32]: ...
     @overload
     def read(
@@ -77,8 +77,8 @@ class GenoReader(Protocol):
         end: int | None = None,
         *,
         genotypes: Literal[True] = ...,
-        dosages: Literal[True] = ...,
-        out: tuple[NDArray[np.int8], NDArray[np.float32]] | None = ...,
+        dosages: Literal[True],
+        out: tuple[NDArray[np.int8], NDArray[np.float32]] | None,
     ) -> tuple[NDArray[np.int8], NDArray[np.float32]]: ...
     def read(
         self,
@@ -124,6 +124,7 @@ class GenoReader(Protocol):
         contig: str,
         start: int = 0,
         end: int | None = None,
+        max_mem: int | str = "4g",
         *,
         genotypes: Literal[True] = ...,
         dosages: Literal[False] = ...,
@@ -134,9 +135,10 @@ class GenoReader(Protocol):
         contig: str,
         start: int = 0,
         end: int | None = None,
+        max_mem: int | str = "4g",
         *,
-        genotypes: Literal[False] = ...,
-        dosages: Literal[True] = ...,
+        genotypes: Literal[False],
+        dosages: Literal[True],
     ) -> Generator[NDArray[np.float32]]: ...
     @overload
     def read_chunks(
@@ -144,9 +146,10 @@ class GenoReader(Protocol):
         contig: str,
         start: int = 0,
         end: int | None = None,
+        max_mem: int | str = "4g",
         *,
         genotypes: Literal[True] = ...,
-        dosages: Literal[True] = ...,
+        dosages: Literal[True],
     ) -> Generator[tuple[NDArray[np.int8], NDArray[np.float32]]]: ...
     def read_chunks(
         self,
