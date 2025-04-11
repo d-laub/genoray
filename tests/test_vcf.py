@@ -5,7 +5,7 @@ import numpy as np
 from numpy.typing import NDArray
 from pytest_cases import fixture, parametrize_with_cases
 
-from variant_io import VCF
+from genoray import VCF
 
 tdir = Path(__file__).parent
 ddir = tdir / "data"

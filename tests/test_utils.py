@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pytest_cases import parametrize_with_cases
 
-from variant_io._utils import ContigNormalizer, format_memory, parse_memory
+from genoray._utils import ContigNormalizer, format_memory, parse_memory
 
 
 def contig_match():
