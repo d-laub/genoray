@@ -31,7 +31,9 @@ genos, dosages = vcf.read("1")
 genos, dosages = pgen.read("1")
 ```
 
-Dosages have shape `(samples, variants)` and dtype `np.float32` for both VCF and PGEN. Note that VCFs must also be provided a FORMAT `dosage_field` to read dosages and this field must have Number=A in the header, meaning there is one value for each ALT allele. PGEN files either store hardcalls (genotypes) or dosages, not both, and dosage PGENs infer hardcalls based on a [hardcall threshold](https://www.cog-genomics.org/plink/2.0/input#dosage_import_settings). Thus, if you want to read hardcalls that do not correspond to inferred hardcalls from a dosage PGEN, you can provide two different PGEN files to the constructor:
+Dosages have shape `(samples, variants)` and dtype `np.float32` for both VCF and PGEN.
+
+Note that VCFs must also be provided a FORMAT `dosage_field` to read dosages and this field must have `Number=A` in the header, meaning there is one value for each ALT allele. PGEN files either store hardcalls (genotypes) or dosages, not both, and dosage PGENs infer hardcalls based on a [hardcall threshold](https://www.cog-genomics.org/plink/2.0/input#dosage_import_settings). Thus, if you want to read hardcalls that do not correspond to inferred hardcalls from a dosage PGEN, you can provide two different PGEN files to the constructor:
 
 ```python
 pgen = PGEN("hardcalls.pgen", dosage_path="dosage.pgen", ...)
@@ -73,7 +75,7 @@ pgen = PGEN("file.pgen", filter=pl.col("kind") == "SNP")  # only include SNPs
 # ⚠️ Important ⚠️
 
 - For the time being, ploidy is always 2, but this could be more flexible for VCFs in the future. PGEN does not support ploidy other than 2.
-- Multi-allelic variants are not supported.
+- Multi-allelic variants are not supported and any multi-allelic sites will only have their first allele returned. As a workaround, you can split multi-allelic sites into bi-allelic ones using `bcftools norm` or `plink2 --make-bpgen`. You can then pass the PLINK 1 `.bed` file to `genoray.PGEN`, although this will erase phasing information. If you need the phasing information, you should export the file to BCF and split the sites with `bcftools`, then convert the BCF back to PGEN with `plink2 --make-pgen`.
 - PGEN returns genotypes with dtype `np.int32` instead of `np.int8` because this is the native dtype for pgenlib.
 - Ranges are 0-based, so starts begin at 0 and ends are exclusive.
 - Missing genotypes and dosages are encoded as -1 and `np.nan`, respectively.

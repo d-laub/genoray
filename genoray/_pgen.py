@@ -106,7 +106,7 @@ class PGEN(Reader[T]):
         )
         self._s2i.add(samples)
         self._s_idx = np.arange(len(samples), dtype=np.uint32)
-        self._geno_pgen = pgenlib.PgenReader(bytes(geno_path))
+        self._geno_pgen = pgenlib.PgenReader(bytes(geno_path), len(samples))
 
         if dosage_path is not None:
             dosage_path = Path(dosage_path)
