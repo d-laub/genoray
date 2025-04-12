@@ -24,6 +24,7 @@ class PGEN(Reader[np.int32]):
     available_samples: list[str]
     filter: pl.Expr | None
     ploidy = 2
+    contigs: list[str]
     _index: pr.PyRanges
     _pgen: pgenlib.PgenReader
     _s_idx: NDArray[np.uint32]
@@ -32,17 +33,18 @@ class PGEN(Reader[np.int32]):
         path = Path(path)
         samples = _read_psam(path.with_suffix(".psam"))
         self.filter = filter
+        self.available_samples = samples.tolist()
         self._s2i = HashTable(
-            max=len(self.available_samples) * 2,  # type: ignore
+            max=len(samples) * 2,  # type: ignore
             dtype=samples.dtype,
         )
         self._s2i.add(samples)
         self._s_idx = np.arange(len(samples), dtype=np.uint32)
-        self.available_samples = samples.tolist()
         self._pgen = pgenlib.PgenReader(bytes(path))
         if not path.with_suffix(".gvi").exists():
             _write_index(path.with_suffix(".pvar"))
         self._index = _read_index(path.with_suffix(".gvi"), self.filter)
+        self.contigs = self._index.chromosomes
         self._c_norm = ContigNormalizer(self._index.chromosomes)
 
     @property
@@ -81,9 +83,7 @@ class PGEN(Reader[np.int32]):
                     "Start": starts,
                     "End": ends,
                 }
-            )
-            .with_row_index("query")
-            .to_pandas(use_pyarrow_extension_array=True)
+            ).to_pandas(use_pyarrow_extension_array=True)
         )
         return queries.count_overlaps(self._index).df["NumberOverlaps"].to_numpy()
 
@@ -231,6 +231,7 @@ class PGEN(Reader[np.int32]):
         out = out.reshape(n_variants, self.n_samples, self.ploidy).transpose(1, 2, 0)[
             self._s_idx
         ]
+        out[out == -9] = -1
 
         return out
 
@@ -328,6 +329,7 @@ class PGEN(Reader[np.int32]):
             out = out.reshape(chunk_size, self.n_samples, self.ploidy).transpose(
                 1, 2, 0
             )[self._s_idx]
+            out[out == -9] = -1
             yield out
 
     @overload
@@ -409,6 +411,7 @@ class PGEN(Reader[np.int32]):
         out = out.reshape(n_variants, self.n_samples, self.ploidy).transpose(1, 2, 0)[
             self._s_idx
         ]
+        out[out == -9] = -1
 
         return out, np.diff(offsets).astype(np.uint32)
 
@@ -437,7 +440,7 @@ def _read_psam(path: Path) -> NDArray[np.str_]:
             "SEX": pl.Utf8,
         },
     )
-    samples = psam["IID"].to_numpy()
+    samples = psam["IID"].to_numpy().astype(str)
     return samples
 
 
@@ -473,7 +476,7 @@ def _write_index(path: Path):
 
 
 def _read_index(path: Path, filter: pl.Expr | None) -> pr.PyRanges:
-    index = pl.read_ipc(path, row_index_name="index")
+    index = pl.read_ipc(path, row_index_name="index", memory_map=False)
     if filter is not None:
         index = index.filter(filter)
     pyr = pr.PyRanges(index.drop("kind").to_pandas(use_pyarrow_extension_array=True))

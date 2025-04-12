@@ -93,7 +93,9 @@ def format_memory(memory: int):
     return f"{value:.2f} {units[exponent]}"
 
 
-def lengths_to_offsets(lengths: NDArray[np.integer], dtype: type[DTYPE] = np.uint64) -> NDArray[DTYPE]:
+def lengths_to_offsets(
+    lengths: NDArray[np.integer], dtype: type[DTYPE] = np.uint64
+) -> NDArray[DTYPE]:
     """Convert lengths to offsets.
 
     Parameters
@@ -106,7 +108,7 @@ def lengths_to_offsets(lengths: NDArray[np.integer], dtype: type[DTYPE] = np.uin
     offsets
         Offsets of the segments.
     """
-    offsets = np.empty(lengths.shape, dtype=dtype)
+    offsets = np.empty(len(lengths) + 1, dtype=dtype)
     offsets[0] = 0
-    offsets[1:] = np.cumsum(lengths[:-1])
+    offsets[1:] = lengths.cumsum()
     return offsets

@@ -6,6 +6,7 @@ from typing import Callable, Generator, Literal, cast, overload
 import cyvcf2
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
+from tqdm.auto import tqdm
 from typing_extensions import Self
 
 from ._types import Reader
@@ -32,6 +33,7 @@ class VCF(Reader[np.int8]):
         path: str | Path,
         filter: Callable[[cyvcf2.Variant], bool] | None = None,
         dosage_field: str | None = None,
+        progress: bool = False,
     ):
         self.path = Path(path)
         self.filter = filter
@@ -44,6 +46,7 @@ class VCF(Reader[np.int8]):
         self.contigs = self._vcf.seqnames
         self._c_norm = ContigNormalizer(self.contigs)
         self.set_samples(self._vcf.samples)
+        self.progress = progress
 
     def _open(self, samples: list[str] | None = None) -> cyvcf2.VCF:
         return cyvcf2.VCF(self.path, samples=samples, lazy=True)
@@ -443,9 +446,7 @@ class VCF(Reader[np.int8]):
         elif dosages:
             _out = (np.empty((self.n_samples, tot_vars), dtype=np.float32),)
         else:
-            _out = (
-                np.empty((self.n_samples, self.ploidy, tot_vars), dtype=np.int8),
-            )
+            _out = (np.empty((self.n_samples, self.ploidy, tot_vars), dtype=np.int8),)
 
         starts = np.atleast_1d(starts)
         if ends is None:
@@ -469,6 +470,10 @@ class VCF(Reader[np.int8]):
         return (*_out, n_vars)  # type: ignore
 
     def _fill_genos(self, vcf: cyvcf2.VCF, out: NDArray[np.int8]):
+        if self.progress:
+            n_variants = out.shape[-1]
+            vcf = tqdm(vcf, total=n_variants, desc="Reading VCF", unit="variant")
+
         for i, v in enumerate(vcf):
             if self.filter is not None and not self.filter(v):
                 continue
@@ -483,6 +488,10 @@ class VCF(Reader[np.int8]):
     def _fill_dosages(
         self, vcf: cyvcf2.VCF, out: NDArray[np.float32], dosage_field: str
     ):
+        if self.progress:
+            n_variants = out.shape[-1]
+            vcf = tqdm(vcf, total=n_variants, desc="Reading VCF", unit="variant")
+
         for i, v in enumerate(vcf):
             if self.filter is not None and not self.filter(v):
                 continue
@@ -505,6 +514,10 @@ class VCF(Reader[np.int8]):
         out: tuple[NDArray[np.int8], NDArray[np.float32]],
         dosage_field: str,
     ):
+        if self.progress:
+            n_variants = out[0].shape[-1]
+            vcf = tqdm(vcf, total=n_variants, desc="Reading VCF", unit="variant")
+
         for i, v in enumerate(vcf):
             if self.filter is not None and not self.filter(v):
                 continue

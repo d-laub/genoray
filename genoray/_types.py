@@ -14,6 +14,7 @@ class Reader(Protocol, Generic[Int]):
     """All samples in the file, in the order they exist on-disk."""
     ploidy: int
     filter: Any | None
+    contigs: list[str]
 
     @property
     def current_samples(self) -> list[str]:
