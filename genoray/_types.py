@@ -1,15 +1,15 @@
 from __future__ import annotations
 
-from typing import Any, Generator, Generic, Literal, Protocol, TypeVar, overload
+from typing import Any, Generator, Generic, Protocol, TypeVar
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 from typing_extensions import Self
 
-Int = TypeVar("Int", bound=np.integer)
+T = TypeVar("T")
 
 
-class Reader(Protocol, Generic[Int]):
+class Reader(Protocol, Generic[T]):
     available_samples: list[str]
     """All samples in the file, in the order they exist on-disk."""
     ploidy: int
@@ -31,7 +31,7 @@ class Reader(Protocol, Generic[Int]):
 
     def n_vars_in_ranges(
         self, contig: str, starts: ArrayLike = 0, ends: ArrayLike | None = None
-    ) -> NDArray[np.int64]:
+    ) -> NDArray[np.uint32]:
         """Return the start and end indices of the variants in the given ranges.
 
         Parameters
@@ -50,64 +50,13 @@ class Reader(Protocol, Generic[Int]):
         """
         ...
 
-    @overload
     def read(
         self,
         contig: str,
         start: int = 0,
         end: int | None = None,
-        *,
-        genotypes: Literal[True] = ...,
-        dosages: Literal[False] = ...,
-        out: NDArray[Int] | None,
-    ) -> NDArray[Int]: ...
-    @overload
-    def read(
-        self,
-        contig: str,
-        start: int = 0,
-        end: int | None = None,
-        *,
-        genotypes: Literal[False],
-        dosages: Literal[True],
-        out: NDArray[np.float32] | None,
-    ) -> NDArray[np.float32]: ...
-    @overload
-    def read(
-        self,
-        contig: str,
-        start: int = 0,
-        end: int | None = None,
-        *,
-        genotypes: Literal[True] = ...,
-        dosages: Literal[True],
-        out: tuple[NDArray[Int], NDArray[np.float32]] | None,
-    ) -> tuple[NDArray[Int], NDArray[np.float32]]: ...
-    @overload
-    def read(
-        self,
-        contig: str,
-        start: int = 0,
-        end: int | None = None,
-        *,
-        genotypes: bool = True,
-        dosages: bool = False,
-        out: NDArray[Int | np.float32]
-        | tuple[NDArray[Int], NDArray[np.float32]]
-        | None = None,
-    ) -> NDArray[Int | np.float32] | tuple[NDArray[Int], NDArray[np.float32]]: ...
-    def read(
-        self,
-        contig: str,
-        start: int = 0,
-        end: int | None = None,
-        *,
-        genotypes: bool = True,
-        dosages: bool = False,
-        out: NDArray[Int | np.float32]
-        | tuple[NDArray[Int], NDArray[np.float32]]
-        | None = None,
-    ) -> NDArray[Int | np.float32] | tuple[NDArray[Int], NDArray[np.float32]]:
+        out: T | None = None,
+    ) -> T | None:
         """Read genotypes and/or dosages for a region.
 
         Parameters
@@ -134,64 +83,13 @@ class Reader(Protocol, Generic[Int]):
         """
         ...
 
-    @overload
     def read_chunks(
         self,
         contig: str,
         start: int = 0,
         end: int | None = None,
         max_mem: int | str = "4g",
-        *,
-        genotypes: Literal[True] = ...,
-        dosages: Literal[False] = ...,
-    ) -> Generator[NDArray[Int]]: ...
-    @overload
-    def read_chunks(
-        self,
-        contig: str,
-        start: int = 0,
-        end: int | None = None,
-        max_mem: int | str = "4g",
-        *,
-        genotypes: Literal[False],
-        dosages: Literal[True],
-    ) -> Generator[NDArray[np.float32]]: ...
-    @overload
-    def read_chunks(
-        self,
-        contig: str,
-        start: int = 0,
-        end: int | None = None,
-        max_mem: int | str = "4g",
-        *,
-        genotypes: Literal[True] = ...,
-        dosages: Literal[True],
-    ) -> Generator[tuple[NDArray[Int], NDArray[np.float32]]]: ...
-    @overload
-    def read_chunks(
-        self,
-        contig: str,
-        start: int = 0,
-        end: int | None = None,
-        max_mem: int | str = "4g",
-        *,
-        genotypes: bool = True,
-        dosages: bool = False,
-    ) -> Generator[
-        NDArray[Int | np.float32] | tuple[NDArray[Int], NDArray[np.float32]]
-    ]: ...
-    def read_chunks(
-        self,
-        contig: str,
-        start: int = 0,
-        end: int | None = None,
-        max_mem: int | str = "4g",
-        *,
-        genotypes: bool = True,
-        dosages: bool = False,
-    ) -> Generator[
-        NDArray[Int | np.float32] | tuple[NDArray[Int], NDArray[np.float32]]
-    ]:
+    ) -> Generator[T]:
         """Iterate over genotypes and/or dosages for a region in chunks limited by max_mem.
 
         Parameters
@@ -215,61 +113,12 @@ class Reader(Protocol, Generic[Int]):
         """
         ...
 
-    @overload
     def read_ranges(
         self,
         contig: str,
         starts: ArrayLike = 0,
         ends: ArrayLike | None = None,
-        *,
-        genotypes: Literal[True] = ...,
-        dosages: Literal[False] = ...,
-    ) -> tuple[NDArray[Int], NDArray[np.uint32]]: ...
-    @overload
-    def read_ranges(
-        self,
-        contig: str,
-        starts: ArrayLike = 0,
-        ends: ArrayLike | None = None,
-        *,
-        genotypes: Literal[False],
-        dosages: Literal[True],
-    ) -> tuple[NDArray[np.float32], NDArray[np.uint32]]: ...
-    @overload
-    def read_ranges(
-        self,
-        contig: str,
-        starts: ArrayLike = 0,
-        ends: ArrayLike | None = None,
-        *,
-        genotypes: Literal[True] = ...,
-        dosages: Literal[True],
-    ) -> tuple[NDArray[Int], NDArray[np.float32], NDArray[np.uint32]]: ...
-    @overload
-    def read_ranges(
-        self,
-        contig: str,
-        starts: ArrayLike = 0,
-        ends: ArrayLike | None = None,
-        *,
-        genotypes: bool = True,
-        dosages: bool = False,
-    ) -> (
-        tuple[NDArray[Int | np.float32], NDArray[np.uint32]]
-        | tuple[NDArray[Int], NDArray[np.float32], NDArray[np.uint32]]
-    ): ...
-    def read_ranges(
-        self,
-        contig: str,
-        starts: ArrayLike = 0,
-        ends: ArrayLike | None = None,
-        *,
-        genotypes: bool = True,
-        dosages: bool = False,
-    ) -> (
-        tuple[NDArray[Int | np.float32], NDArray[np.uint32]]
-        | tuple[NDArray[Int], NDArray[np.float32], NDArray[np.uint32]]
-    ):
+    ) -> tuple[T, NDArray[np.uint32]] | None:
         """Read genotypes and/or dosages for multiple regions.
 
         Parameters

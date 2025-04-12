@@ -1,22 +1,65 @@
 from __future__ import annotations
 
+from functools import partial
 from pathlib import Path
-from typing import Callable, Generator, Literal, cast, overload
+from typing import Callable, Generator, TypeVar, cast
 
 import cyvcf2
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
+from phantom import Phantom
 from tqdm.auto import tqdm
-from typing_extensions import Self
+from typing_extensions import Self, TypeGuard, assert_never
 
 from ._types import Reader
-from ._utils import ContigNormalizer, format_memory, lengths_to_offsets, parse_memory
+from ._utils import (
+    ContigNormalizer,
+    format_memory,
+    is_dtype,
+    lengths_to_offsets,
+    parse_memory,
+)
 
 
 class DosageFieldError(RuntimeError): ...
 
 
-class VCF(Reader[np.int8]):
+def _is_genos_dosages(obj) -> TypeGuard[tuple[Genos, Dosages]]:
+    """Check if the object is a tuple of genotypes and dosages.
+
+    Parameters
+    ----------
+    obj
+        Object to check.
+
+    Returns
+    -------
+    bool
+        True if the object is a tuple of genotypes and dosages, False otherwise.
+    """
+    return (
+        isinstance(obj, tuple)
+        and len(obj) == 2
+        and isinstance(obj[0], Genos)
+        and isinstance(obj[1], Dosages)
+    )
+
+
+class Genos(NDArray[np.int8], Phantom, predicate=partial(is_dtype, dtype=np.int32)): ...
+
+
+class Dosages(
+    NDArray[np.float32], Phantom, predicate=partial(is_dtype, dtype=np.float32)
+): ...
+
+
+class GenosDosages(tuple[Genos, Dosages], Phantom, predicate=_is_genos_dosages): ...
+
+
+T = TypeVar("T", Genos, Dosages, GenosDosages)
+
+
+class VCF(Reader[T]):
     path: Path
     available_samples: list[str]
     contigs: list[str]
@@ -27,18 +70,27 @@ class VCF(Reader[np.int8]):
     _s_idx: NDArray[np.intp]
     _samples: list[str]
     _c_norm: ContigNormalizer
+    _read_as: type[T]
+
+    Genos = Genos
+    Dosages = Dosages
+    GenosDosages = GenosDosages
 
     def __init__(
         self,
         path: str | Path,
         filter: Callable[[cyvcf2.Variant], bool] | None = None,
+        read_as: type[T] = Genos,
         dosage_field: str | None = None,
         progress: bool = False,
     ):
+        if (read_as is Dosages or read_as is GenosDosages) and dosage_field is None:
+            raise ValueError(
+                "Dosage field not specified. Set the VCF reader's `dosage_field` parameter."
+            )
+
         self.path = Path(path)
         self.filter = filter
-        if dosage_field is True:
-            dosage_field = "DS"
         self.dosage_field = dosage_field
 
         self._vcf = self._open()
@@ -46,6 +98,7 @@ class VCF(Reader[np.int8]):
         self.contigs = self._vcf.seqnames
         self._c_norm = ContigNormalizer(self.contigs)
         self.set_samples(self._vcf.samples)
+        self._read_as = read_as
         self.progress = progress
 
     def _open(self, samples: list[str] | None = None) -> cyvcf2.VCF:
@@ -75,7 +128,7 @@ class VCF(Reader[np.int8]):
         contig: str,
         starts: ArrayLike = 0,
         ends: ArrayLike | None = None,
-    ) -> NDArray[np.int64]:
+    ) -> NDArray[np.uint32]:
         starts = np.atleast_1d(starts)
         ends = (
             np.full(len(starts), np.iinfo(np.int64).max)
@@ -85,9 +138,9 @@ class VCF(Reader[np.int8]):
 
         c = self._c_norm.norm(contig)
         if c is None:
-            return np.zeros(len(starts), dtype=np.int64)
+            return np.zeros(len(starts), dtype=np.uint32)
 
-        out = np.empty(len(starts), dtype=np.int64)
+        out = np.empty(len(starts), dtype=np.uint32)
         for i, (s, e) in enumerate(zip(starts, ends)):
             coord = f"{c}:{s + 1}-{e}"
             if self.filter is None:
@@ -97,141 +150,71 @@ class VCF(Reader[np.int8]):
 
         return out
 
-    @overload
     def read(
         self,
         contig: str,
         start: int = 0,
         end: int | None = None,
-        *,
-        genotypes: Literal[True] = ...,
-        dosages: Literal[False] = ...,
-        out: NDArray[np.int8] | None = ...,
-    ) -> NDArray[np.int8]: ...
-    @overload
-    def read(
-        self,
-        contig: str,
-        start: int = 0,
-        end: int | None = None,
-        *,
-        genotypes: Literal[False],
-        dosages: Literal[True],
-        out: NDArray[np.float32] | None = ...,
-    ) -> NDArray[np.float32]: ...
-    @overload
-    def read(
-        self,
-        contig: str,
-        start: int = 0,
-        end: int | None = None,
-        *,
-        genotypes: Literal[True] = ...,
-        dosages: Literal[True],
-        out: tuple[NDArray[np.int8], NDArray[np.float32]] | None = ...,
-    ) -> tuple[NDArray[np.int8], NDArray[np.float32]]: ...
-    @overload
-    def read(
-        self,
-        contig: str,
-        start: int = 0,
-        end: int | None = None,
-        *,
-        genotypes: bool = True,
-        dosages: bool = False,
-        out: NDArray[np.int8 | np.float32]
-        | tuple[NDArray[np.int8], NDArray[np.float32]]
-        | None = None,
-    ) -> (
-        NDArray[np.int8 | np.float32] | tuple[NDArray[np.int8], NDArray[np.float32]]
-    ): ...
-    def read(
-        self,
-        contig: str,
-        start: int = 0,
-        end: int | None = None,
-        *,
-        genotypes: bool = True,
-        dosages: bool = False,
-        out: NDArray[np.int8 | np.float32]
-        | tuple[NDArray[np.int8], NDArray[np.float32]]
-        | None = None,
-    ) -> NDArray[np.int8 | np.float32] | tuple[NDArray[np.int8], NDArray[np.float32]]:
-        if not genotypes and not dosages:
-            raise ValueError("Either genotypes or dosage_field must be specified.")
-        if dosages and self.dosage_field is None:
-            raise ValueError(
-                "Dosage field not specified. Set the VCF reader's `dosage_field` parameter."
-            )
-
+        out: T | None = None,
+    ) -> T | None:
         c = self._c_norm.norm(contig)
         if c is None:
-            if genotypes and not dosages:
-                return np.empty((self.n_samples, self.ploidy, 0), dtype=np.int8)
-            elif not genotypes and dosages:
-                return np.empty((self.n_samples, 0), dtype=np.float32)
-            else:
-                return (
-                    np.empty((self.n_samples, self.ploidy, 0), dtype=np.int8),
-                    np.empty((self.n_samples, 0), dtype=np.float32),
-                )
+            return
 
         if end is None:
             end = np.iinfo(np.int64).max
 
         itr = self._vcf(f"{c}:{start + 1}-{end}")  # region string is 1-based
         if out is None:
-            n_variants: int = self.n_vars_in_ranges(c, start, end)[0]
+            n_variants: np.uint32 = self.n_vars_in_ranges(c, start, end)[0]
             if n_variants == 0:
-                if genotypes and not dosages:
-                    return np.empty((self.n_samples, self.ploidy, 0), dtype=np.int8)
-                elif not genotypes and dosages:
-                    return np.empty((self.n_samples, 0), dtype=np.float32)
-                else:
-                    return (
-                        np.empty((self.n_samples, self.ploidy, 0), dtype=np.int8),
-                        np.empty((self.n_samples, 0), dtype=np.float32),
-                    )
+                return
 
-            if genotypes and not dosages:
-                out = np.empty((self.n_samples, self.ploidy, n_variants), dtype=np.int8)
-                self._fill_genos(itr, out)
-            elif not genotypes and dosages:
-                out = np.empty((self.n_samples, n_variants), dtype=np.float32)
+            if self._read_as is Genos:
+                data = np.empty(
+                    (self.n_samples, self.ploidy, n_variants), dtype=np.int8
+                )
+                self._fill_genos(itr, data)
+            elif self._read_as is Dosages:
+                data = np.empty((self.n_samples, n_variants), dtype=np.float32)
                 self._fill_dosages(
                     itr,
-                    out,
+                    data,
                     self.dosage_field,  # type: ignore | guaranteed to be str by guard clause
                 )
             else:
-                out = (
+                data = (
                     np.empty((self.n_samples, self.ploidy, n_variants), dtype=np.int8),
                     np.empty((self.n_samples, n_variants), dtype=np.float32),
                 )
                 self._fill_genos_and_dosages(
                     itr,
-                    out,
-                    self.dosage_field,  # type: ignore | guaranteed to be str by guard clause
+                    data,
+                    self.dosage_field,  # type: ignore | guaranteed to be str by init guard clause
                 )
+            out = cast(T, data)
         else:
-            if genotypes and not dosages:
-                out = cast(
-                    NDArray[np.int8], out
-                )  # type checker errors on call, so let it error out
+            if self._read_as is Genos:
+                if not isinstance(out, Genos):
+                    raise ValueError(
+                        f"Expected output array of type {Genos.dtype}, got {type(out)}"
+                    )
                 self._fill_genos(itr, out)
-            elif not genotypes and dosages:
-                out = cast(
-                    NDArray[np.float32], out
-                )  # type checker errors on call, so let it error out
+            elif self._read_as is Dosages:
+                if not isinstance(out, Dosages):
+                    raise ValueError(
+                        f"Expected output array of type {Dosages.dtype}, got {type(out)}"
+                    )
                 self._fill_dosages(
                     itr,
                     out,
                     self.dosage_field,  # type: ignore | guaranteed to be str by guard clause
                 )
             else:
-                out = cast(
-                    tuple[NDArray[np.int8], NDArray[np.float32]], out
-                )  # type checker errors on call, so let it error out
+                if not isinstance(out, GenosDosages):
+                    raise ValueError(
+                        f"Expected output to be 2-tuple of arrays np.int8 and np.float32, but got {type(out)}"
+                    )
                 self._fill_genos_and_dosages(
                     itr,
                     out,
@@ -240,84 +223,17 @@ class VCF(Reader[np.int8]):
 
         return out
 
-    @overload
     def read_chunks(
         self,
         contig: str,
         start: int = 0,
         end: int | None = None,
         max_mem: int | str = "4g",
-        *,
-        genotypes: Literal[True] = ...,
-        dosages: Literal[False] = ...,
-    ) -> Generator[NDArray[np.int8]]: ...
-    @overload
-    def read_chunks(
-        self,
-        contig: str,
-        start: int = 0,
-        end: int | None = None,
-        max_mem: int | str = "4g",
-        *,
-        genotypes: Literal[False],
-        dosages: Literal[True],
-    ) -> Generator[NDArray[np.float32]]: ...
-    @overload
-    def read_chunks(
-        self,
-        contig: str,
-        start: int = 0,
-        end: int | None = None,
-        max_mem: int | str = "4g",
-        *,
-        genotypes: Literal[True] = ...,
-        dosages: Literal[True],
-    ) -> Generator[tuple[NDArray[np.int8], NDArray[np.float32]]]: ...
-    @overload
-    def read_chunks(
-        self,
-        contig: str,
-        start: int = 0,
-        end: int | None = None,
-        max_mem: int | str = "4g",
-        *,
-        genotypes: bool = True,
-        dosages: bool = False,
-    ) -> Generator[
-        NDArray[np.int8 | np.float32] | tuple[NDArray[np.int8], NDArray[np.float32]]
-    ]: ...
-    def read_chunks(
-        self,
-        contig: str,
-        start: int = 0,
-        end: int | None = None,
-        max_mem: int | str = "4g",
-        *,
-        genotypes: bool = True,
-        dosages: bool = False,
-    ) -> Generator[
-        NDArray[np.int8 | np.float32] | tuple[NDArray[np.int8], NDArray[np.float32]]
-    ]:
-        if not genotypes and not dosages:
-            raise ValueError("Either genotypes or dosage_field must be specified.")
-        if dosages and self.dosage_field is None:
-            raise ValueError(
-                "Dosage field not specified. Set the VCF reader's `dosage_field` parameter."
-            )
-
+    ) -> Generator[T]:
         max_mem = parse_memory(max_mem)
 
         c = self._c_norm.norm(contig)
         if c is None:
-            if genotypes and dosages:
-                yield (
-                    np.empty((self.n_samples, self.ploidy, 0), dtype=np.int8),
-                    np.empty((self.n_samples, 0), dtype=np.float32),
-                )
-            elif dosages:
-                yield np.empty((self.n_samples, 0), dtype=np.float32)
-            else:
-                yield np.empty((self.n_samples, self.ploidy, 0), dtype=np.int8)
             return
 
         if end is None:
@@ -325,18 +241,9 @@ class VCF(Reader[np.int8]):
 
         n_variants: int = self.n_vars_in_ranges(c, start, end)[0]
         if n_variants == 0:
-            if genotypes and dosages:
-                yield (
-                    np.empty((self.n_samples, self.ploidy, 0), dtype=np.int8),
-                    np.empty((self.n_samples, 0), dtype=np.float32),
-                )
-            elif dosages:
-                yield np.empty((self.n_samples, 0), dtype=np.float32)
-            else:
-                yield np.empty((self.n_samples, self.ploidy, 0), dtype=np.int8)
             return
 
-        mem_per_v = self._mem_per_variant(genotypes, dosages)
+        mem_per_v = self._mem_per_variant()
         vars_per_chunk = min(max_mem // mem_per_v, n_variants)
         if vars_per_chunk == 0:
             raise ValueError(
@@ -358,10 +265,10 @@ class VCF(Reader[np.int8]):
 
         itr = self._vcf(f"{c}:{start + 1}-{end}")  # region string is 1-based
         for chunk_size in chunk_sizes:
-            if genotypes and not dosages:
+            if self._read_as is Genos:
                 out = np.empty((self.n_samples, self.ploidy, chunk_size), dtype=np.int8)
                 self._fill_genos(itr, out)
-            elif not genotypes and dosages:
+            elif self._read_as is Dosages:
                 out = np.empty((self.n_samples, chunk_size), dtype=np.float32)
                 self._fill_dosages(
                     itr,
@@ -378,72 +285,31 @@ class VCF(Reader[np.int8]):
                     out,
                     self.dosage_field,  # type: ignore | guaranteed to be str by guard clause
                 )
-            yield out
 
-    @overload
+            yield cast(T, out)
+
     def read_ranges(
         self,
         contig: str,
         starts: ArrayLike = 0,
         ends: ArrayLike | None = None,
-        *,
-        genotypes: Literal[True] = ...,
-        dosages: Literal[False] = ...,
-    ) -> tuple[NDArray[np.int8], NDArray[np.uint32]]: ...
-    @overload
-    def read_ranges(
-        self,
-        contig: str,
-        starts: ArrayLike = 0,
-        ends: ArrayLike | None = None,
-        *,
-        genotypes: Literal[False],
-        dosages: Literal[True],
-    ) -> tuple[NDArray[np.float32], NDArray[np.uint32]]: ...
-    @overload
-    def read_ranges(
-        self,
-        contig: str,
-        starts: ArrayLike = 0,
-        ends: ArrayLike | None = None,
-        *,
-        genotypes: Literal[True] = ...,
-        dosages: Literal[True],
-    ) -> tuple[NDArray[np.int8], NDArray[np.float32], NDArray[np.uint32]]: ...
-    @overload
-    def read_ranges(
-        self,
-        contig: str,
-        starts: ArrayLike = 0,
-        ends: ArrayLike | None = None,
-        *,
-        genotypes: bool = True,
-        dosages: bool = False,
-    ) -> (
-        tuple[NDArray[np.int8 | np.float32], NDArray[np.uint32]]
-        | tuple[NDArray[np.int8], NDArray[np.float32], NDArray[np.uint32]]
-    ): ...
-    def read_ranges(
-        self,
-        contig: str,
-        starts: ArrayLike = 0,
-        ends: ArrayLike | None = None,
-        *,
-        genotypes: bool = True,
-        dosages: bool = False,
-    ) -> (
-        tuple[NDArray[np.int8 | np.float32], NDArray[np.uint32]]
-        | tuple[NDArray[np.int8], NDArray[np.float32], NDArray[np.uint32]]
-    ):
+    ) -> tuple[T, NDArray[np.uint32]] | None:
+        c = self._c_norm.norm(contig)
+        if c is None:
+            return
+
         n_vars = self.n_vars_in_ranges(contig, starts, ends)
 
         tot_vars = n_vars.sum()
-        if genotypes and dosages:
+        if tot_vars == 0:
+            return
+
+        if self._read_as is GenosDosages:
             _out = (
                 np.empty((self.n_samples, self.ploidy, tot_vars), dtype=np.int8),
                 np.empty((self.n_samples, tot_vars), dtype=np.float32),
             )
-        elif dosages:
+        elif self._read_as is Dosages:
             _out = (np.empty((self.n_samples, tot_vars), dtype=np.float32),)
         else:
             _out = (np.empty((self.n_samples, self.ploidy, tot_vars), dtype=np.int8),)
@@ -457,17 +323,23 @@ class VCF(Reader[np.int8]):
         offsets = lengths_to_offsets(n_vars)
         for i, (s, e) in enumerate(zip(starts, ends)):
             o_s, o_e = offsets[i], offsets[i + 1]
-            if genotypes is not dosages:
+            if o_s == o_e:
+                continue
+
+            if self._read_as is not GenosDosages:
                 sub_out = _out[0][..., o_s:o_e]
             else:
                 _out = cast(tuple[NDArray[np.int8], NDArray[np.float32]], _out)
                 sub_out = (_out[0][..., o_s:o_e], _out[1][..., o_s:o_e])
-            self.read(contig, s, e, genotypes=genotypes, dosages=dosages, out=sub_out)
+            sub_out = cast(T, sub_out)
+            self.read(contig, s, e, out=sub_out)
 
-        if genotypes is not dosages:
-            return _out[0], n_vars  # type: ignore
+        if self._read_as is not GenosDosages:
+            _out = cast(T, _out[0])
+            return _out, n_vars
 
-        return (*_out, n_vars)  # type: ignore
+        _out = cast(T, _out)
+        return _out, n_vars
 
     def _fill_genos(self, vcf: cyvcf2.VCF, out: NDArray[np.int8]):
         if self.progress:
@@ -537,7 +409,7 @@ class VCF(Reader[np.int8]):
         else:
             raise ValueError("Not enough variants found in the given range.")
 
-    def _mem_per_variant(self, genotypes: bool, dosages: bool) -> int:
+    def _mem_per_variant(self) -> int:
         """Calculate the memory required per variant for the given genotypes and dosages.
 
         Parameters
@@ -552,6 +424,11 @@ class VCF(Reader[np.int8]):
         int
             Memory required per variant in bytes.
         """
-        return (self.n_samples * self.ploidy if genotypes else 0) + (
-            self.n_samples * 4 if dosages else 0
-        )
+        if issubclass(self._read_as, Genos):
+            return self.n_samples * self.ploidy
+        elif issubclass(self._read_as, Dosages):
+            return self.n_samples * np.float32().itemsize
+        elif issubclass(self._read_as, GenosDosages):
+            return self.n_samples * self.ploidy + self.n_samples * np.float32().itemsize
+        else:
+            assert_never(self._read_as)

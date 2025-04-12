@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from functools import partial
 from pathlib import Path
-from typing import Generator, Literal, cast, overload
+from typing import Generator, TypeVar, cast
 
 import numpy as np
 import pgenlib
@@ -9,18 +10,62 @@ import polars as pl
 import pyranges as pr
 from hirola import HashTable
 from numpy.typing import ArrayLike, NDArray
-from typing_extensions import Self
+from phantom import Phantom
+from typing_extensions import Self, TypeGuard, assert_never
 
 from ._types import Reader
-from ._utils import ContigNormalizer, format_memory, lengths_to_offsets, parse_memory
+from ._utils import (
+    ContigNormalizer,
+    format_memory,
+    is_dtype,
+    lengths_to_offsets,
+    parse_memory,
+)
 
-# TODO: the index could likely be implemented using the NCLS lib underlying PyRanges and then we can
-# pass np.memmap arrays directly instead of having to futz with DataFrames. This will likely make
-# filtering less ergonomic/harder to make ergonomic though, but a memmap approach will be much more
-# scalable.
+
+def _is_genos_dosages(obj) -> TypeGuard[tuple[Genos, Dosages]]:
+    """Check if the object is a tuple of genotypes and dosages.
+
+    Parameters
+    ----------
+    obj
+        Object to check.
+
+    Returns
+    -------
+    bool
+        True if the object is a tuple of genotypes and dosages, False otherwise.
+    """
+    return (
+        isinstance(obj, tuple)
+        and len(obj) == 2
+        and isinstance(obj[0], Genos)
+        and isinstance(obj[1], Dosages)
+    )
 
 
-class PGEN(Reader[np.int32]):
+class Genos(
+    NDArray[np.int32], Phantom, predicate=partial(is_dtype, dtype=np.int32)
+): ...
+
+
+class Dosages(
+    NDArray[np.float32], Phantom, predicate=partial(is_dtype, dtype=np.float32)
+): ...
+
+
+class GenosDosages(tuple[Genos, Dosages], Phantom, predicate=_is_genos_dosages): ...
+
+
+T = TypeVar(
+    "T",
+    Genos,
+    Dosages,
+    GenosDosages,
+)
+
+
+class PGEN(Reader[T]):
     available_samples: list[str]
     filter: pl.Expr | None
     ploidy = 2
@@ -28,10 +73,24 @@ class PGEN(Reader[np.int32]):
     _index: pr.PyRanges
     _pgen: pgenlib.PgenReader
     _s_idx: NDArray[np.uint32]
+    _read_as: type[T]
 
-    def __init__(self, path: str | Path, filter: pl.Expr | None = None):
+    Genos = Genos
+    Dosages = Dosages
+    GenosDosages = GenosDosages
+
+    def __init__(
+        self,
+        path: str | Path,
+        filter: pl.Expr | None = None,
+        read_as: type[T] = Genos,
+    ):
+        if read_as is Dosages or read_as is GenosDosages:
+            raise NotImplementedError("PGEN dosages are not yet supported.")
+
         path = Path(path)
         samples = _read_psam(path.with_suffix(".psam"))
+
         self.filter = filter
         self.available_samples = samples.tolist()
         self._s2i = HashTable(
@@ -46,6 +105,7 @@ class PGEN(Reader[np.int32]):
         self._index = _read_index(path.with_suffix(".gvi"), self.filter)
         self.contigs = self._index.chromosomes
         self._c_norm = ContigNormalizer(self._index.chromosomes)
+        self._read_as = read_as
 
     @property
     def current_samples(self) -> list[str]:
@@ -68,10 +128,10 @@ class PGEN(Reader[np.int32]):
         contig: str,
         starts: ArrayLike = 0,
         ends: ArrayLike | None = None,
-    ) -> NDArray[np.int64]:
+    ) -> NDArray[np.uint32]:
         c = self._c_norm.norm(contig)
         if c is None:
-            return np.zeros_like(np.atleast_1d(starts), dtype=np.int64)
+            return np.zeros_like(np.atleast_1d(starts), dtype=np.uint32)
 
         starts = np.atleast_1d(starts)
         if ends is None:
@@ -85,7 +145,12 @@ class PGEN(Reader[np.int32]):
                 }
             ).to_pandas(use_pyarrow_extension_array=True)
         )
-        return queries.count_overlaps(self._index).df["NumberOverlaps"].to_numpy()
+        return (
+            queries.count_overlaps(self._index)
+            .df["NumberOverlaps"]
+            .to_numpy()
+            .astype(np.uint32)
+        )
 
     def _var_idxs(
         self, contig: str, starts: ArrayLike = 0, ends: ArrayLike | None = None
@@ -130,7 +195,12 @@ class PGEN(Reader[np.int32]):
             .with_row_index("query")
             .to_pandas(use_pyarrow_extension_array=True)
         )
-        join = pl.from_pandas(queries.join(self._index).df).sort("query", "index")
+        join = pl.from_pandas(queries.join(self._index).df)
+        if join.height == 0:
+            return np.empty(0, np.uint32), np.zeros_like(
+                np.atleast_1d(starts), np.uint64
+            )
+        join = join.sort("query", "index")
         idxs = join["index"].to_numpy()
         lens = (
             join.group_by("query", maintain_order=True).agg(pl.len())["len"].to_numpy()
@@ -138,169 +208,15 @@ class PGEN(Reader[np.int32]):
         offsets = lengths_to_offsets(lens)
         return idxs, offsets
 
-    @overload
     def read(
         self,
         contig: str,
         start: int = 0,
         end: int | None = None,
-        *,
-        genotypes: Literal[True] = ...,
-        dosages: Literal[False] = ...,
-        out: NDArray[np.int32] | None,
-    ) -> NDArray[np.int32]: ...
-    @overload
-    def read(
-        self,
-        contig: str,
-        start: int = 0,
-        end: int | None = None,
-        *,
-        genotypes: Literal[False],
-        dosages: Literal[True],
-        out: NDArray[np.float32] | None,
-    ) -> NDArray[np.float32]: ...
-    @overload
-    def read(
-        self,
-        contig: str,
-        start: int = 0,
-        end: int | None = None,
-        *,
-        genotypes: Literal[True] = ...,
-        dosages: Literal[True],
-        out: tuple[NDArray[np.int32], NDArray[np.float32]] | None,
-    ) -> tuple[NDArray[np.int32], NDArray[np.float32]]: ...
-    @overload
-    def read(
-        self,
-        contig: str,
-        start: int = 0,
-        end: int | None = None,
-        *,
-        genotypes: bool = True,
-        dosages: bool = False,
-        out: NDArray[np.int32 | np.float32]
-        | tuple[NDArray[np.int32], NDArray[np.float32]]
-        | None = None,
-    ) -> (
-        NDArray[np.int32 | np.float32] | tuple[NDArray[np.int32], NDArray[np.float32]]
-    ): ...
-    def read(
-        self,
-        contig: str,
-        start: int = 0,
-        end: int | None = None,
-        *,
-        genotypes: bool = True,
-        dosages: bool = False,
-        out: NDArray[np.int32 | np.float32]
-        | tuple[NDArray[np.int32], NDArray[np.float32]]
-        | None = None,
-    ) -> NDArray[np.int32 | np.float32] | tuple[NDArray[np.int32], NDArray[np.float32]]:
-        if not genotypes and not dosages:
-            raise ValueError("Either genotypes or dosage_field must be specified.")
-
-        if dosages:
-            raise NotImplementedError("Dosages are not yet supported.")
-
+        out: T | None = None,
+    ) -> T | None:
         c = self._c_norm.norm(contig)
         if c is None:
-            if genotypes and not dosages:
-                return np.empty((self.n_samples, self.ploidy, 0), dtype=np.int32)
-            elif not genotypes and dosages:
-                return np.empty((self.n_samples, 0), dtype=np.float32)
-            else:
-                return (
-                    np.empty((self.n_samples, self.ploidy, 0), dtype=np.int32),
-                    np.empty((self.n_samples, 0), dtype=np.float32),
-                )
-
-        if end is None:
-            end = np.iinfo(np.int64).max
-
-        var_idxs, _ = self._var_idxs(c, start, end)
-        n_variants = len(var_idxs)
-
-        if out is None:
-            out = np.empty((n_variants, self.n_samples * self.ploidy), dtype=np.int32)
-
-        out = cast(NDArray[np.int32], out)  # not implementing dosages yet
-
-        self._pgen.read_alleles_list(var_idxs, out)
-        out = out.reshape(n_variants, self.n_samples, self.ploidy).transpose(1, 2, 0)[
-            self._s_idx
-        ]
-        out[out == -9] = -1
-
-        return out
-
-    @overload
-    def read_chunks(
-        self,
-        contig: str,
-        start: int = 0,
-        end: int | None = None,
-        max_mem: int | str = "4g",
-        *,
-        genotypes: Literal[True] = ...,
-        dosages: Literal[False] = ...,
-    ) -> Generator[NDArray[np.int32]]: ...
-    @overload
-    def read_chunks(
-        self,
-        contig: str,
-        start: int = 0,
-        end: int | None = None,
-        max_mem: int | str = "4g",
-        *,
-        genotypes: Literal[False],
-        dosages: Literal[True],
-    ) -> Generator[NDArray[np.float32]]: ...
-    @overload
-    def read_chunks(
-        self,
-        contig: str,
-        start: int = 0,
-        end: int | None = None,
-        max_mem: int | str = "4g",
-        *,
-        genotypes: Literal[True] = ...,
-        dosages: Literal[True],
-    ) -> Generator[tuple[NDArray[np.int32], NDArray[np.float32]]]: ...
-    @overload
-    def read_chunks(
-        self,
-        contig: str,
-        start: int = 0,
-        end: int | None = None,
-        max_mem: int | str = "4g",
-        *,
-        genotypes: bool = True,
-        dosages: bool = False,
-    ) -> Generator[
-        NDArray[np.int32 | np.float32] | tuple[NDArray[np.int32], NDArray[np.float32]]
-    ]: ...
-    def read_chunks(
-        self,
-        contig: str,
-        start: int = 0,
-        end: int | None = None,
-        max_mem: int | str = "4g",
-        *,
-        genotypes: bool = True,
-        dosages: bool = False,
-    ) -> Generator[
-        NDArray[np.int32 | np.float32] | tuple[NDArray[np.int32], NDArray[np.float32]]
-    ]:
-        if dosages:
-            raise NotImplementedError("Dosages are not yet supported.")
-
-        max_mem = parse_memory(max_mem)
-
-        c = self._c_norm.norm(contig)
-        if c is None:
-            yield np.empty((self.n_samples, self.ploidy, 0), dtype=np.int32)
             return
 
         if end is None:
@@ -309,10 +225,51 @@ class PGEN(Reader[np.int32]):
         var_idxs, _ = self._var_idxs(c, start, end)
         n_variants = len(var_idxs)
         if n_variants == 0:
-            yield np.empty((self.n_samples, self.ploidy, 0), dtype=np.int32)
             return
 
-        mem_per_v = self._mem_per_variant(genotypes, dosages)
+        # TODO: support dosages
+
+        if out is None:
+            data = np.empty((n_variants, self.n_samples * self.ploidy), dtype=np.int32)
+        else:
+            if not isinstance(out, Genos):
+                raise ValueError(f"Expected a np.int32 array, got {type(out)}.")
+            data = out
+
+        self._pgen.read_alleles_list(var_idxs, data)
+        data = data.reshape(n_variants, self.n_samples, self.ploidy).transpose(1, 2, 0)[
+            self._s_idx
+        ]
+        data[data == -9] = -1
+
+        data = cast(T, data)
+
+        return data
+
+    def read_chunks(
+        self,
+        contig: str,
+        start: int = 0,
+        end: int | None = None,
+        max_mem: int | str = "4g",
+    ) -> Generator[T]:
+        # TODO: support dosages
+
+        max_mem = parse_memory(max_mem)
+
+        c = self._c_norm.norm(contig)
+        if c is None:
+            return
+
+        if end is None:
+            end = np.iinfo(np.int64).max
+
+        var_idxs, _ = self._var_idxs(c, start, end)
+        n_variants = len(var_idxs)
+        if n_variants == 0:
+            return
+
+        mem_per_v = self._mem_per_variant()
         vars_per_chunk = min(max_mem // mem_per_v, n_variants)
         if vars_per_chunk == 0:
             raise ValueError(
@@ -324,86 +281,32 @@ class PGEN(Reader[np.int32]):
         v_chunks = np.array_split(var_idxs, n_chunks)
         for var_idx in v_chunks:
             chunk_size = len(var_idx)
-            out = np.empty((self.n_samples, self.ploidy, chunk_size), dtype=np.int32)
+            out = np.empty((chunk_size, self.n_samples * self.ploidy), dtype=np.int32)
             self._pgen.read_alleles_list(var_idx, out)
             out = out.reshape(chunk_size, self.n_samples, self.ploidy).transpose(
                 1, 2, 0
             )[self._s_idx]
             out[out == -9] = -1
-            yield out
+            yield cast(T, out)
 
-    @overload
     def read_ranges(
         self,
         contig: str,
         starts: ArrayLike = 0,
         ends: ArrayLike | None = None,
-        *,
-        genotypes: Literal[True] = ...,
-        dosages: Literal[False] = ...,
-    ) -> tuple[NDArray[np.int32], NDArray[np.uint32]]: ...
-    @overload
-    def read_ranges(
-        self,
-        contig: str,
-        starts: ArrayLike = 0,
-        ends: ArrayLike | None = None,
-        *,
-        genotypes: Literal[False],
-        dosages: Literal[True],
-    ) -> tuple[NDArray[np.float32], NDArray[np.uint32]]: ...
-    @overload
-    def read_ranges(
-        self,
-        contig: str,
-        starts: ArrayLike = 0,
-        ends: ArrayLike | None = None,
-        *,
-        genotypes: Literal[True] = ...,
-        dosages: Literal[True],
-    ) -> tuple[NDArray[np.int32], NDArray[np.float32], NDArray[np.uint32]]: ...
-    @overload
-    def read_ranges(
-        self,
-        contig: str,
-        starts: ArrayLike = 0,
-        ends: ArrayLike | None = None,
-        *,
-        genotypes: bool = True,
-        dosages: bool = False,
-    ) -> (
-        tuple[NDArray[np.int32 | np.float32], NDArray[np.uint32]]
-        | tuple[NDArray[np.int32], NDArray[np.float32], NDArray[np.uint32]]
-    ): ...
-    def read_ranges(
-        self,
-        contig: str,
-        starts: ArrayLike = 0,
-        ends: ArrayLike | None = None,
-        *,
-        genotypes: bool = True,
-        dosages: bool = False,
-    ) -> (
-        tuple[NDArray[np.int32 | np.float32], NDArray[np.uint32]]
-        | tuple[NDArray[np.int32], NDArray[np.float32], NDArray[np.uint32]]
-    ):
-        if dosages:
-            raise NotImplementedError("Dosages are not yet supported.")
+    ) -> tuple[T, NDArray[np.uint32]] | None:
+        # TODO: support dosages
 
         starts = np.atleast_1d(starts)
 
         c = self._c_norm.norm(contig)
         if c is None:
-            return np.empty(
-                (self.n_samples, self.ploidy, 0), dtype=np.int32
-            ), np.zeros_like(starts, dtype=np.uint32)
+            return
 
         var_idxs, offsets = self._var_idxs(c, starts, ends)
         n_variants = len(var_idxs)
         if n_variants == 0:
-            return np.empty(
-                (self.n_samples, self.ploidy, 0), dtype=np.int32
-            ), np.zeros_like(starts, dtype=np.uint32)
+            return
 
         out = np.empty((n_variants, self.n_samples * self.ploidy), dtype=np.int32)
 
@@ -413,12 +316,15 @@ class PGEN(Reader[np.int32]):
         ]
         out[out == -9] = -1
 
-        return out, np.diff(offsets).astype(np.uint32)
+        return cast(T, out), np.diff(offsets).astype(np.uint32)
 
-    def _mem_per_variant(self, genotypes: bool, dosages: bool) -> int:
-        if dosages:
+    def _mem_per_variant(self) -> int:
+        if issubclass(self._read_as, Genos):
+            return self.n_samples * self.ploidy * np.int32().itemsize
+        elif issubclass(self._read_as, (Dosages, GenosDosages)):
             raise NotImplementedError("Dosages are not yet supported.")
-        return self.n_samples * self.ploidy * np.int32().itemsize
+        else:
+            assert_never(self._read_as)
 
 
 def _read_psam(path: Path) -> NDArray[np.str_]:
@@ -457,6 +363,10 @@ KIND = (
 )
 
 
+# TODO: index can likely be implemented using the NCLS lib underlying PyRanges and then we can
+# pass np.memmap arrays directly instead of having to futz with DataFrames. This will likely make
+# filtering less ergonomic/harder to make ergonomic though, but a memmap approach will be scalable
+# to ultra-large datasets (100k+ individuals).
 def _write_index(path: Path):
     (
         pl.scan_csv(
@@ -468,7 +378,7 @@ def _write_index(path: Path):
         .select(
             Chromosome="#CHROM",
             Start=pl.col("POS") - 1,
-            End=pl.col("POS"),
+            End=pl.col("POS") + RLEN - 1,
             kind=KIND,
         )
         .sink_ipc(path.with_suffix(".gvi"))

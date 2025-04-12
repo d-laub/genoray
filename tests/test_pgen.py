@@ -5,19 +5,19 @@ import numpy as np
 from numpy.typing import NDArray
 from pytest_cases import fixture, parametrize_with_cases
 
-from genoray import VCF
+from genoray import PGEN
 
 tdir = Path(__file__).parent
 ddir = tdir / "data"
 
 
 @fixture  # type: ignore
-def vcf():
-    return VCF(ddir / "test.vcf.gz", read_as=VCF.GenosDosages, dosage_field="DS")
+def pgen():
+    return PGEN(ddir / "test.pgen")
 
 
 def read_all():
-    cse = "chr1", 81261, 81263
+    cse = "chr1", 81261, 81262
     # (s p v)
     genos = np.array([[[0, -1], [1, -1]], [[1, 0], [1, 1]]], np.int8)
     # (s v)
@@ -37,31 +37,30 @@ def read_spanning_del():
 
 @parametrize_with_cases("cse, genos, dosages", cases=".", prefix="read_")
 def test_read(
-    vcf: VCF[VCF.GenosDosages],
+    pgen: PGEN[PGEN.Genos],
     cse: tuple[str, int, int],
     genos: NDArray[np.int8],
     dosages: NDArray[np.float32],
 ):
     # (s p v)
-    actual = vcf.read(*cse)
-    assert actual is not None
-    np.testing.assert_equal(actual[0], genos)
-    np.testing.assert_equal(actual[1], dosages)
+    actual = pgen.read(*cse)
+    np.testing.assert_equal(actual, genos)
+    # np.testing.assert_equal(actual[1], dosages)
 
 
 @parametrize_with_cases("cse, genos, dosages", cases=".", prefix="read_")
 def test_read_chunks(
-    vcf: VCF[VCF.GenosDosages],
+    pgen: PGEN[PGEN.Genos],
     cse: tuple[str, int, int],
     genos: NDArray[np.int8],
     dosages: NDArray[np.float32],
 ):
-    max_mem = vcf._mem_per_variant()
+    max_mem = pgen._mem_per_variant()
     cat = partial(np.concatenate, axis=-1)
-    itr = vcf.read_chunks(*cse, max_mem)
-    chunks = list(zip(*itr))
-    assert len(chunks[0]) == genos.shape[-1]
-    assert len(chunks[1]) == dosages.shape[-1]
-    actual = cat(chunks[0]), cat(chunks[1])
-    np.testing.assert_equal(actual[0], genos)
-    np.testing.assert_equal(actual[1], dosages)
+    itr = pgen.read_chunks(*cse, max_mem)
+    chunks = list(itr)
+    assert len(chunks) == genos.shape[-1]
+    # assert len(chunks[1]) == dosages.shape[-1]
+    actual = cat(chunks)
+    np.testing.assert_equal(actual, genos)
+    # np.testing.assert_equal(actual[1], dosages)

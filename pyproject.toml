@@ -18,6 +18,7 @@ dependencies = [
     "pyarrow>=19.0.1",
     "setuptools>=78.1.0", # pyranges misses this dependency with uv for some reason
     "tqdm>=4.67.1",
+    "phantom-types>=3.0.2",
 ]
 
 [dependency-groups]

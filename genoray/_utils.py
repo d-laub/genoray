@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import re
-from typing import Iterable, TypeVar, overload
+from typing import Any, Iterable, TypeVar, overload
 
 import numpy as np
 from numpy.typing import NDArray
@@ -39,22 +39,22 @@ class ContigNormalizer:
             return [self.contig_map.get(c, None) for c in contigs]
 
 
-def is_dtype(array: NDArray, dtype: type[DTYPE]) -> TypeGuard[NDArray[DTYPE]]:
-    """Check if the array has the given dtype.
+def is_dtype(obj: Any, dtype: type[DTYPE]) -> TypeGuard[NDArray[DTYPE]]:
+    """Check if the object is a NumPy array with the given dtype.
 
     Parameters
     ----------
-    array
-        Array to check.
+    obj
+        Object to check.
     dtype
         Dtype to check against.
 
     Returns
     -------
     bool
-        True if the array has the given dtype, False otherwise.
+        True if the object is an array with the given dtype, False otherwise.
     """
-    return array.dtype.type == dtype
+    return isinstance(obj, np.ndarray) and obj.dtype.type == dtype
 
 
 _MEM_PARSER = re.compile(r"(?i)([0-9]+?)(.*)")
