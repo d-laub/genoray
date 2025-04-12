@@ -60,6 +60,10 @@ vcf = VCF("file.vcf.gz", filter=lambda v: v.QUAL > 20)  # only include variants 
 pgen = PGEN("file.pgen", filter=pl.col("kind") == "SNP")  # only include SNPs
 ```
 
+## Type Safety
+
+`genoray` is fully type-safe, meaning that type checkers like mypy and pyright can infer the types of the input and output data for everything in `genoray` and provide compile-time errors. In addition, if you want to abstract your code to work with either VCF or PGEN files, you can use the `genoray.Reader` base class, which is a `typing.Protocol` that all `genoray` readers adhere to. This allows you to write code that works with either VCF or PGEN files without having to worry about the underlying implementation details.
+
 # ⚠️ Important ⚠️
 
 - For the time being, ploidy is always 2, but this could be more flexible for VCFs in the future. PGEN does not support ploidy other than 2.
