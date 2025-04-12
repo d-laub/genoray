@@ -66,3 +66,4 @@ pgen = PGEN("file.pgen", filter=pl.col("kind") == "SNP")  # only include SNPs
 - Multi-allelic variants are not supported.
 - PGEN returns genotypes with dtype `np.int32` instead of `np.int8` because this is the native dtype for pgenlib.
 - Ranges are 0-based, so starts begin at 0 and ends are exclusive.
+- Missing genotypes and dosages are encoded as -1 and `np.nan`, respectively.
