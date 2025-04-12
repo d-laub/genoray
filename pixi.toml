@@ -1,0 +1,22 @@
+[workspace]
+name = "genoray"
+channels = ["conda-forge", "bioconda"]
+platforms = ["linux-64"]
+
+[pypi-dependencies]
+genoray = { path = ".", editable = true }
+
+[dependencies]
+htslib = "*"
+bcftools = "*"
+plink2 = "*"
+pytest = "*"
+commitizen = "*"
+pre-commit = "*"
+ruff = "*"
+pytest-cases = "*"
+ipykernel = "*"
+ipywidgets = "*"
+
+[tasks]
+i-kernel = "ipython kernel install --user --name genoray"

@@ -1,6 +1,6 @@
 [project]
 name = "genoray"
-version = "0.0.0"
+version = "0.1.0"
 description = "Add your description here"
 authors = [{ name = "David Laub", email = "dlaub@ucsd.edu" }]
 readme = "README.md"
@@ -16,20 +16,9 @@ dependencies = [
     "typing-extensions>=4.13.2",
     "pandas",
     "pyarrow>=19.0.1",
-    "setuptools>=78.1.0", # pyranges misses this dependency with uv for some reason
+    "setuptools>=78.1.0",        # uv misses this dependency for pyranges
     "tqdm>=4.67.1",
     "phantom-types>=3.0.2",
-]
-
-[dependency-groups]
-dev = [
-    "pytest",
-    "commitizen",
-    "pre-commit",
-    "ruff",
-    "pytest-cases>=3.8.6",
-    "ipykernel>=6.29.5",
-    "ipywidgets>=8.1.6",
 ]
 
 [tool.commitizen]
@@ -41,5 +30,5 @@ update_changelog_on_bump = true
 major_version_zero = true
 
 [build-system]
-requires = ["hatchling"]
 build-backend = "hatchling.build"
+requires = ["hatchling"]
