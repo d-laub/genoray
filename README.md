@@ -2,7 +2,7 @@
 
 If you want to use NumPy with genetic variant data, `genoray` is for you! `genoray` provides a uniform API for efficient range queries of genotypes and dosages from VCF and PGEN (PLINK 2.0) files. `genoray` is also fully type-safe and has minimal dependencies.
 
-The API is minimal, with only three core methods for single range queries, automatically chunking reads **to respect a memory limit**, and reading **multiple range queries**.
+The API is minimal, with only three core methods: **single range queries**, automatically chunking a range query **to respect a memory limit**, and reading **multiple range queries**.
 
 ## `read`
 Read genotypes and/or dosages for a single range `(contig, start, end)`. Returns a NumPy array of shape `(samples, ploidy, variants)`. For VCF, the dtype is `np.int8`, and for PGEN, the dtype is `np.int32`.
@@ -31,7 +31,13 @@ genos, dosages = vcf.read("1")
 genos, dosages = pgen.read("1")
 ```
 
-Dosages have shape `(samples, variants)` and dtype `np.float32` for both VCF and PGEN.
+Dosages have shape `(samples, variants)` and dtype `np.float32` for both VCF and PGEN. Note that VCFs must also be provided a FORMAT `dosage_field` to read dosages and this field must have Number=A in the header, meaning there is one value for each ALT allele. PGEN files either store hardcalls (genotypes) or dosages, not both, and dosage PGENs infer hardcalls based on a [hardcall threshold](https://www.cog-genomics.org/plink/2.0/input#dosage_import_settings). Thus, if you want to read hardcalls that do not correspond to inferred hardcalls from a dosage PGEN, you can provide two different PGEN files to the constructor:
+
+```python
+pgen = PGEN("hardcalls.pgen", dosage_path="dosage.pgen", ...)
+```
+
+This will read hardcalls from `hardcalls.pgen` and dosages from `dosage.pgen`. The two PGEN files must have the same samples and variants in the same order. The `dosage_path` argument is optional, and if not provided, both hardcalls and dosages will be sourced from the path argument (`"hardcalls.pgen"` in the example).
 
 > [!IMPORTANT]
 > PGEN files are automatically indexed on construction, creating a `<prefix>.gvi` file. This is a one-time cost to enable much faster range queries, but it takes longer for larger files. Don't delete this index file unless you want to re-index the PGEN file.
