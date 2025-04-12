@@ -53,7 +53,7 @@ genos, n_vars = vcf.read_ranges('1', starts=[1, 1000, 2000], ends=[1000, 2000, 3
 
 ## Filtering
 
-You can filter variants from VCF or PGEN files by a providing a function or polars Expression to the constructor, respectively. For VCFs, the function must accept a [cyvcf2.Variant](https://brentp.github.io/cyvcf2/docstrings.html#cyvcf2.cyvcf2.Variant) and return a boolean indicating whether to include the variant. For PGENs, the expression will operate on a polars DataFrame with four columns: "Chromosome", "Start", "End", and "kind". The expression should return a boolean mask indicating which variants to include. The "kind" column is a string that indicates the type of variant, which can be "SNP", "INDEL", or "MNP".
+You can filter variants from VCF or PGEN files by a providing a function or [polars.Expression](https://docs.pola.rs/user-guide/concepts/expressions-and-contexts/) to the constructor, respectively. For VCFs, the function must accept a [cyvcf2.Variant](https://brentp.github.io/cyvcf2/docstrings.html#cyvcf2.cyvcf2.Variant) and return a boolean indicating whether to include the variant. For PGENs, the expression will operate on a polars DataFrame with four columns: "Chromosome", "Start", "End", and "kind". The expression should return a boolean mask indicating which variants to include. The "kind" column is a string that indicates the type of variant, which can be "SNP", "INDEL", or "MNP".
 
 ```python
 vcf = VCF("file.vcf.gz", filter=lambda v: v.QUAL > 20)  # only include variants with quality > 20
