@@ -71,3 +71,7 @@ pgen = PGEN("file.pgen", filter=pl.col("kind") == "SNP")  # only include SNPs
 - PGEN returns genotypes with dtype `np.int32` instead of `np.int8` because this is the native dtype for pgenlib.
 - Ranges are 0-based, so starts begin at 0 and ends are exclusive.
 - Missing genotypes and dosages are encoded as -1 and `np.nan`, respectively.
+
+# Contributing
+
+To contribute to `genoray`, please fork the repository and create a pull request. We welcome contributions of all kinds, including bug fixes, new features, and documentation improvements. Please make sure to run the tests before submitting a pull request. We provide a Pixi environment that includes all development dependencies. To use the environment, install Pixi and run `pixi s` in the repository root directory. This will activate the environment and install all dependencies. You can then run the tests using `pytest`. If you have any questions or suggestions, please open an issue on the repository.
