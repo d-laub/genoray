@@ -71,7 +71,8 @@ class PGEN(Reader[T]):
     ploidy = 2
     contigs: list[str]
     _index: pr.PyRanges
-    _pgen: pgenlib.PgenReader
+    _geno_pgen: pgenlib.PgenReader
+    _dose_pgen: pgenlib.PgenReader
     _s_idx: NDArray[np.uint32]
     _read_as: type[T]
 
@@ -81,15 +82,21 @@ class PGEN(Reader[T]):
 
     def __init__(
         self,
-        path: str | Path,
+        geno_path: str | Path,
         filter: pl.Expr | None = None,
         read_as: type[T] = Genos,
+        dosage_path: str | Path | None = None,
     ):
+        # TODO: support dosages and allow user to either provide a second PGEN file for dosages
+        # or else use the same PGEN file for both genotypes and dosages.
+        # That being said, there's probably not much point for a user to use the same PGEN file
+        # for genos and dosages since PLINK2 defines hardcalls as a simple threshold on the dosages
+        # when dosages are available.
         if read_as is Dosages or read_as is GenosDosages:
             raise NotImplementedError("PGEN dosages are not yet supported.")
 
-        path = Path(path)
-        samples = _read_psam(path.with_suffix(".psam"))
+        geno_path = Path(geno_path)
+        samples = _read_psam(geno_path.with_suffix(".psam"))
 
         self.filter = filter
         self.available_samples = samples.tolist()
@@ -99,10 +106,22 @@ class PGEN(Reader[T]):
         )
         self._s2i.add(samples)
         self._s_idx = np.arange(len(samples), dtype=np.uint32)
-        self._pgen = pgenlib.PgenReader(bytes(path))
-        if not path.with_suffix(".gvi").exists():
-            _write_index(path.with_suffix(".pvar"))
-        self._index = _read_index(path.with_suffix(".gvi"), self.filter)
+        self._geno_pgen = pgenlib.PgenReader(bytes(geno_path))
+
+        if dosage_path is not None:
+            dosage_path = Path(dosage_path)
+            dose_samples = _read_psam(dosage_path.with_suffix(".psam"))
+            if (samples != dose_samples).any():
+                raise ValueError(
+                    "Samples in dosage file do not match those in genotype file."
+                )
+            self._dose_pgen = pgenlib.PgenReader(bytes(Path(dosage_path)))
+        else:
+            self._dose_pgen = self._geno_pgen
+
+        if not geno_path.with_suffix(".gvi").exists():
+            _write_index(geno_path.with_suffix(".pvar"))
+        self._index = _read_index(geno_path.with_suffix(".gvi"), self.filter)
         self.contigs = self._index.chromosomes
         self._c_norm = ContigNormalizer(self._index.chromosomes)
         self._read_as = read_as
@@ -117,11 +136,13 @@ class PGEN(Reader[T]):
         if (missing := _samples[s_idx == -1]).any():
             raise ValueError(f"Samples {missing} not found in the file.")
         self._s_idx = s_idx
-        self._pgen.change_sample_subset(np.sort(s_idx))
+        self._geno_pgen.change_sample_subset(np.sort(s_idx))
         return self
 
     def __del__(self):
-        self._pgen.close()
+        self._geno_pgen.close()
+        if self._dose_pgen is not None:
+            self._dose_pgen.close()
 
     def n_vars_in_ranges(
         self,
@@ -236,7 +257,7 @@ class PGEN(Reader[T]):
                 raise ValueError(f"Expected a np.int32 array, got {type(out)}.")
             data = out
 
-        self._pgen.read_alleles_list(var_idxs, data)
+        self._geno_pgen.read_alleles_list(var_idxs, data)
         data = data.reshape(n_variants, self.n_samples, self.ploidy).transpose(1, 2, 0)[
             self._s_idx
         ]
@@ -282,7 +303,7 @@ class PGEN(Reader[T]):
         for var_idx in v_chunks:
             chunk_size = len(var_idx)
             out = np.empty((chunk_size, self.n_samples * self.ploidy), dtype=np.int32)
-            self._pgen.read_alleles_list(var_idx, out)
+            self._geno_pgen.read_alleles_list(var_idx, out)
             out = out.reshape(chunk_size, self.n_samples, self.ploidy).transpose(
                 1, 2, 0
             )[self._s_idx]
@@ -310,7 +331,7 @@ class PGEN(Reader[T]):
 
         out = np.empty((n_variants, self.n_samples * self.ploidy), dtype=np.int32)
 
-        self._pgen.read_alleles_list(var_idxs, out)
+        self._geno_pgen.read_alleles_list(var_idxs, out)
         out = out.reshape(n_variants, self.n_samples, self.ploidy).transpose(1, 2, 0)[
             self._s_idx
         ]

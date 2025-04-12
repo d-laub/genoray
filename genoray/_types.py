@@ -76,8 +76,11 @@ class Reader(Protocol, Generic[T]):
 
         Returns
         -------
-        genotypes
-            Shape: (samples ploidy variants)
+        data
+            Genotypes and/or dosages. Genotypes have shape (samples ploidy variants) and
+            dosages have shape (samples variants). Missing genotypes have value -1 and missing dosages
+            have value np.nan. If just using genotypes or dosages, will be a single array, otherwise
+            will be a tuple of arrays.
         dosage
             Shape: (samples variants)
         """
@@ -109,7 +112,9 @@ class Reader(Protocol, Generic[T]):
         -------
         data
             Generator of genotypes and/or dosages. Genotypes have shape (samples ploidy variants) and
-            dosages have shape (samples variants).
+            dosages have shape (samples variants). Missing genotypes have value -1 and missing dosages
+            have value np.nan. If just using genotypes or dosages, will be a single array, otherwise
+            will be a tuple of arrays.
         """
         ...
 
@@ -138,11 +143,11 @@ class Reader(Protocol, Generic[T]):
 
         Returns
         -------
-        genotypes
-            Shape: (samples ploidy variants). Data for each region are concatenated along the
-            variant axis.
-        dosage
-            Shape: (samples variants). Data for each region are concatenated along the variant axis.
+        data
+            Genotypes and/or dosages. Genotypes have shape (samples ploidy variants) and
+            dosages have shape (samples variants). Missing genotypes have value -1 and missing dosages
+            have value np.nan. If just using genotypes or dosages, will be a single array, otherwise
+            will be a tuple of arrays.
         n_variants_per_region
             Shape: (regions). Number of variants in the given ranges.
         """
