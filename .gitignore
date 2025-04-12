@@ -2,6 +2,7 @@
 __pycache__/
 notebooks/
 .venv/
+dist/
 
 # pixi environments
 .pixi
