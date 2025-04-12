@@ -20,3 +20,4 @@ ipywidgets = "*"
 
 [tasks]
 i-kernel = "ipython kernel install --user --name genoray"
+pre-commit = "pre-commit install --hook-type commit-msg"
