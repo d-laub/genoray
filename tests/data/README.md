@@ -1,0 +1,1 @@
+All test data are sourced from test.vcf and any changes to the test data should only be made in this file. After changes are made, run `gen_from_vcf.sh` to update the rest of the test data.
