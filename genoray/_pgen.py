@@ -176,23 +176,23 @@ class PGEN(Reader[T]):
     def _var_idxs(
         self, contig: str, starts: ArrayLike = 0, ends: ArrayLike | None = None
     ) -> tuple[NDArray[np.uint32], NDArray[np.uint64]]:
-        """Get variant indices and the number of indices per region.
+        """Get variant indices and the number of indices per range.
 
         Parameters
         ----------
         contig
             Contig name.
         starts
-            0-based start positions of the regions.
+            0-based start positions of the ranges.
         ends
-            0-based, exclusive end positions of the regions.
+            0-based, exclusive end positions of the ranges.
 
         Returns
         -------
         idxs
             Shape: (tot_variants). Variant indices for the given ranges.
         offsets
-            Shape: (regions+1). Offsets to get variant indices for each region.
+            Shape: (ranges+1). Offsets to get variant indices for each range.
         """
         starts = np.atleast_1d(starts)
 
@@ -377,9 +377,9 @@ ILEN = ALEN - RLEN
 KIND = (
     pl.when(ILEN != 0)
     .then(pl.lit("INDEL"))
-    .when(RLEN == 1)
+    .when(RLEN == 1)  # ILEN == 0 and RLEN == 1
     .then(pl.lit("SNP"))
-    .otherwise(pl.lit("MNP"))
+    .otherwise(pl.lit("MNP"))  # ILEN == 0 and RLEN > 1
     .cast(pl.Categorical)
 )
 

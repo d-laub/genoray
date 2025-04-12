@@ -84,6 +84,21 @@ class VCF(Reader[T]):
         dosage_field: str | None = None,
         progress: bool = False,
     ):
+        """Create a VCF reader.
+        
+        Parameters
+        ----------
+        path
+            Path to the VCF file.
+        filter
+            Function to filter variants. Should return True for variants to keep.
+        read_as
+            Type of data to read from the VCF file. Can be VCF.Genos, VCF.Dosages, or VCF.GenosDosages.
+        dosage_field
+            Name of the dosage field to read from the VCF file. Required if read_as is VCF.Dosages or VCF.GenosDosages.
+        progress
+            Whether to show a progress bar while reading the VCF file.
+"""
         if (read_as is Dosages or read_as is GenosDosages) and dosage_field is None:
             raise ValueError(
                 "Dosage field not specified. Set the VCF reader's `dosage_field` parameter."
@@ -109,6 +124,18 @@ class VCF(Reader[T]):
         return self._samples
 
     def set_samples(self, samples: list[str]) -> Self:
+        """Set the samples to read from the VCF file. Modifies the VCF reader in place and return it.
+        
+        Parameters
+        ----------
+        samples
+            List of sample names to read from the VCF file.
+        
+        Returns
+        -------
+        VCF
+            The VCF reader with the specified samples.
+        """
         if missing := set(samples).difference(self.available_samples):
             raise ValueError(
                 f"Samples {missing} not found in the VCF file. "
@@ -164,7 +191,7 @@ class VCF(Reader[T]):
         if end is None:
             end = np.iinfo(np.int64).max
 
-        itr = self._vcf(f"{c}:{start + 1}-{end}")  # region string is 1-based
+        itr = self._vcf(f"{c}:{start + 1}-{end}")  # range string is 1-based
         if out is None:
             n_variants: np.uint32 = self.n_vars_in_ranges(c, start, end)[0]
             if n_variants == 0:
@@ -263,7 +290,7 @@ class VCF(Reader[T]):
             chunk_sizes = np.full(n_chunks + 1, vars_per_chunk)
             chunk_sizes[-1] = final_chunk
 
-        itr = self._vcf(f"{c}:{start + 1}-{end}")  # region string is 1-based
+        itr = self._vcf(f"{c}:{start + 1}-{end}")  # range string is 1-based
         for chunk_size in chunk_sizes:
             if self._read_as is Genos:
                 out = np.empty((self.n_samples, self.ploidy, chunk_size), dtype=np.int8)

@@ -39,14 +39,14 @@ class Reader(Protocol, Generic[T]):
         contig
             Contig name.
         starts
-            0-based start positions of the regions.
+            0-based start positions of the ranges.
         ends
-            0-based, exclusive end positions of the regions.
+            0-based, exclusive end positions of the ranges.
 
         Returns
         -------
         n_variants
-            Shape: (regions). Number of variants in the given ranges.
+            Shape: (ranges). Number of variants in the given ranges.
         """
         ...
 
@@ -57,16 +57,16 @@ class Reader(Protocol, Generic[T]):
         end: int | None = None,
         out: T | None = None,
     ) -> T | None:
-        """Read genotypes and/or dosages for a region.
+        """Read genotypes and/or dosages for a range.
 
         Parameters
         ----------
         contig
             Contig name.
         start
-            0-based start position of the region.
+            0-based start position of the range.
         end
-            0-based, exclusive end position of the region.
+            0-based, exclusive end position of the range.
         samples
             Samples to read. If None, all samples are read.
         ploids
@@ -93,7 +93,7 @@ class Reader(Protocol, Generic[T]):
         end: int | None = None,
         max_mem: int | str = "4g",
     ) -> Generator[T]:
-        """Iterate over genotypes and/or dosages for a region in chunks limited by max_mem.
+        """Iterate over genotypes and/or dosages for a range in chunks limited by max_mem.
 
         Parameters
         ----------
@@ -102,7 +102,7 @@ class Reader(Protocol, Generic[T]):
         start
             0-based start position.
         end
-            0-based, exclusive end position of the region.
+            0-based, exclusive end position of the range.
         samples
             Samples to read. If None, all samples are read.
         ploids
@@ -124,16 +124,16 @@ class Reader(Protocol, Generic[T]):
         starts: ArrayLike = 0,
         ends: ArrayLike | None = None,
     ) -> tuple[T, NDArray[np.uint32]] | None:
-        """Read genotypes and/or dosages for multiple regions.
+        """Read genotypes and/or dosages for multiple ranges.
 
         Parameters
         ----------
         contig
             Contig name.
         start
-            0-based start position of the region.
+            0-based start position of the range.
         end
-            0-based, exclusive end position of the region.
+            0-based, exclusive end position of the range.
         samples
             Samples to read. If None, all samples are read.
         ploids
@@ -148,7 +148,7 @@ class Reader(Protocol, Generic[T]):
             dosages have shape (samples variants). Missing genotypes have value -1 and missing dosages
             have value np.nan. If just using genotypes or dosages, will be a single array, otherwise
             will be a tuple of arrays.
-        n_variants_per_region
-            Shape: (regions). Number of variants in the given ranges.
+        n_variants_per_range
+            Shape: (ranges). Number of variants in the given ranges.
         """
         ...
