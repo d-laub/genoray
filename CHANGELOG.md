@@ -1,3 +1,9 @@
+## 0.2.0 (2025-04-12)
+
+### Feat
+
+- change read_ranges to return offsets which are more immediately useful
+
 ## 0.1.0 (2025-04-12)
 
 ### Feat
