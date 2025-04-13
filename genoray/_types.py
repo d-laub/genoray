@@ -123,7 +123,7 @@ class Reader(Protocol, Generic[T]):
         contig: str,
         starts: ArrayLike = 0,
         ends: ArrayLike | None = None,
-    ) -> tuple[T, NDArray[np.uint32]] | None:
+    ) -> tuple[T, NDArray[np.uint64]] | None:
         """Read genotypes and/or dosages for multiple ranges.
 
         Parameters
@@ -148,7 +148,14 @@ class Reader(Protocol, Generic[T]):
             dosages have shape (samples variants). Missing genotypes have value -1 and missing dosages
             have value np.nan. If just using genotypes or dosages, will be a single array, otherwise
             will be a tuple of arrays.
-        n_variants_per_range
-            Shape: (ranges). Number of variants in the given ranges.
+        offsets
+            Shape: (ranges+1). Offsets to slice out data for each range from the variants axis like so:
+            
+            .. code-block:: python
+
+                data, offsets = reader.read_ranges(...)
+                data[..., offsets[i] : offsets[i + 1]]  # data for range i
+
+            Thus, number of variants for range `i` is `np.diff(offsets)[i]`.
         """
         ...

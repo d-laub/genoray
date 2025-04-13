@@ -52,11 +52,12 @@ genos = vcf.read_chunks("1", max_mem="4g")  # default is "4g", can also be capit
 ```
 
 ## `read_ranges`
-If you want to read multiple ranges on the same contig at once, you can use the `read_ranges` method. This method takes starts and ends and returns a NumPy array of shape `(samples, ploidy, variants)` (and/or `(samples, variants)` for dosages) for each range, as well as the number of variants in each range. Since the data is allocated as a single array, the number of variants in each range let's you slice out the data for each range from the `variants` axis.
+If you want to read multiple ranges on the same contig at once, you can use the `read_ranges` method. This method takes starts and ends and returns a NumPy array of shape `(samples, ploidy, variants)` (and/or `(samples, variants)` for dosages) for each range, as well as the offsets to slice out the variants for each range. Since the data is allocated as a single array, the offsets let you slice out the data for each range from the `variants` axis.
 
 ```python
-# shape: (samples, ploidy, variants), shape: (n_ranges)
-genos, n_vars = vcf.read_ranges('1', starts=[1, 1000, 2000], ends=[1000, 2000, 3000])
+# shape: (samples, ploidy, variants), shape: (n_ranges+1)
+genos, offsets = vcf.read_ranges('1', starts=[1, 1000, 2000], ends=[1000, 2000, 3000])
+first_range_genos = genos[..., offsets[0]:offsets[1]]
 ```
 
 ## Filtering

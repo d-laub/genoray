@@ -99,7 +99,7 @@ class PGEN(Reader[T]):
         samples = _read_psam(geno_path.with_suffix(".psam"))
 
         self.filter = filter
-        self.available_samples = samples.tolist()
+        self.available_samples = cast(list[str], samples.tolist())
         self._s2i = HashTable(
             max=len(samples) * 2,  # type: ignore
             dtype=samples.dtype,
@@ -128,7 +128,7 @@ class PGEN(Reader[T]):
 
     @property
     def current_samples(self) -> list[str]:
-        return self._s2i.keys[self._s_idx].tolist()
+        return cast(list[str], self._s2i.keys[self._s_idx].tolist())
 
     def set_samples(self, samples: list[str]) -> Self:
         _samples = np.atleast_1d(samples)
@@ -315,7 +315,7 @@ class PGEN(Reader[T]):
         contig: str,
         starts: ArrayLike = 0,
         ends: ArrayLike | None = None,
-    ) -> tuple[T, NDArray[np.uint32]] | None:
+    ) -> tuple[T, NDArray[np.uint64]] | None:
         # TODO: support dosages
 
         starts = np.atleast_1d(starts)
@@ -337,7 +337,7 @@ class PGEN(Reader[T]):
         ]
         out[out == -9] = -1
 
-        return cast(T, out), np.diff(offsets).astype(np.uint32)
+        return cast(T, out), offsets
 
     def _mem_per_variant(self) -> int:
         if issubclass(self._read_as, Genos):

@@ -320,7 +320,7 @@ class VCF(Reader[T]):
         contig: str,
         starts: ArrayLike = 0,
         ends: ArrayLike | None = None,
-    ) -> tuple[T, NDArray[np.uint32]] | None:
+    ) -> tuple[T, NDArray[np.uint64]] | None:
         c = self._c_norm.norm(contig)
         if c is None:
             return
@@ -363,10 +363,10 @@ class VCF(Reader[T]):
 
         if self._read_as is not GenosDosages:
             _out = cast(T, _out[0])
-            return _out, n_vars
+            return _out, offsets
 
         _out = cast(T, _out)
-        return _out, n_vars
+        return _out, offsets
 
     def _fill_genos(self, vcf: cyvcf2.VCF, out: NDArray[np.int8]):
         if self.progress:
