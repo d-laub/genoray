@@ -379,8 +379,6 @@ class VCF(Reader[T]):
 
         if self.progress and self._pbar is None:
             vcf = tqdm(vcf, total=n_variants, desc="Reading VCF", unit=" variant")
-        if self._pbar is not None and self._pbar.total is None:
-            self._pbar.total = n_variants
 
         i = 0
         for i, v in enumerate(vcf):
@@ -401,8 +399,6 @@ class VCF(Reader[T]):
         n_variants = out.shape[-1]
         if self.progress and self._pbar is None:
             vcf = tqdm(vcf, total=n_variants, desc="Reading VCF", unit=" variant")
-        if self._pbar is not None and self._pbar.total is None:
-            self._pbar.total = n_variants
 
         i = 0
         for i, v in enumerate(vcf):
@@ -431,8 +427,6 @@ class VCF(Reader[T]):
         n_variants = out[0].shape[-1]
         if self.progress and self._pbar is None:
             vcf = tqdm(vcf, total=n_variants, desc="Reading VCF", unit=" variant")
-        if self._pbar is not None and self._pbar.total is None:
-            self._pbar.total = n_variants
 
         i = 0
         for i, v in enumerate(vcf):
