@@ -85,7 +85,7 @@ class VCF(Reader[T]):
         progress: bool = False,
     ):
         """Create a VCF reader.
-        
+
         Parameters
         ----------
         path
@@ -98,7 +98,7 @@ class VCF(Reader[T]):
             Name of the dosage field to read from the VCF file. Required if read_as is VCF.Dosages or VCF.GenosDosages.
         progress
             Whether to show a progress bar while reading the VCF file.
-"""
+        """
         if (read_as is Dosages or read_as is GenosDosages) and dosage_field is None:
             raise ValueError(
                 "Dosage field not specified. Set the VCF reader's `dosage_field` parameter."
@@ -125,12 +125,12 @@ class VCF(Reader[T]):
 
     def set_samples(self, samples: list[str]) -> Self:
         """Set the samples to read from the VCF file. Modifies the VCF reader in place and return it.
-        
+
         Parameters
         ----------
         samples
             List of sample names to read from the VCF file.
-        
+
         Returns
         -------
         VCF
@@ -154,14 +154,10 @@ class VCF(Reader[T]):
         self,
         contig: str,
         starts: ArrayLike = 0,
-        ends: ArrayLike | None = None,
+        ends: ArrayLike = np.iinfo(np.int32).max,
     ) -> NDArray[np.uint32]:
         starts = np.atleast_1d(starts)
-        ends = (
-            np.full(len(starts), np.iinfo(np.int64).max)
-            if ends is None
-            else np.atleast_1d(ends)
-        )
+        ends = np.atleast_1d(ends)
 
         c = self._c_norm.norm(contig)
         if c is None:
@@ -181,7 +177,7 @@ class VCF(Reader[T]):
         self,
         contig: str,
         start: int = 0,
-        end: int | None = None,
+        end: int = np.iinfo(np.int32).max,
         out: T | None = None,
     ) -> T | None:
         c = self._c_norm.norm(contig)
@@ -254,7 +250,7 @@ class VCF(Reader[T]):
         self,
         contig: str,
         start: int = 0,
-        end: int | None = None,
+        end: int = np.iinfo(np.int32).max,
         max_mem: int | str = "4g",
     ) -> Generator[T]:
         max_mem = parse_memory(max_mem)
@@ -319,7 +315,7 @@ class VCF(Reader[T]):
         self,
         contig: str,
         starts: ArrayLike = 0,
-        ends: ArrayLike | None = None,
+        ends: ArrayLike = np.iinfo(np.int32).max,
     ) -> tuple[T, NDArray[np.uint64]] | None:
         c = self._c_norm.norm(contig)
         if c is None:
@@ -342,10 +338,7 @@ class VCF(Reader[T]):
             _out = (np.empty((self.n_samples, self.ploidy, tot_vars), dtype=np.int8),)
 
         starts = np.atleast_1d(starts)
-        if ends is None:
-            ends = np.full(len(starts), np.iinfo(np.int64).max)
-        else:
-            ends = np.atleast_1d(ends)
+        ends = np.atleast_1d(ends)
 
         offsets = lengths_to_offsets(n_vars)
         for i, (s, e) in enumerate(zip(starts, ends)):

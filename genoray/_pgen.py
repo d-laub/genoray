@@ -148,15 +148,14 @@ class PGEN(Reader[T]):
         self,
         contig: str,
         starts: ArrayLike = 0,
-        ends: ArrayLike | None = None,
+        ends: ArrayLike = np.iinfo(np.int32).max,
     ) -> NDArray[np.uint32]:
         c = self._c_norm.norm(contig)
         if c is None:
             return np.zeros_like(np.atleast_1d(starts), dtype=np.uint32)
 
         starts = np.atleast_1d(starts)
-        if ends is None:
-            ends = np.full_like(starts, np.iinfo(np.int32).max)
+        ends = np.atleast_1d(ends)
         queries = pr.PyRanges(
             pl.DataFrame(
                 {
@@ -174,7 +173,10 @@ class PGEN(Reader[T]):
         )
 
     def _var_idxs(
-        self, contig: str, starts: ArrayLike = 0, ends: ArrayLike | None = None
+        self,
+        contig: str,
+        starts: ArrayLike = 0,
+        ends: ArrayLike = np.iinfo(np.int32).max,
     ) -> tuple[NDArray[np.uint32], NDArray[np.uint64]]:
         """Get variant indices and the number of indices per range.
 
@@ -203,8 +205,7 @@ class PGEN(Reader[T]):
             )
 
         starts = np.atleast_1d(starts)
-        if ends is None:
-            ends = np.full_like(starts, np.iinfo(np.int32).max)
+        ends = np.atleast_1d(ends)
         queries = pr.PyRanges(
             pl.DataFrame(
                 {
@@ -233,15 +234,12 @@ class PGEN(Reader[T]):
         self,
         contig: str,
         start: int = 0,
-        end: int | None = None,
+        end: int = np.iinfo(np.int32).max,
         out: T | None = None,
     ) -> T | None:
         c = self._c_norm.norm(contig)
         if c is None:
             return
-
-        if end is None:
-            end = np.iinfo(np.int64).max
 
         var_idxs, _ = self._var_idxs(c, start, end)
         n_variants = len(var_idxs)
@@ -271,7 +269,7 @@ class PGEN(Reader[T]):
         self,
         contig: str,
         start: int = 0,
-        end: int | None = None,
+        end: int = np.iinfo(np.int32).max,
         max_mem: int | str = "4g",
     ) -> Generator[T]:
         # TODO: support dosages
@@ -281,9 +279,6 @@ class PGEN(Reader[T]):
         c = self._c_norm.norm(contig)
         if c is None:
             return
-
-        if end is None:
-            end = np.iinfo(np.int64).max
 
         var_idxs, _ = self._var_idxs(c, start, end)
         n_variants = len(var_idxs)
@@ -314,7 +309,7 @@ class PGEN(Reader[T]):
         self,
         contig: str,
         starts: ArrayLike = 0,
-        ends: ArrayLike | None = None,
+        ends: ArrayLike = np.iinfo(np.int32).max,
     ) -> tuple[T, NDArray[np.uint64]] | None:
         # TODO: support dosages
 

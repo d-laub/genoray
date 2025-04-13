@@ -75,6 +75,7 @@ pgen = PGEN("file.pgen", filter=pl.col("kind") == "SNP")  # only include SNPs
 
 # ⚠️ Important ⚠️
 
+- PGEN dosages are not yet supported.
 - For the time being, ploidy is always 2, but this could be more flexible for VCFs in the future. PGEN does not support ploidy other than 2.
 - Multi-allelic variants are not supported and any multi-allelic sites will only have their first allele returned. As a workaround, you can split multi-allelic sites into bi-allelic ones using `bcftools norm` or `plink2 --make-bpgen`. You can then pass the PLINK 1 `.bed` file to `genoray.PGEN`, although this will erase phasing information. If you need the phasing information, you should export the file to BCF and split the sites with `bcftools`, then convert the BCF back to PGEN with `plink2 --make-pgen`.
 - PGEN returns genotypes with dtype `np.int32` instead of `np.int8` because this is the native dtype for pgenlib.

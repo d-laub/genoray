@@ -30,7 +30,7 @@ class Reader(Protocol, Generic[T]):
         return len(self.current_samples)
 
     def n_vars_in_ranges(
-        self, contig: str, starts: ArrayLike = 0, ends: ArrayLike | None = None
+        self, contig: str, starts: ArrayLike = 0, ends: ArrayLike = np.iinfo(np.int32).max
     ) -> NDArray[np.uint32]:
         """Return the start and end indices of the variants in the given ranges.
 
@@ -54,7 +54,7 @@ class Reader(Protocol, Generic[T]):
         self,
         contig: str,
         start: int = 0,
-        end: int | None = None,
+        end: int = np.iinfo(np.int32).max,
         out: T | None = None,
     ) -> T | None:
         """Read genotypes and/or dosages for a range.
@@ -90,7 +90,7 @@ class Reader(Protocol, Generic[T]):
         self,
         contig: str,
         start: int = 0,
-        end: int | None = None,
+        end: int = np.iinfo(np.int32).max,
         max_mem: int | str = "4g",
     ) -> Generator[T]:
         """Iterate over genotypes and/or dosages for a range in chunks limited by max_mem.
@@ -122,7 +122,7 @@ class Reader(Protocol, Generic[T]):
         self,
         contig: str,
         starts: ArrayLike = 0,
-        ends: ArrayLike | None = None,
+        ends: ArrayLike = np.iinfo(np.int32).max,
     ) -> tuple[T, NDArray[np.uint64]] | None:
         """Read genotypes and/or dosages for multiple ranges.
 
@@ -150,7 +150,7 @@ class Reader(Protocol, Generic[T]):
             will be a tuple of arrays.
         offsets
             Shape: (ranges+1). Offsets to slice out data for each range from the variants axis like so:
-            
+
             .. code-block:: python
 
                 data, offsets = reader.read_ranges(...)
