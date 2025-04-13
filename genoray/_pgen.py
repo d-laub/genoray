@@ -100,13 +100,6 @@ class PGEN(Reader[T]):
         dosage_path
             Path to a dosage PGEN file. If None, the genotype PGEN file will be used for both genotypes and dosages.
         """
-        # TODO: support dosages and allow user to either provide a second PGEN file for dosages
-        # or else use the same PGEN file for both genotypes and dosages.
-        # That being said, there's probably not much point for a user to use the same PGEN file
-        # for genos and dosages since PLINK2 defines hardcalls as a simple threshold on the dosages
-        # when dosages are available.
-        if issubclass(read_as, (Dosages, GenosDosages)):
-            raise NotImplementedError("PGEN dosages are not yet supported.")
 
         geno_path = Path(geno_path)
         samples = _read_psam(geno_path.with_suffix(".psam"))
@@ -244,12 +237,10 @@ class PGEN(Reader[T]):
     def read(
         self,
         contig: str,
-        start: int = 0,
-        end: int = np.iinfo(R_DTYPE).max,
+        start: int | np.integer = 0,
+        end: int | np.integer = np.iinfo(R_DTYPE).max,
         out: T | None = None,
     ) -> T | None:
-        # TODO: support dosages
-
         c = self._c_norm.norm(contig)
         if c is None:
             return
@@ -259,32 +250,24 @@ class PGEN(Reader[T]):
         if n_variants == 0:
             return
 
-        if out is None:
-            data = np.empty((n_variants, self.n_samples * self.ploidy), dtype=np.int32)
+        if issubclass(self._read_as, Genos):
+            _out = self._read_genos(var_idxs, Genos.parse(out))
+        elif issubclass(self._read_as, Dosages):
+            _out = self._read_dosages(var_idxs, Dosages.parse(out))
+        elif issubclass(self._read_as, GenosDosages):
+            _out = self._read_genos_and_dosages(var_idxs, GenosDosages.parse(out))
         else:
-            if not isinstance(out, Genos):
-                raise ValueError(f"Expected a np.int32 array, got {type(out)}.")
-            data = out
+            assert_never(self._read_as)
 
-        self._geno_pgen.read_alleles_list(var_idxs, data)
-        data = data.reshape(n_variants, self.n_samples, self.ploidy).transpose(1, 2, 0)[
-            self._s_idx
-        ]
-        data[data == -9] = -1
-
-        data = cast(T, data)
-
-        return data
+        return cast(T, _out)
 
     def read_chunks(
         self,
         contig: str,
-        start: int = 0,
-        end: int = np.iinfo(R_DTYPE).max,
+        start: int | np.integer = 0,
+        end: int | np.integer = np.iinfo(R_DTYPE).max,
         max_mem: int | str = "4g",
     ) -> Generator[T]:
-        # TODO: support dosages
-
         max_mem = parse_memory(max_mem)
 
         c = self._c_norm.norm(contig)
@@ -307,13 +290,15 @@ class PGEN(Reader[T]):
         n_chunks = -(-n_variants // vars_per_chunk)
         v_chunks = np.array_split(var_idxs, n_chunks)
         for var_idx in v_chunks:
-            chunk_size = len(var_idx)
-            out = np.empty((chunk_size, self.n_samples * self.ploidy), dtype=np.int32)
-            self._geno_pgen.read_alleles_list(var_idx, out)
-            out = out.reshape(chunk_size, self.n_samples, self.ploidy).transpose(
-                1, 2, 0
-            )[self._s_idx]
-            out[out == -9] = -1
+            if issubclass(self._read_as, Genos):
+                out = self._read_genos(var_idx)
+            elif issubclass(self._read_as, Dosages):
+                out = self._read_dosages(var_idx)
+            elif issubclass(self._read_as, GenosDosages):
+                out = self._read_genos_and_dosages(var_idx)
+            else:
+                assert_never(self._read_as)
+
             yield cast(T, out)
 
     def read_ranges(
@@ -322,8 +307,6 @@ class PGEN(Reader[T]):
         starts: ArrayLike = 0,
         ends: ArrayLike = np.iinfo(R_DTYPE).max,
     ) -> tuple[T, NDArray[np.uint64]] | None:
-        # TODO: support dosages
-
         c = self._c_norm.norm(contig)
         if c is None:
             return
@@ -333,15 +316,67 @@ class PGEN(Reader[T]):
         if n_variants == 0:
             return
 
-        out = np.empty((n_variants, self.n_samples * self.ploidy), dtype=np.int32)
-
-        self._geno_pgen.read_alleles_list(var_idxs, out)
-        out = out.reshape(n_variants, self.n_samples, self.ploidy).transpose(1, 2, 0)[
-            self._s_idx
-        ]
-        out[out == -9] = -1
+        if issubclass(self._read_as, Genos):
+            out = self._read_genos(var_idxs)
+        elif issubclass(self._read_as, Dosages):
+            out = self._read_dosages(var_idxs)
+        elif issubclass(self._read_as, GenosDosages):
+            out = self._read_genos_and_dosages(var_idxs)
+        else:
+            assert_never(self._read_as)
 
         return cast(T, out), offsets
+
+    def read_ranges_chunks(
+        self,
+        contig: str,
+        starts: ArrayLike = 0,
+        ends: ArrayLike = np.iinfo(R_DTYPE).max,
+        max_mem: int | str = "4g",
+    ) -> Generator[Generator[T]]:
+        # TODO: support dosages
+
+        max_mem = parse_memory(max_mem)
+
+        c = self._c_norm.norm(contig)
+        if c is None:
+            return
+
+        starts = np.atleast_1d(np.asarray(starts, R_DTYPE))
+        ends = np.atleast_1d(np.asarray(ends, R_DTYPE))
+
+        var_idxs, offsets = self._var_idxs(c, starts, ends)
+        n_variants = len(var_idxs)
+        if n_variants == 0:
+            return
+
+        mem_per_v = self._mem_per_variant()
+        vars_per_chunk = min(max_mem // mem_per_v, n_variants)
+        if vars_per_chunk == 0:
+            raise ValueError(
+                f"Maximum memory {format_memory(max_mem)} insufficient to read a single variant."
+                f" Memory per variant: {format_memory(mem_per_v)}."
+            )
+
+        for i in range(len(offsets) - 1):
+            o_s, o_e = offsets[i], offsets[i + 1]
+            range_idxs = var_idxs[o_s:o_e]
+            n_variants = len(range_idxs)
+            if n_variants == 0:
+                continue
+            n_chunks = -(-n_variants // vars_per_chunk)
+            v_chunks = np.array_split(range_idxs, n_chunks)
+
+            if issubclass(self._read_as, Genos):
+                r = self._read_genos
+            elif issubclass(self._read_as, Dosages):
+                r = self._read_dosages
+            elif issubclass(self._read_as, GenosDosages):
+                r = self._read_genos_and_dosages
+            else:
+                assert_never(self._read_as)
+
+            yield (cast(T, r(var_idx)) for var_idx in v_chunks)
 
     def _mem_per_variant(self) -> int:
         if issubclass(self._read_as, Genos):
@@ -350,6 +385,46 @@ class PGEN(Reader[T]):
             raise NotImplementedError("Dosages are not yet supported.")
         else:
             assert_never(self._read_as)
+
+    def _read_genos(
+        self, var_idxs: NDArray[np.uint32], out: Genos | None = None
+    ) -> Genos:
+        if out is None:
+            _out = np.empty(
+                (len(var_idxs), self.n_samples * self.ploidy), dtype=np.int32
+            )
+        else:
+            _out = out
+        self._geno_pgen.read_alleles_list(var_idxs, _out)
+        _out = _out.reshape(len(var_idxs), self.n_samples, self.ploidy).transpose(
+            1, 2, 0
+        )[self._s_idx]
+        _out[_out == -9] = -1
+        return Genos(_out)
+
+    def _read_dosages(
+        self, var_idxs: NDArray[np.uint32], out: Dosages | None = None
+    ) -> Dosages:
+        if out is None:
+            _out = np.empty((len(var_idxs), self.n_samples), dtype=np.float32)
+        else:
+            _out = out
+        self._dose_pgen.read_dosages_list(var_idxs, _out)
+        _out = _out.transpose(1, 0)[self._s_idx]
+        _out[_out == -9] = np.nan
+        return Dosages.parse(_out)
+
+    def _read_genos_and_dosages(
+        self, var_idxs: NDArray[np.uint32], out: GenosDosages | None = None
+    ) -> GenosDosages:
+        if out is None:
+            _out = (None, None)
+        else:
+            _out = out
+
+        genos = self._read_genos(var_idxs, _out[0])
+        dosages = self._read_dosages(var_idxs, _out[1])
+        return GenosDosages((genos, dosages))
 
 
 def _read_psam(path: Path) -> NDArray[np.str_]:

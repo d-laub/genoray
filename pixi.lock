@@ -513,7 +513,7 @@ packages:
 - pypi: .
   name: genoray
   version: 0.2.0
-  sha256: 922d306b5ccc9be855f1b3d96be664edd56cc97bc7fe43f379be63984fefd6cb
+  sha256: e9eb0deda362d9a052cf4bb4f2eb9e965a8a8dcd837ed37a7ffef037c22de6c6
   requires_dist:
   - cyvcf2>=0.31.1
   - hirola>=0.3.0

@@ -180,8 +180,8 @@ class VCF(Reader[T]):
     def read(
         self,
         contig: str,
-        start: int = 0,
-        end: int = np.iinfo(R_DTYPE).max,
+        start: int | np.integer = 0,
+        end: int | np.integer = np.iinfo(R_DTYPE).max,
         out: T | None = None,
     ) -> T | None:
         c = self._c_norm.norm(contig)
@@ -246,8 +246,8 @@ class VCF(Reader[T]):
     def read_chunks(
         self,
         contig: str,
-        start: int = 0,
-        end: int = np.iinfo(R_DTYPE).max,
+        start: int | np.integer = 0,
+        end: int | np.integer = np.iinfo(R_DTYPE).max,
         max_mem: int | str = "4g",
     ) -> Generator[T]:
         max_mem = parse_memory(max_mem)
@@ -340,7 +340,7 @@ class VCF(Reader[T]):
             if o_s == o_e:
                 continue
 
-            if self._read_as is not GenosDosages:
+            if not issubclass(self._read_as, GenosDosages):
                 sub_out = _out[0][..., o_s:o_e]
             else:
                 _out = cast(tuple[NDArray[np.int8], NDArray[np.float32]], _out)
@@ -348,12 +348,21 @@ class VCF(Reader[T]):
             sub_out = cast(T, sub_out)
             self.read(contig, s, e, out=sub_out)
 
-        if self._read_as is not GenosDosages:
+        if not issubclass(self._read_as, GenosDosages):
             _out = cast(T, _out[0])
             return _out, offsets
 
         _out = cast(T, _out)
         return _out, offsets
+
+    def read_ranges_chunks(
+        self,
+        contig: str,
+        starts: ArrayLike = 0,
+        ends: ArrayLike = np.iinfo(R_DTYPE).max,
+        max_mem: int | str = "4g",
+    ) -> Generator[Generator[T]]:
+        raise NotImplementedError("No performance gain from this.")
 
     def _fill_genos(self, vcf: cyvcf2.VCF, out: NDArray[np.int8]):
         n_variants = out.shape[-1]

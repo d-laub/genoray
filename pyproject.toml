@@ -16,7 +16,7 @@ dependencies = [
     "typing-extensions>=4.13.2",
     "pandas",
     "pyarrow>=19.0.1",
-    "setuptools>=78.1.0",        # uv misses this dependency for pyranges
+    "setuptools>=78.1.0", # uv misses this dependency for pyranges
     "tqdm>=4.67.1",
     "phantom-types>=3.0.2",
 ]

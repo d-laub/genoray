@@ -51,15 +51,15 @@ class Reader(Protocol, Generic[T]):
         Returns
         -------
         n_variants
-            Shape: (ranges). Number of variants in the given ranges.
+            Shape: :code:`(ranges)`. Number of variants in the given ranges.
         """
         ...
 
     def read(
         self,
         contig: str,
-        start: int = 0,
-        end: int = np.iinfo(R_DTYPE).max,
+        start: int | np.integer = 0,
+        end: int | np.integer = np.iinfo(R_DTYPE).max,
         out: T | None = None,
     ) -> T | None:
         """Read genotypes and/or dosages for a range.
@@ -69,36 +69,27 @@ class Reader(Protocol, Generic[T]):
         contig
             Contig name.
         start
-            0-based start position of the range.
+            0-based start position.
         end
-            0-based, exclusive end position of the range.
-        samples
-            Samples to read. If None, all samples are read.
-        ploids
-            Ploids to read. If None, all ploids are read.
-        dosage_field
-            Dosage field to read. If True, use the default dosage field for the format.
+            0-based, exclusive end position.
 
         Returns
         -------
-        data
-            Genotypes and/or dosages. Genotypes have shape (samples ploidy variants) and
-            dosages have shape (samples variants). Missing genotypes have value -1 and missing dosages
+            Genotypes and/or dosages. Genotypes have shape :code:`(samples ploidy variants)` and
+            dosages have shape :code:`(samples variants)`. Missing genotypes have value -1 and missing dosages
             have value np.nan. If just using genotypes or dosages, will be a single array, otherwise
             will be a tuple of arrays.
-        dosage
-            Shape: (samples variants)
         """
         ...
 
     def read_chunks(
         self,
         contig: str,
-        start: int = 0,
-        end: int = np.iinfo(R_DTYPE).max,
+        start: int | np.integer = 0,
+        end: int | np.integer = np.iinfo(R_DTYPE).max,
         max_mem: int | str = "4g",
     ) -> Generator[T]:
-        """Iterate over genotypes and/or dosages for a range in chunks limited by max_mem.
+        """Iterate over genotypes and/or dosages for a range in chunks limited by :code:`max_mem`.
 
         Parameters
         ----------
@@ -107,17 +98,15 @@ class Reader(Protocol, Generic[T]):
         start
             0-based start position.
         end
-            0-based, exclusive end position of the range.
-        samples
-            Samples to read. If None, all samples are read.
-        ploids
-            Ploids to read. If None, all ploids are read.
+            0-based, exclusive end position.
+        max_mem
+            Maximum memory to use for each chunk. Can be an integer or a string with a suffix
+            (e.g. "4g", "2 MB").
 
         Returns
         -------
-        data
-            Generator of genotypes and/or dosages. Genotypes have shape (samples ploidy variants) and
-            dosages have shape (samples variants). Missing genotypes have value -1 and missing dosages
+            Generator of genotypes and/or dosages. Genotypes have shape :code:`(samples ploidy variants)` and
+            dosages have shape :code:`(samples variants)`. Missing genotypes have value -1 and missing dosages
             have value np.nan. If just using genotypes or dosages, will be a single array, otherwise
             will be a tuple of arrays.
         """
@@ -135,32 +124,65 @@ class Reader(Protocol, Generic[T]):
         ----------
         contig
             Contig name.
-        start
-            0-based start position of the range.
-        end
-            0-based, exclusive end position of the range.
-        samples
-            Samples to read. If None, all samples are read.
-        ploids
-            Ploids to read. If None, all ploids are read.
-        dosage_field
-            Dosage field to read. If True, use the default dosage field for the format.
+        starts
+            0-based start positions.
+        ends
+            0-based, exclusive end positions.
 
         Returns
         -------
         data
-            Genotypes and/or dosages. Genotypes have shape (samples ploidy variants) and
-            dosages have shape (samples variants). Missing genotypes have value -1 and missing dosages
+            Genotypes and/or dosages. Genotypes have shape :code:`(samples ploidy variants)` and
+            dosages have shape :code:`(samples variants)`. Missing genotypes have value -1 and missing dosages
             have value np.nan. If just using genotypes or dosages, will be a single array, otherwise
             will be a tuple of arrays.
         offsets
             Shape: (ranges+1). Offsets to slice out data for each range from the variants axis like so:
 
-            .. code-block:: python
+        Examples
+        --------
+        .. code-block:: python
 
-                data, offsets = reader.read_ranges(...)
-                data[..., offsets[i] : offsets[i + 1]]  # data for range i
+            data, offsets = reader.read_ranges(...)
+            data[..., offsets[i] : offsets[i + 1]]  # data for range i
 
-            Thus, number of variants for range `i` is `np.diff(offsets)[i]`.
+        Note that the number of variants for range :code:`i` is :code:`np.diff(offsets)[i]`.
+        """
+        ...
+
+    def read_ranges_chunks(
+        self,
+        contig: str,
+        starts: ArrayLike = 0,
+        ends: ArrayLike = np.iinfo(R_DTYPE).max,
+        max_mem: int | str = "4g",
+    ) -> Generator[Generator[T]]:
+        """Read genotypes and/or dosages for multiple ranges in chunks limited by :code:`max_mem`.
+
+        Parameters
+        ----------
+        contig
+            Contig name.
+        starts
+            0-based start positions.
+        ends
+            0-based, exclusive end positions.
+
+        Returns
+        -------
+            Generator of generators of genotypes and/or dosages of each ranges' data. Genotypes have shape :code:`(samples ploidy variants)` and
+            dosages have shape :code:`(samples variants)`. Missing genotypes have value -1 and missing dosages
+            have value np.nan. If just using genotypes or dosages, will be a single array, otherwise
+            will be a tuple of arrays.
+
+        Examples
+        --------
+        .. code-block:: python
+
+            gen = reader.read_ranges_chunks(...)
+            for range_ in gen:
+                for chunk in range_:
+                    # do something with chunk
+                    pass
         """
         ...
