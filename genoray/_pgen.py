@@ -100,7 +100,6 @@ class PGEN(Reader[T]):
         dosage_path
             Path to a dosage PGEN file. If None, the genotype PGEN file will be used for both genotypes and dosages.
         """
-
         geno_path = Path(geno_path)
         samples = _read_psam(geno_path.with_suffix(".psam"))
 
@@ -334,8 +333,6 @@ class PGEN(Reader[T]):
         ends: ArrayLike = np.iinfo(R_DTYPE).max,
         max_mem: int | str = "4g",
     ) -> Generator[Generator[T]]:
-        # TODO: support dosages
-
         max_mem = parse_memory(max_mem)
 
         c = self._c_norm.norm(contig)
