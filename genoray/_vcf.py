@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from functools import partial
 from pathlib import Path
 from typing import Callable, Generator, TypeVar, cast
@@ -66,7 +67,7 @@ class VCF(Reader[T]):
     ploidy = 2
     filter: Callable[[cyvcf2.Variant], bool] | None
     dosage_field: str | None
-    pbar: tqdm | None
+    _pbar: tqdm | None
     """A progress bar to use while reading variants. This will be incremented per variant
     during any calls to a read function."""
     _vcf: cyvcf2.VCF
@@ -118,7 +119,7 @@ class VCF(Reader[T]):
         self.set_samples(self._vcf.samples)
         self._read_as = cast(type[T], read_as)
         self.progress = progress
-        self.pbar = None
+        self._pbar = None
 
     def _open(self, samples: list[str] | None = None) -> cyvcf2.VCF:
         return cyvcf2.VCF(self.path, samples=samples, lazy=True)
@@ -153,6 +154,15 @@ class VCF(Reader[T]):
 
     def __del__(self):
         self._vcf.close()
+
+    @contextmanager
+    def using_pbar(self, pbar: tqdm):
+        """Create a context where the given progress bar will be incremented by any calls to a read method."""
+        self._pbar = pbar
+        try:
+            yield self
+        finally:
+            self._pbar = None
 
     def n_vars_in_ranges(
         self,
@@ -367,10 +377,10 @@ class VCF(Reader[T]):
     def _fill_genos(self, vcf: cyvcf2.VCF, out: NDArray[np.int8]):
         n_variants = out.shape[-1]
 
-        if self.progress and self.pbar is None:
+        if self.progress and self._pbar is None:
             vcf = tqdm(vcf, total=n_variants, desc="Reading VCF", unit=" variant")
-        if self.pbar is not None and self.pbar.total is None:
-            self.pbar.total = n_variants
+        if self._pbar is not None and self._pbar.total is None:
+            self._pbar.total = n_variants
 
         i = 0
         for i, v in enumerate(vcf):
@@ -379,8 +389,8 @@ class VCF(Reader[T]):
 
             out[..., i] = v.genotype.array()[:, : self.ploidy]
 
-            if self.pbar is not None:
-                self.pbar.update()
+            if self._pbar is not None:
+                self._pbar.update()
 
         if i != n_variants - 1:
             raise ValueError("Not enough variants found in the given range.")
@@ -389,10 +399,10 @@ class VCF(Reader[T]):
         self, vcf: cyvcf2.VCF, out: NDArray[np.float32], dosage_field: str
     ):
         n_variants = out.shape[-1]
-        if self.progress and self.pbar is None:
+        if self.progress and self._pbar is None:
             vcf = tqdm(vcf, total=n_variants, desc="Reading VCF", unit=" variant")
-        if self.pbar is not None and self.pbar.total is None:
-            self.pbar.total = n_variants
+        if self._pbar is not None and self._pbar.total is None:
+            self._pbar.total = n_variants
 
         i = 0
         for i, v in enumerate(vcf):
@@ -406,8 +416,8 @@ class VCF(Reader[T]):
             # (s, 1, 1) or (s, 1)? -> (s)
             out[..., i] = d.squeeze()
 
-            if self.pbar is not None:
-                self.pbar.update()
+            if self._pbar is not None:
+                self._pbar.update()
 
         if i != n_variants - 1:
             raise ValueError("Not enough variants found in the given range.")
@@ -419,10 +429,10 @@ class VCF(Reader[T]):
         dosage_field: str,
     ):
         n_variants = out[0].shape[-1]
-        if self.progress and self.pbar is None:
+        if self.progress and self._pbar is None:
             vcf = tqdm(vcf, total=n_variants, desc="Reading VCF", unit=" variant")
-        if self.pbar is not None and self.pbar.total is None:
-            self.pbar.total = n_variants
+        if self._pbar is not None and self._pbar.total is None:
+            self._pbar.total = n_variants
 
         i = 0
         for i, v in enumerate(vcf):
@@ -439,8 +449,8 @@ class VCF(Reader[T]):
             # (s, 1, 1) or (s, 1)? -> (s)
             out[1][..., i] = d.squeeze()
 
-            if self.pbar is not None:
-                self.pbar.update()
+            if self._pbar is not None:
+                self._pbar.update()
 
         if i != n_variants - 1:
             raise ValueError("Not enough variants found in the given range.")
