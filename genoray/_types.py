@@ -7,6 +7,8 @@ from numpy.typing import ArrayLike, NDArray
 from typing_extensions import Self
 
 T = TypeVar("T")
+R_DTYPE = np.uint64
+"""Dtype for range indices. This determines the maximum size of a contig in genoray."""
 
 
 class Reader(Protocol, Generic[T]):
@@ -30,7 +32,10 @@ class Reader(Protocol, Generic[T]):
         return len(self.current_samples)
 
     def n_vars_in_ranges(
-        self, contig: str, starts: ArrayLike = 0, ends: ArrayLike = np.iinfo(np.int32).max
+        self,
+        contig: str,
+        starts: ArrayLike = 0,
+        ends: ArrayLike = np.iinfo(R_DTYPE).max,
     ) -> NDArray[np.uint32]:
         """Return the start and end indices of the variants in the given ranges.
 
@@ -54,7 +59,7 @@ class Reader(Protocol, Generic[T]):
         self,
         contig: str,
         start: int = 0,
-        end: int = np.iinfo(np.int32).max,
+        end: int = np.iinfo(R_DTYPE).max,
         out: T | None = None,
     ) -> T | None:
         """Read genotypes and/or dosages for a range.
@@ -90,7 +95,7 @@ class Reader(Protocol, Generic[T]):
         self,
         contig: str,
         start: int = 0,
-        end: int = np.iinfo(np.int32).max,
+        end: int = np.iinfo(R_DTYPE).max,
         max_mem: int | str = "4g",
     ) -> Generator[T]:
         """Iterate over genotypes and/or dosages for a range in chunks limited by max_mem.
@@ -122,7 +127,7 @@ class Reader(Protocol, Generic[T]):
         self,
         contig: str,
         starts: ArrayLike = 0,
-        ends: ArrayLike = np.iinfo(np.int32).max,
+        ends: ArrayLike = np.iinfo(R_DTYPE).max,
     ) -> tuple[T, NDArray[np.uint64]] | None:
         """Read genotypes and/or dosages for multiple ranges.
 

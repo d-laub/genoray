@@ -13,7 +13,7 @@ from numpy.typing import ArrayLike, NDArray
 from phantom import Phantom
 from typing_extensions import Self, TypeGuard, assert_never
 
-from ._types import Reader
+from ._types import R_DTYPE, Reader
 from ._utils import (
     ContigNormalizer,
     format_memory,
@@ -87,12 +87,25 @@ class PGEN(Reader[T]):
         read_as: type[T] = Genos,
         dosage_path: str | Path | None = None,
     ):
+        """Create a PGEN reader.
+
+        Parameters
+        ----------
+        path
+            Path to the PGEN file. Only used for genotypes if a dosage path is provided as well.
+        filter
+            Polars expression to filter variants. Should return True for variants to keep.
+        read_as
+            Type of data to read from the PGEN file. Can be PGEN.Genos, PGEN.Dosages, or PGEN.GenosDosages.
+        dosage_path
+            Path to a dosage PGEN file. If None, the genotype PGEN file will be used for both genotypes and dosages.
+        """
         # TODO: support dosages and allow user to either provide a second PGEN file for dosages
         # or else use the same PGEN file for both genotypes and dosages.
         # That being said, there's probably not much point for a user to use the same PGEN file
         # for genos and dosages since PLINK2 defines hardcalls as a simple threshold on the dosages
         # when dosages are available.
-        if read_as is Dosages or read_as is GenosDosages:
+        if issubclass(read_as, (Dosages, GenosDosages)):
             raise NotImplementedError("PGEN dosages are not yet supported.")
 
         geno_path = Path(geno_path)
@@ -124,7 +137,7 @@ class PGEN(Reader[T]):
         self._index = _read_index(geno_path.with_suffix(".gvi"), self.filter)
         self.contigs = self._index.chromosomes
         self._c_norm = ContigNormalizer(self._index.chromosomes)
-        self._read_as = read_as
+        self._read_as = cast(type[T], read_as)
 
     @property
     def current_samples(self) -> list[str]:
@@ -148,14 +161,15 @@ class PGEN(Reader[T]):
         self,
         contig: str,
         starts: ArrayLike = 0,
-        ends: ArrayLike = np.iinfo(np.int32).max,
+        ends: ArrayLike = np.iinfo(R_DTYPE).max,
     ) -> NDArray[np.uint32]:
+        starts = np.atleast_1d(np.asarray(starts, R_DTYPE))
+
         c = self._c_norm.norm(contig)
         if c is None:
-            return np.zeros_like(np.atleast_1d(starts), dtype=np.uint32)
+            return np.zeros_like(starts, dtype=np.uint32)
 
-        starts = np.atleast_1d(starts)
-        ends = np.atleast_1d(ends)
+        ends = np.atleast_1d(np.asarray(ends, R_DTYPE))
         queries = pr.PyRanges(
             pl.DataFrame(
                 {
@@ -176,7 +190,7 @@ class PGEN(Reader[T]):
         self,
         contig: str,
         starts: ArrayLike = 0,
-        ends: ArrayLike = np.iinfo(np.int32).max,
+        ends: ArrayLike = np.iinfo(R_DTYPE).max,
     ) -> tuple[NDArray[np.uint32], NDArray[np.uint64]]:
         """Get variant indices and the number of indices per range.
 
@@ -196,16 +210,13 @@ class PGEN(Reader[T]):
         offsets
             Shape: (ranges+1). Offsets to get variant indices for each range.
         """
-        starts = np.atleast_1d(starts)
+        starts = np.atleast_1d(np.asarray(starts, R_DTYPE))
 
         c = self._c_norm.norm(contig)
         if c is None:
-            return np.empty(0, np.uint32), np.zeros_like(
-                np.atleast_1d(starts), np.uint64
-            )
+            return np.empty(0, np.uint32), np.zeros_like(starts, np.uint64)
 
-        starts = np.atleast_1d(starts)
-        ends = np.atleast_1d(ends)
+        ends = np.atleast_1d(np.asarray(ends, R_DTYPE))
         queries = pr.PyRanges(
             pl.DataFrame(
                 {
@@ -234,9 +245,11 @@ class PGEN(Reader[T]):
         self,
         contig: str,
         start: int = 0,
-        end: int = np.iinfo(np.int32).max,
+        end: int = np.iinfo(R_DTYPE).max,
         out: T | None = None,
     ) -> T | None:
+        # TODO: support dosages
+
         c = self._c_norm.norm(contig)
         if c is None:
             return
@@ -245,8 +258,6 @@ class PGEN(Reader[T]):
         n_variants = len(var_idxs)
         if n_variants == 0:
             return
-
-        # TODO: support dosages
 
         if out is None:
             data = np.empty((n_variants, self.n_samples * self.ploidy), dtype=np.int32)
@@ -269,7 +280,7 @@ class PGEN(Reader[T]):
         self,
         contig: str,
         start: int = 0,
-        end: int = np.iinfo(np.int32).max,
+        end: int = np.iinfo(R_DTYPE).max,
         max_mem: int | str = "4g",
     ) -> Generator[T]:
         # TODO: support dosages
@@ -309,11 +320,9 @@ class PGEN(Reader[T]):
         self,
         contig: str,
         starts: ArrayLike = 0,
-        ends: ArrayLike = np.iinfo(np.int32).max,
+        ends: ArrayLike = np.iinfo(R_DTYPE).max,
     ) -> tuple[T, NDArray[np.uint64]] | None:
         # TODO: support dosages
-
-        starts = np.atleast_1d(starts)
 
         c = self._c_norm.norm(contig)
         if c is None:
@@ -379,10 +388,11 @@ KIND = (
 )
 
 
-# TODO: index can likely be implemented using the NCLS lib underlying PyRanges and then we can
+# TODO: can index be implemented using the NCLS lib underlying PyRanges? Then we can
 # pass np.memmap arrays directly instead of having to futz with DataFrames. This will likely make
-# filtering less ergonomic/harder to make ergonomic though, but a memmap approach will be scalable
-# to ultra-large datasets (100k+ individuals).
+# filtering less ergonomic/harder to make ergonomic though, but a memmap approach should be scalable
+# to datasets with billions+ unique variants (reduce memory), reduce instantion time, but increase query time.
+# Unless, NCLS creates a bunch of data structures in memory anyway.
 def _write_index(path: Path):
     (
         pl.scan_csv(

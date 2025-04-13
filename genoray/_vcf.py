@@ -11,7 +11,7 @@ from phantom import Phantom
 from tqdm.auto import tqdm
 from typing_extensions import Self, TypeGuard, assert_never
 
-from ._types import Reader
+from ._types import R_DTYPE, Reader
 from ._utils import (
     ContigNormalizer,
     format_memory,
@@ -45,7 +45,7 @@ def _is_genos_dosages(obj) -> TypeGuard[tuple[Genos, Dosages]]:
     )
 
 
-class Genos(NDArray[np.int8], Phantom, predicate=partial(is_dtype, dtype=np.int32)): ...
+class Genos(NDArray[np.int8], Phantom, predicate=partial(is_dtype, dtype=np.int8)): ...
 
 
 class Dosages(
@@ -65,7 +65,10 @@ class VCF(Reader[T]):
     contigs: list[str]
     ploidy = 2
     filter: Callable[[cyvcf2.Variant], bool] | None
-    dosage_field: str | None = None
+    dosage_field: str | None
+    pbar: tqdm | None
+    """A progress bar to use while reading variants. This will be incremented per variant
+    during any calls to a read function."""
     _vcf: cyvcf2.VCF
     _s_idx: NDArray[np.intp]
     _samples: list[str]
@@ -99,7 +102,7 @@ class VCF(Reader[T]):
         progress
             Whether to show a progress bar while reading the VCF file.
         """
-        if (read_as is Dosages or read_as is GenosDosages) and dosage_field is None:
+        if issubclass(read_as, (Dosages, GenosDosages)) and dosage_field is None:
             raise ValueError(
                 "Dosage field not specified. Set the VCF reader's `dosage_field` parameter."
             )
@@ -113,8 +116,9 @@ class VCF(Reader[T]):
         self.contigs = self._vcf.seqnames
         self._c_norm = ContigNormalizer(self.contigs)
         self.set_samples(self._vcf.samples)
-        self._read_as = read_as
+        self._read_as = cast(type[T], read_as)
         self.progress = progress
+        self.pbar = None
 
     def _open(self, samples: list[str] | None = None) -> cyvcf2.VCF:
         return cyvcf2.VCF(self.path, samples=samples, lazy=True)
@@ -154,16 +158,16 @@ class VCF(Reader[T]):
         self,
         contig: str,
         starts: ArrayLike = 0,
-        ends: ArrayLike = np.iinfo(np.int32).max,
+        ends: ArrayLike = np.iinfo(R_DTYPE).max,
     ) -> NDArray[np.uint32]:
-        starts = np.atleast_1d(starts)
-        ends = np.atleast_1d(ends)
+        starts = np.atleast_1d(np.asarray(starts, R_DTYPE))
+        ends = np.atleast_1d(np.asarray(ends, R_DTYPE))
 
         c = self._c_norm.norm(contig)
         if c is None:
-            return np.zeros(len(starts), dtype=np.uint32)
+            return np.zeros_like(starts, np.uint32)
 
-        out = np.empty(len(starts), dtype=np.uint32)
+        out = np.empty_like(starts, np.uint32)
         for i, (s, e) in enumerate(zip(starts, ends)):
             coord = f"{c}:{s + 1}-{e}"
             if self.filter is None:
@@ -177,15 +181,12 @@ class VCF(Reader[T]):
         self,
         contig: str,
         start: int = 0,
-        end: int = np.iinfo(np.int32).max,
+        end: int = np.iinfo(R_DTYPE).max,
         out: T | None = None,
     ) -> T | None:
         c = self._c_norm.norm(contig)
         if c is None:
             return
-
-        if end is None:
-            end = np.iinfo(np.int64).max
 
         itr = self._vcf(f"{c}:{start + 1}-{end}")  # range string is 1-based
         if out is None:
@@ -219,15 +220,11 @@ class VCF(Reader[T]):
         else:
             if self._read_as is Genos:
                 if not isinstance(out, Genos):
-                    raise ValueError(
-                        f"Expected output array of type {Genos.dtype}, got {type(out)}"
-                    )
+                    raise ValueError("Expected an int8 output array.")
                 self._fill_genos(itr, out)
             elif self._read_as is Dosages:
                 if not isinstance(out, Dosages):
-                    raise ValueError(
-                        f"Expected output array of type {Dosages.dtype}, got {type(out)}"
-                    )
+                    raise ValueError("Expected a float32 output array.")
                 self._fill_dosages(
                     itr,
                     out,
@@ -236,7 +233,7 @@ class VCF(Reader[T]):
             else:
                 if not isinstance(out, GenosDosages):
                     raise ValueError(
-                        f"Expected output to be 2-tuple of arrays np.int8 and np.float32, but got {type(out)}"
+                        "Expected a 2-tuple of int8 and np.float32 arrays."
                     )
                 self._fill_genos_and_dosages(
                     itr,
@@ -250,7 +247,7 @@ class VCF(Reader[T]):
         self,
         contig: str,
         start: int = 0,
-        end: int = np.iinfo(np.int32).max,
+        end: int = np.iinfo(R_DTYPE).max,
         max_mem: int | str = "4g",
     ) -> Generator[T]:
         max_mem = parse_memory(max_mem)
@@ -258,9 +255,6 @@ class VCF(Reader[T]):
         c = self._c_norm.norm(contig)
         if c is None:
             return
-
-        if end is None:
-            end = np.iinfo(np.int64).max
 
         n_variants: int = self.n_vars_in_ranges(c, start, end)[0]
         if n_variants == 0:
@@ -315,7 +309,7 @@ class VCF(Reader[T]):
         self,
         contig: str,
         starts: ArrayLike = 0,
-        ends: ArrayLike = np.iinfo(np.int32).max,
+        ends: ArrayLike = np.iinfo(R_DTYPE).max,
     ) -> tuple[T, NDArray[np.uint64]] | None:
         c = self._c_norm.norm(contig)
         if c is None:
@@ -362,28 +356,36 @@ class VCF(Reader[T]):
         return _out, offsets
 
     def _fill_genos(self, vcf: cyvcf2.VCF, out: NDArray[np.int8]):
-        if self.progress:
-            n_variants = out.shape[-1]
-            vcf = tqdm(vcf, total=n_variants, desc="Reading VCF", unit="variant")
+        n_variants = out.shape[-1]
 
+        if self.progress and self.pbar is None:
+            vcf = tqdm(vcf, total=n_variants, desc="Reading VCF", unit=" variant")
+        if self.pbar is not None and self.pbar.total is None:
+            self.pbar.total = n_variants
+
+        i = 0
         for i, v in enumerate(vcf):
             if self.filter is not None and not self.filter(v):
                 continue
 
             out[..., i] = v.genotype.array()[:, : self.ploidy]
 
-            if i == out.shape[-1] - 1:
-                break
-        else:
+            if self.pbar is not None:
+                self.pbar.update()
+
+        if i != n_variants - 1:
             raise ValueError("Not enough variants found in the given range.")
 
     def _fill_dosages(
         self, vcf: cyvcf2.VCF, out: NDArray[np.float32], dosage_field: str
     ):
-        if self.progress:
-            n_variants = out.shape[-1]
-            vcf = tqdm(vcf, total=n_variants, desc="Reading VCF", unit="variant")
+        n_variants = out.shape[-1]
+        if self.progress and self.pbar is None:
+            vcf = tqdm(vcf, total=n_variants, desc="Reading VCF", unit=" variant")
+        if self.pbar is not None and self.pbar.total is None:
+            self.pbar.total = n_variants
 
+        i = 0
         for i, v in enumerate(vcf):
             if self.filter is not None and not self.filter(v):
                 continue
@@ -395,9 +397,10 @@ class VCF(Reader[T]):
             # (s, 1, 1) or (s, 1)? -> (s)
             out[..., i] = d.squeeze()
 
-            if i == out.shape[-1] - 1:
-                break
-        else:
+            if self.pbar is not None:
+                self.pbar.update()
+
+        if i != n_variants - 1:
             raise ValueError("Not enough variants found in the given range.")
 
     def _fill_genos_and_dosages(
@@ -406,10 +409,13 @@ class VCF(Reader[T]):
         out: tuple[NDArray[np.int8], NDArray[np.float32]],
         dosage_field: str,
     ):
-        if self.progress:
-            n_variants = out[0].shape[-1]
-            vcf = tqdm(vcf, total=n_variants, desc="Reading VCF", unit="variant")
+        n_variants = out[0].shape[-1]
+        if self.progress and self.pbar is None:
+            vcf = tqdm(vcf, total=n_variants, desc="Reading VCF", unit=" variant")
+        if self.pbar is not None and self.pbar.total is None:
+            self.pbar.total = n_variants
 
+        i = 0
         for i, v in enumerate(vcf):
             if self.filter is not None and not self.filter(v):
                 continue
@@ -424,9 +430,10 @@ class VCF(Reader[T]):
             # (s, 1, 1) or (s, 1)? -> (s)
             out[1][..., i] = d.squeeze()
 
-            if i == out[0].shape[-1] - 1:
-                break
-        else:
+            if self.pbar is not None:
+                self.pbar.update()
+
+        if i != n_variants - 1:
             raise ValueError("Not enough variants found in the given range.")
 
     def _mem_per_variant(self) -> int:

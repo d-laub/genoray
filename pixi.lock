@@ -512,8 +512,8 @@ packages:
   timestamp: 1741969612334
 - pypi: .
   name: genoray
-  version: 0.1.0
-  sha256: 9e21a067a4892d3178102d98103c3f997fd70fed85def6f9b7e075a0675a8d19
+  version: 0.2.0
+  sha256: 922d306b5ccc9be855f1b3d96be664edd56cc97bc7fe43f379be63984fefd6cb
   requires_dist:
   - cyvcf2>=0.31.1
   - hirola>=0.3.0
