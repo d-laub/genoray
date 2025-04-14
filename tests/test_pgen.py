@@ -37,7 +37,7 @@ def read_spanning_del():
 
 @parametrize_with_cases("cse, genos, dosages", cases=".", prefix="read_")
 def test_read(
-    pgen: PGEN[PGEN.Genos],
+    pgen: PGEN,
     cse: tuple[str, int, int],
     genos: NDArray[np.int8],
     dosages: NDArray[np.float32],
@@ -49,15 +49,15 @@ def test_read(
 
 
 @parametrize_with_cases("cse, genos, dosages", cases=".", prefix="read_")
-def test_read_chunks(
-    pgen: PGEN[PGEN.Genos],
+def test_chunk(
+    pgen: PGEN,
     cse: tuple[str, int, int],
     genos: NDArray[np.int8],
     dosages: NDArray[np.float32],
 ):
-    max_mem = pgen._mem_per_variant()
+    max_mem = pgen._mem_per_variant(PGEN.Genos)
     cat = partial(np.concatenate, axis=-1)
-    itr = pgen.read_chunks(*cse, max_mem)
+    itr = pgen.chunk(*cse, max_mem)
     chunks = list(itr)
     assert len(chunks) == genos.shape[-1]
     # assert len(chunks[1]) == dosages.shape[-1]

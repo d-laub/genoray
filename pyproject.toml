@@ -19,6 +19,7 @@ dependencies = [
     "setuptools>=78.1.0", # uv misses this dependency for pyranges
     "tqdm>=4.67.1",
     "phantom-types>=3.0.2",
+    "more-itertools>=10.6.0",
 ]
 
 [tool.commitizen]

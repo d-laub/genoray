@@ -1,41 +1,73 @@
 from __future__ import annotations
 
-from functools import partial
 from pathlib import Path
-from typing import Generator, TypeVar, cast
+from typing import Any, Callable, Generator, TypeVar, cast
 
 import numpy as np
 import pgenlib
 import polars as pl
 import pyranges as pr
 from hirola import HashTable
+from more_itertools import mark_ends
 from numpy.typing import ArrayLike, NDArray
 from phantom import Phantom
 from typing_extensions import Self, TypeGuard, assert_never
 
-from ._types import R_DTYPE, Reader
+from ._types import R_DTYPE
 from ._utils import (
     ContigNormalizer,
     format_memory,
-    is_dtype,
+    hap_ilens,
     lengths_to_offsets,
     parse_memory,
 )
 
 
-def _is_genos_dosages(obj) -> TypeGuard[tuple[Genos, Dosages]]:
-    """Check if the object is a tuple of genotypes and dosages.
+def _is_genos(obj: Any) -> TypeGuard[Genos]:
+    return (
+        isinstance(obj, np.ndarray)
+        and obj.dtype.type == np.int32
+        and obj.ndim == 3
+        and obj.shape[1] == 2
+    )
 
-    Parameters
-    ----------
-    obj
-        Object to check.
 
-    Returns
-    -------
-    bool
-        True if the object is a tuple of genotypes and dosages, False otherwise.
-    """
+class Genos(NDArray[np.int32], Phantom, predicate=_is_genos):
+    _dtype = np.int32
+
+
+def _is_dosages(obj: Any) -> TypeGuard[Dosages]:
+    return (
+        isinstance(obj, np.ndarray) and obj.dtype.type == np.float32 and obj.ndim == 2
+    )
+
+
+class Dosages(NDArray[np.float32], Phantom, predicate=_is_dosages):
+    _dtype = np.float32
+
+
+def _is_phasing(obj: Any) -> TypeGuard[Phasing]:
+    return isinstance(obj, np.ndarray) and obj.dtype.type == np.bool_ and obj.ndim == 2
+
+
+class Phasing(NDArray[np.bool_], Phantom, predicate=_is_phasing):
+    _dtype = np.bool_
+
+
+def _is_genos_phasing(obj) -> TypeGuard[GenosPhasing]:
+    return (
+        isinstance(obj, tuple)
+        and len(obj) == 2
+        and isinstance(obj[0], Genos)
+        and isinstance(obj[1], Phasing)
+    )
+
+
+class GenosPhasing(tuple[Genos, Phasing], Phantom, predicate=_is_genos_phasing):
+    _dtypes = (np.int32, np.bool_)
+
+
+def _is_genos_dosages(obj) -> TypeGuard[GenosDosages]:
     return (
         isinstance(obj, tuple)
         and len(obj) == 2
@@ -44,28 +76,31 @@ def _is_genos_dosages(obj) -> TypeGuard[tuple[Genos, Dosages]]:
     )
 
 
-class Genos(
-    NDArray[np.int32], Phantom, predicate=partial(is_dtype, dtype=np.int32)
-): ...
+class GenosDosages(tuple[Genos, Dosages], Phantom, predicate=_is_genos_dosages):
+    _dtypes = (np.int32, np.float32)
 
 
-class Dosages(
-    NDArray[np.float32], Phantom, predicate=partial(is_dtype, dtype=np.float32)
-): ...
+def _is_genos_phasing_dosages(obj) -> TypeGuard[GenosPhasingDosages]:
+    return (
+        isinstance(obj, tuple)
+        and len(obj) == 3
+        and isinstance(obj[0], Genos)
+        and isinstance(obj[1], Phasing)
+        and isinstance(obj[2], Dosages)
+    )
 
 
-class GenosDosages(tuple[Genos, Dosages], Phantom, predicate=_is_genos_dosages): ...
+class GenosPhasingDosages(
+    tuple[Genos, Phasing, Dosages], Phantom, predicate=_is_genos_phasing_dosages
+):
+    _dtypes = (np.int32, np.bool_, np.float32)
 
 
-T = TypeVar(
-    "T",
-    Genos,
-    Dosages,
-    GenosDosages,
-)
+T = TypeVar("T", Genos, Dosages, GenosPhasing, GenosDosages, GenosPhasingDosages)
+L = TypeVar("L", Genos, GenosDosages)
 
 
-class PGEN(Reader[T]):
+class PGEN:
     available_samples: list[str]
     filter: pl.Expr | None
     ploidy = 2
@@ -74,17 +109,24 @@ class PGEN(Reader[T]):
     _geno_pgen: pgenlib.PgenReader
     _dose_pgen: pgenlib.PgenReader
     _s_idx: NDArray[np.uint32]
-    _read_as: type[T]
+    _dose_path: Path | None
+    _ilens: NDArray[np.int32] | None  # unfiltered ilens so that var_idxs map correctly
 
     Genos = Genos
+    """:code:`(samples ploidy variants) int32`"""
     Dosages = Dosages
+    """:code:`(samples variants) float32`"""
+    GenosPhasing = GenosPhasing
+    """:code:`(samples ploidy variants) int32` and :code:`(samples variants) bool`"""
     GenosDosages = GenosDosages
+    """:code:`(samples ploidy variants) int32` and :code:`(samples variants) float32`"""
+    GenosPhasingDosages = GenosPhasingDosages
+    """:code:`(samples ploidy variants) int32`, :code:`(samples variants) bool`, and :code:`(samples variants) float32`"""
 
     def __init__(
         self,
         geno_path: str | Path,
         filter: pl.Expr | None = None,
-        read_as: type[T] = Genos,
         dosage_path: str | Path | None = None,
     ):
         """Create a PGEN reader.
@@ -123,17 +165,24 @@ class PGEN(Reader[T]):
             self._dose_pgen = pgenlib.PgenReader(bytes(Path(dosage_path)))
         else:
             self._dose_pgen = self._geno_pgen
+        self._dose_path = dosage_path
 
-        if not geno_path.with_suffix(".gvi").exists():
+        if not geno_path.with_suffix(".pvar.gvi").exists():
             _write_index(geno_path.with_suffix(".pvar"))
-        self._index = _read_index(geno_path.with_suffix(".gvi"), self.filter)
+        self._index, self._ilens = _read_index(
+            geno_path.with_suffix(".pvar.gvi"), self.filter
+        )
         self.contigs = self._index.chromosomes
         self._c_norm = ContigNormalizer(self._index.chromosomes)
-        self._read_as = cast(type[T], read_as)
 
     @property
     def current_samples(self) -> list[str]:
         return cast(list[str], self._s2i.keys[self._s_idx].tolist())
+
+    @property
+    def n_samples(self) -> int:
+        """Number of samples in the file."""
+        return len(self._s_idx)
 
     def set_samples(self, samples: list[str]) -> Self:
         _samples = np.atleast_1d(samples)
@@ -141,8 +190,32 @@ class PGEN(Reader[T]):
         if (missing := _samples[s_idx == -1]).any():
             raise ValueError(f"Samples {missing} not found in the file.")
         self._s_idx = s_idx
+        # if dose path is None, then dose pgen is just a reference to geno pgen so
+        # we're also (somewhat unsafely) mutating the dose pgen here
         self._geno_pgen.change_sample_subset(np.sort(s_idx))
+        if self._dose_path is not None:
+            self._dose_pgen.change_sample_subset(np.sort(s_idx))
         return self
+
+    @property
+    def dosage_path(self) -> Path | None:
+        """Path to the dosage file."""
+        return self._dose_path
+
+    @dosage_path.setter
+    def dosage_path(self, dosage_path: str | Path | None):
+        """Set the path to the dosage file."""
+        if dosage_path is not None:
+            dosage_path = Path(dosage_path)
+            dose_samples = _read_psam(dosage_path.with_suffix(".psam"))
+            if (np.asarray(self.available_samples) != dose_samples).any():
+                raise ValueError(
+                    "Samples in dosage file do not match those in genotype file."
+                )
+            self._dose_pgen = pgenlib.PgenReader(bytes(Path(dosage_path)))
+        else:
+            self._dose_pgen = self._geno_pgen
+        self._dose_path = dosage_path
 
     def __del__(self):
         self._geno_pgen.close()
@@ -155,6 +228,22 @@ class PGEN(Reader[T]):
         starts: ArrayLike = 0,
         ends: ArrayLike = np.iinfo(R_DTYPE).max,
     ) -> NDArray[np.uint32]:
+        """Return the start and end indices of the variants in the given ranges.
+
+        Parameters
+        ----------
+        contig
+            Contig name.
+        starts
+            0-based start positions of the ranges.
+        ends
+            0-based, exclusive end positions of the ranges.
+
+        Returns
+        -------
+        n_variants
+            Shape: :code:`(ranges)`. Number of variants in the given ranges.
+        """
         starts = np.atleast_1d(np.asarray(starts, R_DTYPE))
 
         c = self._c_norm.norm(contig)
@@ -178,7 +267,7 @@ class PGEN(Reader[T]):
             .astype(np.uint32)
         )
 
-    def _var_idxs(
+    def var_idxs(
         self,
         contig: str,
         starts: ArrayLike = 0,
@@ -238,47 +327,102 @@ class PGEN(Reader[T]):
         contig: str,
         start: int | np.integer = 0,
         end: int | np.integer = np.iinfo(R_DTYPE).max,
+        mode: type[T] = Genos,
         out: T | None = None,
     ) -> T | None:
+        """Read genotypes and/or dosages for a range.
+
+        Parameters
+        ----------
+        contig
+            Contig name.
+        start
+            0-based start position.
+        end
+            0-based, exclusive end position.
+
+        Returns
+        -------
+            Genotypes and/or dosages. Genotypes have shape :code:`(samples ploidy variants)` and
+            dosages have shape :code:`(samples variants)`. Missing genotypes have value -1 and missing dosages
+            have value np.nan. If just using genotypes or dosages, will be a single array, otherwise
+            will be a tuple of arrays.
+        """
         c = self._c_norm.norm(contig)
         if c is None:
             return
 
-        var_idxs, _ = self._var_idxs(c, start, end)
+        var_idxs, _ = self.var_idxs(c, start, end)
         n_variants = len(var_idxs)
         if n_variants == 0:
             return
 
-        if issubclass(self._read_as, Genos):
-            _out = self._read_genos(var_idxs, Genos.parse(out))
-        elif issubclass(self._read_as, Dosages):
-            _out = self._read_dosages(var_idxs, Dosages.parse(out))
-        elif issubclass(self._read_as, GenosDosages):
-            _out = self._read_genos_and_dosages(var_idxs, GenosDosages.parse(out))
+        if issubclass(mode, Genos):
+            if out is not None:
+                out = mode.parse(out)
+            _out = self._read_genos(var_idxs, out)
+        elif issubclass(mode, Dosages):
+            if out is not None:
+                out = mode.parse(out)
+            _out = self._read_dosages(var_idxs, out)
+        elif issubclass(mode, GenosPhasing):
+            if out is not None:
+                out = mode.parse(out)
+            _out = self._read_genos_phasing(var_idxs, out)
+        elif issubclass(mode, GenosDosages):
+            if out is not None:
+                out = mode.parse(out)
+            _out = self._read_genos_dosages(var_idxs, out)
+        elif issubclass(mode, GenosPhasingDosages):
+            if out is not None:
+                out = mode.parse(out)
+            _out = self._read_genos_phasing_dosages(var_idxs, out)
         else:
-            assert_never(self._read_as)
+            assert_never(mode)
 
-        return cast(T, _out)
+        return mode.parse(_out)
 
-    def read_chunks(
+    def chunk(
         self,
         contig: str,
         start: int | np.integer = 0,
         end: int | np.integer = np.iinfo(R_DTYPE).max,
         max_mem: int | str = "4g",
+        mode: type[T] = Genos,
     ) -> Generator[T]:
+        """Iterate over genotypes and/or dosages for a range in chunks limited by :code:`max_mem`.
+
+        Parameters
+        ----------
+        contig
+            Contig name.
+        start
+            0-based start position.
+        end
+            0-based, exclusive end position.
+        max_mem
+            Maximum memory to use for each chunk. Can be an integer or a string with a suffix
+            (e.g. "4g", "2 MB").
+
+        Returns
+        -------
+            Generator of genotypes and/or dosages. Genotypes have shape :code:`(samples ploidy variants)` and
+            dosages have shape :code:`(samples variants)`. Missing genotypes have value -1 and missing dosages
+            have value np.nan. If just using genotypes or dosages, will be a single array, otherwise
+            will be a tuple of arrays.
+        """
         max_mem = parse_memory(max_mem)
 
         c = self._c_norm.norm(contig)
         if c is None:
             return
 
-        var_idxs, _ = self._var_idxs(c, start, end)
+        var_idxs, _ = self.var_idxs(c, start, end)
         n_variants = len(var_idxs)
         if n_variants == 0:
             return
 
-        mem_per_v = self._mem_per_variant()
+        mem_per_v = self._mem_per_variant(mode)
         vars_per_chunk = min(max_mem // mem_per_v, n_variants)
         if vars_per_chunk == 0:
             raise ValueError(
@@ -289,50 +433,118 @@ class PGEN(Reader[T]):
         n_chunks = -(-n_variants // vars_per_chunk)
         v_chunks = np.array_split(var_idxs, n_chunks)
         for var_idx in v_chunks:
-            if issubclass(self._read_as, Genos):
-                out = self._read_genos(var_idx)
-            elif issubclass(self._read_as, Dosages):
-                out = self._read_dosages(var_idx)
-            elif issubclass(self._read_as, GenosDosages):
-                out = self._read_genos_and_dosages(var_idx)
+            if issubclass(mode, Genos):
+                _out = self._read_genos(var_idx)
+            elif issubclass(mode, Dosages):
+                _out = self._read_dosages(var_idx)
+            elif issubclass(mode, GenosPhasing):
+                _out = self._read_genos_phasing(var_idx)
+            elif issubclass(mode, GenosDosages):
+                _out = self._read_genos_dosages(var_idx)
+            elif issubclass(mode, GenosPhasingDosages):
+                _out = self._read_genos_phasing_dosages(var_idx)
             else:
-                assert_never(self._read_as)
+                assert_never(mode)
 
-            yield cast(T, out)
+            yield mode.parse(_out)
 
     def read_ranges(
         self,
         contig: str,
         starts: ArrayLike = 0,
         ends: ArrayLike = np.iinfo(R_DTYPE).max,
+        mode: type[T] = Genos,
     ) -> tuple[T, NDArray[np.uint64]] | None:
+        """Read genotypes and/or dosages for multiple ranges.
+
+        Parameters
+        ----------
+        contig
+            Contig name.
+        starts
+            0-based start positions.
+        ends
+            0-based, exclusive end positions.
+
+        Returns
+        -------
+        data
+            Genotypes and/or dosages. Genotypes have shape :code:`(samples ploidy variants)` and
+            dosages have shape :code:`(samples variants)`. Missing genotypes have value -1 and missing dosages
+            have value np.nan. If just using genotypes or dosages, will be a single array, otherwise
+            will be a tuple of arrays.
+        offsets
+            Shape: (ranges+1). Offsets to slice out data for each range from the variants axis like so:
+
+        Examples
+        --------
+        .. code-block:: python
+
+            data, offsets = reader.read_ranges(...)
+            data[..., offsets[i] : offsets[i + 1]]  # data for range i
+
+        Note that the number of variants for range :code:`i` is :code:`np.diff(offsets)[i]`.
+        """
         c = self._c_norm.norm(contig)
         if c is None:
             return
 
-        var_idxs, offsets = self._var_idxs(c, starts, ends)
+        var_idxs, offsets = self.var_idxs(c, starts, ends)
         n_variants = len(var_idxs)
         if n_variants == 0:
             return
 
-        if issubclass(self._read_as, Genos):
+        if issubclass(mode, Genos):
             out = self._read_genos(var_idxs)
-        elif issubclass(self._read_as, Dosages):
+        elif issubclass(mode, Dosages):
             out = self._read_dosages(var_idxs)
-        elif issubclass(self._read_as, GenosDosages):
-            out = self._read_genos_and_dosages(var_idxs)
+        elif issubclass(mode, GenosPhasing):
+            out = self._read_genos_phasing(var_idxs)
+        elif issubclass(mode, GenosDosages):
+            out = self._read_genos_dosages(var_idxs)
+        elif issubclass(mode, GenosPhasingDosages):
+            out = self._read_genos_phasing_dosages(var_idxs)
         else:
-            assert_never(self._read_as)
+            assert_never(mode)
 
-        return cast(T, out), offsets
+        return mode.parse(out), offsets
 
-    def read_ranges_chunks(
+    def chunk_ranges(
         self,
         contig: str,
         starts: ArrayLike = 0,
         ends: ArrayLike = np.iinfo(R_DTYPE).max,
         max_mem: int | str = "4g",
-    ) -> Generator[Generator[T]]:
+        mode: type[T] = Genos,
+    ) -> Generator[Generator[T] | None]:
+        """Read genotypes and/or dosages for multiple ranges in chunks limited by :code:`max_mem`.
+
+        Parameters
+        ----------
+        contig
+            Contig name.
+        starts
+            0-based start positions.
+        ends
+            0-based, exclusive end positions.
+
+        Returns
+        -------
+            Generator of generators of genotypes and/or dosages of each ranges' data. Genotypes have shape :code:`(samples ploidy variants)` and
+            dosages have shape :code:`(samples variants)`. Missing genotypes have value -1 and missing dosages
+            have value np.nan. If just using genotypes or dosages, will be a single array, otherwise
+            will be a tuple of arrays.
+
+        Examples
+        --------
+        .. code-block:: python
+
+            gen = reader.read_ranges_chunks(...)
+            for range_ in gen:
+                for chunk in range_:
+                    # do something with chunk
+                    pass
+        """
         max_mem = parse_memory(max_mem)
 
         c = self._c_norm.norm(contig)
@@ -342,12 +554,12 @@ class PGEN(Reader[T]):
         starts = np.atleast_1d(np.asarray(starts, R_DTYPE))
         ends = np.atleast_1d(np.asarray(ends, R_DTYPE))
 
-        var_idxs, offsets = self._var_idxs(c, starts, ends)
+        var_idxs, offsets = self.var_idxs(c, starts, ends)
         n_variants = len(var_idxs)
         if n_variants == 0:
             return
 
-        mem_per_v = self._mem_per_variant()
+        mem_per_v = self._mem_per_variant(mode)
         vars_per_chunk = min(max_mem // mem_per_v, n_variants)
         if vars_per_chunk == 0:
             raise ValueError(
@@ -359,29 +571,150 @@ class PGEN(Reader[T]):
             o_s, o_e = offsets[i], offsets[i + 1]
             range_idxs = var_idxs[o_s:o_e]
             n_variants = len(range_idxs)
+
             if n_variants == 0:
+                yield None
                 continue
+
             n_chunks = -(-n_variants // vars_per_chunk)
             v_chunks = np.array_split(range_idxs, n_chunks)
 
-            if issubclass(self._read_as, Genos):
-                r = self._read_genos
-            elif issubclass(self._read_as, Dosages):
-                r = self._read_dosages
-            elif issubclass(self._read_as, GenosDosages):
-                r = self._read_genos_and_dosages
+            if issubclass(mode, Genos):
+                read = self._read_genos
+            elif issubclass(mode, Dosages):
+                read = self._read_dosages
+            elif issubclass(mode, GenosPhasing):
+                read = self._read_genos_phasing
+            elif issubclass(mode, GenosDosages):
+                read = self._read_genos_dosages
+            elif issubclass(mode, GenosPhasingDosages):
+                read = self._read_genos_phasing_dosages
             else:
-                assert_never(self._read_as)
+                assert_never(mode)
 
-            yield (cast(T, r(var_idx)) for var_idx in v_chunks)
+            yield (mode.parse(read(var_idx)) for var_idx in v_chunks)
 
-    def _mem_per_variant(self) -> int:
-        if issubclass(self._read_as, Genos):
-            return self.n_samples * self.ploidy * np.int32().itemsize
-        elif issubclass(self._read_as, (Dosages, GenosDosages)):
-            raise NotImplementedError("Dosages are not yet supported.")
+    def chunk_ranges_with_length(
+        self,
+        contig: str,
+        starts: ArrayLike = 0,
+        ends: ArrayLike = np.iinfo(R_DTYPE).max,
+        max_mem: int | str = "4g",
+        mode: type[L] = Genos,
+    ) -> Generator[Generator[L] | None]:
+        """Read genotypes and/or dosages for multiple ranges in chunks approximately limited by :code:`max_mem`.
+        Will extend the ranges so that the returned data corresponds to haplotypes that have at least as much
+        length as the original ranges.
+
+        .. note::
+
+            Even if the reader is set to only return dosages, this method must read in genotypes to compute
+            haplotype lengths so there is no performance difference between reading with/without genotypes.
+
+        Parameters
+        ----------
+        contig
+            Contig name.
+        starts
+            0-based start positions.
+        ends
+            0-based, exclusive end positions.
+
+        Returns
+        -------
+            Generator of generators of genotypes and/or dosages of each ranges' data. Genotypes have shape
+            :code:`(samples ploidy variants)` and dosages have shape :code:`(samples variants)`. Missing genotypes
+            have value -1 and missing dosages have value np.nan. If just using genotypes or dosages, will be a
+            single array, otherwise will be a tuple of arrays.
+
+        Examples
+        --------
+        .. code-block:: python
+
+            gen = reader.read_ranges_chunks(...)
+            for range_ in gen:
+                for chunk in range_:
+                    # do something with chunk
+                    pass
+        """
+        if self._ilens is None:
+            raise ValueError(
+                "Cannot use chunk_ranges_with_length without ilens, which usually happens when multi-allelic"
+                " variants are present."
+            )
+
+        max_mem = parse_memory(max_mem)
+
+        c = self._c_norm.norm(contig)
+        if c is None:
+            return
+
+        starts = np.atleast_1d(np.asarray(starts, R_DTYPE))
+        ends = np.atleast_1d(np.asarray(ends, R_DTYPE))
+
+        var_idxs, offsets = self.var_idxs(c, starts, ends)
+        n_variants = len(var_idxs)
+        if n_variants == 0:
+            return
+
+        mem_per_v = self._mem_per_variant(mode)
+        vars_per_chunk = min(max_mem // mem_per_v, n_variants)
+        if vars_per_chunk == 0:
+            raise ValueError(
+                f"Maximum memory {format_memory(max_mem)} insufficient to read a single variant."
+                f" Memory per variant: {format_memory(mem_per_v)}."
+            )
+
+        if issubclass(mode, Genos):
+            read = self._read_genos
+        elif issubclass(mode, GenosDosages):
+            read = self._read_genos_dosages
         else:
-            assert_never(self._read_as)
+            assert_never(mode)
+
+        read = cast(Callable[[NDArray[np.uint32]], L], read)
+
+        for i in range(len(offsets) - 1):
+            o_s, o_e = offsets[i], offsets[i + 1]
+            range_idxs = var_idxs[o_s:o_e]
+            n_variants = len(range_idxs)
+            if n_variants == 0:
+                yield None
+                return
+            n_chunks = -(-n_variants // vars_per_chunk)
+            v_chunks = np.array_split(range_idxs, n_chunks)
+
+            yield cast(
+                Generator[L],
+                _gen_with_length(
+                    v_chunks=v_chunks,
+                    length=int(ends[i] - starts[i]),
+                    read=read,
+                    ilens=self._ilens,
+                ),
+            )
+
+    def _mem_per_variant(self, mode: type[T]) -> int:
+        mem = 0
+
+        if issubclass(mode, Genos):
+            mem += self.n_samples * self.ploidy * mode._dtype().itemsize
+        elif issubclass(mode, Dosages):
+            mem += self.n_samples * mode._dtype().itemsize
+        elif issubclass(mode, GenosPhasing):
+            mem += self.n_samples * self.ploidy * mode._dtypes[0]().itemsize
+            mem += self.n_samples * mode._dtypes[1]().itemsize
+        elif issubclass(mode, GenosDosages):
+            mem += self.n_samples * self.ploidy * mode._dtypes[0]().itemsize
+            mem += self.n_samples * mode._dtypes[1]().itemsize
+        elif issubclass(mode, GenosPhasingDosages):
+            mem += self.n_samples * self.ploidy * mode._dtypes[0]().itemsize
+            mem += self.n_samples * mode._dtypes[1]().itemsize
+            mem += self.n_samples * mode._dtypes[2]().itemsize
+        else:
+            assert_never(mode)
+
+        return mem
 
     def _read_genos(
         self, var_idxs: NDArray[np.uint32], out: Genos | None = None
@@ -406,12 +739,14 @@ class PGEN(Reader[T]):
             _out = np.empty((len(var_idxs), self.n_samples), dtype=np.float32)
         else:
             _out = out
+
         self._dose_pgen.read_dosages_list(var_idxs, _out)
         _out = _out.transpose(1, 0)[self._s_idx]
         _out[_out == -9] = np.nan
+
         return Dosages.parse(_out)
 
-    def _read_genos_and_dosages(
+    def _read_genos_dosages(
         self, var_idxs: NDArray[np.uint32], out: GenosDosages | None = None
     ) -> GenosDosages:
         if out is None:
@@ -421,7 +756,89 @@ class PGEN(Reader[T]):
 
         genos = self._read_genos(var_idxs, _out[0])
         dosages = self._read_dosages(var_idxs, _out[1])
+
         return GenosDosages((genos, dosages))
+
+    def _read_genos_phasing(
+        self, var_idxs: NDArray[np.uint32], out: GenosPhasing | None = None
+    ) -> GenosPhasing:
+        if out is None:
+            genos = np.empty(
+                (len(var_idxs), self.n_samples * self.ploidy), dtype=np.int32
+            )
+            phasing = np.empty((len(var_idxs), self.n_samples), dtype=np.bool_)
+        else:
+            genos = out[0]
+            phasing = out[1]
+
+        self._dose_pgen.read_alleles_and_phasepresent_list(var_idxs, genos, phasing)
+        genos = genos.reshape(len(var_idxs), self.n_samples, self.ploidy).transpose(
+            1, 2, 0
+        )[self._s_idx]
+        genos[genos == -9] = np.nan
+        phasing = phasing.transpose(1, 0)[self._s_idx]
+
+        return GenosPhasing.parse((genos, phasing))
+
+    def _read_genos_phasing_dosages(
+        self, var_idxs: NDArray[np.uint32], out: GenosPhasingDosages | None = None
+    ) -> GenosPhasingDosages:
+        if out is None:
+            _out = (None, None)
+        else:
+            _out = (GenosPhasing(out[:2]), out[2])
+
+        genos_phasing = self._read_genos_phasing(var_idxs, _out[0])
+        dosages = self._read_dosages(var_idxs, _out[1])
+
+        return GenosPhasingDosages((*genos_phasing, dosages))
+
+
+_IDX_EXTENSION = 20
+
+
+def _gen_with_length(
+    v_chunks: list[NDArray[np.uint32]],
+    length: int,
+    read: Callable[[NDArray[np.uint32]], L],
+    ilens: NDArray[np.int32],  # full dataset ilens
+) -> Generator[L]:
+    max_idx = len(ilens)
+    for _, is_last, var_idx in mark_ends(v_chunks):
+        out = read(var_idx)
+
+        if is_last:
+            ls_ext_out: list[L] = []
+            ext_s_idx = var_idx[-1]
+
+            if isinstance(out, GenosDosages):
+                hap_lens = np.full(out[0].shape[:-1], length, dtype=np.int32)
+                hap_lens += hap_ilens(out[0], ilens[var_idx])
+            else:
+                hap_lens = np.full(out.shape[:-1], length, dtype=np.int32)
+                hap_lens += hap_ilens(out, ilens[var_idx])
+
+            while (hap_lens < length).any() and ext_s_idx < max_idx:
+                end_idx: int = min(ext_s_idx + _IDX_EXTENSION, max_idx)
+                ext_idx = np.arange(ext_s_idx + 1, end_idx, dtype=np.uint32)
+                ext_out = read(ext_idx)
+
+                if isinstance(ext_out, GenosDosages):
+                    ext_genos = ext_out[0]
+                else:
+                    ext_genos = ext_out
+
+                ls_ext_out.append(ext_out)
+                ext_s_idx = ext_idx[-1]
+                hap_lens += hap_ilens(ext_genos, ilens[ext_idx])
+
+            if isinstance(out, GenosDosages):
+                data = tuple(map(np.concat, zip(*ls_ext_out)))
+            else:
+                data = np.concat([out, *ls_ext_out])
+            out = type(out).parse(data)
+
+        yield out
 
 
 def _read_psam(path: Path) -> NDArray[np.str_]:
@@ -447,45 +864,66 @@ def _read_psam(path: Path) -> NDArray[np.str_]:
     return samples
 
 
-RLEN = pl.col("REF").str.len_bytes()
-ALEN = pl.col("ALT").str.len_bytes()
-ILEN = ALEN - RLEN
-KIND = (
-    pl.when(ILEN != 0)
-    .then(pl.lit("INDEL"))
-    .when(RLEN == 1)  # ILEN == 0 and RLEN == 1
-    .then(pl.lit("SNP"))
-    .otherwise(pl.lit("MNP"))  # ILEN == 0 and RLEN > 1
-    .cast(pl.Categorical)
-)
-
-
 # TODO: can index be implemented using the NCLS lib underlying PyRanges? Then we can
 # pass np.memmap arrays directly instead of having to futz with DataFrames. This will likely make
 # filtering less ergonomic/harder to make ergonomic though, but a memmap approach should be scalable
 # to datasets with billions+ unique variants (reduce memory), reduce instantion time, but increase query time.
 # Unless, NCLS creates a bunch of data structures in memory anyway.
-def _write_index(path: Path):
+# TODO: support full .pvar and .bim spec see https://www.cog-genomics.org/plink/2.0/formats#pvar
+def _write_index(pvar: Path):
+    ILEN = pl.col("rlen") - pl.col("ALT").str.len_bytes()
+    KIND = (
+        pl.when(ILEN != 0)
+        .then(pl.lit("INDEL"))
+        .when(pl.col("rlen") == 1)  # ILEN == 0 and RLEN == 1
+        .then(pl.lit("SNP"))
+        .otherwise(pl.lit("MNP"))  # ILEN == 0 and RLEN > 1
+        .cast(pl.Categorical)
+    )
+
     (
         pl.scan_csv(
-            path.with_suffix(".pvar"),
+            pvar,
             separator="\t",
             comment_prefix="##",
-            schema_overrides={"#CHROM": pl.Utf8, "POS": pl.Int32},
+            schema_overrides={"#CHROM": pl.Categorical, "POS": pl.UInt64},
         )
-        .select(
+        .with_columns(
             Chromosome="#CHROM",
             Start=pl.col("POS") - 1,
-            End=pl.col("POS") + RLEN - 1,
-            kind=KIND,
+            End=pl.col("POS") + pl.col("REF").str.len_bytes() - 1,
+            ALT=pl.col("ALT").str.split(","),
+            rlen=pl.col("REF").str.len_bytes(),
         )
-        .sink_ipc(path.with_suffix(".gvi"))
+        .drop("#CHROM", "POS")
+        .with_row_index("index")
+        .explode("ALT")
+        .with_columns(ilen=ILEN, kind=KIND)
+        .drop("rlen")
+        .group_by("index")
+        .agg(pl.exclude("ALT", "ilen", "kind").first(), "ALT", "ilen", "kind")
+        .drop("index")
+        .sink_ipc(pvar.with_suffix(".pvar.gvi"))
     )
 
 
-def _read_index(path: Path, filter: pl.Expr | None) -> pr.PyRanges:
-    index = pl.read_ipc(path, row_index_name="index", memory_map=False)
+def _read_index(
+    path: Path, filter: pl.Expr | None
+) -> tuple[pr.PyRanges, NDArray[np.int32] | None]:
+    print(path)
+    index = pl.scan_ipc(path, row_index_name="index", memory_map=False)
+
+    if index.select((pl.col("ALT").list.len() != 1).any()).collect().item():
+        ilens = None
+    else:
+        ilens = index.select(pl.col("ilen").explode()).collect()["ilen"].to_numpy()
+
     if filter is not None:
         index = index.filter(filter)
-    pyr = pr.PyRanges(index.drop("kind").to_pandas(use_pyarrow_extension_array=True))
-    return pyr
+
+    pyr = pr.PyRanges(
+        index.select("Chromosome", "Start", "End", "index")
+        .collect()
+        .to_pandas(use_pyarrow_extension_array=True)
+    )
+    return pyr, ilens

@@ -13,7 +13,7 @@ ddir = tdir / "data"
 
 @fixture  # type: ignore
 def vcf():
-    return VCF(ddir / "test.vcf.gz", read_as=VCF.GenosDosages, dosage_field="DS")
+    return VCF(ddir / "test.vcf.gz", dosage_field="DS")
 
 
 def read_all():
@@ -37,28 +37,28 @@ def read_spanning_del():
 
 @parametrize_with_cases("cse, genos, dosages", cases=".", prefix="read_")
 def test_read(
-    vcf: VCF[VCF.GenosDosages],
+    vcf: VCF,
     cse: tuple[str, int, int],
     genos: NDArray[np.int8],
     dosages: NDArray[np.float32],
 ):
     # (s p v)
-    actual = vcf.read(*cse)
+    actual = vcf.read(*cse, VCF.Genos16Dosages)
     assert actual is not None
     np.testing.assert_equal(actual[0], genos)
     np.testing.assert_equal(actual[1], dosages)
 
 
 @parametrize_with_cases("cse, genos, dosages", cases=".", prefix="read_")
-def test_read_chunks(
-    vcf: VCF[VCF.GenosDosages],
+def test_chunk(
+    vcf: VCF,
     cse: tuple[str, int, int],
     genos: NDArray[np.int8],
     dosages: NDArray[np.float32],
 ):
-    max_mem = vcf._mem_per_variant()
+    max_mem = vcf._mem_per_variant(VCF.Genos16Dosages)
     cat = partial(np.concatenate, axis=-1)
-    itr = vcf.read_chunks(*cse, max_mem)
+    itr = vcf.chunk(*cse, max_mem, VCF.Genos16Dosages)
     chunks = list(zip(*itr))
     assert len(chunks[0]) == genos.shape[-1]
     assert len(chunks[1]) == dosages.shape[-1]

@@ -76,10 +76,11 @@ def parse_memory(memory: int | str) -> int:
     unit = unit.strip()
     mem_i = int(n)
     coef = _MEM_COEF.get(unit.lower(), None)
+
     if coef is None:
         raise ValueError(f"Unrecognized memory unit '{unit}'.")
 
-    return mem_i * coef
+    return mem_i * coef.item()
 
 
 def format_memory(memory: int):
@@ -112,3 +113,25 @@ def lengths_to_offsets(
     offsets[0] = 0
     offsets[1:] = lengths.cumsum()
     return offsets
+
+
+def hap_ilens(
+    genotypes: NDArray[np.integer], ilens: NDArray[np.int32]
+) -> NDArray[np.int32]:
+    """Get the indel lengths of haplotypes from genotypes i.e. the difference in their lengths compared
+    to the reference sequence. Assumes phased genotypes.
+
+    Parameters
+    ----------
+    genotypes
+        Genotypes array. Shape: (samples, ploidy, variants).
+    ilens
+        Lengths of the segments. Shape: (variants).
+
+    Returns
+    -------
+    hap_lengths
+        Lengths of the haplotypes. Shape: (samples, ploidy).
+    """
+    ilens = np.broadcast_to(ilens, genotypes.shape)  # zero-copy, read only
+    return ilens.sum(-1, where=genotypes == 1)
