@@ -135,3 +135,43 @@ def test_set_samples(
     np.testing.assert_equal(g, genos[s_idx])
     np.testing.assert_equal(p, phasing[s_idx])
     np.testing.assert_equal(d, dosages[s_idx])
+
+def length_all():
+    cse = "chr1", 81261, 81263
+    # (s p v)
+    genos = np.array([[[0, -1], [1, -1]], [[1, 0], [1, 1]]], np.int8)
+    # (s v)
+    phasing = np.array([[1, 0], [1, 0]], np.bool_)
+    dosages = np.array([[1.0, np.nan], [2.0, 1.0]], np.float32)
+    return cse, genos, phasing, dosages
+
+
+def length_spanning_del():
+    cse = "chr1", 81262, 81263
+    # (s p v)
+    genos = np.array([[[0, -1], [1, -1]], [[1, 0], [1, 1]]], np.int8)
+    # (s v)
+    phasing = np.array([[1, 0], [1, 0]], np.bool_)
+    dosages = np.array([[1.0, np.nan], [2.0, 1.0]], np.float32)
+    return cse, genos, phasing, dosages
+
+
+@parametrize_with_cases("cse, genos, phasing, dosages", cases=".", prefix="length_")
+def test_chunk_with_length(
+    vcf: VCF,
+    cse: tuple[str, int, int],
+    genos: NDArray[np.int8],
+    phasing: NDArray[np.bool_],
+    dosages: NDArray[np.float32],
+):
+    vcf.phasing = True
+
+    max_mem = vcf._mem_per_variant(VCF.Genos16Dosages)
+    gpd = vcf.chunk_with_length(*cse, max_mem, VCF.Genos16Dosages)
+    for i, chunk in enumerate(gpd):
+        gp, d = chunk
+        g, p = np.array_split(gp, 2, 1)
+        p = p.squeeze(1).astype(bool)
+        np.testing.assert_equal(g, genos[..., [i]])
+        np.testing.assert_equal(p, phasing[..., [i]])
+        np.testing.assert_equal(d, dosages[..., [i]])
