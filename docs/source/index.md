@@ -49,8 +49,9 @@ genos, dosages = vcf.read("1", mode=VCF.Genos16Dosages)
 
 Dosages have shape `(samples, variants)` and dtype `np.float32`.
 
-> [!NOTE]
-> VCFs must also be provided a FORMAT `dosage_field` to read dosages and this field must have `Number=A` in the header, meaning there is one value for each ALT allele. 
+```{note}
+VCFs must also be provided a FORMAT `dosage_field` to read dosages and this field must have `Number=A` in the header, meaning there is one value for each ALT allele. 
+```
 
 A key feature of `genoray` is letting you work with data that is too large to fit into memory. For example:
 
@@ -67,8 +68,9 @@ for chunk in genos:
 ```
 The `chunk` method will automatically chunk the data along the `variants` axis to respect the memory limit, returning a generator of data instead of everything at once.
 
-> [!NOTE]
-> We also set `phasing=True` and changed the mode to `VCF.Genos8` to read phased genotypes as `int8`. The `phasing` argument lets us have access to the phase of the genotype in the format the cyvcf2 adheres to: the 3rd entry along the ploidy axis is the phase: 0 for unphased, 1 for phased. Reducing precision to `int8` instead of `int16` reduces the memory per variant by half -- we would only need higher precision if we expected to have more than 128 alleles at a variant site.
+```{note}
+We also set `phasing=True` and changed the mode to `VCF.Genos8` to read phased genotypes as `int8`. The `phasing` argument lets us have access to the phase of the genotype in the format the cyvcf2 adheres to: the 3rd entry along the ploidy axis is the phase: 0 for unphased, 1 for phased. Reducing precision to `int8` instead of `int16` reduces the memory per variant by half -- we would only need higher precision if we expected to have more than 128 alleles at a variant site.
+```
 
 ## PGEN
 
@@ -78,8 +80,9 @@ from genoray import PGEN
 pgen = PGEN("file.pgen")
 ```
 
-> [!IMPORTANT]
-> PGEN files are automatically indexed on construction, creating a `<prefix>.gvi` file. This is a one-time cost to enable fast range queries, but it takes longer for larger files. Don't delete this index file unless you want to re-index the PGEN file.
+```{important}
+PGEN files are automatically indexed on construction, creating a `<prefix>.gvi` file. This is a one-time cost to enable fast range queries, but it takes longer for larger files. Don't delete this index file unless you want to re-index the PGEN file.
+```
 
 We can query data for a region in the same way as VCF:
 
@@ -108,8 +111,9 @@ for range_ in genos:
 
 The `read_ranges` method takes starts and ends and returns data for each range and the offsets to slice out the variants for each range. Since the data is allocated as a single array, the offsets let you slice out the data for each range from the `variants` axis.
 
-> [!NOTE]
-> We do not provide an API for multi-range queries of VCFs because benchmarking showed that this provided no benefit to throughput.
+```{note}
+We do not provide an API for multi-range queries of VCFs because benchmarking showed that this provided no benefit to throughput.
+```
 
 Like VCF, methods for PGENs accept a `mode` argument to change the return type to include genotypes, phasing, and/or dosages:
 
@@ -119,12 +123,15 @@ genos, phasing, dosages = pgen.read("1", mode=PGEN.GenosPhasingDosages)
 
 The PGEN reader adheres to pgenlib's API, so the phasing information is in a separate boolean array instead of using an extra column like VCF/cyvcf2. The phasing information is a boolean array of shape `(samples, variants)` where `True` indicates that the genotype is phased and `False` indicates that it is unphased.
 
-> [!IMPORTANT]
-> PGEN files either store hardcalls (genotypes) or dosages, not both, and dosage PGENs infer hardcalls based on a [hardcall threshold](https://www.cog-genomics.org/plink/2.0/input#dosage_import_settings). Thus, if you want to read hardcalls that do not correspond to inferred hardcalls from a dosage PGEN, you can provide two different PGEN files to the constructor. This will read hardcalls from `hardcalls.pgen` and dosages from `dosage.pgen`. The two PGEN files must have the same samples and variants in the same order. The `dosage_path` argument is optional, and if not provided, both hardcalls and dosages will be sourced from the path argument (`"hardcalls.pgen"` in the example):
+:::{important}
+PGEN files either store hardcalls (genotypes) or dosages, not both, and dosage PGENs infer hardcalls based on a [hardcall threshold](https://www.cog-genomics.org/plink/2.0/input#dosage_import_settings). Thus, if you want to read hardcalls that do not correspond to inferred hardcalls from a dosage PGEN, you can provide two different PGEN files to the constructor:
 
 ```python
 pgen = PGEN("hardcalls.pgen", dosage_path="dosage.pgen", ...)
 ```
+
+This will read hardcalls from `hardcalls.pgen` and dosages from `dosage.pgen`. The two PGEN files must have the same samples and variants in the same order. The `dosage_path` argument is optional, and if not provided, both hardcalls and dosages will be sourced from the path argument (`"hardcalls.pgen"` in the example).
+:::
 
 ## Filtering
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Generator, TypeVar, cast, final
+from typing import Any, Callable, Generator, TypeVar, cast
 
 import cyvcf2
 import numpy as np
@@ -11,7 +11,7 @@ from phantom import Phantom
 from tqdm.auto import tqdm
 from typing_extensions import Self, TypeGuard, assert_never
 
-from ._types import R_DTYPE
+from ._types import R_DTYPE, UINT64_MAX
 from ._utils import (
     ContigNormalizer,
     format_memory,
@@ -111,19 +111,25 @@ class Genos16Dosages(tuple[Genos16, Dosages], Phantom, predicate=_is_genos16_dos
 
 
 T = TypeVar("T", Genos8, Genos16, Dosages, Genos8Dosages, Genos16Dosages)
-M = TypeVar("M", Genos8, Genos16, Dosages, Genos8Dosages, Genos16Dosages)
 L = TypeVar("L", Genos8, Genos16, Genos8Dosages, Genos16Dosages)
 
 
-@final
 class VCF:
     path: Path
+    """Path to the VCF file."""
     available_samples: list[str]
+    """List of available samples in the VCF file."""
     contigs: list[str]
+    """List of available contigs in the VCF file."""
     ploidy = 2
+    """Ploidy of the VCF file. This is currently always 2 since we use cyvcf2."""
     filter: Callable[[cyvcf2.Variant], bool] | None
+    """Function to filter variants. Should return True for variants to keep."""
     phasing: bool
+    """Whether to include phasing information on genotypes. If True, the ploidy axis will be length 3 such that
+    phasing is indicated by the 3rd value: 0 = unphased, 1 = phased. If False, the ploidy axis will be length 2."""
     dosage_field: str | None
+    """Name of the dosage field to read from the VCF file. Required if you want to use modes that include dosages."""
     _pbar: tqdm | None
     """A progress bar to use while reading variants. This will be incremented per variant
     during any calls to a read function."""
@@ -133,15 +139,15 @@ class VCF:
     _c_norm: ContigNormalizer
 
     Genos8 = Genos8
-    """:code:`(samples ploidy variants) int8`"""
+    """Mode for :code:`int8` genotypes :code:`(samples ploidy variants)`"""
     Genos16 = Genos16
-    """:code:`(samples ploidy variants) int16`"""
+    """Mode for :code:`int16` genotypes :code:`(samples ploidy variants)`"""
     Dosages = Dosages
-    """:code:`(samples variants) float32`"""
+    """Mode for dosages :code:`(samples variants) float32`"""
     Genos8Dosages = Genos8Dosages
-    """:code:`(samples ploidy variants) int8` and :code:`(samples variants) float32`"""
+    """Mode for :code:`int8` genotypes :code:`(samples ploidy variants) int8` and dosages :code:`(samples variants) float32`"""
     Genos16Dosages = Genos16Dosages
-    """:code:`(samples ploidy variants) int16` and :code:`(samples variants) float32`"""
+    """Mode for :code:`int16` genotypes :code:`(samples ploidy variants) int16` and dosages :code:`(samples variants) float32`"""
 
     def __init__(
         self,
@@ -188,6 +194,7 @@ class VCF:
 
     @property
     def current_samples(self) -> list[str]:
+        """List of samples currently being read from the VCF file."""
         return self._samples
 
     @property
@@ -223,7 +230,14 @@ class VCF:
 
     @contextmanager
     def using_pbar(self, pbar: tqdm):
-        """Create a context where the given progress bar will be incremented by any calls to a read method."""
+        """Create a context where the given progress bar will be incremented by any calls to a read method.
+
+        Parameters
+        ----------
+        pbar
+            Progress bar to use while reading variants. This will be incremented per variant
+            during any calls to a read function.
+        """
         self._pbar = pbar
         try:
             yield self
@@ -234,7 +248,7 @@ class VCF:
         self,
         contig: str,
         starts: ArrayLike = 0,
-        ends: ArrayLike = np.iinfo(R_DTYPE).max,
+        ends: ArrayLike = UINT64_MAX,
     ) -> NDArray[np.uint32]:
         """Return the start and end indices of the variants in the given ranges.
 
@@ -249,7 +263,6 @@ class VCF:
 
         Returns
         -------
-        n_variants
             Shape: :code:`(ranges)`. Number of variants in the given ranges.
         """
         starts = np.atleast_1d(np.asarray(starts, R_DTYPE))
@@ -273,7 +286,7 @@ class VCF:
         self,
         contig: str,
         start: int | np.integer = 0,
-        end: int | np.integer = np.iinfo(R_DTYPE).max,
+        end: int | np.integer = UINT64_MAX,
         mode: type[T] = Genos16,
         out: T | None = None,
     ) -> T | None:
@@ -287,6 +300,10 @@ class VCF:
             0-based start position.
         end
             0-based, exclusive end position.
+        mode
+            Type of data to read.
+        out
+            Output array to fill with genotypes and/or dosages. If None, a new array will be created.
 
         Returns
         -------
@@ -375,7 +392,7 @@ class VCF:
         self,
         contig: str,
         start: int | np.integer = 0,
-        end: int | np.integer = np.iinfo(R_DTYPE).max,
+        end: int | np.integer = UINT64_MAX,
         max_mem: int | str = "4g",
         mode: type[T] = Genos16,
     ) -> Generator[T]:
@@ -392,6 +409,8 @@ class VCF:
         max_mem
             Maximum memory to use for each chunk. Can be an integer or a string with a suffix
             (e.g. "4g", "2 MB").
+        mode
+            Type of data to read.
 
         Returns
         -------
@@ -474,7 +493,7 @@ class VCF:
         self,
         contig: str,
         start: int | np.integer = 0,
-        end: int | np.integer = np.iinfo(R_DTYPE).max,
+        end: int | np.integer = UINT64_MAX,
         max_mem: int | str = "4g",
         mode: type[L] = Genos16,
     ) -> Generator[L]:
@@ -482,29 +501,26 @@ class VCF:
         Will extend the range so that the returned data corresponds to haplotypes that have at least as much
         length as the original range.
 
-        .. note::
-
-            Even if the reader is set to only return dosages, this method must read in genotypes to compute
-            haplotype lengths so there is no performance difference between reading with/without genotypes.
-
         Parameters
         ----------
         contig
             Contig name.
-        starts
+        start
             0-based start positions.
-        ends
+        end
             0-based, exclusive end positions.
         max_mem
             Maximum memory to use for each chunk. Can be an integer or a string with a suffix
             (e.g. "4g", "2 MB").
+        mode
+            Type of data to read.
 
         Returns
         -------
-            Generator of genotypes and/or dosages. Genotypes have shape
-            :code:`(samples ploidy variants)` and dosages have shape :code:`(samples variants)`. Missing genotypes
-            have value -1 and missing dosages have value np.nan. If just using genotypes or dosages, will be a
-            single array, otherwise will be a tuple of arrays.
+            Generator of genotypes and/or dosages. Genotypes have shape :code:`(samples ploidy variants)` and
+            dosages have shape :code:`(samples variants)`. Missing genotypes have value -1 and missing dosages
+            have value np.nan. If just using genotypes or dosages, will be a single array, otherwise will be a
+            tuple of arrays.
         """
         if (
             issubclass(mode, (Genos8Dosages, Genos16Dosages))

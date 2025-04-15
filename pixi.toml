@@ -3,10 +3,12 @@ name = "genoray"
 channels = ["conda-forge", "bioconda"]
 platforms = ["linux-64"]
 
-[pypi-dependencies]
-genoray = { path = ".", editable = true }
+[environments]
+dev = ['dev']
+doc = ['doc']
 
-[dependencies]
+
+[feature.dev.dependencies]
 python = "3.9.*"
 htslib = "*"
 bcftools = "*"
@@ -19,6 +21,24 @@ pytest-cases = "*"
 ipykernel = "*"
 ipywidgets = "*"
 
-[tasks]
+[feature.dev.pypi-dependencies]
+genoray = { path = ".", editable = true }
+
+[feature.dev.tasks]
 i-kernel = "ipython kernel install --user --name genoray"
 pre-commit = "pre-commit install --hook-type commit-msg"
+publish = "rm -r dist && uv build && uv publish"
+
+[feature.doc.dependencies]
+python = "3.12.*"
+sphinx = "*"
+sphinx-book-theme = "*"
+sphinx-autobuild = "*"
+sphinx-autodoc-typehints = "*"
+myst-parser = "*"
+
+[feature.doc.pypi-dependencies]
+genoray = { path = ".", editable = true }
+
+[feature.doc.tasks]
+doc = { cmd = "make clean && make html", cwd = "docs" }

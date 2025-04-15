@@ -13,7 +13,7 @@ from numpy.typing import ArrayLike, NDArray
 from phantom import Phantom
 from typing_extensions import Self, TypeGuard, assert_never
 
-from ._types import R_DTYPE
+from ._types import R_DTYPE, UINT64_MAX
 from ._utils import (
     ContigNormalizer,
     format_memory,
@@ -102,9 +102,13 @@ L = TypeVar("L", Genos, GenosDosages)
 
 class PGEN:
     available_samples: list[str]
+    """List of available samples in the PGEN file."""
     filter: pl.Expr | None
+    """Polars expression to filter variants. Should return True for variants to keep."""
     ploidy = 2
+    """Ploidy of the samples. The PGEN format currently only supports diploid (2)."""
     contigs: list[str]
+    """List of contig names in the PGEN file."""
     _index: pr.PyRanges
     _geno_pgen: pgenlib.PgenReader
     _dose_pgen: pgenlib.PgenReader
@@ -137,8 +141,6 @@ class PGEN:
             Path to the PGEN file. Only used for genotypes if a dosage path is provided as well.
         filter
             Polars expression to filter variants. Should return True for variants to keep.
-        read_as
-            Type of data to read from the PGEN file. Can be PGEN.Genos, PGEN.Dosages, or PGEN.GenosDosages.
         dosage_path
             Path to a dosage PGEN file. If None, the genotype PGEN file will be used for both genotypes and dosages.
         """
@@ -177,6 +179,7 @@ class PGEN:
 
     @property
     def current_samples(self) -> list[str]:
+        """List of samples that are currently being used, in order."""
         return cast(list[str], self._s2i.keys[self._s_idx].tolist())
 
     @property
@@ -185,6 +188,13 @@ class PGEN:
         return len(self._s_idx)
 
     def set_samples(self, samples: list[str]) -> Self:
+        """Set the samples to use.
+
+        Parameters
+        ----------
+        samples
+            List of sample names to use. If None, all samples will be used.
+        """
         _samples = np.atleast_1d(samples)
         s_idx = self._s2i.get(_samples).astype(np.uint32)
         if (missing := _samples[s_idx == -1]).any():
@@ -226,7 +236,7 @@ class PGEN:
         self,
         contig: str,
         starts: ArrayLike = 0,
-        ends: ArrayLike = np.iinfo(R_DTYPE).max,
+        ends: ArrayLike = UINT64_MAX,
     ) -> NDArray[np.uint32]:
         """Return the start and end indices of the variants in the given ranges.
 
@@ -271,7 +281,7 @@ class PGEN:
         self,
         contig: str,
         starts: ArrayLike = 0,
-        ends: ArrayLike = np.iinfo(R_DTYPE).max,
+        ends: ArrayLike = UINT64_MAX,
     ) -> tuple[NDArray[np.uint32], NDArray[np.uint64]]:
         """Get variant indices and the number of indices per range.
 
@@ -286,9 +296,8 @@ class PGEN:
 
         Returns
         -------
-        idxs
             Shape: (tot_variants). Variant indices for the given ranges.
-        offsets
+
             Shape: (ranges+1). Offsets to get variant indices for each range.
         """
         starts = np.atleast_1d(np.asarray(starts, R_DTYPE))
@@ -326,7 +335,7 @@ class PGEN:
         self,
         contig: str,
         start: int | np.integer = 0,
-        end: int | np.integer = np.iinfo(R_DTYPE).max,
+        end: int | np.integer = UINT64_MAX,
         mode: type[T] = Genos,
         out: T | None = None,
     ) -> T | None:
@@ -340,6 +349,14 @@ class PGEN:
             0-based start position.
         end
             0-based, exclusive end position.
+        mode
+            Type of data to read. Can be :code:`Genos`, :code:`Dosages`, :code:`GenosPhasing`,
+            :code:`GenosDosages`, or :code:`GenosPhasingDosages`.
+        out
+            Array to write the data to. If None, a new array will be created. The shape and dtype of the array
+            should match the expected output shape for the given mode. For example, if mode is :code:`Genos`,
+            the shape should be :code:`(samples ploidy variants)`. If mode is :code:`Dosages`, the shape should
+            be :code:`(samples variants)`.
 
         Returns
         -------
@@ -386,7 +403,7 @@ class PGEN:
         self,
         contig: str,
         start: int | np.integer = 0,
-        end: int | np.integer = np.iinfo(R_DTYPE).max,
+        end: int | np.integer = UINT64_MAX,
         max_mem: int | str = "4g",
         mode: type[T] = Genos,
     ) -> Generator[T]:
@@ -403,6 +420,9 @@ class PGEN:
         max_mem
             Maximum memory to use for each chunk. Can be an integer or a string with a suffix
             (e.g. "4g", "2 MB").
+        mode
+            Type of data to read. Can be :code:`Genos`, :code:`Dosages`, :code:`GenosPhasing`,
+            :code:`GenosDosages`, or :code:`GenosPhasingDosages`.
 
         Returns
         -------
@@ -452,7 +472,7 @@ class PGEN:
         self,
         contig: str,
         starts: ArrayLike = 0,
-        ends: ArrayLike = np.iinfo(R_DTYPE).max,
+        ends: ArrayLike = UINT64_MAX,
         mode: type[T] = Genos,
     ) -> tuple[T, NDArray[np.uint64]] | None:
         """Read genotypes and/or dosages for multiple ranges.
@@ -465,15 +485,17 @@ class PGEN:
             0-based start positions.
         ends
             0-based, exclusive end positions.
+        mode
+            Type of data to read. Can be :code:`Genos`, :code:`Dosages`, :code:`GenosPhasing`,
+            :code:`GenosDosages`, or :code:`GenosPhasingDosages`.
 
         Returns
         -------
-        data
             Genotypes and/or dosages. Genotypes have shape :code:`(samples ploidy variants)` and
             dosages have shape :code:`(samples variants)`. Missing genotypes have value -1 and missing dosages
             have value np.nan. If just using genotypes or dosages, will be a single array, otherwise
             will be a tuple of arrays.
-        offsets
+            
             Shape: (ranges+1). Offsets to slice out data for each range from the variants axis like so:
 
         Examples
@@ -513,7 +535,7 @@ class PGEN:
         self,
         contig: str,
         starts: ArrayLike = 0,
-        ends: ArrayLike = np.iinfo(R_DTYPE).max,
+        ends: ArrayLike = UINT64_MAX,
         max_mem: int | str = "4g",
         mode: type[T] = Genos,
     ) -> Generator[Generator[T] | None]:
@@ -527,6 +549,12 @@ class PGEN:
             0-based start positions.
         ends
             0-based, exclusive end positions.
+        max_mem
+            Maximum memory to use for each chunk. Can be an integer or a string with a suffix
+            (e.g. "4g", "2 MB").
+        mode
+            Type of data to read. Can be :code:`Genos`, :code:`Dosages`, :code:`GenosPhasing`,
+            :code:`GenosDosages`, or :code:`GenosPhasingDosages`.
 
         Returns
         -------
@@ -541,6 +569,8 @@ class PGEN:
 
             gen = reader.read_ranges_chunks(...)
             for range_ in gen:
+                if range_ is None:
+                    continue
                 for chunk in range_:
                     # do something with chunk
                     pass
@@ -598,7 +628,7 @@ class PGEN:
         self,
         contig: str,
         starts: ArrayLike = 0,
-        ends: ArrayLike = np.iinfo(R_DTYPE).max,
+        ends: ArrayLike = UINT64_MAX,
         max_mem: int | str = "4g",
         mode: type[L] = Genos,
     ) -> Generator[Generator[L] | None]:
@@ -619,6 +649,12 @@ class PGEN:
             0-based start positions.
         ends
             0-based, exclusive end positions.
+        max_mem
+            Maximum memory to use for each chunk. Can be an integer or a string with a suffix
+            (e.g. "4g", "2 MB").
+        mode
+            Type of data to read. Can be :code:`Genos`, :code:`Dosages`, :code:`GenosPhasing`,
+            :code:`GenosDosages`, or :code:`GenosPhasingDosages`.
 
         Returns
         -------
@@ -633,6 +669,8 @@ class PGEN:
 
             gen = reader.read_ranges_chunks(...)
             for range_ in gen:
+                if range_ is None:
+                    continue
                 for chunk in range_:
                     # do something with chunk
                     pass
@@ -877,7 +915,9 @@ def _write_index(pvar: Path):
         .then(pl.lit("INDEL"))
         .when(pl.col("rlen") == 1)  # ILEN == 0 and RLEN == 1
         .then(pl.lit("SNP"))
-        .otherwise(pl.lit("MNP"))  # ILEN == 0 and RLEN > 1
+        .when(pl.col("rlen") > 1)  # ILEN == 0 and RLEN > 1
+        .then(pl.lit("MNP"))  # ILEN == 0 and RLEN > 1
+        .otherwise(pl.lit("OTHER"))
         .cast(pl.Categorical)
     )
 
