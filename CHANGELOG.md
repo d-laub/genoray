@@ -1,3 +1,21 @@
+## 0.3.0 (2025-04-14)
+
+### Feat
+
+- multi-allelics, PGEN dosages, more precise typing and API
+- improve pbar injection via context manager
+- prototype for PGEN dosages
+- prototype for PGEN dosages
+- prototype for injecting a progress bar
+
+### Fix
+
+- make pbar context behavior match docstring
+
+### Refactor
+
+- clarify default for end/ends to be max value of np.int32
+
 ## 0.2.0 (2025-04-12)
 
 ### Feat
