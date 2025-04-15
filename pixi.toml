@@ -28,7 +28,7 @@ genoray = { path = ".", editable = true }
 i-kernel = "ipython kernel install --user --name genoray"
 pre-commit = "pre-commit install --hook-type commit-msg"
 bump-dry = "cz bump --dry-run"
-bump = "cz bump"
+bump = "cz bump && git push --follow-tags"
 publish = "rm -r dist && uv build && uv publish"
 
 [feature.doc.dependencies]
