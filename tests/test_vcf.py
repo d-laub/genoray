@@ -1,4 +1,3 @@
-from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -96,15 +95,19 @@ def test_chunk(
     phasing: NDArray[np.bool_],
     dosages: NDArray[np.float32],
 ):
+    vcf.phasing = True
+
     max_mem = vcf._mem_per_variant(VCF.Genos16Dosages)
-    cat = partial(np.concatenate, axis=-1)
-    itr = vcf.chunk(*cse, max_mem, VCF.Genos16Dosages)
-    chunks = list(zip(*itr))
-    assert len(chunks[0]) == genos.shape[-1]
-    assert len(chunks[1]) == dosages.shape[-1]
-    actual = cat(chunks[0]), cat(chunks[1])
-    np.testing.assert_equal(actual[0], genos)
-    np.testing.assert_equal(actual[1], dosages)
+    gpd = vcf.chunk(*cse, max_mem, VCF.Genos16Dosages)
+    for i, chunk in enumerate(gpd):
+        gp, d = chunk
+        g, p = np.array_split(gp, 2, 1)
+        p = p.squeeze(1).astype(bool)
+        assert is_dtype(g, np.int16)
+        assert is_dtype(d, np.float32)
+        np.testing.assert_equal(g, genos[..., [i]])
+        np.testing.assert_equal(p, phasing[..., [i]])
+        np.testing.assert_equal(d, dosages[..., [i]])
 
 
 @parametrize_with_cases("cse, genos, phasing, dosages", cases=".", prefix="read_")
@@ -123,14 +126,12 @@ def test_set_samples(
     assert vcf.n_samples == len(samples)
     np.testing.assert_equal(vcf._s_sorter, s_sorter)
 
-    # (s p v)
-    actual_genos = vcf.read(*cse)
-    assert actual_genos is not None
-    actual_dosages = vcf.read(*cse, VCF.Dosages)
-    assert actual_dosages is not None
-    actual_genos_dosages = vcf.read(*cse, VCF.Genos16Dosages)
-    assert actual_genos_dosages is not None
-    np.testing.assert_equal(actual_genos, genos[s_idx])
-    np.testing.assert_equal(actual_dosages, dosages[s_idx])
-    np.testing.assert_equal(actual_genos_dosages[0], genos[s_idx])
-    np.testing.assert_equal(actual_genos_dosages[1], dosages[s_idx])
+    vcf.phasing = True
+    gpd = vcf.read(*cse, VCF.Genos16Dosages)
+    assert gpd is not None
+    gp, d = gpd
+    g, p = np.array_split(gp, 2, 1)
+    p = p.squeeze(1).astype(bool)
+    np.testing.assert_equal(g, genos[s_idx])
+    np.testing.assert_equal(p, phasing[s_idx])
+    np.testing.assert_equal(d, dosages[s_idx])

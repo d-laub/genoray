@@ -1,4 +1,3 @@
-from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -55,18 +54,21 @@ def test_read(
 
     gp = pgen.read(*cse, PGEN.GenosPhasing)
     assert gp is not None
-    np.testing.assert_equal(gp[0], genos)
-    np.testing.assert_equal(gp[1], phasing)
+    g, p = gp
+    np.testing.assert_equal(g, genos)
+    np.testing.assert_equal(p, phasing)
 
     gd = pgen.read(*cse, PGEN.GenosDosages)
     assert gd is not None
-    np.testing.assert_equal(gd[0], genos)
+    g, d = gd
+    np.testing.assert_equal(g, genos)
     np.testing.assert_equal(gd[1], dosages)
 
     gpd = pgen.read(*cse, PGEN.GenosPhasingDosages)
     assert gpd is not None
-    np.testing.assert_equal(gpd[0], genos)
-    np.testing.assert_equal(gpd[1], phasing)
+    g, p, d = gpd
+    np.testing.assert_equal(g, genos)
+    np.testing.assert_equal(p, phasing)
     np.testing.assert_equal(gpd[2], dosages)
 
 
@@ -78,15 +80,59 @@ def test_chunk(
     phasing: NDArray[np.bool_],
     dosages: NDArray[np.float32],
 ):
-    max_mem = pgen._mem_per_variant(PGEN.Genos)
-    cat = partial(np.concatenate, axis=-1)
-    itr = pgen.chunk(*cse, max_mem)
-    chunks = list(itr)
-    assert len(chunks) == genos.shape[-1]
-    # assert len(chunks[1]) == dosages.shape[-1]
-    actual = cat(chunks)
-    np.testing.assert_equal(actual, genos)
-    # np.testing.assert_equal(actual[1], dosages)
+    mode = PGEN.GenosPhasingDosages
+    gpd = pgen.chunk(*cse, pgen._mem_per_variant(mode), mode)
+    for i, chunk in enumerate(gpd):
+        g, p, d = chunk
+        np.testing.assert_equal(g, genos[..., [i]])
+        np.testing.assert_equal(p, phasing[..., [i]])
+        np.testing.assert_equal(d, dosages[..., [i]])
+
+
+@parametrize_with_cases("cse, genos, phasing, dosages", cases=".", prefix="read_")
+def test_read_ranges(
+    pgen: PGEN,
+    cse: tuple[str, int, int],
+    genos: NDArray[np.int8],
+    phasing: NDArray[np.bool_],
+    dosages: NDArray[np.float32],
+):
+    c, s, e = cse
+    s = [s, s]
+    e = [e, e]
+
+    gpdo = pgen.read_ranges(c, s, e, PGEN.GenosPhasingDosages)
+    assert gpdo is not None
+    (g, p, d), o = gpdo
+    np.testing.assert_equal(g[..., o[0] : o[1]], genos)
+    np.testing.assert_equal(g[..., o[1] : o[2]], genos)
+    np.testing.assert_equal(p[..., o[0] : o[1]], phasing)
+    np.testing.assert_equal(p[..., o[1] : o[2]], phasing)
+    np.testing.assert_equal(d[..., o[0] : o[1]], dosages)
+    np.testing.assert_equal(d[..., o[1] : o[2]], dosages)
+
+
+@parametrize_with_cases("cse, genos, phasing, dosages", cases=".", prefix="read_")
+def test_chunk_ranges(
+    pgen: PGEN,
+    cse: tuple[str, int, int],
+    genos: NDArray[np.int8],
+    phasing: NDArray[np.bool_],
+    dosages: NDArray[np.float32],
+):
+    c, s, e = cse
+    s = [s, s]
+    e = [e, e]
+
+    mode = PGEN.GenosPhasingDosages
+    gpdo = pgen.chunk_ranges(c, s, e, max_mem=pgen._mem_per_variant(mode), mode=mode)
+    for range_ in gpdo:
+        assert range_ is not None
+        for i, chunk in enumerate(range_):
+            g, p, d = chunk
+            np.testing.assert_equal(g, genos[..., [i]])
+            np.testing.assert_equal(p, phasing[..., [i]])
+            np.testing.assert_equal(d, dosages[..., [i]])
 
 
 @parametrize_with_cases("cse, genos, phasing, dosages", cases=".", prefix="read_")
@@ -104,14 +150,9 @@ def test_set_samples(
     assert pgen.n_samples == len(samples)
     np.testing.assert_equal(pgen._s_idx, s_idx)
 
-    # (s p v)
-    actual_genos = pgen.read(*cse)
-    assert actual_genos is not None
-    actual_dosages = pgen.read(*cse, PGEN.Dosages)
-    assert actual_dosages is not None
-    actual_genos_dosages = pgen.read(*cse, PGEN.GenosDosages)
-    assert actual_genos_dosages is not None
-    np.testing.assert_equal(actual_genos, genos[s_idx])
-    np.testing.assert_equal(actual_dosages, dosages[s_idx])
-    np.testing.assert_equal(actual_genos_dosages[0], genos[s_idx])
-    np.testing.assert_equal(actual_genos_dosages[1], dosages[s_idx])
+    gpd = pgen.read(*cse, PGEN.GenosPhasingDosages)
+    assert gpd is not None
+    g, p, d = gpd
+    np.testing.assert_equal(g, genos[s_idx])
+    np.testing.assert_equal(p, phasing[s_idx])
+    np.testing.assert_equal(d, dosages[s_idx])
