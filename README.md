@@ -1,9 +1,3 @@
-```{toctree}
-:hidden: true
-
-api
-```
-
 # `genoray`
 
 If you want to use NumPy with genetic variant data, `genoray` is for you! `genoray` enables ergonomic and efficient range queries of genotypes and dosages from VCF and PGEN (PLINK 2.0) files. `genoray` is also fully type-safe and has minimal dependencies.
@@ -128,11 +122,28 @@ pgen = PGEN("hardcalls.pgen", dosage_path="dosage.pgen", ...)
 
 ## Filtering
 
-You can filter variants from VCF or PGEN files by a providing a function or [polars expression](https://docs.pola.rs/user-guide/concepts/expressions-and-contexts/) to the constructor, respectively. For VCFs, the function must accept a [cyvcf2.Variant](https://brentp.github.io/cyvcf2/docstrings.html#cyvcf2.cyvcf2.Variant) and return a boolean indicating whether to include the variant. For PGENs, the expression will operate on a polars DataFrame with all of the columns available in the underlying PVAR except "#CHROM", "POS", and "ALT", which are superseded by columns that are added by genoray: "Chromosome", "Start", "End", "ALT" as a list of strings, "ilen" (indel length), and "kind". The expression should return a boolean mask indicating which variants to include. The "kind" column is a list of strings that indicates the type of each ALT allele as "SNP", "INDEL", "MNP", or "OTHER".
+You can filter variants from VCF or PGEN files by a providing a function or [polars expression](https://docs.pola.rs/user-guide/concepts/expressions-and-contexts/) to the constructor, respectively.
+
+For VCFs, the function must accept a [cyvcf2.Variant](https://brentp.github.io/cyvcf2/docstrings.html#cyvcf2.cyvcf2.Variant) and return a boolean indicating whether to include the site.
 
 ```python
-vcf = VCF("file.vcf.gz", filter=lambda v: v.INFO['AF_EUR'] > 0.05)  # only include variants that are common in EUR
-pgen = PGEN("file.pgen", filter=pl.col("kind").list.eval(pl.element() == "SNP").list.all())  # only include SNPs
+# only include variants that are common in EUR
+vcf = VCF("file.vcf.gz", filter=lambda v: v.INFO['AF_EUR'] > 0.05)
+```
+
+For PGENs, the expression will operate on a polars DataFrame with all of the columns available in the underlying PVAR except `#CHROM`, `POS`, and `ALT`, which are superseded by columns added by `genoray`:
+- `Chromosome`
+- `Start`
+- `End`
+- `ALT` as a list of strings
+- `ilen` (indel length)
+- `kind` a list of strings that indicates the type of each ALT allele as `"SNP"`, `"INDEL"`, `"MNP"`, or `"OTHER"`
+
+The expression should return a boolean mask indicating which variants to include.
+
+```python
+# only include SNPs
+pgen = PGEN("file.pgen", filter=pl.col("kind").list.eval(pl.element() == "SNP").list.all())
 ```
 
 # ⚠️ Important ⚠️
