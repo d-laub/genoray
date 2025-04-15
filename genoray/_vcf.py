@@ -134,7 +134,7 @@ class VCF:
     """A progress bar to use while reading variants. This will be incremented per variant
     during any calls to a read function."""
     _vcf: cyvcf2.VCF
-    _s_idx: NDArray[np.intp]
+    _s_sorter: NDArray[np.intp] | slice
     _samples: list[str]
     _c_norm: ContigNormalizer
 
@@ -185,9 +185,9 @@ class VCF:
         self.available_samples = self._vcf.samples
         self.contigs = self._vcf.seqnames
         self._c_norm = ContigNormalizer(self.contigs)
-        self.set_samples(self._vcf.samples)
         self.progress = progress
         self._pbar = None
+        self.set_samples(self._vcf.samples)
 
     def _open(self, samples: list[str] | None = None) -> cyvcf2.VCF:
         return cyvcf2.VCF(self.path, samples=samples, lazy=True)
@@ -202,7 +202,7 @@ class VCF:
         """Number of samples in the VCF file."""
         return len(self._samples)
 
-    def set_samples(self, samples: list[str]) -> Self:
+    def set_samples(self, samples: list[str] | None) -> Self:
         """Set the samples to read from the VCF file. Modifies the VCF reader in place and returns it.
 
         Parameters
@@ -214,6 +214,12 @@ class VCF:
         -------
             The VCF reader with the specified samples.
         """
+        if samples is None or samples == self.available_samples:
+            self._s_sorter = slice(None)
+            self._samples = self.available_samples
+            self._vcf = self._open(samples)
+            return self
+
         if missing := set(samples).difference(self.available_samples):
             raise ValueError(
                 f"Samples {missing} not found in the VCF file. "
@@ -222,7 +228,7 @@ class VCF:
         self._vcf = self._open(samples)
         _, s_idx, _ = np.intersect1d(self._vcf.samples, samples, return_indices=True)
         self._samples = samples
-        self._s_idx = s_idx
+        self._s_sorter = np.argsort(s_idx)
         return self
 
     def __del__(self):
@@ -597,10 +603,10 @@ class VCF:
 
             if self.phasing:
                 # (s p+1) np.int16
-                out[..., i] = v.genotype.array()
+                out[..., i] = v.genotype.array()[self._s_sorter]
             else:
                 # (s p) np.int16
-                out[..., i] = v.genotype.array()[:, : self.ploidy]
+                out[..., i] = v.genotype.array()[self._s_sorter, : self.ploidy]
 
             if self._pbar is not None:
                 self._pbar.update()
@@ -628,7 +634,7 @@ class VCF:
                     f"Dosage field '{dosage_field}' not found for record {repr(v)}"
                 )
             # (s, 1, 1) or (s, 1)? -> (s)
-            out[..., i] = d.squeeze()
+            out[..., i] = d.squeeze(1)[self._s_sorter]
 
             if self._pbar is not None:
                 self._pbar.update()
@@ -656,10 +662,9 @@ class VCF:
 
             if self.phasing:
                 # (s p+1) np.int16
-                out[0][..., i] = v.genotype.array()
+                out[0][..., i] = v.genotype.array()[self._s_sorter]
             else:
-                print(i, out[0].shape, v.genotype.array()[:, : self.ploidy].shape)
-                out[0][..., i] = v.genotype.array()[:, : self.ploidy]
+                out[0][..., i] = v.genotype.array()[self._s_sorter, : self.ploidy]
 
             d = v.format(dosage_field)
             if d is None:
@@ -667,7 +672,7 @@ class VCF:
                     f"Dosage field '{dosage_field}' not found for record {repr(v)}"
                 )
             # (s, 1, 1) or (s, 1)? -> (s)
-            out[1][..., i] = d.squeeze()
+            out[1][..., i] = d.squeeze(1)[self._s_sorter]
 
             if self._pbar is not None:
                 self._pbar.update()

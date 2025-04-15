@@ -6,6 +6,7 @@ from numpy.typing import NDArray
 from pytest_cases import fixture, parametrize_with_cases
 
 from genoray import VCF
+from genoray._utils import is_dtype
 
 tdir = Path(__file__).parent
 ddir = tdir / "data"
@@ -21,9 +22,9 @@ def read_all():
     # (s p v)
     genos = np.array([[[0, -1], [1, -1]], [[1, 0], [1, 1]]], np.int8)
     # (s v)
-    dosages = np.full((2, 2), 0.5, np.float32)
-    dosages[0, 1] = np.nan
-    return cse, genos, dosages
+    phasing = np.array([[1, 0], [1, 0]], np.bool_)
+    dosages = np.array([[1.0, np.nan], [2.0, 1.0]], np.float32)
+    return cse, genos, phasing, dosages
 
 
 def read_spanning_del():
@@ -31,29 +32,68 @@ def read_spanning_del():
     # (s p v)
     genos = np.array([[[0], [1]], [[1], [1]]], np.int8)
     # (s v)
-    dosages = np.full((2, 1), 0.5, np.float32)
-    return cse, genos, dosages
+    phasing = np.array([[1], [1]], np.bool_)
+    dosages = np.array([[1.0], [2.0]], np.float32)
+    return cse, genos, phasing, dosages
 
 
-@parametrize_with_cases("cse, genos, dosages", cases=".", prefix="read_")
+@parametrize_with_cases("cse, genos, phasing, dosages", cases=".", prefix="read_")
 def test_read(
     vcf: VCF,
     cse: tuple[str, int, int],
     genos: NDArray[np.int8],
+    phasing: NDArray[np.bool_],
     dosages: NDArray[np.float32],
 ):
     # (s p v)
-    actual = vcf.read(*cse, VCF.Genos16Dosages)
-    assert actual is not None
-    np.testing.assert_equal(actual[0], genos)
-    np.testing.assert_equal(actual[1], dosages)
+    g = vcf.read(*cse, VCF.Genos8)
+    assert g is not None
+    assert is_dtype(g, np.int8)
+    np.testing.assert_equal(g, genos)
+
+    # (s p v)
+    g = vcf.read(*cse, VCF.Genos16)
+    assert g is not None
+    assert is_dtype(g, np.int16)
+    np.testing.assert_equal(g, genos)
+
+    # (s p v)
+    d = vcf.read(*cse, VCF.Dosages)
+    assert d is not None
+    np.testing.assert_equal(d, dosages)
+
+    # (s p v)
+    gd = vcf.read(*cse, VCF.Genos16Dosages)
+    assert gd is not None
+    g, d = gd
+    assert is_dtype(g, np.int16)
+    np.testing.assert_equal(g, genos)
+    np.testing.assert_equal(d, dosages)
+
+    vcf.phasing = True
+    gp = vcf.read(*cse)
+    assert gp is not None
+    assert is_dtype(gp, np.int16)
+    g, p = np.array_split(gp, 2, 1)
+    np.testing.assert_equal(g, genos)
+    # (s 1 v) -> (s p v)
+    np.testing.assert_equal(p.squeeze(1).astype(bool), phasing)
+
+    gpd = vcf.read(*cse, VCF.Genos16Dosages)
+    assert gpd is not None
+    gp, d = gpd
+    g, p = np.array_split(gp, 2, 1)
+    np.testing.assert_equal(g, genos)
+    np.testing.assert_equal(p.squeeze(1).astype(bool), phasing)
+    np.testing.assert_equal(d, dosages)
 
 
-@parametrize_with_cases("cse, genos, dosages", cases=".", prefix="read_")
+@parametrize_with_cases("cse, genos, phasing, dosages", cases=".", prefix="read_")
 def test_chunk(
     vcf: VCF,
     cse: tuple[str, int, int],
     genos: NDArray[np.int8],
+    phasing: NDArray[np.bool_],
     dosages: NDArray[np.float32],
 ):
     max_mem = vcf._mem_per_variant(VCF.Genos16Dosages)
@@ -65,3 +105,32 @@ def test_chunk(
     actual = cat(chunks[0]), cat(chunks[1])
     np.testing.assert_equal(actual[0], genos)
     np.testing.assert_equal(actual[1], dosages)
+
+
+@parametrize_with_cases("cse, genos, phasing, dosages", cases=".", prefix="read_")
+def test_set_samples(
+    vcf: VCF,
+    cse: tuple[str, int, int],
+    genos: NDArray[np.int8],
+    phasing: NDArray[np.bool_],
+    dosages: NDArray[np.float32],
+):
+    s_idx = [1]
+    s_sorter = np.array([0], np.intp)
+    samples = [vcf.available_samples[i] for i in s_idx]
+    vcf.set_samples(samples)
+    assert vcf.current_samples == samples
+    assert vcf.n_samples == len(samples)
+    np.testing.assert_equal(vcf._s_sorter, s_sorter)
+
+    # (s p v)
+    actual_genos = vcf.read(*cse)
+    assert actual_genos is not None
+    actual_dosages = vcf.read(*cse, VCF.Dosages)
+    assert actual_dosages is not None
+    actual_genos_dosages = vcf.read(*cse, VCF.Genos16Dosages)
+    assert actual_genos_dosages is not None
+    np.testing.assert_equal(actual_genos, genos[s_idx])
+    np.testing.assert_equal(actual_dosages, dosages[s_idx])
+    np.testing.assert_equal(actual_genos_dosages[0], genos[s_idx])
+    np.testing.assert_equal(actual_genos_dosages[1], dosages[s_idx])

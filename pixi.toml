@@ -25,8 +25,10 @@ ipywidgets = "*"
 genoray = { path = ".", editable = true }
 
 [feature.dev.tasks]
-i-kernel = "ipython kernel install --user --name genoray"
 pre-commit = "pre-commit install --hook-type commit-msg"
+i-kernel = "ipython kernel install --user --name genoray"
+gen = "./tests/data/gen_from_vcf.sh"
+test = "pytest tests"
 bump-dry = "cz bump --dry-run"
 bump = "cz bump && git push --follow-tags"
 publish = "rm -r dist && uv build && uv publish"

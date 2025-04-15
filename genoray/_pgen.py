@@ -112,7 +112,8 @@ class PGEN:
     _index: pr.PyRanges
     _geno_pgen: pgenlib.PgenReader
     _dose_pgen: pgenlib.PgenReader
-    _s_idx: NDArray[np.uint32]
+    _s_idx: NDArray[np.uint32] | slice
+    _s_sorter: NDArray[np.intp] | slice
     _dose_path: Path | None
     _ilens: NDArray[np.int32] | None  # unfiltered ilens so that var_idxs map correctly
 
@@ -154,7 +155,8 @@ class PGEN:
             dtype=samples.dtype,
         )
         self._s2i.add(samples)
-        self._s_idx = np.arange(len(samples), dtype=np.uint32)
+        self._s_idx = slice(None)
+        self._s_sorter = slice(None)
         self._geno_pgen = pgenlib.PgenReader(bytes(geno_path), len(samples))
 
         if dosage_path is not None:
@@ -180,14 +182,18 @@ class PGEN:
     @property
     def current_samples(self) -> list[str]:
         """List of samples that are currently being used, in order."""
+        if isinstance(self._s_sorter, slice):
+            return self.available_samples
         return cast(list[str], self._s2i.keys[self._s_idx].tolist())
 
     @property
     def n_samples(self) -> int:
         """Number of samples in the file."""
-        return len(self._s_idx)
+        if isinstance(self._s_sorter, slice):
+            return len(self.available_samples)
+        return len(self._s_sorter)
 
-    def set_samples(self, samples: list[str]) -> Self:
+    def set_samples(self, samples: list[str] | None) -> Self:
         """Set the samples to use.
 
         Parameters
@@ -195,11 +201,17 @@ class PGEN:
         samples
             List of sample names to use. If None, all samples will be used.
         """
+        if samples is None or samples == self.available_samples:
+            self._s_idx = slice(None)
+            self._s_sorter = slice(None)
+            return self
+
         _samples = np.atleast_1d(samples)
         s_idx = self._s2i.get(_samples).astype(np.uint32)
         if (missing := _samples[s_idx == -1]).any():
             raise ValueError(f"Samples {missing} not found in the file.")
         self._s_idx = s_idx
+        self._s_sorter = np.argsort(s_idx)
         # if dose path is None, then dose pgen is just a reference to geno pgen so
         # we're also (somewhat unsafely) mutating the dose pgen here
         self._geno_pgen.change_sample_subset(np.sort(s_idx))
@@ -495,7 +507,7 @@ class PGEN:
             dosages have shape :code:`(samples variants)`. Missing genotypes have value -1 and missing dosages
             have value np.nan. If just using genotypes or dosages, will be a single array, otherwise
             will be a tuple of arrays.
-            
+
             Shape: (ranges+1). Offsets to slice out data for each range from the variants axis like so:
 
         Examples
@@ -766,7 +778,7 @@ class PGEN:
         self._geno_pgen.read_alleles_list(var_idxs, _out)
         _out = _out.reshape(len(var_idxs), self.n_samples, self.ploidy).transpose(
             1, 2, 0
-        )[self._s_idx]
+        )[self._s_sorter]
         _out[_out == -9] = -1
         return Genos(_out)
 
@@ -779,7 +791,7 @@ class PGEN:
             _out = out
 
         self._dose_pgen.read_dosages_list(var_idxs, _out)
-        _out = _out.transpose(1, 0)[self._s_idx]
+        _out = _out.transpose(1, 0)[self._s_sorter]
         _out[_out == -9] = np.nan
 
         return Dosages.parse(_out)
@@ -812,9 +824,9 @@ class PGEN:
         self._dose_pgen.read_alleles_and_phasepresent_list(var_idxs, genos, phasing)
         genos = genos.reshape(len(var_idxs), self.n_samples, self.ploidy).transpose(
             1, 2, 0
-        )[self._s_idx]
-        genos[genos == -9] = np.nan
-        phasing = phasing.transpose(1, 0)[self._s_idx]
+        )[self._s_sorter]
+        genos[genos == -9] = -1
+        phasing = phasing.transpose(1, 0)[self._s_sorter]
 
         return GenosPhasing.parse((genos, phasing))
 

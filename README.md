@@ -4,15 +4,16 @@ If you want to use NumPy with genetic variant data, `genoray` is for you! `genor
 
 # Summary
 
-The `genoray` API more-or-less boils down to just two classes and up to four methods:
+The `genoray` API more-or-less boils down to just two classes and up to five methods:
 
 - `VCF` and `PGEN` classes for reading VCF and PGEN files, respectively.
-- `read` method for reading a single range of variants.
-- `chunk` method for reading a single range of variants in chunks.
-- `read_ranges` method for reading multiple ranges of variants at once.
-- `chunk_ranges` method for reading multiple ranges of variants at once in chunks.
+- `read` read variants for a single range.
+- `chunk` read variants for a single range in chunks.
+- `read_ranges` read multiple ranges of variants at once.
+- `chunk_ranges` read multiple ranges of variants in chunks.
+- `set_samples` subset and/or re-order the samples.
 
-The other important arguments to know are `mode` (and `phasing` for VCF) to set the return type and `max_mem` for chunking. The modes that are available for each file format are always accessible from the class itself, e.g. `VCF.Genos16`, `PGEN.GenosDosages`, etc. Lastly, you can filter variants on the fly using the `filter` argument to class constructors.
+The other important arguments to know are `mode` (and `phasing` for VCF) to set the return type and `max_mem` for chunking. The modes that are available for each file format are always accessible from the class itself, e.g. `VCF.Genos16`, `PGEN.GenosDosages`, etc. You can also filter variants on the fly using the `filter` argument to class constructors.
 
 # Examples
 

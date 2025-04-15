@@ -21,9 +21,9 @@ def read_all():
     # (s p v)
     genos = np.array([[[0, -1], [1, -1]], [[1, 0], [1, 1]]], np.int8)
     # (s v)
-    dosages = np.full((2, 2), 0.5, np.float32)
-    dosages[0, 1] = np.nan
-    return cse, genos, dosages
+    phasing = np.array([[1, 0], [1, 0]], np.bool_)
+    dosages = np.array([[1.0, np.nan], [2.0, 1.0]], np.float32)
+    return cse, genos, phasing, dosages
 
 
 def read_spanning_del():
@@ -31,28 +31,51 @@ def read_spanning_del():
     # (s p v)
     genos = np.array([[[0], [1]], [[1], [1]]], np.int8)
     # (s v)
-    dosages = np.full((2, 1), 0.5, np.float32)
-    return cse, genos, dosages
+    phasing = np.array([[1], [1]], np.bool_)
+    dosages = np.array([[1.0], [2.0]], np.float32)
+    return cse, genos, phasing, dosages
 
 
-@parametrize_with_cases("cse, genos, dosages", cases=".", prefix="read_")
+@parametrize_with_cases("cse, genos, phasing, dosages", cases=".", prefix="read_")
 def test_read(
     pgen: PGEN,
     cse: tuple[str, int, int],
     genos: NDArray[np.int8],
+    phasing: NDArray[np.bool_],
     dosages: NDArray[np.float32],
 ):
     # (s p v)
-    actual = pgen.read(*cse)
-    np.testing.assert_equal(actual, genos)
-    # np.testing.assert_equal(actual[1], dosages)
+    g = pgen.read(*cse)
+    assert g is not None
+    np.testing.assert_equal(g, genos)
+
+    d = pgen.read(*cse, PGEN.Dosages)
+    assert d is not None
+    np.testing.assert_equal(d, dosages)
+
+    gp = pgen.read(*cse, PGEN.GenosPhasing)
+    assert gp is not None
+    np.testing.assert_equal(gp[0], genos)
+    np.testing.assert_equal(gp[1], phasing)
+
+    gd = pgen.read(*cse, PGEN.GenosDosages)
+    assert gd is not None
+    np.testing.assert_equal(gd[0], genos)
+    np.testing.assert_equal(gd[1], dosages)
+
+    gpd = pgen.read(*cse, PGEN.GenosPhasingDosages)
+    assert gpd is not None
+    np.testing.assert_equal(gpd[0], genos)
+    np.testing.assert_equal(gpd[1], phasing)
+    np.testing.assert_equal(gpd[2], dosages)
 
 
-@parametrize_with_cases("cse, genos, dosages", cases=".", prefix="read_")
+@parametrize_with_cases("cse, genos, phasing, dosages", cases=".", prefix="read_")
 def test_chunk(
     pgen: PGEN,
     cse: tuple[str, int, int],
     genos: NDArray[np.int8],
+    phasing: NDArray[np.bool_],
     dosages: NDArray[np.float32],
 ):
     max_mem = pgen._mem_per_variant(PGEN.Genos)
@@ -64,3 +87,31 @@ def test_chunk(
     actual = cat(chunks)
     np.testing.assert_equal(actual, genos)
     # np.testing.assert_equal(actual[1], dosages)
+
+
+@parametrize_with_cases("cse, genos, phasing, dosages", cases=".", prefix="read_")
+def test_set_samples(
+    pgen: PGEN,
+    cse: tuple[str, int, int],
+    genos: NDArray[np.int8],
+    phasing: NDArray[np.bool_],
+    dosages: NDArray[np.float32],
+):
+    s_idx = np.array([1], np.uint32)
+    samples = [pgen.available_samples[i] for i in s_idx]
+    pgen.set_samples(samples)
+    assert pgen.current_samples == samples
+    assert pgen.n_samples == len(samples)
+    np.testing.assert_equal(pgen._s_idx, s_idx)
+
+    # (s p v)
+    actual_genos = pgen.read(*cse)
+    assert actual_genos is not None
+    actual_dosages = pgen.read(*cse, PGEN.Dosages)
+    assert actual_dosages is not None
+    actual_genos_dosages = pgen.read(*cse, PGEN.GenosDosages)
+    assert actual_genos_dosages is not None
+    np.testing.assert_equal(actual_genos, genos[s_idx])
+    np.testing.assert_equal(actual_dosages, dosages[s_idx])
+    np.testing.assert_equal(actual_genos_dosages[0], genos[s_idx])
+    np.testing.assert_equal(actual_genos_dosages[1], dosages[s_idx])
