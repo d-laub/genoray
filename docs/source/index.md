@@ -165,6 +165,7 @@ pgen = PGEN("file.pgen", filter=pl.col("kind").list.eval(pl.element() == "SNP").
 - Different file formats may use different data types for their respective representations of genotypes, phasing, and dosages.
 - Ranges are 0-based, so starts begin at 0 and ends are exclusive.
 - Missing genotypes and dosages are encoded as -1 and `np.nan`, respectively.
+- Dosages from PGEN files may not exactly match VCF files (up to a fraction of a percent) because PLINK 2.0 must encode dosages with fixed precision which can not match what can be represented by text in a VCF (may also disagree with how BCF encodes dosage).
 
 # Contributing
 
