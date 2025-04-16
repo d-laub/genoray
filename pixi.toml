@@ -31,7 +31,8 @@ i-kernel = "ipython kernel install --user --name genoray"
 gen = "sh tests/data/gen_from_vcf.sh"
 test = "pytest tests"
 bump-dry = "cz bump --dry-run"
-bump = "cz bump && git push --follow-tags"
+bump = "cz bump"
+push = "git push --follow-tags"
 publish = "rm -r dist && uv build && uv publish"
 
 [feature.doc.dependencies]

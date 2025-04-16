@@ -1,3 +1,9 @@
+## 0.4.0 (2025-04-15)
+
+### Feat
+
+- chunk_ranges_with_length and everything passes all tests
+
 ## 0.3.0 (2025-04-14)
 
 ### Feat
