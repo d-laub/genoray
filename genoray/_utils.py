@@ -134,4 +134,4 @@ def hap_ilens(
         Lengths of the haplotypes. Shape: (samples, ploidy).
     """
     ilens = np.broadcast_to(ilens, genotypes.shape)  # zero-copy, read only
-    return ilens.sum(-1, where=genotypes == 1)
+    return ilens.sum(-1, dtype=np.int32, where=genotypes == 1)

@@ -23,11 +23,12 @@ ipywidgets = "*"
 
 [feature.dev.pypi-dependencies]
 genoray = { path = ".", editable = true }
+jurigged = { version = ">=0.6.0, <0.7", extras = ["develoop"] }
 
 [feature.dev.tasks]
 pre-commit = "pre-commit install --hook-type commit-msg"
 i-kernel = "ipython kernel install --user --name genoray"
-gen = "./tests/data/gen_from_vcf.sh"
+gen = "sh tests/data/gen_from_vcf.sh"
 test = "pytest tests"
 bump-dry = "cz bump --dry-run"
 bump = "cz bump && git push --follow-tags"

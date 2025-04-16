@@ -1,0 +1,5 @@
+##contig=<ID=chr1>
+#CHROM	POS	ID	REF	ALT
+1	81262	.	GAT	A
+1	81262	.	G	A
+1	81265	.	T	C

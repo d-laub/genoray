@@ -13,7 +13,10 @@ from numpy.typing import ArrayLike, NDArray
 from phantom import Phantom
 from typing_extensions import Self, TypeGuard, assert_never
 
-from ._types import R_DTYPE, UINT64_MAX
+from ._types import (  #! we have to use INT64_MAX because this is what PyRanges uses!
+    INT64_MAX,
+    PGEN_R_DTYPE,
+)
 from ._utils import (
     ContigNormalizer,
     format_memory,
@@ -97,7 +100,7 @@ class GenosPhasingDosages(
 
 
 T = TypeVar("T", Genos, Dosages, GenosPhasing, GenosDosages, GenosPhasingDosages)
-L = TypeVar("L", Genos, GenosDosages)
+L = TypeVar("L", Genos, GenosPhasing, GenosDosages, GenosPhasingDosages)
 
 
 class PGEN:
@@ -115,7 +118,7 @@ class PGEN:
     _s_idx: NDArray[np.uint32] | slice
     _s_sorter: NDArray[np.intp] | slice
     _dose_path: Path | None
-    _ilens: NDArray[np.int32] | None  # unfiltered ilens so that var_idxs map correctly
+    _sei: StartsEndsIlens | None  # unfiltered so that var_idxs map correctly
 
     Genos = Genos
     """:code:`(samples ploidy variants) int32`"""
@@ -173,7 +176,7 @@ class PGEN:
 
         if not geno_path.with_suffix(".pvar.gvi").exists():
             _write_index(geno_path.with_suffix(".pvar"))
-        self._index, self._ilens = _read_index(
+        self._index, self._sei = _read_index(
             geno_path.with_suffix(".pvar.gvi"), self.filter
         )
         self.contigs = self._index.chromosomes
@@ -248,7 +251,7 @@ class PGEN:
         self,
         contig: str,
         starts: ArrayLike = 0,
-        ends: ArrayLike = UINT64_MAX,
+        ends: ArrayLike = INT64_MAX,
     ) -> NDArray[np.uint32]:
         """Return the start and end indices of the variants in the given ranges.
 
@@ -266,13 +269,13 @@ class PGEN:
         n_variants
             Shape: :code:`(ranges)`. Number of variants in the given ranges.
         """
-        starts = np.atleast_1d(np.asarray(starts, R_DTYPE))
+        starts = np.atleast_1d(np.asarray(starts, PGEN_R_DTYPE))
 
         c = self._c_norm.norm(contig)
         if c is None:
             return np.zeros_like(starts, dtype=np.uint32)
 
-        ends = np.atleast_1d(np.asarray(ends, R_DTYPE))
+        ends = np.atleast_1d(np.asarray(ends, PGEN_R_DTYPE))
         queries = pr.PyRanges(
             pl.DataFrame(
                 {
@@ -293,7 +296,7 @@ class PGEN:
         self,
         contig: str,
         starts: ArrayLike = 0,
-        ends: ArrayLike = UINT64_MAX,
+        ends: ArrayLike = INT64_MAX,
     ) -> tuple[NDArray[np.uint32], NDArray[np.uint64]]:
         """Get variant indices and the number of indices per range.
 
@@ -312,17 +315,17 @@ class PGEN:
 
             Shape: (ranges+1). Offsets to get variant indices for each range.
         """
-        starts = np.atleast_1d(np.asarray(starts, R_DTYPE))
+        starts = np.atleast_1d(np.asarray(starts, PGEN_R_DTYPE))
 
         c = self._c_norm.norm(contig)
         if c is None:
             return np.empty(0, np.uint32), np.zeros_like(starts, np.uint64)
 
-        ends = np.atleast_1d(np.asarray(ends, R_DTYPE))
+        ends = np.atleast_1d(np.asarray(ends, PGEN_R_DTYPE))
         queries = pr.PyRanges(
             pl.DataFrame(
                 {
-                    "Chromosome": np.full_like(starts, contig),
+                    "Chromosome": np.full(len(starts), c),
                     "Start": starts,
                     "End": ends,
                 }
@@ -347,7 +350,7 @@ class PGEN:
         self,
         contig: str,
         start: int | np.integer = 0,
-        end: int | np.integer = UINT64_MAX,
+        end: int | np.integer = INT64_MAX,
         mode: type[T] = Genos,
         out: T | None = None,
     ) -> T | None:
@@ -409,13 +412,13 @@ class PGEN:
         else:
             assert_never(mode)
 
-        return mode.parse(_out)
+        return _out  # type: ignore
 
     def chunk(
         self,
         contig: str,
         start: int | np.integer = 0,
-        end: int | np.integer = UINT64_MAX,
+        end: int | np.integer = INT64_MAX,
         max_mem: int | str = "4g",
         mode: type[T] = Genos,
     ) -> Generator[T]:
@@ -484,7 +487,7 @@ class PGEN:
         self,
         contig: str,
         starts: ArrayLike = 0,
-        ends: ArrayLike = UINT64_MAX,
+        ends: ArrayLike = INT64_MAX,
         mode: type[T] = Genos,
     ) -> tuple[T, NDArray[np.uint64]] | None:
         """Read genotypes and/or dosages for multiple ranges.
@@ -547,7 +550,7 @@ class PGEN:
         self,
         contig: str,
         starts: ArrayLike = 0,
-        ends: ArrayLike = UINT64_MAX,
+        ends: ArrayLike = INT64_MAX,
         max_mem: int | str = "4g",
         mode: type[T] = Genos,
     ) -> Generator[Generator[T] | None]:
@@ -593,8 +596,8 @@ class PGEN:
         if c is None:
             return
 
-        starts = np.atleast_1d(np.asarray(starts, R_DTYPE))
-        ends = np.atleast_1d(np.asarray(ends, R_DTYPE))
+        starts = np.atleast_1d(np.asarray(starts, PGEN_R_DTYPE))
+        ends = np.atleast_1d(np.asarray(ends, PGEN_R_DTYPE))
 
         var_idxs, offsets = self.var_idxs(c, starts, ends)
         n_variants = len(var_idxs)
@@ -640,7 +643,7 @@ class PGEN:
         self,
         contig: str,
         starts: ArrayLike = 0,
-        ends: ArrayLike = UINT64_MAX,
+        ends: ArrayLike = INT64_MAX,
         max_mem: int | str = "4g",
         mode: type[L] = Genos,
     ) -> Generator[Generator[L] | None]:
@@ -687,9 +690,9 @@ class PGEN:
                     # do something with chunk
                     pass
         """
-        if self._ilens is None:
+        if self._sei is None:
             raise ValueError(
-                "Cannot use chunk_ranges_with_length without ilens, which usually happens when multi-allelic"
+                "Cannot use chunk_ranges_with_length without variant start, end, and ilen info, which usually happens when multi-allelic"
                 " variants are present."
             )
 
@@ -697,14 +700,16 @@ class PGEN:
 
         c = self._c_norm.norm(contig)
         if c is None:
+            # we have full length, no deletions in any of the ranges
             return
 
-        starts = np.atleast_1d(np.asarray(starts, R_DTYPE))
-        ends = np.atleast_1d(np.asarray(ends, R_DTYPE))
+        starts = np.atleast_1d(np.asarray(starts, PGEN_R_DTYPE))
+        ends = np.atleast_1d(np.asarray(ends, PGEN_R_DTYPE))
 
         var_idxs, offsets = self.var_idxs(c, starts, ends)
         n_variants = len(var_idxs)
         if n_variants == 0:
+            # we have full length, no deletions in any of the ranges
             return
 
         mem_per_v = self._mem_per_variant(mode)
@@ -717,31 +722,35 @@ class PGEN:
 
         if issubclass(mode, Genos):
             read = self._read_genos
+        elif issubclass(mode, GenosPhasing):
+            read = self._read_genos_phasing
         elif issubclass(mode, GenosDosages):
             read = self._read_genos_dosages
+        elif issubclass(mode, GenosPhasingDosages):
+            read = self._read_genos_phasing_dosages
         else:
             assert_never(mode)
 
         read = cast(Callable[[NDArray[np.uint32]], L], read)
 
-        for i in range(len(offsets) - 1):
+        for i, s, e in zip(range(len(offsets) - 1), starts, ends):
             o_s, o_e = offsets[i], offsets[i + 1]
             range_idxs = var_idxs[o_s:o_e]
             n_variants = len(range_idxs)
             if n_variants == 0:
+                # we have full length, no deletions in any of the ranges
                 yield None
                 return
             n_chunks = -(-n_variants // vars_per_chunk)
             v_chunks = np.array_split(range_idxs, n_chunks)
 
-            yield cast(
-                Generator[L],
-                _gen_with_length(
-                    v_chunks=v_chunks,
-                    length=int(ends[i] - starts[i]),
-                    read=read,
-                    ilens=self._ilens,
-                ),
+            yield _gen_with_length(
+                v_chunks=v_chunks,
+                length=e - s,
+                read=read,
+                v_starts=self._sei.v_starts,
+                v_ends=self._sei.v_ends,
+                ilens=self._sei.ilens,
             )
 
     def _mem_per_variant(self, mode: type[T]) -> int:
@@ -851,44 +860,71 @@ def _gen_with_length(
     v_chunks: list[NDArray[np.uint32]],
     length: int,
     read: Callable[[NDArray[np.uint32]], L],
+    v_starts: NDArray[PGEN_R_DTYPE],  # full dataset v_starts
+    v_ends: NDArray[PGEN_R_DTYPE],  # full dataset v_ends
     ilens: NDArray[np.int32],  # full dataset ilens
 ) -> Generator[L]:
-    max_idx = len(ilens)
+    # * This implementation computes haplotype lengths as shorter than they actually are if a spanning deletion is present
+    # * This this will result in including more variants than needed, which is fine since we're extending var_idx by more than we
+    # * need to anyway.
+    #! Assume len(v_chunks) > 0 and all len(var_idx) > 0 is guaranteed by caller
+
+    max_idx = len(ilens) - 1
     for _, is_last, var_idx in mark_ends(v_chunks):
+        if not is_last:
+            yield read(var_idx)
+            continue
+
+        ext_s_idx = min(var_idx[-1] + 1, max_idx)
+        ext_e_idx = min(ext_s_idx + _IDX_EXTENSION - 1, max_idx)
+        if ext_s_idx == ext_e_idx:
+            yield read(var_idx)
+            return
+
+        var_idx = np.concat(
+            [var_idx, np.arange(ext_s_idx, ext_e_idx + 1, dtype=np.uint32)]
+        )
         out = read(var_idx)
 
-        if is_last:
-            ls_ext_out: list[L] = []
-            ext_s_idx = var_idx[-1]
+        if isinstance(out, Genos):
+            hap_lens = np.full(out.shape[:-1], length, dtype=np.int32)
+            hap_lens += hap_ilens(out, ilens[var_idx])
+        else:
+            hap_lens = np.full(out[0].shape[:-1], length, dtype=np.int32)
+            hap_lens += hap_ilens(out[0], ilens[var_idx])
 
-            if isinstance(out, GenosDosages):
-                hap_lens = np.full(out[0].shape[:-1], length, dtype=np.int32)
-                hap_lens += hap_ilens(out[0], ilens[var_idx])
+        ls_ext: list[L] = []
+        last_end = v_ends[var_idx[-1]]
+        while (hap_lens < length).any() and ext_s_idx < max_idx:
+            ext_s_idx = min(var_idx[-1] + 1, max_idx)
+            ext_e_idx = min(ext_s_idx + _IDX_EXTENSION - 1, max_idx)
+            if ext_s_idx == ext_e_idx:
+                break
+
+            var_idx = np.arange(ext_s_idx, ext_e_idx + 1, dtype=np.uint32)
+            ext_out = read(var_idx)
+            ls_ext.append(ext_out)
+
+            if isinstance(ext_out, Genos):
+                ext_genos = ext_out
             else:
-                hap_lens = np.full(out.shape[:-1], length, dtype=np.int32)
-                hap_lens += hap_ilens(out, ilens[var_idx])
+                ext_genos = ext_out[0]
 
-            while (hap_lens < length).any() and ext_s_idx < max_idx:
-                end_idx: int = min(ext_s_idx + _IDX_EXTENSION, max_idx)
-                ext_idx = np.arange(ext_s_idx + 1, end_idx, dtype=np.uint32)
-                ext_out = read(ext_idx)
+            dist = v_starts[var_idx[-1]] - last_end
+            hap_lens += dist + hap_ilens(ext_genos, ilens[var_idx])
+            last_end = v_ends[var_idx[-1]]
 
-                if isinstance(ext_out, GenosDosages):
-                    ext_genos = ext_out[0]
-                else:
-                    ext_genos = ext_out
+        if len(ls_ext) == 0:
+            yield out
+            return
 
-                ls_ext_out.append(ext_out)
-                ext_s_idx = ext_idx[-1]
-                hap_lens += hap_ilens(ext_genos, ilens[ext_idx])
-
-            if isinstance(out, GenosDosages):
-                data = tuple(map(np.concat, zip(*ls_ext_out)))
-            else:
-                data = np.concat([out, *ls_ext_out])
-            out = type(out).parse(data)
-
-        yield out
+        if isinstance(out, Genos):
+            out = np.concat([out, *ls_ext], axis=-1)
+        else:
+            out = tuple(
+                np.concat([o, *ls], axis=-1) for o, ls in zip(out, zip(*ls_ext))
+            )
+        yield out  # type: ignore
 
 
 def _read_psam(path: Path) -> NDArray[np.str_]:
@@ -921,7 +957,7 @@ def _read_psam(path: Path) -> NDArray[np.str_]:
 # Unless, NCLS creates a bunch of data structures in memory anyway.
 # TODO: support full .pvar and .bim spec see https://www.cog-genomics.org/plink/2.0/formats#pvar
 def _write_index(pvar: Path):
-    ILEN = pl.col("rlen") - pl.col("ALT").str.len_bytes()
+    ILEN = pl.col("ALT").str.len_bytes().cast(pl.Int32) - pl.col("rlen").cast(pl.Int32)
     KIND = (
         pl.when(ILEN != 0)
         .then(pl.lit("INDEL"))
@@ -938,7 +974,10 @@ def _write_index(pvar: Path):
             pvar,
             separator="\t",
             comment_prefix="##",
-            schema_overrides={"#CHROM": pl.Categorical, "POS": pl.UInt64},
+            schema_overrides={
+                "#CHROM": pl.Categorical,
+                "POS": pl.Int64,  #! MAKE SURE THIS MATCHES PGEN_R_DTYPE
+            },
         )
         .with_columns(
             Chromosome="#CHROM",
@@ -959,16 +998,49 @@ def _write_index(pvar: Path):
     )
 
 
+class StartsEndsIlens:
+    v_starts: NDArray[PGEN_R_DTYPE]
+    v_ends: NDArray[PGEN_R_DTYPE]
+    ilens: NDArray[np.int32]
+
+    def __init__(
+        self,
+        v_starts: NDArray[PGEN_R_DTYPE],
+        v_ends: NDArray[PGEN_R_DTYPE],
+        ilens: NDArray[np.int32],
+    ):
+        self.v_starts = v_starts
+        self.v_ends = v_ends
+        self.ilens = ilens
+
+
 def _read_index(
     path: Path, filter: pl.Expr | None
-) -> tuple[pr.PyRanges, NDArray[np.int32] | None]:
-    print(path)
+) -> tuple[pr.PyRanges, StartsEndsIlens | None]:
     index = pl.scan_ipc(path, row_index_name="index", memory_map=False)
 
-    if index.select((pl.col("ALT").list.len() != 1).any()).collect().item():
-        ilens = None
+    if filter is None:
+        has_multiallelics = (
+            index.select((pl.col("ALT").list.len() != 1).any()).collect().item()
+        )
     else:
-        ilens = index.select(pl.col("ilen").explode()).collect()["ilen"].to_numpy()
+        has_multiallelics = (
+            index.filter(filter)
+            .select((pl.col("ALT").list.len() != 1).any())
+            .collect()
+            .item()
+        )
+
+    if has_multiallelics:
+        sei = None
+    else:
+        # can just leave the first alt for multiallelic sites since they're getting filtered out
+        # anyway, so they won't be accessed
+        data = index.select("Start", "End", pl.col("ilen").list.first()).collect()
+        v_starts = data["Start"].to_numpy()
+        v_ends = data["End"].to_numpy()
+        ilens = data["ilen"].to_numpy()
+        sei = StartsEndsIlens(v_starts, v_ends, ilens)
 
     if filter is not None:
         index = index.filter(filter)
@@ -978,4 +1050,4 @@ def _read_index(
         .collect()
         .to_pandas(use_pyarrow_extension_array=True)
     )
-    return pyr, ilens
+    return pyr, sei

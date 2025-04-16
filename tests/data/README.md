@@ -1,1 +1,1 @@
-All test data are sourced from test.vcf and any changes to the test data should only be made in this file. After changes are made, run `gen_from_vcf.sh` to update the rest of the test data.
+All test data are sourced from the .vcf files and any changes to the test data should only be made in those files. After changes are made, run `gen_from_vcf.sh` to update the rest of the test data. Note that PLINK 2 does not support multi-allelics and dosages at the same time! Thus, there is a bi-allelic VCF with dosages and a multi-allelic VCF without.

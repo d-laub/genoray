@@ -6,15 +6,17 @@ from typing import Any, Callable, Generator, TypeVar, cast
 
 import cyvcf2
 import numpy as np
+from more_itertools import mark_ends
 from numpy.typing import ArrayLike, NDArray
 from phantom import Phantom
 from tqdm.auto import tqdm
 from typing_extensions import Self, TypeGuard, assert_never
 
-from ._types import R_DTYPE, UINT64_MAX
+from ._types import UINT64_MAX, VCF_R_DTYPE
 from ._utils import (
     ContigNormalizer,
     format_memory,
+    hap_ilens,
     parse_memory,
 )
 
@@ -112,6 +114,8 @@ class Genos16Dosages(tuple[Genos16, Dosages], Phantom, predicate=_is_genos16_dos
 
 T = TypeVar("T", Genos8, Genos16, Dosages, Genos8Dosages, Genos16Dosages)
 L = TypeVar("L", Genos8, Genos16, Genos8Dosages, Genos16Dosages)
+G = TypeVar("G", Genos8, Genos16)
+GD = TypeVar("GD", Genos8Dosages, Genos16Dosages)
 
 
 class VCF:
@@ -271,8 +275,8 @@ class VCF:
         -------
             Shape: :code:`(ranges)`. Number of variants in the given ranges.
         """
-        starts = np.atleast_1d(np.asarray(starts, R_DTYPE))
-        ends = np.atleast_1d(np.asarray(ends, R_DTYPE))
+        starts = np.atleast_1d(np.asarray(starts, VCF_R_DTYPE))
+        ends = np.atleast_1d(np.asarray(ends, VCF_R_DTYPE))
 
         c = self._c_norm.norm(contig)
         if c is None:
@@ -466,7 +470,6 @@ class VCF:
         itr = self._vcf(f"{c}:{start + 1}-{end}")  # range string is 1-based
         ploidy = self.ploidy + self.phasing
         for chunk_size in chunk_sizes:
-            print(chunk_size)
             if issubclass(mode, (Genos8, Genos16)):
                 out = np.empty((self.n_samples, ploidy, chunk_size), dtype=mode._gdtype)
                 self._fill_genos(itr, out)
@@ -535,6 +538,7 @@ class VCF:
             raise ValueError(
                 "Dosage field not specified. Set the VCF reader's `dosage_field` parameter."
             )
+        mode = cast(type[L], mode)
 
         max_mem = parse_memory(max_mem)
 
@@ -568,10 +572,13 @@ class VCF:
 
         itr = self._vcf(f"{c}:{start + 1}-{end}")  # range string is 1-based
         ploidy = self.ploidy + self.phasing
-        for chunk_size in chunk_sizes:
+        hap_lens = np.full((self.n_samples, self.ploidy), end - start, dtype=np.int32)
+        for _, is_last, chunk_size in mark_ends(chunk_sizes):
+            ilens = np.empty(chunk_size, dtype=np.int32)
             if issubclass(mode, (Genos8, Genos16)):
                 out = np.empty((self.n_samples, ploidy, chunk_size), dtype=mode._gdtype)
-                self._fill_genos(itr, out)
+                last_end = self._fill_genos(itr, out, ilens)
+                hap_lens += hap_ilens(out[:, : self.ploidy], ilens)
             elif issubclass(mode, (Genos8Dosages, Genos16Dosages)):
                 out = (
                     np.empty(
@@ -580,17 +587,56 @@ class VCF:
                     ),
                     np.empty((self.n_samples, chunk_size), dtype=np.float32),
                 )
-                self._fill_genos_and_dosages(
+                last_end = self._fill_genos_and_dosages(
                     itr,
                     out,
                     self.dosage_field,  # type: ignore | guaranteed to be str by guard clause
+                    ilens,
+                )
+                hap_lens += hap_ilens(out[0][:, : self.ploidy], ilens)
+            else:
+                assert_never(mode)
+
+            mode = cast(type[L], mode)
+
+            if not is_last:
+                yield mode.parse(out)
+                continue
+
+            if issubclass(mode, (Genos8, Genos16)):
+                ls_ext = self._ext_genos_with_length(
+                    c, start, end, hap_lens, mode, last_end
+                )
+            elif issubclass(mode, (Genos8Dosages, Genos16Dosages)):
+                ls_ext = self._ext_genos_dosages_with_length(
+                    c,
+                    start,
+                    end,
+                    hap_lens,
+                    mode,
+                    self.dosage_field,  # type: ignore | guaranteed to be str by guard clause
+                    last_end,
                 )
             else:
                 assert_never(mode)
 
-            yield mode.parse(out)
+            if len(ls_ext) > 0:
+                if issubclass(mode, (Genos8, Genos16)):
+                    out = np.concat([out, *ls_ext], axis=-1)
+                else:
+                    out = tuple(
+                        np.concat([o, *ls], axis=-1) for o, ls in zip(out, zip(*ls_ext))
+                    )
 
-    def _fill_genos(self, vcf: cyvcf2.VCF, out: NDArray[np.int8 | np.int16]):
+            yield out  # type: ignore
+
+    def _fill_genos(
+        self,
+        vcf: cyvcf2.VCF,
+        out: NDArray[np.int8 | np.int16],
+        ilens: NDArray[np.int32] | None = None,
+    ) -> int:
+        #! assumes n_variants > 0
         n_variants = out.shape[-1]
 
         if self.progress and self._pbar is None:
@@ -608,6 +654,9 @@ class VCF:
                 # (s p) np.int16
                 out[..., i] = v.genotype.array()[self._s_sorter, : self.ploidy]
 
+            if ilens is not None:
+                ilens[i] = len(v.ALT[0]) - len(v.REF)
+
             if self._pbar is not None:
                 self._pbar.update()
 
@@ -617,9 +666,12 @@ class VCF:
         if i != n_variants - 1:
             raise ValueError("Not enough variants found in the given range.")
 
+        return v.end  # type: ignore
+
     def _fill_dosages(
         self, vcf: cyvcf2.VCF, out: NDArray[np.float32], dosage_field: str
-    ):
+    ) -> int:
+        #! assumes n_variants > 0
         n_variants = out.shape[-1]
         if self.progress and self._pbar is None:
             vcf = tqdm(vcf, total=n_variants, desc="Reading VCF", unit=" variant")
@@ -645,13 +697,18 @@ class VCF:
         if i != n_variants - 1:
             raise ValueError("Not enough variants found in the given range.")
 
+        return v.end  # type: ignore
+
     def _fill_genos_and_dosages(
         self,
         vcf: cyvcf2.VCF,
         out: tuple[NDArray[np.int8 | np.int16], NDArray[np.float32]],
         dosage_field: str,
-    ):
+        ilens: NDArray[np.int32] | None = None,
+    ) -> int:
+        #! assumes n_variants > 0
         n_variants = out[0].shape[-1]
+
         if self.progress and self._pbar is None:
             vcf = tqdm(vcf, total=n_variants, desc="Reading VCF", unit=" variant")
 
@@ -674,6 +731,9 @@ class VCF:
             # (s, 1, 1) or (s, 1)? -> (s)
             out[1][..., i] = d.squeeze(1)[self._s_sorter]
 
+            if ilens is not None:
+                ilens[i] = len(v.ALT[0]) - len(v.REF)
+
             if self._pbar is not None:
                 self._pbar.update()
 
@@ -682,6 +742,8 @@ class VCF:
 
         if i != n_variants - 1:
             raise ValueError("Not enough variants found in the given range.")
+
+        return v.end  # type: ignore
 
     def _mem_per_variant(self, mode: type[T]) -> int:
         """Calculate the memory required per variant for the given genotypes and dosages.
@@ -714,33 +776,82 @@ class VCF:
 
         return mem
 
+    def _ext_genos_with_length(
+        self,
+        contig: str,
+        start: int | np.integer,
+        end: int | np.integer,
+        hap_lens: NDArray[np.int32],
+        mode: type[G],
+        last_end: int,
+    ) -> list[G]:
+        ploidy = self.ploidy + self.phasing
+        length = end - start
+        ext_start = end
+        coord = f"{contig}:{ext_start + 1}"
 
-def _genos_with_length(
-    vcf: cyvcf2.VCF,
-    n_samples: int,
-    ploidy: int,
-    filter: Callable[[cyvcf2.Variant], bool] | None,
-    contig: str,
-    start: int,
-    end: int,
-    dtype: type[GDTYPE],
-) -> NDArray[GDTYPE]:
-    length = end - start
-    coord = f"{contig}:{start + 1}"
-    hap_lens = np.full((n_samples, ploidy), length, dtype=np.int32)
-    ls_genos: list[NDArray[GDTYPE]] = []
-    for v in vcf(coord):
-        if filter is not None and not filter(v):
-            continue
-        # (s p)
-        genos = cast(NDArray, v.genotype.array()[:, :ploidy])
-        genos = genos.astype(dtype)
-        ls_genos.append(genos)
-        if v.is_indel:
-            ilen = len(v.REF) - len(v.ALT[0])
+        _CHECK_LEN_EVERY_N = 20
+        ls_genos: list[G] = []
+        for i, v in enumerate(self._vcf(coord)):
+            if v.start < ext_start or self.filter is not None and not self.filter(v):
+                continue
+
             # (s p)
-            hap_lens += np.where(genos == 1, ilen, 0)
-        if v.pos > start and (hap_lens >= length).all():
-            break
-    genos = np.stack(ls_genos, axis=-1)
-    return genos
+            genos = v.genotype.array()[:, :ploidy, None]
+            genos = genos.astype(mode._gdtype)
+            ls_genos.append(genos)
+
+            if v.is_indel:
+                ilen = len(v.ALT[0]) - len(v.REF)
+                dist = v.start - last_end
+                hap_lens += dist + np.where(genos == 1, ilen, 0)
+                last_end = v.end
+
+            if i % _CHECK_LEN_EVERY_N == 0 and (hap_lens >= length).all():
+                break
+
+        return ls_genos  # type: ignore
+
+    def _ext_genos_dosages_with_length(
+        self,
+        contig: str,
+        start: int | np.integer,
+        end: int | np.integer,
+        hap_lens: NDArray[np.int32],
+        mode: type[GD],
+        dosage_field: str,
+        last_end: int,
+    ) -> list[GD]:
+        ploidy = self.ploidy + self.phasing
+        length = end - start
+        coord = f"{contig}:{end + 1}"
+
+        _CHECK_LEN_EVERY_N = 20
+        ls_geno_dosages: list[GD] = []
+        for i, v in enumerate(self._vcf(coord)):
+            if v.start < end or self.filter is not None and not self.filter(v):
+                continue
+            # (s p)
+            genos = v.genotype.array()[:, :ploidy, None]
+            genos = genos.astype(mode._gdtype)
+
+            dosages = v.format(dosage_field)
+            if dosages is None:
+                raise DosageFieldError(
+                    f"Dosage field '{dosage_field}' not found for record {repr(v)}"
+                )
+            # (s, 1, 1) or (s, 1)? -> (s)
+            dosages = dosages.squeeze(1)[self._s_sorter, None]
+
+            ls_geno_dosages.append((genos, dosages))  # type: ignore
+
+            if v.is_indel:
+                ilen = len(v.ALT[0]) - len(v.REF)
+                dist = v.start - last_end
+                hap_lens += dist + np.where(genos == 1, ilen, 0)
+                last_end = v.end
+
+            if i % _CHECK_LEN_EVERY_N == 0 and (hap_lens >= length).all():
+                break
+
+        return ls_geno_dosages

@@ -12,13 +12,13 @@ ddir = tdir / "data"
 
 @fixture  # type: ignore
 def pgen():
-    return PGEN(ddir / "test.pgen")
+    return PGEN(ddir / "biallelic.pgen")
 
 
 def read_all():
-    cse = "chr1", 81261, 81262
+    cse = "chr1", 81261, 81262  # just 81262 in VCF
     # (s p v)
-    genos = np.array([[[0, -1], [1, -1]], [[1, 0], [1, 1]]], np.int8)
+    genos = np.array([[[0, -1], [1, -1]], [[1, 0], [1, 1]]], np.int32)
     # (s v)
     phasing = np.array([[1, 0], [1, 0]], np.bool_)
     dosages = np.array([[1.0, np.nan], [2.0, 1.0]], np.float32)
@@ -26,9 +26,9 @@ def read_all():
 
 
 def read_spanning_del():
-    cse = "chr1", 81262, 81263
+    cse = "chr1", 81262, 81263  # just 81263 in VCF
     # (s p v)
-    genos = np.array([[[0], [1]], [[1], [1]]], np.int8)
+    genos = np.array([[[0], [1]], [[1], [1]]], np.int32)
     # (s v)
     phasing = np.array([[1], [1]], np.bool_)
     dosages = np.array([[1.0], [2.0]], np.float32)
@@ -50,7 +50,7 @@ def test_read(
 
     d = pgen.read(*cse, PGEN.Dosages)
     assert d is not None
-    np.testing.assert_equal(d, dosages)
+    np.testing.assert_allclose(d, dosages, rtol=1e-5)
 
     gp = pgen.read(*cse, PGEN.GenosPhasing)
     assert gp is not None
@@ -62,14 +62,14 @@ def test_read(
     assert gd is not None
     g, d = gd
     np.testing.assert_equal(g, genos)
-    np.testing.assert_equal(gd[1], dosages)
+    np.testing.assert_allclose(d, dosages, rtol=1e-5)
 
     gpd = pgen.read(*cse, PGEN.GenosPhasingDosages)
     assert gpd is not None
     g, p, d = gpd
     np.testing.assert_equal(g, genos)
     np.testing.assert_equal(p, phasing)
-    np.testing.assert_equal(gpd[2], dosages)
+    np.testing.assert_allclose(d, dosages, rtol=1e-5)
 
 
 @parametrize_with_cases("cse, genos, phasing, dosages", cases=".", prefix="read_")
@@ -86,7 +86,7 @@ def test_chunk(
         g, p, d = chunk
         np.testing.assert_equal(g, genos[..., [i]])
         np.testing.assert_equal(p, phasing[..., [i]])
-        np.testing.assert_equal(d, dosages[..., [i]])
+        np.testing.assert_allclose(d, dosages[..., [i]], rtol=1e-5)
 
 
 @parametrize_with_cases("cse, genos, phasing, dosages", cases=".", prefix="read_")
@@ -108,8 +108,8 @@ def test_read_ranges(
     np.testing.assert_equal(g[..., o[1] : o[2]], genos)
     np.testing.assert_equal(p[..., o[0] : o[1]], phasing)
     np.testing.assert_equal(p[..., o[1] : o[2]], phasing)
-    np.testing.assert_equal(d[..., o[0] : o[1]], dosages)
-    np.testing.assert_equal(d[..., o[1] : o[2]], dosages)
+    np.testing.assert_allclose(d[..., o[0] : o[1]], dosages, rtol=1e-5)
+    np.testing.assert_allclose(d[..., o[1] : o[2]], dosages, rtol=1e-5)
 
 
 @parametrize_with_cases("cse, genos, phasing, dosages", cases=".", prefix="read_")
@@ -132,7 +132,7 @@ def test_chunk_ranges(
             g, p, d = chunk
             np.testing.assert_equal(g, genos[..., [i]])
             np.testing.assert_equal(p, phasing[..., [i]])
-            np.testing.assert_equal(d, dosages[..., [i]])
+            np.testing.assert_allclose(d, dosages[..., [i]], rtol=1e-5)
 
 
 @parametrize_with_cases("cse, genos, phasing, dosages", cases=".", prefix="read_")
@@ -155,4 +155,44 @@ def test_set_samples(
     g, p, d = gpd
     np.testing.assert_equal(g, genos[s_idx])
     np.testing.assert_equal(p, phasing[s_idx])
-    np.testing.assert_equal(d, dosages[s_idx])
+    np.testing.assert_allclose(d, dosages[s_idx], rtol=1e-5)
+
+
+def length_no_ext():
+    cse = "chr1", 81264, 81265  # just 81265 in VCF
+    # (s p v)
+    genos = np.array([[[1], [0]], [[-1], [-1]]], np.int8)
+    # (s v)
+    phasing = np.array([[1], [0]], np.bool_)
+    dosages = np.array([[0.900024], [np.nan]], np.float32)
+    return cse, genos, phasing, dosages
+
+
+def length_ext():
+    cse = "chr1", 81262, 81263  # just 81263 in VCF
+    # (s p v)
+    genos = np.array([[[0, -1, 1], [1, -1, 0]], [[1, 0, -1], [1, 1, -1]]], np.int8)
+    # (s v)
+    phasing = np.array([[1, 0, 1], [1, 0, 0]], np.bool_)
+    dosages = np.array([[1.0, np.nan, 0.900024], [2.0, 1.0, np.nan]], np.float32)
+    return cse, genos, phasing, dosages
+
+
+@parametrize_with_cases("cse, genos, phasing, dosages", cases=".", prefix="length_")
+def test_chunk_with_length(
+    pgen: PGEN,
+    cse: tuple[str, int, int],
+    genos: NDArray[np.int8],
+    phasing: NDArray[np.bool_],
+    dosages: NDArray[np.float32],
+):
+    mode = PGEN.GenosPhasingDosages
+    max_mem = pgen._mem_per_variant(mode)
+    gpd = pgen.chunk_ranges_with_length(*cse, max_mem, mode)
+    for range_ in gpd:
+        assert range_ is not None
+        for chunk in range_:
+            g, p, d = chunk
+            np.testing.assert_equal(g, genos)
+            np.testing.assert_equal(p, phasing)
+            np.testing.assert_allclose(d, dosages, rtol=1e-5)

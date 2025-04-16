@@ -13,7 +13,7 @@ ddir = tdir / "data"
 
 @fixture  # type: ignore
 def vcf():
-    return VCF(ddir / "test.vcf.gz", dosage_field="DS")
+    return VCF(ddir / "biallelic.vcf.gz", dosage_field="DS")
 
 
 def read_all():
@@ -136,23 +136,23 @@ def test_set_samples(
     np.testing.assert_equal(p, phasing[s_idx])
     np.testing.assert_equal(d, dosages[s_idx])
 
-def length_all():
-    cse = "chr1", 81261, 81263
+def length_no_ext():
+    cse = "chr1", 81264, 81265  # just 81265 in VCF
     # (s p v)
-    genos = np.array([[[0, -1], [1, -1]], [[1, 0], [1, 1]]], np.int8)
+    genos = np.array([[[1], [0]], [[-1], [-1]]], np.int8)
     # (s v)
-    phasing = np.array([[1, 0], [1, 0]], np.bool_)
-    dosages = np.array([[1.0, np.nan], [2.0, 1.0]], np.float32)
+    phasing = np.array([[1], [0]], np.bool_)
+    dosages = np.array([[0.9], [np.nan]], np.float32)
     return cse, genos, phasing, dosages
 
 
-def length_spanning_del():
-    cse = "chr1", 81262, 81263
+def length_ext():
+    cse = "chr1", 81262, 81263  # just 81263 in VCF
     # (s p v)
-    genos = np.array([[[0, -1], [1, -1]], [[1, 0], [1, 1]]], np.int8)
+    genos = np.array([[[0, 1], [1, 0]], [[1, -1], [1, -1]]], np.int8)
     # (s v)
-    phasing = np.array([[1, 0], [1, 0]], np.bool_)
-    dosages = np.array([[1.0, np.nan], [2.0, 1.0]], np.float32)
+    phasing = np.array([[1, 1], [1, 0]], np.bool_)
+    dosages = np.array([[1.0, 0.9], [2.0, np.nan]], np.float32)
     return cse, genos, phasing, dosages
 
 
@@ -172,6 +172,6 @@ def test_chunk_with_length(
         gp, d = chunk
         g, p = np.array_split(gp, 2, 1)
         p = p.squeeze(1).astype(bool)
-        np.testing.assert_equal(g, genos[..., [i]])
-        np.testing.assert_equal(p, phasing[..., [i]])
-        np.testing.assert_equal(d, dosages[..., [i]])
+        np.testing.assert_equal(g, genos)
+        np.testing.assert_equal(p, phasing)
+        np.testing.assert_equal(d, dosages)
