@@ -1,3 +1,9 @@
+## 0.4.2 (2025-04-16)
+
+### Fix
+
+- set and test minimum dependencies
+
 ## 0.4.1 (2025-04-16)
 
 ### Fix

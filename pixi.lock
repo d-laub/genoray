@@ -873,9 +873,9 @@ packages:
 - pypi: .
   name: genoray
   version: 0.4.1
-  sha256: cb4a21ba5064684c5b1ba75f12e0225e0d2219797c428d8b5ab01a1307f7ed75
+  sha256: 815a01d00bfd2bce58d7d1b13ef58f708d92669131b6fdec41982a655a634a90
   requires_dist:
-  - numpy
+  - numpy>=1.26
   - pandas>=2.2.2
   - hirola>=0.3.0
   - pgenlib>=0.92.0
@@ -1791,8 +1791,6 @@ packages:
   - python_abi 3.12.* *_cp312
   constrains:
   - numpy-base <0a0
-  arch: x86_64
-  platform: linux
   license: BSD-3-Clause
   license_family: BSD
   purls:
@@ -1812,8 +1810,6 @@ packages:
   - python_abi 3.9.* *_cp39
   constrains:
   - numpy-base <0a0
-  arch: x86_64
-  platform: linux
   license: BSD-3-Clause
   license_family: BSD
   purls:
