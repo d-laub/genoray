@@ -209,9 +209,9 @@ class PGEN:
             self._s_sorter = slice(None)
             return self
 
-        _samples = np.atleast_1d(samples)
+        _samples = np.atleast_1d(np.asarray(samples, dtype=str))
         s_idx = self._s2i.get(_samples).astype(np.uint32)
-        if (missing := _samples[s_idx == -1]).any():
+        if len(missing := _samples[s_idx == -1]) > 0:
             raise ValueError(f"Samples {missing} not found in the file.")
         self._s_idx = s_idx
         self._s_sorter = np.argsort(s_idx)
@@ -881,7 +881,7 @@ def _gen_with_length(
             yield read(var_idx)
             return
 
-        var_idx = np.concat(
+        var_idx = np.concatenate(
             [var_idx, np.arange(ext_s_idx, ext_e_idx + 1, dtype=np.uint32)]
         )
         out = read(var_idx)
@@ -919,10 +919,10 @@ def _gen_with_length(
             return
 
         if isinstance(out, Genos):
-            out = np.concat([out, *ls_ext], axis=-1)
+            out = np.concatenate([out, *ls_ext], axis=-1)
         else:
             out = tuple(
-                np.concat([o, *ls], axis=-1) for o, ls in zip(out, zip(*ls_ext))
+                np.concatenate([o, *ls], axis=-1) for o, ls in zip(out, zip(*ls_ext))
             )
         yield out  # type: ignore
 

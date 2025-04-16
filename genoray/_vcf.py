@@ -622,10 +622,10 @@ class VCF:
 
             if len(ls_ext) > 0:
                 if issubclass(mode, (Genos8, Genos16)):
-                    out = np.concat([out, *ls_ext], axis=-1)
+                    out = np.concatenate([out, *ls_ext], axis=-1)
                 else:
                     out = tuple(
-                        np.concat([o, *ls], axis=-1) for o, ls in zip(out, zip(*ls_ext))
+                        np.concatenate([o, *ls], axis=-1) for o, ls in zip(out, zip(*ls_ext))
                     )
 
             yield out  # type: ignore
