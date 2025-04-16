@@ -1,7 +1,9 @@
+from __future__ import annotations
+
 from pathlib import Path
 
 import numpy as np
-from numpy.typing import NDArray
+from numpy.typing import ArrayLike, NDArray
 from pytest_cases import fixture, parametrize_with_cases
 
 from genoray import PGEN
@@ -135,6 +137,17 @@ def test_chunk_ranges(
             np.testing.assert_allclose(d, dosages[..., [i]], rtol=1e-5)
 
 
+def samples_none():
+    samples = None
+    return samples
+
+
+def samples_second():
+    samples = "sample1"
+    return samples
+
+
+@parametrize_with_cases("samples", cases=".", prefix="samples_")
 @parametrize_with_cases("cse, genos, phasing, dosages", cases=".", prefix="read_")
 def test_set_samples(
     pgen: PGEN,
@@ -142,10 +155,17 @@ def test_set_samples(
     genos: NDArray[np.int8],
     phasing: NDArray[np.bool_],
     dosages: NDArray[np.float32],
+    samples: ArrayLike | None,
 ):
-    s_idx = np.array([1], np.uint32)
-    samples = [pgen.available_samples[i] for i in s_idx]
     pgen.set_samples(samples)
+
+    if samples is None:
+        samples = pgen.available_samples
+        s_idx = slice(None)
+    else:
+        samples = np.atleast_1d(samples)
+        s_idx = np.intersect1d(pgen.available_samples, samples, return_indices=True)[1]
+
     assert pgen.current_samples == samples
     assert pgen.n_samples == len(samples)
     np.testing.assert_equal(pgen._s_idx, s_idx)

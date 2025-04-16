@@ -196,7 +196,7 @@ class PGEN:
             return len(self.available_samples)
         return len(self._s_sorter)
 
-    def set_samples(self, samples: list[str] | None) -> Self:
+    def set_samples(self, samples: ArrayLike | None) -> Self:
         """Set the samples to use.
 
         Parameters
@@ -204,15 +204,18 @@ class PGEN:
         samples
             List of sample names to use. If None, all samples will be used.
         """
-        if samples is None or samples == self.available_samples:
+        if samples is not None:
+            samples = np.atleast_1d(samples)
+
+        if samples is None or (samples == np.asarray(self.available_samples)).all():
             self._s_idx = slice(None)
             self._s_sorter = slice(None)
             return self
 
-        _samples = np.atleast_1d(np.asarray(samples, dtype=str))
-        s_idx = self._s2i.get(_samples).astype(np.uint32)
-        if len(missing := _samples[s_idx == -1]) > 0:
+        s_idx = self._s2i.get(samples).astype(np.uint32)
+        if len(missing := samples[s_idx == -1]) > 0:
             raise ValueError(f"Samples {missing} not found in the file.")
+
         self._s_idx = s_idx
         self._s_sorter = np.argsort(s_idx)
         # if dose path is None, then dose pgen is just a reference to geno pgen so

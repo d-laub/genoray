@@ -9,14 +9,14 @@ doc = ['doc']
 
 [dependencies]
 python = ">=3.9"
+
+[pypi-dependencies]
 numpy = "==1.26"
 pandas = "==2.2.2"
 polars = "==1.26"
 typing-extensions = "==4.11"
 tqdm = "==4.65"
-more-itertools = "==10"
-
-[pypi-dependencies]
+more-itertools = "==10.0"
 cyvcf2 = "==0.31.1"
 hirola = "==0.3.0"
 pgenlib = "==0.92.0"
@@ -36,6 +36,7 @@ ruff = "*"
 pytest-cases = "*"
 ipykernel = "*"
 ipywidgets = "*"
+uv = "*"
 
 [feature.dev.pypi-dependencies]
 genoray = { path = ".", editable = true }

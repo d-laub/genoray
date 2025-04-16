@@ -1,7 +1,9 @@
+from __future__ import annotations
+
 from pathlib import Path
 
 import numpy as np
-from numpy.typing import NDArray
+from numpy.typing import ArrayLike, NDArray
 from pytest_cases import fixture, parametrize_with_cases
 
 from genoray import VCF
@@ -110,6 +112,17 @@ def test_chunk(
         np.testing.assert_equal(d, dosages[..., [i]])
 
 
+def samples_none():
+    samples = None
+    return samples
+
+
+def samples_second():
+    samples = "sample1"
+    return samples
+
+
+@parametrize_with_cases("samples", cases=".", prefix="samples_")
 @parametrize_with_cases("cse, genos, phasing, dosages", cases=".", prefix="read_")
 def test_set_samples(
     vcf: VCF,
@@ -117,11 +130,19 @@ def test_set_samples(
     genos: NDArray[np.int8],
     phasing: NDArray[np.bool_],
     dosages: NDArray[np.float32],
+    samples: ArrayLike | None,
 ):
-    s_idx = [1]
-    s_sorter = np.array([0], np.intp)
-    samples = [vcf.available_samples[i] for i in s_idx]
     vcf.set_samples(samples)
+
+    if samples is None:
+        samples = vcf.available_samples
+        s_idx = slice(None)
+        s_sorter = slice(None)
+    else:
+        samples = np.atleast_1d(samples)
+        s_idx = np.intersect1d(vcf.available_samples, samples, return_indices=True)[1]
+        s_sorter = np.argsort(s_idx)
+
     assert vcf.current_samples == samples
     assert vcf.n_samples == len(samples)
     np.testing.assert_equal(vcf._s_sorter, s_sorter)
@@ -135,6 +156,7 @@ def test_set_samples(
     np.testing.assert_equal(g, genos[s_idx])
     np.testing.assert_equal(p, phasing[s_idx])
     np.testing.assert_equal(d, dosages[s_idx])
+
 
 def length_no_ext():
     cse = "chr1", 81264, 81265  # just 81265 in VCF

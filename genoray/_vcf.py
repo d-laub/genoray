@@ -206,7 +206,7 @@ class VCF:
         """Number of samples in the VCF file."""
         return len(self._samples)
 
-    def set_samples(self, samples: list[str] | None) -> Self:
+    def set_samples(self, samples: ArrayLike | None) -> Self:
         """Set the samples to read from the VCF file. Modifies the VCF reader in place and returns it.
 
         Parameters
@@ -218,10 +218,13 @@ class VCF:
         -------
             The VCF reader with the specified samples.
         """
+        if samples is not None:
+            samples = cast(list[str], np.atleast_1d(samples).tolist())
+
         if samples is None or samples == self.available_samples:
             self._s_sorter = slice(None)
             self._samples = self.available_samples
-            self._vcf = self._open(samples)
+            self._vcf = self._open(None)
             return self
 
         if missing := set(samples).difference(self.available_samples):
@@ -625,7 +628,8 @@ class VCF:
                     out = np.concatenate([out, *ls_ext], axis=-1)
                 else:
                     out = tuple(
-                        np.concatenate([o, *ls], axis=-1) for o, ls in zip(out, zip(*ls_ext))
+                        np.concatenate([o, *ls], axis=-1)
+                        for o, ls in zip(out, zip(*ls_ext))
                     )
 
             yield out  # type: ignore
