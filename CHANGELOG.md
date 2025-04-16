@@ -1,3 +1,9 @@
+## 0.4.4 (2025-04-16)
+
+### Fix
+
+- with_length methods need to return where end was extended to
+
 ## 0.4.3 (2025-04-16)
 
 ### Fix
