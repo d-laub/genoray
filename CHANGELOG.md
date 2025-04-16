@@ -1,3 +1,9 @@
+## 0.4.1 (2025-04-16)
+
+### Fix
+
+- relax typing-extensions version
+
 ## 0.4.0 (2025-04-15)
 
 ### Feat
