@@ -1,3 +1,9 @@
+## 0.4.3 (2025-04-16)
+
+### Fix
+
+- relax set_samples type to be array-like
+
 ## 0.4.2 (2025-04-16)
 
 ### Fix
