@@ -859,8 +859,8 @@ packages:
   timestamp: 1741969612334
 - pypi: .
   name: genoray
-  version: 0.4.2
-  sha256: 946c7263f87a008624d5a4c55750a22eeb9919bc22c4f091144602a9ed66e05c
+  version: 0.4.3
+  sha256: 33a4b94778610c01b3fe45512726f0ccafbfcf7178eb67082e1457dde182547d
   requires_dist:
   - numpy>=1.26
   - pandas>=2.2.2

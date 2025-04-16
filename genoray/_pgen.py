@@ -13,10 +13,6 @@ from numpy.typing import ArrayLike, NDArray
 from phantom import Phantom
 from typing_extensions import Self, TypeGuard, assert_never
 
-from ._types import (  #! we have to use INT64_MAX because this is what PyRanges uses!
-    INT64_MAX,
-    PGEN_R_DTYPE,
-)
 from ._utils import (
     ContigNormalizer,
     format_memory,
@@ -24,6 +20,12 @@ from ._utils import (
     lengths_to_offsets,
     parse_memory,
 )
+
+PGEN_R_DTYPE = np.int64
+"""Dtype for PGEN range indices. This determines the maximum size of a contig in genoray.
+We have to use int64 because this is what PyRanges uses."""
+
+INT64_MAX = np.iinfo(PGEN_R_DTYPE).max
 
 
 def _is_genos(obj: Any) -> TypeGuard[Genos]:
@@ -649,7 +651,7 @@ class PGEN:
         ends: ArrayLike = INT64_MAX,
         max_mem: int | str = "4g",
         mode: type[L] = Genos,
-    ) -> Generator[Generator[L] | None]:
+    ) -> Generator[Generator[tuple[L, PGEN_R_DTYPE]] | None]:
         """Read genotypes and/or dosages for multiple ranges in chunks approximately limited by :code:`max_mem`.
         Will extend the ranges so that the returned data corresponds to haplotypes that have at least as much
         length as the original ranges.
@@ -676,7 +678,8 @@ class PGEN:
 
         Returns
         -------
-            Generator of generators of genotypes and/or dosages of each ranges' data. Genotypes have shape
+            Generator of generators of genotypes and/or dosages of each ranges' data, plus an integer indicating
+            the 0-based end position of the final variant in the chunk. Genotypes have shape
             :code:`(samples ploidy variants)` and dosages have shape :code:`(samples variants)`. Missing genotypes
             have value -1 and missing dosages have value np.nan. If just using genotypes or dosages, will be a
             single array, otherwise will be a tuple of arrays.
@@ -866,7 +869,7 @@ def _gen_with_length(
     v_starts: NDArray[PGEN_R_DTYPE],  # full dataset v_starts
     v_ends: NDArray[PGEN_R_DTYPE],  # full dataset v_ends
     ilens: NDArray[np.int32],  # full dataset ilens
-) -> Generator[L]:
+) -> Generator[tuple[L, PGEN_R_DTYPE]]:
     # * This implementation computes haplotype lengths as shorter than they actually are if a spanning deletion is present
     # * This this will result in including more variants than needed, which is fine since we're extending var_idx by more than we
     # * need to anyway.
@@ -874,19 +877,21 @@ def _gen_with_length(
 
     max_idx = len(ilens) - 1
     for _, is_last, var_idx in mark_ends(v_chunks):
+        last_end = cast(PGEN_R_DTYPE, v_ends[var_idx[-1]])
         if not is_last:
-            yield read(var_idx)
+            yield read(var_idx), last_end
             continue
 
         ext_s_idx = min(var_idx[-1] + 1, max_idx)
         ext_e_idx = min(ext_s_idx + _IDX_EXTENSION - 1, max_idx)
         if ext_s_idx == ext_e_idx:
-            yield read(var_idx)
+            yield read(var_idx), last_end
             return
 
         var_idx = np.concatenate(
             [var_idx, np.arange(ext_s_idx, ext_e_idx + 1, dtype=np.uint32)]
         )
+        last_end = cast(PGEN_R_DTYPE, v_ends[var_idx[-1]])
         out = read(var_idx)
 
         if isinstance(out, Genos):
@@ -897,7 +902,6 @@ def _gen_with_length(
             hap_lens += hap_ilens(out[0], ilens[var_idx])
 
         ls_ext: list[L] = []
-        last_end = v_ends[var_idx[-1]]
         while (hap_lens < length).any() and ext_s_idx < max_idx:
             ext_s_idx = min(var_idx[-1] + 1, max_idx)
             ext_e_idx = min(ext_s_idx + _IDX_EXTENSION - 1, max_idx)
@@ -915,10 +919,10 @@ def _gen_with_length(
 
             dist = v_starts[var_idx[-1]] - last_end
             hap_lens += dist + hap_ilens(ext_genos, ilens[var_idx])
-            last_end = v_ends[var_idx[-1]]
+            last_end = cast(PGEN_R_DTYPE, v_ends[var_idx[-1]])
 
         if len(ls_ext) == 0:
-            yield out
+            yield out, last_end
             return
 
         if isinstance(out, Genos):
@@ -927,7 +931,10 @@ def _gen_with_length(
             out = tuple(
                 np.concatenate([o, *ls], axis=-1) for o, ls in zip(out, zip(*ls_ext))
             )
-        yield out  # type: ignore
+        yield (
+            out,  # type: ignore
+            last_end,
+        )
 
 
 def _read_psam(path: Path) -> NDArray[np.str_]:

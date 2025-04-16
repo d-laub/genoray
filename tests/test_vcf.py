@@ -165,7 +165,8 @@ def length_no_ext():
     # (s v)
     phasing = np.array([[1], [0]], np.bool_)
     dosages = np.array([[0.9], [np.nan]], np.float32)
-    return cse, genos, phasing, dosages
+    last_end = 81265
+    return cse, genos, phasing, dosages, last_end
 
 
 def length_ext():
@@ -175,25 +176,28 @@ def length_ext():
     # (s v)
     phasing = np.array([[1, 1], [1, 0]], np.bool_)
     dosages = np.array([[1.0, 0.9], [2.0, np.nan]], np.float32)
-    return cse, genos, phasing, dosages
+    last_end = 81265
+    return cse, genos, phasing, dosages, last_end
 
 
-@parametrize_with_cases("cse, genos, phasing, dosages", cases=".", prefix="length_")
+@parametrize_with_cases("cse, genos, phasing, dosages, last_end", cases=".", prefix="length_")
 def test_chunk_with_length(
     vcf: VCF,
     cse: tuple[str, int, int],
     genos: NDArray[np.int8],
     phasing: NDArray[np.bool_],
     dosages: NDArray[np.float32],
+    last_end: int,
 ):
     vcf.phasing = True
 
     max_mem = vcf._mem_per_variant(VCF.Genos16Dosages)
     gpd = vcf.chunk_with_length(*cse, max_mem, VCF.Genos16Dosages)
-    for i, chunk in enumerate(gpd):
+    for i, (chunk, end) in enumerate(gpd):
         gp, d = chunk
         g, p = np.array_split(gp, 2, 1)
         p = p.squeeze(1).astype(bool)
         np.testing.assert_equal(g, genos)
         np.testing.assert_equal(p, phasing)
         np.testing.assert_equal(d, dosages)
+        assert end == last_end

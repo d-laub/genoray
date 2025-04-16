@@ -185,7 +185,8 @@ def length_no_ext():
     # (s v)
     phasing = np.array([[1], [0]], np.bool_)
     dosages = np.array([[0.900024], [np.nan]], np.float32)
-    return cse, genos, phasing, dosages
+    last_end = 81265
+    return cse, genos, phasing, dosages, last_end
 
 
 def length_ext():
@@ -195,24 +196,29 @@ def length_ext():
     # (s v)
     phasing = np.array([[1, 0, 1], [1, 0, 0]], np.bool_)
     dosages = np.array([[1.0, np.nan, 0.900024], [2.0, 1.0, np.nan]], np.float32)
-    return cse, genos, phasing, dosages
+    last_end = 81265
+    return cse, genos, phasing, dosages, last_end
 
 
-@parametrize_with_cases("cse, genos, phasing, dosages", cases=".", prefix="length_")
+@parametrize_with_cases(
+    "cse, genos, phasing, dosages, last_end", cases=".", prefix="length_"
+)
 def test_chunk_with_length(
     pgen: PGEN,
     cse: tuple[str, int, int],
     genos: NDArray[np.int8],
     phasing: NDArray[np.bool_],
     dosages: NDArray[np.float32],
+    last_end: int,
 ):
     mode = PGEN.GenosPhasingDosages
     max_mem = pgen._mem_per_variant(mode)
     gpd = pgen.chunk_ranges_with_length(*cse, max_mem, mode)
     for range_ in gpd:
         assert range_ is not None
-        for chunk in range_:
+        for chunk, end in range_:
             g, p, d = chunk
             np.testing.assert_equal(g, genos)
             np.testing.assert_equal(p, phasing)
             np.testing.assert_allclose(d, dosages, rtol=1e-5)
+            assert end == last_end

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Generator, TypeVar, cast
@@ -12,13 +13,19 @@ from phantom import Phantom
 from tqdm.auto import tqdm
 from typing_extensions import Self, TypeGuard, assert_never
 
-from ._types import UINT64_MAX, VCF_R_DTYPE
 from ._utils import (
     ContigNormalizer,
     format_memory,
     hap_ilens,
     parse_memory,
 )
+
+VCF_R_DTYPE = np.int64
+"""Dtype for VCF range indices. This determines the maximum size of a contig in genoray.
+We have to use int64 because this is what htslib uses for CSI indexes."""
+
+INT64_MAX = np.iinfo(VCF_R_DTYPE).max
+"""Maximum value for a 64-bit signed integer."""
 
 
 class DosageFieldError(RuntimeError): ...
@@ -261,7 +268,7 @@ class VCF:
         self,
         contig: str,
         starts: ArrayLike = 0,
-        ends: ArrayLike = UINT64_MAX,
+        ends: ArrayLike = INT64_MAX,
     ) -> NDArray[np.uint32]:
         """Return the start and end indices of the variants in the given ranges.
 
@@ -278,7 +285,7 @@ class VCF:
         -------
             Shape: :code:`(ranges)`. Number of variants in the given ranges.
         """
-        starts = np.atleast_1d(np.asarray(starts, VCF_R_DTYPE))
+        starts = np.atleast_1d(np.asarray(starts, VCF_R_DTYPE)) + 1  # 1-based
         ends = np.atleast_1d(np.asarray(ends, VCF_R_DTYPE))
 
         c = self._c_norm.norm(contig)
@@ -287,7 +294,7 @@ class VCF:
 
         out = np.empty_like(starts, np.uint32)
         for i, (s, e) in enumerate(zip(starts, ends)):
-            coord = f"{c}:{s + 1}-{e}"
+            coord = f"{c}:{s}-{e}"
             if self.filter is None:
                 out[i] = sum(1 for _ in self._vcf(coord))
             else:
@@ -299,7 +306,7 @@ class VCF:
         self,
         contig: str,
         start: int | np.integer = 0,
-        end: int | np.integer = UINT64_MAX,
+        end: int | np.integer = INT64_MAX,
         mode: type[T] = Genos16,
         out: T | None = None,
     ) -> T | None:
@@ -337,7 +344,7 @@ class VCF:
         if c is None:
             return
 
-        itr = self._vcf(f"{c}:{start + 1}-{end}")  # range string is 1-based
+        itr = self._vcf(f"{c}:{int(start + 1)}-{end}")  # range string is 1-based
         ploidy = self.ploidy + self.phasing
         if out is None:
             n_variants: np.uint32 = self.n_vars_in_ranges(c, start, end)[0]
@@ -405,7 +412,7 @@ class VCF:
         self,
         contig: str,
         start: int | np.integer = 0,
-        end: int | np.integer = UINT64_MAX,
+        end: int | np.integer = INT64_MAX,
         max_mem: int | str = "4g",
         mode: type[T] = Genos16,
     ) -> Generator[T]:
@@ -470,7 +477,7 @@ class VCF:
             chunk_sizes = np.full(n_chunks + 1, vars_per_chunk)
             chunk_sizes[-1] = final_chunk
 
-        itr = self._vcf(f"{c}:{start + 1}-{end}")  # range string is 1-based
+        itr = self._vcf(f"{c}:{int(start + 1)}-{end}")  # range string is 1-based
         ploidy = self.ploidy + self.phasing
         for chunk_size in chunk_sizes:
             if issubclass(mode, (Genos8, Genos16)):
@@ -505,10 +512,10 @@ class VCF:
         self,
         contig: str,
         start: int | np.integer = 0,
-        end: int | np.integer = UINT64_MAX,
+        end: int | np.integer = INT64_MAX,
         max_mem: int | str = "4g",
         mode: type[L] = Genos16,
-    ) -> Generator[L]:
+    ) -> Generator[tuple[L, int]]:
         """Read genotypes and/or dosages in chunks approximately limited by :code:`max_mem`.
         Will extend the range so that the returned data corresponds to haplotypes that have at least as much
         length as the original range.
@@ -529,7 +536,8 @@ class VCF:
 
         Returns
         -------
-            Generator of genotypes and/or dosages. Genotypes have shape :code:`(samples ploidy variants)` and
+            Generator of chunks of genotypes and/or dosages and the 0-based end position of the final variant
+            in the chunk. Genotypes have shape :code:`(samples ploidy variants)` and
             dosages have shape :code:`(samples variants)`. Missing genotypes have value -1 and missing dosages
             have value np.nan. If just using genotypes or dosages, will be a single array, otherwise will be a
             tuple of arrays.
@@ -573,7 +581,7 @@ class VCF:
             chunk_sizes = np.full(n_chunks + 1, vars_per_chunk)
             chunk_sizes[-1] = final_chunk
 
-        itr = self._vcf(f"{c}:{start + 1}-{end}")  # range string is 1-based
+        itr = self._vcf(f"{c}:{int(start + 1)}-{end}")  # range string is 1-based
         ploidy = self.ploidy + self.phasing
         hap_lens = np.full((self.n_samples, self.ploidy), end - start, dtype=np.int32)
         for _, is_last, chunk_size in mark_ends(chunk_sizes):
@@ -603,15 +611,15 @@ class VCF:
             mode = cast(type[L], mode)
 
             if not is_last:
-                yield mode.parse(out)
+                yield mode.parse(out), last_end
                 continue
 
             if issubclass(mode, (Genos8, Genos16)):
-                ls_ext = self._ext_genos_with_length(
+                ls_ext, last_end = self._ext_genos_with_length(
                     c, start, end, hap_lens, mode, last_end
                 )
             elif issubclass(mode, (Genos8Dosages, Genos16Dosages)):
-                ls_ext = self._ext_genos_dosages_with_length(
+                ls_ext, last_end = self._ext_genos_dosages_with_length(
                     c,
                     start,
                     end,
@@ -632,7 +640,10 @@ class VCF:
                         for o, ls in zip(out, zip(*ls_ext))
                     )
 
-            yield out  # type: ignore
+            yield (
+                out,  # type: ignore
+                last_end,
+            )
 
     def _fill_genos(
         self,
@@ -788,7 +799,7 @@ class VCF:
         hap_lens: NDArray[np.int32],
         mode: type[G],
         last_end: int,
-    ) -> list[G]:
+    ) -> tuple[list[G], int]:
         ploidy = self.ploidy + self.phasing
         length = end - start
         ext_start = end
@@ -796,25 +807,36 @@ class VCF:
 
         _CHECK_LEN_EVERY_N = 20
         ls_genos: list[G] = []
-        for i, v in enumerate(self._vcf(coord)):
-            if v.start < ext_start or self.filter is not None and not self.filter(v):
-                continue
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore", message="no intervals found for", category=UserWarning
+            )
+            for i, v in enumerate(self._vcf(coord)):
+                if (
+                    v.start < ext_start
+                    or self.filter is not None
+                    and not self.filter(v)
+                ):
+                    continue
 
-            # (s p)
-            genos = v.genotype.array()[:, :ploidy, None]
-            genos = genos.astype(mode._gdtype)
-            ls_genos.append(genos)
+                # (s p)
+                genos = v.genotype.array()[:, :ploidy, None]
+                genos = genos.astype(mode._gdtype)
+                ls_genos.append(genos)
 
-            if v.is_indel:
-                ilen = len(v.ALT[0]) - len(v.REF)
-                dist = v.start - last_end
-                hap_lens += dist + np.where(genos == 1, ilen, 0)
-                last_end = v.end
+                if v.is_indel:
+                    ilen = len(v.ALT[0]) - len(v.REF)
+                    dist = v.start - last_end
+                    hap_lens += dist + np.where(genos == 1, ilen, 0)
+                    last_end = cast(int, v.end)
 
-            if i % _CHECK_LEN_EVERY_N == 0 and (hap_lens >= length).all():
-                break
+                if i % _CHECK_LEN_EVERY_N == 0 and (hap_lens >= length).all():
+                    break
+        
+        if len(ls_genos) > 0:
+            last_end = cast(int, v.end)  # type: ignore | guaranteed bound by len(ls) > 0
 
-        return ls_genos  # type: ignore
+        return ls_genos, last_end
 
     def _ext_genos_dosages_with_length(
         self,
@@ -825,7 +847,7 @@ class VCF:
         mode: type[GD],
         dosage_field: str,
         last_end: int,
-    ) -> list[GD]:
+    ) -> tuple[list[GD], int]:
         ploidy = self.ploidy + self.phasing
         length = end - start
         coord = f"{contig}:{end + 1}"
@@ -853,9 +875,12 @@ class VCF:
                 ilen = len(v.ALT[0]) - len(v.REF)
                 dist = v.start - last_end
                 hap_lens += dist + np.where(genos == 1, ilen, 0)
-                last_end = v.end
+                last_end = cast(int, v.end)
 
             if i % _CHECK_LEN_EVERY_N == 0 and (hap_lens >= length).all():
                 break
+        
+        if len(ls_geno_dosages) > 0:
+            last_end = cast(int, v.end)  # type: ignore | guaranteed bound by len(ls) > 0
 
-        return ls_geno_dosages
+        return ls_geno_dosages, last_end
