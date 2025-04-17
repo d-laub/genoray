@@ -164,6 +164,7 @@ class VCF:
     _samples: list[str]
     _c_norm: ContigNormalizer
     _index: _Index | None
+    _vcf: cyvcf2.VCF
 
     Genos8 = Genos8
     """Mode for :code:`int8` genotypes :code:`(samples ploidy variants)`"""
@@ -262,8 +263,9 @@ class VCF:
             samples = cast(list[str], np.atleast_1d(samples).tolist())
 
         if samples is None or samples == self.available_samples:
-            self._s_sorter = slice(None)
             self._samples = self.available_samples
+            self._s_sorter = slice(None)
+            self._vcf = self._open()
             return self
 
         if missing := set(samples).difference(self.available_samples):
@@ -276,6 +278,7 @@ class VCF:
         _, s_idx, _ = np.intersect1d(vcf.samples, samples, return_indices=True)
         self._samples = samples
         self._s_sorter = np.argsort(s_idx)
+        self._vcf = vcf
         return self
 
     @contextmanager
@@ -353,9 +356,9 @@ class VCF:
         for i, (s, e) in enumerate(zip(starts, ends)):
             coord = f"{c}:{s}-{e}"
             if self._filter is None:
-                out[i] = sum(1 for _ in self._open()(coord))
+                out[i] = sum(1 for _ in self._vcf(coord))
             else:
-                out[i] = sum(self._filter(v) for v in self._open()(coord))
+                out[i] = sum(self._filter(v) for v in self._vcf(coord))
 
         return out
 
@@ -507,7 +510,7 @@ class VCF:
         if c is None:
             return
 
-        vcf = self._open()(f"{c}:{int(start + 1)}-{end}")  # range string is 1-based
+        vcf = self._vcf(f"{c}:{int(start + 1)}-{end}")  # range string is 1-based
         ploidy = self.ploidy + self.phasing
         if out is None:
             n_variants: np.uint32 = self.n_vars_in_ranges(c, start, end)[0]
@@ -640,7 +643,7 @@ class VCF:
             chunk_sizes = np.full(n_chunks + 1, vars_per_chunk)
             chunk_sizes[-1] = final_chunk
 
-        vcf = self._open()(f"{c}:{int(start + 1)}-{end}")  # range string is 1-based
+        vcf = self._vcf(f"{c}:{int(start + 1)}-{end}")  # range string is 1-based
         ploidy = self.ploidy + self.phasing
         for chunk_size in chunk_sizes:
             if issubclass(mode, (Genos8, Genos16)):
@@ -671,14 +674,14 @@ class VCF:
 
             yield mode.parse(out)
 
-    def _chunk_with_length(
+    def _chunk_ranges_with_length(
         self,
         contig: str,
-        start: int | np.integer = 0,
-        end: int | np.integer = INT64_MAX,
+        starts: ArrayLike = 0,
+        ends: ArrayLike = INT64_MAX,
         max_mem: int | str = "4g",
         mode: type[L] = Genos16,
-    ) -> Generator[tuple[L, int, int]]:  # data, end, n_extension_vars
+    ) -> Generator[Generator[tuple[L, int, int]] | None]:  # data, end, n_extension_vars
         """Read genotypes and/or dosages in chunks approximately limited by :code:`max_mem`.
         Will extend the range so that the returned data corresponds to haplotypes that have at least as much
         length as the original range.
@@ -720,19 +723,40 @@ class VCF:
         if c is None:
             return
 
-        n_variants: int = self.n_vars_in_ranges(c, start, end)[0]
-        if n_variants == 0:
+        n_variants = self.n_vars_in_ranges(c, starts, ends)
+        tot_variants = n_variants.sum()
+        if tot_variants == 0:
             return
 
         mem_per_v = self._mem_per_variant(mode)
-        vars_per_chunk = min(max_mem // mem_per_v, n_variants)
+        vars_per_chunk = min(max_mem // mem_per_v, tot_variants)
         if vars_per_chunk == 0:
             raise ValueError(
                 f"Maximum memory {format_memory(max_mem)} insufficient to read a single variant."
                 f" Memory per variant: {format_memory(mem_per_v)}."
             )
 
-        n_chunks, final_chunk = divmod(n_variants, vars_per_chunk)
+        starts = np.atleast_1d(np.asarray(starts, VCF_R_DTYPE))
+        starts += 1  # cyvcf2 queries are 1-based
+        ends = np.atleast_1d(np.asarray(ends, VCF_R_DTYPE))
+
+        for s, e, n in zip(starts, ends, n_variants):
+            if n == 0:
+                yield None
+                continue
+
+            yield self._chunk_with_length_helper(n, vars_per_chunk, c, s, e, mode)
+
+    def _chunk_with_length_helper(
+        self,
+        n: int,
+        vars_per_chunk: int,
+        contig: str,
+        start: VCF_R_DTYPE,
+        end: VCF_R_DTYPE,
+        mode: type[L],
+    ) -> Generator[tuple[L, int, int]]:
+        n_chunks, final_chunk = divmod(n, vars_per_chunk)
         if final_chunk == 0:
             # perfectly divisible so there is no final chunk
             chunk_sizes = np.full(n_chunks, vars_per_chunk)
@@ -744,7 +768,7 @@ class VCF:
             chunk_sizes = np.full(n_chunks + 1, vars_per_chunk)
             chunk_sizes[-1] = final_chunk
 
-        vcf = self._open()(f"{c}:{int(start + 1)}-{end}")  # range string is 1-based
+        vcf = self._vcf(f"{contig}:{start}-{end}")
         ploidy = self.ploidy + self.phasing
         hap_lens = np.full((self.n_samples, self.ploidy), end - start, dtype=np.int32)
         for _, is_last, chunk_size in mark_ends(chunk_sizes):
@@ -779,11 +803,11 @@ class VCF:
 
             if issubclass(mode, (Genos8, Genos16)):
                 ls_ext, last_end = self._ext_genos_with_length(
-                    c, start, end, hap_lens, mode, last_end
+                    contig, start, end, hap_lens, mode, last_end
                 )
             elif issubclass(mode, (Genos8Dosages, Genos16Dosages)):
                 ls_ext, last_end = self._ext_genos_dosages_with_length(
-                    c,
+                    contig,
                     start,
                     end,
                     hap_lens,
@@ -1175,7 +1199,7 @@ class VCF:
             warnings.filterwarnings(
                 "ignore", message="no intervals found for", category=UserWarning
             )
-            for i, v in enumerate(self._open()(coord)):
+            for i, v in enumerate(self._vcf(coord)):
                 if v.start < ext_start or (
                     self._filter is not None and not self._filter(v)
                 ):
@@ -1221,7 +1245,7 @@ class VCF:
             warnings.filterwarnings(
                 "ignore", message="no intervals found for", category=UserWarning
             )
-            for i, v in enumerate(self._open()(coord)):
+            for i, v in enumerate(self._vcf(coord)):
                 if v.start < ext_start or (
                     self._filter is not None and not self._filter(v)
                 ):
