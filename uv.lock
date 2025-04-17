@@ -99,7 +99,7 @@ wheels = [
 
 [[package]]
 name = "genoray"
-version = "0.4.2"
+version = "0.4.4"
 source = { editable = "." }
 dependencies = [
     { name = "cyvcf2" },

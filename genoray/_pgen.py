@@ -25,6 +25,9 @@ PGEN_R_DTYPE = np.int64
 """Dtype for PGEN range indices. This determines the maximum size of a contig in genoray.
 We have to use int64 because this is what PyRanges uses."""
 
+PGEN_V_IDX = np.uint32
+"""Dtype for PGEN variant indices (uint32). This determines the maximum number of unique variants in a file."""
+
 INT64_MAX = np.iinfo(PGEN_R_DTYPE).max
 
 
@@ -302,7 +305,7 @@ class PGEN:
         contig: str,
         starts: ArrayLike = 0,
         ends: ArrayLike = INT64_MAX,
-    ) -> tuple[NDArray[np.uint32], NDArray[np.uint64]]:
+    ) -> tuple[NDArray[PGEN_V_IDX], NDArray[np.uint64]]:
         """Get variant indices and the number of indices per range.
 
         Parameters
@@ -324,7 +327,7 @@ class PGEN:
 
         c = self._c_norm.norm(contig)
         if c is None:
-            return np.empty(0, np.uint32), np.zeros_like(starts, np.uint64)
+            return np.empty(0, PGEN_V_IDX), np.zeros_like(starts, np.uint64)
 
         ends = np.atleast_1d(np.asarray(ends, PGEN_R_DTYPE))
         queries = pr.PyRanges(
@@ -340,7 +343,7 @@ class PGEN:
         )
         join = pl.from_pandas(queries.join(self._index).df)
         if join.height == 0:
-            return np.empty(0, np.uint32), np.zeros_like(
+            return np.empty(0, PGEN_V_IDX), np.zeros_like(
                 np.atleast_1d(starts), np.uint64
             )
         join = join.sort("query", "index")
@@ -651,7 +654,7 @@ class PGEN:
         ends: ArrayLike = INT64_MAX,
         max_mem: int | str = "4g",
         mode: type[L] = Genos,
-    ) -> Generator[Generator[tuple[L, PGEN_R_DTYPE]] | None]:
+    ) -> Generator[Generator[tuple[L, PGEN_R_DTYPE, PGEN_V_IDX]] | None]:
         """Read genotypes and/or dosages for multiple ranges in chunks approximately limited by :code:`max_mem`.
         Will extend the ranges so that the returned data corresponds to haplotypes that have at least as much
         length as the original ranges.
@@ -782,7 +785,7 @@ class PGEN:
         return mem
 
     def _read_genos(
-        self, var_idxs: NDArray[np.uint32], out: Genos | None = None
+        self, var_idxs: NDArray[PGEN_V_IDX], out: Genos | None = None
     ) -> Genos:
         if out is None:
             _out = np.empty(
@@ -798,7 +801,7 @@ class PGEN:
         return Genos(_out)
 
     def _read_dosages(
-        self, var_idxs: NDArray[np.uint32], out: Dosages | None = None
+        self, var_idxs: NDArray[PGEN_V_IDX], out: Dosages | None = None
     ) -> Dosages:
         if out is None:
             _out = np.empty((len(var_idxs), self.n_samples), dtype=np.float32)
@@ -812,7 +815,7 @@ class PGEN:
         return Dosages.parse(_out)
 
     def _read_genos_dosages(
-        self, var_idxs: NDArray[np.uint32], out: GenosDosages | None = None
+        self, var_idxs: NDArray[PGEN_V_IDX], out: GenosDosages | None = None
     ) -> GenosDosages:
         if out is None:
             _out = (None, None)
@@ -825,7 +828,7 @@ class PGEN:
         return GenosDosages((genos, dosages))
 
     def _read_genos_phasing(
-        self, var_idxs: NDArray[np.uint32], out: GenosPhasing | None = None
+        self, var_idxs: NDArray[PGEN_V_IDX], out: GenosPhasing | None = None
     ) -> GenosPhasing:
         if out is None:
             genos = np.empty(
@@ -846,7 +849,7 @@ class PGEN:
         return GenosPhasing.parse((genos, phasing))
 
     def _read_genos_phasing_dosages(
-        self, var_idxs: NDArray[np.uint32], out: GenosPhasingDosages | None = None
+        self, var_idxs: NDArray[PGEN_V_IDX], out: GenosPhasingDosages | None = None
     ) -> GenosPhasingDosages:
         if out is None:
             _out = (None, None)
@@ -863,13 +866,13 @@ _IDX_EXTENSION = 20
 
 
 def _gen_with_length(
-    v_chunks: list[NDArray[np.uint32]],
+    v_chunks: list[NDArray[PGEN_V_IDX]],
     length: int,
-    read: Callable[[NDArray[np.uint32]], L],
+    read: Callable[[NDArray[PGEN_V_IDX]], L],
     v_starts: NDArray[PGEN_R_DTYPE],  # full dataset v_starts
     v_ends: NDArray[PGEN_R_DTYPE],  # full dataset v_ends
     ilens: NDArray[np.int32],  # full dataset ilens
-) -> Generator[tuple[L, PGEN_R_DTYPE]]:
+) -> Generator[tuple[L, PGEN_R_DTYPE, PGEN_V_IDX]]:
     # * This implementation computes haplotype lengths as shorter than they actually are if a spanning deletion is present
     # * This this will result in including more variants than needed, which is fine since we're extending var_idx by more than we
     # * need to anyway.
@@ -879,17 +882,17 @@ def _gen_with_length(
     for _, is_last, var_idx in mark_ends(v_chunks):
         last_end = cast(PGEN_R_DTYPE, v_ends[var_idx[-1]])
         if not is_last:
-            yield read(var_idx), last_end
+            yield read(var_idx), last_end, var_idx[0]
             continue
 
         ext_s_idx = min(var_idx[-1] + 1, max_idx)
         ext_e_idx = min(ext_s_idx + _IDX_EXTENSION - 1, max_idx)
         if ext_s_idx == ext_e_idx:
-            yield read(var_idx), last_end
+            yield read(var_idx), last_end, var_idx[0]
             return
 
         var_idx = np.concatenate(
-            [var_idx, np.arange(ext_s_idx, ext_e_idx + 1, dtype=np.uint32)]
+            [var_idx, np.arange(ext_s_idx, ext_e_idx + 1, dtype=PGEN_V_IDX)]
         )
         last_end = cast(PGEN_R_DTYPE, v_ends[var_idx[-1]])
         out = read(var_idx)
@@ -908,7 +911,7 @@ def _gen_with_length(
             if ext_s_idx == ext_e_idx:
                 break
 
-            var_idx = np.arange(ext_s_idx, ext_e_idx + 1, dtype=np.uint32)
+            var_idx = np.arange(ext_s_idx, ext_e_idx + 1, dtype=PGEN_V_IDX)
             ext_out = read(var_idx)
             ls_ext.append(ext_out)
 
@@ -922,7 +925,7 @@ def _gen_with_length(
             last_end = cast(PGEN_R_DTYPE, v_ends[var_idx[-1]])
 
         if len(ls_ext) == 0:
-            yield out, last_end
+            yield out, last_end, var_idx[0]
             return
 
         if isinstance(out, Genos):
@@ -934,6 +937,7 @@ def _gen_with_length(
         yield (
             out,  # type: ignore
             last_end,
+            var_idx[0],
         )
 
 
@@ -958,54 +962,6 @@ def _read_psam(path: Path) -> NDArray[np.str_]:
     )
     samples = psam["IID"].to_numpy().astype(str)
     return samples
-
-
-# TODO: can index be implemented using the NCLS lib underlying PyRanges? Then we can
-# pass np.memmap arrays directly instead of having to futz with DataFrames. This will likely make
-# filtering less ergonomic/harder to make ergonomic though, but a memmap approach should be scalable
-# to datasets with billions+ unique variants (reduce memory), reduce instantion time, but increase query time.
-# Unless, NCLS creates a bunch of data structures in memory anyway.
-# TODO: support full .pvar and .bim spec see https://www.cog-genomics.org/plink/2.0/formats#pvar
-def _write_index(pvar: Path):
-    ILEN = pl.col("ALT").str.len_bytes().cast(pl.Int32) - pl.col("rlen").cast(pl.Int32)
-    KIND = (
-        pl.when(ILEN != 0)
-        .then(pl.lit("INDEL"))
-        .when(pl.col("rlen") == 1)  # ILEN == 0 and RLEN == 1
-        .then(pl.lit("SNP"))
-        .when(pl.col("rlen") > 1)  # ILEN == 0 and RLEN > 1
-        .then(pl.lit("MNP"))  # ILEN == 0 and RLEN > 1
-        .otherwise(pl.lit("OTHER"))
-        .cast(pl.Categorical)
-    )
-
-    (
-        pl.scan_csv(
-            pvar,
-            separator="\t",
-            comment_prefix="##",
-            schema_overrides={
-                "#CHROM": pl.Categorical,
-                "POS": pl.Int64,  #! MAKE SURE THIS MATCHES PGEN_R_DTYPE
-            },
-        )
-        .with_columns(
-            Chromosome="#CHROM",
-            Start=pl.col("POS") - 1,
-            End=pl.col("POS") + pl.col("REF").str.len_bytes() - 1,
-            ALT=pl.col("ALT").str.split(","),
-            rlen=pl.col("REF").str.len_bytes(),
-        )
-        .drop("#CHROM", "POS")
-        .with_row_index("index")
-        .explode("ALT")
-        .with_columns(ilen=ILEN, kind=KIND)
-        .drop("rlen")
-        .group_by("index")
-        .agg(pl.exclude("ALT", "ilen", "kind").first(), "ALT", "ilen", "kind")
-        .drop("index")
-        .sink_ipc(pvar.with_suffix(".pvar.gvi"))
-    )
 
 
 class StartsEndsIlens:
@@ -1061,3 +1017,112 @@ def _read_index(
         .to_pandas(use_pyarrow_extension_array=True)
     )
     return pyr, sei
+
+
+# TODO: can index be implemented using the NCLS lib underlying PyRanges? Then we can
+# pass np.memmap arrays directly instead of having to futz with DataFrames. This will likely make
+# filtering less ergonomic/harder to make ergonomic though, but a memmap approach should be scalable
+# to datasets with billions+ unique variants (reduce memory), reduce instantion time, but increase query time.
+# Unless, NCLS creates a bunch of data structures in memory anyway.
+# TODO: support full .pvar and .bim spec see https://www.cog-genomics.org/plink/2.0/formats#pvar
+def _write_index(pvar: Path):
+    ILEN = pl.col("ALT").str.len_bytes().cast(pl.Int32) - pl.col("rlen").cast(pl.Int32)
+    KIND = (
+        pl.when(ILEN != 0)
+        .then(pl.lit("INDEL"))
+        .when(pl.col("rlen") == 1)  # ILEN == 0 and RLEN == 1
+        .then(pl.lit("SNP"))
+        .when(pl.col("rlen") > 1)  # ILEN == 0 and RLEN > 1
+        .then(pl.lit("MNP"))  # ILEN == 0 and RLEN > 1
+        .otherwise(pl.lit("OTHER"))
+        .cast(pl.Categorical)
+    )
+
+    (
+        _scan_pvar(pvar)
+        .with_columns(
+            Chromosome="#CHROM",
+            Start=pl.col("POS") - 1,
+            End=pl.col("POS") + pl.col("REF").str.len_bytes() - 1,
+            ALT=pl.col("ALT").str.split(","),
+            rlen=pl.col("REF").str.len_bytes(),
+        )
+        .drop("#CHROM", "POS")
+        .with_row_index("index")
+        .explode("ALT")
+        .with_columns(ilen=ILEN, kind=KIND)
+        .drop("rlen")
+        .group_by("index")
+        .agg(pl.exclude("ALT", "ilen", "kind").first(), "ALT", "ilen", "kind")
+        .drop("index")
+        .sink_ipc(pvar.with_suffix(".pvar.gvi"))
+    )
+
+
+def _scan_pvar(pvar: Path):
+    pvar_schema = {
+        "#CHROM": pl.Utf8,
+        "POS": pl.Int64,
+        "ID": pl.Utf8,
+        "REF": pl.Utf8,
+        "ALT": pl.Utf8,
+        "QUAL": pl.Float64,
+        "FILTER": pl.Utf8,
+        "INFO": pl.Utf8,
+        "CM": pl.Float64,
+    }
+
+    cols = None
+    is_pvar = False
+    with open(pvar, "r") as f:
+        for line in f:
+            if line.startswith("##"):
+                is_pvar = True
+                continue
+            if line.startswith("#"):
+                is_pvar = True
+            cols = [c for c in line.strip().split("\t")]
+            break
+
+    if not is_pvar:
+        return _scan_bim(pvar)
+
+    if cols is None:
+        raise ValueError(f"No non-comment lines in PVAR file: {pvar}")
+
+    if "FORMAT" in cols:
+        raise RuntimeError("PVAR does not support the FORMAT column.")
+
+    if "INFO" in cols:
+        raise NotImplementedError("The INFO column is not supported yet.")
+
+    return pl.scan_csv(
+        pvar,
+        separator="\t",
+        comment_prefix="##",
+        schema={c: pvar_schema[c] for c in cols},
+    )
+
+
+def _scan_bim(bim: Path):
+    with open(bim, "r") as f:
+        n_cols = len(f.readline().strip().split("\t"))
+
+    schema = {
+        "#CHROM": pl.Categorical,
+        "ID": pl.Utf8,
+        "CM": pl.Float64,
+        "POS": pl.Int32,
+        "ALT": pl.Utf8,
+        "REF": pl.Utf8,
+    }
+
+    if n_cols == 5:
+        del schema["CM"]
+
+    return pl.scan_csv(
+        bim,
+        separator="\t",
+        has_header=False,
+        schema=schema,
+    ).filter(pl.col("POS") > 0)

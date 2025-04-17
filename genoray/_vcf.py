@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import warnings
 from contextlib import contextmanager
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Callable, Generator, TypeVar, cast
 
 import cyvcf2
 import numpy as np
+import polars as pl
+import pyranges as pr
 from more_itertools import mark_ends
 from numpy.typing import ArrayLike, NDArray
 from phantom import Phantom
@@ -17,6 +20,7 @@ from ._utils import (
     ContigNormalizer,
     format_memory,
     hap_ilens,
+    lengths_to_offsets,
     parse_memory,
 )
 
@@ -144,10 +148,10 @@ class VCF:
     _pbar: tqdm | None
     """A progress bar to use while reading variants. This will be incremented per variant
     during any calls to a read function."""
-    _vcf: cyvcf2.VCF
     _s_sorter: NDArray[np.intp] | slice
     _samples: list[str]
     _c_norm: ContigNormalizer
+    _index: pr.PyRanges | None
 
     Genos8 = Genos8
     """Mode for :code:`int8` genotypes :code:`(samples ploidy variants)`"""
@@ -191,17 +195,18 @@ class VCF:
         self.filter = filter
         self.phasing = phasing
         self.dosage_field = dosage_field
-
-        self._vcf = self._open()
-        self.available_samples = self._vcf.samples
-        self.contigs = self._vcf.seqnames
-        self._c_norm = ContigNormalizer(self.contigs)
         self.progress = progress
         self._pbar = None
-        self.set_samples(self._vcf.samples)
 
-    def _open(self, samples: list[str] | None = None) -> cyvcf2.VCF:
-        return cyvcf2.VCF(self.path, samples=samples, lazy=True)
+        vcf = cyvcf2.VCF(path)
+        self.available_samples = vcf.samples
+        self.contigs = vcf.seqnames
+        self._c_norm = ContigNormalizer(vcf.seqnames)
+
+        self.set_samples(None)
+
+    def _open(self) -> cyvcf2.VCF:
+        return cyvcf2.VCF(self.path, samples=self._samples, lazy=True)
 
     @property
     def current_samples(self) -> list[str]:
@@ -231,7 +236,6 @@ class VCF:
         if samples is None or samples == self.available_samples:
             self._s_sorter = slice(None)
             self._samples = self.available_samples
-            self._vcf = self._open(None)
             return self
 
         if missing := set(samples).difference(self.available_samples):
@@ -239,14 +243,12 @@ class VCF:
                 f"Samples {missing} not found in the VCF file. "
                 f"Available samples: {self.available_samples}"
             )
-        self._vcf = self._open(samples)
-        _, s_idx, _ = np.intersect1d(self._vcf.samples, samples, return_indices=True)
+
+        vcf = self._open()
+        _, s_idx, _ = np.intersect1d(vcf.samples, samples, return_indices=True)
         self._samples = samples
         self._s_sorter = np.argsort(s_idx)
         return self
-
-    def __del__(self):
-        self._vcf.close()
 
     @contextmanager
     def using_pbar(self, pbar: tqdm):
@@ -296,9 +298,9 @@ class VCF:
         for i, (s, e) in enumerate(zip(starts, ends)):
             coord = f"{c}:{s}-{e}"
             if self.filter is None:
-                out[i] = sum(1 for _ in self._vcf(coord))
+                out[i] = sum(1 for _ in self._open()(coord))
             else:
-                out[i] = sum(self.filter(v) for v in self._vcf(coord))
+                out[i] = sum(self.filter(v) for v in self._open()(coord))
 
         return out
 
@@ -344,7 +346,7 @@ class VCF:
         if c is None:
             return
 
-        itr = self._vcf(f"{c}:{int(start + 1)}-{end}")  # range string is 1-based
+        vcf = self._open()(f"{c}:{int(start + 1)}-{end}")  # range string is 1-based
         ploidy = self.ploidy + self.phasing
         if out is None:
             n_variants: np.uint32 = self.n_vars_in_ranges(c, start, end)[0]
@@ -355,11 +357,11 @@ class VCF:
                 data = np.empty(
                     (self.n_samples, ploidy, n_variants), dtype=mode._gdtype
                 )
-                self._fill_genos(itr, data)
+                self._fill_genos(vcf, data)
             elif issubclass(mode, Dosages):
                 data = np.empty((self.n_samples, n_variants), dtype=np.float32)
                 self._fill_dosages(
-                    itr,
+                    vcf,
                     data,
                     self.dosage_field,  # type: ignore | guaranteed to be str by guard clause
                 )
@@ -372,7 +374,7 @@ class VCF:
                     np.empty((self.n_samples, n_variants), dtype=np.float32),
                 )
                 self._fill_genos_and_dosages(
-                    itr,
+                    vcf,
                     data,
                     self.dosage_field,  # type: ignore | guaranteed to be str by init guard clause
                 )
@@ -384,12 +386,12 @@ class VCF:
             if issubclass(mode, (Genos8, Genos16)):
                 if not isinstance(out, (Genos8, Genos16)):
                     raise ValueError("Expected an int8 output array.")
-                self._fill_genos(itr, out)
+                self._fill_genos(vcf, out)
             elif issubclass(mode, Dosages):
                 if not isinstance(out, Dosages):
                     raise ValueError("Expected a float32 output array.")
                 self._fill_dosages(
-                    itr,
+                    vcf,
                     out,
                     self.dosage_field,  # type: ignore | guaranteed to be str by guard clause
                 )
@@ -399,7 +401,7 @@ class VCF:
                         "Expected a 2-tuple of int8 and np.float32 arrays."
                     )
                 self._fill_genos_and_dosages(
-                    itr,
+                    vcf,
                     out,
                     self.dosage_field,  # type: ignore | guaranteed to be str by guard clause
                 )
@@ -477,16 +479,16 @@ class VCF:
             chunk_sizes = np.full(n_chunks + 1, vars_per_chunk)
             chunk_sizes[-1] = final_chunk
 
-        itr = self._vcf(f"{c}:{int(start + 1)}-{end}")  # range string is 1-based
+        vcf = self._open()(f"{c}:{int(start + 1)}-{end}")  # range string is 1-based
         ploidy = self.ploidy + self.phasing
         for chunk_size in chunk_sizes:
             if issubclass(mode, (Genos8, Genos16)):
                 out = np.empty((self.n_samples, ploidy, chunk_size), dtype=mode._gdtype)
-                self._fill_genos(itr, out)
+                self._fill_genos(vcf, out)
             elif issubclass(mode, Dosages):
                 out = np.empty((self.n_samples, chunk_size), dtype=np.float32)
                 self._fill_dosages(
-                    itr,
+                    vcf,
                     out,
                     self.dosage_field,  # type: ignore | guaranteed to be str by guard clause
                 )
@@ -499,7 +501,7 @@ class VCF:
                     np.empty((self.n_samples, chunk_size), dtype=np.float32),
                 )
                 self._fill_genos_and_dosages(
-                    itr,
+                    vcf,
                     out,
                     self.dosage_field,  # type: ignore | guaranteed to be str by guard clause
                 )
@@ -581,14 +583,14 @@ class VCF:
             chunk_sizes = np.full(n_chunks + 1, vars_per_chunk)
             chunk_sizes[-1] = final_chunk
 
-        itr = self._vcf(f"{c}:{int(start + 1)}-{end}")  # range string is 1-based
+        vcf = self._open()(f"{c}:{int(start + 1)}-{end}")  # range string is 1-based
         ploidy = self.ploidy + self.phasing
         hap_lens = np.full((self.n_samples, self.ploidy), end - start, dtype=np.int32)
         for _, is_last, chunk_size in mark_ends(chunk_sizes):
             ilens = np.empty(chunk_size, dtype=np.int32)
             if issubclass(mode, (Genos8, Genos16)):
                 out = np.empty((self.n_samples, ploidy, chunk_size), dtype=mode._gdtype)
-                last_end = self._fill_genos(itr, out, ilens)
+                last_end = self._fill_genos(vcf, out, ilens)
                 hap_lens += hap_ilens(out[:, : self.ploidy], ilens)
             elif issubclass(mode, (Genos8Dosages, Genos16Dosages)):
                 out = (
@@ -599,7 +601,7 @@ class VCF:
                     np.empty((self.n_samples, chunk_size), dtype=np.float32),
                 )
                 last_end = self._fill_genos_and_dosages(
-                    itr,
+                    vcf,
                     out,
                     self.dosage_field,  # type: ignore | guaranteed to be str by guard clause
                     ilens,
@@ -644,6 +646,200 @@ class VCF:
                 out,  # type: ignore
                 last_end,
             )
+
+    def get_record_info(
+        self,
+        contig: str | None = None,
+        start: int | np.integer = 0,
+        end: int | np.integer = INT64_MAX,
+        attrs: list[str] | None = None,
+        info: list[str] | None = None,
+        progress: bool = False,
+    ) -> pl.DataFrame:
+        """Get a DataFrame of any non-FORMAT fields in the VCF for a given range or the entire VCF.
+        Will filter variants if the VCF instance has a filter function.
+
+        Parameters
+        ----------
+        contig
+            Contig name. If None, will read the entire VCF.
+        start
+            0-based start position.
+        end
+            0-based, exclusive end position.
+        attrs
+            List of cyvcf2.Variant attributes to include.
+        info
+            List of INFO fields to include.
+        progress
+            Whether to show a progress bar while reading the VCF file. Note that if given a range or
+            the VCF instance has a filter, this will incur a two-pass read to first count the number
+            of variants in the range that pass the filter.
+        """
+        if attrs is None and info is None:
+            raise ValueError("Must provide either attrs or info.")
+
+        if attrs is None:
+            attrs = []
+        if info is None:
+            info = []
+
+        cols = deepcopy(attrs)
+        attrs = [c.strip("#") for c in attrs]
+
+        def extract(v):
+            return tuple(getattr(v, a) for a in attrs) + tuple(v.INFO[f] for f in info)
+
+        if info is not None:
+            cols.extend(info)
+
+        curr_samples = self.current_samples
+        self.set_samples([])
+
+        if contig is None:
+            vcf = self._open()
+        else:
+            c = self._c_norm.norm(contig)
+            if c is None:
+                return pl.DataFrame()
+
+            vcf = self._open()(f"{c}:{int(start + 1)}-{end}")
+
+        if progress:
+            n_variants = None
+            if self.filter is None and contig is None:
+                try:
+                    n_variants = cast(int, vcf.num_records)
+                except ValueError:
+                    pass
+            elif contig is None:
+                n_variants = sum(self.n_vars_in_ranges(c)[0] for c in self.contigs)
+            else:
+                n_variants = self.n_vars_in_ranges(
+                    c,  # type: ignore | guaranteed bound by checking contig is None above
+                    start,
+                    end,
+                )[0]
+            vcf = tqdm(vcf, total=n_variants, desc="Reading records", unit=" record")
+
+        if self.filter is None:
+            data = zip(*(extract(v) for v in vcf))
+        else:
+            data = zip(*(extract(v) for v in vcf if self.filter(v)))
+
+        df = pl.DataFrame(
+            dict(zip(cols, data)),
+            schema_overrides={
+                "#CHROM": pl.Utf8,
+                "ID": pl.Utf8,
+                "FILTER": pl.Utf8,
+                "QUAL": pl.Float64,
+            },
+        )
+
+        self.set_samples(curr_samples)
+
+        return df
+
+    def _write_gvi_index(
+        self, attrs: list[str] | None = None, info: list[str] | None = None
+    ) -> None:
+        min_attrs = ["#CHROM", "start", "end"]
+
+        if attrs is None:
+            attrs = min_attrs
+
+        if missing := set(attrs).difference(min_attrs):
+            attrs.extend(missing)
+
+        filt = self.filter
+        self.filter = None
+        try:
+            record_info = self.get_record_info(attrs=attrs, info=info)
+        finally:
+            self.filter = filt
+
+        record_info.write_ipc(f"{self.path}.gvi", compression="zstd")
+
+    def _load_index(self, filter: pl.Expr | None) -> Self:
+        index = pl.read_ipc(
+            f"{self.path}.gvi", row_index_name="index", memory_map=False
+        )
+
+        if self.filter is not None and filter is None:
+            filt = [self.filter(v) for v in self._open()]
+            index = index.filter(pl.lit(filt))
+        elif filter is not None:
+            index = index.filter(filter)
+
+        index = index.rename({"#CHROM": "Chromosome", "start": "Start", "end": "End"})
+        gr = pr.PyRanges(
+            index.select("Chromosome", "Start", "End", "index").to_pandas(
+                use_pyarrow_extension_array=True
+            )
+        )
+        self._index = gr
+
+        return self
+
+    def _var_idxs(
+        self,
+        contig: str,
+        starts: ArrayLike = 0,
+        ends: ArrayLike = INT64_MAX,
+    ) -> tuple[NDArray[np.integer], NDArray[np.uint64]]:
+        """Get variant indices and the number of indices per range.
+
+        Parameters
+        ----------
+        contig
+            Contig name.
+        starts
+            0-based start positions of the ranges.
+        ends
+            0-based, exclusive end positions of the ranges.
+
+        Returns
+        -------
+            Shape: (tot_variants). Variant indices for the given ranges.
+
+            Shape: (ranges+1). Offsets to get variant indices for each range.
+        """
+        if self._index is None:
+            raise RuntimeError(
+                "Index not loaded. Call `load_index()` before using this method."
+            )
+
+        starts = np.atleast_1d(np.asarray(starts, VCF_R_DTYPE))
+
+        c = self._c_norm.norm(contig)
+        if c is None:
+            return np.empty(0, np.uint32), np.zeros_like(starts, np.uint64)
+
+        ends = np.atleast_1d(np.asarray(ends, VCF_R_DTYPE))
+        queries = pr.PyRanges(
+            pl.DataFrame(
+                {
+                    "Chromosome": np.full(len(starts), c),
+                    "Start": starts,
+                    "End": ends,
+                }
+            )
+            .with_row_index("query")
+            .to_pandas(use_pyarrow_extension_array=True)
+        )
+        join = pl.from_pandas(queries.join(self._index).df)
+        if join.height == 0:
+            return np.empty(0, np.uint32), np.zeros_like(
+                np.atleast_1d(starts), np.uint64
+            )
+        join = join.sort("query", "index")
+        idxs = join["index"].to_numpy()
+        lens = (
+            join.group_by("query", maintain_order=True).agg(pl.len())["len"].to_numpy()
+        )
+        offsets = lengths_to_offsets(lens)
+        return idxs, offsets
 
     def _fill_genos(
         self,
@@ -811,7 +1007,7 @@ class VCF:
             warnings.filterwarnings(
                 "ignore", message="no intervals found for", category=UserWarning
             )
-            for i, v in enumerate(self._vcf(coord)):
+            for i, v in enumerate(self._open()(coord)):
                 if (
                     v.start < ext_start
                     or self.filter is not None
@@ -832,7 +1028,7 @@ class VCF:
 
                 if i % _CHECK_LEN_EVERY_N == 0 and (hap_lens >= length).all():
                     break
-        
+
         if len(ls_genos) > 0:
             last_end = cast(int, v.end)  # type: ignore | guaranteed bound by len(ls) > 0
 
@@ -854,7 +1050,7 @@ class VCF:
 
         _CHECK_LEN_EVERY_N = 20
         ls_geno_dosages: list[GD] = []
-        for i, v in enumerate(self._vcf(coord)):
+        for i, v in enumerate(self._open()(coord)):
             if v.start < end or self.filter is not None and not self.filter(v):
                 continue
             # (s p)
@@ -879,7 +1075,7 @@ class VCF:
 
             if i % _CHECK_LEN_EVERY_N == 0 and (hap_lens >= length).all():
                 break
-        
+
         if len(ls_geno_dosages) > 0:
             last_end = cast(int, v.end)  # type: ignore | guaranteed bound by len(ls) > 0
 

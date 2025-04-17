@@ -180,7 +180,9 @@ def length_ext():
     return cse, genos, phasing, dosages, last_end
 
 
-@parametrize_with_cases("cse, genos, phasing, dosages, last_end", cases=".", prefix="length_")
+@parametrize_with_cases(
+    "cse, genos, phasing, dosages, last_end", cases=".", prefix="length_"
+)
 def test_chunk_with_length(
     vcf: VCF,
     cse: tuple[str, int, int],
