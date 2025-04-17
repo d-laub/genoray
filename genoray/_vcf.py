@@ -4,7 +4,7 @@ import warnings
 from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Callable, Generator, TypeVar, cast
+from typing import Any, Callable, Generator, Literal, TypeVar, cast
 
 import cyvcf2
 import numpy as np
@@ -129,6 +129,18 @@ G = TypeVar("G", Genos8, Genos16)
 GD = TypeVar("GD", Genos8Dosages, Genos16Dosages)
 
 
+class _Index:
+    gr: pr.PyRanges
+    """PyRanges for range queries, just has Chromosome, Start, End, and index columns."""
+    df: pl.DataFrame
+    """All the other columns in the index that aren't #CHROM, start, end, or index. Facilitates
+    index -> attribute lookups."""
+
+    def __init__(self, gr: pr.PyRanges, df: pl.DataFrame):
+        self.gr = gr
+        self.df = df
+
+
 class VCF:
     path: Path
     """Path to the VCF file."""
@@ -151,7 +163,7 @@ class VCF:
     _s_sorter: NDArray[np.intp] | slice
     _samples: list[str]
     _c_norm: ContigNormalizer
-    _index: pr.PyRanges | None
+    _index: _Index | None
 
     Genos8 = Genos8
     """Mode for :code:`int8` genotypes :code:`(samples ploidy variants)`"""
@@ -216,7 +228,7 @@ class VCF:
 
     def _index_path(self) -> Path:
         """Path to the index file."""
-        return self.path.with_suffix(".csi")
+        return Path(f"{self.path}.gvi")
 
     @filter.setter
     def filter(self, filter: Callable[[cyvcf2.Variant], bool] | None):
@@ -306,7 +318,7 @@ class VCF:
         if self._index is None:
             return self._n_vars_no_index(contig, starts, ends)
         else:
-            return self._n_vars_with_index(self._index, contig, starts, ends)
+            return self._n_vars_with_index(self._index.gr, contig, starts, ends)
 
     def _n_vars_no_index(
         self,
@@ -373,16 +385,17 @@ class VCF:
             Shape: :code:`(ranges)`. Number of variants in the given ranges.
         """
         starts = np.atleast_1d(np.asarray(starts, VCF_R_DTYPE))
+        n_ranges = len(starts)
 
         c = self._c_norm.norm(contig)
         if c is None:
-            return np.zeros_like(starts, dtype=np.uint32)
+            return np.zeros(n_ranges, dtype=np.uint32)
 
         ends = np.atleast_1d(np.asarray(ends, VCF_R_DTYPE))
         queries = pr.PyRanges(
             pl.DataFrame(
                 {
-                    "Chromosome": np.full_like(starts, contig),
+                    "Chromosome": np.full(n_ranges, c),
                     "Start": starts,
                     "End": ends,
                 }
@@ -394,6 +407,63 @@ class VCF:
             .to_numpy()
             .astype(np.uint32)
         )
+
+    def _var_idxs(
+        self,
+        contig: str,
+        starts: ArrayLike = 0,
+        ends: ArrayLike = INT64_MAX,
+    ) -> tuple[NDArray[np.integer], NDArray[np.uint64]]:
+        """Get variant indices and the number of indices per range.
+
+        Parameters
+        ----------
+        contig
+            Contig name.
+        starts
+            0-based start positions of the ranges.
+        ends
+            0-based, exclusive end positions of the ranges.
+
+        Returns
+        -------
+            Shape: (tot_variants). Variant indices for the given ranges.
+
+            Shape: (ranges+1). Offsets to get variant indices for each range.
+        """
+        if self._index is None:
+            raise RuntimeError(
+                "Index not loaded. Call `load_index()` before using this method."
+            )
+
+        starts = np.atleast_1d(np.asarray(starts, VCF_R_DTYPE))
+        n_ranges = len(starts)
+
+        c = self._c_norm.norm(contig)
+        if c is None:
+            return np.empty(0, np.uint32), np.zeros(n_ranges + 1, np.uint64)
+
+        ends = np.atleast_1d(np.asarray(ends, VCF_R_DTYPE))
+        queries = pr.PyRanges(
+            pl.DataFrame(
+                {
+                    "Chromosome": np.full(n_ranges, c),
+                    "Start": starts,
+                    "End": ends,
+                }
+            )
+            .with_row_index("query")
+            .to_pandas(use_pyarrow_extension_array=True)
+        )
+        join = pl.from_pandas(queries.join(self._index.gr).df)
+        if join.height == 0:
+            return np.empty(0, np.uint32), np.zeros(n_ranges + 1, np.uint64)
+
+        join = join.sort("query", "index")
+        idxs = join["index"].to_numpy()
+        lens = self.n_vars_in_ranges(c, starts, ends)
+        offsets = lengths_to_offsets(lens)
+        return idxs, offsets
 
     def read(
         self,
@@ -834,9 +904,12 @@ class VCF:
         return df
 
     def _write_gvi_index(
-        self, attrs: list[str] | None = None, info: list[str] | None = None
+        self,
+        attrs: list[str] | None = None,
+        info: list[str] | None = None,
+        preset: Literal["genoray", "genvarloader"] = "genoray",
     ) -> None:
-        """Writes all record information to disk, ignoring any filtering. At a minimum this index will
+        """Writes record information to disk, ignoring any filtering. At a minimum this index will
         include columns `#CHROM`, `start`, and `end` (0-based) to facilitate range queries.
 
         Parameters
@@ -846,8 +919,16 @@ class VCF:
             columns `#CHROM`, `start`, and `end` (0-based) to facilitate range queries.
         info
             List of INFO fields to include.
+        preset
+            Preset to use for writing the index. Can be "genoray" or "genvarloader". "genoray" will
+            write the minimum columns for range queries: `#CHROM`, `start`, and `end` (0-based).
+            "genvarloader" will write the minimum columns for range queries and writing a GenVarLoader
+            dataset, which adds `REF` and `ALT`.
         """
-        min_attrs = ["#CHROM", "start", "end"]
+        if preset == "genoray":
+            min_attrs = ["#CHROM", "start", "end"]
+        elif preset == "genvarloader":
+            min_attrs = ["#CHROM", "start", "end", "REF", "ALT"]
 
         if attrs is None:
             attrs = min_attrs
@@ -893,72 +974,38 @@ class VCF:
         elif filter is not None:
             index = index.filter(filter)
 
+        df = index.drop("#CHROM", "start", "end", "index")
         index = index.rename({"#CHROM": "Chromosome", "start": "Start", "end": "End"})
         gr = pr.PyRanges(
             index.select("Chromosome", "Start", "End", "index").to_pandas(
                 use_pyarrow_extension_array=True
             )
         )
-        self._index = gr
+        self._index = _Index(gr, df)
 
         return self
 
-    def _var_idxs(
-        self,
-        contig: str,
-        starts: ArrayLike = 0,
-        ends: ArrayLike = INT64_MAX,
-    ) -> tuple[NDArray[np.integer], NDArray[np.uint64]]:
-        """Get variant indices and the number of indices per range.
+    def _index_compat(self) -> Literal["genoray", "genvarloader"] | None:
+        if not self._index_path().exists():
+            return
 
-        Parameters
-        ----------
-        contig
-            Contig name.
-        starts
-            0-based start positions of the ranges.
-        ends
-            0-based, exclusive end positions of the ranges.
+        presets = {
+            "genoray": {"#CHROM", "start", "end"},
+            "genvarloader": {"#CHROM", "start", "end", "REF", "ALT"},
+        }
 
-        Returns
-        -------
-            Shape: (tot_variants). Variant indices for the given ranges.
-
-            Shape: (ranges+1). Offsets to get variant indices for each range.
-        """
-        if self._index is None:
-            raise RuntimeError(
-                "Index not loaded. Call `load_index()` before using this method."
+        schema = pl.scan_ipc(self._index_path(), memory_map=False).collect_schema()
+        cols = set(schema)
+        if not (presets["genvarloader"] - cols):
+            return "genvarloader"
+        elif not (presets["genoray"] - cols):
+            return "genoray"
+        else:
+            raise ValueError(
+                f"Index file {self._index_path()} does not satisfy minimum column requirements:"
+                f" {presets['genoray']}."
+                f" Found columns: {cols}."
             )
-
-        starts = np.atleast_1d(np.asarray(starts, VCF_R_DTYPE))
-        n_ranges = len(starts)
-
-        c = self._c_norm.norm(contig)
-        if c is None:
-            return np.empty(0, np.uint32), np.zeros(n_ranges + 1, np.uint64)
-
-        ends = np.atleast_1d(np.asarray(ends, VCF_R_DTYPE))
-        queries = pr.PyRanges(
-            pl.DataFrame(
-                {
-                    "Chromosome": np.full(n_ranges, c),
-                    "Start": starts,
-                    "End": ends,
-                }
-            )
-            .with_row_index("query")
-            .to_pandas(use_pyarrow_extension_array=True)
-        )
-        join = pl.from_pandas(queries.join(self._index).df)
-        if join.height == 0:
-            return np.empty(0, np.uint32), np.zeros(n_ranges + 1, np.uint64)
-
-        join = join.sort("query", "index")
-        idxs = join["index"].to_numpy()
-        lens = self.n_vars_in_ranges(c, starts, ends)
-        offsets = lengths_to_offsets(lens)
-        return idxs, offsets
 
     def _fill_genos(
         self,
@@ -969,14 +1016,14 @@ class VCF:
         #! assumes n_variants > 0
         n_variants = out.shape[-1]
 
+        if self._filter is not None:
+            vcf = filter(self._filter, vcf)
+
         if self.progress and self._pbar is None:
             vcf = tqdm(vcf, total=n_variants, desc="Reading VCF", unit=" variant")
 
         i = 0
         for i, v in enumerate(vcf):
-            if self._filter is not None and not self._filter(v):
-                continue
-
             if self.phasing:
                 # (s p+1) np.int16
                 out[..., i] = v.genotype.array()[self._s_sorter]
@@ -1003,13 +1050,15 @@ class VCF:
     ) -> int:
         #! assumes n_variants > 0
         n_variants = out.shape[-1]
+
+        if self._filter is not None:
+            vcf = filter(self._filter, vcf)
+
         if self.progress and self._pbar is None:
             vcf = tqdm(vcf, total=n_variants, desc="Reading VCF", unit=" variant")
 
         i = 0
         for i, v in enumerate(vcf):
-            if self._filter is not None and not self._filter(v):
-                continue
             d = v.format(dosage_field)
             if d is None:
                 raise DosageFieldError(
@@ -1039,14 +1088,14 @@ class VCF:
         #! assumes n_variants > 0
         n_variants = out[0].shape[-1]
 
+        if self._filter is not None:
+            vcf = filter(self._filter, vcf)
+
         if self.progress and self._pbar is None:
             vcf = tqdm(vcf, total=n_variants, desc="Reading VCF", unit=" variant")
 
         i = 0
         for i, v in enumerate(vcf):
-            if self._filter is not None and not self._filter(v):
-                continue
-
             if self.phasing:
                 # (s p+1) np.int16
                 out[0][..., i] = v.genotype.array()[self._s_sorter]
@@ -1127,14 +1176,12 @@ class VCF:
                 "ignore", message="no intervals found for", category=UserWarning
             )
             for i, v in enumerate(self._open()(coord)):
-                if (
-                    v.start < ext_start
-                    or self._filter is not None
-                    and not self._filter(v)
+                if v.start < ext_start or (
+                    self._filter is not None and not self._filter(v)
                 ):
                     continue
 
-                # (s p)
+                # (s p, 1)
                 genos = v.genotype.array()[:, :ploidy, None]
                 genos = genos.astype(mode._gdtype)
                 ls_genos.append(genos)
@@ -1142,7 +1189,7 @@ class VCF:
                 if v.is_indel:
                     ilen = len(v.ALT[0]) - len(v.REF)
                     dist = v.start - last_end
-                    hap_lens += dist + np.where(genos == 1, ilen, 0)
+                    hap_lens += dist + np.where(genos == 1, ilen, 0).squeeze(-1)
                     last_end = cast(int, v.end)
 
                 if i % _CHECK_LEN_EVERY_N == 0 and (hap_lens >= length).all():
@@ -1165,35 +1212,43 @@ class VCF:
     ) -> tuple[list[GD], int]:
         ploidy = self.ploidy + self.phasing
         length = end - start
-        coord = f"{contig}:{end + 1}"
+        ext_start = end
+        coord = f"{contig}:{ext_start + 1}"
 
         _CHECK_LEN_EVERY_N = 20
         ls_geno_dosages: list[GD] = []
-        for i, v in enumerate(self._open()(coord)):
-            if v.start < end or self._filter is not None and not self._filter(v):
-                continue
-            # (s p)
-            genos = v.genotype.array()[:, :ploidy, None]
-            genos = genos.astype(mode._gdtype)
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore", message="no intervals found for", category=UserWarning
+            )
+            for i, v in enumerate(self._open()(coord)):
+                if v.start < ext_start or (
+                    self._filter is not None and not self._filter(v)
+                ):
+                    continue
+                # (s p 1)
+                genos = v.genotype.array()[:, :ploidy, None]
+                genos = genos.astype(mode._gdtype)
 
-            dosages = v.format(dosage_field)
-            if dosages is None:
-                raise DosageFieldError(
-                    f"Dosage field '{dosage_field}' not found for record {repr(v)}"
-                )
-            # (s, 1, 1) or (s, 1)? -> (s)
-            dosages = dosages.squeeze(1)[self._s_sorter, None]
+                dosages = v.format(dosage_field)
+                if dosages is None:
+                    raise DosageFieldError(
+                        f"Dosage field '{dosage_field}' not found for record {repr(v)}"
+                    )
+                # (s, 1, 1) or (s, 1)? -> (s)
+                dosages = dosages.squeeze(1)[self._s_sorter, None]
 
-            ls_geno_dosages.append((genos, dosages))  # type: ignore
+                ls_geno_dosages.append((genos, dosages))  # type: ignore
 
-            if v.is_indel:
-                ilen = len(v.ALT[0]) - len(v.REF)
-                dist = v.start - last_end
-                hap_lens += dist + np.where(genos == 1, ilen, 0)
-                last_end = cast(int, v.end)
+                if v.is_indel:
+                    ilen = len(v.ALT[0]) - len(v.REF)
+                    dist = v.start - last_end
+                    # (s p 1)
+                    hap_lens += dist + np.where(genos == 1, ilen, 0).squeeze(-1)
+                    last_end = cast(int, v.end)
 
-            if i % _CHECK_LEN_EVERY_N == 0 and (hap_lens >= length).all():
-                break
+                if i % _CHECK_LEN_EVERY_N == 0 and (hap_lens >= length).all():
+                    break
 
         if len(ls_geno_dosages) > 0:
             last_end = cast(int, v.end)  # type: ignore | guaranteed bound by len(ls) > 0

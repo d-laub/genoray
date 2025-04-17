@@ -111,7 +111,7 @@ L = TypeVar("L", Genos, GenosPhasing, GenosDosages, GenosPhasingDosages)
 class PGEN:
     available_samples: list[str]
     """List of available samples in the PGEN file."""
-    filter: pl.Expr | None
+    _filter: pl.Expr | None
     """Polars expression to filter variants. Should return True for variants to keep."""
     ploidy = 2
     """Ploidy of the samples. The PGEN format currently only supports diploid (2)."""
@@ -122,8 +122,10 @@ class PGEN:
     _dose_pgen: pgenlib.PgenReader
     _s_idx: NDArray[np.uint32] | slice
     _s_sorter: NDArray[np.intp] | slice
+    _geno_path: Path
     _dose_path: Path | None
     _sei: StartsEndsIlens | None  # unfiltered so that var_idxs map correctly
+    """Starts, ends, ilens, and ALT alleles if the PGEN with filters is bi-allelic."""
 
     Genos = Genos
     """:code:`(samples ploidy variants) int32`"""
@@ -154,9 +156,10 @@ class PGEN:
             Path to a dosage PGEN file. If None, the genotype PGEN file will be used for both genotypes and dosages.
         """
         geno_path = Path(geno_path)
-        samples = _read_psam(geno_path.with_suffix(".psam"))
+        self._geno_path = geno_path
+        self._filter = filter
 
-        self.filter = filter
+        samples = _read_psam(geno_path.with_suffix(".psam"))
         self.available_samples = cast(list[str], samples.tolist())
         self._s2i = HashTable(
             max=len(samples) * 2,  # type: ignore
@@ -179,11 +182,9 @@ class PGEN:
             self._dose_pgen = self._geno_pgen
         self._dose_path = dosage_path
 
-        if not geno_path.with_suffix(".pvar.gvi").exists():
+        if not self._index_path().exists():
             _write_index(geno_path.with_suffix(".pvar"))
-        self._index, self._sei = _read_index(
-            geno_path.with_suffix(".pvar.gvi"), self.filter
-        )
+        self._index, self._sei = _read_index(self._index_path(), filter)
         self.contigs = self._index.chromosomes
         self._c_norm = ContigNormalizer(self._index.chromosomes)
 
@@ -200,6 +201,21 @@ class PGEN:
         if isinstance(self._s_sorter, slice):
             return len(self.available_samples)
         return len(self._s_sorter)
+
+    @property
+    def filter(self) -> pl.Expr | None:
+        """Polars expression to filter variants. Should return True for variants to keep."""
+        return self._filter
+
+    @filter.setter
+    def filter(self, filter: pl.Expr | None):
+        """Set the Polars expression to filter variants. Should return True for variants to keep."""
+        self._index, self._sei = _read_index(self._index_path(), filter)
+        self._filter = filter
+
+    def _index_path(self) -> Path:
+        """Path to the index file."""
+        return self._geno_path.with_suffix(".pvar.gvi")
 
     def set_samples(self, samples: ArrayLike | None) -> Self:
         """Set the samples to use.
@@ -970,16 +986,19 @@ class StartsEndsIlens:
     v_starts: NDArray[PGEN_R_DTYPE]
     v_ends: NDArray[PGEN_R_DTYPE]
     ilens: NDArray[np.int32]
+    alt: pl.Series
 
     def __init__(
         self,
         v_starts: NDArray[PGEN_R_DTYPE],
         v_ends: NDArray[PGEN_R_DTYPE],
         ilens: NDArray[np.int32],
+        alt: pl.Series,
     ):
         self.v_starts = v_starts
         self.v_ends = v_ends
         self.ilens = ilens
+        self.alt = alt
 
 
 def _read_index(
@@ -1004,11 +1023,14 @@ def _read_index(
     else:
         # can just leave the first alt for multiallelic sites since they're getting filtered out
         # anyway, so they won't be accessed
-        data = index.select("Start", "End", pl.col("ilen").list.first()).collect()
+        data = index.select(
+            "Start", "End", pl.col("ilen").list.first(), pl.col("ALT").list.first()
+        ).collect()
         v_starts = data["Start"].to_numpy()
         v_ends = data["End"].to_numpy()
         ilens = data["ilen"].to_numpy()
-        sei = StartsEndsIlens(v_starts, v_ends, ilens)
+        alt = data["ALT"]
+        sei = StartsEndsIlens(v_starts, v_ends, ilens, alt)
 
     if filter is not None:
         index = index.filter(filter)
@@ -1026,7 +1048,6 @@ def _read_index(
 # filtering less ergonomic/harder to make ergonomic though, but a memmap approach should be scalable
 # to datasets with billions+ unique variants (reduce memory), reduce instantion time, but increase query time.
 # Unless, NCLS creates a bunch of data structures in memory anyway.
-# TODO: support full .pvar and .bim spec see https://www.cog-genomics.org/plink/2.0/formats#pvar
 def _write_index(pvar: Path):
     ILEN = pl.col("ALT").str.len_bytes().cast(pl.Int32) - pl.col("rlen").cast(pl.Int32)
     KIND = (
