@@ -138,7 +138,7 @@ class VCF:
     """List of available contigs in the VCF file."""
     ploidy = 2
     """Ploidy of the VCF file. This is currently always 2 since we use cyvcf2."""
-    filter: Callable[[cyvcf2.Variant], bool] | None
+    _filter: Callable[[cyvcf2.Variant], bool] | None
     """Function to filter variants. Should return True for variants to keep."""
     phasing: bool
     """Whether to include phasing information on genotypes. If True, the ploidy axis will be length 3 such that
@@ -192,11 +192,12 @@ class VCF:
             Whether to show a progress bar while reading the VCF file.
         """
         self.path = Path(path)
-        self.filter = filter
+        self._filter = filter
         self.phasing = phasing
         self.dosage_field = dosage_field
         self.progress = progress
         self._pbar = None
+        self._index = None
 
         vcf = cyvcf2.VCF(path)
         self.available_samples = vcf.samples
@@ -207,6 +208,17 @@ class VCF:
 
     def _open(self) -> cyvcf2.VCF:
         return cyvcf2.VCF(self.path, samples=self._samples, lazy=True)
+
+    @property
+    def filter(self) -> Callable[[cyvcf2.Variant], bool] | None:
+        """Function to filter variants. Should return True for variants to keep."""
+        return self._filter
+
+    @filter.setter
+    def filter(self, filter: Callable[[cyvcf2.Variant], bool] | None):
+        """Changing the filter invalidates the in-memory index."""
+        self._index = None
+        self._filter = filter
 
     @property
     def current_samples(self) -> list[str]:
@@ -287,7 +299,33 @@ class VCF:
         -------
             Shape: :code:`(ranges)`. Number of variants in the given ranges.
         """
-        starts = np.atleast_1d(np.asarray(starts, VCF_R_DTYPE)) + 1  # 1-based
+        if self._index is None:
+            return self._n_vars_no_index(contig, starts, ends)
+        else:
+            return self._n_vars_with_index(self._index, contig, starts, ends)
+
+    def _n_vars_no_index(
+        self,
+        contig: str,
+        starts: ArrayLike = 0,
+        ends: ArrayLike = INT64_MAX,
+    ) -> NDArray[np.uint32]:
+        """Return the start and end indices of the variants in the given ranges.
+
+        Parameters
+        ----------
+        contig
+            Contig name.
+        starts
+            0-based start positions of the ranges.
+        ends
+            0-based, exclusive end positions of the ranges.
+
+        Returns
+        -------
+            Shape: :code:`(ranges)`. Number of variants in the given ranges.
+        """
+        starts = np.atleast_1d(np.asarray(starts, VCF_R_DTYPE))
         ends = np.atleast_1d(np.asarray(ends, VCF_R_DTYPE))
 
         c = self._c_norm.norm(contig)
@@ -295,14 +333,63 @@ class VCF:
             return np.zeros_like(starts, np.uint32)
 
         out = np.empty_like(starts, np.uint32)
+        starts += 1  # 1-based
         for i, (s, e) in enumerate(zip(starts, ends)):
             coord = f"{c}:{s}-{e}"
-            if self.filter is None:
+            if self._filter is None:
                 out[i] = sum(1 for _ in self._open()(coord))
             else:
-                out[i] = sum(self.filter(v) for v in self._open()(coord))
+                out[i] = sum(self._filter(v) for v in self._open()(coord))
 
         return out
+
+    def _n_vars_with_index(
+        self,
+        index: pr.PyRanges,
+        contig: str,
+        starts: ArrayLike = 0,
+        ends: ArrayLike = INT64_MAX,
+    ) -> NDArray[np.uint32]:
+        """Return the start and end indices of the variants in the given ranges.
+
+        Parameters
+        ----------
+        index
+            Index to use for counting variants.
+        contig
+            Contig name.
+        starts
+            0-based start positions of the ranges.
+        ends
+            0-based, exclusive end positions of the ranges.
+
+        Returns
+        -------
+        n_variants
+            Shape: :code:`(ranges)`. Number of variants in the given ranges.
+        """
+        starts = np.atleast_1d(np.asarray(starts, VCF_R_DTYPE))
+
+        c = self._c_norm.norm(contig)
+        if c is None:
+            return np.zeros_like(starts, dtype=np.uint32)
+
+        ends = np.atleast_1d(np.asarray(ends, VCF_R_DTYPE))
+        queries = pr.PyRanges(
+            pl.DataFrame(
+                {
+                    "Chromosome": np.full_like(starts, contig),
+                    "Start": starts,
+                    "End": ends,
+                }
+            ).to_pandas(use_pyarrow_extension_array=True)
+        )
+        return (
+            queries.count_overlaps(index)
+            .df["NumberOverlaps"]
+            .to_numpy()
+            .astype(np.uint32)
+        )
 
     def read(
         self,
@@ -510,14 +597,14 @@ class VCF:
 
             yield mode.parse(out)
 
-    def chunk_with_length(
+    def _chunk_with_length(
         self,
         contig: str,
         start: int | np.integer = 0,
         end: int | np.integer = INT64_MAX,
         max_mem: int | str = "4g",
         mode: type[L] = Genos16,
-    ) -> Generator[tuple[L, int]]:
+    ) -> Generator[tuple[L, int, int]]:  # data, end, n_extension_vars
         """Read genotypes and/or dosages in chunks approximately limited by :code:`max_mem`.
         Will extend the range so that the returned data corresponds to haplotypes that have at least as much
         length as the original range.
@@ -613,7 +700,7 @@ class VCF:
             mode = cast(type[L], mode)
 
             if not is_last:
-                yield mode.parse(out), last_end
+                yield mode.parse(out), last_end, 0
                 continue
 
             if issubclass(mode, (Genos8, Genos16)):
@@ -645,6 +732,7 @@ class VCF:
             yield (
                 out,  # type: ignore
                 last_end,
+                len(ls_ext),
             )
 
     def get_record_info(
@@ -707,7 +795,7 @@ class VCF:
 
         if progress:
             n_variants = None
-            if self.filter is None and contig is None:
+            if self._filter is None and contig is None:
                 try:
                     n_variants = cast(int, vcf.num_records)
                 except ValueError:
@@ -722,10 +810,10 @@ class VCF:
                 )[0]
             vcf = tqdm(vcf, total=n_variants, desc="Reading records", unit=" record")
 
-        if self.filter is None:
+        if self._filter is None:
             data = zip(*(extract(v) for v in vcf))
         else:
-            data = zip(*(extract(v) for v in vcf if self.filter(v)))
+            data = zip(*(extract(v) for v in vcf if self._filter(v)))
 
         df = pl.DataFrame(
             dict(zip(cols, data)),
@@ -744,6 +832,7 @@ class VCF:
     def _write_gvi_index(
         self, attrs: list[str] | None = None, info: list[str] | None = None
     ) -> None:
+        """Writes all record information to disk, ignoring any filtering."""
         min_attrs = ["#CHROM", "start", "end"]
 
         if attrs is None:
@@ -752,12 +841,12 @@ class VCF:
         if missing := set(attrs).difference(min_attrs):
             attrs.extend(missing)
 
-        filt = self.filter
-        self.filter = None
+        filt = self._filter
+        self._filter = None
         try:
             record_info = self.get_record_info(attrs=attrs, info=info)
         finally:
-            self.filter = filt
+            self._filter = filt
 
         record_info.write_ipc(f"{self.path}.gvi", compression="zstd")
 
@@ -766,8 +855,8 @@ class VCF:
             f"{self.path}.gvi", row_index_name="index", memory_map=False
         )
 
-        if self.filter is not None and filter is None:
-            filt = [self.filter(v) for v in self._open()]
+        if self._filter is not None and filter is None:
+            filt = [self._filter(v) for v in self._open()]
             index = index.filter(pl.lit(filt))
         elif filter is not None:
             index = index.filter(filter)
@@ -855,7 +944,7 @@ class VCF:
 
         i = 0
         for i, v in enumerate(vcf):
-            if self.filter is not None and not self.filter(v):
+            if self._filter is not None and not self._filter(v):
                 continue
 
             if self.phasing:
@@ -889,7 +978,7 @@ class VCF:
 
         i = 0
         for i, v in enumerate(vcf):
-            if self.filter is not None and not self.filter(v):
+            if self._filter is not None and not self._filter(v):
                 continue
             d = v.format(dosage_field)
             if d is None:
@@ -925,7 +1014,7 @@ class VCF:
 
         i = 0
         for i, v in enumerate(vcf):
-            if self.filter is not None and not self.filter(v):
+            if self._filter is not None and not self._filter(v):
                 continue
 
             if self.phasing:
@@ -1010,8 +1099,8 @@ class VCF:
             for i, v in enumerate(self._open()(coord)):
                 if (
                     v.start < ext_start
-                    or self.filter is not None
-                    and not self.filter(v)
+                    or self._filter is not None
+                    and not self._filter(v)
                 ):
                     continue
 
@@ -1051,7 +1140,7 @@ class VCF:
         _CHECK_LEN_EVERY_N = 20
         ls_geno_dosages: list[GD] = []
         for i, v in enumerate(self._open()(coord)):
-            if v.start < end or self.filter is not None and not self.filter(v):
+            if v.start < end or self._filter is not None and not self._filter(v):
                 continue
             # (s p)
             genos = v.genotype.array()[:, :ploidy, None]

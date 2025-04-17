@@ -647,14 +647,16 @@ class PGEN:
 
             yield (mode.parse(read(var_idx)) for var_idx in v_chunks)
 
-    def chunk_ranges_with_length(
+    def _chunk_ranges_with_length(
         self,
         contig: str,
         starts: ArrayLike = 0,
         ends: ArrayLike = INT64_MAX,
         max_mem: int | str = "4g",
         mode: type[L] = Genos,
-    ) -> Generator[Generator[tuple[L, PGEN_R_DTYPE, PGEN_V_IDX]] | None]:
+    ) -> Generator[
+        Generator[tuple[L, PGEN_R_DTYPE, NDArray[PGEN_V_IDX]]] | None
+    ]:  # data, end, n_extension_vars
         """Read genotypes and/or dosages for multiple ranges in chunks approximately limited by :code:`max_mem`.
         Will extend the ranges so that the returned data corresponds to haplotypes that have at least as much
         length as the original ranges.
@@ -872,7 +874,7 @@ def _gen_with_length(
     v_starts: NDArray[PGEN_R_DTYPE],  # full dataset v_starts
     v_ends: NDArray[PGEN_R_DTYPE],  # full dataset v_ends
     ilens: NDArray[np.int32],  # full dataset ilens
-) -> Generator[tuple[L, PGEN_R_DTYPE, PGEN_V_IDX]]:
+) -> Generator[tuple[L, PGEN_R_DTYPE, NDArray[PGEN_V_IDX]]]:
     # * This implementation computes haplotype lengths as shorter than they actually are if a spanning deletion is present
     # * This this will result in including more variants than needed, which is fine since we're extending var_idx by more than we
     # * need to anyway.
@@ -882,13 +884,13 @@ def _gen_with_length(
     for _, is_last, var_idx in mark_ends(v_chunks):
         last_end = cast(PGEN_R_DTYPE, v_ends[var_idx[-1]])
         if not is_last:
-            yield read(var_idx), last_end, var_idx[0]
+            yield read(var_idx), last_end, var_idx
             continue
 
         ext_s_idx = min(var_idx[-1] + 1, max_idx)
         ext_e_idx = min(ext_s_idx + _IDX_EXTENSION - 1, max_idx)
         if ext_s_idx == ext_e_idx:
-            yield read(var_idx), last_end, var_idx[0]
+            yield read(var_idx), last_end, var_idx
             return
 
         var_idx = np.concatenate(
@@ -925,7 +927,7 @@ def _gen_with_length(
             last_end = cast(PGEN_R_DTYPE, v_ends[var_idx[-1]])
 
         if len(ls_ext) == 0:
-            yield out, last_end, var_idx[0]
+            yield out, last_end, var_idx
             return
 
         if isinstance(out, Genos):
@@ -937,7 +939,7 @@ def _gen_with_length(
         yield (
             out,  # type: ignore
             last_end,
-            var_idx[0],
+            var_idx,
         )
 
 
