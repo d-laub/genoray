@@ -837,7 +837,16 @@ class VCF:
         self, attrs: list[str] | None = None, info: list[str] | None = None
     ) -> None:
         """Writes all record information to disk, ignoring any filtering. At a minimum this index will
-        include columns: `#CHROM`, `start`, and `end` (0-based)."""
+        include columns `#CHROM`, `start`, and `end` (0-based) to facilitate range queries.
+
+        Parameters
+        ----------
+        attrs
+            List of cyvcf2.Variant attributes to include. At a minimum this index will include
+            columns `#CHROM`, `start`, and `end` (0-based) to facilitate range queries.
+        info
+            List of INFO fields to include.
+        """
         min_attrs = ["#CHROM", "start", "end"]
 
         if attrs is None:
@@ -853,11 +862,29 @@ class VCF:
         finally:
             self._filter = filt
 
-        record_info.write_ipc(f"{self.path}.gvi", compression="zstd")
+        record_info.write_ipc(self._index_path(), compression="zstd")
 
     def _load_index(self, filter: pl.Expr | None = None) -> Self:
+        """Load the index from disk, applying the filter expression if provided. You must
+        ensure that the filter expression is exactly equivalent to the vcf.filter function.
+        If a filter expression is not given and the VCF has a filter function, then one pass
+        over the VCF will be made to infer what records should be filtered.
+
+        Parameters
+        ----------
+        filter
+            Filter expression to apply to the index. This should be a pl.Expr object that
+            is equivalent to the VCF filter function. If None, the filter function will be
+            used to filter the index.
+        """
+        if not self._index_path().exists():
+            raise FileNotFoundError(
+                f"Index file {self._index_path()} does not exist. "
+                "Please create the index using `write_gvi_index()`."
+            )
+
         index = pl.read_ipc(
-            f"{self.path}.gvi", row_index_name="index", memory_map=False
+            self._index_path(), row_index_name="index", memory_map=False
         )
 
         if self._filter is not None and filter is None:
