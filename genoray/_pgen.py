@@ -324,16 +324,17 @@ class PGEN:
             Shape: (ranges+1). Offsets to get variant indices for each range.
         """
         starts = np.atleast_1d(np.asarray(starts, PGEN_R_DTYPE))
+        n_ranges = len(starts)
 
         c = self._c_norm.norm(contig)
         if c is None:
-            return np.empty(0, PGEN_V_IDX), np.zeros_like(starts, np.uint64)
+            return np.empty(0, PGEN_V_IDX), np.zeros(n_ranges + 1, np.uint64)
 
         ends = np.atleast_1d(np.asarray(ends, PGEN_R_DTYPE))
         queries = pr.PyRanges(
             pl.DataFrame(
                 {
-                    "Chromosome": np.full(len(starts), c),
+                    "Chromosome": np.full(n_ranges, c),
                     "Start": starts,
                     "End": ends,
                 }
@@ -342,15 +343,13 @@ class PGEN:
             .to_pandas(use_pyarrow_extension_array=True)
         )
         join = pl.from_pandas(queries.join(self._index).df)
+
         if join.height == 0:
-            return np.empty(0, PGEN_V_IDX), np.zeros_like(
-                np.atleast_1d(starts), np.uint64
-            )
+            return np.empty(0, PGEN_V_IDX), np.zeros(n_ranges + 1, np.uint64)
+
         join = join.sort("query", "index")
         idxs = join["index"].to_numpy()
-        lens = (
-            join.group_by("query", maintain_order=True).agg(pl.len())["len"].to_numpy()
-        )
+        lens = self.n_vars_in_ranges(c, starts, ends)
         offsets = lengths_to_offsets(lens)
         return idxs, offsets
 

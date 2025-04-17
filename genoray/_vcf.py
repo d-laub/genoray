@@ -214,6 +214,10 @@ class VCF:
         """Function to filter variants. Should return True for variants to keep."""
         return self._filter
 
+    def _index_path(self) -> Path:
+        """Path to the index file."""
+        return self.path.with_suffix(".csi")
+
     @filter.setter
     def filter(self, filter: Callable[[cyvcf2.Variant], bool] | None):
         """Changing the filter invalidates the in-memory index."""
@@ -832,7 +836,8 @@ class VCF:
     def _write_gvi_index(
         self, attrs: list[str] | None = None, info: list[str] | None = None
     ) -> None:
-        """Writes all record information to disk, ignoring any filtering."""
+        """Writes all record information to disk, ignoring any filtering. At a minimum this index will
+        include columns: `#CHROM`, `start`, and `end` (0-based)."""
         min_attrs = ["#CHROM", "start", "end"]
 
         if attrs is None:
@@ -850,7 +855,7 @@ class VCF:
 
         record_info.write_ipc(f"{self.path}.gvi", compression="zstd")
 
-    def _load_index(self, filter: pl.Expr | None) -> Self:
+    def _load_index(self, filter: pl.Expr | None = None) -> Self:
         index = pl.read_ipc(
             f"{self.path}.gvi", row_index_name="index", memory_map=False
         )
@@ -900,16 +905,17 @@ class VCF:
             )
 
         starts = np.atleast_1d(np.asarray(starts, VCF_R_DTYPE))
+        n_ranges = len(starts)
 
         c = self._c_norm.norm(contig)
         if c is None:
-            return np.empty(0, np.uint32), np.zeros_like(starts, np.uint64)
+            return np.empty(0, np.uint32), np.zeros(n_ranges + 1, np.uint64)
 
         ends = np.atleast_1d(np.asarray(ends, VCF_R_DTYPE))
         queries = pr.PyRanges(
             pl.DataFrame(
                 {
-                    "Chromosome": np.full(len(starts), c),
+                    "Chromosome": np.full(n_ranges, c),
                     "Start": starts,
                     "End": ends,
                 }
@@ -919,14 +925,11 @@ class VCF:
         )
         join = pl.from_pandas(queries.join(self._index).df)
         if join.height == 0:
-            return np.empty(0, np.uint32), np.zeros_like(
-                np.atleast_1d(starts), np.uint64
-            )
+            return np.empty(0, np.uint32), np.zeros(n_ranges + 1, np.uint64)
+
         join = join.sort("query", "index")
         idxs = join["index"].to_numpy()
-        lens = (
-            join.group_by("query", maintain_order=True).agg(pl.len())["len"].to_numpy()
-        )
+        lens = self.n_vars_in_ranges(c, starts, ends)
         offsets = lengths_to_offsets(lens)
         return idxs, offsets
 
