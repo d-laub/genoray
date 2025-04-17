@@ -226,3 +226,76 @@ def test_chunk_with_length(
             np.testing.assert_allclose(d, dosages, rtol=1e-5)
             assert end == last_end
             np.testing.assert_equal(v_idxs, var_idxs)
+
+
+def n_vars_miss_chr():
+    contig = "chr2"
+    starts = 0
+    ends = np.iinfo(np.int64).max
+    desired = np.array([0], dtype=np.uint32)
+    return contig, starts, ends, desired
+
+
+def n_vars_all():
+    contig = "chr1"
+    starts = 0
+    ends = np.iinfo(np.int64).max
+    desired = np.array([3], dtype=np.uint32)
+    return contig, starts, ends, desired
+
+
+def n_vars_spanning_del():
+    contig = "chr1"
+    starts = 81262
+    ends = 81263
+    desired = np.array([1], dtype=np.uint32)
+    return contig, starts, ends, desired
+
+
+@parametrize_with_cases("contig, starts, ends, desired", cases=".", prefix="n_vars_")
+def test_n_vars_in_ranges(
+    pgen: PGEN,
+    contig: str,
+    starts: ArrayLike,
+    ends: ArrayLike,
+    desired: NDArray[np.uint32],
+):
+    n_vars = pgen.n_vars_in_ranges(contig, starts, ends)
+    assert n_vars == desired
+
+
+def var_idxs_miss_chr():
+    contig = "chr2"
+    starts = 0
+    ends = np.iinfo(np.int64).max
+    desired = (np.array([], dtype=np.uint32), np.array([0, 0], dtype=np.uint64))
+    return contig, starts, ends, desired
+
+
+def var_idxs_all():
+    contig = "chr1"
+    starts = 0
+    ends = np.iinfo(np.int64).max
+    desired = (np.array([0, 1, 2], dtype=np.uint32), np.array([0, 3], dtype=np.uint64))
+    return contig, starts, ends, desired
+
+
+def var_idxs_spanning_del():
+    contig = "chr1"
+    starts = 81262
+    ends = 81263
+    desired = (np.array([0], dtype=np.uint32), np.array([0, 1], dtype=np.uint64))
+    return contig, starts, ends, desired
+
+
+@parametrize_with_cases("contig, starts, ends, desired", cases=".", prefix="var_idxs_")
+def test_var_idxs(
+    pgen: PGEN,
+    contig: str,
+    starts: ArrayLike,
+    ends: ArrayLike,
+    desired: tuple[NDArray[np.uint32], NDArray[np.uint64]],
+):
+    var_idxs, offsets = pgen.var_idxs(contig, starts, ends)
+    assert np.array_equal(var_idxs, desired[0])
+    assert np.array_equal(offsets, desired[1])

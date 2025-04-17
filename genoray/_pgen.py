@@ -278,6 +278,7 @@ class PGEN:
             Shape: :code:`(ranges)`. Number of variants in the given ranges.
         """
         starts = np.atleast_1d(np.asarray(starts, PGEN_R_DTYPE))
+        n_ranges = len(starts)
 
         c = self._c_norm.norm(contig)
         if c is None:
@@ -287,7 +288,7 @@ class PGEN:
         queries = pr.PyRanges(
             pl.DataFrame(
                 {
-                    "Chromosome": np.full_like(starts, contig),
+                    "Chromosome": np.full(n_ranges, c),
                     "Start": starts,
                     "End": ends,
                 }
