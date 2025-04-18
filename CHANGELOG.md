@@ -1,3 +1,20 @@
+## 0.5.0 (2025-04-17)
+
+### Feat
+
+- convenience methods for automatically writing a gvl-compat index
+- make with_length methods private/experimental
+
+### Fix
+
+- correct output index when vcf filter is applied
+- type error in pgen.n_vars
+- bug in computing var_idx offsets for ranges with no variants
+
+### Perf
+
+- faster reads by avoiding re-opening the VCF for each query
+
 ## 0.4.4 (2025-04-16)
 
 ### Fix
