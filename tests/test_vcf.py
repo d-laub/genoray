@@ -197,14 +197,16 @@ def test_chunk_with_length(
     vcf.phasing = True
 
     max_mem = vcf._mem_per_variant(VCF.Genos16Dosages)
-    gpd = vcf._chunk_with_length(*cse, max_mem, VCF.Genos16Dosages)
-    for i, (chunk, end, n_ext) in enumerate(gpd):
-        gp, d = chunk
-        g, p = np.array_split(gp, 2, 1)
-        p = p.squeeze(1).astype(bool)
-        np.testing.assert_equal(g, genos)
-        np.testing.assert_equal(p, phasing)
-        np.testing.assert_equal(d, dosages)
-        assert end == last_end
-        assert n_ext == n_extension
+    gpd = vcf._chunk_ranges_with_length(*cse, max_mem, VCF.Genos16Dosages)
+    for range_ in gpd:
+        assert range_ is not None
+        for chunk, end, n_ext in range_:
+            gp, d = chunk
+            g, p = np.array_split(gp, 2, 1)
+            p = p.squeeze(1).astype(bool)
+            np.testing.assert_equal(g, genos)
+            np.testing.assert_equal(p, phasing)
+            np.testing.assert_equal(d, dosages)
+            assert end == last_end
+            assert n_ext == n_extension
 

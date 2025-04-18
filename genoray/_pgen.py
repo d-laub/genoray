@@ -1116,9 +1116,6 @@ def _scan_pvar(pvar: Path):
     if "FORMAT" in cols:
         raise RuntimeError("PVAR does not support the FORMAT column.")
 
-    if "INFO" in cols:
-        raise NotImplementedError("The INFO column is not supported yet.")
-
     return pl.scan_csv(
         pvar,
         separator="\t",

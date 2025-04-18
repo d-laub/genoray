@@ -963,11 +963,11 @@ class VCF:
         filt = self._filter
         self._filter = None
         try:
-            record_info = self.get_record_info(attrs=attrs, info=info)
+            index = self.get_record_info(attrs=attrs, info=info)
         finally:
             self._filter = filt
 
-        record_info.write_ipc(self._index_path(), compression="zstd")
+        index.write_ipc(self._index_path(), compression="zstd")
 
     def _load_index(self, filter: pl.Expr | None = None) -> Self:
         """Load the index from disk, applying the filter expression if provided. You must
@@ -1030,6 +1030,32 @@ class VCF:
                 f" {presets['genoray']}."
                 f" Found columns: {cols}."
             )
+
+    def _make_index_gvl_compat(self) -> None:
+        missing_cols = {"REF", "ALT"}
+
+        if self._index_compat() == "genvarloader":
+            return
+
+        if self._index_path().exists():
+            schema = pl.scan_ipc(self._index_path(), memory_map=False).collect_schema()
+            missing_cols -= set(schema)
+
+        if not missing_cols:
+            return
+
+        missing_info = self.get_record_info(attrs=list(missing_cols)).with_row_index()
+        index = pl.read_ipc(
+            self._index_path(), row_index_name="index", memory_map=False
+        )
+
+        if missing_info.height != index.height:
+            raise ValueError(
+                "Index file and missing info do not have the same number of rows."
+            )
+
+        index = index.join(missing_info, on="index").sort("index")
+        index.write_ipc(self._index_path(), compression="zstd")
 
     def _fill_genos(
         self,
