@@ -37,6 +37,10 @@ pyranges = "==0.1.1"
 pyarrow = "==16"
 phantom-types = "==3"
 loguru = "==0.7.0"
+attrs = "*"
+awkward = "*"
+numba = "*"
+seqpro = "==0.2.2"
 
 [feature.dev.tasks]
 install = "uv pip install -e ."
@@ -71,6 +75,10 @@ pyranges = "*"
 pyarrow = "*"
 phantom-types = "*"
 loguru = "*"
+attrs = "*"
+awkward = "*"
+numba = "*"
+seqpro = ">=0.2.2"
 
 [feature.doc.tasks]
 install = "uv pip install -e ."
