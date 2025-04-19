@@ -1,3 +1,10 @@
+## 0.5.1 (2025-04-19)
+
+### Fix
+
+- handle >1d arrays for lengths_to_offsets
+- str memory parsing
+
 ## 0.5.0 (2025-04-17)
 
 ### Feat
