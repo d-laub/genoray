@@ -1,28 +1,14 @@
-[workspace]
+[project]
 name = "genoray"
 channels = ["conda-forge", "bioconda"]
 platforms = ["linux-64"]
 
 [environments]
 dev = ['dev']
-doc = ['doc']
+doc = { features = ['doc'] }
 
 [dependencies]
-python = ">=3.9"
-
-[pypi-dependencies]
-numpy = "==1.26"
-pandas = "==2.2.2"
-polars = "==1.26"
-typing-extensions = "==4.11"
-tqdm = "==4.65"
-more-itertools = "==10.0"
-cyvcf2 = "==0.31.1"
-hirola = "==0.3.0"
-pgenlib = "==0.92.0"
-pyranges = "==0.1.1"
-pyarrow = "==16"
-phantom-types = "==3"
+uv = "*"
 
 [feature.dev.dependencies]
 python = "3.9.*"
@@ -36,13 +22,24 @@ ruff = "*"
 pytest-cases = "*"
 ipykernel = "*"
 ipywidgets = "*"
-uv = "*"
 
 [feature.dev.pypi-dependencies]
-genoray = { path = ".", editable = true }
-jurigged = { version = ">=0.6.0, <0.7", extras = ["develoop"] }
+numpy = "==1.26"
+pandas = "==2.2.2"
+polars = "==1.26"
+typing-extensions = ">=4.11"
+tqdm = "==4.65"
+more-itertools = "==10.0"
+cyvcf2 = "==0.31.1"
+hirola = "==0.3.0"
+pgenlib = "==0.92.0"
+pyranges = "==0.1.1"
+pyarrow = "==16"
+phantom-types = "==3"
+loguru = "==0.7.0"
 
 [feature.dev.tasks]
+install = "uv pip install -e ."
 pre-commit = "pre-commit install --hook-type commit-msg"
 i-kernel = "ipython kernel install --user --name genoray"
 gen = "sh tests/data/gen_from_vcf.sh"
@@ -61,7 +58,20 @@ sphinx-autodoc-typehints = "*"
 myst-parser = "*"
 
 [feature.doc.pypi-dependencies]
-genoray = { path = ".", editable = true }
+numpy = "*"
+pandas = "*"
+polars = "*"
+typing-extensions = "*"
+tqdm = "*"
+more-itertools = "*"
+cyvcf2 = "*"
+hirola = "*"
+pgenlib = "*"
+pyranges = "*"
+pyarrow = "*"
+phantom-types = "*"
+loguru = "*"
 
 [feature.doc.tasks]
+install = "uv pip install -e ."
 doc = { cmd = "make clean && make html", cwd = "docs" }

@@ -8,9 +8,11 @@ import pgenlib
 import polars as pl
 import pyranges as pr
 from hirola import HashTable
-from more_itertools import mark_ends
+from loguru import logger
+from more_itertools import mark_ends, windowed
 from numpy.typing import ArrayLike, NDArray
 from phantom import Phantom
+from tqdm.auto import tqdm
 from typing_extensions import Self, TypeGuard, assert_never
 
 from ._utils import (
@@ -182,8 +184,6 @@ class PGEN:
             self._dose_pgen = self._geno_pgen
         self._dose_path = dosage_path
 
-        if not self._index_path().exists():
-            _write_index(geno_path.with_suffix(".pvar"))
         self._index, self._sei = _read_index(self._index_path(), filter)
         self.contigs = self._index.chromosomes
         self._c_norm = ContigNormalizer(self._index.chromosomes)
@@ -577,6 +577,7 @@ class PGEN:
         ends: ArrayLike = INT64_MAX,
         max_mem: int | str = "4g",
         mode: type[T] = Genos,
+        progress: bool = False,
     ) -> Generator[Generator[T] | None]:
         """Read genotypes and/or dosages for multiple ranges in chunks limited by :code:`max_mem`.
 
@@ -624,28 +625,33 @@ class PGEN:
         ends = np.atleast_1d(np.asarray(ends, PGEN_R_DTYPE))
 
         var_idxs, offsets = self.var_idxs(c, starts, ends)
-        n_variants = len(var_idxs)
-        if n_variants == 0:
+        vars_per_range = np.diff(offsets)
+        tot_variants = len(var_idxs)
+        if tot_variants == 0:
             return
 
         mem_per_v = self._mem_per_variant(mode)
-        vars_per_chunk = min(max_mem // mem_per_v, n_variants)
-        if vars_per_chunk == 0:
+        vars_per_chunk = np.minimum(max_mem // mem_per_v, vars_per_range)
+        if vars_per_chunk.min() == 0:
             raise ValueError(
                 f"Maximum memory {format_memory(max_mem)} insufficient to read a single variant."
                 f" Memory per variant: {format_memory(mem_per_v)}."
             )
 
-        for i in range(len(offsets) - 1):
-            o_s, o_e = offsets[i], offsets[i + 1]
-            range_idxs = var_idxs[o_s:o_e]
-            n_variants = len(range_idxs)
+        chunks_per_range = -(-vars_per_range // vars_per_chunk)
+        itr = zip(windowed(offsets, 2), chunks_per_range)
+        if progress:
+            tot_n_chunks = chunks_per_range.sum()
+            itr = tqdm(itr, total=tot_n_chunks, desc="Reading ranges")
 
-            if n_variants == 0:
+        for (o_s, o_e), n_chunks in itr:
+            range_idxs = var_idxs[o_s:o_e]
+            vars_per_range = len(range_idxs)
+
+            if vars_per_range == 0:
                 yield None
                 continue
 
-            n_chunks = -(-n_variants // vars_per_chunk)
             v_chunks = np.array_split(range_idxs, n_chunks)
 
             if issubclass(mode, Genos):
@@ -661,7 +667,7 @@ class PGEN:
             else:
                 assert_never(mode)
 
-            yield (mode.parse(read(var_idx)) for var_idx in v_chunks)
+            yield (cast(T, read(var_idx)) for var_idx in v_chunks)
 
     def _chunk_ranges_with_length(
         self,
@@ -1004,6 +1010,11 @@ class StartsEndsIlens:
 def _read_index(
     path: Path, filter: pl.Expr | None
 ) -> tuple[pr.PyRanges, StartsEndsIlens | None]:
+    if not path.exists():
+        logger.info(f"Genoray index file {path} does not exist. Writing index.")
+        _write_index(path)
+
+    logger.info("Loading genoray index.")
     index = pl.scan_ipc(path, row_index_name="index", memory_map=False)
 
     if filter is None:
@@ -1048,7 +1059,7 @@ def _read_index(
 # filtering less ergonomic/harder to make ergonomic though, but a memmap approach should be scalable
 # to datasets with billions+ unique variants (reduce memory), reduce instantion time, but increase query time.
 # Unless, NCLS creates a bunch of data structures in memory anyway.
-def _write_index(pvar: Path):
+def _write_index(path: Path):
     ILEN = pl.col("ALT").str.len_bytes().cast(pl.Int32) - pl.col("rlen").cast(pl.Int32)
     KIND = (
         pl.when(ILEN != 0)
@@ -1058,11 +1069,11 @@ def _write_index(pvar: Path):
         .when(pl.col("rlen") > 1)  # ILEN == 0 and RLEN > 1
         .then(pl.lit("MNP"))  # ILEN == 0 and RLEN > 1
         .otherwise(pl.lit("OTHER"))
-        .cast(pl.Categorical)
+        .cast(pl.Enum(["SNP", "MNP", "INDEL", "OTHER"]))
     )
 
     (
-        _scan_pvar(pvar)
+        _scan_pvar(path.with_suffix(""))
         .with_columns(
             Chromosome="#CHROM",
             Start=pl.col("POS") - 1,
@@ -1078,7 +1089,7 @@ def _write_index(pvar: Path):
         .group_by("index")
         .agg(pl.exclude("ALT", "ilen", "kind").first(), "ALT", "ilen", "kind")
         .drop("index")
-        .sink_ipc(pvar.with_suffix(".pvar.gvi"))
+        .sink_ipc(path)
     )
 
 

@@ -48,8 +48,8 @@ def test_normalize_contig_name(
 
 
 def parse_b():
-    mem = "1"
-    desired = 1
+    mem = "32"
+    desired = 32
     return mem, desired
 
 
@@ -66,8 +66,8 @@ def parse_m():
 
 
 def parse_g():
-    mem = "1g"
-    desired = 2**30
+    mem = "32g"
+    desired = 32 * 2**30
     return mem, desired
 
 
@@ -102,8 +102,8 @@ def parse_mb():
 
 
 def parse_gb():
-    mem = "1gb"
-    desired = 10**9
+    mem = "32gb"
+    desired = 32 * 10**9
     return mem, desired
 
 

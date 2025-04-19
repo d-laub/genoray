@@ -19,6 +19,7 @@ dependencies = [
     "tqdm>=4.65",
     "phantom-types>=3",
     "more-itertools>=10",
+    "loguru>=0.7.0",
 ]
 
 [tool.commitizen]

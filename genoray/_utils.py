@@ -57,7 +57,7 @@ def is_dtype(obj: Any, dtype: type[DTYPE]) -> TypeGuard[NDArray[DTYPE]]:
     return isinstance(obj, np.ndarray) and obj.dtype.type == dtype
 
 
-_MEM_PARSER = re.compile(r"(?i)([0-9]+?)(.*)")
+_MEM_PARSER = re.compile(r"(?i)(\d+)(.*)")
 _MEM_COEF = dict(zip(["", "k", "m", "g", "t", "p", "e"], 2 ** (np.arange(8) * 10)))
 _MEM_COEF |= {f"{unit}ib": mem for unit, mem in _MEM_COEF.items() if unit != ""}
 _MEM_COEF |= dict(
