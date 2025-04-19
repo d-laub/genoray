@@ -109,7 +109,7 @@ def lengths_to_offsets(
     offsets
         Offsets of the segments.
     """
-    offsets = np.empty(len(lengths) + 1, dtype=dtype)
+    offsets = np.empty(lengths.size + 1, dtype=dtype)
     offsets[0] = 0
     offsets[1:] = lengths.cumsum()
     return offsets
