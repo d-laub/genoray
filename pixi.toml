@@ -47,7 +47,7 @@ test = "pytest tests"
 bump-dry = "cz bump --dry-run"
 bump = "cz bump"
 push = "git push --follow-tags"
-publish = "rm -r dist && uv build && uv publish"
+publish = "rm -rf dist && uv build && uv publish"
 
 [feature.doc.dependencies]
 python = "3.12.*"
