@@ -4,7 +4,7 @@ import warnings
 from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Callable, Generator, Literal, TypeVar, cast
+from typing import Any, Callable, Generator, TypeVar, cast
 
 import cyvcf2
 import numpy as np
@@ -13,16 +13,12 @@ import pyranges as pr
 from more_itertools import mark_ends
 from numpy.typing import ArrayLike, NDArray
 from phantom import Phantom
+from seqpro._ragged import OFFSET_TYPE, lengths_to_offsets
 from tqdm.auto import tqdm
 from typing_extensions import Self, TypeGuard, assert_never
 
-from ._utils import (
-    ContigNormalizer,
-    format_memory,
-    hap_ilens,
-    lengths_to_offsets,
-    parse_memory,
-)
+from ._index import ILEN, SCHEMA
+from ._utils import ContigNormalizer, format_memory, hap_ilens, parse_memory
 
 VCF_R_DTYPE = np.int64
 """Dtype for VCF range indices. This determines the maximum size of a contig in genoray.
@@ -416,7 +412,7 @@ class VCF:
         contig: str,
         starts: ArrayLike = 0,
         ends: ArrayLike = INT64_MAX,
-    ) -> tuple[NDArray[np.integer], NDArray[np.uint64]]:
+    ) -> tuple[NDArray[np.integer], NDArray[OFFSET_TYPE]]:
         """Get variant indices and the number of indices per range.
 
         Parameters
@@ -444,7 +440,7 @@ class VCF:
 
         c = self._c_norm.norm(contig)
         if c is None:
-            return np.empty(0, np.uint32), np.zeros(n_ranges + 1, np.uint64)
+            return np.empty(0, np.uint32), np.zeros(n_ranges + 1, OFFSET_TYPE)
 
         ends = np.atleast_1d(np.asarray(ends, VCF_R_DTYPE))
         queries = pr.PyRanges(
@@ -460,7 +456,7 @@ class VCF:
         )
         join = pl.from_pandas(queries.join(self._index.gr).df)
         if join.height == 0:
-            return np.empty(0, np.uint32), np.zeros(n_ranges + 1, np.uint64)
+            return np.empty(0, np.uint32), np.zeros(n_ranges + 1, OFFSET_TYPE)
 
         join = join.sort("query", "index")
         idxs = join["index"].to_numpy()
@@ -870,89 +866,78 @@ class VCF:
         if info is None:
             info = []
 
-        cols = deepcopy(attrs)
-        attrs = [c.strip("#") for c in attrs]
-
         def extract(v):
             return tuple(getattr(v, a) for a in attrs) + tuple(v.INFO[f] for f in info)
 
+        cols = deepcopy(attrs)
         if info is not None:
             cols.extend(info)
 
         curr_samples = self.current_samples
         self.set_samples([])
-
-        if contig is None:
-            vcf = self._open()
-        else:
-            c = self._c_norm.norm(contig)
-            if c is None:
-                return pl.DataFrame()
-
-            vcf = self._open()(f"{c}:{int(start + 1)}-{end}")
-
-        if progress:
-            n_variants = None
-            if self._filter is None and contig is None:
-                try:
-                    n_variants = cast(int, vcf.num_records)
-                except ValueError:
-                    pass
-            elif contig is None:
-                n_variants = sum(self.n_vars_in_ranges(c)[0] for c in self.contigs)
+        try:
+            if contig is None:
+                vcf = self._open()
             else:
-                n_variants = self.n_vars_in_ranges(
-                    c,  # type: ignore | guaranteed bound by checking contig is None above
-                    start,
-                    end,
-                )[0]
-            vcf = tqdm(vcf, total=n_variants, desc="Reading records", unit=" record")
+                c = self._c_norm.norm(contig)
+                if c is None:
+                    return pl.DataFrame()
 
-        if self._filter is None:
-            data = zip(*(extract(v) for v in vcf))
-        else:
-            data = zip(*(extract(v) for v in vcf if self._filter(v)))
+                vcf = self._open()(f"{c}:{int(start + 1)}-{end}")
 
-        df = pl.DataFrame(
-            dict(zip(cols, data)),
-            schema_overrides={
-                "#CHROM": pl.Utf8,
-                "ID": pl.Utf8,
-                "FILTER": pl.Utf8,
-                "QUAL": pl.Float64,
-            },
-        )
+            if progress:
+                n_variants = None
+                if self._filter is None and contig is None:
+                    try:
+                        n_variants = cast(int, vcf.num_records)
+                    except ValueError:
+                        pass
+                elif contig is None:
+                    n_variants = sum(self.n_vars_in_ranges(c)[0] for c in self.contigs)
+                else:
+                    n_variants = self.n_vars_in_ranges(
+                        c,  # type: ignore | guaranteed bound by checking contig is None above
+                        start,
+                        end,
+                    )[0]
+                vcf = tqdm(
+                    vcf, total=n_variants, desc="Reading records", unit=" record"
+                )
 
-        self.set_samples(curr_samples)
+            if self._filter is None:
+                data = zip(*(extract(v) for v in vcf))
+            else:
+                data = zip(*(extract(v) for v in vcf if self._filter(v)))
+
+            df = pl.DataFrame(
+                dict(zip(cols, data)),
+                schema_overrides={
+                    "CHROM": pl.Utf8,
+                    "ID": pl.Utf8,
+                    "FILTER": pl.Utf8,
+                    "QUAL": pl.Float64,
+                },
+            )
+        finally:
+            self.set_samples(curr_samples)
 
         return df
 
     def _write_gvi_index(
-        self,
-        attrs: list[str] | None = None,
-        info: list[str] | None = None,
-        preset: Literal["genoray", "genvarloader"] = "genoray",
+        self, attrs: list[str] | None = None, info: list[str] | None = None
     ) -> None:
         """Writes record information to disk, ignoring any filtering. At a minimum this index will
-        include columns `#CHROM`, `start`, and `end` (0-based) to facilitate range queries.
+        include columns `CHROM`, `POS` (1-based), `REF`, and `ALT`.
 
         Parameters
         ----------
         attrs
             List of cyvcf2.Variant attributes to include. At a minimum this index will include
-            columns `#CHROM`, `start`, and `end` (0-based) to facilitate range queries.
+            columns `CHROM`, `POS` (1-based), `REF`, and `ALT`.
         info
             List of INFO fields to include.
-        preset
-            Preset to use for writing the index. Can be "genoray" or "genvarloader". "genoray" will
-            write the minimum columns for range queries: `#CHROM`, `start`, and `end` (0-based).
-            "genvarloader" will write the minimum columns for range queries and writing a GenVarLoader
-            dataset, which adds `REF` and `ALT`.
         """
-        if preset == "genoray":
-            min_attrs = ["#CHROM", "start", "end"]
-        elif preset == "genvarloader":
-            min_attrs = ["#CHROM", "start", "end", "REF", "ALT"]
+        min_attrs = list(SCHEMA.keys())
 
         if attrs is None:
             attrs = min_attrs
@@ -963,7 +948,15 @@ class VCF:
         filt = self._filter
         self._filter = None
         try:
-            index = self.get_record_info(attrs=attrs, info=info)
+            index = (
+                self.get_record_info(attrs=attrs, info=info)
+                .with_row_index()
+                .explode("ALT")
+                .with_columns(ILEN=ILEN)
+                .group_by("index", maintain_order=True)
+                .agg(pl.exclude("ALT", "ILEN").first(), "ALT", "ILEN")
+                .drop("index")
+            )
         finally:
             self._filter = filt
 
@@ -998,64 +991,18 @@ class VCF:
         elif filter is not None:
             index = index.filter(filter)
 
-        df = index.drop("#CHROM", "start", "end", "index")
-        index = index.rename({"#CHROM": "Chromosome", "start": "Start", "end": "End"})
+        df = index.drop("CHROM", "POS", "index")
         gr = pr.PyRanges(
-            index.select("Chromosome", "Start", "End", "index").to_pandas(
-                use_pyarrow_extension_array=True
-            )
+            index.select(
+                "index",
+                Chromosome="CHROM",
+                Start=pl.col("POS") - 1,
+                End=pl.col("POS") + pl.col("REF").str.len_bytes() - 1,
+            ).to_pandas(use_pyarrow_extension_array=True)
         )
         self._index = _Index(gr, df)
 
         return self
-
-    def _index_compat(self) -> Literal["genoray", "genvarloader"] | None:
-        if not self._index_path().exists():
-            return
-
-        presets = {
-            "genoray": {"#CHROM", "start", "end"},
-            "genvarloader": {"#CHROM", "start", "end", "REF", "ALT"},
-        }
-
-        schema = pl.scan_ipc(self._index_path(), memory_map=False).collect_schema()
-        cols = set(schema)
-        if not (presets["genvarloader"] - cols):
-            return "genvarloader"
-        elif not (presets["genoray"] - cols):
-            return "genoray"
-        else:
-            raise ValueError(
-                f"Index file {self._index_path()} does not satisfy minimum column requirements:"
-                f" {presets['genoray']}."
-                f" Found columns: {cols}."
-            )
-
-    def _make_index_gvl_compat(self) -> None:
-        missing_cols = {"REF", "ALT"}
-
-        if self._index_compat() == "genvarloader":
-            return
-
-        if self._index_path().exists():
-            schema = pl.scan_ipc(self._index_path(), memory_map=False).collect_schema()
-            missing_cols -= set(schema)
-
-        if not missing_cols:
-            return
-
-        missing_info = self.get_record_info(attrs=list(missing_cols)).with_row_index()
-        index = pl.read_ipc(
-            self._index_path(), row_index_name="index", memory_map=False
-        )
-
-        if missing_info.height != index.height:
-            raise ValueError(
-                "Index file and missing info do not have the same number of rows."
-            )
-
-        index = index.join(missing_info, on="index").sort("index")
-        index.write_ipc(self._index_path(), compression="zstd")
 
     def _fill_genos(
         self,
@@ -1071,6 +1018,8 @@ class VCF:
 
         if self.progress and self._pbar is None:
             vcf = tqdm(vcf, total=n_variants, desc="Reading VCF", unit=" variant")
+        elif self._pbar is not None and self._pbar.total is None:
+            self._pbar.total = n_variants
 
         i = 0
         for i, v in enumerate(vcf):
@@ -1106,6 +1055,8 @@ class VCF:
 
         if self.progress and self._pbar is None:
             vcf = tqdm(vcf, total=n_variants, desc="Reading VCF", unit=" variant")
+        elif self._pbar is not None and self._pbar.total is None:
+            self._pbar.total = n_variants
 
         i = 0
         for i, v in enumerate(vcf):
@@ -1143,6 +1094,8 @@ class VCF:
 
         if self.progress and self._pbar is None:
             vcf = tqdm(vcf, total=n_variants, desc="Reading VCF", unit=" variant")
+        elif self._pbar is not None and self._pbar.total is None:
+            self._pbar.total = n_variants
 
         i = 0
         for i, v in enumerate(vcf):

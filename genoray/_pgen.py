@@ -12,16 +12,11 @@ from loguru import logger
 from more_itertools import mark_ends, windowed
 from numpy.typing import ArrayLike, NDArray
 from phantom import Phantom
-from tqdm.auto import tqdm
+from seqpro._ragged import OFFSET_TYPE, lengths_to_offsets
 from typing_extensions import Self, TypeGuard, assert_never
 
-from ._utils import (
-    ContigNormalizer,
-    format_memory,
-    hap_ilens,
-    lengths_to_offsets,
-    parse_memory,
-)
+from ._index import ILEN
+from ._utils import ContigNormalizer, format_memory, hap_ilens, parse_memory
 
 PGEN_R_DTYPE = np.int64
 """Dtype for PGEN range indices. This determines the maximum size of a contig in genoray.
@@ -128,6 +123,7 @@ class PGEN:
     _dose_path: Path | None
     _sei: StartsEndsIlens | None  # unfiltered so that var_idxs map correctly
     """Starts, ends, ilens, and ALT alleles if the PGEN with filters is bi-allelic."""
+    _s2i: HashTable
 
     Genos = Genos
     """:code:`(samples ploidy variants) int32`"""
@@ -322,7 +318,7 @@ class PGEN:
         contig: str,
         starts: ArrayLike = 0,
         ends: ArrayLike = INT64_MAX,
-    ) -> tuple[NDArray[PGEN_V_IDX], NDArray[np.uint64]]:
+    ) -> tuple[NDArray[PGEN_V_IDX], NDArray[OFFSET_TYPE]]:
         """Get variant indices and the number of indices per range.
 
         Parameters
@@ -345,7 +341,7 @@ class PGEN:
 
         c = self._c_norm.norm(contig)
         if c is None:
-            return np.empty(0, PGEN_V_IDX), np.zeros(n_ranges + 1, np.uint64)
+            return np.empty(0, PGEN_V_IDX), np.zeros(n_ranges + 1, OFFSET_TYPE)
 
         ends = np.atleast_1d(np.asarray(ends, PGEN_R_DTYPE))
         queries = pr.PyRanges(
@@ -362,7 +358,7 @@ class PGEN:
         join = pl.from_pandas(queries.join(self._index).df)
 
         if join.height == 0:
-            return np.empty(0, PGEN_V_IDX), np.zeros(n_ranges + 1, np.uint64)
+            return np.empty(0, PGEN_V_IDX), np.zeros(n_ranges + 1, OFFSET_TYPE)
 
         join = join.sort("query", "index")
         idxs = join["index"].to_numpy()
@@ -513,7 +509,7 @@ class PGEN:
         starts: ArrayLike = 0,
         ends: ArrayLike = INT64_MAX,
         mode: type[T] = Genos,
-    ) -> tuple[T, NDArray[np.uint64]] | None:
+    ) -> tuple[T, NDArray[OFFSET_TYPE]] | None:
         """Read genotypes and/or dosages for multiple ranges.
 
         Parameters
@@ -568,7 +564,7 @@ class PGEN:
         else:
             assert_never(mode)
 
-        return mode.parse(out), offsets
+        return cast(T, out), offsets
 
     def chunk_ranges(
         self,
@@ -577,7 +573,6 @@ class PGEN:
         ends: ArrayLike = INT64_MAX,
         max_mem: int | str = "4g",
         mode: type[T] = Genos,
-        progress: bool = False,
     ) -> Generator[Generator[T] | None]:
         """Read genotypes and/or dosages for multiple ranges in chunks limited by :code:`max_mem`.
 
@@ -639,19 +634,13 @@ class PGEN:
             )
 
         chunks_per_range = -(-vars_per_range // vars_per_chunk)
-        itr = zip(windowed(offsets, 2), chunks_per_range)
-        if progress:
-            tot_n_chunks = chunks_per_range.sum()
-            itr = tqdm(itr, total=tot_n_chunks, desc="Reading ranges")
 
-        for (o_s, o_e), n_chunks in itr:
-            range_idxs = var_idxs[o_s:o_e]
-            vars_per_range = len(range_idxs)
-
-            if vars_per_range == 0:
+        for (o_s, o_e), n_chunks in zip(windowed(offsets, 2), chunks_per_range):
+            if o_s == o_e:
                 yield None
                 continue
 
+            range_idxs = var_idxs[o_s:o_e]
             v_chunks = np.array_split(range_idxs, n_chunks)
 
             if issubclass(mode, Genos):
@@ -1011,11 +1000,14 @@ def _read_index(
     path: Path, filter: pl.Expr | None
 ) -> tuple[pr.PyRanges, StartsEndsIlens | None]:
     if not path.exists():
-        logger.info(f"Genoray index file {path} does not exist. Writing index.")
+        logger.info("Genoray PVAR index not found, creating index.")
         _write_index(path)
 
     logger.info("Loading genoray index.")
-    index = pl.scan_ipc(path, row_index_name="index", memory_map=False)
+    index = pl.scan_ipc(path, row_index_name="index", memory_map=False).with_columns(
+        Start=pl.col("POS") - 1,
+        End=pl.col("POS") + pl.col("REF").str.len_bytes() - 1,
+    )
 
     if filter is None:
         has_multiallelics = (
@@ -1032,14 +1024,15 @@ def _read_index(
     if has_multiallelics:
         sei = None
     else:
-        # can just leave the first alt for multiallelic sites since they're getting filtered out
+        # can keep the first alt for multiallelic sites since they're getting filtered out
         # anyway, so they won't be accessed
+        # if the filter is changed, the index is invalidated and re-read (see filter setter)
         data = index.select(
-            "Start", "End", pl.col("ilen").list.first(), pl.col("ALT").list.first()
+            "Start", "End", pl.col("ILEN", "ALT").list.first()
         ).collect()
         v_starts = data["Start"].to_numpy()
         v_ends = data["End"].to_numpy()
-        ilens = data["ilen"].to_numpy()
+        ilens = data["ILEN"].to_numpy()
         alt = data["ALT"]
         sei = StartsEndsIlens(v_starts, v_ends, ilens, alt)
 
@@ -1047,47 +1040,30 @@ def _read_index(
         index = index.filter(filter)
 
     pyr = pr.PyRanges(
-        index.select("Chromosome", "Start", "End", "index")
+        index.select("index", "Start", "End", Chromosome="CHROM")
         .collect()
         .to_pandas(use_pyarrow_extension_array=True)
     )
     return pyr, sei
 
 
-# TODO: can index be implemented using the NCLS lib underlying PyRanges? Then we can
-# pass np.memmap arrays directly instead of having to futz with DataFrames. This will likely make
+# TODO: can this be implemented using the NCLS lib underlying PyRanges? Then we can
+# pass np.memmap arrays directly instead of having to futz with DataFrames? This will likely make
 # filtering less ergonomic/harder to make ergonomic though, but a memmap approach should be scalable
-# to datasets with billions+ unique variants (reduce memory), reduce instantion time, but increase query time.
+# to datasets with billions+ unique variants (reduce memory), reduce instantion time, but ~increase query time.
 # Unless, NCLS creates a bunch of data structures in memory anyway.
 def _write_index(path: Path):
-    ILEN = pl.col("ALT").str.len_bytes().cast(pl.Int32) - pl.col("rlen").cast(pl.Int32)
-    KIND = (
-        pl.when(ILEN != 0)
-        .then(pl.lit("INDEL"))
-        .when(pl.col("rlen") == 1)  # ILEN == 0 and RLEN == 1
-        .then(pl.lit("SNP"))
-        .when(pl.col("rlen") > 1)  # ILEN == 0 and RLEN > 1
-        .then(pl.lit("MNP"))  # ILEN == 0 and RLEN > 1
-        .otherwise(pl.lit("OTHER"))
-        .cast(pl.Enum(["SNP", "MNP", "INDEL", "OTHER"]))
-    )
+    """Write PVAR index."""
 
     (
         _scan_pvar(path.with_suffix(""))
-        .with_columns(
-            Chromosome="#CHROM",
-            Start=pl.col("POS") - 1,
-            End=pl.col("POS") + pl.col("REF").str.len_bytes() - 1,
-            ALT=pl.col("ALT").str.split(","),
-            rlen=pl.col("REF").str.len_bytes(),
-        )
-        .drop("#CHROM", "POS")
+        .rename({"#CHROM": "CHROM"})
         .with_row_index("index")
+        .with_columns(ALT=pl.col("ALT").str.split(","))
         .explode("ALT")
-        .with_columns(ilen=ILEN, kind=KIND)
-        .drop("rlen")
-        .group_by("index")
-        .agg(pl.exclude("ALT", "ilen", "kind").first(), "ALT", "ilen", "kind")
+        .with_columns(ILEN=ILEN)
+        .group_by("index", maintain_order=True)
+        .agg(pl.exclude("ALT", "ILEN").first(), "ALT", "ILEN")
         .drop("index")
         .sink_ipc(path)
     )
