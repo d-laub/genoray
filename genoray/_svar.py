@@ -28,7 +28,7 @@ INT64_MAX = np.iinfo(POS_TYPE).max
 
 class SparseGenotypes(Ragged[V_IDX_TYPE]):
     """A Ragged array of variant indices with additional guarantees and methods:
-    
+
     - dtype is :code:`int32`
     - Ragged shape of **at least** 2 dimensions that should correspond to (samples, ploidy)
     - :code:`from_dense` to convert dense genotypes to sparse genotypes
@@ -60,7 +60,7 @@ class SparseGenotypes(Ragged[V_IDX_TYPE]):
 
 class SparseVar:
     path: Path
-    samples: list[str]
+    available_samples: list[str]
     ploidy: int
     contigs: list[str]
     genos: SparseGenotypes
@@ -73,7 +73,7 @@ class SparseVar:
     @property
     def n_samples(self) -> int:
         """Number of samples in the dataset."""
-        return len(self.samples)
+        return len(self.available_samples)
 
     @property
     def n_variants(self) -> int:
@@ -95,9 +95,9 @@ class SparseVar:
             metadata = json.load(f)
         contigs = metadata["contigs"]
         self.contigs = contigs
-        self.samples = metadata["samples"]
+        self.available_samples = metadata["samples"]
         self.ploidy = metadata["ploidy"]
-        samples = np.array(self.samples)
+        samples = np.array(self.available_samples)
         self._s2i = HashTable(
             len(samples) * 2,  # type: ignore
             dtype=samples.dtype,
@@ -194,10 +194,10 @@ class SparseVar:
             and the second column is the end index of the variant.
         """
         if samples is None:
-            samples = np.atleast_1d(np.array(self.samples))
+            samples = np.atleast_1d(np.array(self.available_samples))
         else:
             samples = np.atleast_1d(np.array(samples))
-            if missing := set(samples) - set(self.samples):  # type: ignore
+            if missing := set(samples) - set(self.available_samples):  # type: ignore
                 raise ValueError(f"Samples {missing} not found in the dataset.")
 
         s_idxs = cast(NDArray[np.int64], self._s2i[samples])
@@ -224,6 +224,7 @@ class SparseVar:
         starts: ArrayLike = 0,
         ends: ArrayLike = INT64_MAX,
         samples: ArrayLike | None = None,
+        out: NDArray[OFFSET_TYPE] | None = None,
     ) -> NDArray[OFFSET_TYPE]:
         """Find the start and end offsets of the sparse genotypes for each range.
 
@@ -237,6 +238,8 @@ class SparseVar:
             0-based, exclusive end positions of the ranges.
         samples
             List of sample names to read. If None, read all samples.
+        out
+            Output array to write to. If None, a new array will be created.
 
         Returns
         -------
@@ -250,10 +253,10 @@ class SparseVar:
             )
 
         if samples is None:
-            samples = np.atleast_1d(np.array(self.samples))
+            samples = np.atleast_1d(np.array(self.available_samples))
         else:
             samples = np.atleast_1d(np.array(samples))
-            if missing := set(samples) - set(self.samples):  # type: ignore
+            if missing := set(samples) - set(self.available_samples):  # type: ignore
                 raise ValueError(f"Samples {missing} not found in the dataset.")
 
         s_idxs = cast(NDArray[np.int64], self._s2i[samples])
@@ -268,8 +271,9 @@ class SparseVar:
         ends = np.atleast_1d(np.asarray(ends, POS_TYPE))
         # (r 2)
         var_ranges = self.var_ranges(contig, starts, ends)
+
         # (r s p 2)
-        starts_ends = _find_starts_ends_with_length(
+        out = _find_starts_ends_with_length(
             self.genos.data,
             self.genos.offsets,
             starts,
@@ -280,8 +284,9 @@ class SparseVar:
             s_idxs,
             self.ploidy,
             self._c_max_idxs[c],
+            out,
         )
-        return starts_ends
+        return out
 
     def read_ranges(
         self,
@@ -309,10 +314,10 @@ class SparseVar:
             a memory mapped read-only array of the full file so the only data in memory will be the offsets.
         """
         if samples is None:
-            samples = np.atleast_1d(np.array(self.samples))
+            samples = np.atleast_1d(np.array(self.available_samples))
         else:
             samples = np.atleast_1d(np.array(samples))
-            if missing := set(samples) - set(self.samples):  # type: ignore
+            if missing := set(samples) - set(self.available_samples):  # type: ignore
                 raise ValueError(f"Samples {missing} not found in the dataset.")
 
         n_samples = len(samples)
@@ -363,9 +368,9 @@ class SparseVar:
             a memory mapped read-only array of the full file so the only data in memory will be the offsets.
         """
         if samples is None:
-            samples = np.atleast_1d(np.array(self.samples))
+            samples = np.atleast_1d(np.array(self.available_samples))
         else:
-            if missing := set(samples) - set(self.samples):  # type: ignore
+            if missing := set(samples) - set(self.available_samples):  # type: ignore
                 raise ValueError(f"Samples {missing} not found in the dataset.")
             samples = np.atleast_1d(np.array(samples))
 
@@ -692,6 +697,7 @@ def _find_starts_ends_with_length(
     sample_idxs: NDArray[np.int64],
     ploidy: int,
     contig_max_idx: int,
+    out: NDArray[OFFSET_TYPE] | None = None,
 ):
     """Find the start and end offsets of the sparse genotypes for each range.
 
@@ -711,7 +717,8 @@ def _find_starts_ends_with_length(
     """
     n_ranges = len(q_starts)
     n_samples = len(sample_idxs)
-    out_ranges = np.zeros((n_ranges, n_samples, ploidy, 2), dtype=OFFSET_TYPE)
+    if out is None:
+        out = np.zeros((n_ranges, n_samples, ploidy, 2), dtype=OFFSET_TYPE)
 
     for r in nb.prange(n_ranges):
         for s in nb.prange(n_samples):
@@ -725,10 +732,10 @@ def _find_starts_ends_with_length(
                 )
 
                 # add o_s to make indices relative to whole array
-                out_ranges[r, s, p, 0] = start_idx + o_s
+                out[r, s, p, 0] = start_idx + o_s
                 if start_idx == max_idx:
                     # no variants in this range
-                    out_ranges[r, s, p, 1] = start_idx + o_s
+                    out[r, s, p, 1] = start_idx + o_s
                     continue
 
                 q_start: POS_TYPE = q_starts[r]
@@ -773,5 +780,6 @@ def _find_starts_ends_with_length(
                     last_v_end = max(last_v_end, v_end)
 
                 # add o_s to make indices relative to whole array
-                out_ranges[r, s, p, 1] = geno_idx + o_s + 1
-    return out_ranges
+                out[r, s, p, 1] = geno_idx + o_s + 1
+
+    return out
