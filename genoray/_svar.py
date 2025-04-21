@@ -28,9 +28,10 @@ INT64_MAX = np.iinfo(POS_TYPE).max
 
 class SparseGenotypes(Ragged[V_IDX_TYPE]):
     """A Ragged array of variant indices with additional guarantees and methods:
-    - dtype is int32
+    
+    - dtype is :code:`int32`
     - Ragged shape of **at least** 2 dimensions that should correspond to (samples, ploidy)
-    - `from_dense` to convert dense genotypes to sparse genotypes
+    - :code:`from_dense` to convert dense genotypes to sparse genotypes
     """
 
     def __attrs_post_init__(self):
@@ -46,7 +47,7 @@ class SparseGenotypes(Ragged[V_IDX_TYPE]):
         genos
             Shape = (sample ploidy variants) Genotypes.
         var_idxs
-            Shape = (variants) variant indices.
+            Shape = (variants) Variant indices.
         """
         # (s p v)
         keep = genos == 1
@@ -131,7 +132,7 @@ class SparseVar:
 
         Returns
         -------
-            Shape: (ranges, 2). The first column is the start index of the variant
+            Shape: :code:`(ranges, 2)`. The first column is the start index of the variant
             and the second column is the end index of the variant.
         """
         starts = np.atleast_1d(np.asarray(starts, POS_TYPE))
@@ -304,7 +305,7 @@ class SparseVar:
 
         Returns
         -------
-            SparseGenotypes with shape (ranges, samples, ploidy, 2). Note that the genotypes will be backed by
+            SparseGenotypes with shape :code:`(ranges, samples, ploidy, ~variants)`. Note that the genotypes will be backed by
             a memory mapped read-only array of the full file so the only data in memory will be the offsets.
         """
         if samples is None:
@@ -341,7 +342,9 @@ class SparseVar:
         ends: ArrayLike = INT64_MAX,
         samples: ArrayLike | None = None,
     ) -> SparseGenotypes:
-        """Read the genotypes for the given ranges.
+        """Read the genotypes for the given ranges such that each entry of variants is guaranteed to have
+        the minimum amount of variants to reach the query length. This can mean either fewer or more variants
+        than would be returned than by :code:`read_ranges`, depending on the presence of indels.
 
         Parameters
         ----------
@@ -356,7 +359,7 @@ class SparseVar:
 
         Returns
         -------
-            SparseGenotypes with shape (ranges, samples, ploidy, 2). Note that the genotypes will be backed by
+            SparseGenotypes with shape :code:`(ranges, samples, ploidy, ~variants)`. Note that the genotypes will be backed by
             a memory mapped read-only array of the full file so the only data in memory will be the offsets.
         """
         if samples is None:
@@ -390,6 +393,19 @@ class SparseVar:
     def from_vcf(
         cls, out: str | Path, vcf: VCF, max_mem: int | str, overwrite: bool = False
     ):
+        """Create a Sparse Variant (.svar) from a VCF/BCF.
+
+        Parameters
+        ----------
+        out
+            Path to the output directory.
+        vcf
+            VCF file to write from.
+        max_mem
+            Maximum memory to use while writing.
+        overwrite
+            Whether to overwrite the output directory if it exists.
+        """
         out = Path(out)
 
         if out.exists() and not overwrite:
@@ -445,6 +461,19 @@ class SparseVar:
     def from_pgen(
         cls, out: str | Path, pgen: PGEN, max_mem: int | str, overwrite: bool = False
     ):
+        """Create a Sparse Variant (.svar) from a PGEN.
+
+        Parameters
+        ----------
+        out
+            Path to the output directory.
+        pgen
+            PGEN file to write from.
+        max_mem
+            Maximum memory to use while writing.
+        overwrite
+            Whether to overwrite the output directory if it exists.
+        """
         out = Path(out)
 
         if out.exists() and not overwrite:

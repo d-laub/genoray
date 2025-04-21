@@ -1,6 +1,7 @@
 ```{toctree}
 :hidden: true
 
+svar
 api
 ```
 

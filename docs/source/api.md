@@ -8,4 +8,6 @@
 .. autoclass:: PGEN
 
 .. autoclass:: SparseVar
+
+.. autoclass:: SparseGenotypes
 ```
