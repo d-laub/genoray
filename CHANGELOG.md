@@ -1,3 +1,9 @@
+## 0.7.0 (2025-04-21)
+
+### Fix
+
+- rename SparseVar.samples to SparseVar.available_samples for consistency
+
 ## 0.6.0 (2025-04-21)
 
 ### Feat
