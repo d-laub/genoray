@@ -4,10 +4,11 @@ from importlib.metadata import version
 from typing import Union
 
 from ._pgen import PGEN
+from ._svar import SparseVar
 from ._vcf import VCF
 
-Reader = Union[VCF, PGEN]
+Reader = Union[VCF, PGEN, SparseVar]
 
 __version__ = version("genoray")
 
-__all__ = ["Reader", "VCF", "PGEN"]
+__all__ = ["Reader", "VCF", "PGEN", "SparseVar"]

@@ -6,4 +6,6 @@
 .. autoclass:: VCF
 
 .. autoclass:: PGEN
+
+.. autoclass:: SparseVar
 ```

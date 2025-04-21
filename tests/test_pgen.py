@@ -229,7 +229,7 @@ def test_chunk_with_length(
 
 
 def n_vars_miss_chr():
-    contig = "chr2"
+    contig = "chr3"
     starts = 0
     ends = np.iinfo(np.int64).max
     desired = np.array([0], dtype=np.uint32)
@@ -265,7 +265,7 @@ def test_n_vars_in_ranges(
 
 
 def var_idxs_miss_chr():
-    contig = "chr2"
+    contig = "chr3"
     starts = 0
     ends = np.iinfo(np.int64).max
     desired = (np.array([], dtype=np.uint32), np.array([0, 0], dtype=np.uint64))

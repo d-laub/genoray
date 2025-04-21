@@ -17,11 +17,15 @@ bcftools index "$multi".gz
 
 echo "Converting VCF to PLINK format..."
 prefix="${bi%.vcf}"
-plink2 --make-pgen --vcf "$bi".gz 'dosage=DS' --out "$prefix"
+plink2 --make-pgen --vcf "$bi".gz 'dosage=DS' --out "$prefix" --vcf-half-call r
 rm -f "$prefix".log
 rm -f "$prefix".pvar.gvi
 
 prefix="${multi%.vcf}"
-plink2 --make-pgen --vcf "$multi".gz --out "$prefix"
+plink2 --make-pgen --vcf "$multi".gz --out "$prefix" --vcf-half-call r
 rm -f "$prefix".log
 rm -f "$prefix".pvar.gvi
+
+
+echo "Converting VCF and PGEN to SVAR format..."
+python "$ddir"/gen_svar.py

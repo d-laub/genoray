@@ -26,7 +26,7 @@ class ContigNormalizer:
     @overload
     def norm(self, contigs: list[str]) -> list[str | None]: ...
     def norm(self, contigs: str | list[str]) -> str | None | list[str | None]:
-        """Normalize the contig name to match the naming scheme of `contigs`.
+        """Normalize contig name(s) to match the naming scheme of the contig normalizer.
 
         Parameters
         ----------
@@ -92,27 +92,6 @@ def format_memory(memory: int):
     exponent = min(int(math.log2(memory) // 10), len(units) - 1)
     value = memory / (1 << (10 * exponent))
     return f"{value:.2f} {units[exponent]}"
-
-
-def lengths_to_offsets(
-    lengths: NDArray[np.integer], dtype: type[DTYPE] = np.uint64
-) -> NDArray[DTYPE]:
-    """Convert lengths to offsets.
-
-    Parameters
-    ----------
-    lengths
-        Lengths of the segments.
-
-    Returns
-    -------
-    offsets
-        Offsets of the segments.
-    """
-    offsets = np.empty(lengths.size + 1, dtype=dtype)
-    offsets[0] = 0
-    offsets[1:] = lengths.cumsum()
-    return offsets
 
 
 def hap_ilens(
