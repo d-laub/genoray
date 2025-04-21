@@ -1,3 +1,14 @@
+## 0.6.0 (2025-04-21)
+
+### Feat
+
+- **wip**: SVAR file format prototyped and is very fast!
+- **wip**: sparse variant file format
+
+### Fix
+
+- pass all tests
+
 ## 0.5.1 (2025-04-19)
 
 ### Fix
