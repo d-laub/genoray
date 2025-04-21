@@ -21,13 +21,12 @@ from ._pgen import PGEN
 from ._utils import ContigNormalizer
 from ._vcf import VCF
 
-SVAR_R_DTYPE = np.int64
-SVAR_V_IDX = np.int32
-IDX_TYPE = np.uint32
-INT64_MAX = np.iinfo(SVAR_R_DTYPE).max
+POS_TYPE = np.int64
+V_IDX_TYPE = np.int32
+INT64_MAX = np.iinfo(POS_TYPE).max
 
 
-class SparseGenotypes(Ragged[SVAR_V_IDX]):
+class SparseGenotypes(Ragged[V_IDX_TYPE]):
     """A Ragged array of variant indices with additional guarantees and methods:
     - dtype is int32
     - Ragged shape of **at least** 2 dimensions that should correspond to (samples, ploidy)
@@ -36,10 +35,10 @@ class SparseGenotypes(Ragged[SVAR_V_IDX]):
 
     def __attrs_post_init__(self):
         assert self.ndim >= 2, "SparseGenotypes must have at least 2 dimensions"
-        assert self.dtype.type == SVAR_V_IDX, "SparseGenotypes must be of type int32"
+        assert self.dtype.type == V_IDX_TYPE, "SparseGenotypes must be of type int32"
 
     @classmethod
-    def from_dense(cls, genos: NDArray[np.int8], var_idxs: NDArray[SVAR_V_IDX]):
+    def from_dense(cls, genos: NDArray[np.int8], var_idxs: NDArray[V_IDX_TYPE]):
         """Convert dense genotypes to sparse genotypes.
 
         Parameters
@@ -63,26 +62,38 @@ class SparseVar:
     samples: list[str]
     ploidy: int
     contigs: list[str]
-    genos: dict[str, SparseGenotypes]
+    genos: SparseGenotypes
     granges: pr.PyRanges
     attrs: pl.DataFrame
     _c_norm: ContigNormalizer
     _s2i: HashTable
+    _c_max_idxs: dict[str, int]
 
     @property
     def n_samples(self) -> int:
+        """Number of samples in the dataset."""
         return len(self.samples)
 
     @property
     def n_variants(self) -> int:
+        """Number of variants in the dataset."""
         return len(self.granges)
 
     def __init__(self, path: str | Path):
+        """Open a Sparse Variant (SVAR) directory.
+
+        Parameters
+        ----------
+        path
+            Path to the SVAR directory.
+        """
         path = Path(path)
         self.path = path
 
         with open(path / "metadata.json") as f:
             metadata = json.load(f)
+        contigs = metadata["contigs"]
+        self.contigs = contigs
         self.samples = metadata["samples"]
         self.ploidy = metadata["ploidy"]
         samples = np.array(self.samples)
@@ -92,22 +103,18 @@ class SparseVar:
         )
         self._s2i.add(samples)
 
-        contigs = natsorted(p.name for p in path.iterdir() if p.is_dir())
-        self.contigs = contigs
         self._c_norm = ContigNormalizer(contigs)
-        self.genos = {
-            c: _open_sparse_memmap(path / c, (self.n_samples, self.ploidy), "r")
-            for c in contigs
-        }
-
+        self.genos = _open_sparse_memmap(path, (self.n_samples, self.ploidy), "r")
         self.granges, self.attrs = self._load_index()
+        vars_per_contig = np.array([len(df) for df in self.granges.values()]).cumsum()
+        self._c_max_idxs = {c: v - 1 for c, v in zip(self.contigs, vars_per_contig)}
 
     def var_ranges(
         self,
         contig: str,
         starts: ArrayLike = 0,
         ends: ArrayLike = INT64_MAX,
-    ) -> NDArray[SVAR_V_IDX]:
+    ) -> NDArray[V_IDX_TYPE]:
         """Get variant index ranges for each query range. i.e.
         For each query range, return the minimum and maximum variant that overlaps.
         Note that this means some variants within those ranges may not actually overlap with
@@ -127,14 +134,14 @@ class SparseVar:
             Shape: (ranges, 2). The first column is the start index of the variant
             and the second column is the end index of the variant.
         """
-        starts = np.atleast_1d(np.asarray(starts, SVAR_R_DTYPE))
+        starts = np.atleast_1d(np.asarray(starts, POS_TYPE))
         n_ranges = len(starts)
 
         c = self._c_norm.norm(contig)
         if c is None:
-            return np.zeros((n_ranges, 2), SVAR_V_IDX)
+            return np.zeros((n_ranges, 2), V_IDX_TYPE)
 
-        ends = np.atleast_1d(np.asarray(ends, SVAR_R_DTYPE))
+        ends = np.atleast_1d(np.asarray(ends, POS_TYPE))
         queries = pr.PyRanges(
             pl.DataFrame(
                 {
@@ -149,47 +156,129 @@ class SparseVar:
         join = queries.join(self.granges)
 
         if len(join) == 0:
-            return np.zeros((n_ranges, 2), SVAR_V_IDX)
+            return np.zeros((n_ranges, 2), V_IDX_TYPE)
 
         return (
             pl.from_pandas(join.df)
-            .group_by("query")
-            .agg(s=pl.col("index").min(), e=pl.col("index").max())
+            .group_by("query", maintain_order=True)
+            .agg(start=pl.col("index").min(), end=pl.col("index").max() + 1)
             .drop("query")
             .to_numpy()
-            .astype(SVAR_V_IDX)
+            .astype(V_IDX_TYPE)
         )
 
-    def find_starts_ends(
+    def _find_starts_ends(
         self,
         contig: str,
         starts: ArrayLike = 0,
         ends: ArrayLike = INT64_MAX,
         samples: ArrayLike | None = None,
     ) -> NDArray[OFFSET_TYPE]:
+        """Find the start and end offsets of the sparse genotypes for each range.
+
+        Parameters
+        ----------
+        contig
+            Contig name.
+        starts
+            0-based start positions of the ranges.
+        ends
+            0-based, exclusive end positions of the ranges.
+        samples
+            List of sample names to read. If None, read all samples.
+
+        Returns
+        -------
+            Shape: (ranges, samples, ploidy, 2). The first column is the start index of the variant
+            and the second column is the end index of the variant.
+        """
         if samples is None:
             samples = np.atleast_1d(np.array(self.samples))
         else:
+            samples = np.atleast_1d(np.array(samples))
             if missing := set(samples) - set(self.samples):  # type: ignore
                 raise ValueError(f"Samples {missing} not found in the dataset.")
-            samples = np.atleast_1d(np.array(samples))
 
         s_idxs = cast(NDArray[np.int64], self._s2i[samples])
 
-        starts = np.atleast_1d(np.asarray(starts, SVAR_R_DTYPE))
+        starts = np.atleast_1d(np.asarray(starts, POS_TYPE))
         n_ranges = len(starts)
 
         c = self._c_norm.norm(contig)
         if c is None:
-            return np.zeros((n_ranges + 1, 2), OFFSET_TYPE)
+            return np.zeros((n_ranges, len(samples), self.ploidy, 2), OFFSET_TYPE)
 
-        ends = np.atleast_1d(np.asarray(ends, SVAR_R_DTYPE))
+        ends = np.atleast_1d(np.asarray(ends, POS_TYPE))
         # (r 2)
         var_ranges = self.var_ranges(contig, starts, ends)
-        genos = self.genos[c]
         # (r s p 2)
         starts_ends = _find_starts_ends(
-            genos.data, genos.offsets, var_ranges, s_idxs, self.ploidy
+            self.genos.data, self.genos.offsets, var_ranges, s_idxs, self.ploidy
+        )
+        return starts_ends
+
+    def _find_starts_ends_with_length(
+        self,
+        contig: str,
+        starts: ArrayLike = 0,
+        ends: ArrayLike = INT64_MAX,
+        samples: ArrayLike | None = None,
+    ) -> NDArray[OFFSET_TYPE]:
+        """Find the start and end offsets of the sparse genotypes for each range.
+
+        Parameters
+        ----------
+        contig
+            Contig name.
+        starts
+            0-based start positions of the ranges.
+        ends
+            0-based, exclusive end positions of the ranges.
+        samples
+            List of sample names to read. If None, read all samples.
+
+        Returns
+        -------
+            Shape: (ranges, samples, ploidy, 2). The first column is the start index of the variant
+            and the second column is the end index of the variant.
+        """
+        has_multiallelics = (self.attrs["ALT"].list.len() > 1).any()
+        if has_multiallelics:
+            raise ValueError(
+                "Cannot use with_length operations with multiallelic variants."
+            )
+
+        if samples is None:
+            samples = np.atleast_1d(np.array(self.samples))
+        else:
+            samples = np.atleast_1d(np.array(samples))
+            if missing := set(samples) - set(self.samples):  # type: ignore
+                raise ValueError(f"Samples {missing} not found in the dataset.")
+
+        s_idxs = cast(NDArray[np.int64], self._s2i[samples])
+
+        starts = np.atleast_1d(np.asarray(starts, POS_TYPE))
+        n_ranges = len(starts)
+
+        c = self._c_norm.norm(contig)
+        if c is None:
+            return np.zeros((n_ranges, len(samples), self.ploidy, 2), OFFSET_TYPE)
+
+        ends = np.atleast_1d(np.asarray(ends, POS_TYPE))
+        # (r 2)
+        var_ranges = self.var_ranges(contig, starts, ends)
+        # (r s p 2)
+        starts_ends = _find_starts_ends_with_length(
+            self.genos.data,
+            self.genos.offsets,
+            starts,
+            ends,
+            var_ranges[:, 0],
+            self.granges.Start.to_numpy(),
+            self.attrs["ILEN"].list.first().to_numpy(),
+            s_idxs,
+            self.ploidy,
+            self._c_max_idxs[c],
         )
         return starts_ends
 
@@ -200,6 +289,76 @@ class SparseVar:
         ends: ArrayLike = INT64_MAX,
         samples: ArrayLike | None = None,
     ) -> SparseGenotypes:
+        """Read the genotypes for the given ranges.
+
+        Parameters
+        ----------
+        contig
+            Contig name.
+        starts
+            0-based start positions of the ranges.
+        ends
+            0-based, exclusive end positions of the ranges.
+        samples
+            List of sample names to read. If None, read all samples.
+
+        Returns
+        -------
+            SparseGenotypes with shape (ranges, samples, ploidy, 2). Note that the genotypes will be backed by
+            a memory mapped read-only array of the full file so the only data in memory will be the offsets.
+        """
+        if samples is None:
+            samples = np.atleast_1d(np.array(self.samples))
+        else:
+            samples = np.atleast_1d(np.array(samples))
+            if missing := set(samples) - set(self.samples):  # type: ignore
+                raise ValueError(f"Samples {missing} not found in the dataset.")
+
+        n_samples = len(samples)
+        starts = np.atleast_1d(np.asarray(starts, POS_TYPE))
+        n_ranges = len(starts)
+
+        c = self._c_norm.norm(contig)
+        if c is None:
+            return SparseGenotypes.from_offsets(
+                np.empty((0), V_IDX_TYPE),
+                (n_samples, self.ploidy),
+                np.zeros((0, 2), OFFSET_TYPE),
+            )
+
+        # (r s p 2)
+        starts_ends = self._find_starts_ends(contig, starts, ends, samples)
+        return SparseGenotypes.from_offsets(
+            self.genos.data,
+            (n_ranges, n_samples, self.ploidy),
+            starts_ends.reshape(-1, 2),
+        )
+
+    def read_ranges_with_length(
+        self,
+        contig: str,
+        starts: ArrayLike = 0,
+        ends: ArrayLike = INT64_MAX,
+        samples: ArrayLike | None = None,
+    ) -> SparseGenotypes:
+        """Read the genotypes for the given ranges.
+
+        Parameters
+        ----------
+        contig
+            Contig name.
+        starts
+            0-based start positions of the ranges.
+        ends
+            0-based, exclusive end positions of the ranges.
+        samples
+            List of sample names to read. If None, read all samples.
+
+        Returns
+        -------
+            SparseGenotypes with shape (ranges, samples, ploidy, 2). Note that the genotypes will be backed by
+            a memory mapped read-only array of the full file so the only data in memory will be the offsets.
+        """
         if samples is None:
             samples = np.atleast_1d(np.array(self.samples))
         else:
@@ -208,21 +367,21 @@ class SparseVar:
             samples = np.atleast_1d(np.array(samples))
 
         n_samples = len(samples)
-        starts = np.atleast_1d(np.asarray(starts, SVAR_R_DTYPE))
+        starts = np.atleast_1d(np.asarray(starts, POS_TYPE))
         n_ranges = len(starts)
 
         c = self._c_norm.norm(contig)
         if c is None:
             return SparseGenotypes.from_offsets(
-                np.empty((0), SVAR_V_IDX),
+                np.empty((0), V_IDX_TYPE),
                 (n_samples, self.ploidy),
                 np.zeros((0, 2), OFFSET_TYPE),
             )
 
         # (r s p 2)
-        starts_ends = self.find_starts_ends(contig, starts, ends, samples)
+        starts_ends = self._find_starts_ends_with_length(contig, starts, ends, samples)
         return SparseGenotypes.from_offsets(
-            self.genos[c].data,
+            self.genos.data,
             (n_ranges, n_samples, self.ploidy),
             starts_ends.reshape(-1, 2),
         )
@@ -240,45 +399,47 @@ class SparseVar:
         out.mkdir(parents=True, exist_ok=True)
 
         contigs = vcf.contigs
-
-        tempdir = TemporaryDirectory()
-        tdir = Path(tempdir.name)
-        shape = (vcf.n_samples, vcf.ploidy)
         with open(out / "metadata.json", "w") as f:
-            json.dump({"samples": vcf.available_samples, "ploidy": vcf.ploidy}, f)
+            json.dump(
+                {
+                    "contigs": contigs,
+                    "samples": vcf.available_samples,
+                    "ploidy": vcf.ploidy,
+                },
+                f,
+            )
 
         if not vcf._index_path().exists():
             logger.info("Genoray VCF index not found, creating index.")
             vcf._write_gvi_index()
-
         shutil.copy(vcf._index_path(), cls._index_path(out))
 
-        c_pbar = tqdm(total=len(contigs), unit=" contig")
-        for c in contigs:
-            c_pbar.set_description(f"Processing contig {c}")
-            v_pbar = tqdm(unit=" variant", position=1)
-            v_pbar.set_description("Reading variants")
-            (tdir / c).mkdir(parents=True, exist_ok=True)
-            (out / c).mkdir(parents=True, exist_ok=True)
+        with TemporaryDirectory() as tdir:
+            tdir = Path(tdir)
+
+            shape = (vcf.n_samples, vcf.ploidy)
+            c_pbar = tqdm(total=len(contigs), unit=" contig")
             offset = 0
-            # genos: (s p v)
-            with vcf.using_pbar(v_pbar) as vcf:
-                for i, genos in enumerate(
-                    vcf.chunk(c, max_mem=max_mem, mode=VCF.Genos8)
-                ):
-                    n_vars = genos.shape[-1]
-                    var_idxs = np.arange(offset, offset + n_vars, dtype=np.int32)
-                    sp_genos = SparseGenotypes.from_dense(genos, var_idxs)
-                    _write_sparse_memmap(tdir / c / str(i), sp_genos)
-                    offset += n_vars
+            chunk_idx = 0
+            for c in contigs:
+                c_pbar.set_description(f"Processing contig {c}")
+                v_pbar = tqdm(unit=" variant", position=1)
+                v_pbar.set_description("Reading variants")
+                with vcf.using_pbar(v_pbar) as vcf:
+                    # genos: (s p v)
+                    for genos in vcf.chunk(c, max_mem=max_mem, mode=VCF.Genos8):
+                        n_vars = genos.shape[-1]
+                        var_idxs = np.arange(offset, offset + n_vars, dtype=np.int32)
+                        sp_genos = SparseGenotypes.from_dense(genos, var_idxs)
+                        _write_sparse_memmap(tdir / str(chunk_idx), sp_genos)
+                        offset += n_vars
+                        chunk_idx += 1
+                    v_pbar.close()
+                c_pbar.update()
+            c_pbar.close()
 
-                v_pbar.set_description("Concatenating intermediate chunks")
-                _concat_sparse_memmaps(out / c, tdir / c, shape)
-                v_pbar.close()
-            c_pbar.update()
-        c_pbar.close()
-
-        tempdir.cleanup()
+            logger.info("Concatenating intermediate chunks")
+            _concat_sparse_memmaps(out, tdir, shape)
 
     @classmethod
     def from_pgen(
@@ -293,42 +454,46 @@ class SparseVar:
         out.mkdir(parents=True, exist_ok=True)
 
         contigs = pgen.contigs
-
-        tempdir = TemporaryDirectory()
-        tdir = Path(tempdir.name)
-        shape = (pgen.n_samples, pgen.ploidy)
         with open(out / "metadata.json", "w") as f:
-            json.dump({"samples": pgen.available_samples, "ploidy": pgen.ploidy}, f)
+            json.dump(
+                {
+                    "contigs": contigs,
+                    "samples": pgen.available_samples,
+                    "ploidy": pgen.ploidy,
+                },
+                f,
+            )
 
         shutil.copy(pgen._index_path(), cls._index_path(out))
 
-        n_variants = len(pgen._index)
-        pbar = tqdm(total=n_variants, unit=" variant")
-        for c in contigs:
-            (tdir / c).mkdir(parents=True, exist_ok=True)
-            (out / c).mkdir(parents=True, exist_ok=True)
-            offset = 0
-            i = 0
-            pbar.set_description(f"Contig {c}, readings variants")
-            for range_ in pgen.chunk_ranges(c, max_mem=max_mem, mode=PGEN.Genos):
-                if range_ is None:
-                    continue
-                # genos: (s p v)
-                for genos in range_:
-                    n_vars = genos.shape[-1]
-                    var_idxs = np.arange(offset, offset + n_vars, dtype=np.int32)
-                    sp_genos = SparseGenotypes.from_dense(
-                        genos.astype(np.int8), var_idxs
-                    )
-                    _write_sparse_memmap(tdir / c / str(i), sp_genos)
-                    offset += n_vars
-                    i += 1
-                    pbar.update(n_vars)
-            pbar.set_description(f"Contig {c}, concatenating intermediate chunks")
-            _concat_sparse_memmaps(out / c, tdir / c, shape)
-        pbar.close()
+        with TemporaryDirectory() as tdir:
+            tdir = Path(tdir)
 
-        tempdir.cleanup()
+            shape = (pgen.n_samples, pgen.ploidy)
+            n_variants = len(pgen._index)
+            pbar = tqdm(total=n_variants, unit=" variant")
+            offset = 0
+            chunk_idx = 0
+            for c in contigs:
+                pbar.set_description(f"Contig {c}, readings variants")
+                for range_ in pgen.chunk_ranges(c, max_mem=max_mem, mode=PGEN.Genos):
+                    if range_ is None:
+                        continue
+                    # genos: (s p v)
+                    for genos in range_:
+                        n_vars = genos.shape[-1]
+                        var_idxs = np.arange(offset, offset + n_vars, dtype=np.int32)
+                        sp_genos = SparseGenotypes.from_dense(
+                            genos.astype(np.int8), var_idxs
+                        )
+                        _write_sparse_memmap(tdir / str(chunk_idx), sp_genos)
+                        offset += n_vars
+                        chunk_idx += 1
+                        pbar.update(n_vars)
+            pbar.close()
+
+            logger.info("Concatenating intermediate chunks")
+            _concat_sparse_memmaps(out, tdir, shape)
 
     @classmethod
     def _index_path(cls, root: Path):
@@ -375,6 +540,7 @@ def _write_sparse_memmap(path: Path, sp_genos: SparseGenotypes):
     )
     var_idxs[:] = sp_genos.data
     var_idxs.flush()
+
     offsets = np.memmap(
         path / "offsets.npy",
         shape=sp_genos.offsets.shape,
@@ -386,7 +552,6 @@ def _write_sparse_memmap(path: Path, sp_genos: SparseGenotypes):
 
 
 def _concat_sparse_memmaps(out_path: Path, chunks_path: Path, shape: tuple[int, int]):
-    """concat one contig"""
     out_path.mkdir(parents=True, exist_ok=True)
 
     # [1, 2, 3, ...]
@@ -447,9 +612,9 @@ def _concat_helper(
 
 @nb.njit(parallel=True, nogil=True, cache=True)
 def _find_starts_ends(
-    genos: NDArray[SVAR_V_IDX],
+    genos: NDArray[V_IDX_TYPE],
     geno_offsets: NDArray[OFFSET_TYPE],
-    var_ranges: NDArray[SVAR_V_IDX],
+    var_ranges: NDArray[V_IDX_TYPE],
     sample_idxs: NDArray[np.int64],
     ploidy: int,
 ):
@@ -471,17 +636,113 @@ def _find_starts_ends(
     """
     n_ranges = len(var_ranges)
     n_samples = len(sample_idxs)
+    out_offsets = np.zeros((n_ranges, n_samples, ploidy, 2), dtype=OFFSET_TYPE)
+
+    for r in nb.prange(n_ranges):
+        for s in nb.prange(n_samples):
+            for p in nb.prange(ploidy):
+                s_idx = sample_idxs[s]
+                sp = s_idx * ploidy + p
+                o_s, o_e = geno_offsets[sp], geno_offsets[sp + 1]
+                sp_genos = genos[o_s:o_e]
+                # add o_s to make indices relative to whole array
+                out_offsets[r, s, p] = np.searchsorted(sp_genos, var_ranges[r]) + o_s
+
+    return out_offsets
+
+
+@nb.njit(parallel=False, nogil=True, cache=True)
+def _find_starts_ends_with_length(
+    genos: NDArray[V_IDX_TYPE],
+    geno_offsets: NDArray[OFFSET_TYPE],
+    q_starts: NDArray[POS_TYPE],
+    q_ends: NDArray[POS_TYPE],
+    first_var_idxs: NDArray[V_IDX_TYPE],
+    v_starts: NDArray[np.int32],
+    ilens: NDArray[np.int32],
+    sample_idxs: NDArray[np.int64],
+    ploidy: int,
+    contig_max_idx: int,
+):
+    """Find the start and end offsets of the sparse genotypes for each range.
+
+    Parameters
+    ----------
+    genos
+        Sparse genotypes
+    geno_offsets
+        Genotype offsets
+    var_ranges
+        Shape = (ranges 2) Variant index ranges.
+
+    Returns
+    -------
+        Shape: (ranges samples ploidy 2). The first column is the start index of the variant
+        and the second column is the end index of the variant.
+    """
+    n_ranges = len(q_starts)
+    n_samples = len(sample_idxs)
     out_ranges = np.zeros((n_ranges, n_samples, ploidy, 2), dtype=OFFSET_TYPE)
 
     for r in nb.prange(n_ranges):
         for s in nb.prange(n_samples):
             for p in nb.prange(ploidy):
-                sp = s * ploidy + p
+                s_idx = sample_idxs[s]
+                sp = s_idx * ploidy + p
                 o_s, o_e = geno_offsets[sp], geno_offsets[sp + 1]
                 sp_genos = genos[o_s:o_e]
-                out_ranges[r, s, p, 0] = np.searchsorted(sp_genos, var_ranges[r, 0])
-                out_ranges[r, s, p, 1] = np.searchsorted(
-                    sp_genos, var_ranges[r, 1], side="right"
+                start_idx, max_idx = np.searchsorted(
+                    sp_genos, [first_var_idxs[r], contig_max_idx + 1]
                 )
 
+                # add o_s to make indices relative to whole array
+                out_ranges[r, s, p, 0] = start_idx + o_s
+                if start_idx == max_idx:
+                    # no variants in this range
+                    out_ranges[r, s, p, 1] = start_idx + o_s
+                    continue
+
+                q_start: POS_TYPE = q_starts[r]
+                q_len: POS_TYPE = q_ends[r] - q_start
+                last_v_end = q_start
+                written_len = 0
+                # ensure geno_idx is assigned when start_idx == n_vars
+                geno_idx = start_idx
+                for geno_idx in range(start_idx, max_idx):
+                    v_idx: V_IDX_TYPE = sp_genos[geno_idx]
+                    v_start = v_starts[v_idx]
+                    ilen: np.int32 = ilens[v_idx]
+
+                    # only add atomized length if v_start >= ref_start
+                    maybe_add_one = POS_TYPE(v_start >= q_start)
+
+                    # only variants within query can add to write length
+                    if v_start >= q_start:
+                        v_write_len = (
+                            (v_start - last_v_end)  # dist between last var and this var
+                            + max(0, ilen)  # insertion length
+                            + maybe_add_one  # maybe add atomized length
+                        )
+
+                        # right-clip insertions
+                        # Not necessary since it's inconsequential to overshoot the target length
+                        # and insertions don't affect the ref length for getting tracks.
+                        # Nevertheless, here's the code to clip a final insertion if we ever wanted to:
+                        # missing_len = target_len - cum_write_len
+                        # clip_right = max(0, v_len - missing_len)
+                        # v_len -= clip_right
+
+                        written_len += v_write_len
+                        if written_len >= q_len:
+                            break
+
+                    v_end = (
+                        v_start
+                        - min(0, ilen)  # deletion length
+                        + maybe_add_one  # maybe add atomized length
+                    )
+                    last_v_end = max(last_v_end, v_end)
+
+                # add o_s to make indices relative to whole array
+                out_ranges[r, s, p, 1] = geno_idx + o_s + 1
     return out_ranges

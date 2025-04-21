@@ -10,6 +10,7 @@ import pyranges as pr
 from hirola import HashTable
 from loguru import logger
 from more_itertools import mark_ends, windowed
+from natsort import natsorted
 from numpy.typing import ArrayLike, NDArray
 from phantom import Phantom
 from seqpro._ragged import OFFSET_TYPE, lengths_to_offsets
@@ -18,14 +19,14 @@ from typing_extensions import Self, TypeGuard, assert_never
 from ._index import ILEN
 from ._utils import ContigNormalizer, format_memory, hap_ilens, parse_memory
 
-PGEN_R_DTYPE = np.int64
+POS_TYPE = np.int64
 """Dtype for PGEN range indices. This determines the maximum size of a contig in genoray.
 We have to use int64 because this is what PyRanges uses."""
 
-PGEN_V_IDX = np.uint32
+V_IDX_TYPE = np.uint32
 """Dtype for PGEN variant indices (uint32). This determines the maximum number of unique variants in a file."""
 
-INT64_MAX = np.iinfo(PGEN_R_DTYPE).max
+INT64_MAX = np.iinfo(POS_TYPE).max
 
 
 def _is_genos(obj: Any) -> TypeGuard[Genos]:
@@ -113,7 +114,7 @@ class PGEN:
     ploidy = 2
     """Ploidy of the samples. The PGEN format currently only supports diploid (2)."""
     contigs: list[str]
-    """List of contig names in the PGEN file."""
+    """Naturally sorted list of contig names in the PGEN file."""
     _index: pr.PyRanges
     _geno_pgen: pgenlib.PgenReader
     _dose_pgen: pgenlib.PgenReader
@@ -124,6 +125,7 @@ class PGEN:
     _sei: StartsEndsIlens | None  # unfiltered so that var_idxs map correctly
     """Starts, ends, ilens, and ALT alleles if the PGEN with filters is bi-allelic."""
     _s2i: HashTable
+    _c_max_idxs: dict[str, int]
 
     Genos = Genos
     """:code:`(samples ploidy variants) int32`"""
@@ -181,8 +183,10 @@ class PGEN:
         self._dose_path = dosage_path
 
         self._index, self._sei = _read_index(self._index_path(), filter)
-        self.contigs = self._index.chromosomes
+        self.contigs = natsorted(self._index.chromosomes)
         self._c_norm = ContigNormalizer(self._index.chromosomes)
+        vars_per_contig = np.array([len(df) for df in self._index.values()]).cumsum()
+        self._c_max_idxs = {c: v - 1 for c, v in zip(self.contigs, vars_per_contig)}
 
     @property
     def current_samples(self) -> list[str]:
@@ -289,14 +293,14 @@ class PGEN:
         n_variants
             Shape: :code:`(ranges)`. Number of variants in the given ranges.
         """
-        starts = np.atleast_1d(np.asarray(starts, PGEN_R_DTYPE))
+        starts = np.atleast_1d(np.asarray(starts, POS_TYPE))
         n_ranges = len(starts)
 
         c = self._c_norm.norm(contig)
         if c is None:
             return np.zeros_like(starts, dtype=np.uint32)
 
-        ends = np.atleast_1d(np.asarray(ends, PGEN_R_DTYPE))
+        ends = np.atleast_1d(np.asarray(ends, POS_TYPE))
         queries = pr.PyRanges(
             pl.DataFrame(
                 {
@@ -318,7 +322,7 @@ class PGEN:
         contig: str,
         starts: ArrayLike = 0,
         ends: ArrayLike = INT64_MAX,
-    ) -> tuple[NDArray[PGEN_V_IDX], NDArray[OFFSET_TYPE]]:
+    ) -> tuple[NDArray[V_IDX_TYPE], NDArray[OFFSET_TYPE]]:
         """Get variant indices and the number of indices per range.
 
         Parameters
@@ -336,14 +340,14 @@ class PGEN:
 
             Shape: (ranges+1). Offsets to get variant indices for each range.
         """
-        starts = np.atleast_1d(np.asarray(starts, PGEN_R_DTYPE))
+        starts = np.atleast_1d(np.asarray(starts, POS_TYPE))
         n_ranges = len(starts)
 
         c = self._c_norm.norm(contig)
         if c is None:
-            return np.empty(0, PGEN_V_IDX), np.zeros(n_ranges + 1, OFFSET_TYPE)
+            return np.empty(0, V_IDX_TYPE), np.zeros(n_ranges + 1, OFFSET_TYPE)
 
-        ends = np.atleast_1d(np.asarray(ends, PGEN_R_DTYPE))
+        ends = np.atleast_1d(np.asarray(ends, POS_TYPE))
         queries = pr.PyRanges(
             pl.DataFrame(
                 {
@@ -358,7 +362,7 @@ class PGEN:
         join = pl.from_pandas(queries.join(self._index).df)
 
         if join.height == 0:
-            return np.empty(0, PGEN_V_IDX), np.zeros(n_ranges + 1, OFFSET_TYPE)
+            return np.empty(0, V_IDX_TYPE), np.zeros(n_ranges + 1, OFFSET_TYPE)
 
         join = join.sort("query", "index")
         idxs = join["index"].to_numpy()
@@ -616,8 +620,8 @@ class PGEN:
         if c is None:
             return
 
-        starts = np.atleast_1d(np.asarray(starts, PGEN_R_DTYPE))
-        ends = np.atleast_1d(np.asarray(ends, PGEN_R_DTYPE))
+        starts = np.atleast_1d(np.asarray(starts, POS_TYPE))
+        ends = np.atleast_1d(np.asarray(ends, POS_TYPE))
 
         var_idxs, offsets = self.var_idxs(c, starts, ends)
         vars_per_range = np.diff(offsets)
@@ -666,7 +670,7 @@ class PGEN:
         max_mem: int | str = "4g",
         mode: type[L] = Genos,
     ) -> Generator[
-        Generator[tuple[L, PGEN_R_DTYPE, NDArray[PGEN_V_IDX]]] | None
+        Generator[tuple[L, POS_TYPE, NDArray[V_IDX_TYPE]]] | None
     ]:  # data, end, n_extension_vars
         """Read genotypes and/or dosages for multiple ranges in chunks approximately limited by :code:`max_mem`.
         Will extend the ranges so that the returned data corresponds to haplotypes that have at least as much
@@ -725,8 +729,8 @@ class PGEN:
             # we have full length, no deletions in any of the ranges
             return
 
-        starts = np.atleast_1d(np.asarray(starts, PGEN_R_DTYPE))
-        ends = np.atleast_1d(np.asarray(ends, PGEN_R_DTYPE))
+        starts = np.atleast_1d(np.asarray(starts, POS_TYPE))
+        ends = np.atleast_1d(np.asarray(ends, POS_TYPE))
 
         var_idxs, offsets = self.var_idxs(c, starts, ends)
         n_variants = len(var_idxs)
@@ -773,6 +777,7 @@ class PGEN:
                 v_starts=self._sei.v_starts,
                 v_ends=self._sei.v_ends,
                 ilens=self._sei.ilens,
+                contig_max_idx=self._c_max_idxs[c],
             )
 
     def _mem_per_variant(self, mode: type[T]) -> int:
@@ -798,7 +803,7 @@ class PGEN:
         return mem
 
     def _read_genos(
-        self, var_idxs: NDArray[PGEN_V_IDX], out: Genos | None = None
+        self, var_idxs: NDArray[V_IDX_TYPE], out: Genos | None = None
     ) -> Genos:
         if out is None:
             _out = np.empty(
@@ -814,7 +819,7 @@ class PGEN:
         return Genos(_out)
 
     def _read_dosages(
-        self, var_idxs: NDArray[PGEN_V_IDX], out: Dosages | None = None
+        self, var_idxs: NDArray[V_IDX_TYPE], out: Dosages | None = None
     ) -> Dosages:
         if out is None:
             _out = np.empty((len(var_idxs), self.n_samples), dtype=np.float32)
@@ -828,7 +833,7 @@ class PGEN:
         return Dosages.parse(_out)
 
     def _read_genos_dosages(
-        self, var_idxs: NDArray[PGEN_V_IDX], out: GenosDosages | None = None
+        self, var_idxs: NDArray[V_IDX_TYPE], out: GenosDosages | None = None
     ) -> GenosDosages:
         if out is None:
             _out = (None, None)
@@ -841,7 +846,7 @@ class PGEN:
         return GenosDosages((genos, dosages))
 
     def _read_genos_phasing(
-        self, var_idxs: NDArray[PGEN_V_IDX], out: GenosPhasing | None = None
+        self, var_idxs: NDArray[V_IDX_TYPE], out: GenosPhasing | None = None
     ) -> GenosPhasing:
         if out is None:
             genos = np.empty(
@@ -862,7 +867,7 @@ class PGEN:
         return GenosPhasing.parse((genos, phasing))
 
     def _read_genos_phasing_dosages(
-        self, var_idxs: NDArray[PGEN_V_IDX], out: GenosPhasingDosages | None = None
+        self, var_idxs: NDArray[V_IDX_TYPE], out: GenosPhasingDosages | None = None
     ) -> GenosPhasingDosages:
         if out is None:
             _out = (None, None)
@@ -879,35 +884,35 @@ _IDX_EXTENSION = 20
 
 
 def _gen_with_length(
-    v_chunks: list[NDArray[PGEN_V_IDX]],
+    v_chunks: list[NDArray[V_IDX_TYPE]],
     length: int,
-    read: Callable[[NDArray[PGEN_V_IDX]], L],
-    v_starts: NDArray[PGEN_R_DTYPE],  # full dataset v_starts
-    v_ends: NDArray[PGEN_R_DTYPE],  # full dataset v_ends
+    read: Callable[[NDArray[V_IDX_TYPE]], L],
+    v_starts: NDArray[POS_TYPE],  # full dataset v_starts
+    v_ends: NDArray[POS_TYPE],  # full dataset v_ends
     ilens: NDArray[np.int32],  # full dataset ilens
-) -> Generator[tuple[L, PGEN_R_DTYPE, NDArray[PGEN_V_IDX]]]:
+    contig_max_idx: int,
+) -> Generator[tuple[L, POS_TYPE, NDArray[V_IDX_TYPE]]]:
     # * This implementation computes haplotype lengths as shorter than they actually are if a spanning deletion is present
     # * This this will result in including more variants than needed, which is fine since we're extending var_idx by more than we
     # * need to anyway.
     #! Assume len(v_chunks) > 0 and all len(var_idx) > 0 is guaranteed by caller
 
-    max_idx = len(ilens) - 1
     for _, is_last, var_idx in mark_ends(v_chunks):
-        last_end = cast(PGEN_R_DTYPE, v_ends[var_idx[-1]])
+        last_end = cast(POS_TYPE, v_ends[var_idx[-1]])
         if not is_last:
             yield read(var_idx), last_end, var_idx
             continue
 
-        ext_s_idx = min(var_idx[-1] + 1, max_idx)
-        ext_e_idx = min(ext_s_idx + _IDX_EXTENSION - 1, max_idx)
+        ext_s_idx = min(var_idx[-1] + 1, contig_max_idx)
+        ext_e_idx = min(ext_s_idx + _IDX_EXTENSION - 1, contig_max_idx)
         if ext_s_idx == ext_e_idx:
             yield read(var_idx), last_end, var_idx
             return
 
         var_idx = np.concatenate(
-            [var_idx, np.arange(ext_s_idx, ext_e_idx + 1, dtype=PGEN_V_IDX)]
+            [var_idx, np.arange(ext_s_idx, ext_e_idx + 1, dtype=V_IDX_TYPE)]
         )
-        last_end = cast(PGEN_R_DTYPE, v_ends[var_idx[-1]])
+        last_end = cast(POS_TYPE, v_ends[var_idx[-1]])
         out = read(var_idx)
 
         if isinstance(out, Genos):
@@ -918,13 +923,13 @@ def _gen_with_length(
             hap_lens += hap_ilens(out[0], ilens[var_idx])
 
         ls_ext: list[L] = []
-        while (hap_lens < length).any() and ext_s_idx < max_idx:
-            ext_s_idx = min(var_idx[-1] + 1, max_idx)
-            ext_e_idx = min(ext_s_idx + _IDX_EXTENSION - 1, max_idx)
+        while (hap_lens < length).any() and ext_s_idx < contig_max_idx:
+            ext_s_idx = min(var_idx[-1] + 1, contig_max_idx)
+            ext_e_idx = min(ext_s_idx + _IDX_EXTENSION - 1, contig_max_idx)
             if ext_s_idx == ext_e_idx:
                 break
 
-            var_idx = np.arange(ext_s_idx, ext_e_idx + 1, dtype=PGEN_V_IDX)
+            var_idx = np.arange(ext_s_idx, ext_e_idx + 1, dtype=V_IDX_TYPE)
             ext_out = read(var_idx)
             ls_ext.append(ext_out)
 
@@ -935,7 +940,7 @@ def _gen_with_length(
 
             dist = v_starts[var_idx[-1]] - last_end
             hap_lens += dist + hap_ilens(ext_genos, ilens[var_idx])
-            last_end = cast(PGEN_R_DTYPE, v_ends[var_idx[-1]])
+            last_end = cast(POS_TYPE, v_ends[var_idx[-1]])
 
         if len(ls_ext) == 0:
             yield out, last_end, var_idx
@@ -978,15 +983,15 @@ def _read_psam(path: Path) -> NDArray[np.str_]:
 
 
 class StartsEndsIlens:
-    v_starts: NDArray[PGEN_R_DTYPE]
-    v_ends: NDArray[PGEN_R_DTYPE]
+    v_starts: NDArray[POS_TYPE]
+    v_ends: NDArray[POS_TYPE]
     ilens: NDArray[np.int32]
     alt: pl.Series
 
     def __init__(
         self,
-        v_starts: NDArray[PGEN_R_DTYPE],
-        v_ends: NDArray[PGEN_R_DTYPE],
+        v_starts: NDArray[POS_TYPE],
+        v_ends: NDArray[POS_TYPE],
         ilens: NDArray[np.int32],
         alt: pl.Series,
     ):

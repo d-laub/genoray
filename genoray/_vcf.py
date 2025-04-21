@@ -11,6 +11,7 @@ import numpy as np
 import polars as pl
 import pyranges as pr
 from more_itertools import mark_ends
+from natsort import natsorted
 from numpy.typing import ArrayLike, NDArray
 from phantom import Phantom
 from seqpro._ragged import OFFSET_TYPE, lengths_to_offsets
@@ -20,11 +21,11 @@ from typing_extensions import Self, TypeGuard, assert_never
 from ._index import ILEN, SCHEMA
 from ._utils import ContigNormalizer, format_memory, hap_ilens, parse_memory
 
-VCF_R_DTYPE = np.int64
+POS_TYPE = np.int64
 """Dtype for VCF range indices. This determines the maximum size of a contig in genoray.
 We have to use int64 because this is what htslib uses for CSI indexes."""
 
-INT64_MAX = np.iinfo(VCF_R_DTYPE).max
+INT64_MAX = np.iinfo(POS_TYPE).max
 """Maximum value for a 64-bit signed integer."""
 
 
@@ -143,7 +144,7 @@ class VCF:
     available_samples: list[str]
     """List of available samples in the VCF file."""
     contigs: list[str]
-    """List of available contigs in the VCF file."""
+    """Naturally sorted list of available contigs in the VCF file."""
     ploidy = 2
     """Ploidy of the VCF file. This is currently always 2 since we use cyvcf2."""
     _filter: Callable[[cyvcf2.Variant], bool] | None
@@ -210,7 +211,7 @@ class VCF:
 
         vcf = cyvcf2.VCF(path)
         self.available_samples = vcf.samples
-        self.contigs = vcf.seqnames
+        self.contigs = natsorted(vcf.seqnames)
         self._c_norm = ContigNormalizer(vcf.seqnames)
 
         self.set_samples(None)
@@ -340,8 +341,8 @@ class VCF:
         -------
             Shape: :code:`(ranges)`. Number of variants in the given ranges.
         """
-        starts = np.atleast_1d(np.asarray(starts, VCF_R_DTYPE))
-        ends = np.atleast_1d(np.asarray(ends, VCF_R_DTYPE))
+        starts = np.atleast_1d(np.asarray(starts, POS_TYPE))
+        ends = np.atleast_1d(np.asarray(ends, POS_TYPE))
 
         c = self._c_norm.norm(contig)
         if c is None:
@@ -383,14 +384,14 @@ class VCF:
         n_variants
             Shape: :code:`(ranges)`. Number of variants in the given ranges.
         """
-        starts = np.atleast_1d(np.asarray(starts, VCF_R_DTYPE))
+        starts = np.atleast_1d(np.asarray(starts, POS_TYPE))
         n_ranges = len(starts)
 
         c = self._c_norm.norm(contig)
         if c is None:
             return np.zeros(n_ranges, dtype=np.uint32)
 
-        ends = np.atleast_1d(np.asarray(ends, VCF_R_DTYPE))
+        ends = np.atleast_1d(np.asarray(ends, POS_TYPE))
         queries = pr.PyRanges(
             pl.DataFrame(
                 {
@@ -435,14 +436,14 @@ class VCF:
                 "Index not loaded. Call `load_index()` before using this method."
             )
 
-        starts = np.atleast_1d(np.asarray(starts, VCF_R_DTYPE))
+        starts = np.atleast_1d(np.asarray(starts, POS_TYPE))
         n_ranges = len(starts)
 
         c = self._c_norm.norm(contig)
         if c is None:
             return np.empty(0, np.uint32), np.zeros(n_ranges + 1, OFFSET_TYPE)
 
-        ends = np.atleast_1d(np.asarray(ends, VCF_R_DTYPE))
+        ends = np.atleast_1d(np.asarray(ends, POS_TYPE))
         queries = pr.PyRanges(
             pl.DataFrame(
                 {
@@ -732,9 +733,9 @@ class VCF:
                 f" Memory per variant: {format_memory(mem_per_v)}."
             )
 
-        starts = np.atleast_1d(np.asarray(starts, VCF_R_DTYPE))
+        starts = np.atleast_1d(np.asarray(starts, POS_TYPE))
         starts += 1  # cyvcf2 queries are 1-based
-        ends = np.atleast_1d(np.asarray(ends, VCF_R_DTYPE))
+        ends = np.atleast_1d(np.asarray(ends, POS_TYPE))
 
         for s, e, n in zip(starts, ends, n_variants):
             if n == 0:
@@ -748,8 +749,8 @@ class VCF:
         n: int,
         vars_per_chunk: int,
         contig: str,
-        start: VCF_R_DTYPE,
-        end: VCF_R_DTYPE,
+        start: POS_TYPE,
+        end: POS_TYPE,
         mode: type[L],
     ) -> Generator[tuple[L, int, int]]:
         n_chunks, final_chunk = divmod(n, vars_per_chunk)

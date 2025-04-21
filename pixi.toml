@@ -12,7 +12,6 @@ uv = "*"
 
 [feature.dev.dependencies]
 python = "3.9.*"
-htslib = "*"
 bcftools = "*"
 plink2 = "*"
 pytest = "*"
@@ -41,6 +40,7 @@ attrs = "*"
 awkward = "*"
 numba = "*"
 seqpro = "==0.2.3"
+seaborn = "*"
 
 [feature.dev.tasks]
 install = "uv pip install -e ."

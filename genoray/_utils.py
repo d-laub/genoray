@@ -26,7 +26,7 @@ class ContigNormalizer:
     @overload
     def norm(self, contigs: list[str]) -> list[str | None]: ...
     def norm(self, contigs: str | list[str]) -> str | None | list[str | None]:
-        """Normalize the contig name to match the naming scheme of `contigs`.
+        """Normalize contig name(s) to match the naming scheme of the contig normalizer.
 
         Parameters
         ----------
