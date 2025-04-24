@@ -892,6 +892,7 @@ class VCF:
                     try:
                         n_variants = cast(int, vcf.num_records)
                     except ValueError:
+                        # VCF doesn't have a CSI or TBI index
                         pass
                 elif contig is None:
                     n_variants = sum(self.n_vars_in_ranges(c)[0] for c in self.contigs)
@@ -925,7 +926,10 @@ class VCF:
         return df
 
     def _write_gvi_index(
-        self, attrs: list[str] | None = None, info: list[str] | None = None
+        self,
+        attrs: list[str] | None = None,
+        info: list[str] | None = None,
+        progress: bool = True,
     ) -> None:
         """Writes record information to disk, ignoring any filtering. At a minimum this index will
         include columns `CHROM`, `POS` (1-based), `REF`, and `ALT`.
@@ -950,7 +954,7 @@ class VCF:
         self._filter = None
         try:
             index = (
-                self.get_record_info(attrs=attrs, info=info)
+                self.get_record_info(attrs=attrs, info=info, progress=progress)
                 .with_row_index()
                 .explode("ALT")
                 .with_columns(ILEN=ILEN)
@@ -986,13 +990,14 @@ class VCF:
             self._index_path(), row_index_name="index", memory_map=False
         )
 
+        df = index.drop("CHROM", "index")
+
         if self._filter is not None and filter is None:
             filt = [self._filter(v) for v in self._open()]
             index = index.filter(pl.lit(filt))
         elif filter is not None:
             index = index.filter(filter)
 
-        df = index.drop("CHROM", "POS", "index")
         gr = pr.PyRanges(
             index.select(
                 "index",
