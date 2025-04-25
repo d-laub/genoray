@@ -23,7 +23,7 @@ dependencies = [
     "attrs",
     "awkward",
     "numba",
-    "seqpro>=0.2.3",
+    "seqpro>=0.3.0",
 ]
 
 [tool.commitizen]
