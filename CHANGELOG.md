@@ -1,3 +1,10 @@
+## 0.7.1 (2025-04-25)
+
+### Fix
+
+- bump seqpro version
+- only filter the pyranges, not record info
+
 ## 0.7.0 (2025-04-21)
 
 ### Fix
