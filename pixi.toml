@@ -40,6 +40,8 @@ attrs = "*"
 awkward = "*"
 numba = "*"
 seqpro = "==0.3.0"
+cyclopts = "*"
+# non-pkg dependencies
 seaborn = "*"
 
 [feature.dev.tasks]

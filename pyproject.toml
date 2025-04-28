@@ -24,6 +24,7 @@ dependencies = [
     "awkward",
     "numba",
     "seqpro>=0.3.0",
+    "cyclopts",
 ]
 
 [tool.commitizen]
@@ -38,3 +39,6 @@ annotated_tag = true
 [build-system]
 build-backend = "hatchling.build"
 requires = ["hatchling"]
+
+[project.scripts]
+svartools = "svartools.__main__:app"

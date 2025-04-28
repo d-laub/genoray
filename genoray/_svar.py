@@ -14,6 +14,7 @@ from hirola import HashTable
 from loguru import logger
 from natsort import natsorted
 from numpy.typing import ArrayLike, NDArray
+from polars._typing import IntoExpr
 from seqpro._ragged import OFFSET_TYPE, Ragged, lengths_to_offsets
 from tqdm.auto import tqdm
 
@@ -80,13 +81,15 @@ class SparseVar:
         """Number of variants in the dataset."""
         return len(self.granges)
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, attrs: IntoExpr | None = None):
         """Open a Sparse Variant (SVAR) directory.
 
         Parameters
         ----------
         path
             Path to the SVAR directory.
+        attrs
+            Expression of attributes to load in addiiton to the ALT and ILEN columns.
         """
         path = Path(path)
         self.path = path
@@ -106,7 +109,7 @@ class SparseVar:
 
         self._c_norm = ContigNormalizer(contigs)
         self.genos = _open_sparse_memmap(path, (self.n_samples, self.ploidy), "r")
-        self.granges, self.attrs = self._load_index()
+        self.granges, self.attrs = self._load_index(attrs)
         vars_per_contig = np.array([len(df) for df in self.granges.values()]).cumsum()
         self._c_max_idxs = {c: v - 1 for c, v in zip(self.contigs, vars_per_contig)}
 
@@ -534,7 +537,9 @@ class SparseVar:
         """Path to the index file."""
         return root / "index.arrow"
 
-    def _load_index(self) -> tuple[pr.PyRanges, pl.DataFrame]:
+    def _load_index(
+        self, attrs: IntoExpr | None = None
+    ) -> tuple[pr.PyRanges, pl.DataFrame]:
         """Load the index file and return the granges and attributes."""
         index = pl.scan_ipc(
             self._index_path(self.path), row_index_name="index", memory_map=False
@@ -550,8 +555,11 @@ class SparseVar:
             .collect()
             .to_pandas()
         )
-        attrs = index.select(pl.exclude("CHROM", "POS", "index")).collect()
-        return granges, attrs
+        if attrs is None:
+            attr_df = index.select("ALT", "ILEN").collect()
+        else:
+            attr_df = index.select("ALT", "ILEN", attrs).collect()
+        return granges, attr_df
 
 
 def _open_sparse_memmap(path: Path, shape: tuple[int, ...], mode: Literal["r", "r+"]):

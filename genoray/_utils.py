@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import re
+from pathlib import Path
 from typing import Any, Iterable, TypeVar, overload
 
 import numpy as np
@@ -114,3 +115,19 @@ def hap_ilens(
     """
     ilens = np.broadcast_to(ilens, genotypes.shape)  # zero-copy, read only
     return ilens.sum(-1, dtype=np.int32, where=genotypes == 1)
+
+
+_VCF_EXT = re.compile(r"\.[vb]cf(\.gz)?$")
+_PGEN_EXT = re.compile(r"\.(pgen|pvar|psam)$")
+
+
+def variant_file_type(path: str | Path):
+    path = Path(path)
+    if _VCF_EXT.match(path.name) is not None:
+        return "vcf"
+    elif _PGEN_EXT.match(path.name) is not None or (
+        path.with_suffix(".pgen").exists()
+        and path.with_suffix(".pvar").exists()
+        and path.with_suffix(".psam").exists()
+    ):
+        return "pgen"
