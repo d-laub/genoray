@@ -5,7 +5,7 @@ description = "Add your description here"
 authors = [{ name = "David Laub", email = "dlaub@ucsd.edu" }]
 readme = "README.md"
 license = { file = "LICENSE.txt" }
-requires-python = ">=3.9"
+requires-python = ">=3.9,<3.13"  # blocked by cyvcf2
 dependencies = [
     "numpy>=1.26",
     "pandas>=2.2.2",
