@@ -143,7 +143,7 @@ class SparseVar:
 
         c = self._c_norm.norm(contig)
         if c is None:
-            return np.zeros((n_ranges, 2), V_IDX_TYPE)
+            return np.full((n_ranges, 2), np.iinfo(V_IDX_TYPE).max, V_IDX_TYPE)
 
         ends = np.atleast_1d(np.asarray(ends, POS_TYPE))
         queries = pr.PyRanges(
@@ -160,16 +160,36 @@ class SparseVar:
         join = queries.join(self.granges)
 
         if len(join) == 0:
-            return np.zeros((n_ranges, 2), V_IDX_TYPE)
+            return np.full((n_ranges, 2), np.iinfo(V_IDX_TYPE).max, V_IDX_TYPE)
 
-        return (
-            pl.from_pandas(join.df)
-            .group_by("query", maintain_order=True)
+        join = pl.from_pandas(join.df).select("query", pl.col("index").cast(V_IDX_TYPE))
+
+        missing_queries = np.setdiff1d(
+            np.arange(n_ranges, dtype=np.uint32),
+            join["query"].unique(),
+            assume_unique=True,
+        ).astype(np.uint32)
+        if missing_queries:
+            missing_join = pl.DataFrame(
+                {
+                    "query": missing_queries,
+                    "index": np.full(
+                        len(missing_queries), np.iinfo(V_IDX_TYPE).max, V_IDX_TYPE
+                    ),
+                }
+            )
+            join = join.vstack(missing_join)
+
+        var_ranges = (
+            join.group_by("query")
             .agg(start=pl.col("index").min(), end=pl.col("index").max() + 1)
+            .sort("query")
             .drop("query")
             .to_numpy()
             .astype(V_IDX_TYPE)
         )
+
+        return var_ranges
 
     def _find_starts_ends(
         self,
@@ -558,7 +578,10 @@ class SparseVar:
         if attrs is None:
             attr_df = index.select("ALT", "ILEN").collect()
         else:
-            attr_df = index.select("ALT", "ILEN", attrs).collect()
+            if isinstance(attrs, list):
+                attr_df = index.select("ALT", "ILEN", *attrs).collect()
+            else:
+                attr_df = index.select("ALT", "ILEN", attrs).collect()
         return granges, attr_df
 
 
@@ -678,11 +701,15 @@ def _find_starts_ends(
     """
     n_ranges = len(var_ranges)
     n_samples = len(sample_idxs)
-    out_offsets = np.zeros((n_ranges, n_samples, ploidy, 2), dtype=OFFSET_TYPE)
+    out_offsets = np.empty((n_ranges, n_samples, ploidy, 2), dtype=OFFSET_TYPE)
 
     for r in nb.prange(n_ranges):
         for s in nb.prange(n_samples):
             for p in nb.prange(ploidy):
+                if var_ranges[r, 0] == var_ranges[r, 1]:
+                    out_offsets[r, s, p] = np.iinfo(OFFSET_TYPE).max
+                    continue
+
                 s_idx = sample_idxs[s]
                 sp = s_idx * ploidy + p
                 o_s, o_e = geno_offsets[sp], geno_offsets[sp + 1]
@@ -699,7 +726,7 @@ def _find_starts_ends_with_length(
     geno_offsets: NDArray[OFFSET_TYPE],
     q_starts: NDArray[POS_TYPE],
     q_ends: NDArray[POS_TYPE],
-    first_var_idxs: NDArray[V_IDX_TYPE],
+    var_ranges: NDArray[V_IDX_TYPE],
     v_starts: NDArray[np.int32],
     ilens: NDArray[np.int32],
     sample_idxs: NDArray[np.int64],
@@ -726,17 +753,21 @@ def _find_starts_ends_with_length(
     n_ranges = len(q_starts)
     n_samples = len(sample_idxs)
     if out is None:
-        out = np.zeros((n_ranges, n_samples, ploidy, 2), dtype=OFFSET_TYPE)
+        out = np.empty((n_ranges, n_samples, ploidy, 2), dtype=OFFSET_TYPE)
 
     for r in nb.prange(n_ranges):
         for s in nb.prange(n_samples):
             for p in nb.prange(ploidy):
+                if var_ranges[r, 0] == var_ranges[r, 1]:
+                    out[r, s, p] = np.iinfo(OFFSET_TYPE).max
+                    continue
+
                 s_idx = sample_idxs[s]
                 sp = s_idx * ploidy + p
                 o_s, o_e = geno_offsets[sp], geno_offsets[sp + 1]
                 sp_genos = genos[o_s:o_e]
                 start_idx, max_idx = np.searchsorted(
-                    sp_genos, [first_var_idxs[r], contig_max_idx + 1]
+                    sp_genos, [var_ranges[r, 0], contig_max_idx + 1]
                 )
 
                 # add o_s to make indices relative to whole array
