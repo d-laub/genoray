@@ -162,21 +162,20 @@ class SparseVar:
         if len(join) == 0:
             return np.full((n_ranges, 2), np.iinfo(V_IDX_TYPE).max, V_IDX_TYPE)
 
-        join = pl.from_pandas(join.df).select("query", pl.col("index").cast(V_IDX_TYPE))
+        join = pl.from_pandas(join.df).select("query", "index")
 
         missing_queries = np.setdiff1d(
             np.arange(n_ranges, dtype=np.uint32),
             join["query"].unique(),
             assume_unique=True,
         ).astype(np.uint32)
-        if missing_queries:
+        if (missing_queries).size > 0:
             missing_join = pl.DataFrame(
                 {
                     "query": missing_queries,
-                    "index": np.full(
-                        len(missing_queries), np.iinfo(V_IDX_TYPE).max, V_IDX_TYPE
-                    ),
-                }
+                    "index": np.full(len(missing_queries), np.iinfo(V_IDX_TYPE).max),
+                },
+                schema={"query": pl.UInt32, "index": pl.UInt32},
             )
             join = join.vstack(missing_join)
 
@@ -301,7 +300,7 @@ class SparseVar:
             self.genos.offsets,
             starts,
             ends,
-            var_ranges[:, 0],
+            var_ranges,
             self.granges.Start.to_numpy(),
             self.attrs["ILEN"].list.first().to_numpy(),
             s_idxs,
