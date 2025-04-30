@@ -1,3 +1,15 @@
+## 0.8.0 (2025-04-29)
+
+### Feat
+
+- index filtering for SVAR. feat: svartools CLI for writing SVAR files
+
+### Fix
+
+- bugfixes in handling start > contig end
+- handle starts > contig ends for SVAR
+- constrain python for cyvcf2 builds
+
 ## 0.7.1 (2025-04-25)
 
 ### Fix
