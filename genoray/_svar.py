@@ -4,7 +4,7 @@ import json
 import shutil
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Literal, cast
+from typing import Any, Generator, Literal, TypeVar, cast
 
 import numba as nb
 import numpy as np
@@ -24,20 +24,32 @@ from ._vcf import VCF
 
 POS_TYPE = np.int64
 V_IDX_TYPE = np.int32
+CCF_TYPE = np.float32
 INT64_MAX = np.iinfo(POS_TYPE).max
+DTYPE = TypeVar("DTYPE", bound=np.generic)
 
 
 class SparseGenotypes(Ragged[V_IDX_TYPE]):
     """A Ragged array of variant indices with additional guarantees and methods:
 
     - dtype is :code:`int32`
-    - Ragged shape of **at least** 2 dimensions that should correspond to (samples, ploidy)
+    - Ragged shape of **at least** 2 dimensions where the final two correspond to (samples, ploidy)
     - :code:`from_dense` to convert dense genotypes to sparse genotypes
     """
 
     def __attrs_post_init__(self):
         assert self.ndim >= 2, "SparseGenotypes must have at least 2 dimensions"
         assert self.dtype.type == V_IDX_TYPE, "SparseGenotypes must be of type int32"
+
+    @property
+    def n_samples(self) -> int:
+        """Number of samples"""
+        return self.shape[-2]
+
+    @property
+    def ploidy(self) -> int:
+        """Ploidy"""
+        return self.shape[-1]
 
     @classmethod
     def from_dense(cls, genos: NDArray[np.int8], var_idxs: NDArray[V_IDX_TYPE]):
@@ -46,7 +58,7 @@ class SparseGenotypes(Ragged[V_IDX_TYPE]):
         Parameters
         ----------
         genos
-            Shape = (sample ploidy variants) Genotypes.
+            Shape = (samples ploidy variants) Genotypes.
         var_idxs
             Shape = (variants) Variant indices.
         """
@@ -54,9 +66,169 @@ class SparseGenotypes(Ragged[V_IDX_TYPE]):
         keep = genos == 1
         data = var_idxs[keep.nonzero()[-1]]
         lengths = keep.sum(-1)
-        shape = genos.shape[:-1]
+        return cls.from_lengths(data, lengths)
+
+
+class SparseCCFs(Ragged[CCF_TYPE]):
+    """A Ragged array of CCFs with additional guarantees and methods:
+
+    - dtype is :code:`float32`
+    - Ragged shape of **at least** 2 dimensions that should correspond to (samples, ploidy)
+    - :code:`from_dense` to convert dense CCFs to sparse CCFs
+    """
+
+    def __attrs_post_init__(self):
+        assert self.ndim >= 2, "SparseCCFs must have at least 2 dimensions"
+        assert self.dtype.type == CCF_TYPE, "SparseCCFs must be of type float32"
+
+    @property
+    def n_samples(self) -> int:
+        """Number of samples"""
+        return self.shape[-2]
+
+    @property
+    def ploidy(self) -> int:
+        """Ploidy"""
+        return self.shape[-1]
+
+    @classmethod
+    def from_dense(
+        cls,
+        genos: NDArray[np.int8],
+        var_idxs: NDArray[V_IDX_TYPE],
+        ccfs: NDArray[CCF_TYPE],
+        v_starts: NDArray[POS_TYPE],
+        ilens: NDArray[np.int32],
+    ) -> tuple[SparseGenotypes, SparseCCFs]:
+        """Convert dense CCFs to sparse CCFs. Infers missing CCFs as germline variants
+        and sets their CCFs to 1 - sum(overlapping somatic CCFs).
+
+        Parameters
+        ----------
+        genos
+            Shape = (samples ploidy variants) Genotypes.
+        var_idxs
+            Shape = (variants) Variant indices.
+        ccfs
+            Shape = (samples variants) Cancer cell fractions (or proxy thereof).
+        v_starts
+            Shape = (total_variants) 0-based start positions.
+        ilens
+            Shape = (total_variants) Indel lengths.
+        """
+        # (s p v)
+        keep: NDArray[np.bool_] = genos == 1
+        geno_data = var_idxs[keep.nonzero()[-1]]
+        lengths = keep.sum(-1)
         offsets = lengths_to_offsets(lengths)
-        return cls.from_offsets(data, shape, offsets)
+        sp_genos = SparseGenotypes(geno_data, lengths.shape, offsets, lengths)
+
+        # (s v) -> (s p v)
+        ccf_data = np.broadcast_to(ccfs[:, None], genos.shape)[keep]
+        _infer_germline_ccfs(
+            ccfs=ccf_data,
+            v_idxs=sp_genos.data,
+            v_starts=v_starts,
+            ilens=ilens,
+            v_offsets=sp_genos.offsets,
+        )
+        sp_ccfs = SparseCCFs(ccf_data, lengths.shape, offsets, lengths)
+
+        return sp_genos, sp_ccfs
+
+
+@nb.njit(parallel=True, nogil=True, cache=True)
+def _infer_germline_ccfs(
+    ccfs: NDArray[CCF_TYPE],
+    v_idxs: NDArray[V_IDX_TYPE],
+    v_starts: NDArray[POS_TYPE],
+    ilens: NDArray[np.int32],
+    v_offsets: NDArray[OFFSET_TYPE],
+    max_ccf: float = 1.0,
+):
+    """Infer germline CCFs from the variant indices and variant starts.
+
+    Germline variants are identified by having missing CCFs.
+    i.e. they have a variant index but missing CCFs. Germline CCFs are inferred
+    to be 1 - sum(overlapping somatic CCFs).
+
+    Parameters
+    ----------
+    ccfs
+        CCFs for the variants.
+    v_idxs
+        Variant indices for the variants.
+    v_starts
+        Variant start positions for the variants.
+    ilens
+        Variant lengths for the variants.
+    v_offsets
+        Variant offsets for the variants.
+    max_ccf
+        Maximum CCF value. Default is 1.0.
+    """
+    n_sp = len(v_offsets) - 1
+    for o_idx in nb.prange(n_sp):
+        o_s, o_e = v_offsets[o_idx], v_offsets[o_idx + 1]
+        n_variants = o_e - o_s
+        if n_variants == 0:
+            continue
+
+        ccf = ccfs[o_s:o_e]
+        if not np.isnan(ccf).any():
+            continue
+
+        v_idx = v_idxs[o_s:o_e]
+        v_start = v_starts[v_idx]
+        ilen = ilens[v_idx]
+        v_end = v_start - np.minimum(0, ilen) + 1  # atomized variants
+        v_end_sorter = np.argsort(v_end)
+        v_end = v_end[v_end_sorter]
+
+        # sorted merge by starts then ends
+        starts_ends = np.empty(n_variants * 2, POS_TYPE)
+        se_local_idx = np.empty(n_variants * 2, V_IDX_TYPE)
+        start_idx = 0
+        end_idx = 0
+        for i in range(n_variants * 2):
+            end = v_end[end_idx]
+            if start_idx < n_variants and v_start[start_idx] < end:
+                starts_ends[i] = v_start[start_idx]
+                se_local_idx[i] = start_idx
+                start_idx += 1
+            else:
+                starts_ends[i] = -end
+                se_local_idx[i] = v_end_sorter[end_idx]
+                end_idx += 1
+
+        #! this assumes that no germline variants overlap
+        #! true with phased genotypes
+        running_ccf = CCF_TYPE(0)
+        g_idx = V_IDX_TYPE(-1)
+        g_end = np.iinfo(POS_TYPE).max
+        for i in range(n_variants * 2):
+            pos: POS_TYPE = starts_ends[i]
+            local_idx: V_IDX_TYPE = se_local_idx[i]
+            pos_ccf: CCF_TYPE = ccf[local_idx]
+            is_germ = np.isnan(pos_ccf)
+
+            #! without this we will decrement the running CCF before setting the germline CCF
+            # this is because tied ends are sorted by start, but the ends are 0-based exclusive
+            # so we need to set the germline CCF before we start any decrementing
+            if -pos >= g_end:
+                ccf[g_idx] = max_ccf - running_ccf
+                g_end = np.iinfo(POS_TYPE).max
+
+            if is_germ and pos > 0:
+                g_idx = local_idx
+                # have to recompute the end because we sorted them above so the local idx points
+                # to the wrong place
+                g_end = pos - min(0, ilen[local_idx]) + 1
+            else:
+                # sign of position, with 0 being positive
+                running_ccf += (2 * (pos >= 0) - 1) * pos_ccf
+
+        np.nan_to_num(ccf, False, max_ccf)
 
 
 class SparseVar:
@@ -65,6 +237,7 @@ class SparseVar:
     ploidy: int
     contigs: list[str]
     genos: SparseGenotypes
+    ccfs: SparseCCFs | None
     granges: pr.PyRanges
     attrs: pl.DataFrame
     _c_norm: ContigNormalizer
@@ -89,7 +262,7 @@ class SparseVar:
         path
             Path to the SVAR directory.
         attrs
-            Expression of attributes to load in addiiton to the ALT and ILEN columns.
+            Expression of attributes to load in addition to the ALT and ILEN columns.
         """
         path = Path(path)
         self.path = path
@@ -108,7 +281,14 @@ class SparseVar:
         self._s2i.add(samples)
 
         self._c_norm = ContigNormalizer(contigs)
-        self.genos = _open_sparse_memmap(path, (self.n_samples, self.ploidy), "r")
+        self.genos = _open_genos(path, (self.n_samples, self.ploidy), "r")
+        if (path / "ccfs.npy").exists():
+            ccf_data = np.memmap(path / "ccfs.npy", dtype=CCF_TYPE, mode="r")
+            self.ccfs = SparseCCFs.from_offsets(
+                ccf_data, self.genos.shape, self.genos.offsets
+            )
+        else:
+            self.ccfs = None
         self.granges, self.attrs = self._load_index(attrs)
         vars_per_contig = np.array([len(df) for df in self.granges.values()]).cumsum()
         self._c_max_idxs = {c: v - 1 for c, v in zip(self.contigs, vars_per_contig)}
@@ -418,7 +598,12 @@ class SparseVar:
 
     @classmethod
     def from_vcf(
-        cls, out: str | Path, vcf: VCF, max_mem: int | str, overwrite: bool = False
+        cls,
+        out: str | Path,
+        vcf: VCF,
+        max_mem: int | str,
+        overwrite: bool = False,
+        with_ccfs: bool = False,
     ):
         """Create a Sparse Variant (.svar) from a VCF/BCF.
 
@@ -432,6 +617,8 @@ class SparseVar:
             Maximum memory to use while writing.
         overwrite
             Whether to overwrite the output directory if it exists.
+        with_ccfs
+            Whether to write CCFs.
         """
         out = Path(out)
 
@@ -460,6 +647,12 @@ class SparseVar:
         with TemporaryDirectory() as tdir:
             tdir = Path(tdir)
 
+            if with_ccfs:
+                if vcf._index is None:
+                    raise ValueError("VCF must be bi-allelic with index loaded")
+                v_starts = vcf._index.gr.Start.to_numpy()
+                ilens = vcf._index.df["ILEN"].list.first().to_numpy()
+
             shape = (vcf.n_samples, vcf.ploidy)
             c_pbar = tqdm(total=len(contigs), unit=" contig")
             offset = 0
@@ -470,23 +663,50 @@ class SparseVar:
                 v_pbar.set_description("Reading variants")
                 with vcf.using_pbar(v_pbar) as vcf:
                     # genos: (s p v)
-                    for genos in vcf.chunk(c, max_mem=max_mem, mode=VCF.Genos8):
-                        n_vars = genos.shape[-1]
-                        var_idxs = np.arange(offset, offset + n_vars, dtype=np.int32)
-                        sp_genos = SparseGenotypes.from_dense(genos, var_idxs)
-                        _write_sparse_memmap(tdir / str(chunk_idx), sp_genos)
-                        offset += n_vars
-                        chunk_idx += 1
+                    if with_ccfs:
+                        for genos, ccfs in vcf.chunk(
+                            c, max_mem=max_mem, mode=VCF.Genos8Dosages
+                        ):
+                            n_vars = genos.shape[-1]
+                            var_idxs = np.arange(
+                                offset, offset + n_vars, dtype=np.int32
+                            )
+                            sp_genos, sp_ccfs = SparseCCFs.from_dense(
+                                genos,
+                                var_idxs,
+                                ccfs,
+                                v_starts,  # type: ignore | guaranteed bound by with_ccfs
+                                ilens,  # type: ignore | guaranteed bound by with_ccfs
+                            )
+                            _write_genos(tdir / str(chunk_idx), sp_genos)
+                            _write_ccfs(tdir / str(chunk_idx), sp_ccfs.data)
+                            offset += n_vars
+                            chunk_idx += 1
+                    else:
+                        for genos in vcf.chunk(c, max_mem=max_mem, mode=VCF.Genos8):
+                            n_vars = genos.shape[-1]
+                            var_idxs = np.arange(
+                                offset, offset + n_vars, dtype=np.int32
+                            )
+                            sp_genos = SparseGenotypes.from_dense(genos, var_idxs)
+                            _write_genos(tdir / str(chunk_idx), sp_genos)
+                            offset += n_vars
+                            chunk_idx += 1
                     v_pbar.close()
                 c_pbar.update()
             c_pbar.close()
 
             logger.info("Concatenating intermediate chunks")
-            _concat_sparse_memmaps(out, tdir, shape)
+            _concat_data(out, tdir, shape, with_ccfs=with_ccfs)
 
     @classmethod
     def from_pgen(
-        cls, out: str | Path, pgen: PGEN, max_mem: int | str, overwrite: bool = False
+        cls,
+        out: str | Path,
+        pgen: PGEN,
+        max_mem: int | str,
+        overwrite: bool = False,
+        with_ccfs: bool = False,
     ):
         """Create a Sparse Variant (.svar) from a PGEN.
 
@@ -500,6 +720,8 @@ class SparseVar:
             Maximum memory to use while writing.
         overwrite
             Whether to overwrite the output directory if it exists.
+        with_ccfs
+            Whether to write CCFs.
         """
         out = Path(out)
 
@@ -532,24 +754,30 @@ class SparseVar:
             chunk_idx = 0
             for c in contigs:
                 pbar.set_description(f"Contig {c}, readings variants")
-                for range_ in pgen.chunk_ranges(c, max_mem=max_mem, mode=PGEN.Genos):
-                    if range_ is None:
-                        continue
-                    # genos: (s p v)
-                    for genos in range_:
-                        n_vars = genos.shape[-1]
-                        var_idxs = np.arange(offset, offset + n_vars, dtype=np.int32)
-                        sp_genos = SparseGenotypes.from_dense(
-                            genos.astype(np.int8), var_idxs
-                        )
-                        _write_sparse_memmap(tdir / str(chunk_idx), sp_genos)
-                        offset += n_vars
-                        chunk_idx += 1
-                        pbar.update(n_vars)
+                if with_ccfs:
+                    if pgen._sei is None:
+                        raise ValueError("PGEN must be bi-allelic with filters applied")
+                    offset, chunk_idx = _process_contig_ccfs(
+                        pgen.chunk_ranges(c, max_mem=max_mem, mode=PGEN.GenosDosages),
+                        tdir,
+                        offset,
+                        chunk_idx,
+                        pgen._sei.v_starts,
+                        pgen._sei.ilens,
+                        pbar,
+                    )
+                else:
+                    offset, chunk_idx = _process_contig(
+                        pgen.chunk_ranges(c, max_mem=max_mem, mode=PGEN.Genos),
+                        tdir,
+                        offset,
+                        chunk_idx,
+                        pbar,
+                    )
             pbar.close()
 
             logger.info("Concatenating intermediate chunks")
-            _concat_sparse_memmaps(out, tdir, shape)
+            _concat_data(out, tdir, shape, with_ccfs=with_ccfs)
 
     @classmethod
     def _index_path(cls, root: Path):
@@ -560,8 +788,21 @@ class SparseVar:
         self, attrs: IntoExpr | None = None
     ) -> tuple[pr.PyRanges, pl.DataFrame]:
         """Load the index file and return the granges and attributes."""
-        index = pl.scan_ipc(
-            self._index_path(self.path), row_index_name="index", memory_map=False
+
+        min_attrs: list[Any] = ["ALT", "ILEN"]
+        if attrs is not None:
+            if isinstance(attrs, list):
+                min_attrs.extend(attrs)
+            else:
+                min_attrs.append(attrs)
+        attrs = min_attrs
+
+        index = (
+            pl.scan_ipc(
+                self._index_path(self.path), row_index_name="index", memory_map=False
+            )
+            .select("CHROM", "POS", "REF", "index", *attrs)
+            .collect()
         )
 
         granges = pr.PyRanges(
@@ -570,30 +811,85 @@ class SparseVar:
                 Chromosome="CHROM",
                 Start=pl.col("POS") - 1,
                 End=pl.col("POS") + pl.col("REF").str.len_bytes() - 1,
-            )
-            .collect()
-            .to_pandas()
+            ).to_pandas()
         )
-        if attrs is None:
-            attr_df = index.select("ALT", "ILEN").collect()
-        else:
-            if isinstance(attrs, list):
-                attr_df = index.select("ALT", "ILEN", *attrs).collect()
-            else:
-                attr_df = index.select("ALT", "ILEN", attrs).collect()
+        attr_df = index.select(*attrs)
         return granges, attr_df
 
 
-def _open_sparse_memmap(path: Path, shape: tuple[int, ...], mode: Literal["r", "r+"]):
+def _process_contig(
+    chunker: Generator[Generator[NDArray[np.int8 | np.int32]] | None],
+    tdir: Path,
+    offset: int,
+    chunk_idx: int,
+    pbar: tqdm | None = None,
+) -> tuple[int, int]:
+    for range_ in chunker:
+        if range_ is None:
+            continue
+        # genos: (s p v)
+        for genos in range_:
+            n_vars = genos.shape[-1]
+            var_idxs = np.arange(offset, offset + n_vars, dtype=np.int32)
+            sp_genos = SparseGenotypes.from_dense(genos.astype(np.int8), var_idxs)
+            _write_genos(tdir / str(chunk_idx), sp_genos)
+            offset += n_vars
+            chunk_idx += 1
+            if pbar is not None:
+                pbar.update(n_vars)
+    return offset, chunk_idx
+
+
+def _process_contig_ccfs(
+    chunker: Generator[
+        Generator[tuple[NDArray[np.int8 | np.int32], NDArray[CCF_TYPE]]] | None
+    ],
+    tdir: Path,
+    offset: int,
+    chunk_idx: int,
+    v_starts: NDArray[POS_TYPE],
+    ilens: NDArray[np.int32],
+    pbar: tqdm | None = None,
+) -> tuple[int, int]:
+    for range_ in chunker:
+        if range_ is None:
+            continue
+        # genos, ccfs: (s p v)
+        for genos, ccfs in range_:
+            n_vars = genos.shape[-1]
+            var_idxs = np.arange(offset, offset + n_vars, dtype=np.int32)
+
+            sp_genos, sp_ccfs = SparseCCFs.from_dense(
+                genos.astype(np.int8), var_idxs, ccfs, v_starts, ilens
+            )
+            _write_genos(tdir / str(chunk_idx), sp_genos)
+            _write_ccfs(tdir / str(chunk_idx), sp_ccfs.data)
+            offset += n_vars
+            chunk_idx += 1
+            if pbar is not None:
+                pbar.update(n_vars)
+    return offset, chunk_idx
+
+
+def _open_genos(path: Path, shape: tuple[int, ...], mode: Literal["r", "r+"]):
     # Load the memory-mapped files
-    var_idxs = np.memmap(path / "variant_idxs.npy", dtype=np.int32, mode=mode)
+    var_idxs = np.memmap(path / "variant_idxs.npy", dtype=V_IDX_TYPE, mode=mode)
     offsets = np.memmap(path / "offsets.npy", dtype=np.int64, mode=mode)
 
     sp_genos = SparseGenotypes.from_offsets(var_idxs, shape, offsets)
     return sp_genos
 
 
-def _write_sparse_memmap(path: Path, sp_genos: SparseGenotypes):
+def _open_ccfs(path: Path, shape: tuple[int, ...], mode: Literal["r", "r+"]):
+    # Load the memory-mapped files
+    ccfs = np.memmap(path / "ccfs.npy", dtype=CCF_TYPE, mode=mode)
+    offsets = np.memmap(path / "offsets.npy", dtype=np.int64, mode=mode)
+
+    sp_genos = SparseCCFs.from_offsets(ccfs, shape, offsets)
+    return sp_genos
+
+
+def _write_genos(path: Path, sp_genos: SparseGenotypes):
     path.mkdir(parents=True, exist_ok=True)
 
     var_idxs = np.memmap(
@@ -615,21 +911,36 @@ def _write_sparse_memmap(path: Path, sp_genos: SparseGenotypes):
     offsets.flush()
 
 
-def _concat_sparse_memmaps(out_path: Path, chunks_path: Path, shape: tuple[int, int]):
+def _write_ccfs(path: Path, ccfs: NDArray[CCF_TYPE]):
+    path.mkdir(parents=True, exist_ok=True)
+
+    ccfs_memmap = np.memmap(
+        path / "ccfs.npy",
+        shape=ccfs.shape,
+        dtype=ccfs.dtype,
+        mode="w+",
+    )
+    ccfs_memmap[:] = ccfs
+    ccfs_memmap.flush()
+
+
+def _concat_data(
+    out_path: Path, chunks_path: Path, shape: tuple[int, int], with_ccfs: bool = False
+):
     out_path.mkdir(parents=True, exist_ok=True)
 
     # [1, 2, 3, ...]
     chunk_dirs = natsorted(chunks_path.iterdir())
 
     vars_per_sp = np.zeros(shape, dtype=np.int32)
-
     ls_sp_genos: list[SparseGenotypes] = []
     for chunk_dir in chunk_dirs:
-        sp_genos = _open_sparse_memmap(chunk_dir, shape, mode="r")
+        sp_genos = _open_genos(chunk_dir, shape, mode="r")
         vars_per_sp += sp_genos.lengths
         ls_sp_genos.append(sp_genos)
 
-    # this should be relatively small even for ultra-large datasets
+    # offsets should be relatively small even for ultra-large datasets
+    # scales O(n_samples * ploidy)
     offsets = lengths_to_offsets(vars_per_sp)
     offsets_memmap = np.memmap(
         out_path / "offsets.npy", dtype=offsets.dtype, mode="w+", shape=offsets.shape
@@ -638,7 +949,7 @@ def _concat_sparse_memmaps(out_path: Path, chunks_path: Path, shape: tuple[int, 
     offsets_memmap.flush()
 
     var_idxs_memmap = np.memmap(
-        out_path / "variant_idxs.npy", dtype=np.int32, mode="w+", shape=offsets[-1]
+        out_path / "variant_idxs.npy", dtype=V_IDX_TYPE, mode="w+", shape=offsets[-1]
     )
     _concat_helper(
         var_idxs_memmap,
@@ -649,28 +960,46 @@ def _concat_sparse_memmaps(out_path: Path, chunks_path: Path, shape: tuple[int, 
     )
     var_idxs_memmap.flush()
 
+    if with_ccfs:
+        ls_: list[SparseCCFs] = []
+        for chunk_dir in chunk_dirs:
+            sp_ccfs = _open_ccfs(chunk_dir, shape, mode="r")
+            vars_per_sp += sp_ccfs.lengths
+            ls_.append(sp_ccfs)
+        ccfs_memmap = np.memmap(
+            out_path / "ccfs.npy", dtype=CCF_TYPE, mode="w+", shape=offsets[-1]
+        )
+        _concat_helper(
+            ccfs_memmap,
+            offsets,
+            [a.data for a in ls_],
+            [a.offsets for a in ls_],
+            shape,
+        )
+        ccfs_memmap.flush()
+
 
 @nb.njit(parallel=True, nogil=True, cache=True)
 def _concat_helper(
-    out_idxs: NDArray[np.int32],
+    out_data: NDArray[DTYPE],
     out_offsets: NDArray[OFFSET_TYPE],
-    in_var_idxs: list[NDArray[np.int32]],
+    in_data: list[NDArray[DTYPE]],
     in_offsets: list[NDArray[OFFSET_TYPE]],
     shape: tuple[int, int],
 ):
     n_samples, ploidy = shape
-    n_chunks = len(in_var_idxs)
+    n_chunks = len(in_data)
     assert len(in_offsets) == n_chunks
     for s in nb.prange(n_samples):
         for p in nb.prange(ploidy):
             sp = s * ploidy + p
             o_s, o_e = out_offsets[sp], out_offsets[sp + 1]
-            sp_out_idxs = out_idxs[o_s:o_e]
+            sp_out_idxs = out_data[o_s:o_e]
             offset = 0
             for chunk in range(n_chunks):
                 i_s, i_e = in_offsets[chunk][sp], in_offsets[chunk][sp + 1]
                 chunk_len = i_e - i_s
-                sp_out_idxs[offset : offset + chunk_len] = in_var_idxs[chunk][i_s:i_e]
+                sp_out_idxs[offset : offset + chunk_len] = in_data[chunk][i_s:i_e]
                 offset += chunk_len
 
 

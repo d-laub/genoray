@@ -123,7 +123,7 @@ class PGEN:
     _geno_path: Path
     _dose_path: Path | None
     _sei: StartsEndsIlens | None  # unfiltered so that var_idxs map correctly
-    """Starts, ends, ilens, and ALT alleles if the PGEN with filters is bi-allelic."""
+    """Variant 0-based starts, ends, ILEN, and ALT alleles if the PGEN with filters is bi-allelic."""
     _s2i: HashTable
     _c_max_idxs: dict[str, int]
 
