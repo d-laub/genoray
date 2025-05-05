@@ -52,8 +52,9 @@ gen = "sh tests/data/gen_from_vcf.sh"
 test = "pytest tests"
 bump-dry = "cz bump --dry-run"
 publish = """
-    cz bump && git push --follow-tags && rm -rf dist && uv build && uv publish
+    git checkout main && cz bump && git push --follow-tags && rm -rf dist && uv build && uv publish
     && git checkout stable && git pull origin stable && git merge main && git push origin stable
+    && git checkout main
     """
 
 [feature.doc.dependencies]
