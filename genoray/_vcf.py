@@ -32,6 +32,9 @@ INT64_MAX = np.iinfo(POS_TYPE).max
 class DosageFieldError(RuntimeError): ...
 
 
+class MultiallelicDosageError(RuntimeError): ...
+
+
 GDTYPE = TypeVar("GDTYPE", np.int8, np.int16)
 
 
@@ -1066,12 +1069,16 @@ class VCF:
 
         i = 0
         for i, v in enumerate(vcf):
+            # (samples alts)
             d = v.format(dosage_field)
             if d is None:
                 raise DosageFieldError(
                     f"Dosage field '{dosage_field}' not found for record {repr(v)}"
                 )
-            # (s, 1, 1) or (s, 1)? -> (s)
+            if d.shape[1] > 1:
+                raise MultiallelicDosageError(
+                    f"Multiallelic dosages are not supported, encountered in VCF record {repr(v)}"
+                )
             out[..., i] = d.squeeze(1)[self._s_sorter]
 
             if self._pbar is not None:

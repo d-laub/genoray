@@ -130,7 +130,12 @@ class PGEN:
     Genos = Genos
     """:code:`(samples ploidy variants) int32`"""
     Dosages = Dosages
-    """:code:`(samples variants) float32`"""
+    """:code:`(samples variants) float32`
+    
+    .. note::
+        PGEN does not support multi-allelic dosages. If you attempt to write one, you will get an
+        error from PLINK 2.0.
+    """
     GenosPhasing = GenosPhasing
     """:code:`(samples ploidy variants) int32` and :code:`(samples variants) bool`"""
     GenosDosages = GenosDosages
