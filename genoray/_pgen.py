@@ -479,6 +479,9 @@ class PGEN:
 
         c = self._c_norm.norm(contig)
         if c is None:
+            logger.warning(
+                f"Query contig {contig} not found in VCF file, even after normalizing for UCSC/Ensembl nomenclature."
+            )
             return
 
         var_idxs, _ = self.var_idxs(c, start, end)
@@ -553,6 +556,9 @@ class PGEN:
         """
         c = self._c_norm.norm(contig)
         if c is None:
+            logger.warning(
+                f"Query contig {contig} not found in VCF file, even after normalizing for UCSC/Ensembl nomenclature."
+            )
             return
 
         var_idxs, offsets = self.var_idxs(c, starts, ends)
@@ -621,17 +627,24 @@ class PGEN:
         """
         max_mem = parse_memory(max_mem)
 
+        starts = np.atleast_1d(np.asarray(starts, POS_TYPE))
         c = self._c_norm.norm(contig)
         if c is None:
+            logger.warning(
+                f"Query contig {contig} not found in VCF file, even after normalizing for UCSC/Ensembl nomenclature."
+            )
+            for _ in range(len(starts)):
+                yield None
             return
 
-        starts = np.atleast_1d(np.asarray(starts, POS_TYPE))
         ends = np.atleast_1d(np.asarray(ends, POS_TYPE))
 
         var_idxs, offsets = self.var_idxs(c, starts, ends)
         vars_per_range = np.diff(offsets)
         tot_variants = len(var_idxs)
         if tot_variants == 0:
+            for _ in range(len(starts)):
+                yield None
             return
 
         mem_per_v = self._mem_per_variant(mode)
@@ -729,12 +742,17 @@ class PGEN:
 
         max_mem = parse_memory(max_mem)
 
+        starts = np.atleast_1d(np.asarray(starts, POS_TYPE))
         c = self._c_norm.norm(contig)
         if c is None:
+            logger.warning(
+                f"Query contig {contig} not found in VCF file, even after normalizing for UCSC/Ensembl nomenclature."
+            )
+            for _ in range(len(starts)):
+                yield None
             # we have full length, no deletions in any of the ranges
             return
 
-        starts = np.atleast_1d(np.asarray(starts, POS_TYPE))
         ends = np.atleast_1d(np.asarray(ends, POS_TYPE))
 
         var_idxs, offsets = self.var_idxs(c, starts, ends)
@@ -1006,15 +1024,28 @@ class StartsEndsIlens:
         self.alt = alt
 
 
+def _valid_index(index_path: Path) -> bool:
+    """Check if the index is valid. Needs to exist and have a modified time greater than
+    the PVAR file."""
+    if not index_path.exists():
+        return False
+
+    pvar_mtime = index_path.with_suffix("").stat().st_mtime_ns
+    index_mtime = index_path.stat().st_mtime_ns
+    return index_mtime > pvar_mtime
+
+
 def _read_index(
-    path: Path, filter: pl.Expr | None
+    index_path: Path, filter: pl.Expr | None
 ) -> tuple[pr.PyRanges, StartsEndsIlens | None]:
-    if not path.exists():
-        logger.info("Genoray PVAR index not found, creating index.")
-        _write_index(path)
+    if not _valid_index(index_path):
+        logger.info("Genoray PVAR index not found or out-of-date, creating index.")
+        _write_index(index_path)
 
     logger.info("Loading genoray index.")
-    index = pl.scan_ipc(path, row_index_name="index", memory_map=False).with_columns(
+    index = pl.scan_ipc(
+        index_path, row_index_name="index", memory_map=False
+    ).with_columns(
         Start=pl.col("POS") - 1,
         End=pl.col("POS") + pl.col("REF").str.len_bytes() - 1,
     )
@@ -1062,11 +1093,11 @@ def _read_index(
 # filtering less ergonomic/harder to make ergonomic though, but a memmap approach should be scalable
 # to datasets with billions+ unique variants (reduce memory), reduce instantion time, but ~increase query time.
 # Unless, NCLS creates a bunch of data structures in memory anyway.
-def _write_index(path: Path):
+def _write_index(index_path: Path):
     """Write PVAR index."""
 
     (
-        _scan_pvar(path.with_suffix(""))
+        _scan_pvar(index_path.with_suffix(""))
         .rename({"#CHROM": "CHROM"})
         .with_row_index("index")
         .with_columns(ALT=pl.col("ALT").str.split(","))
@@ -1075,7 +1106,7 @@ def _write_index(path: Path):
         .group_by("index", maintain_order=True)
         .agg(pl.exclude("ALT", "ILEN").first(), "ALT", "ILEN")
         .drop("index")
-        .sink_ipc(path)
+        .sink_ipc(index_path)
     )
 
 

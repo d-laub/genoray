@@ -10,6 +10,7 @@ import cyvcf2
 import numpy as np
 import polars as pl
 import pyranges as pr
+from loguru import logger
 from more_itertools import mark_ends
 from natsort import natsorted
 from numpy.typing import ArrayLike, NDArray
@@ -508,7 +509,12 @@ class VCF:
 
         c = self._c_norm.norm(contig)
         if c is None:
+            logger.warning(
+                f"Query contig {contig} not found in VCF file, even after normalizing for UCSC/Ensembl nomenclature."
+            )
             return
+
+        start = max(0, start)
 
         vcf = self._vcf(f"{c}:{int(start + 1)}-{end}")  # range string is 1-based
         ploidy = self.ploidy + self.phasing
@@ -617,7 +623,12 @@ class VCF:
 
         c = self._c_norm.norm(contig)
         if c is None:
+            logger.warning(
+                f"Query contig {contig} not found in VCF file, even after normalizing for UCSC/Ensembl nomenclature."
+            )
             return
+
+        start = max(0, start)
 
         n_variants: int = self.n_vars_in_ranges(c, start, end)[0]
         if n_variants == 0:
@@ -718,14 +729,22 @@ class VCF:
         mode = cast(type[L], mode)
 
         max_mem = parse_memory(max_mem)
+        starts = np.atleast_1d(np.asarray(starts, POS_TYPE)).clip(min=0)
 
         c = self._c_norm.norm(contig)
         if c is None:
+            logger.warning(
+                f"Query contig {contig} not found in VCF file, even after normalizing for UCSC/Ensembl nomenclature."
+            )
+            for _ in range(len(starts)):
+                yield None
             return
 
         n_variants = self.n_vars_in_ranges(c, starts, ends)
         tot_variants = n_variants.sum()
         if tot_variants == 0:
+            for _ in range(len(starts)):
+                yield None
             return
 
         mem_per_v = self._mem_per_variant(mode)
@@ -736,7 +755,6 @@ class VCF:
                 f" Memory per variant: {format_memory(mem_per_v)}."
             )
 
-        starts = np.atleast_1d(np.asarray(starts, POS_TYPE))
         starts += 1  # cyvcf2 queries are 1-based
         ends = np.atleast_1d(np.asarray(ends, POS_TYPE))
 
@@ -983,10 +1001,10 @@ class VCF:
             is equivalent to the VCF filter function. If None, the filter function will be
             used to filter the index.
         """
-        if not self._index_path().exists():
+        if not self._valid_index():
             raise FileNotFoundError(
-                f"Index file {self._index_path()} does not exist. "
-                "Please create the index using `write_gvi_index()`."
+                f"Index file {self._index_path()} does not exist or is out-of-date. "
+                "Please create the index using `_write_gvi_index()`."
             )
 
         index = pl.read_ipc(
@@ -1012,6 +1030,16 @@ class VCF:
         self._index = _Index(gr, df)
 
         return self
+
+    def _valid_index(self) -> bool:
+        """Check if the index is valid. Needs to exist and have a modified time greater than
+        the VCF file."""
+        if not self._index_path().exists():
+            return False
+
+        vcf_mtime = self.path.stat().st_mtime_ns
+        index_mtime = self._index_path().stat().st_mtime_ns
+        return index_mtime > vcf_mtime
 
     def _fill_genos(
         self,
@@ -1123,7 +1151,10 @@ class VCF:
                 raise DosageFieldError(
                     f"Dosage field '{dosage_field}' not found for record {repr(v)}"
                 )
-            # (s, 1, 1) or (s, 1)? -> (s)
+            if d.shape[1] > 1:
+                raise MultiallelicDosageError(
+                    f"Multiallelic dosages are not supported, encountered in VCF record {repr(v)}"
+                )
             out[1][..., i] = d.squeeze(1)[self._s_sorter]
 
             if ilens is not None:
