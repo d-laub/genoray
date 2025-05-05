@@ -1,3 +1,9 @@
+## 0.10.0 (2025-05-04)
+
+### Feat
+
+- change SVAR CCFs to dosages, do not infer germline CCFs automatically
+
 ## 0.9.0 (2025-05-01)
 
 ### Feat
