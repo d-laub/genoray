@@ -1,3 +1,4 @@
+import shutil
 from pathlib import Path
 
 from genoray import PGEN, VCF, SparseVar
@@ -8,12 +9,12 @@ def main():
     vcf = VCF(ddir / "biallelic.vcf.gz", dosage_field="DS")
     vcf._load_index()
     pgen = PGEN(ddir / "biallelic.pgen")
-    SparseVar.from_vcf(
-        ddir / "biallelic.vcf.svar", vcf, "1g", overwrite=True, with_dosages=True
-    )
-    SparseVar.from_pgen(
-        ddir / "biallelic.pgen.svar", pgen, "1g", overwrite=True, with_dosages=True
-    )
+    vcf_path = ddir / "biallelic.vcf.svar"
+    shutil.rmtree(vcf_path)
+    pgen_path = ddir / "biallelic.pgen.svar"
+    shutil.rmtree(pgen_path)
+    SparseVar.from_vcf(vcf_path, vcf, "1g", overwrite=True, with_dosages=True)
+    SparseVar.from_pgen(pgen_path, pgen, "1g", overwrite=True, with_dosages=True)
 
 
 if __name__ == "__main__":
