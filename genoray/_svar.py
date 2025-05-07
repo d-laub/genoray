@@ -247,17 +247,14 @@ class SparseVar:
         ).astype(np.uint32)
         if (missing_queries).size > 0:
             missing_join = pl.DataFrame(
-                {
-                    "query": missing_queries,
-                    "index": np.full(len(missing_queries), np.iinfo(V_IDX_TYPE).max),
-                },
-                schema={"query": pl.UInt32, "index": pl.UInt32},
-            )
+                {"query": missing_queries},
+            ).with_columns(index=pl.lit(None).cast(pl.UInt32))
             join = join.vstack(missing_join)
 
         var_ranges = (
             join.group_by("query")
             .agg(start=pl.col("index").min(), end=pl.col("index").max() + 1)
+            .with_columns(pl.col("start", "end").fill_null(np.iinfo(V_IDX_TYPE).max))
             .sort("query")
             .drop("query")
             .to_numpy()
