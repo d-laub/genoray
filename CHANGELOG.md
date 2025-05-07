@@ -1,3 +1,9 @@
+## 0.10.2 (2025-05-07)
+
+### Fix
+
+- wrong var ranges for queries with no overlapping variants
+
 ## 0.10.1 (2025-05-06)
 
 ### Fix
