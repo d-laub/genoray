@@ -1,3 +1,10 @@
+## 0.10.1 (2025-05-06)
+
+### Fix
+
+- incrementing start coordinates twice for VCFs, consistent encoding of missing contig return value for SVAR
+- correct number of ranges returned by chunk methods when n_variants == 0 or contig not found. raise warning for missing contigs
+
 ## 0.10.0 (2025-05-04)
 
 ### Feat
