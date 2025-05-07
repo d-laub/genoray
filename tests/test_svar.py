@@ -1,9 +1,12 @@
+from __future__ import annotations
+
 from pathlib import Path
 
 import numpy as np
 from numpy.typing import NDArray
 from pytest import fixture
 from pytest_cases import parametrize_with_cases
+from seqpro._ragged import OFFSET_TYPE
 
 from genoray import SparseVar
 from genoray._svar import DOSAGE_TYPE, V_IDX_TYPE, SparseDosages, SparseGenotypes
@@ -12,6 +15,16 @@ ddir = Path(__file__).parent / "data"
 
 DATA = np.array([2, 5, 0, 4, 0, 3, 0, 1, 3, 4], V_IDX_TYPE)
 DOSAGES = np.array([0.9, 0.9, 1, 1, 2, 2, 2, 1, 2, 1], DOSAGE_TYPE)
+
+
+def get_missing_contig_desired(
+    svar: SparseVar, n_ranges: int, n_samples: int
+) -> SparseGenotypes:
+    # (r s p 2)
+    offsets = np.full((n_ranges, n_samples, svar.ploidy, 2), -1, OFFSET_TYPE)
+    return SparseGenotypes.from_offsets(
+        svar.genos.data, (n_ranges, n_samples, svar.ploidy), offsets.reshape(-1, 2)
+    )
 
 
 def svar_vcf():
@@ -74,12 +87,21 @@ def case_spanning_del():
     return cse, var_ranges, desired
 
 
+def case_missing_contig():
+    cse = "🥸", 81261, 81263
+    # (r 2)
+    var_ranges = np.full((1, 2), np.iinfo(V_IDX_TYPE).max, V_IDX_TYPE)
+    # (r s p 2)
+    desired = None
+    return cse, var_ranges, desired
+
+
 @parametrize_with_cases("cse, var_ranges, desired", cases=".", prefix="case_")
 def test_var_ranges(
     svar: SparseVar,
     cse: tuple[str, int, int],
     var_ranges: NDArray[V_IDX_TYPE],
-    desired: SparseGenotypes,
+    desired: SparseGenotypes | None,
 ):
     actual = svar.var_ranges(*cse)
 
@@ -91,9 +113,12 @@ def test_read_ranges(
     svar: SparseVar,
     cse: tuple[str, int, int],
     var_ranges: NDArray[V_IDX_TYPE],
-    desired: SparseGenotypes,
+    desired: SparseGenotypes | None,
 ):
     actual = svar.read_ranges(*cse)
+
+    if desired is None:
+        desired = get_missing_contig_desired(svar, 1, svar.n_samples)
 
     assert actual.shape == desired.shape
     np.testing.assert_equal(actual.data, desired.data)
@@ -105,13 +130,17 @@ def test_read_ranges_sample_subset(
     svar: SparseVar,
     cse: tuple[str, int, int],
     var_ranges: NDArray[V_IDX_TYPE],
-    desired: SparseGenotypes,
+    desired: SparseGenotypes | None,
 ):
-    samples = "sample2"
-    actual = svar.read_ranges(*cse, samples=samples)
+    sample = "sample2"
+    s_idx = svar.available_samples.index(sample)
+    actual = svar.read_ranges(*cse, samples=sample)
+
+    if desired is None:
+        desired = get_missing_contig_desired(svar, 1, svar.n_samples)
 
     # desired: (1 s p ~v)
-    desired = SparseGenotypes.from_awkward(desired.to_awkward()[:, [1]])  # type: ignore
+    desired = SparseGenotypes.from_awkward(desired.to_awkward()[:, [s_idx]])  # type: ignore
     assert actual.shape == desired.shape
     np.testing.assert_equal(actual.data, desired.data)
     np.testing.assert_equal(actual.offsets, desired.offsets)

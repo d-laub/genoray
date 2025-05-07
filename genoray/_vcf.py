@@ -353,7 +353,7 @@ class VCF:
             return np.zeros_like(starts, np.uint32)
 
         out = np.empty_like(starts, np.uint32)
-        starts += 1  # 1-based
+        starts = starts + 1  # 1-based
         for i, (s, e) in enumerate(zip(starts, ends)):
             coord = f"{c}:{s}-{e}"
             if self._filter is None:
@@ -755,7 +755,7 @@ class VCF:
                 f" Memory per variant: {format_memory(mem_per_v)}."
             )
 
-        starts += 1  # cyvcf2 queries are 1-based
+        starts = starts + 1  # cyvcf2 queries are 1-based
         ends = np.atleast_1d(np.asarray(ends, POS_TYPE))
 
         for s, e, n in zip(starts, ends, n_variants):

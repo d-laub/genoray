@@ -305,7 +305,7 @@ class SparseVar:
 
         c = self._c_norm.norm(contig)
         if c is None:
-            return np.zeros((n_ranges, len(samples), self.ploidy, 2), OFFSET_TYPE)
+            return np.full((n_ranges, len(samples), self.ploidy, 2), -1, OFFSET_TYPE)
 
         ends = np.atleast_1d(np.asarray(ends, POS_TYPE))
         # (r 2)
@@ -364,7 +364,7 @@ class SparseVar:
 
         c = self._c_norm.norm(contig)
         if c is None:
-            return np.zeros((n_ranges, len(samples), self.ploidy, 2), OFFSET_TYPE)
+            return np.full((n_ranges, len(samples), self.ploidy, 2), -1, OFFSET_TYPE)
 
         ends = np.atleast_1d(np.asarray(ends, POS_TYPE))
         # (r 2)
@@ -422,14 +422,6 @@ class SparseVar:
         starts = np.atleast_1d(np.asarray(starts, POS_TYPE))
         n_ranges = len(starts)
 
-        c = self._c_norm.norm(contig)
-        if c is None:
-            return SparseGenotypes.from_offsets(
-                np.empty((0), V_IDX_TYPE),
-                (n_samples, self.ploidy),
-                np.zeros((0, 2), OFFSET_TYPE),
-            )
-
         # (r s p 2)
         starts_ends = self._find_starts_ends(contig, starts, ends, samples)
         return SparseGenotypes.from_offsets(
@@ -475,14 +467,6 @@ class SparseVar:
         n_samples = len(samples)
         starts = np.atleast_1d(np.asarray(starts, POS_TYPE))
         n_ranges = len(starts)
-
-        c = self._c_norm.norm(contig)
-        if c is None:
-            return SparseGenotypes.from_offsets(
-                np.empty((0), V_IDX_TYPE),
-                (n_samples, self.ploidy),
-                np.zeros((0, 2), OFFSET_TYPE),
-            )
 
         # (r s p 2)
         starts_ends = self._find_starts_ends_with_length(contig, starts, ends, samples)
