@@ -634,6 +634,10 @@ class VCF:
         if n_variants == 0:
             return
 
+        if self._pbar is not None and self._pbar.total is None:
+            self._pbar.total = n_variants
+            self._pbar.refresh()
+
         mem_per_v = self._mem_per_variant(mode)
         vars_per_chunk = min(max_mem // mem_per_v, n_variants)
         if vars_per_chunk == 0:
@@ -1057,6 +1061,7 @@ class VCF:
             vcf = tqdm(vcf, total=n_variants, desc="Reading VCF", unit=" variant")
         elif self._pbar is not None and self._pbar.total is None:
             self._pbar.total = n_variants
+            self._pbar.refresh()
 
         i = 0
         for i, v in enumerate(vcf):
@@ -1094,6 +1099,7 @@ class VCF:
             vcf = tqdm(vcf, total=n_variants, desc="Reading VCF", unit=" variant")
         elif self._pbar is not None and self._pbar.total is None:
             self._pbar.total = n_variants
+            self._pbar.refresh()
 
         i = 0
         for i, v in enumerate(vcf):
@@ -1137,6 +1143,7 @@ class VCF:
             vcf = tqdm(vcf, total=n_variants, desc="Reading VCF", unit=" variant")
         elif self._pbar is not None and self._pbar.total is None:
             self._pbar.total = n_variants
+            self._pbar.refresh()
 
         i = 0
         for i, v in enumerate(vcf):

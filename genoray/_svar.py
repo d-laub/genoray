@@ -505,6 +505,10 @@ class SparseVar:
             )
         out.mkdir(parents=True, exist_ok=True)
 
+        if not vcf._index_path().exists():
+            logger.info("Genoray VCF index not found, creating index.")
+            vcf._write_gvi_index()
+
         contigs = vcf.contigs
         with open(out / "metadata.json", "w") as f:
             json.dump(
@@ -516,9 +520,6 @@ class SparseVar:
                 f,
             )
 
-        if not vcf._index_path().exists():
-            logger.info("Genoray VCF index not found, creating index.")
-            vcf._write_gvi_index()
         shutil.copy(vcf._index_path(), cls._index_path(out))
 
         with TemporaryDirectory() as tdir:

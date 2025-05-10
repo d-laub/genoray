@@ -927,6 +927,7 @@ def _gen_with_length(
             continue
 
         ext_s_idx = min(var_idx[-1] + 1, contig_max_idx)
+        # end idx is 0-based inclusive
         ext_e_idx = min(ext_s_idx + _IDX_EXTENSION - 1, contig_max_idx)
         if ext_s_idx == ext_e_idx:
             yield read(var_idx), last_end, var_idx
@@ -935,6 +936,7 @@ def _gen_with_length(
         var_idx = np.concatenate(
             [var_idx, np.arange(ext_s_idx, ext_e_idx + 1, dtype=V_IDX_TYPE)]
         )
+        last_idx: V_IDX_TYPE = var_idx[-1]
         last_end = cast(POS_TYPE, v_ends[var_idx[-1]])
         out = read(var_idx)
 
@@ -948,12 +950,14 @@ def _gen_with_length(
         ls_ext: list[L] = []
         while (hap_lens < length).any() and ext_s_idx < contig_max_idx:
             ext_s_idx = min(var_idx[-1] + 1, contig_max_idx)
+            # end idx is 0-based inclusive
             ext_e_idx = min(ext_s_idx + _IDX_EXTENSION - 1, contig_max_idx)
             if ext_s_idx == ext_e_idx:
                 break
 
-            var_idx = np.arange(ext_s_idx, ext_e_idx + 1, dtype=V_IDX_TYPE)
-            ext_out = read(var_idx)
+            ext_idx = np.arange(ext_s_idx, ext_e_idx + 1, dtype=V_IDX_TYPE)
+            last_idx = ext_idx[-1]
+            ext_out = read(ext_idx)
             ls_ext.append(ext_out)
 
             if isinstance(ext_out, Genos):
@@ -961,9 +965,9 @@ def _gen_with_length(
             else:
                 ext_genos = ext_out[0]
 
-            dist = v_starts[var_idx[-1]] - last_end
-            hap_lens += dist + hap_ilens(ext_genos, ilens[var_idx])
-            last_end = cast(POS_TYPE, v_ends[var_idx[-1]])
+            dist = v_starts[ext_idx[-1]] - last_end
+            hap_lens += dist + hap_ilens(ext_genos, ilens[ext_idx])
+            last_end = cast(POS_TYPE, v_ends[ext_idx[-1]])
 
         if len(ls_ext) == 0:
             yield out, last_end, var_idx
@@ -975,6 +979,8 @@ def _gen_with_length(
             out = tuple(
                 np.concatenate([o, *ls], axis=-1) for o, ls in zip(out, zip(*ls_ext))
             )
+
+        var_idx = np.arange(var_idx[0], last_idx + 1, dtype=V_IDX_TYPE)
         yield (
             out,  # type: ignore
             last_end,

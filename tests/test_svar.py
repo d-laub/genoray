@@ -92,6 +92,16 @@ def case_missing_contig():
     # (r 2)
     var_ranges = np.full((1, 2), np.iinfo(V_IDX_TYPE).max, V_IDX_TYPE)
     # (r s p 2)
+    offsets = np.full((1, 2, 2, 2), -1, OFFSET_TYPE)
+    desired = SparseGenotypes.from_offsets(DATA, (1, 2, 2), offsets.reshape(-1, 2))
+    return cse, var_ranges, desired
+
+
+def case_no_vars():
+    cse = "chr1", int(1e8), int(2e8)
+    # (r 2)
+    var_ranges = np.full((1, 2), np.iinfo(V_IDX_TYPE).max, V_IDX_TYPE)
+    # (r s p 2)
     desired = None
     return cse, var_ranges, desired
 
