@@ -1,3 +1,9 @@
+## 0.10.3 (2025-05-10)
+
+### Fix
+
+- pgen chunk with length var_idxs for full chunk, not just last extension
+
 ## 0.10.2 (2025-05-07)
 
 ### Fix
