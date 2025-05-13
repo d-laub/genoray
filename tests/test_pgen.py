@@ -6,7 +6,7 @@ import numpy as np
 from numpy.typing import ArrayLike, NDArray
 from pytest_cases import fixture, parametrize_with_cases
 
-from genoray import PGEN
+from genoray._pgen import PGEN, POS_TYPE, V_IDX_TYPE
 
 tdir = Path(__file__).parent
 ddir = tdir / "data"
@@ -47,32 +47,38 @@ def read_missing_contig():
     return cse, genos, phasing, dosages
 
 
+def read_none():
+    cse = "chr1", 0, 1
+    # (s p v)
+    genos = None
+    # (s v)
+    phasing = None
+    dosages = None
+    return cse, genos, phasing, dosages
+
+
 @parametrize_with_cases("cse, genos, phasing, dosages", cases=".", prefix="read_")
 def test_read(
     pgen: PGEN,
     cse: tuple[str, int, int],
-    genos: NDArray[np.int8],
-    phasing: NDArray[np.bool_],
-    dosages: NDArray[np.float32],
+    genos: NDArray[np.int8] | None,
+    phasing: NDArray[np.bool_] | None,
+    dosages: NDArray[np.float32] | None,
 ):
     # (s p v)
     g = pgen.read(*cse)
-    if cse[0] == "🥸":
-        assert g is None
-    else:
-        assert g is not None
-        np.testing.assert_equal(g, genos)
+    np.testing.assert_equal(g, genos)
 
     d = pgen.read(*cse, PGEN.Dosages)
-    if cse[0] == "🥸":
-        assert g is None
+    if dosages is None:
+        assert d is None
     else:
         assert d is not None
         np.testing.assert_allclose(d, dosages, rtol=1e-5)
 
     gp = pgen.read(*cse, PGEN.GenosPhasing)
-    if cse[0] == "🥸":
-        assert g is None
+    if phasing is None:
+        assert gp is None
     else:
         assert gp is not None
         g, p = gp
@@ -80,8 +86,8 @@ def test_read(
         np.testing.assert_equal(p, phasing)
 
     gd = pgen.read(*cse, PGEN.GenosDosages)
-    if cse[0] == "🥸":
-        assert g is None
+    if dosages is None:
+        assert gd is None
     else:
         assert gd is not None
         g, d = gd
@@ -89,8 +95,8 @@ def test_read(
         np.testing.assert_allclose(d, dosages, rtol=1e-5)
 
     gpd = pgen.read(*cse, PGEN.GenosPhasingDosages)
-    if cse[0] == "🥸":
-        assert g is None
+    if phasing is None or dosages is None:
+        assert gpd is None
     else:
         assert gpd is not None
         g, p, d = gpd
@@ -103,36 +109,38 @@ def test_read(
 def test_chunk(
     pgen: PGEN,
     cse: tuple[str, int, int],
-    genos: NDArray[np.int8],
-    phasing: NDArray[np.bool_],
-    dosages: NDArray[np.float32],
+    genos: NDArray[np.int8] | None,
+    phasing: NDArray[np.bool_] | None,
+    dosages: NDArray[np.float32] | None,
 ):
     mode = PGEN.GenosPhasingDosages
     gpd = pgen.chunk(*cse, pgen._mem_per_variant(mode), mode)
-    chunk = None
-    for i, chunk in enumerate(gpd):
-        g, p, d = chunk
-        np.testing.assert_equal(g, genos[..., [i]])
-        np.testing.assert_equal(p, phasing[..., [i]])
-        np.testing.assert_allclose(d, dosages[..., [i]], rtol=1e-5)
-    if cse[0] == "🥸":
-        assert chunk is None
+    if genos is None or phasing is None or dosages is None:
+        assert sum(1 for _ in gpd) == 0
+    else:
+        chunk = None
+        for i, chunk in enumerate(gpd):
+            g, p, d = chunk
+            np.testing.assert_equal(g, genos[..., [i]])
+            np.testing.assert_equal(p, phasing[..., [i]])
+            np.testing.assert_allclose(d, dosages[..., [i]], rtol=1e-5)
+        assert chunk is not None
 
 
 @parametrize_with_cases("cse, genos, phasing, dosages", cases=".", prefix="read_")
 def test_read_ranges(
     pgen: PGEN,
     cse: tuple[str, int, int],
-    genos: NDArray[np.int8],
-    phasing: NDArray[np.bool_],
-    dosages: NDArray[np.float32],
+    genos: NDArray[np.int8] | None,
+    phasing: NDArray[np.bool_] | None,
+    dosages: NDArray[np.float32] | None,
 ):
     c, s, e = cse
     s = [s, s]
     e = [e, e]
 
     gpdo = pgen.read_ranges(c, s, e, PGEN.GenosPhasingDosages)
-    if cse[0] == "🥸":
+    if genos is None or phasing is None or dosages is None:
         assert gpdo is None
     else:
         assert gpdo is not None
@@ -149,9 +157,9 @@ def test_read_ranges(
 def test_chunk_ranges(
     pgen: PGEN,
     cse: tuple[str, int, int],
-    genos: NDArray[np.int8],
-    phasing: NDArray[np.bool_],
-    dosages: NDArray[np.float32],
+    genos: NDArray[np.int8] | None,
+    phasing: NDArray[np.bool_] | None,
+    dosages: NDArray[np.float32] | None,
 ):
     c, s, e = cse
     s = [s, s]
@@ -160,7 +168,7 @@ def test_chunk_ranges(
     mode = PGEN.GenosPhasingDosages
     gpdo = pgen.chunk_ranges(c, s, e, max_mem=pgen._mem_per_variant(mode), mode=mode)
     for range_ in gpdo:
-        if cse[0] == "🥸":
+        if genos is None or phasing is None or dosages is None:
             assert range_ is None
         else:
             assert range_ is not None
@@ -186,9 +194,9 @@ def samples_second():
 def test_set_samples(
     pgen: PGEN,
     cse: tuple[str, int, int],
-    genos: NDArray[np.int8],
-    phasing: NDArray[np.bool_],
-    dosages: NDArray[np.float32],
+    genos: NDArray[np.int8] | None,
+    phasing: NDArray[np.bool_] | None,
+    dosages: NDArray[np.float32] | None,
     samples: ArrayLike | None,
 ):
     pgen.set_samples(samples)
@@ -205,7 +213,7 @@ def test_set_samples(
     np.testing.assert_equal(pgen._s_idx, s_idx)
 
     gpd = pgen.read(*cse, PGEN.GenosPhasingDosages)
-    if cse[0] == "🥸":
+    if genos is None or phasing is None or dosages is None:
         assert gpd is None
     else:
         assert gpd is not None
@@ -223,7 +231,7 @@ def length_no_ext():
     phasing = np.array([[1], [0]], np.bool_)
     dosages = np.array([[0.900024], [np.nan]], np.float32)
     last_end = 81265
-    var_idxs = np.array([2], dtype=np.uint32)
+    var_idxs = np.array([2], dtype=V_IDX_TYPE)
     return cse, genos, phasing, dosages, last_end, var_idxs
 
 
@@ -235,7 +243,19 @@ def length_ext():
     phasing = np.array([[1, 0, 1], [1, 0, 0]], np.bool_)
     dosages = np.array([[1.0, np.nan, 0.900024], [2.0, 1.0, np.nan]], np.float32)
     last_end = 81265
-    var_idxs = np.arange(3, dtype=np.uint32)
+    var_idxs = np.arange(3, dtype=V_IDX_TYPE)
+    return cse, genos, phasing, dosages, last_end, var_idxs
+
+
+def length_none():
+    cse = "chr1", 0, 1
+    # (s p v)
+    genos = None
+    # (s v)
+    phasing = None
+    dosages = None
+    last_end = 1
+    var_idxs = np.array([], dtype=V_IDX_TYPE)
     return cse, genos, phasing, dosages, last_end, var_idxs
 
 
@@ -245,9 +265,9 @@ def length_ext():
 def test_chunk_with_length(
     pgen: PGEN,
     cse: tuple[str, int, int],
-    genos: NDArray[np.int8],
-    phasing: NDArray[np.bool_],
-    dosages: NDArray[np.float32],
+    genos: NDArray[np.int8] | None,
+    phasing: NDArray[np.bool_] | None,
+    dosages: NDArray[np.float32] | None,
     last_end: int,
     var_idxs: np.uint32,
 ):
@@ -255,20 +275,31 @@ def test_chunk_with_length(
     max_mem = pgen._mem_per_variant(mode)
     gpd = pgen._chunk_ranges_with_length(*cse, max_mem, mode)
     for range_ in gpd:
-        assert range_ is not None
-        for chunk, end, v_idxs in range_:
-            g, p, d = chunk
-            np.testing.assert_equal(g, genos)
-            np.testing.assert_equal(p, phasing)
-            np.testing.assert_allclose(d, dosages, rtol=1e-5)
-            assert end == last_end
-            np.testing.assert_equal(v_idxs, var_idxs)
+        if genos is None or phasing is None or dosages is None:
+            assert range_ is None
+        else:
+            assert range_ is not None
+            for chunk, end, v_idxs in range_:
+                g, p, d = chunk
+                np.testing.assert_equal(g, genos)
+                np.testing.assert_equal(p, phasing)
+                np.testing.assert_allclose(d, dosages, rtol=1e-5)
+                assert end == last_end
+                np.testing.assert_equal(v_idxs, var_idxs)
 
 
 def n_vars_miss_chr():
     contig = "chr3"
     starts = 0
     ends = np.iinfo(np.int64).max
+    desired = np.array([0], dtype=np.uint32)
+    return contig, starts, ends, desired
+
+
+def n_vars_none():
+    contig = "chr1"
+    starts = 0
+    ends = 1
     desired = np.array([0], dtype=np.uint32)
     return contig, starts, ends, desired
 
@@ -304,16 +335,24 @@ def test_n_vars_in_ranges(
 def var_idxs_miss_chr():
     contig = "chr3"
     starts = 0
-    ends = np.iinfo(np.int64).max
-    desired = (np.array([], dtype=np.uint32), np.array([0, 0], dtype=np.uint64))
+    ends = np.iinfo(POS_TYPE).max
+    desired = (np.array([], dtype=V_IDX_TYPE), np.array([0, 0], dtype=np.uint64))
+    return contig, starts, ends, desired
+
+
+def var_idxs_none():
+    contig = "chr1"
+    starts = 0
+    ends = 1
+    desired = (np.array([], dtype=V_IDX_TYPE), np.array([0, 0], dtype=np.uint64))
     return contig, starts, ends, desired
 
 
 def var_idxs_all():
     contig = "chr1"
     starts = 0
-    ends = np.iinfo(np.int64).max
-    desired = (np.array([0, 1, 2], dtype=np.uint32), np.array([0, 3], dtype=np.uint64))
+    ends = np.iinfo(POS_TYPE).max
+    desired = (np.array([0, 1, 2], dtype=V_IDX_TYPE), np.array([0, 3], dtype=np.uint64))
     return contig, starts, ends, desired
 
 
@@ -321,7 +360,7 @@ def var_idxs_spanning_del():
     contig = "chr1"
     starts = 81262
     ends = 81263
-    desired = (np.array([0], dtype=np.uint32), np.array([0, 1], dtype=np.uint64))
+    desired = (np.array([0], dtype=V_IDX_TYPE), np.array([0, 1], dtype=np.uint64))
     return contig, starts, ends, desired
 
 
@@ -331,7 +370,7 @@ def test_var_idxs(
     contig: str,
     starts: ArrayLike,
     ends: ArrayLike,
-    desired: tuple[NDArray[np.uint32], NDArray[np.uint64]],
+    desired: tuple[NDArray[V_IDX_TYPE], NDArray[np.uint64]],
 ):
     var_idxs, offsets = pgen.var_idxs(contig, starts, ends)
     assert np.array_equal(var_idxs, desired[0])

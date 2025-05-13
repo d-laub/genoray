@@ -918,7 +918,9 @@ class VCF:
                         n_variants = cast(int, vcf.num_records)
                     except ValueError:
                         # VCF doesn't have a CSI or TBI index
-                        pass
+                        n_variants = sum(
+                            self.n_vars_in_ranges(c)[0] for c in self.contigs
+                        )
                 elif contig is None:
                     n_variants = sum(self.n_vars_in_ranges(c)[0] for c in self.contigs)
                 else:
@@ -1011,6 +1013,7 @@ class VCF:
                 "Please create the index using `_write_gvi_index()`."
             )
 
+        logger.info("Loading genoray index.")
         index = pl.read_ipc(
             self._index_path(), row_index_name="index", memory_map=False
         )
@@ -1018,7 +1021,14 @@ class VCF:
         df = index.drop("CHROM", "index")
 
         if self._filter is not None and filter is None:
-            filt = [self._filter(v) for v in self._open()]
+            logger.warning(
+                "[performance] VCF has a filter but an index filter was not provided."
+                " In order to infer which rows should be filtered, we must iterate"
+                " over the VCF file. This is much slower than providing a polars filter"
+                " expression that matches the VCF filter function."
+            )
+            _vcf = self._open()
+            filt = [self._filter(v) for v in tqdm(_vcf, total=_vcf.num_records)]
             index = index.filter(pl.lit(filt))
         elif filter is not None:
             index = index.filter(filter)
