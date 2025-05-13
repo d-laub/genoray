@@ -1,3 +1,13 @@
+## 0.10.6 (2025-05-13)
+
+### Fix
+
+- contig max indices for SVAR
+
+### Perf
+
+- lazily process vcf index and sink to disk
+
 ## 0.10.5 (2025-05-13)
 
 ### Fix
