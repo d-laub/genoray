@@ -982,6 +982,7 @@ class VCF:
         try:
             index = (
                 self.get_record_info(attrs=attrs, info=info, progress=progress)
+                .lazy()
                 .with_row_index()
                 .explode("ALT")
                 .with_columns(ILEN=ILEN)
@@ -992,7 +993,7 @@ class VCF:
         finally:
             self._filter = filt
 
-        index.write_ipc(self._index_path(), compression="zstd")
+        index.sink_ipc(self._index_path(), compression="zstd")
 
     def _load_index(self, filter: pl.Expr | None = None) -> Self:
         """Load the index from disk, applying the filter expression if provided. You must
