@@ -1,3 +1,9 @@
+## 0.10.5 (2025-05-13)
+
+### Fix
+
+- keep iterating if any region has no variants
+
 ## 0.10.4 (2025-05-13)
 
 ### Fix
