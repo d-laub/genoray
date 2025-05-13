@@ -6,15 +6,19 @@ import numpy as np
 from numpy.typing import NDArray
 from pytest import fixture
 from pytest_cases import parametrize_with_cases
-from seqpro._ragged import OFFSET_TYPE
+from seqpro._ragged import LENGTH_TYPE, OFFSET_TYPE, lengths_to_offsets
 
 from genoray import SparseVar
 from genoray._svar import DOSAGE_TYPE, V_IDX_TYPE, SparseDosages, SparseGenotypes
 
 ddir = Path(__file__).parent / "data"
 
+N_SAMPLES = 2
+PLOIDY = 2
 DATA = np.array([2, 5, 0, 4, 0, 3, 0, 1, 3, 4], V_IDX_TYPE)
 DOSAGES = np.array([0.9, 0.9, 1, 1, 2, 2, 2, 1, 2, 1], DOSAGE_TYPE)
+LENGTHS = np.array([[2, 2], [2, 4]], LENGTH_TYPE)
+OFFSETS = lengths_to_offsets(LENGTHS)
 
 
 def get_missing_contig_desired(
@@ -46,7 +50,7 @@ def svar():
 @parametrize_with_cases("svar", cases=".", prefix="svar_")
 def test_contents(svar: SparseVar):
     # (s p)
-    lengths = np.array([[2, 2], [2, 4]], np.uint32)
+    lengths = LENGTHS
     desired_genos = SparseGenotypes.from_lengths(DATA, lengths)
     desired_ccfs = SparseDosages.from_lengths(DOSAGES, lengths)
 
@@ -71,7 +75,7 @@ def case_all():
     var_ranges = np.array([[0, 3]], V_IDX_TYPE)
     # (s p)
     shape = (1, 2, 2)
-    offsets = np.array([[0, 1], [2, 3], [4, 5], [6, 8]])
+    offsets = np.array([[0, 1], [2, 3], [4, 5], [6, 8]], dtype=OFFSET_TYPE)
     desired = SparseGenotypes.from_offsets(DATA, shape, offsets)
     return cse, var_ranges, desired
 
@@ -80,7 +84,7 @@ def case_spanning_del():
     cse = "chr1", 81262, 81263
     # (r 2)
     var_ranges = np.array([[0, 1]], V_IDX_TYPE)
-    shape = (1, 2, 2)
+    shape = (1, N_SAMPLES, PLOIDY)
     # (s p)
     offsets = np.array([[0, 0], [2, 3], [4, 5], [6, 7]])
     desired = SparseGenotypes.from_offsets(DATA, shape, offsets)
@@ -91,9 +95,10 @@ def case_missing_contig():
     cse = "🥸", 81261, 81263
     # (r 2)
     var_ranges = np.full((1, 2), np.iinfo(V_IDX_TYPE).max, V_IDX_TYPE)
+    shape = (1, N_SAMPLES, PLOIDY)
     # (r s p 2)
-    offsets = np.full((1, 2, 2, 2), -1, OFFSET_TYPE)
-    desired = SparseGenotypes.from_offsets(DATA, (1, 2, 2), offsets.reshape(-1, 2))
+    offsets = np.full((1, N_SAMPLES, PLOIDY, 2), -1, OFFSET_TYPE)
+    desired = SparseGenotypes.from_offsets(DATA, shape, offsets.reshape(-1, 2))
     return cse, var_ranges, desired
 
 
@@ -101,8 +106,10 @@ def case_no_vars():
     cse = "chr1", int(1e8), int(2e8)
     # (r 2)
     var_ranges = np.full((1, 2), np.iinfo(V_IDX_TYPE).max, V_IDX_TYPE)
+    shape = (1, N_SAMPLES, PLOIDY)
     # (r s p 2)
-    desired = None
+    offsets = np.full((1, N_SAMPLES, PLOIDY, 2), np.iinfo(OFFSET_TYPE).max, OFFSET_TYPE)
+    desired = SparseGenotypes.from_offsets(DATA, shape, offsets.reshape(-1, 2))
     return cse, var_ranges, desired
 
 
