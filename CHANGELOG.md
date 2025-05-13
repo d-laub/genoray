@@ -1,3 +1,9 @@
+## 0.10.7 (2025-05-13)
+
+### Fix
+
+- contig max indices for SVAR
+
 ## 0.10.6 (2025-05-13)
 
 ### Fix
