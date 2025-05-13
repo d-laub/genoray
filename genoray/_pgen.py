@@ -756,13 +756,15 @@ class PGEN:
         ends = np.atleast_1d(np.asarray(ends, POS_TYPE))
 
         var_idxs, offsets = self.var_idxs(c, starts, ends)
-        n_variants = len(var_idxs)
-        if n_variants == 0:
+        tot_variants = len(var_idxs)
+        if tot_variants == 0:
+            for _ in range(len(starts)):
+                yield None
             # we have full length, no deletions in any of the ranges
             return
 
         mem_per_v = self._mem_per_variant(mode)
-        vars_per_chunk = min(max_mem // mem_per_v, n_variants)
+        vars_per_chunk = min(max_mem // mem_per_v, tot_variants)
         if vars_per_chunk == 0:
             raise ValueError(
                 f"Maximum memory {format_memory(max_mem)} insufficient to read a single variant."
