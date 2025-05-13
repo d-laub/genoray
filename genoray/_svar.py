@@ -186,7 +186,10 @@ class SparseVar:
         else:
             self.dosages = None
         self.granges, self.attrs = self._load_index(attrs)
-        self._c_max_idxs = {c: len(self.granges[c]) for c in self.contigs}
+        vars_per_contig = np.array(
+            [len(self.granges[c]) for c in self.contigs]
+        ).cumsum()
+        self._c_max_idxs = {c: v - 1 for c, v in zip(self.contigs, vars_per_contig)}
 
     def var_ranges(
         self,
