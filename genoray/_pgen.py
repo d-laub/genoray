@@ -784,14 +784,15 @@ class PGEN:
 
         read = cast(Callable[[NDArray[np.uint32]], L], read)
 
-        for i, s, e in zip(range(len(offsets) - 1), starts, ends):
+        for i, (s, e) in enumerate(zip(starts, ends)):
             o_s, o_e = offsets[i], offsets[i + 1]
             range_idxs = var_idxs[o_s:o_e]
             n_variants = len(range_idxs)
             if n_variants == 0:
                 # we have full length, no deletions in any of the ranges
                 yield None
-                return
+                continue
+            
             n_chunks = -(-n_variants // vars_per_chunk)
             v_chunks = np.array_split(range_idxs, n_chunks)
 
