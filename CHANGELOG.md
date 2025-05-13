@@ -1,3 +1,9 @@
+## 0.10.4 (2025-05-13)
+
+### Fix
+
+- yield None for each range if no variants from PGEN
+
 ## 0.10.3 (2025-05-10)
 
 ### Fix
