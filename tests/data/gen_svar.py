@@ -7,6 +7,7 @@ from genoray import PGEN, VCF, SparseVar
 def main():
     ddir = Path(__file__).parent
     vcf = VCF(ddir / "biallelic.vcf.gz", dosage_field="DS")
+    vcf._write_gvi_index()
     vcf._load_index()
     pgen = PGEN(ddir / "biallelic.pgen")
     vcf_path = ddir / "biallelic.vcf.svar"

@@ -11,9 +11,11 @@ multi=$ddir/multiallelic.vcf
 echo "Bgzipping and indexing VCF files..."
 bgzip -c "$bi" >| "$bi".gz
 bcftools index "$bi".gz
+rm -f "$bi".gz.gvi
 
 bgzip -c "$multi" >| "$multi".gz
 bcftools index "$multi".gz
+rm -f "$multi".gz.gvi
 
 echo "Converting VCF to PLINK format..."
 prefix="${bi%.vcf}"
