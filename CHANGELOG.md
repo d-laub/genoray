@@ -1,3 +1,9 @@
+## 0.10.8 (2025-05-15)
+
+### Fix
+
+- relax pgenlib required version
+
 ## 0.10.7 (2025-05-13)
 
 ### Fix
