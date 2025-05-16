@@ -792,7 +792,7 @@ class PGEN:
                 # we have full length, no deletions in any of the ranges
                 yield None
                 continue
-            
+
             n_chunks = -(-n_variants // vars_per_chunk)
             v_chunks = np.array_split(range_idxs, n_chunks)
 
@@ -1158,6 +1158,7 @@ def _scan_pvar(pvar: Path):
         separator="\t",
         comment_prefix="##",
         schema={c: pvar_schema[c] for c in cols},
+        null_values=".",
     )
 
 
@@ -1182,4 +1183,5 @@ def _scan_bim(bim: Path):
         separator="\t",
         has_header=False,
         schema=schema,
+        null_values=".",
     ).filter(pl.col("POS") > 0)
