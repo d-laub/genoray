@@ -830,6 +830,9 @@ class PGEN:
         else:
             assert_never(mode)
 
+        if isinstance(self._s_sorter, np.ndarray):
+            mem *= 2  # have to make a copy to sort by samples
+
         return mem
 
     def _read_genos(
