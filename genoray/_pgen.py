@@ -233,7 +233,11 @@ class PGEN:
         if samples is not None:
             samples = np.atleast_1d(samples)
 
-        if samples is None or (samples == np.asarray(self.available_samples)).all():
+        if (
+            samples is None
+            or len(samples) == len(self.available_samples)
+            and (samples == np.asarray(self.available_samples)).all()
+        ):
             self._s_idx = slice(None)
             self._s_sorter = slice(None)
             return self
