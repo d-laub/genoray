@@ -185,6 +185,7 @@ class SparseVar:
             )
         else:
             self.dosages = None
+        logger.info("Loading genoray index")
         self.granges, self.attrs = self._load_index(attrs)
         vars_per_contig = np.array(
             [len(self.granges[c]) for c in self.contigs]
