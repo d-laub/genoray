@@ -1,3 +1,10 @@
+## 0.11.1 (2025-05-17)
+
+### Fix
+
+- pgen chunking with length
+- ILEN filter needs to be before column selection
+
 ## 0.11.0 (2025-05-17)
 
 ### Feat
