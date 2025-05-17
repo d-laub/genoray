@@ -940,17 +940,22 @@ def _gen_with_length(
         ext_s_idx: int = min(var_idx[-1] + 1, contig_max_idx)
         # end idx is 0-based inclusive
         ext_e_idx = min(ext_s_idx + _idx_extension - 1, contig_max_idx)
+        _idx_extension *= 2
+        if ext_s_idx == ext_e_idx:
+            # no extension needed
+            yield read(var_idx), last_end, var_idx
+            return
+
         var_idx = np.concatenate(
             [var_idx, np.arange(ext_s_idx, ext_e_idx + 1, dtype=V_IDX_TYPE)]
         )
-        _idx_extension *= 2
         last_idx: V_IDX_TYPE = var_idx[-1]
         last_end = cast(POS_TYPE, v_ends[var_idx[-1]])
 
         # (s p v)
         out = read(var_idx)
 
-        if ext_e_idx == contig_max_idx:
+        if ext_s_idx == ext_e_idx:
             yield out, last_end, var_idx
             return
 
@@ -969,7 +974,7 @@ def _gen_with_length(
             # end idx is 0-based inclusive
             ext_e_idx = min(ext_s_idx + _idx_extension - 1, contig_max_idx)
             _idx_extension *= 2
-            if ext_e_idx == contig_max_idx:
+            if ext_s_idx == ext_e_idx:
                 break
 
             ext_idx = np.arange(ext_s_idx, ext_e_idx + 1, dtype=V_IDX_TYPE)
