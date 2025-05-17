@@ -1,3 +1,17 @@
+## 0.11.0 (2025-05-17)
+
+### Feat
+
+- add exprs submodule for more convenient filtering
+
+### Fix
+
+- set ILEN to 0 for vars that are filtered out so they don't affect length calc
+- mem per variant should be doubled when needing to sort by sample
+- check samples for PGEN.set_samples
+- parse PVAR "." as null values
+- more logging
+
 ## 0.10.8 (2025-05-15)
 
 ### Fix
