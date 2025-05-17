@@ -1090,11 +1090,15 @@ def _read_index(
         # can keep the first alt for multiallelic sites since they're getting filtered out
         # anyway, so they won't be accessed
         # if the filter is changed, the index is invalidated and re-read (see filter setter)
-        data = index.select("Start", "End", pl.col("ILEN", "ALT").list.first())
         if filter is not None:
-            data = data.with_columns(
-                ILEN=pl.when(filter).then("ILEN").otherwise(pl.lit(0))
+            data = index.with_columns(
+                ILEN=pl.when(filter)
+                .then(pl.col("ILEN").list.first())
+                .otherwise(pl.lit(0))
             )
+            data = data.select("Start", "End", "ILEN", pl.col("ALT").list.first())
+        else:
+            data = index.select("Start", "End", pl.col("ILEN", "ALT").list.first())
         data = data.collect()
         v_starts = data["Start"].to_numpy()
         v_ends = data["End"].to_numpy()
