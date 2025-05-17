@@ -19,8 +19,8 @@ from seqpro._ragged import OFFSET_TYPE, lengths_to_offsets
 from tqdm.auto import tqdm
 from typing_extensions import Self, TypeGuard, assert_never
 
-from ._index import ILEN, SCHEMA
 from ._utils import ContigNormalizer, format_memory, hap_ilens, parse_memory
+from .exprs import ILEN, IndexSchema
 
 POS_TYPE = np.int64
 """Dtype for VCF range indices. This determines the maximum size of a contig in genoray.
@@ -969,7 +969,7 @@ class VCF:
         info
             List of INFO fields to include.
         """
-        min_attrs = list(SCHEMA.keys())
+        min_attrs = list(IndexSchema.keys())
 
         if attrs is None:
             attrs = min_attrs
@@ -980,20 +980,13 @@ class VCF:
         filt = self._filter
         self._filter = None
         try:
-            index = (
-                self.get_record_info(attrs=attrs, info=info, progress=progress)
-                .lazy()
-                .with_row_index()
-                .explode("ALT")
-                .with_columns(ILEN=ILEN)
-                .group_by("index", maintain_order=True)
-                .agg(pl.exclude("ALT", "ILEN").first(), "ALT", "ILEN")
-                .drop("index")
-            )
+            index = self.get_record_info(
+                attrs=attrs, info=info, progress=progress
+            ).with_columns(ILEN=ILEN)
         finally:
             self._filter = filt
 
-        index.sink_ipc(self._index_path(), compression="zstd")
+        index.write_ipc(self._index_path(), compression="zstd")
 
     def _load_index(self, filter: pl.Expr | None = None) -> Self:
         """Load the index from disk, applying the filter expression if provided. You must

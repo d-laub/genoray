@@ -1,7 +1,7 @@
 # API
 
 ```{eval-rst}
-.. currentmodule:: genoray
+.. module:: genoray
 
 .. autoclass:: VCF
 
@@ -10,4 +10,11 @@
 .. autoclass:: SparseVar
 
 .. autoclass:: SparseGenotypes
+```
+
+## `genoray.exprs`
+
+```{eval-rst}
+.. automodule:: genoray.exprs
+    :exclude-members: IndexSchema
 ```

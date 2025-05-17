@@ -16,8 +16,8 @@ from phantom import Phantom
 from seqpro._ragged import OFFSET_TYPE, lengths_to_offsets
 from typing_extensions import Self, TypeGuard, assert_never
 
-from ._index import ILEN
 from ._utils import ContigNormalizer, format_memory, hap_ilens, parse_memory
+from .exprs import ILEN, is_biallelic
 
 POS_TYPE = np.int64
 """Dtype for PGEN range indices. This determines the maximum size of a contig in genoray.
@@ -802,7 +802,8 @@ class PGEN:
 
             yield _gen_with_length(
                 v_chunks=v_chunks,
-                length=e - s,
+                q_start=s,
+                q_end=e,
                 read=read,
                 v_starts=self._sei.v_starts,
                 v_ends=self._sei.v_ends,
@@ -913,12 +914,10 @@ class PGEN:
         return GenosPhasingDosages((*genos_phasing, dosages))
 
 
-_IDX_EXTENSION = 20
-
-
 def _gen_with_length(
     v_chunks: list[NDArray[V_IDX_TYPE]],
-    length: int,
+    q_start: int,
+    q_end: int,
     read: Callable[[NDArray[V_IDX_TYPE]], L],
     v_starts: NDArray[POS_TYPE],  # full dataset v_starts
     v_ends: NDArray[POS_TYPE],  # full dataset v_ends
@@ -929,40 +928,48 @@ def _gen_with_length(
     # * This this will result in including more variants than needed, which is fine since we're extending var_idx by more than we
     # * need to anyway.
     #! Assume len(v_chunks) > 0 and all len(var_idx) > 0 is guaranteed by caller
+    length = q_end - q_start
 
+    _idx_extension = 20
     for _, is_last, var_idx in mark_ends(v_chunks):
         last_end = cast(POS_TYPE, v_ends[var_idx[-1]])
         if not is_last:
             yield read(var_idx), last_end, var_idx
             continue
 
-        ext_s_idx = min(var_idx[-1] + 1, contig_max_idx)
+        ext_s_idx: int = min(var_idx[-1] + 1, contig_max_idx)
         # end idx is 0-based inclusive
-        ext_e_idx = min(ext_s_idx + _IDX_EXTENSION - 1, contig_max_idx)
-        if ext_s_idx == ext_e_idx:
-            yield read(var_idx), last_end, var_idx
-            return
-
+        ext_e_idx = min(ext_s_idx + _idx_extension - 1, contig_max_idx)
         var_idx = np.concatenate(
             [var_idx, np.arange(ext_s_idx, ext_e_idx + 1, dtype=V_IDX_TYPE)]
         )
+        _idx_extension *= 2
         last_idx: V_IDX_TYPE = var_idx[-1]
         last_end = cast(POS_TYPE, v_ends[var_idx[-1]])
+
+        # (s p v)
         out = read(var_idx)
 
+        if ext_e_idx == contig_max_idx:
+            yield out, last_end, var_idx
+            return
+
         if isinstance(out, Genos):
-            hap_lens = np.full(out.shape[:-1], length, dtype=np.int32)
+            # (s p)
+            hap_lens = np.full(out.shape[:-1], last_end - q_start, dtype=np.int32)
             hap_lens += hap_ilens(out, ilens[var_idx])
         else:
-            hap_lens = np.full(out[0].shape[:-1], length, dtype=np.int32)
+            # (s p)
+            hap_lens = np.full(out[0].shape[:-1], last_end - q_start, dtype=np.int32)
             hap_lens += hap_ilens(out[0], ilens[var_idx])
 
         ls_ext: list[L] = []
-        while (hap_lens < length).any() and ext_s_idx < contig_max_idx:
+        while (hap_lens < length).any():
             ext_s_idx = min(var_idx[-1] + 1, contig_max_idx)
             # end idx is 0-based inclusive
-            ext_e_idx = min(ext_s_idx + _IDX_EXTENSION - 1, contig_max_idx)
-            if ext_s_idx == ext_e_idx:
+            ext_e_idx = min(ext_s_idx + _idx_extension - 1, contig_max_idx)
+            _idx_extension *= 2
+            if ext_e_idx == contig_max_idx:
                 break
 
             ext_idx = np.arange(ext_s_idx, ext_e_idx + 1, dtype=V_IDX_TYPE)
@@ -1023,9 +1030,13 @@ def _read_psam(path: Path) -> NDArray[np.str_]:
 
 class StartsEndsIlens:
     v_starts: NDArray[POS_TYPE]
+    """0-based starts, sorted."""
     v_ends: NDArray[POS_TYPE]
+    """0-based exclusive ends, sorted by start."""
     ilens: NDArray[np.int32]
+    """Indel lengths, sorted by start."""
     alt: pl.Series
+    """Alternate alleles, sorted by start."""
 
     def __init__(
         self,
@@ -1067,15 +1078,10 @@ def _read_index(
     )
 
     if filter is None:
-        has_multiallelics = (
-            index.select((pl.col("ALT").list.len() != 1).any()).collect().item()
-        )
+        has_multiallelics = index.select((~is_biallelic).any()).collect().item()
     else:
         has_multiallelics = (
-            index.filter(filter)
-            .select((pl.col("ALT").list.len() != 1).any())
-            .collect()
-            .item()
+            index.filter(filter).select((~is_biallelic).any()).collect().item()
         )
 
     if has_multiallelics:
@@ -1084,9 +1090,12 @@ def _read_index(
         # can keep the first alt for multiallelic sites since they're getting filtered out
         # anyway, so they won't be accessed
         # if the filter is changed, the index is invalidated and re-read (see filter setter)
-        data = index.select(
-            "Start", "End", pl.col("ILEN", "ALT").list.first()
-        ).collect()
+        data = index.select("Start", "End", pl.col("ILEN", "ALT").list.first())
+        if filter is not None:
+            data = data.with_columns(
+                ILEN=pl.when(filter).then("ILEN").otherwise(pl.lit(0))
+            )
+        data = data.collect()
         v_starts = data["Start"].to_numpy()
         v_ends = data["End"].to_numpy()
         ilens = data["ILEN"].to_numpy()
@@ -1115,13 +1124,8 @@ def _write_index(index_path: Path):
     (
         _scan_pvar(index_path.with_suffix(""))
         .rename({"#CHROM": "CHROM"})
-        .with_row_index("index")
         .with_columns(ALT=pl.col("ALT").str.split(","))
-        .explode("ALT")
         .with_columns(ILEN=ILEN)
-        .group_by("index", maintain_order=True)
-        .agg(pl.exclude("ALT", "ILEN").first(), "ALT", "ILEN")
-        .drop("index")
         .sink_ipc(index_path)
     )
 
