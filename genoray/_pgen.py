@@ -10,7 +10,6 @@ import pyranges as pr
 from hirola import HashTable
 from loguru import logger
 from more_itertools import mark_ends, windowed
-from natsort import natsorted
 from numpy.typing import ArrayLike, NDArray
 from phantom import Phantom
 from seqpro._ragged import OFFSET_TYPE, lengths_to_offsets
@@ -187,10 +186,9 @@ class PGEN:
             self._dose_pgen = self._geno_pgen
         self._dose_path = dosage_path
 
-        self._index, self._sei = _read_index(self._index_path(), filter)
-        self.contigs = natsorted(self._index.chromosomes)
-        self._c_norm = ContigNormalizer(self._index.chromosomes)
-        vars_per_contig = np.array([len(df) for df in self._index.values()]).cumsum()
+        self._index, self._sei, self.contigs = _read_index(self._index_path(), filter)
+        self._c_norm = ContigNormalizer(self.contigs)
+        vars_per_contig = np.array([len(self._index[c]) for c in self.contigs]).cumsum()
         self._c_max_idxs = {c: v - 1 for c, v in zip(self.contigs, vars_per_contig)}
 
     @property
@@ -215,7 +213,7 @@ class PGEN:
     @filter.setter
     def filter(self, filter: pl.Expr | None):
         """Set the Polars expression to filter variants. Should return True for variants to keep."""
-        self._index, self._sei = _read_index(self._index_path(), filter)
+        self._index, self._sei, _ = _read_index(self._index_path(), filter)
         self._filter = filter
 
     def _index_path(self) -> Path:
@@ -959,13 +957,15 @@ def _gen_with_length(
             yield out, last_end, var_idx
             return
 
+        initial_len = max(length, last_end - q_start)
+
         if isinstance(out, Genos):
             # (s p)
-            hap_lens = np.full(out.shape[:-1], last_end - q_start, dtype=np.int32)
+            hap_lens = np.full(out.shape[:-1], initial_len, dtype=np.int32)
             hap_lens += hap_ilens(out, ilens[var_idx])
         else:
             # (s p)
-            hap_lens = np.full(out[0].shape[:-1], last_end - q_start, dtype=np.int32)
+            hap_lens = np.full(out[0].shape[:-1], initial_len, dtype=np.int32)
             hap_lens += hap_ilens(out[0], ilens[var_idx])
 
         ls_ext: list[L] = []
@@ -1069,7 +1069,7 @@ def _valid_index(index_path: Path) -> bool:
 
 def _read_index(
     index_path: Path, filter: pl.Expr | None
-) -> tuple[pr.PyRanges, StartsEndsIlens | None]:
+) -> tuple[pr.PyRanges, StartsEndsIlens | None, list[str]]:
     if not _valid_index(index_path):
         logger.info("Genoray PVAR index not found or out-of-date, creating index.")
         _write_index(index_path)
@@ -1095,15 +1095,15 @@ def _read_index(
         # can keep the first alt for multiallelic sites since they're getting filtered out
         # anyway, so they won't be accessed
         # if the filter is changed, the index is invalidated and re-read (see filter setter)
-        if filter is not None:
+        if filter is None:
+            data = index.select("Start", "End", pl.col("ILEN", "ALT").list.first())
+        else:
             data = index.with_columns(
                 ILEN=pl.when(filter)
                 .then(pl.col("ILEN").list.first())
                 .otherwise(pl.lit(0))
             )
             data = data.select("Start", "End", "ILEN", pl.col("ALT").list.first())
-        else:
-            data = index.select("Start", "End", pl.col("ILEN", "ALT").list.first())
         data = data.collect()
         v_starts = data["Start"].to_numpy()
         v_ends = data["End"].to_numpy()
@@ -1114,12 +1114,11 @@ def _read_index(
     if filter is not None:
         index = index.filter(filter)
 
-    pyr = pr.PyRanges(
-        index.select("index", "Start", "End", Chromosome="CHROM")
-        .collect()
-        .to_pandas(use_pyarrow_extension_array=True)
-    )
-    return pyr, sei
+    index = index.select("index", "Start", "End", Chromosome="CHROM").collect()
+    # PVAR contigs are not necessarily sorted, only guaranteed to be sorted within a contig
+    contigs = index["Chromosome"].unique(maintain_order=True).to_list()
+    pyr = pr.PyRanges(index.to_pandas(use_pyarrow_extension_array=True))
+    return pyr, sei, contigs
 
 
 # TODO: can this be implemented using the NCLS lib underlying PyRanges? Then we can

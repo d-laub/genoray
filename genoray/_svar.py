@@ -135,6 +135,7 @@ class SparseVar:
     _c_norm: ContigNormalizer
     _s2i: HashTable
     _c_max_idxs: dict[str, int]
+    _is_biallelic: bool
 
     @property
     def n_samples(self) -> int:
@@ -187,6 +188,7 @@ class SparseVar:
             self.dosages = None
         logger.info("Loading genoray index")
         self.granges, self.attrs = self._load_index(attrs)
+        self._is_biallelic = (self.attrs["ALT"].list.len() == 1).all()
         vars_per_contig = np.array(
             [len(self.granges[c]) for c in self.contigs]
         ).cumsum()
@@ -344,8 +346,7 @@ class SparseVar:
             Shape: (ranges, samples, ploidy, 2). The first column is the start index of the variant
             and the second column is the end index of the variant.
         """
-        has_multiallelics = (self.attrs["ALT"].list.len() > 1).any()
-        if has_multiallelics:
+        if not self._is_biallelic:
             raise ValueError(
                 "Cannot use with_length operations with multiallelic variants."
             )
