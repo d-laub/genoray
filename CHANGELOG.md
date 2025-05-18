@@ -1,3 +1,9 @@
+## 0.11.2 (2025-05-17)
+
+### Fix
+
+- PGEN variants are only guaranteed to be sorted within contigs. perf: cache SVAR bi-allelic status
+
 ## 0.11.1 (2025-05-17)
 
 ### Fix
