@@ -1,3 +1,9 @@
+## 0.11.3 (2025-05-19)
+
+### Fix
+
+- treat missing fields as null in get_record_info
+
 ## 0.11.2 (2025-05-17)
 
 ### Fix
