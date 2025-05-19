@@ -143,6 +143,34 @@ class _Index:
 
 
 class VCF:
+    """Create a VCF reader.
+
+    Parameters
+    ----------
+    path
+        Path to the VCF file.
+    filter
+        Function to filter variants. Should return True for variants to keep.
+
+        .. note::
+            To avoid KeyErrors, this function needs to be tolerant to missing fields. For example, if you
+            access an INFO or FORMAT field, not all variants are guaranteed to have the same fields.
+            The `cyvcf2.Variant <https://brentp.github.io/cyvcf2/docstrings.html#cyvcf2.cyvcf2.Variant>`_
+            API provides the :meth:`.get <dict.get>` method on the INFO and FORMAT attributes. For example,
+            :code:`lambda v: v.INFO.get("AF", 0) > 0.05` will skip any variants with an AF <= 0.05 or a
+            missing AF by treating missing AFs as 0.
+    read_as
+        Type of data to read from the VCF file. Can be VCF.Genos, VCF.Dosages, or VCF.GenosDosages.
+    phasing
+        Whether to include phasing information on genotypes. If True, the ploidy axis will be length 3 such that
+        phasing is indicated by the 3rd value: 0 = unphased, 1 = phased. If False, the ploidy axis will be length 2.
+    dosage_field
+        Name of the dosage field to read from the VCF file. Required if read_as is VCF.Dosages, VCF.Genos8Dosages,
+        or VCF.Genos16Dosages.
+    progress
+        Whether to show a progress bar while reading the VCF file.
+    """
+
     path: Path
     """Path to the VCF file."""
     available_samples: list[str]
@@ -186,25 +214,6 @@ class VCF:
         dosage_field: str | None = None,
         progress: bool = False,
     ):
-        """Create a VCF reader.
-
-        Parameters
-        ----------
-        path
-            Path to the VCF file.
-        filter
-            Function to filter variants. Should return True for variants to keep.
-        read_as
-            Type of data to read from the VCF file. Can be VCF.Genos, VCF.Dosages, or VCF.GenosDosages.
-        phasing
-            Whether to include phasing information on genotypes. If True, the ploidy axis will be length 3 such that
-            phasing is indicated by the 3rd value: 0 = unphased, 1 = phased. If False, the ploidy axis will be length 2.
-        dosage_field
-            Name of the dosage field to read from the VCF file. Required if read_as is VCF.Dosages, VCF.Genos8Dosages,
-            or VCF.Genos16Dosages.
-        progress
-            Whether to show a progress bar while reading the VCF file.
-        """
         self.path = Path(path)
         self._filter = filter
         self.phasing = phasing
@@ -893,7 +902,9 @@ class VCF:
             info = []
 
         def extract(v):
-            return tuple(getattr(v, a) for a in attrs) + tuple(v.INFO[f] for f in info)
+            return tuple(getattr(v, a) for a in attrs) + tuple(
+                v.INFO.get(f, None) for f in info
+            )
 
         cols = deepcopy(attrs)
         if info is not None:
@@ -913,22 +924,29 @@ class VCF:
 
             if progress:
                 n_variants = None
-                if self._filter is None and contig is None:
-                    try:
-                        n_variants = cast(int, vcf.num_records)
-                    except ValueError:
-                        # VCF doesn't have a CSI or TBI index
+                filt = self._filter
+                self._filter = None
+                try:
+                    if contig is None:
+                        try:
+                            n_variants = cast(int, vcf.num_records)
+                        except ValueError:
+                            # VCF doesn't have a CSI or TBI index
+                            n_variants = sum(
+                                self.n_vars_in_ranges(c)[0] for c in self.contigs
+                            )
+                    elif contig is None:
                         n_variants = sum(
                             self.n_vars_in_ranges(c)[0] for c in self.contigs
                         )
-                elif contig is None:
-                    n_variants = sum(self.n_vars_in_ranges(c)[0] for c in self.contigs)
-                else:
-                    n_variants = self.n_vars_in_ranges(
-                        c,  # type: ignore | guaranteed bound by checking contig is None above
-                        start,
-                        end,
-                    )[0]
+                    else:
+                        n_variants = self.n_vars_in_ranges(
+                            c,  # type: ignore | guaranteed bound by checking contig is None above
+                            start,
+                            end,
+                        )[0]
+                finally:
+                    self._filter = filt
                 vcf = tqdm(
                     vcf, total=n_variants, desc="Reading records", unit=" record"
                 )

@@ -4,6 +4,7 @@ notebooks/
 .venv/
 dist/
 docs/build/
+data/
 
 # pixi environments
 .pixi

@@ -106,6 +106,18 @@ L = TypeVar("L", Genos, GenosPhasing, GenosDosages, GenosPhasingDosages)
 
 
 class PGEN:
+    """Create a PGEN reader.
+
+    Parameters
+    ----------
+    path
+        Path to the PGEN file. Only used for genotypes if a dosage path is provided as well.
+    filter
+        Polars expression to filter variants. Should return True for variants to keep.
+    dosage_path
+        Path to a dosage PGEN file. If None, the genotype PGEN file will be used for both genotypes and dosages.
+    """
+
     available_samples: list[str]
     """List of available samples in the PGEN file."""
     _filter: pl.Expr | None
@@ -148,17 +160,6 @@ class PGEN:
         filter: pl.Expr | None = None,
         dosage_path: str | Path | None = None,
     ):
-        """Create a PGEN reader.
-
-        Parameters
-        ----------
-        path
-            Path to the PGEN file. Only used for genotypes if a dosage path is provided as well.
-        filter
-            Polars expression to filter variants. Should return True for variants to keep.
-        dosage_path
-            Path to a dosage PGEN file. If None, the genotype PGEN file will be used for both genotypes and dosages.
-        """
         geno_path = Path(geno_path)
         self._geno_path = geno_path
         self._filter = filter

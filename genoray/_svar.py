@@ -124,6 +124,16 @@ class SparseDosages(Ragged[DOSAGE_TYPE]):
 
 
 class SparseVar:
+    """Open a Sparse Variant (SVAR) directory.
+
+    Parameters
+    ----------
+    path
+        Path to the SVAR directory.
+    attrs
+        Expression of attributes to load in addition to the ALT and ILEN columns.
+    """
+
     path: Path
     available_samples: list[str]
     ploidy: int
@@ -152,15 +162,6 @@ class SparseVar:
         return (self.path / "dosages.npy").exists()
 
     def __init__(self, path: str | Path, attrs: IntoExpr | None = None):
-        """Open a Sparse Variant (SVAR) directory.
-
-        Parameters
-        ----------
-        path
-            Path to the SVAR directory.
-        attrs
-            Expression of attributes to load in addition to the ALT and ILEN columns.
-        """
         path = Path(path)
         self.path = path
 
