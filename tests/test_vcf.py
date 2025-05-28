@@ -6,7 +6,6 @@ import numpy as np
 from numpy.typing import ArrayLike, NDArray
 from pytest_cases import fixture, parametrize_with_cases
 
-from genoray._utils import is_dtype
 from genoray._vcf import VCF
 
 tdir = Path(__file__).parent
@@ -44,20 +43,18 @@ def read_spanning_del():
 def read_missing_contig():
     cse = "🥸", 81261, 81263
     # (s p v)
-    genos = None
-    # (s v)
-    phasing = None
-    dosages = None
+    genos_phasing, dosages = VCF.Genos8Dosages.empty(N_SAMPLES, VCF.ploidy + 1, 0)
+    genos, phasing = np.array_split(genos_phasing, 2, 1)
+    phasing = phasing.squeeze(1).astype(bool)
     return cse, genos, phasing, dosages
 
 
 def read_none():
     cse = "chr1", 0, 1
     # (s p v)
-    genos = None
-    # (s v)
-    phasing = None
-    dosages = None
+    genos_phasing, dosages = VCF.Genos8Dosages.empty(N_SAMPLES, VCF.ploidy + 1, 0)
+    genos, phasing = np.array_split(genos_phasing, 2, 1)
+    phasing = phasing.squeeze(1).astype(bool)
     return cse, genos, phasing, dosages
 
 
@@ -65,20 +62,16 @@ def read_none():
 def test_read(
     vcf: VCF,
     cse: tuple[str, int, int],
-    genos: NDArray[np.int8] | None,
-    phasing: NDArray[np.bool_] | None,
-    dosages: NDArray[np.float32] | None,
+    genos: NDArray[np.int8],
+    phasing: NDArray[np.bool_],
+    dosages: NDArray[np.float32],
 ):
     # (s p v)
     g = vcf.read(*cse, VCF.Genos8)
-    if g is not None:
-        assert is_dtype(g, np.int8)
     np.testing.assert_equal(g, genos)
 
     # (s p v)
     g = vcf.read(*cse, VCF.Genos16)
-    if g is not None:
-        assert is_dtype(g, np.int16)
     np.testing.assert_equal(g, genos)
 
     # (s p v)
@@ -86,35 +79,22 @@ def test_read(
     np.testing.assert_equal(d, dosages)
 
     # (s p v)
-    gd = vcf.read(*cse, VCF.Genos16Dosages)
-    if gd is None:
-        g, d = None, None
-    else:
-        g, d = gd
-        assert is_dtype(g, np.int16)
+    g, d = vcf.read(*cse, VCF.Genos16Dosages)
     np.testing.assert_equal(g, genos)
     np.testing.assert_equal(d, dosages)
 
     #! with phasing
     vcf.phasing = True
     gp = vcf.read(*cse)
-    if gp is None:
-        g, p = None, None
-    else:
-        assert is_dtype(gp, np.int16)
-        # (s p+1 v) -> (s p v), (s v)
-        g, p = np.array_split(gp, 2, 1)
-        p = p.squeeze(1).astype(bool)
+    # (s p+1 v) -> (s p v), (s v)
+    g, p = np.array_split(gp, 2, 1)
+    p = p.squeeze(1).astype(bool)
     np.testing.assert_equal(g, genos)
     np.testing.assert_equal(p, phasing)
 
-    gpd = vcf.read(*cse, VCF.Genos16Dosages)
-    if gpd is None:
-        g, p, d = None, None, None
-    else:
-        gp, d = gpd
-        g, p = np.array_split(gp, 2, 1)
-        p = p.squeeze(1).astype(bool)
+    gp, d = vcf.read(*cse, VCF.Genos16Dosages)
+    g, p = np.array_split(gp, 2, 1)
+    p = p.squeeze(1).astype(bool)
     np.testing.assert_equal(g, genos)
     np.testing.assert_equal(p, phasing)
     np.testing.assert_equal(d, dosages)
@@ -124,28 +104,26 @@ def test_read(
 def test_chunk(
     vcf: VCF,
     cse: tuple[str, int, int],
-    genos: NDArray[np.int8] | None,
-    phasing: NDArray[np.bool_] | None,
-    dosages: NDArray[np.float32] | None,
+    genos: NDArray[np.int8],
+    phasing: NDArray[np.bool_],
+    dosages: NDArray[np.float32],
 ):
     vcf.phasing = True
 
+    n_variants = genos.shape[2]
     max_mem = vcf._mem_per_variant(VCF.Genos16Dosages)
     gpd = vcf.chunk(*cse, max_mem, VCF.Genos16Dosages)
-    if genos is None or phasing is None or dosages is None:
-        assert sum(1 for _ in gpd) == 0
-    else:
-        chunk = None
-        for i, chunk in enumerate(gpd):
-            gp, d = chunk
-            g, p = np.array_split(gp, 2, 1)
-            p = p.squeeze(1).astype(bool)
-            assert is_dtype(g, np.int16)
-            assert is_dtype(d, np.float32)
+    for i, (gp, d) in enumerate(gpd):
+        g, p = np.array_split(gp, 2, 1)
+        p = p.squeeze(1).astype(bool)
+        if n_variants != 0:
             np.testing.assert_equal(g, genos[..., [i]])
             np.testing.assert_equal(p, phasing[..., [i]])
             np.testing.assert_equal(d, dosages[..., [i]])
-        assert chunk is not None
+        else:
+            np.testing.assert_equal(g, genos)
+            np.testing.assert_equal(p, phasing)
+            np.testing.assert_equal(d, dosages)
 
 
 def samples_none():
@@ -224,13 +202,13 @@ def length_ext():
 def length_none():
     cse = "chr1", 0, 1
     # (s p v)
-    genos = None
-    # (s v)
-    phasing = None
-    dosages = None
+    genos_phasing, dosages = VCF.Genos8Dosages.empty(N_SAMPLES, VCF.ploidy + 1, 0)
+    genos, phasing = np.array_split(genos_phasing, 2, 1)
+    phasing = phasing.squeeze(1).astype(bool)
     last_end = 1
     n_extension = 0
     return cse, genos, phasing, dosages, last_end, n_extension
+
 
 @parametrize_with_cases(
     "cse, genos, phasing, dosages, last_end, n_extension", cases=".", prefix="length_"
@@ -238,9 +216,9 @@ def length_none():
 def test_chunk_with_length(
     vcf: VCF,
     cse: tuple[str, int, int],
-    genos: NDArray[np.int8] | None,
-    phasing: NDArray[np.bool_] | None,
-    dosages: NDArray[np.float32] | None,
+    genos: NDArray[np.int8],
+    phasing: NDArray[np.bool_],
+    dosages: NDArray[np.float32],
     last_end: int,
     n_extension: int,
 ):
@@ -249,16 +227,12 @@ def test_chunk_with_length(
     max_mem = vcf._mem_per_variant(VCF.Genos16Dosages)
     gpd = vcf._chunk_ranges_with_length(*cse, max_mem, VCF.Genos16Dosages)
     for range_ in gpd:
-        if genos is None or phasing is None or dosages is None:
-            assert range_ is None
-        else:
-            assert range_ is not None
-            for chunk, end, n_ext in range_:
-                gp, d = chunk
-                g, p = np.array_split(gp, 2, 1)
-                p = p.squeeze(1).astype(bool)
-                np.testing.assert_equal(g, genos)
-                np.testing.assert_equal(p, phasing)
-                np.testing.assert_equal(d, dosages)
-                assert end == last_end
-                assert n_ext == n_extension
+        for chunk, end, n_ext in range_:
+            gp, d = chunk
+            g, p = np.array_split(gp, 2, 1)
+            p = p.squeeze(1).astype(bool)
+            np.testing.assert_equal(g, genos)
+            np.testing.assert_equal(p, phasing)
+            np.testing.assert_equal(d, dosages)
+            assert end == last_end
+            assert n_ext == n_extension
