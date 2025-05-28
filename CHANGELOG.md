@@ -1,3 +1,9 @@
+## 0.12.0 (2025-05-27)
+
+### Feat
+
+- change all methods to never return None, and instead return arrays with 0 variants
+
 ## 0.11.3 (2025-05-19)
 
 ### Fix
