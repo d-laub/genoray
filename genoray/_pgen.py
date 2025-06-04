@@ -259,7 +259,13 @@ class PGEN:
 
     def _index_path(self) -> Path:
         """Path to the index file."""
-        return self._geno_path.with_suffix(".pvar.gvi")
+        # check whether pvar or pvar.zst
+        index = self._geno_path.with_suffix(".pvar")
+        if not index.exists():
+            index = self._geno_path.with_suffix(".pvar.zst")
+        if not index.exists():
+            raise FileNotFoundError("No index file found.")
+        return index.with_suffix(".gvi")
 
     def set_samples(self, samples: ArrayLike | None) -> Self:
         """Set the samples to use.
@@ -805,7 +811,14 @@ class PGEN:
                 f"Query contig {contig} not found in VCF file, even after normalizing for UCSC/Ensembl nomenclature."
             )
             for e in ends:
-                yield ((mode.empty(self.n_samples, self.ploidy, 0), e, np.empty(0, dtype=V_IDX_TYPE)) for _ in range(1))
+                yield (
+                    (
+                        mode.empty(self.n_samples, self.ploidy, 0),
+                        e,
+                        np.empty(0, dtype=V_IDX_TYPE),
+                    )
+                    for _ in range(1)
+                )
             # we have full length, no deletions in any of the ranges
             return
 
@@ -815,7 +828,14 @@ class PGEN:
         tot_variants = len(var_idxs)
         if tot_variants == 0:
             for e in ends:
-                yield ((mode.empty(self.n_samples, self.ploidy, 0), e, np.empty(0, dtype=V_IDX_TYPE)) for _ in range(1))
+                yield (
+                    (
+                        mode.empty(self.n_samples, self.ploidy, 0),
+                        e,
+                        np.empty(0, dtype=V_IDX_TYPE),
+                    )
+                    for _ in range(1)
+                )
             # we have full length, no deletions in any of the ranges
             return
 
@@ -846,7 +866,14 @@ class PGEN:
             n_variants = len(range_idxs)
             if n_variants == 0:
                 # we have full length, no deletions in any of the ranges
-                yield ((mode.empty(self.n_samples, self.ploidy, 0), e, np.empty(0, dtype=V_IDX_TYPE)) for _ in range(1))
+                yield (
+                    (
+                        mode.empty(self.n_samples, self.ploidy, 0),
+                        e,
+                        np.empty(0, dtype=V_IDX_TYPE),
+                    )
+                    for _ in range(1)
+                )
                 continue
 
             n_chunks = -(-n_variants // vars_per_chunk)
