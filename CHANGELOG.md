@@ -1,3 +1,10 @@
+## 0.12.2 (2025-06-05)
+
+### Fix
+
+- compatibility with zstd compressed PVAR
+- compatibility with zstd compressed PVAR
+
 ## 0.12.1 (2025-06-04)
 
 ### Fix
