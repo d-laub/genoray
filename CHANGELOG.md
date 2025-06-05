@@ -1,3 +1,10 @@
+## 0.12.1 (2025-06-04)
+
+### Fix
+
+- extend index suffix, not replace it
+- recognize .pvar.zst files automatically
+
 ## 0.12.0 (2025-05-27)
 
 ### Feat
