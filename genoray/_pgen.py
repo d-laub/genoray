@@ -3,6 +3,7 @@ from __future__ import annotations
 from functools import partial
 from io import TextIOWrapper
 from pathlib import Path
+from types import TracebackType
 from typing import Any, Callable, Generator, TypeVar, cast
 
 import numpy as np
@@ -1274,9 +1275,17 @@ def _scan_pvar(pvar: Path):
 class ZstdFile(TextIOWrapper):
     def __init__(self, path: Path):
         self.path = path
-        self.f = open(path, "rb")
-        self.reader = ZstdDecompressor().stream_reader(self.f)
+        self.reader = ZstdDecompressor().stream_reader(open(path, "rb"))
         super().__init__(self.reader, newline="\n", encoding="utf-8")
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        self.reader.close()
+        return super().__exit__(exc_type, exc_val, exc_tb)
 
 
 def _scan_bim(bim: Path):
