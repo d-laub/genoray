@@ -201,6 +201,8 @@ class PGEN:
         dosage_path: str | Path | None = None,
     ):
         geno_path = Path(geno_path)
+        if geno_path.suffix != ".pgen":
+            geno_path = geno_path.with_suffix(".pgen")
         self._geno_path = geno_path
         self._filter = filter
 
@@ -265,7 +267,7 @@ class PGEN:
             index = self._geno_path.with_suffix(".pvar.zst")
         if not index.exists():
             raise FileNotFoundError("No index file found.")
-        return index.with_suffix(".gvi")
+        return index.with_suffix(f"{index.suffix}.gvi")
 
     def set_samples(self, samples: ArrayLike | None) -> Self:
         """Set the samples to use.
