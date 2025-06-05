@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
-from pytest_cases import fixture, parametrize_with_cases
+from pytest_cases import parametrize_with_cases
 
 from genoray._pgen import PGEN, POS_TYPE, V_IDX_TYPE
 
@@ -14,9 +14,12 @@ ddir = tdir / "data"
 N_SAMPLES = 2
 
 
-@fixture  # type: ignore
-def pgen():
+def pgen_no_vzs():
     return PGEN(ddir / "biallelic.pgen")
+
+
+def pgen_vzs():
+    return PGEN(ddir / "biallelic.zst.pgen")
 
 
 def read_all():
@@ -53,6 +56,7 @@ def read_none():
     return cse, genos, phasing, dosages
 
 
+@parametrize_with_cases("pgen", cases=".", prefix="pgen_", scope="session")
 @parametrize_with_cases("cse, genos, phasing, dosages", cases=".", prefix="read_")
 def test_read(
     pgen: PGEN,
@@ -82,6 +86,7 @@ def test_read(
     np.testing.assert_allclose(d, dosages, rtol=1e-5)
 
 
+@parametrize_with_cases("pgen", cases=".", prefix="pgen_", scope="session")
 @parametrize_with_cases("cse, genos, phasing, dosages", cases=".", prefix="read_")
 def test_chunk(
     pgen: PGEN,
@@ -104,6 +109,7 @@ def test_chunk(
             np.testing.assert_allclose(d, dosages, rtol=1e-5)
 
 
+@parametrize_with_cases("pgen", cases=".", prefix="pgen_", scope="session")
 @parametrize_with_cases("cse, genos, phasing, dosages", cases=".", prefix="read_")
 def test_read_ranges(
     pgen: PGEN,
@@ -125,6 +131,7 @@ def test_read_ranges(
     np.testing.assert_allclose(d[..., o[1] : o[2]], dosages, rtol=1e-5)
 
 
+@parametrize_with_cases("pgen", cases=".", prefix="pgen_", scope="session")
 @parametrize_with_cases("cse, genos, phasing, dosages", cases=".", prefix="read_")
 def test_chunk_ranges(
     pgen: PGEN,
@@ -162,6 +169,7 @@ def samples_second():
     return samples
 
 
+@parametrize_with_cases("pgen", cases=".", prefix="pgen_", scope="session")
 @parametrize_with_cases("samples", cases=".", prefix="samples_")
 @parametrize_with_cases("cse, genos, phasing, dosages", cases=".", prefix="read_")
 def test_set_samples(
@@ -225,6 +233,7 @@ def length_none():
     return cse, genos, phasing, dosages, last_end, var_idxs
 
 
+@parametrize_with_cases("pgen", cases=".", prefix="pgen_", scope="session")
 @parametrize_with_cases(
     "cse, genos, phasing, dosages, last_end, var_idxs", cases=".", prefix="length_"
 )
@@ -282,6 +291,7 @@ def n_vars_spanning_del():
     return contig, starts, ends, desired
 
 
+@parametrize_with_cases("pgen", cases=".", prefix="pgen_", scope="session")
 @parametrize_with_cases("contig, starts, ends, desired", cases=".", prefix="n_vars_")
 def test_n_vars_in_ranges(
     pgen: PGEN,
@@ -326,6 +336,7 @@ def var_idxs_spanning_del():
     return contig, starts, ends, desired
 
 
+@parametrize_with_cases("pgen", cases=".", prefix="pgen_", scope="session")
 @parametrize_with_cases("contig, starts, ends, desired", cases=".", prefix="var_idxs_")
 def test_var_idxs(
     pgen: PGEN,

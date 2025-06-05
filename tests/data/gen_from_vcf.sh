@@ -28,6 +28,11 @@ plink2 --make-pgen --vcf "$multi".gz --out "$prefix" --vcf-half-call r
 rm -f "$prefix".log
 rm -f "$prefix".pvar.gvi
 
+prefix="${bi%.vcf}.zst"
+plink2 --make-pgen vzs --vcf "$bi".gz 'dosage=DS' --out "$prefix" --vcf-half-call r
+rm -f "$prefix".log
+rm -f "$prefix".pvar.zst.gvi
+
 
 echo "Converting VCF and PGEN to SVAR format..."
 python "$ddir"/gen_svar.py

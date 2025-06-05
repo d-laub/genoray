@@ -41,6 +41,7 @@ awkward = "*"
 numba = "*"
 seqpro = "==0.3.0"
 cyclopts = "*"
+zstandard = "*"
 # non-pkg dependencies
 seaborn = "*"
 

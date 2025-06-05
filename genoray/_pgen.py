@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from functools import partial
+from io import TextIOWrapper
 from pathlib import Path
 from typing import Any, Callable, Generator, TypeVar, cast
 
@@ -14,6 +16,7 @@ from numpy.typing import ArrayLike, NDArray
 from phantom import Phantom
 from seqpro._ragged import OFFSET_TYPE, lengths_to_offsets
 from typing_extensions import Self, TypeGuard, assert_never
+from zstandard import ZstdDecompressor
 
 from ._utils import ContigNormalizer, format_memory, hap_ilens, parse_memory
 from .exprs import ILEN, is_biallelic
@@ -1236,7 +1239,11 @@ def _scan_pvar(pvar: Path):
 
     cols = None
     is_pvar = False
-    with open(pvar, "r") as f:
+    if pvar.suffix == ".zst":
+        opener = ZstdFile
+    else:
+        opener = partial(open, mode="r")
+    with opener(pvar) as f:
         for line in f:
             if line.startswith("##"):
                 is_pvar = True
@@ -1262,6 +1269,14 @@ def _scan_pvar(pvar: Path):
         schema={c: pvar_schema[c] for c in cols},
         null_values=".",
     )
+
+
+class ZstdFile(TextIOWrapper):
+    def __init__(self, path: Path):
+        self.path = path
+        self.f = open(path, "rb")
+        self.reader = ZstdDecompressor().stream_reader(self.f)
+        super().__init__(self.reader, newline="\n", encoding="utf-8")
 
 
 def _scan_bim(bim: Path):
