@@ -1,3 +1,9 @@
+## 0.13.0 (2025-06-10)
+
+### Fix
+
+- adjust for breaking changes in seqpro Ragged API
+
 ## 0.12.2 (2025-06-05)
 
 ### Fix
