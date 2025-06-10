@@ -39,7 +39,7 @@ loguru = "==0.7.0"
 attrs = "*"
 awkward = "*"
 numba = "*"
-seqpro = "==0.3.0"
+seqpro = "==0.6.0"
 cyclopts = "*"
 zstandard = "*"
 # non-pkg dependencies

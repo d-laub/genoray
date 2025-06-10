@@ -313,7 +313,7 @@ class SparseVar:
         ends = np.atleast_1d(np.asarray(ends, POS_TYPE))
         # (r 2)
         var_ranges = self.var_ranges(contig, starts, ends)
-        # (r s p 2)
+        # (2 r s p)
         starts_ends = _find_starts_ends(
             self.genos.data, self.genos.offsets, var_ranges, s_idxs, self.ploidy
         )
@@ -372,7 +372,7 @@ class SparseVar:
         # (r 2)
         var_ranges = self.var_ranges(contig, starts, ends)
 
-        # (r s p 2)
+        # (2 r s p)
         out = _find_starts_ends_with_length(
             self.genos.data,
             self.genos.offsets,
@@ -424,12 +424,12 @@ class SparseVar:
         starts = np.atleast_1d(np.asarray(starts, POS_TYPE))
         n_ranges = len(starts)
 
-        # (r s p 2)
+        # (2 r s p)
         starts_ends = self._find_starts_ends(contig, starts, ends, samples)
         return SparseGenotypes.from_offsets(
             self.genos.data,
             (n_ranges, n_samples, self.ploidy),
-            starts_ends.reshape(-1, 2),
+            starts_ends.reshape(2, -1),
         )
 
     def read_ranges_with_length(
@@ -470,12 +470,12 @@ class SparseVar:
         starts = np.atleast_1d(np.asarray(starts, POS_TYPE))
         n_ranges = len(starts)
 
-        # (r s p 2)
+        # (2 r s p)
         starts_ends = self._find_starts_ends_with_length(contig, starts, ends, samples)
         return SparseGenotypes.from_offsets(
             self.genos.data,
             (n_ranges, n_samples, self.ploidy),
-            starts_ends.reshape(-1, 2),
+            starts_ends.reshape(2, -1),
         )
 
     @classmethod
@@ -901,13 +901,13 @@ def _find_starts_ends(
     """
     n_ranges = len(var_ranges)
     n_samples = len(sample_idxs)
-    out_offsets = np.empty((n_ranges, n_samples, ploidy, 2), dtype=OFFSET_TYPE)
+    out_offsets = np.empty((2, n_ranges, n_samples, ploidy), dtype=OFFSET_TYPE)
 
     for r in nb.prange(n_ranges):
         for s in nb.prange(n_samples):
             for p in nb.prange(ploidy):
                 if var_ranges[r, 0] == var_ranges[r, 1]:
-                    out_offsets[r, s, p] = np.iinfo(OFFSET_TYPE).max
+                    out_offsets[:, r, s, p] = np.iinfo(OFFSET_TYPE).max
                     continue
 
                 s_idx = sample_idxs[s]
@@ -915,7 +915,7 @@ def _find_starts_ends(
                 o_s, o_e = geno_offsets[sp], geno_offsets[sp + 1]
                 sp_genos = genos[o_s:o_e]
                 # add o_s to make indices relative to whole array
-                out_offsets[r, s, p] = np.searchsorted(sp_genos, var_ranges[r]) + o_s
+                out_offsets[:, r, s, p] = np.searchsorted(sp_genos, var_ranges[r]) + o_s
 
     return out_offsets
 
@@ -947,19 +947,19 @@ def _find_starts_ends_with_length(
 
     Returns
     -------
-        Shape: (ranges samples ploidy 2). The first column is the start index of the variant
+        Shape: (2 ranges samples ploidy). The first column is the start index of the variant
         and the second column is the end index of the variant.
     """
     n_ranges = len(q_starts)
     n_samples = len(sample_idxs)
     if out is None:
-        out = np.empty((n_ranges, n_samples, ploidy, 2), dtype=OFFSET_TYPE)
+        out = np.empty((2, n_ranges, n_samples, ploidy), dtype=OFFSET_TYPE)
 
     for r in nb.prange(n_ranges):
         for s in nb.prange(n_samples):
             for p in nb.prange(ploidy):
                 if var_ranges[r, 0] == var_ranges[r, 1]:
-                    out[r, s, p] = np.iinfo(OFFSET_TYPE).max
+                    out[:, r, s, p] = np.iinfo(OFFSET_TYPE).max
                     continue
 
                 s_idx = sample_idxs[s]
@@ -971,10 +971,10 @@ def _find_starts_ends_with_length(
                 )
 
                 # add o_s to make indices relative to whole array
-                out[r, s, p, 0] = start_idx + o_s
+                out[0, r, s, p] = start_idx + o_s
                 if start_idx == max_idx:
                     # no variants in this range
-                    out[r, s, p, 1] = start_idx + o_s
+                    out[1, r, s, p] = start_idx + o_s
                     continue
 
                 q_start: POS_TYPE = q_starts[r]
@@ -1019,6 +1019,6 @@ def _find_starts_ends_with_length(
                     last_v_end = max(last_v_end, v_end)
 
                 # add o_s to make indices relative to whole array
-                out[r, s, p, 1] = geno_idx + o_s + 1
+                out[1, r, s, p] = geno_idx + o_s + 1
 
     return out

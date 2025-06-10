@@ -25,9 +25,9 @@ def get_missing_contig_desired(
     svar: SparseVar, n_ranges: int, n_samples: int
 ) -> SparseGenotypes:
     # (r s p 2)
-    offsets = np.full((n_ranges, n_samples, svar.ploidy, 2), -1, OFFSET_TYPE)
+    offsets = np.full((2, n_ranges, n_samples, svar.ploidy), -1, OFFSET_TYPE)
     return SparseGenotypes.from_offsets(
-        svar.genos.data, (n_ranges, n_samples, svar.ploidy), offsets.reshape(-1, 2)
+        svar.genos.data, (n_ranges, n_samples, svar.ploidy), offsets.reshape(2, -1)
     )
 
 
@@ -74,8 +74,9 @@ def case_all():
     # (r 2)
     var_ranges = np.array([[0, 3]], V_IDX_TYPE)
     # (s p)
-    shape = (1, 2, 2)
-    offsets = np.array([[0, 1], [2, 3], [4, 5], [6, 8]], dtype=OFFSET_TYPE)
+    shape = (1, N_SAMPLES, PLOIDY)
+    # (2 r*s*p)
+    offsets = np.array([[0, 2, 4, 6], [1, 3, 5, 8]], dtype=OFFSET_TYPE)
     desired = SparseGenotypes.from_offsets(DATA, shape, offsets)
     return cse, var_ranges, desired
 
@@ -85,8 +86,8 @@ def case_spanning_del():
     # (r 2)
     var_ranges = np.array([[0, 1]], V_IDX_TYPE)
     shape = (1, N_SAMPLES, PLOIDY)
-    # (s p)
-    offsets = np.array([[0, 0], [2, 3], [4, 5], [6, 7]])
+    # (2 r*s*p)
+    offsets = np.array([[0, 2, 4, 6], [0, 3, 5, 7]], dtype=OFFSET_TYPE)
     desired = SparseGenotypes.from_offsets(DATA, shape, offsets)
     return cse, var_ranges, desired
 
@@ -96,9 +97,9 @@ def case_missing_contig():
     # (r 2)
     var_ranges = np.full((1, 2), np.iinfo(V_IDX_TYPE).max, V_IDX_TYPE)
     shape = (1, N_SAMPLES, PLOIDY)
-    # (r s p 2)
-    offsets = np.full((1, N_SAMPLES, PLOIDY, 2), -1, OFFSET_TYPE)
-    desired = SparseGenotypes.from_offsets(DATA, shape, offsets.reshape(-1, 2))
+    # (2 r*s*p)
+    offsets = np.full((2, *shape), -1, OFFSET_TYPE)
+    desired = SparseGenotypes.from_offsets(DATA, shape, offsets.reshape(2, -1))
     return cse, var_ranges, desired
 
 
@@ -107,9 +108,9 @@ def case_no_vars():
     # (r 2)
     var_ranges = np.full((1, 2), np.iinfo(V_IDX_TYPE).max, V_IDX_TYPE)
     shape = (1, N_SAMPLES, PLOIDY)
-    # (r s p 2)
-    offsets = np.full((1, N_SAMPLES, PLOIDY, 2), np.iinfo(OFFSET_TYPE).max, OFFSET_TYPE)
-    desired = SparseGenotypes.from_offsets(DATA, shape, offsets.reshape(-1, 2))
+    # (2 r*s*p)
+    offsets = np.full((2, *shape), np.iinfo(OFFSET_TYPE).max, OFFSET_TYPE)
+    desired = SparseGenotypes.from_offsets(DATA, shape, offsets.reshape(2, -1))
     return cse, var_ranges, desired
 
 
@@ -165,18 +166,18 @@ def test_read_ranges_sample_subset(
 
 def length_no_ext():
     cse = "chr1", 81264, 81265
-    shape = (1, 2, 2)
-    # (s p)
-    offsets = np.array([[0, 1], [3, 3], [5, 5], [8, 8]])
+    shape = (1, N_SAMPLES, PLOIDY)
+    # (2 r*s*p)
+    offsets = np.array([[0, 3, 5, 8], [1, 3, 5, 8]], dtype=OFFSET_TYPE)
     desired = SparseGenotypes.from_offsets(DATA, shape, offsets)
     return cse, desired
 
 
 def length_ext():
     cse = "chr1", 81262, 81263
-    shape = (1, 2, 2)
-    # (s p)
-    offsets = np.array([[0, 1], [2, 3], [4, 5], [6, 8]])
+    shape = (1, N_SAMPLES, PLOIDY)
+    # (2 r*s*p)
+    offsets = np.array([[0, 2, 4, 6], [1, 3, 5, 8]], dtype=OFFSET_TYPE)
     desired = SparseGenotypes.from_offsets(DATA, shape, offsets)
     return cse, desired
 
