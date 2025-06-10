@@ -39,14 +39,14 @@ loguru = "==0.7.0"
 attrs = "*"
 awkward = "*"
 numba = "*"
-seqpro = "==0.3.0"
+# seqpro = "==0.3.0"
 cyclopts = "*"
 zstandard = "*"
 # non-pkg dependencies
 seaborn = "*"
 
 [feature.dev.tasks]
-install = "uv pip install -e ."
+install = "uv pip install -e . -e /carter/users/dlaub/projects/ML4GLand/SeqPro"
 pre-commit = "pre-commit install --hook-type commit-msg"
 i-kernel = "ipython kernel install --user --name genoray"
 gen = { cmd = "sh tests/data/gen_from_vcf.sh", depends-on = ["install"] }

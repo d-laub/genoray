@@ -15,7 +15,7 @@ from loguru import logger
 from natsort import natsorted
 from numpy.typing import ArrayLike, NDArray
 from polars._typing import IntoExpr
-from seqpro._ragged import OFFSET_TYPE, Ragged, lengths_to_offsets
+from seqpro.rag import OFFSET_TYPE, Ragged, lengths_to_offsets
 from tqdm.auto import tqdm
 
 from ._pgen import PGEN
@@ -33,23 +33,24 @@ class SparseGenotypes(Ragged[V_IDX_TYPE]):
     """A Ragged array of variant indices with additional guarantees and methods:
 
     - dtype is :code:`int32`
-    - Ragged shape of **at least** 2 dimensions where the final two correspond to (samples, ploidy)
+    - Ragged shape of **at least** 3 dimensions where the final two correspond to (samples, ploidy, ~variants)
     - :code:`from_dense` to convert dense genotypes to sparse genotypes
     """
 
-    def __attrs_post_init__(self):
-        assert self.ndim >= 2, "SparseGenotypes must have at least 2 dimensions"
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        assert self.ndim >= 3, "SparseGenotypes must have at least 3 dimensions"
         assert self.dtype.type == V_IDX_TYPE, "SparseGenotypes must be of type int32"
 
     @property
     def n_samples(self) -> int:
         """Number of samples"""
-        return self.shape[-2]
+        return self.shape[-3]
 
     @property
     def ploidy(self) -> int:
         """Ploidy"""
-        return self.shape[-1]
+        return self.shape[-2]
 
     @classmethod
     def from_dense(cls, genos: NDArray[np.int8], var_idxs: NDArray[V_IDX_TYPE]):
@@ -77,8 +78,9 @@ class SparseDosages(Ragged[DOSAGE_TYPE]):
     - :code:`from_dense` to convert dense dosages to sparse dosages
     """
 
-    def __attrs_post_init__(self):
-        assert self.ndim >= 2, "SparseDosages must have at least 2 dimensions"
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        assert self.ndim >= 3, "SparseDosages must have at least 3 dimensions"
         assert self.dtype.type == DOSAGE_TYPE, "SparseDosages must be of type float32"
 
     @property
@@ -113,12 +115,13 @@ class SparseDosages(Ragged[DOSAGE_TYPE]):
         keep: NDArray[np.bool_] = genos == 1
         geno_data = var_idxs[keep.nonzero()[-1]]
         lengths = keep.sum(-1)
+        shape = (*lengths.shape, None)
         offsets = lengths_to_offsets(lengths)
-        sp_genos = SparseGenotypes(geno_data, lengths.shape, offsets, lengths)
+        sp_genos = SparseGenotypes.from_offsets(geno_data, offsets, shape)
 
         # (s v) -> (s p v)
         dosage_data = np.broadcast_to(dosages[:, None], genos.shape)[keep]
-        sp_dosages = SparseDosages(dosage_data, lengths.shape, offsets, lengths)
+        sp_dosages = SparseDosages.from_offsets(dosage_data, offsets, shape)
 
         return sp_genos, sp_dosages
 
@@ -179,11 +182,11 @@ class SparseVar:
         self._s2i.add(samples)
 
         self._c_norm = ContigNormalizer(contigs)
-        self.genos = _open_genos(path, (self.n_samples, self.ploidy), "r")
+        self.genos = _open_genos(path, (self.n_samples, self.ploidy, None), "r")
         if (path / "dosages.npy").exists():
             dosage_data = np.memmap(path / "dosages.npy", dtype=DOSAGE_TYPE, mode="r")
             self.dosages = SparseDosages.from_offsets(
-                dosage_data, self.genos.shape, self.genos.offsets
+                dosage_data, self.genos.offsets, self.genos.shape
             )
         else:
             self.dosages = None
@@ -740,21 +743,21 @@ def _process_contig_dosages(
     return offset, chunk_idx
 
 
-def _open_genos(path: Path, shape: tuple[int, ...], mode: Literal["r", "r+"]):
+def _open_genos(path: Path, shape: tuple[int | None, ...], mode: Literal["r", "r+"]):
     # Load the memory-mapped files
     var_idxs = np.memmap(path / "variant_idxs.npy", dtype=V_IDX_TYPE, mode=mode)
     offsets = np.memmap(path / "offsets.npy", dtype=np.int64, mode=mode)
 
-    sp_genos = SparseGenotypes.from_offsets(var_idxs, shape, offsets)
+    sp_genos = SparseGenotypes.from_offsets(var_idxs, offsets, shape)
     return sp_genos
 
 
-def _open_dosages(path: Path, shape: tuple[int, ...], mode: Literal["r", "r+"]):
+def _open_dosages(path: Path, shape: tuple[int | None, ...], mode: Literal["r", "r+"]):
     # Load the memory-mapped files
     dosages = np.memmap(path / "dosages.npy", dtype=DOSAGE_TYPE, mode=mode)
     offsets = np.memmap(path / "offsets.npy", dtype=np.int64, mode=mode)
 
-    sp_genos = SparseDosages.from_offsets(dosages, shape, offsets)
+    sp_genos = SparseDosages.from_offsets(dosages, offsets, shape)
     return sp_genos
 
 
@@ -807,7 +810,7 @@ def _concat_data(
     vars_per_sp = np.zeros(shape, dtype=np.int32)
     ls_sp_genos: list[SparseGenotypes] = []
     for chunk_dir in chunk_dirs:
-        sp_genos = _open_genos(chunk_dir, shape, mode="r")
+        sp_genos = _open_genos(chunk_dir, (*shape, None), mode="r")
         vars_per_sp += sp_genos.lengths
         ls_sp_genos.append(sp_genos)
 
@@ -835,7 +838,7 @@ def _concat_data(
     if with_dosages:
         ls_: list[SparseDosages] = []
         for chunk_dir in chunk_dirs:
-            sp_dosages = _open_dosages(chunk_dir, shape, mode="r")
+            sp_dosages = _open_dosages(chunk_dir, (*shape, None), mode="r")
             vars_per_sp += sp_dosages.lengths
             ls_.append(sp_dosages)
         dosages_memmap = np.memmap(
