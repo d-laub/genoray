@@ -894,8 +894,8 @@ class VCF:
     def get_record_info(
         self,
         contig: str | None = None,
-        start: int | np.integer = 0,
-        end: int | np.integer = INT64_MAX,
+        start: int | np.integer | None = None,
+        end: int | np.integer | None = None,
         attrs: list[str] | None = None,
         info: list[str] | None = None,
         progress: bool = False,
@@ -922,6 +922,14 @@ class VCF:
         """
         if attrs is None and info is None:
             raise ValueError("Must provide either attrs or info.")
+
+        if (start is not None or end is not None) and contig is None:
+            raise ValueError("start and end must be None if no contig is specified.")
+
+        if start is None:
+            start = 0
+        if end is None:
+            end = INT64_MAX
 
         if attrs is None:
             attrs = []
