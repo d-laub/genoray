@@ -970,10 +970,6 @@ class VCF:
                             n_variants = sum(
                                 self.n_vars_in_ranges(c)[0] for c in self.contigs
                             )
-                    elif contig is None:
-                        n_variants = sum(
-                            self.n_vars_in_ranges(c)[0] for c in self.contigs
-                        )
                     else:
                         n_variants = self.n_vars_in_ranges(
                             c,  # type: ignore | guaranteed bound by checking contig is None above
