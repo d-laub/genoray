@@ -1,3 +1,9 @@
+## 0.13.1 (2025-06-11)
+
+### Fix
+
+- raise error in VCF.get_record_info if contig is unspecified but start or end is.
+
 ## 0.13.0 (2025-06-10)
 
 ### Fix
