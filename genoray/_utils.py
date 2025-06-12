@@ -6,9 +6,9 @@ from pathlib import Path
 from typing import Any, Iterable, TypeVar, overload
 
 import numpy as np
+from hirola import HashTable
 from numpy.typing import ArrayLike, NDArray
 from typing_extensions import TypeGuard
-from hirola import HashTable
 
 DTYPE = TypeVar("DTYPE", bound=np.generic)
 
@@ -26,7 +26,10 @@ class ContigNormalizer:
         )
         self.remapper = {k: self.contigs.index(c) for k, c in self.contig_map.items()}
         keys = np.array(list(self.remapper.keys()))
-        self._c2dup = HashTable(max = len(self.contig_map) * 2, keys.dtype)
+        self._c2dup = HashTable(
+            max=len(self.contig_map) * 2,  # type: ignore
+            dtype=keys.dtype,
+        )
         self._c2dup.add(keys)
         self.dup2i = np.array(list(self.remapper.values()))
 
