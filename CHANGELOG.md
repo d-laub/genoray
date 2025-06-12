@@ -1,3 +1,9 @@
+## 0.14.0 (2025-06-11)
+
+### Feat
+
+- contig normalizer can map unnormalized contigs to indices.
+
 ## 0.13.1 (2025-06-11)
 
 ### Fix
