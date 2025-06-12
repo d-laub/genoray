@@ -6,21 +6,29 @@ from pathlib import Path
 from typing import Any, Iterable, TypeVar, overload
 
 import numpy as np
-from numpy.typing import NDArray
+from numpy.typing import ArrayLike, NDArray
 from typing_extensions import TypeGuard
+from hirola import HashTable
 
 DTYPE = TypeVar("DTYPE", bound=np.generic)
 
 
 class ContigNormalizer:
+    contigs: list[str]
     contig_map: dict[str, str]
 
     def __init__(self, contigs: Iterable[str]):
+        self.contigs = list(contigs)
         self.contig_map = (
             {f"{c[3:]}": c for c in contigs if c.startswith("chr")}
             | {f"chr{c}": c for c in contigs if not c.startswith("chr")}
             | {c: c for c in contigs}
         )
+        self.remapper = {k: self.contigs.index(c) for k, c in self.contig_map.items()}
+        keys = np.array(list(self.remapper.keys()))
+        self._c2dup = HashTable(max = len(self.contig_map) * 2, keys.dtype)
+        self._c2dup.add(keys)
+        self.dup2i = np.array(list(self.remapper.values()))
 
     @overload
     def norm(self, contigs: str) -> str | None: ...
@@ -38,6 +46,17 @@ class ContigNormalizer:
             return self.contig_map.get(contigs, None)
         else:
             return [self.contig_map.get(c, None) for c in contigs]
+
+    def c_idxs(self, contigs: ArrayLike) -> NDArray[np.integer]:
+        """Map contig names to their indices in the contig normalizer, automatically mapping unnormalized contigs.
+
+        Parameters
+        ----------
+        contigs
+            Contig name(s) to map.
+        """
+        dup_idx = self._c2dup.get(contigs)
+        return self.dup2i[dup_idx]
 
 
 def is_dtype(obj: Any, dtype: type[DTYPE]) -> TypeGuard[NDArray[DTYPE]]:
