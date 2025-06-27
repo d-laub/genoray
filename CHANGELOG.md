@@ -1,3 +1,9 @@
+## 0.14.2 (2025-06-26)
+
+### Fix
+
+- use last_idx in pgen chunk_with_length loop
+
 ## 0.14.1 (2025-06-11)
 
 ### Fix
