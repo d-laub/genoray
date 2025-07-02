@@ -1008,13 +1008,13 @@ class VCF:
         progress: bool = True,
     ) -> None:
         """Writes record information to disk, ignoring any filtering. At a minimum this index will
-        include columns `CHROM`, `POS` (1-based), `REF`, and `ALT`.
+        include columns `CHROM`, `POS` (1-based), `REF`, `ALT`, and `ILEN`.
 
         Parameters
         ----------
         attrs
             List of cyvcf2.Variant attributes to include. At a minimum this index will include
-            columns `CHROM`, `POS` (1-based), `REF`, and `ALT`.
+            columns `CHROM`, `POS` (1-based), `REF`, `ALT`, and `ILEN`.
         info
             List of INFO fields to include.
         """
@@ -1072,7 +1072,7 @@ class VCF:
             )
             _vcf = self._open()
             filt = [self._filter(v) for v in tqdm(_vcf, total=_vcf.num_records)]
-            index = index.filter(pl.lit(filt))
+            index = index.filter(pl.Series(filt))
         elif filter is not None:
             index = index.filter(filter)
 

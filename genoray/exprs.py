@@ -19,6 +19,7 @@ IndexSchema = {
     "POS": pl.Int64,
     "REF": pl.Utf8,
     "ALT": pl.List(pl.Utf8),
+    "ILEN": pl.List(pl.Int32),
 }
 """Minimum schema for a genoray index file (extension :code:`.gvi`)."""
 

@@ -157,7 +157,8 @@ class PGEN:
     path
         Path to the PGEN file. Only used for genotypes if a dosage path is provided as well.
     filter
-        Polars expression to filter variants. Should return True for variants to keep.
+        Polars expression to filter variants. Should return True for variants to keep. Will have at least the columns
+        `CHROM`, `POS` (1-based), `REF`, `ALT`, and `ILEN` available to use.
     dosage_path
         Path to a dosage PGEN file. If None, the genotype PGEN file will be used for both genotypes and dosages.
     """
