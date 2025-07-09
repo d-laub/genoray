@@ -29,8 +29,8 @@ def write(
     overwrite : bool, optional
         Whether to overwrite the output file if it exists.
     """
-    from genoray import PGEN, VCF, SparseVar
-    from genoray._utils import variant_file_type
+    from .. import PGEN, VCF, SparseVar
+    from .._utils import variant_file_type
 
     file_type = variant_file_type(source)
     if file_type == "vcf":
