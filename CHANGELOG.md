@@ -1,3 +1,10 @@
+## 0.14.3 (2025-07-09)
+
+### Fix
+
+- move svartools to be inside package dir
+- use pl.Series instead of pl.lit to define VCF filter column
+
 ## 0.14.2 (2025-06-26)
 
 ### Fix
