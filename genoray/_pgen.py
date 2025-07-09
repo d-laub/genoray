@@ -328,8 +328,9 @@ class PGEN:
         self._dose_path = dosage_path
 
     def __del__(self):
-        self._geno_pgen.close()
-        if self._dose_pgen is not None:
+        if hasattr(self, "_geno_pgen"):
+            self._geno_pgen.close()
+        if hasattr(self, "_dose_pgen") and self._dose_pgen is not None:
             self._dose_pgen.close()
 
     def n_vars_in_ranges(

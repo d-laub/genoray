@@ -42,7 +42,7 @@ build-backend = "hatchling.build"
 requires = ["hatchling"]
 
 [project.scripts]
-svartools = "genoray.svartools.cli:app"
+svartools = "svartools:app"
 
 [tool.pytest.ini_options]
 filterwarnings = ["ignore::DeprecationWarning:sorted_nearest.*"]
