@@ -1,3 +1,9 @@
+## 0.14.4 (2025-07-09)
+
+### Fix
+
+- **perf**: move svartools to standalone script
+
 ## 0.14.3 (2025-07-09)
 
 ### Fix
