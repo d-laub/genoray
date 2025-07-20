@@ -1,3 +1,9 @@
+## 0.14.6 (2025-07-19)
+
+### Fix
+
+- handle contigs/chunks with no variants
+
 ## 0.14.5 (2025-07-19)
 
 ### Fix
