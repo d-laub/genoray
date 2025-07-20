@@ -545,6 +545,8 @@ class SparseVar:
                             c, max_mem=max_mem, mode=VCF.Genos8Dosages
                         ):
                             n_vars = genos.shape[-1]
+                            if n_vars == 0:
+                                continue
                             var_idxs = np.arange(
                                 offset, offset + n_vars, dtype=np.int32
                             )
@@ -558,6 +560,8 @@ class SparseVar:
                     else:
                         for genos in vcf.chunk(c, max_mem=max_mem, mode=VCF.Genos8):
                             n_vars = genos.shape[-1]
+                            if n_vars == 0:
+                                continue
                             var_idxs = np.arange(
                                 offset, offset + n_vars, dtype=np.int32
                             )
@@ -701,6 +705,8 @@ def _process_contig(
         # genos: (s p v)
         for genos in range_:
             n_vars = genos.shape[-1]
+            if n_vars == 0:
+                continue
             var_idxs = np.arange(offset, offset + n_vars, dtype=np.int32)
             sp_genos = SparseGenotypes.from_dense(genos.astype(np.int8), var_idxs)
             _write_genos(tdir / str(chunk_idx), sp_genos)
@@ -726,6 +732,8 @@ def _process_contig_dosages(
         # genos, dosages: (s p v)
         for genos, dosages in range_:
             n_vars = genos.shape[-1]
+            if n_vars == 0:
+                continue
             var_idxs = np.arange(offset, offset + n_vars, dtype=np.int32)
 
             sp_genos, sp_dosages = SparseDosages.from_dense(
