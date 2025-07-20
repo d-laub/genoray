@@ -55,7 +55,7 @@ def test_contents(svar: SparseVar):
     desired_ccfs = SparseDosages.from_lengths(DOSAGES, lengths)
 
     if svar.path.suffixes[0] == ".vcf":
-        assert svar.contigs == ["chr1", "chr2"]
+        assert svar.contigs == ["chr1", "chr2", "chr3"]
     elif svar.path.suffixes[0] == ".pgen":
         assert svar.contigs == ["1", "2"]
 
