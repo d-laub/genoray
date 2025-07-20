@@ -903,19 +903,17 @@ def _find_starts_ends(
     n_samples = len(sample_idxs)
     out_offsets = np.empty((2, n_ranges, n_samples, ploidy), dtype=OFFSET_TYPE)
 
-    for r in nb.prange(n_ranges):
-        for s in nb.prange(n_samples):
-            for p in nb.prange(ploidy):
-                if var_ranges[r, 0] == var_ranges[r, 1]:
-                    out_offsets[:, r, s, p] = np.iinfo(OFFSET_TYPE).max
-                    continue
+    no_vars = var_ranges[:, 0] == var_ranges[:, 1]
+    out_offsets[:, no_vars] = np.iinfo(OFFSET_TYPE).max
 
-                s_idx = sample_idxs[s]
-                sp = s_idx * ploidy + p
-                o_s, o_e = geno_offsets[sp], geno_offsets[sp + 1]
-                sp_genos = genos[o_s:o_e]
-                # add o_s to make indices relative to whole array
-                out_offsets[:, r, s, p] = np.searchsorted(sp_genos, var_ranges[r]) + o_s
+    for s in nb.prange(n_samples):
+        for p in nb.prange(ploidy):
+            s_idx = sample_idxs[s]
+            sp = s_idx * ploidy + p
+            o_s, o_e = geno_offsets[sp], geno_offsets[sp + 1]
+            sp_genos = genos[o_s:o_e]
+            # add o_s to make indices relative to whole array
+            out_offsets[..., s, p] = np.searchsorted(sp_genos, var_ranges).T + o_s
 
     return out_offsets
 

@@ -20,7 +20,7 @@ from tqdm.auto import tqdm
 from typing_extensions import Self, TypeGuard, assert_never
 
 from ._utils import ContigNormalizer, format_memory, hap_ilens, parse_memory
-from .exprs import ILEN, IndexSchema
+from .exprs import ILEN
 
 POS_TYPE = np.int64
 """Dtype for VCF range indices. This determines the maximum size of a contig in genoray.
@@ -1018,7 +1018,7 @@ class VCF:
         info
             List of INFO fields to include.
         """
-        min_attrs = list(IndexSchema.keys())
+        min_attrs = ["CHROM", "POS", "REF", "ALT"]
 
         if attrs is None:
             attrs = min_attrs
