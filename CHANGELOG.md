@@ -1,3 +1,10 @@
+## 0.14.5 (2025-07-19)
+
+### Fix
+
+- svar no_var offsets
+- min_attrs for VCF._write_gvi_index
+
 ## 0.14.4 (2025-07-09)
 
 ### Fix
