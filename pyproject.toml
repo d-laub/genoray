@@ -1,6 +1,6 @@
 [project]
 name = "genoray"
-version = "0.12.2"
+version = "0.14.6"
 description = "Add your description here"
 authors = [{ name = "David Laub", email = "dlaub@ucsd.edu" }]
 readme = "README.md"
@@ -23,7 +23,7 @@ dependencies = [
     "attrs",
     "awkward",
     "numba",
-    "seqpro>=0.3.0",
+    "seqpro>=0.6.0",
     "cyclopts",
     "zstandard",
 ]
@@ -42,7 +42,7 @@ build-backend = "hatchling.build"
 requires = ["hatchling"]
 
 [project.scripts]
-svartools = "svartools.__main__:app"
+svartools = "svartools:app"
 
 [tool.pytest.ini_options]
 filterwarnings = ["ignore::DeprecationWarning:sorted_nearest.*"]

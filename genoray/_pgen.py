@@ -157,7 +157,8 @@ class PGEN:
     path
         Path to the PGEN file. Only used for genotypes if a dosage path is provided as well.
     filter
-        Polars expression to filter variants. Should return True for variants to keep.
+        Polars expression to filter variants. Should return True for variants to keep. Will have at least the columns
+        `CHROM`, `POS` (1-based), `REF`, `ALT`, and `ILEN` available to use.
     dosage_path
         Path to a dosage PGEN file. If None, the genotype PGEN file will be used for both genotypes and dosages.
     """
@@ -327,8 +328,9 @@ class PGEN:
         self._dose_path = dosage_path
 
     def __del__(self):
-        self._geno_pgen.close()
-        if self._dose_pgen is not None:
+        if hasattr(self, "_geno_pgen"):
+            self._geno_pgen.close()
+        if hasattr(self, "_dose_pgen") and self._dose_pgen is not None:
             self._dose_pgen.close()
 
     def n_vars_in_ranges(
@@ -1010,7 +1012,7 @@ def _gen_with_length(
     contig_max_idx: int,
 ) -> Generator[tuple[L, POS_TYPE, NDArray[V_IDX_TYPE]]]:
     # * This implementation computes haplotype lengths as shorter than they actually are if a spanning deletion is present
-    # * This this will result in including more variants than needed, which is fine since we're extending var_idx by more than we
+    # * This will result in including more variants than needed, which is fine since we're extending var_idx by more than we
     # * need to anyway.
     #! Assume len(v_chunks) > 0 and all len(var_idx) > 0 is guaranteed by caller
     length = q_end - q_start
@@ -1057,7 +1059,7 @@ def _gen_with_length(
 
         ls_ext: list[L] = []
         while (hap_lens < length).any():
-            ext_s_idx = min(var_idx[-1] + 1, contig_max_idx)
+            ext_s_idx = min(last_idx + 1, contig_max_idx)
             # end idx is 0-based inclusive
             ext_e_idx = min(ext_s_idx + _idx_extension - 1, contig_max_idx)
             _idx_extension *= 2

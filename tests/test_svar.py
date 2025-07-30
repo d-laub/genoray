@@ -25,9 +25,9 @@ def get_missing_contig_desired(
     svar: SparseVar, n_ranges: int, n_samples: int
 ) -> SparseGenotypes:
     # (r s p 2)
-    offsets = np.full((n_ranges, n_samples, svar.ploidy, 2), -1, OFFSET_TYPE)
+    offsets = np.full((2, n_ranges, n_samples, svar.ploidy), -1, OFFSET_TYPE)
     return SparseGenotypes.from_offsets(
-        svar.genos.data, (n_ranges, n_samples, svar.ploidy), offsets.reshape(-1, 2)
+        svar.genos.data, (n_ranges, n_samples, svar.ploidy), offsets.reshape(2, -1)
     )
 
 
@@ -55,7 +55,7 @@ def test_contents(svar: SparseVar):
     desired_ccfs = SparseDosages.from_lengths(DOSAGES, lengths)
 
     if svar.path.suffixes[0] == ".vcf":
-        assert svar.contigs == ["chr1", "chr2"]
+        assert svar.contigs == ["chr1", "chr2", "chr3"]
     elif svar.path.suffixes[0] == ".pgen":
         assert svar.contigs == ["1", "2"]
 
@@ -74,7 +74,7 @@ def case_all():
     # (r 2)
     var_ranges = np.array([[0, 3]], V_IDX_TYPE)
     # (s p)
-    shape = (1, 2, 2, None)
+    shape = (1, N_SAMPLES, PLOIDY, None)
     offsets = np.array([[0, 2, 4, 6], [1, 3, 5, 8]], dtype=OFFSET_TYPE)
     desired = SparseGenotypes.from_offsets(DATA, shape, offsets)
     return cse, var_ranges, desired
@@ -174,7 +174,7 @@ def length_no_ext():
 
 def length_ext():
     cse = "chr1", 81262, 81263
-    shape = (1, 2, 2, None)
+    shape = (1, N_SAMPLES, PLOIDY, None)
     # (s p)
     offsets = np.array([[0, 2, 4, 6], [1, 3, 5, 8]], OFFSET_TYPE)
     desired = SparseGenotypes.from_offsets(DATA, shape, offsets)

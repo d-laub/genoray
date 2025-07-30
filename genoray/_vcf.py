@@ -20,7 +20,7 @@ from tqdm.auto import tqdm
 from typing_extensions import Self, TypeGuard, assert_never
 
 from ._utils import ContigNormalizer, format_memory, hap_ilens, parse_memory
-from .exprs import ILEN, IndexSchema
+from .exprs import ILEN
 
 POS_TYPE = np.int64
 """Dtype for VCF range indices. This determines the maximum size of a contig in genoray.
@@ -894,8 +894,8 @@ class VCF:
     def get_record_info(
         self,
         contig: str | None = None,
-        start: int | np.integer = 0,
-        end: int | np.integer = INT64_MAX,
+        start: int | np.integer | None = None,
+        end: int | np.integer | None = None,
         attrs: list[str] | None = None,
         info: list[str] | None = None,
         progress: bool = False,
@@ -922,6 +922,14 @@ class VCF:
         """
         if attrs is None and info is None:
             raise ValueError("Must provide either attrs or info.")
+
+        if (start is not None or end is not None) and contig is None:
+            raise ValueError("start and end must be None if no contig is specified.")
+
+        if start is None:
+            start = 0
+        if end is None:
+            end = INT64_MAX
 
         if attrs is None:
             attrs = []
@@ -962,10 +970,6 @@ class VCF:
                             n_variants = sum(
                                 self.n_vars_in_ranges(c)[0] for c in self.contigs
                             )
-                    elif contig is None:
-                        n_variants = sum(
-                            self.n_vars_in_ranges(c)[0] for c in self.contigs
-                        )
                     else:
                         n_variants = self.n_vars_in_ranges(
                             c,  # type: ignore | guaranteed bound by checking contig is None above
@@ -1004,17 +1008,17 @@ class VCF:
         progress: bool = True,
     ) -> None:
         """Writes record information to disk, ignoring any filtering. At a minimum this index will
-        include columns `CHROM`, `POS` (1-based), `REF`, and `ALT`.
+        include columns `CHROM`, `POS` (1-based), `REF`, `ALT`, and `ILEN`.
 
         Parameters
         ----------
         attrs
             List of cyvcf2.Variant attributes to include. At a minimum this index will include
-            columns `CHROM`, `POS` (1-based), `REF`, and `ALT`.
+            columns `CHROM`, `POS` (1-based), `REF`, `ALT`, and `ILEN`.
         info
             List of INFO fields to include.
         """
-        min_attrs = list(IndexSchema.keys())
+        min_attrs = ["CHROM", "POS", "REF", "ALT"]
 
         if attrs is None:
             attrs = min_attrs
@@ -1068,7 +1072,7 @@ class VCF:
             )
             _vcf = self._open()
             filt = [self._filter(v) for v in tqdm(_vcf, total=_vcf.num_records)]
-            index = index.filter(pl.lit(filt))
+            index = index.filter(pl.Series(filt))
         elif filter is not None:
             index = index.filter(filter)
 

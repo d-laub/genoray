@@ -1,3 +1,59 @@
+## 0.14.6 (2025-07-19)
+
+### Fix
+
+- handle contigs/chunks with no variants
+
+## 0.14.5 (2025-07-19)
+
+### Fix
+
+- svar no_var offsets
+- min_attrs for VCF._write_gvi_index
+
+## 0.14.4 (2025-07-09)
+
+### Fix
+
+- **perf**: move svartools to standalone script
+
+## 0.14.3 (2025-07-09)
+
+### Fix
+
+- move svartools to be inside package dir
+- use pl.Series instead of pl.lit to define VCF filter column
+
+## 0.14.2 (2025-06-26)
+
+### Fix
+
+- use last_idx in pgen chunk_with_length loop
+
+## 0.14.1 (2025-06-11)
+
+### Fix
+
+- contig normalizer
+
+## 0.14.0 (2025-06-11)
+
+### Feat
+
+- contig normalizer can map unnormalized contigs to indices.
+
+## 0.13.1 (2025-06-11)
+
+### Fix
+
+- raise error in VCF.get_record_info if contig is unspecified but start or end is.
+
+## 0.13.0 (2025-06-10)
+
+### Fix
+
+- adjust for breaking changes in seqpro Ragged API
+
 ## 0.12.2 (2025-06-05)
 
 ### Fix

@@ -277,7 +277,7 @@ class SparseVar:
         ends = np.atleast_1d(np.asarray(ends, POS_TYPE))
         # (r 2)
         var_ranges = self.var_ranges(contig, starts, ends)
-        # (r s p 2)
+        # (2 r s p)
         starts_ends = _find_starts_ends(
             self.genos.data, self.genos.offsets, var_ranges, s_idxs, self.ploidy
         )
@@ -336,7 +336,7 @@ class SparseVar:
         # (r 2)
         var_ranges = self.var_ranges(contig, starts, ends)
 
-        # (r s p 2)
+        # (2 r s p)
         out = _find_starts_ends_with_length(
             self.genos.data,
             self.genos.offsets,
@@ -388,7 +388,7 @@ class SparseVar:
         starts = np.atleast_1d(np.asarray(starts, POS_TYPE))
         n_ranges = len(starts)
 
-        # (r s p 2)
+        # (2 r s p)
         starts_ends = self._find_starts_ends(contig, starts, ends, samples)
         return SparseGenotypes.from_offsets(
             self.genos.data,
@@ -509,6 +509,8 @@ class SparseVar:
                             c, max_mem=max_mem, mode=VCF.Genos8Dosages
                         ):
                             n_vars = genos.shape[-1]
+                            if n_vars == 0:
+                                continue
                             var_idxs = np.arange(
                                 offset, offset + n_vars, dtype=np.int32
                             )
@@ -522,6 +524,8 @@ class SparseVar:
                     else:
                         for genos in vcf.chunk(c, max_mem=max_mem, mode=VCF.Genos8):
                             n_vars = genos.shape[-1]
+                            if n_vars == 0:
+                                continue
                             var_idxs = np.arange(
                                 offset, offset + n_vars, dtype=np.int32
                             )
@@ -665,6 +669,8 @@ def _process_contig(
         # genos: (s p v)
         for genos in range_:
             n_vars = genos.shape[-1]
+            if n_vars == 0:
+                continue
             var_idxs = np.arange(offset, offset + n_vars, dtype=np.int32)
             sp_genos = dense2sparse(genos.astype(np.int8), var_idxs)
             _write_genos(tdir / str(chunk_idx), sp_genos)
@@ -690,6 +696,8 @@ def _process_contig_dosages(
         # genos, dosages: (s p v)
         for genos, dosages in range_:
             n_vars = genos.shape[-1]
+            if n_vars == 0:
+                continue
             var_idxs = np.arange(offset, offset + n_vars, dtype=np.int32)
 
             sp_genos, sp_dosages = dense2sparse(
@@ -909,7 +917,7 @@ def _find_starts_ends_with_length(
 
     Returns
     -------
-        Shape: (ranges samples ploidy 2). The first column is the start index of the variant
+        Shape: (2 ranges samples ploidy). The first column is the start index of the variant
         and the second column is the end index of the variant.
     """
     n_ranges = len(q_starts)
