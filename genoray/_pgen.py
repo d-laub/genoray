@@ -15,7 +15,7 @@ from loguru import logger
 from more_itertools import mark_ends, windowed
 from numpy.typing import ArrayLike, NDArray
 from phantom import Phantom
-from seqpro._ragged import OFFSET_TYPE, lengths_to_offsets
+from seqpro.rag import OFFSET_TYPE, lengths_to_offsets
 from typing_extensions import Self, TypeGuard, assert_never
 from zstandard import ZstdDecompressor
 

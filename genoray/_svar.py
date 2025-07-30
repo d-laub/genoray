@@ -4,7 +4,7 @@ import json
 import shutil
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, Generator, Literal, TypeVar, cast
+from typing import Any, Generator, Literal, TypeVar, cast, overload
 
 import numba as nb
 import numpy as np
@@ -29,101 +29,62 @@ INT64_MAX = np.iinfo(POS_TYPE).max
 DTYPE = TypeVar("DTYPE", bound=np.generic)
 
 
-class SparseGenotypes(Ragged[V_IDX_TYPE]):
-    """A Ragged array of variant indices with additional guarantees and methods:
-
-    - dtype is :code:`int32`
-    - Ragged shape of **at least** 3 dimensions where the final two correspond to (samples, ploidy, ~variants)
-    - :code:`from_dense` to convert dense genotypes to sparse genotypes
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        assert self.ndim >= 3, "SparseGenotypes must have at least 3 dimensions"
-        assert self.dtype.type == V_IDX_TYPE, "SparseGenotypes must be of type int32"
-
-    @property
-    def n_samples(self) -> int:
-        """Number of samples"""
-        return self.shape[-3]
-
-    @property
-    def ploidy(self) -> int:
-        """Ploidy"""
-        return self.shape[-2]
-
-    @classmethod
-    def from_dense(cls, genos: NDArray[np.int8], var_idxs: NDArray[V_IDX_TYPE]):
-        """Convert dense genotypes to sparse genotypes.
-
-        Parameters
-        ----------
-        genos
-            Shape = (samples ploidy variants) Genotypes.
-        var_idxs
-            Shape = (variants) Variant indices.
-        """
-        # (s p v)
-        keep = genos == 1
-        data = var_idxs[keep.nonzero()[-1]]
-        lengths = keep.sum(-1)
-        return cls.from_lengths(data, lengths)
+SparseGenotypes = Ragged[V_IDX_TYPE]
+SparseDosages = Ragged[DOSAGE_TYPE]
 
 
-class SparseDosages(Ragged[DOSAGE_TYPE]):
-    """A Ragged array of dosages with additional guarantees and methods:
+@overload
+def dense2sparse(
+    genos: NDArray[np.int8],
+    var_idxs: NDArray[V_IDX_TYPE],
+    dosages: None = ...,
+) -> SparseGenotypes: ...
+@overload
+def dense2sparse(
+    genos: NDArray[np.int8],
+    var_idxs: NDArray[V_IDX_TYPE],
+    dosages: NDArray[DOSAGE_TYPE] = ...,
+) -> tuple[SparseGenotypes, SparseDosages]: ...
+def dense2sparse(
+    genos: NDArray[np.int8],
+    var_idxs: NDArray[V_IDX_TYPE],
+    dosages: NDArray[DOSAGE_TYPE] | None = None,
+) -> SparseGenotypes | tuple[SparseGenotypes, SparseDosages]:
+    """Convert dense genotypes (and dosages) to sparse genotypes."""
+    # (s p v)
+    if genos.ndim < 3:
+        raise ValueError(
+            "Sparse genotypes must have at least 3 dimensions, with the final three dimensions corresponding"
+            " to (samples, ploidy, variants)"
+        )
+    if dosages is not None:
+        if dosages.ndim < 2:
+            raise ValueError(
+                "Sparse dosages must have at least 2 dimensions, with the final two dimensions corresponding"
+                " to (samples, variants)"
+            )
+        if dosages.shape[-1] != genos.shape[-1]:
+            raise ValueError(
+                "Sparse dosages must have the same number of variants as the genotypes"
+            )
+        if dosages.shape[-2] != genos.shape[-3]:
+            raise ValueError(
+                "Sparse dosages must have the same number of samples as the genotypes"
+            )
 
-    - dtype is :code:`float32`
-    - Ragged shape of **at least** 2 dimensions that should correspond to (samples, ploidy)
-    - :code:`from_dense` to convert dense dosages to sparse dosages
-    """
+    keep = genos == 1
+    data = var_idxs[keep.nonzero()[-1]]
+    lengths = keep.sum(-1)
+    shape = (*lengths.shape, None)
+    offsets = lengths_to_offsets(lengths)
+    rag = SparseGenotypes.from_offsets(data, shape, offsets)
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        assert self.ndim >= 3, "SparseDosages must have at least 3 dimensions"
-        assert self.dtype.type == DOSAGE_TYPE, "SparseDosages must be of type float32"
-
-    @property
-    def n_samples(self) -> int:
-        """Number of samples"""
-        return self.shape[-2]
-
-    @property
-    def ploidy(self) -> int:
-        """Ploidy"""
-        return self.shape[-1]
-
-    @classmethod
-    def from_dense(
-        cls,
-        genos: NDArray[np.int8],
-        var_idxs: NDArray[V_IDX_TYPE],
-        dosages: NDArray[DOSAGE_TYPE],
-    ) -> tuple[SparseGenotypes, SparseDosages]:
-        """Convert dense dosages to sparse dosages.
-
-        Parameters
-        ----------
-        genos
-            Shape = (samples ploidy variants) Genotypes.
-        var_idxs
-            Shape = (variants) Variant indices.
-        dosages
-            Shape = (samples variants) Cancer cell fractions (or proxy thereof).
-        """
-        # (s p v)
-        keep: NDArray[np.bool_] = genos == 1
-        geno_data = var_idxs[keep.nonzero()[-1]]
-        lengths = keep.sum(-1)
-        shape = (*lengths.shape, None)
-        offsets = lengths_to_offsets(lengths)
-        sp_genos = SparseGenotypes.from_offsets(geno_data, offsets, shape)
-
+    if dosages is not None:
         # (s v) -> (s p v)
         dosage_data = np.broadcast_to(dosages[:, None], genos.shape)[keep]
-        sp_dosages = SparseDosages.from_offsets(dosage_data, offsets, shape)
-
-        return sp_genos, sp_dosages
+        dosages = SparseDosages.from_offsets(dosage_data, shape, offsets)
+        return rag, dosages
+    return rag
 
 
 class SparseVar:
@@ -186,7 +147,7 @@ class SparseVar:
         if (path / "dosages.npy").exists():
             dosage_data = np.memmap(path / "dosages.npy", dtype=DOSAGE_TYPE, mode="r")
             self.dosages = SparseDosages.from_offsets(
-                dosage_data, self.genos.offsets, self.genos.shape
+                dosage_data, self.genos.shape, self.genos.offsets
             )
         else:
             self.dosages = None
@@ -431,8 +392,8 @@ class SparseVar:
         starts_ends = self._find_starts_ends(contig, starts, ends, samples)
         return SparseGenotypes.from_offsets(
             self.genos.data,
-            (n_ranges, n_samples, self.ploidy),
-            starts_ends.reshape(-1, 2),
+            (n_ranges, n_samples, self.ploidy, None),
+            starts_ends.reshape(2, -1),
         )
 
     def read_ranges_with_length(
@@ -473,12 +434,12 @@ class SparseVar:
         starts = np.atleast_1d(np.asarray(starts, POS_TYPE))
         n_ranges = len(starts)
 
-        # (r s p 2)
+        # (2 r s p)
         starts_ends = self._find_starts_ends_with_length(contig, starts, ends, samples)
         return SparseGenotypes.from_offsets(
             self.genos.data,
-            (n_ranges, n_samples, self.ploidy),
-            starts_ends.reshape(-1, 2),
+            (n_ranges, n_samples, self.ploidy, None),
+            starts_ends.reshape(2, -1),
         )
 
     @classmethod
@@ -551,7 +512,7 @@ class SparseVar:
                             var_idxs = np.arange(
                                 offset, offset + n_vars, dtype=np.int32
                             )
-                            sp_genos, sp_dosages = SparseDosages.from_dense(
+                            sp_genos, sp_dosages = dense2sparse(
                                 genos, var_idxs, dosages
                             )
                             _write_genos(tdir / str(chunk_idx), sp_genos)
@@ -564,7 +525,7 @@ class SparseVar:
                             var_idxs = np.arange(
                                 offset, offset + n_vars, dtype=np.int32
                             )
-                            sp_genos = SparseGenotypes.from_dense(genos, var_idxs)
+                            sp_genos = dense2sparse(genos, var_idxs)
                             _write_genos(tdir / str(chunk_idx), sp_genos)
                             offset += n_vars
                             chunk_idx += 1
@@ -705,7 +666,7 @@ def _process_contig(
         for genos in range_:
             n_vars = genos.shape[-1]
             var_idxs = np.arange(offset, offset + n_vars, dtype=np.int32)
-            sp_genos = SparseGenotypes.from_dense(genos.astype(np.int8), var_idxs)
+            sp_genos = dense2sparse(genos.astype(np.int8), var_idxs)
             _write_genos(tdir / str(chunk_idx), sp_genos)
             offset += n_vars
             chunk_idx += 1
@@ -731,7 +692,7 @@ def _process_contig_dosages(
             n_vars = genos.shape[-1]
             var_idxs = np.arange(offset, offset + n_vars, dtype=np.int32)
 
-            sp_genos, sp_dosages = SparseDosages.from_dense(
+            sp_genos, sp_dosages = dense2sparse(
                 genos.astype(np.int8), var_idxs, dosages
             )
             _write_genos(tdir / str(chunk_idx), sp_genos)
@@ -748,7 +709,7 @@ def _open_genos(path: Path, shape: tuple[int | None, ...], mode: Literal["r", "r
     var_idxs = np.memmap(path / "variant_idxs.npy", dtype=V_IDX_TYPE, mode=mode)
     offsets = np.memmap(path / "offsets.npy", dtype=np.int64, mode=mode)
 
-    sp_genos = SparseGenotypes.from_offsets(var_idxs, offsets, shape)
+    sp_genos = SparseGenotypes.from_offsets(var_idxs, shape, offsets)
     return sp_genos
 
 
@@ -757,7 +718,7 @@ def _open_dosages(path: Path, shape: tuple[int | None, ...], mode: Literal["r", 
     dosages = np.memmap(path / "dosages.npy", dtype=DOSAGE_TYPE, mode=mode)
     offsets = np.memmap(path / "offsets.npy", dtype=np.int64, mode=mode)
 
-    sp_genos = SparseDosages.from_offsets(dosages, offsets, shape)
+    sp_genos = SparseDosages.from_offsets(dosages, shape, offsets)
     return sp_genos
 
 
@@ -904,21 +865,19 @@ def _find_starts_ends(
     """
     n_ranges = len(var_ranges)
     n_samples = len(sample_idxs)
-    out_offsets = np.empty((n_ranges, n_samples, ploidy, 2), dtype=OFFSET_TYPE)
+    out_offsets = np.empty((2, n_ranges, n_samples, ploidy), dtype=OFFSET_TYPE)
 
-    for r in nb.prange(n_ranges):
-        for s in nb.prange(n_samples):
-            for p in nb.prange(ploidy):
-                if var_ranges[r, 0] == var_ranges[r, 1]:
-                    out_offsets[r, s, p] = np.iinfo(OFFSET_TYPE).max
-                    continue
+    for s in nb.prange(n_samples):
+        for p in nb.prange(ploidy):
+            s_idx = sample_idxs[s]
+            sp = s_idx * ploidy + p
+            o_s, o_e = geno_offsets[sp], geno_offsets[sp + 1]
+            sp_genos = genos[o_s:o_e]
+            # add o_s to make indices relative to whole array
+            out_offsets[..., s, p] = np.searchsorted(sp_genos, var_ranges).T + o_s
 
-                s_idx = sample_idxs[s]
-                sp = s_idx * ploidy + p
-                o_s, o_e = geno_offsets[sp], geno_offsets[sp + 1]
-                sp_genos = genos[o_s:o_e]
-                # add o_s to make indices relative to whole array
-                out_offsets[r, s, p] = np.searchsorted(sp_genos, var_ranges[r]) + o_s
+    no_vars = var_ranges[:, 0] == var_ranges[:, 1]
+    out_offsets[:, no_vars] = np.iinfo(OFFSET_TYPE).max
 
     return out_offsets
 
@@ -956,13 +915,13 @@ def _find_starts_ends_with_length(
     n_ranges = len(q_starts)
     n_samples = len(sample_idxs)
     if out is None:
-        out = np.empty((n_ranges, n_samples, ploidy, 2), dtype=OFFSET_TYPE)
+        out = np.empty((2, n_ranges, n_samples, ploidy), dtype=OFFSET_TYPE)
 
     for r in nb.prange(n_ranges):
         for s in nb.prange(n_samples):
             for p in nb.prange(ploidy):
                 if var_ranges[r, 0] == var_ranges[r, 1]:
-                    out[r, s, p] = np.iinfo(OFFSET_TYPE).max
+                    out[:, r, s, p] = np.iinfo(OFFSET_TYPE).max
                     continue
 
                 s_idx = sample_idxs[s]
@@ -974,10 +933,10 @@ def _find_starts_ends_with_length(
                 )
 
                 # add o_s to make indices relative to whole array
-                out[r, s, p, 0] = start_idx + o_s
+                out[0, r, s, p] = start_idx + o_s
                 if start_idx == max_idx:
                     # no variants in this range
-                    out[r, s, p, 1] = start_idx + o_s
+                    out[1, r, s, p] = start_idx + o_s
                     continue
 
                 q_start: POS_TYPE = q_starts[r]
@@ -1022,6 +981,6 @@ def _find_starts_ends_with_length(
                     last_v_end = max(last_v_end, v_end)
 
                 # add o_s to make indices relative to whole array
-                out[r, s, p, 1] = geno_idx + o_s + 1
+                out[1, r, s, p] = geno_idx + o_s + 1
 
     return out

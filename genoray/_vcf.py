@@ -15,7 +15,7 @@ from more_itertools import mark_ends
 from natsort import natsorted
 from numpy.typing import ArrayLike, NDArray
 from phantom import Phantom
-from seqpro._ragged import OFFSET_TYPE, lengths_to_offsets
+from seqpro.rag import OFFSET_TYPE, lengths_to_offsets
 from tqdm.auto import tqdm
 from typing_extensions import Self, TypeGuard, assert_never
 

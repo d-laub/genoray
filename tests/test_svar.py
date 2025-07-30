@@ -6,7 +6,7 @@ import numpy as np
 from numpy.typing import NDArray
 from pytest import fixture
 from pytest_cases import parametrize_with_cases
-from seqpro._ragged import LENGTH_TYPE, OFFSET_TYPE, lengths_to_offsets
+from seqpro.rag import OFFSET_TYPE, lengths_to_offsets
 
 from genoray import SparseVar
 from genoray._svar import DOSAGE_TYPE, V_IDX_TYPE, SparseDosages, SparseGenotypes
@@ -17,7 +17,7 @@ N_SAMPLES = 2
 PLOIDY = 2
 DATA = np.array([2, 5, 0, 4, 0, 3, 0, 1, 3, 4], V_IDX_TYPE)
 DOSAGES = np.array([0.9, 0.9, 1, 1, 2, 2, 2, 1, 2, 1], DOSAGE_TYPE)
-LENGTHS = np.array([[2, 2], [2, 4]], LENGTH_TYPE)
+LENGTHS = np.array([[2, 2], [2, 4]])
 OFFSETS = lengths_to_offsets(LENGTHS)
 
 
@@ -74,8 +74,8 @@ def case_all():
     # (r 2)
     var_ranges = np.array([[0, 3]], V_IDX_TYPE)
     # (s p)
-    shape = (1, 2, 2)
-    offsets = np.array([[0, 1], [2, 3], [4, 5], [6, 8]], dtype=OFFSET_TYPE)
+    shape = (1, 2, 2, None)
+    offsets = np.array([[0, 2, 4, 6], [1, 3, 5, 8]], dtype=OFFSET_TYPE)
     desired = SparseGenotypes.from_offsets(DATA, shape, offsets)
     return cse, var_ranges, desired
 
@@ -84,9 +84,9 @@ def case_spanning_del():
     cse = "chr1", 81262, 81263
     # (r 2)
     var_ranges = np.array([[0, 1]], V_IDX_TYPE)
-    shape = (1, N_SAMPLES, PLOIDY)
+    shape = (1, N_SAMPLES, PLOIDY, None)
     # (s p)
-    offsets = np.array([[0, 0], [2, 3], [4, 5], [6, 7]])
+    offsets = np.array([[0, 2, 4, 6], [0, 3, 5, 7]], dtype=OFFSET_TYPE)
     desired = SparseGenotypes.from_offsets(DATA, shape, offsets)
     return cse, var_ranges, desired
 
@@ -95,10 +95,10 @@ def case_missing_contig():
     cse = "🥸", 81261, 81263
     # (r 2)
     var_ranges = np.full((1, 2), np.iinfo(V_IDX_TYPE).max, V_IDX_TYPE)
-    shape = (1, N_SAMPLES, PLOIDY)
+    shape = (1, N_SAMPLES, PLOIDY, None)
     # (r s p 2)
-    offsets = np.full((1, N_SAMPLES, PLOIDY, 2), -1, OFFSET_TYPE)
-    desired = SparseGenotypes.from_offsets(DATA, shape, offsets.reshape(-1, 2))
+    offsets = np.full((2, N_SAMPLES, PLOIDY, 1), -1, OFFSET_TYPE)
+    desired = SparseGenotypes.from_offsets(DATA, shape, offsets.reshape(2, -1))
     return cse, var_ranges, desired
 
 
@@ -106,10 +106,10 @@ def case_no_vars():
     cse = "chr1", int(1e8), int(2e8)
     # (r 2)
     var_ranges = np.full((1, 2), np.iinfo(V_IDX_TYPE).max, V_IDX_TYPE)
-    shape = (1, N_SAMPLES, PLOIDY)
-    # (r s p 2)
-    offsets = np.full((1, N_SAMPLES, PLOIDY, 2), np.iinfo(OFFSET_TYPE).max, OFFSET_TYPE)
-    desired = SparseGenotypes.from_offsets(DATA, shape, offsets.reshape(-1, 2))
+    shape = (1, N_SAMPLES, PLOIDY, None)
+    # (2 r s p)
+    offsets = np.full((2, N_SAMPLES, PLOIDY, 1), np.iinfo(OFFSET_TYPE).max, OFFSET_TYPE)
+    desired = SparseGenotypes.from_offsets(DATA, shape, offsets.reshape(2, -1))
     return cse, var_ranges, desired
 
 
@@ -157,7 +157,7 @@ def test_read_ranges_sample_subset(
         desired = get_missing_contig_desired(svar, 1, svar.n_samples)
 
     # desired: (1 s p ~v)
-    desired = SparseGenotypes.from_awkward(desired.to_awkward()[:, [s_idx]])  # type: ignore
+    desired = desired[:, [s_idx]]
     assert actual.shape == desired.shape
     np.testing.assert_equal(actual.data, desired.data)
     np.testing.assert_equal(actual.offsets, desired.offsets)
@@ -165,18 +165,18 @@ def test_read_ranges_sample_subset(
 
 def length_no_ext():
     cse = "chr1", 81264, 81265
-    shape = (1, 2, 2)
+    shape = (1, 2, 2, None)
     # (s p)
-    offsets = np.array([[0, 1], [3, 3], [5, 5], [8, 8]])
+    offsets = np.array([[0, 3, 5, 8], [1, 3, 5, 8]], OFFSET_TYPE)
     desired = SparseGenotypes.from_offsets(DATA, shape, offsets)
     return cse, desired
 
 
 def length_ext():
     cse = "chr1", 81262, 81263
-    shape = (1, 2, 2)
+    shape = (1, 2, 2, None)
     # (s p)
-    offsets = np.array([[0, 1], [2, 3], [4, 5], [6, 8]])
+    offsets = np.array([[0, 2, 4, 6], [1, 3, 5, 8]], OFFSET_TYPE)
     desired = SparseGenotypes.from_offsets(DATA, shape, offsets)
     return cse, desired
 
