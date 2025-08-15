@@ -176,7 +176,7 @@ def length_ext():
     cse = "chr1", 81262, 81263
     shape = (1, N_SAMPLES, PLOIDY, None)
     # (s p)
-    offsets = np.array([[0, 2, 4, 6], [1, 3, 5, 8]], OFFSET_TYPE)
+    offsets = np.array([[0, 2, 4, 6], [0, 3, 5, 8]], OFFSET_TYPE)
     desired = SparseGenotypes.from_offsets(DATA, shape, offsets)
     return cse, desired
 

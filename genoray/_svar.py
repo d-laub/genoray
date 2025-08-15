@@ -963,9 +963,13 @@ def _find_starts_ends_with_length(
 
                     # only variants within query can add to write length
                     if v_start >= q_start:
+                        written_len += v_start - last_v_end
+                        if written_len >= q_len:
+                            geno_idx -= 1
+                            break
+
                         v_write_len = (
-                            (v_start - last_v_end)  # dist between last var and this var
-                            + max(0, ilen)  # insertion length
+                            max(0, ilen)  # insertion length
                             + maybe_add_one  # maybe add atomized length
                         )
 
