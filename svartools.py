@@ -2,6 +2,7 @@
 
 from importlib.metadata import version
 from pathlib import Path
+from typing import Optional, Union
 
 from cyclopts import App
 
@@ -15,7 +16,11 @@ app = App(
 
 @app.command
 def write(
-    source: Path, out: Path, max_mem: str = "1g", overwrite: bool = False
+    source: Path,
+    out: Path,
+    max_mem: str = "1g",
+    overwrite: bool = False,
+    dosages: Optional[Union[bool, Path]] = None,
 ) -> None:
     """
     Convert a VCF or PGEN file to a SVAR file.
@@ -30,6 +35,9 @@ def write(
         Maximum memory to use for conversion e.g. 1g, 250 MB, etc.
     overwrite : bool, optional
         Whether to overwrite the output file if it exists.
+    dosages : bool | Path | None, optional
+        Whether to write dosages. If :code:`source` is a PGEN, this must be a path to a PGEN of dosages.
+        If :code:`source` is a VCF, this should be a boolean.
     """
     from genoray import PGEN, VCF, SparseVar
     from genoray._utils import variant_file_type
@@ -37,10 +45,20 @@ def write(
     file_type = variant_file_type(source)
     if file_type == "vcf":
         vcf = VCF(source)
-        SparseVar.from_vcf(out, vcf, max_mem, overwrite)
+        SparseVar.from_vcf(out, vcf, max_mem, overwrite, with_dosages=dosages)
     elif file_type == "pgen":
-        pgen = PGEN(source)
-        SparseVar.from_pgen(out, pgen, max_mem, overwrite)
+        if dosages is False:
+            dosages = None
+            with_dosages = False
+        elif dosages is True:
+            raise ValueError(
+                "Dosages must be provided as a path to a PGEN if source is a PGEN."
+            )
+        else:
+            with_dosages = True
+
+        pgen = PGEN(source, dosage_path=dosages)
+        SparseVar.from_pgen(out, pgen, max_mem, overwrite, with_dosages=with_dosages)
     else:
         raise ValueError(f"Unsupported file type: {source}")
 
