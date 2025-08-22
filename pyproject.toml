@@ -23,7 +23,7 @@ dependencies = [
     "attrs",
     "awkward",
     "numba",
-    "seqpro>=0.7.0",
+    "seqpro>=0.7.1",
     "cyclopts",
     "zstandard",
 ]
