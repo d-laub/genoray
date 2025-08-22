@@ -389,7 +389,7 @@ class VCF:
         -------
             Shape: :code:`(ranges)`. Number of variants in the given ranges.
         """
-        starts = np.atleast_1d(np.asarray(starts, POS_TYPE))
+        starts = np.atleast_1d(np.asarray(starts, POS_TYPE)).clip(min=0)
         ends = np.atleast_1d(np.asarray(ends, POS_TYPE))
 
         c = self._c_norm.norm(contig)
@@ -432,7 +432,7 @@ class VCF:
         n_variants
             Shape: :code:`(ranges)`. Number of variants in the given ranges.
         """
-        starts = np.atleast_1d(np.asarray(starts, POS_TYPE))
+        starts = np.atleast_1d(np.asarray(starts, POS_TYPE)).clip(min=0)
         n_ranges = len(starts)
 
         c = self._c_norm.norm(contig)
