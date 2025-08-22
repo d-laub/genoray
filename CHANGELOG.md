@@ -1,3 +1,17 @@
+## 0.15.0 (2025-08-22)
+
+### Feat
+
+- option to write dosages in svartools
+- use awkward subclass version of Ragged arrays
+
+### Fix
+
+- **vcf**: clip starts to >= 0 for any pyrange ops. bump seqpro dep
+- pyranges can return wrong result with regions containing negative coordinates
+- variant file types with preceding dots. perf: SVAR queries
+- svar read_ranges_with_length will no longer include an extra variant on the right when less than the distance between that variant and the penultimate variant is sufficient to span the requested range
+
 ## 0.14.6 (2025-07-19)
 
 ### Fix
