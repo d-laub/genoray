@@ -244,6 +244,9 @@ class VCF:
         progress: bool = False,
     ):
         self.path = Path(path)
+        if not self.path.exists():
+            raise FileNotFoundError(f"VCF file {self.path} does not exist.")
+
         self._filter = filter
         self.phasing = phasing
         self.dosage_field = dosage_field
@@ -257,6 +260,9 @@ class VCF:
         self._c_norm = ContigNormalizer(vcf.seqnames)
 
         self.set_samples(None)
+
+        if self._valid_index() and self._filter is None:
+            self._load_index()
 
     def _open(self) -> cyvcf2.VCF:
         return cyvcf2.VCF(self.path, samples=self._samples, lazy=True)
@@ -1006,6 +1012,7 @@ class VCF:
         attrs: list[str] | None = None,
         info: list[str] | None = None,
         progress: bool = True,
+        overwrite: bool = True,
     ) -> None:
         """Writes record information to disk, ignoring any filtering. At a minimum this index will
         include columns `CHROM`, `POS` (1-based), `REF`, `ALT`, and `ILEN`.
@@ -1017,7 +1024,16 @@ class VCF:
             columns `CHROM`, `POS` (1-based), `REF`, `ALT`, and `ILEN`.
         info
             List of INFO fields to include.
+        progress
+            Whether to show a progress bar while reading the VCF file.
+        overwrite
+            Whether to overwrite the index file if it exists.
         """
+        if self._valid_index() and not overwrite:
+            raise FileExistsError(
+                f"A valid index file {self._index_path()} already exists. Use overwrite=True to overwrite."
+            )
+
         min_attrs = ["CHROM", "POS", "REF", "ALT"]
 
         if attrs is None:

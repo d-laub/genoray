@@ -128,6 +128,8 @@ class SparseVar:
     def __init__(self, path: str | Path, attrs: IntoExpr | None = None):
         path = Path(path)
         self.path = path
+        if not self.path.exists():
+            raise FileNotFoundError(f"SVAR directory {self.path} does not exist.")
 
         with open(path / "metadata.json") as f:
             metadata = json.load(f)
@@ -874,6 +876,8 @@ def _find_starts_ends(
     n_ranges = len(var_ranges)
     n_samples = len(sample_idxs)
     out_offsets = np.empty((2, n_ranges, n_samples, ploidy), dtype=OFFSET_TYPE)
+    sorter = np.argsort(var_ranges[:, 0])
+    var_ranges = var_ranges[sorter]
 
     for s in nb.prange(n_samples):
         for p in nb.prange(ploidy):
@@ -886,6 +890,9 @@ def _find_starts_ends(
 
     no_vars = var_ranges[:, 0] == var_ranges[:, 1]
     out_offsets[:, no_vars] = np.iinfo(OFFSET_TYPE).max
+
+    unsorter = sorter[sorter]
+    out_offsets = out_offsets[:, unsorter]
 
     return out_offsets
 
@@ -925,20 +932,26 @@ def _find_starts_ends_with_length(
     if out is None:
         out = np.empty((2, n_ranges, n_samples, ploidy), dtype=OFFSET_TYPE)
 
-    for r in nb.prange(n_ranges):
-        for s in nb.prange(n_samples):
-            for p in nb.prange(ploidy):
+    sorter = np.argsort(var_ranges[:, 0])
+    var_ranges = var_ranges[sorter]
+
+    for s in nb.prange(n_samples):
+        for p in nb.prange(ploidy):
+            s_idx = sample_idxs[s]
+            sp = s_idx * ploidy + p
+            o_s, o_e = geno_offsets[sp], geno_offsets[sp + 1]
+            sp_genos = genos[o_s:o_e]
+            
+            max_idx = np.searchsorted(sp_genos, contig_max_idx + 1)
+            start_idxs = np.searchsorted(sp_genos, var_ranges[:, 0])
+            
+            for r in nb.prange(n_ranges):
+                start_idx = start_idxs[r]  
+                
                 if var_ranges[r, 0] == var_ranges[r, 1]:
                     out[:, r, s, p] = np.iinfo(OFFSET_TYPE).max
                     continue
 
-                s_idx = sample_idxs[s]
-                sp = s_idx * ploidy + p
-                o_s, o_e = geno_offsets[sp], geno_offsets[sp + 1]
-                sp_genos = genos[o_s:o_e]
-                start_idx, max_idx = np.searchsorted(
-                    sp_genos, [var_ranges[r, 0], contig_max_idx + 1]
-                )
 
                 # add o_s to make indices relative to whole array
                 out[0, r, s, p] = start_idx + o_s
@@ -995,4 +1008,7 @@ def _find_starts_ends_with_length(
                 # add o_s to make indices relative to whole array
                 out[1, r, s, p] = geno_idx + o_s + 1
 
+    unsorter = sorter[sorter]
+    out = out[:, unsorter]
+    
     return out

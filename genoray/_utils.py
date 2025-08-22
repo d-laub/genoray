@@ -147,9 +147,9 @@ _PGEN_EXT = re.compile(r"\.(pgen|pvar|psam)$")
 
 def variant_file_type(path: str | Path):
     path = Path(path)
-    if _VCF_EXT.match(path.name) is not None:
+    if _VCF_EXT.search(path.name) is not None:
         return "vcf"
-    elif _PGEN_EXT.match(path.name) is not None or (
+    elif _PGEN_EXT.search(path.name) is not None or (
         path.with_suffix(".pgen").exists()
         and path.with_suffix(".pvar").exists()
         and path.with_suffix(".psam").exists()

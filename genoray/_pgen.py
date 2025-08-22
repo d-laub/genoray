@@ -205,11 +205,14 @@ class PGEN:
         filter: pl.Expr | None = None,
         dosage_path: str | Path | None = None,
     ):
+        self._filter = filter
+
         geno_path = Path(geno_path)
         if geno_path.suffix != ".pgen":
             geno_path = geno_path.with_suffix(".pgen")
         self._geno_path = geno_path
-        self._filter = filter
+        if not self._geno_path.exists():
+            raise FileNotFoundError(f"PGEN file {self._geno_path} does not exist.")
 
         samples = _read_psam(geno_path.with_suffix(".psam"))
         self.available_samples = cast(list[str], samples.tolist())

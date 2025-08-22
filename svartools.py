@@ -15,6 +15,22 @@ app = App(
 
 
 @app.command
+def index(source: Path):
+    """Create a genoray index for a VCF or PGEN file."""
+    from genoray import PGEN, VCF
+    from genoray._utils import variant_file_type
+
+    file_type = variant_file_type(source)
+    if file_type == "vcf":
+        vcf = VCF(source)
+        vcf._write_gvi_index()
+    elif file_type == "pgen":
+        _ = PGEN(source)
+    else:
+        raise ValueError(f"Unsupported file type: {source}")
+
+
+@app.command
 def write(
     source: Path,
     out: Path,

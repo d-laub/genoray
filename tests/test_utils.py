@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from pytest_cases import parametrize_with_cases
 
-from genoray._utils import ContigNormalizer, format_memory, parse_memory
+from genoray._utils import (
+    ContigNormalizer,
+    format_memory,
+    parse_memory,
+    variant_file_type,
+)
 
 
 def contig_match():
@@ -175,3 +180,32 @@ def format_eb():
 @parametrize_with_cases("memory, desired", cases=".", prefix="format_")
 def test_format_memory(memory: int, desired: str):
     assert format_memory(memory) == desired
+
+
+def file_path_vcf():
+    path = "test.vcf.gz"
+    desired = "vcf"
+    return path, desired
+
+
+def file_path_pgen():
+    path = "test.pgen"
+    desired = "pgen"
+    return path, desired
+
+
+def file_path_vcf_preceding_dots():
+    path = "hi.there.vcf.gz"
+    desired = "vcf"
+    return path, desired
+
+
+def file_path_pgen_preceding_dots():
+    path = "hi.there.pgen"
+    desired = "pgen"
+    return path, desired
+
+
+@parametrize_with_cases("path, desired", cases=".", prefix="file_path_")
+def test_variant_file_type(path: str, desired: str):
+    assert variant_file_type(path) == desired
