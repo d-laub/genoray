@@ -484,7 +484,8 @@ class VCF:
                 "Index not loaded. Call `load_index()` before using this method."
             )
 
-        starts = np.atleast_1d(np.asarray(starts, POS_TYPE))
+        #! need to clip or else PyRanges can give wrong results
+        starts = np.atleast_1d(np.asarray(starts, POS_TYPE)).clip(min=0)
         n_ranges = len(starts)
 
         c = self._c_norm.norm(contig)
