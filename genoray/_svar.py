@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import json
 import shutil
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, Generator, Literal, TypeVar, cast, overload
+from typing import Any, Generator, Literal, TypeVar, Union, cast, overload
 
 import numba as nb
 import numpy as np
@@ -15,6 +14,7 @@ from loguru import logger
 from natsort import natsorted
 from numpy.typing import ArrayLike, NDArray
 from polars._typing import IntoExpr
+from pydantic import BaseModel
 from seqpro.rag import OFFSET_TYPE, Ragged, lengths_to_offsets
 from tqdm.auto import tqdm
 
@@ -87,6 +87,16 @@ def dense2sparse(
     return rag
 
 
+CURRENT_VERSION = 1
+
+
+class SparseVarMetadata(BaseModel):
+    version: Union[int, None] = None
+    samples: list[str]
+    ploidy: int
+    contigs: list[str]
+
+
 class SparseVar:
     """Open a Sparse Variant (SVAR) directory.
 
@@ -99,6 +109,7 @@ class SparseVar:
     """
 
     path: Path
+    version: int | None
     available_samples: list[str]
     ploidy: int
     contigs: list[str]
@@ -131,12 +142,13 @@ class SparseVar:
         if not self.path.exists():
             raise FileNotFoundError(f"SVAR directory {self.path} does not exist.")
 
-        with open(path / "metadata.json") as f:
-            metadata = json.load(f)
-        contigs = metadata["contigs"]
+        with open(path / "metadata.json", "rb") as f:
+            metadata = SparseVarMetadata.model_validate_json(f.read())
+        contigs = metadata.contigs
+        self.version = metadata.version
         self.contigs = contigs
-        self.available_samples = metadata["samples"]
-        self.ploidy = metadata["ploidy"]
+        self.available_samples = metadata.samples
+        self.ploidy = metadata.ploidy
         samples = np.array(self.available_samples)
         self._s2i = HashTable(
             len(samples) * 2,  # type: ignore
@@ -482,14 +494,13 @@ class SparseVar:
 
         contigs = vcf.contigs
         with open(out / "metadata.json", "w") as f:
-            json.dump(
-                {
-                    "contigs": contigs,
-                    "samples": vcf.available_samples,
-                    "ploidy": vcf.ploidy,
-                },
-                f,
-            )
+            json = SparseVarMetadata(
+                version=CURRENT_VERSION,
+                contigs=contigs,
+                samples=vcf.available_samples,
+                ploidy=vcf.ploidy,
+            ).model_dump_json()
+            f.write(json)
 
         shutil.copy(vcf._index_path(), cls._index_path(out))
 
@@ -576,14 +587,13 @@ class SparseVar:
 
         contigs = pgen.contigs
         with open(out / "metadata.json", "w") as f:
-            json.dump(
-                {
-                    "contigs": contigs,
-                    "samples": pgen.available_samples,
-                    "ploidy": pgen.ploidy,
-                },
-                f,
-            )
+            json = SparseVarMetadata(
+                version=CURRENT_VERSION,
+                contigs=contigs,
+                samples=pgen.available_samples,
+                ploidy=pgen.ploidy,
+            ).model_dump_json()
+            f.write(json)
 
         shutil.copy(pgen._index_path(), cls._index_path(out))
 
@@ -651,11 +661,57 @@ class SparseVar:
                 "index",
                 Chromosome="CHROM",
                 Start=pl.col("POS") - 1,
-                End=pl.col("POS") + pl.col("REF").str.len_bytes() - 1,
+                # SVAR is exclusively bi-allelic, so use first in list
+                End=pl.col("POS") - pl.col("ILEN").list.first().clip(upper_bound=0),
             ).to_pandas()
         )
         attr_df = index.select(*attrs)
         return granges, attr_df
+
+    def cache_afs(self):
+        """Cache the allele frequencies on disk. Will also load all possible attributes and add the AF column in-memory."""
+        self._load_all_attrs()
+        afs = self._compute_afs()
+        self.attrs = self.attrs.with_columns(AF=pl.Series(afs))
+        self._write_afs()
+
+    def _load_all_attrs(self):
+        idx_df = pl.scan_ipc(self._index_path(self.path))
+        schema = idx_df.collect_schema()
+        missing = set(schema) - set(self.attrs.columns) - {"CHROM", "POS"}
+        missing_attrs = idx_df.select(*missing).collect()
+        self.attrs = self.attrs.hstack(missing_attrs)
+
+    def _compute_afs(self) -> NDArray[np.float32]:
+        n_samples, ploidy, _ = cast(tuple[int, int, None], self.genos.shape)
+        max_count = n_samples * ploidy
+        n_variants = len(self.granges)
+        afs = np.zeros(n_variants, np.float32)
+        _nb_af_helper(afs, self.genos.data, self.genos.offsets, max_count)
+        return afs
+
+    def _write_afs(self):
+        df = self._to_df()
+        df.write_ipc(self._index_path(self.path))
+
+    def _to_df(self) -> pl.DataFrame:
+        chr_pos = pl.DataFrame(
+            {
+                "CHROM": pl.from_pandas(self.granges.Chromosome),
+                "POS": pl.from_pandas(self.granges.Start + 1),
+            }
+        )
+        df = chr_pos.hstack(self.attrs)
+        return df
+
+
+@nb.njit(nogil=True, cache=True)
+def _nb_af_helper(afs, v_idxs, offsets, max_count):
+    for i in range(len(offsets) - 1):
+        o_s, o_e = offsets[i], offsets[i + 1]
+        v_slice = v_idxs[o_s:o_e]
+        afs[v_slice] += 1
+    afs /= max_count
 
 
 def _process_contig(
@@ -941,17 +997,16 @@ def _find_starts_ends_with_length(
             sp = s_idx * ploidy + p
             o_s, o_e = geno_offsets[sp], geno_offsets[sp + 1]
             sp_genos = genos[o_s:o_e]
-            
+
             max_idx = np.searchsorted(sp_genos, contig_max_idx + 1)
             start_idxs = np.searchsorted(sp_genos, var_ranges[:, 0])
-            
+
             for r in nb.prange(n_ranges):
-                start_idx = start_idxs[r]  
-                
+                start_idx = start_idxs[r]
+
                 if var_ranges[r, 0] == var_ranges[r, 1]:
                     out[:, r, s, p] = np.iinfo(OFFSET_TYPE).max
                     continue
-
 
                 # add o_s to make indices relative to whole array
                 out[0, r, s, p] = start_idx + o_s
@@ -1010,5 +1065,5 @@ def _find_starts_ends_with_length(
 
     unsorter = sorter[sorter]
     out = out[:, unsorter]
-    
+
     return out

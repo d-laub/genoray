@@ -19,6 +19,8 @@ DATA = np.array([2, 5, 0, 4, 0, 3, 0, 1, 3, 4], V_IDX_TYPE)
 DOSAGES = np.array([0.9, 0.9, 1, 1, 2, 2, 2, 1, 2, 1], DOSAGE_TYPE)
 LENGTHS = np.array([[2, 2], [2, 4]])
 OFFSETS = lengths_to_offsets(LENGTHS)
+_, counts = np.unique(DATA, return_counts=True)
+afs = counts / (N_SAMPLES * PLOIDY)
 
 
 def get_missing_contig_desired(
@@ -32,18 +34,18 @@ def get_missing_contig_desired(
 
 
 def svar_vcf():
-    svar = SparseVar(ddir / "biallelic.vcf.svar")
+    svar = SparseVar(ddir / "biallelic.vcf.svar", "AF")
     return svar
 
 
 def svar_pgen():
-    svar = SparseVar(ddir / "biallelic.pgen.svar")
+    svar = SparseVar(ddir / "biallelic.pgen.svar", "AF")
     return svar
 
 
 @fixture
 def svar():
-    svar = SparseVar(ddir / "biallelic.vcf.svar")
+    svar = SparseVar(ddir / "biallelic.vcf.svar", "AF")
     return svar
 
 
@@ -190,3 +192,11 @@ def test_read_ranges_with_length(
     assert actual.shape == desired.shape
     np.testing.assert_equal(actual.data, desired.data)
     np.testing.assert_equal(actual.offsets, desired.offsets)
+
+
+def test_compute_afs(svar: SparseVar):
+    actual_afs = svar._compute_afs()
+    np.testing.assert_equal(actual_afs, afs)
+
+def test_cache_afs(svar: SparseVar):
+    np.testing.assert_equal(svar.attrs["AF"], afs)

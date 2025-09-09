@@ -26,7 +26,11 @@ dependencies = [
     "seqpro>=0.7.1",
     "cyclopts",
     "zstandard",
+    "pydantic",
 ]
+
+[project.optional-dependencies]
+cli = ["genoray-cli"]
 
 [tool.commitizen]
 name = "cz_conventional_commits"
@@ -40,9 +44,6 @@ annotated_tag = true
 [build-system]
 build-backend = "hatchling.build"
 requires = ["hatchling"]
-
-[project.scripts]
-svartools = "svartools:app"
 
 [tool.pytest.ini_options]
 filterwarnings = ["ignore::DeprecationWarning:sorted_nearest.*"]
