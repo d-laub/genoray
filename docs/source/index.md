@@ -102,9 +102,6 @@ first_range_genos = genos[..., offsets[0]:offsets[1]]
 
 genos = pgen.chunk_ranges('1', starts=[1, 1000, 2000], ends=[1000, 2000, 3000])
 for range_ in genos:
-    if range_ is None:
-        # no data for this range
-        continue
     for chunk in range_:
         # do something with chunk, each chunk is a NumPy array of shape (samples, ploidy, variants)
         ...
@@ -164,9 +161,9 @@ pgen = PGEN("file.pgen", filter=pl.col("kind").list.eval(pl.element() == "SNP").
 
 - For the time being, ploidy is 2 for all classes in `genoray`, but this could be more flexible for VCFs in the future. The PGEN format does not support ploidy other than 2.
 - Different file formats may use different data types for their respective representations of genotypes, phasing, and dosages.
-- Ranges are 0-based, so starts begin at 0 and ends are exclusive.
-- Missing genotypes and dosages are encoded as -1 and `np.nan`, respectively.
-- Dosages from PGEN files may not exactly match VCF files (up to a fraction of a percent) because PLINK 2.0 must encode dosages with fixed precision which can not match what can be represented by text in a VCF (may also disagree with how BCF encodes dosage).
+- Ranges are 0-based, half-open intervals i.e. `[start, end)`, so starts begin at 0 and ends are exclusive.
+- Missing genotypes and dosages are encoded as `-1` and `np.nan`, respectively.
+- Dosages from PGEN files may not exactly match VCF files (up to a fraction of a percent) because PLINK 2.0 currently encodes dosages with a different precision than VCF/BCF.
 
 # Contributing
 

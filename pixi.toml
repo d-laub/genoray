@@ -42,6 +42,7 @@ numba = "*"
 seqpro = "==0.7.1"
 cyclopts = "*"
 zstandard = "*"
+pydantic = "*"
 # non-pkg dependencies
 seaborn = "*"
 

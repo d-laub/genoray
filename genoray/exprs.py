@@ -5,6 +5,7 @@ given the minimum set of index columns:
 - :code:`"POS"` : :code:`pl.Int64`
 - :code:`"REF"` : :code:`pl.Utf8`
 - :code:`"ALT"` : :code:`pl.List[Utf8]`
+- :code:`"ILEN"` : :code:`pl.List[Int32]`
 
 Applicable for PGEN files and the experimental :meth:`VCF._load_index` method.
 
@@ -23,14 +24,10 @@ IndexSchema = {
 }
 """Minimum schema for a genoray index file (extension :code:`.gvi`)."""
 
-is_snp = (pl.col("REF").str.len_bytes() == 1) & pl.col("ALT").list.eval(
-    pl.element().str.len_bytes() == 1
-).list.all()
+is_snp = pl.col("ILEN").list.eval(pl.element() == 0).list.all()
 """True if all ALT alleles are SNPs (single nucleotide polymorphisms)."""
 
-is_indel = (pl.col("REF").str.len_bytes() > 1) | pl.col("ALT").list.eval(
-    pl.element().str.len_bytes() > 1
-).list.all()
+is_indel = pl.col("ILEN").list.eval(pl.element() != 0).list.all()
 """True if all ALT alleles are indels (insertions or deletions)."""
 
 is_biallelic = pl.col("ALT").list.len() == 1
