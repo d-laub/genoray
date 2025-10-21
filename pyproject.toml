@@ -7,7 +7,7 @@ readme = "README.md"
 license = { file = "LICENSE.txt" }
 requires-python = ">=3.9,<3.13" # blocked by cyvcf2
 dependencies = [
-    "seqpro>=0.7.1",
+    "seqpro>=0.8.0",
     "genoray>=0.15.0",
     "numpy>=1.26",
     "pandas>=2.2.2",
