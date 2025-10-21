@@ -1,3 +1,13 @@
+## 0.16.0 (2025-10-20)
+
+### Feat
+
+- caching AFs as variant attributes.
+
+### Fix
+
+- bump seqpro
+
 ## 0.15.0 (2025-08-22)
 
 ### Feat
