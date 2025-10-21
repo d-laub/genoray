@@ -37,13 +37,13 @@ SparseDosages = Ragged[DOSAGE_TYPE]
 def dense2sparse(
     genos: NDArray[np.int8],
     var_idxs: NDArray[V_IDX_TYPE],
-    dosages: None = ...,
+    dosages: None = None,
 ) -> SparseGenotypes: ...
 @overload
 def dense2sparse(
     genos: NDArray[np.int8],
     var_idxs: NDArray[V_IDX_TYPE],
-    dosages: NDArray[DOSAGE_TYPE] = ...,
+    dosages: NDArray[DOSAGE_TYPE],
 ) -> tuple[SparseGenotypes, SparseDosages]: ...
 def dense2sparse(
     genos: NDArray[np.int8],
@@ -82,8 +82,8 @@ def dense2sparse(
     if dosages is not None:
         # (s v) -> (s p v)
         dosage_data = np.broadcast_to(dosages[:, None], genos.shape)[keep]
-        dosages = SparseDosages.from_offsets(dosage_data, shape, offsets)
-        return rag, dosages
+        _dosages = SparseDosages.from_offsets(dosage_data, shape, offsets)
+        return rag, _dosages
     return rag
 
 
