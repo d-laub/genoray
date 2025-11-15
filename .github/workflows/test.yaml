@@ -1,11 +1,11 @@
 name: Test
 
-on:
-  # uncomment when tests are implemented
-  # pull_request:
-  #   branches:
-  #     - main
-  # workflow_dispatch:
+# uncomment when tests are implemented
+# on:
+#   pull_request:
+#     branches:
+#       - main
+#   workflow_dispatch:
 
 jobs:
   test:
