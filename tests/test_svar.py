@@ -198,5 +198,6 @@ def test_compute_afs(svar: SparseVar):
     actual_afs = svar._compute_afs()
     np.testing.assert_equal(actual_afs, afs)
 
+
 def test_cache_afs(svar: SparseVar):
     np.testing.assert_equal(svar.attrs["AF"], afs)
