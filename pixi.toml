@@ -45,6 +45,18 @@ cyclopts = "*"
 zstandard = "*"
 pydantic = "*"
 
+[tasks]
+install = "uv pip install -e ."
+gen = { cmd = "sh tests/data/gen_from_vcf.sh", depends-on = ["install"] }
+test = { cmd = "pytest tests", depends-on = ["gen", "install"] }
+pre-commit = "pre-commit install --hook-type commit-msg"
+bump-dry = "cz bump --dry-run"
+publish = """
+    git checkout main && cz bump && git push --follow-tags && rm -rf dist && uv build && uv publish
+    && git checkout stable && git pull origin stable && git merge main && git push origin stable
+    && git checkout main
+    """
+
 [feature.dev.pypi-dependencies]
 numpy = "==1.26"
 pandas = "==2.2.2"
@@ -70,17 +82,7 @@ pydantic = "*"
 seaborn = "*"
 
 [feature.dev.tasks]
-install = "uv pip install -e ."
-pre-commit = "pre-commit install --hook-type commit-msg"
 i-kernel = "ipython kernel install --user --name genoray"
-gen = { cmd = "sh tests/data/gen_from_vcf.sh", depends-on = ["install"] }
-test = { cmd = "pytest tests", depends-on = ["gen", "install"] }
-bump-dry = "cz bump --dry-run"
-publish = """
-    git checkout main && cz bump && git push --follow-tags && rm -rf dist && uv build && uv publish
-    && git checkout stable && git pull origin stable && git merge main && git push origin stable
-    && git checkout main
-    """
 
 [feature.doc.dependencies]
 sphinx = "*"
