@@ -1,17 +1,18 @@
-[project]
+[workspace]
 name = "genoray"
 channels = ["conda-forge", "bioconda"]
 platforms = ["linux-64"]
 
 [environments]
-dev = ['dev']
-doc = { features = ['doc'] }
+default = ["dev", "py39"]
+doc = ["doc", "py312"]
+py39 = ["py39"]
+py310 = ["py310"]
+py311 = ["py311"]
+py312 = ["py312"]
 
 [dependencies]
 uv = "*"
-
-[feature.dev.dependencies]
-python = "3.9.*"
 bcftools = "*"
 plink2 = "*"
 pytest = "*"
@@ -21,6 +22,28 @@ ruff = "*"
 pytest-cases = "*"
 ipykernel = "*"
 ipywidgets = "*"
+
+[pypi-dependencies]
+numpy = "*"
+pandas = "*"
+polars = "*"
+typing-extensions = "*"
+tqdm = "*"
+more-itertools = "*"
+cyvcf2 = "*"
+hirola = "*"
+pgenlib = "*"
+pyranges = "*"
+pyarrow = "*"
+phantom-types = "*"
+loguru = "*"
+attrs = "*"
+awkward = "*"
+numba = "*"
+seqpro = "*"
+cyclopts = "*"
+zstandard = "*"
+pydantic = "*"
 
 [feature.dev.pypi-dependencies]
 numpy = "==1.26"
@@ -60,7 +83,6 @@ publish = """
     """
 
 [feature.doc.dependencies]
-python = "3.12.*"
 sphinx = "*"
 sphinx-book-theme = "*"
 sphinx-autobuild = "*"
@@ -89,3 +111,15 @@ seqpro = ">=0.8.0"
 [feature.doc.tasks]
 install = "uv pip install -e ."
 doc = { cmd = "make clean && make html", cwd = "docs" }
+
+[feature.py39.dependencies]
+python = "3.9.*"
+
+[feature.py310.dependencies]
+python = "3.10.*"
+
+[feature.py311.dependencies]
+python = "3.11.*"
+
+[feature.py312.dependencies]
+python = "3.12.*"
