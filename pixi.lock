@@ -142,6 +142,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/11/a8/c6a4b901d17399c77cd81fb001ce8961e9f5e04d3daf27e8925cb012e163/docutils-0.22.3-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/2d/e1/b2e2ae805f263507e050f1ebfc2fb3654124161f3bea466a1b2a4485c705/fonttools-4.60.1-cp39-cp39-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/eb/02/a6b21098b1d5d6249b7c5ab69dde30108a71e4e819d4a9778f1de1d5b70d/fsspec-2025.10.0-py3-none-any.whl
+      - pypi: https://files.pythonhosted.org/packages/4e/d2/59de71bdbecedeb616d8b9ae226841e78e83a5a1b02dbbc20d9d884665cf/genoray_cli-0.1.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/ac/8e/0eccb528701273640dd4f13678a0c1352176166aecd1ee7f4fa29355132b/hirola-0.3.0-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/f0/0f/310fb31e39e2d734ccaa2c0fb981ee41f7bd5056ce9bc29b2248bd569169/humanfriendly-10.0-py2.py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/a4/ed/1f1afb2e9e7f38a545d628f864d562a5ae64fe6f7a10e28ffb9b185b4e89/importlib_resources-6.5.2-py3-none-any.whl
@@ -182,6 +183,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/dc/9b/47798a6c91d8bdb567fe2698fe81e0c6b7cb7ef4d13da4114b41d239f65d/typing_inspection-0.4.2-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/5c/23/c7abc0ca0a1526a0774eca151daeb8de62ec457e77262b66b359c3c7679e/tzdata-2025.2-py2.py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/86/b2/fc50c58271a1ead0e5a0a0e6311f4b221f35954dce438ce62751b3af9b68/zstandard-0.25.0-cp39-cp39-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
+      - pypi: ./
   doc:
     channels:
     - url: https://conda.anaconda.org/conda-forge/
@@ -366,6 +368,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/74/c0/97df3032a348bee991750c1334d66901086070ddc1326d00407e1c3a16c9/cyvcf2-0.31.1-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/55/e2/2537ebcff11c1ee1ff17d8d0b6f4db75873e3b0fb32c2d4a2ee31ecb310a/docstring_parser-0.17.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/44/4b/e0cfc1a6f17e990f3e64b7d941ddc4acdc7b19d6edd51abf495f32b1a9e4/fsspec-2025.3.2-py3-none-any.whl
+      - pypi: https://files.pythonhosted.org/packages/4e/d2/59de71bdbecedeb616d8b9ae226841e78e83a5a1b02dbbc20d9d884665cf/genoray_cli-0.1.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/ac/8e/0eccb528701273640dd4f13678a0c1352176166aecd1ee7f4fa29355132b/hirola-0.3.0-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/f0/0f/310fb31e39e2d734ccaa2c0fb981ee41f7bd5056ce9bc29b2248bd569169/humanfriendly-10.0-py2.py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/cb/da/8341fd3056419441286c8e26bf436923021005ece0bff5f41906476ae514/llvmlite-0.44.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
@@ -396,6 +399,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/65/f3/107a22063bf27bdccf2024833d3445f4eea42b2e598abfbd46f6a63b6cb0/typing_inspect-0.9.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/31/08/aa4fdfb71f7de5176385bd9e90852eaf6b5d622735020ad600f2bab54385/typing_inspection-0.4.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/5c/23/c7abc0ca0a1526a0774eca151daeb8de62ec457e77262b66b359c3c7679e/tzdata-2025.2-py2.py3-none-any.whl
+      - pypi: ./
   py310:
     channels:
     - url: https://conda.anaconda.org/conda-forge/
@@ -536,6 +540,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/55/e2/2537ebcff11c1ee1ff17d8d0b6f4db75873e3b0fb32c2d4a2ee31ecb310a/docstring_parser-0.17.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/11/a8/c6a4b901d17399c77cd81fb001ce8961e9f5e04d3daf27e8925cb012e163/docutils-0.22.3-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/eb/02/a6b21098b1d5d6249b7c5ab69dde30108a71e4e819d4a9778f1de1d5b70d/fsspec-2025.10.0-py3-none-any.whl
+      - pypi: https://files.pythonhosted.org/packages/4e/d2/59de71bdbecedeb616d8b9ae226841e78e83a5a1b02dbbc20d9d884665cf/genoray_cli-0.1.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/ac/8e/0eccb528701273640dd4f13678a0c1352176166aecd1ee7f4fa29355132b/hirola-0.3.0-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/f0/0f/310fb31e39e2d734ccaa2c0fb981ee41f7bd5056ce9bc29b2248bd569169/humanfriendly-10.0-py2.py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/a6/7b/6d7585998a5991fa74dc925aae57913ba8c7c2efff909de9d34cc1cd3c27/llvmlite-0.45.1-cp310-cp310-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
@@ -571,6 +576,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/dc/9b/47798a6c91d8bdb567fe2698fe81e0c6b7cb7ef4d13da4114b41d239f65d/typing_inspection-0.4.2-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/5c/23/c7abc0ca0a1526a0774eca151daeb8de62ec457e77262b66b359c3c7679e/tzdata-2025.2-py2.py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/fd/e5/6d36f92a197c3c17729a2125e29c169f460538a7d939a27eaaa6dcfcba8e/zstandard-0.25.0-cp310-cp310-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
+      - pypi: ./
   py311:
     channels:
     - url: https://conda.anaconda.org/conda-forge/
@@ -711,6 +717,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/55/e2/2537ebcff11c1ee1ff17d8d0b6f4db75873e3b0fb32c2d4a2ee31ecb310a/docstring_parser-0.17.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/11/a8/c6a4b901d17399c77cd81fb001ce8961e9f5e04d3daf27e8925cb012e163/docutils-0.22.3-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/eb/02/a6b21098b1d5d6249b7c5ab69dde30108a71e4e819d4a9778f1de1d5b70d/fsspec-2025.10.0-py3-none-any.whl
+      - pypi: https://files.pythonhosted.org/packages/4e/d2/59de71bdbecedeb616d8b9ae226841e78e83a5a1b02dbbc20d9d884665cf/genoray_cli-0.1.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/ac/8e/0eccb528701273640dd4f13678a0c1352176166aecd1ee7f4fa29355132b/hirola-0.3.0-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/f0/0f/310fb31e39e2d734ccaa2c0fb981ee41f7bd5056ce9bc29b2248bd569169/humanfriendly-10.0-py2.py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/fe/af/85fc237de98b181dbbe8647324331238d6c52a3554327ccdc83ced28efba/llvmlite-0.45.1-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
@@ -746,6 +753,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/dc/9b/47798a6c91d8bdb567fe2698fe81e0c6b7cb7ef4d13da4114b41d239f65d/typing_inspection-0.4.2-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/5c/23/c7abc0ca0a1526a0774eca151daeb8de62ec457e77262b66b359c3c7679e/tzdata-2025.2-py2.py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/bb/1f/e9cfd801a3f9190bf3e759c422bbfd2247db9d7f3d54a56ecde70137791a/zstandard-0.25.0-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
+      - pypi: ./
   py312:
     channels:
     - url: https://conda.anaconda.org/conda-forge/
@@ -889,6 +897,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/55/e2/2537ebcff11c1ee1ff17d8d0b6f4db75873e3b0fb32c2d4a2ee31ecb310a/docstring_parser-0.17.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/11/a8/c6a4b901d17399c77cd81fb001ce8961e9f5e04d3daf27e8925cb012e163/docutils-0.22.3-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/eb/02/a6b21098b1d5d6249b7c5ab69dde30108a71e4e819d4a9778f1de1d5b70d/fsspec-2025.10.0-py3-none-any.whl
+      - pypi: https://files.pythonhosted.org/packages/4e/d2/59de71bdbecedeb616d8b9ae226841e78e83a5a1b02dbbc20d9d884665cf/genoray_cli-0.1.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/ac/8e/0eccb528701273640dd4f13678a0c1352176166aecd1ee7f4fa29355132b/hirola-0.3.0-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/f0/0f/310fb31e39e2d734ccaa2c0fb981ee41f7bd5056ce9bc29b2248bd569169/humanfriendly-10.0-py2.py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/96/76/0f7154952f037cb320b83e1c952ec4a19d5d689cf7d27cb8a26887d7bbc1/llvmlite-0.45.1-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
@@ -924,6 +933,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/dc/9b/47798a6c91d8bdb567fe2698fe81e0c6b7cb7ef4d13da4114b41d239f65d/typing_inspection-0.4.2-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/5c/23/c7abc0ca0a1526a0774eca151daeb8de62ec457e77262b66b359c3c7679e/tzdata-2025.2-py2.py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/53/60/7be26e610767316c028a2cbedb9a3beabdbe33e2182c373f71a1c0b88f36/zstandard-0.25.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
+      - pypi: ./
   py39:
     channels:
     - url: https://conda.anaconda.org/conda-forge/
@@ -1063,6 +1073,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/55/e2/2537ebcff11c1ee1ff17d8d0b6f4db75873e3b0fb32c2d4a2ee31ecb310a/docstring_parser-0.17.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/11/a8/c6a4b901d17399c77cd81fb001ce8961e9f5e04d3daf27e8925cb012e163/docutils-0.22.3-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/eb/02/a6b21098b1d5d6249b7c5ab69dde30108a71e4e819d4a9778f1de1d5b70d/fsspec-2025.10.0-py3-none-any.whl
+      - pypi: https://files.pythonhosted.org/packages/4e/d2/59de71bdbecedeb616d8b9ae226841e78e83a5a1b02dbbc20d9d884665cf/genoray_cli-0.1.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/ac/8e/0eccb528701273640dd4f13678a0c1352176166aecd1ee7f4fa29355132b/hirola-0.3.0-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/f0/0f/310fb31e39e2d734ccaa2c0fb981ee41f7bd5056ce9bc29b2248bd569169/humanfriendly-10.0-py2.py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/e0/d0/889e9705107db7b1ec0767b03f15d7b95b4c4f9fdf91928ab1c7e9ffacf6/llvmlite-0.43.0-cp39-cp39-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
@@ -1098,6 +1109,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/dc/9b/47798a6c91d8bdb567fe2698fe81e0c6b7cb7ef4d13da4114b41d239f65d/typing_inspection-0.4.2-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/5c/23/c7abc0ca0a1526a0774eca151daeb8de62ec457e77262b66b359c3c7679e/tzdata-2025.2-py2.py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/86/b2/fc50c58271a1ead0e5a0a0e6311f4b221f35954dce438ce62751b3af9b68/zstandard-0.25.0-cp39-cp39-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
+      - pypi: ./
 packages:
 - conda: https://conda.anaconda.org/conda-forge/linux-64/_libgcc_mutex-0.1-conda_forge.tar.bz2
   sha256: fe51de6107f9edc7aa4f786a70f4a883943bc9d39b3bb7307c04c41410990726
@@ -2605,6 +2617,43 @@ packages:
   - zstandard ; python_full_version < '3.14' and extra == 'test-full'
   - tqdm ; extra == 'tqdm'
   requires_python: '>=3.9'
+- pypi: ./
+  name: genoray
+  version: 0.16.0
+  sha256: f070551dddaec1477ceaabef874148464a9bc1ffdc3ac616aae5de388675fd5a
+  requires_dist:
+  - seqpro>=0.8.0
+  - genoray>=0.15.0
+  - numpy>=1.26
+  - pandas>=2.2.2
+  - hirola>=0.3.0
+  - pgenlib>=0.91.0
+  - cyvcf2>=0.31.1
+  - polars>=1.26
+  - pyranges>=0.1.3
+  - typing-extensions>=4.11
+  - pyarrow>=16
+  - tqdm>=4.65
+  - phantom-types>=3
+  - more-itertools>=10
+  - loguru>=0.7.0
+  - attrs
+  - awkward
+  - numba
+  - cyclopts
+  - zstandard
+  - pydantic
+  - genoray-cli ; extra == 'cli'
+  requires_python: '>=3.9,<3.13'
+  editable: true
+- pypi: https://files.pythonhosted.org/packages/4e/d2/59de71bdbecedeb616d8b9ae226841e78e83a5a1b02dbbc20d9d884665cf/genoray_cli-0.1.1-py3-none-any.whl
+  name: genoray-cli
+  version: 0.1.1
+  sha256: 64bbe087ee51362221e217030b5611b7600f9c7e5a0f8b4fd6b7fdaa513271ec
+  requires_dist:
+  - cyclopts
+  - genoray
+  requires_python: '>=3.9,<3.13'
 - conda: https://conda.anaconda.org/conda-forge/linux-64/gsl-2.7-he838d99_0.tar.bz2
   sha256: 132a918b676dd1f533d7c6f95e567abf7081a6ea3251c3280de35ef600e0da87
   md5: fec079ba39c9cca093bf4c00001825de

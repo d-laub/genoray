@@ -24,6 +24,7 @@ ipykernel = "*"
 ipywidgets = "*"
 
 [pypi-dependencies]
+genoray = { path = ".", editable = true, extras = ["cli"] }
 numpy = "*"
 pandas = "*"
 polars = "*"
@@ -46,9 +47,8 @@ zstandard = "*"
 pydantic = "*"
 
 [tasks]
-install = "uv pip install -e ."
-gen = { cmd = "sh tests/data/gen_from_vcf.sh", depends-on = ["install"] }
-test = { cmd = "pytest tests", depends-on = ["gen", "install"] }
+gen = { cmd = "sh tests/data/gen_from_vcf.sh" }
+test = { cmd = "pytest tests", depends-on = "gen" }
 pre-commit = "pre-commit install --hook-type commit-msg"
 bump-dry = "cz bump --dry-run"
 publish = """
@@ -111,7 +111,6 @@ numba = "*"
 seqpro = ">=0.8.0"
 
 [feature.doc.tasks]
-install = "uv pip install -e ."
 doc = { cmd = "make clean && make html", cwd = "docs" }
 
 [feature.py39.dependencies]
