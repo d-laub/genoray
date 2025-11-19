@@ -142,7 +142,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/11/a8/c6a4b901d17399c77cd81fb001ce8961e9f5e04d3daf27e8925cb012e163/docutils-0.22.3-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/2d/e1/b2e2ae805f263507e050f1ebfc2fb3654124161f3bea466a1b2a4485c705/fonttools-4.60.1-cp39-cp39-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/eb/02/a6b21098b1d5d6249b7c5ab69dde30108a71e4e819d4a9778f1de1d5b70d/fsspec-2025.10.0-py3-none-any.whl
-      - pypi: https://files.pythonhosted.org/packages/4e/d2/59de71bdbecedeb616d8b9ae226841e78e83a5a1b02dbbc20d9d884665cf/genoray_cli-0.1.1-py3-none-any.whl
+      - pypi: https://files.pythonhosted.org/packages/31/c7/002ee3f8d7190ca86cb84a0498f718a9323a89fdd6c2d892d1161771c23c/genoray_cli-0.1.2-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/ac/8e/0eccb528701273640dd4f13678a0c1352176166aecd1ee7f4fa29355132b/hirola-0.3.0-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/f0/0f/310fb31e39e2d734ccaa2c0fb981ee41f7bd5056ce9bc29b2248bd569169/humanfriendly-10.0-py2.py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/a4/ed/1f1afb2e9e7f38a545d628f864d562a5ae64fe6f7a10e28ffb9b185b4e89/importlib_resources-6.5.2-py3-none-any.whl
@@ -368,7 +368,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/74/c0/97df3032a348bee991750c1334d66901086070ddc1326d00407e1c3a16c9/cyvcf2-0.31.1-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/55/e2/2537ebcff11c1ee1ff17d8d0b6f4db75873e3b0fb32c2d4a2ee31ecb310a/docstring_parser-0.17.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/44/4b/e0cfc1a6f17e990f3e64b7d941ddc4acdc7b19d6edd51abf495f32b1a9e4/fsspec-2025.3.2-py3-none-any.whl
-      - pypi: https://files.pythonhosted.org/packages/4e/d2/59de71bdbecedeb616d8b9ae226841e78e83a5a1b02dbbc20d9d884665cf/genoray_cli-0.1.1-py3-none-any.whl
+      - pypi: https://files.pythonhosted.org/packages/31/c7/002ee3f8d7190ca86cb84a0498f718a9323a89fdd6c2d892d1161771c23c/genoray_cli-0.1.2-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/ac/8e/0eccb528701273640dd4f13678a0c1352176166aecd1ee7f4fa29355132b/hirola-0.3.0-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/f0/0f/310fb31e39e2d734ccaa2c0fb981ee41f7bd5056ce9bc29b2248bd569169/humanfriendly-10.0-py2.py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/cb/da/8341fd3056419441286c8e26bf436923021005ece0bff5f41906476ae514/llvmlite-0.44.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
@@ -540,7 +540,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/55/e2/2537ebcff11c1ee1ff17d8d0b6f4db75873e3b0fb32c2d4a2ee31ecb310a/docstring_parser-0.17.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/11/a8/c6a4b901d17399c77cd81fb001ce8961e9f5e04d3daf27e8925cb012e163/docutils-0.22.3-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/eb/02/a6b21098b1d5d6249b7c5ab69dde30108a71e4e819d4a9778f1de1d5b70d/fsspec-2025.10.0-py3-none-any.whl
-      - pypi: https://files.pythonhosted.org/packages/4e/d2/59de71bdbecedeb616d8b9ae226841e78e83a5a1b02dbbc20d9d884665cf/genoray_cli-0.1.1-py3-none-any.whl
+      - pypi: https://files.pythonhosted.org/packages/31/c7/002ee3f8d7190ca86cb84a0498f718a9323a89fdd6c2d892d1161771c23c/genoray_cli-0.1.2-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/ac/8e/0eccb528701273640dd4f13678a0c1352176166aecd1ee7f4fa29355132b/hirola-0.3.0-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/f0/0f/310fb31e39e2d734ccaa2c0fb981ee41f7bd5056ce9bc29b2248bd569169/humanfriendly-10.0-py2.py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/a6/7b/6d7585998a5991fa74dc925aae57913ba8c7c2efff909de9d34cc1cd3c27/llvmlite-0.45.1-cp310-cp310-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
@@ -717,7 +717,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/55/e2/2537ebcff11c1ee1ff17d8d0b6f4db75873e3b0fb32c2d4a2ee31ecb310a/docstring_parser-0.17.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/11/a8/c6a4b901d17399c77cd81fb001ce8961e9f5e04d3daf27e8925cb012e163/docutils-0.22.3-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/eb/02/a6b21098b1d5d6249b7c5ab69dde30108a71e4e819d4a9778f1de1d5b70d/fsspec-2025.10.0-py3-none-any.whl
-      - pypi: https://files.pythonhosted.org/packages/4e/d2/59de71bdbecedeb616d8b9ae226841e78e83a5a1b02dbbc20d9d884665cf/genoray_cli-0.1.1-py3-none-any.whl
+      - pypi: https://files.pythonhosted.org/packages/31/c7/002ee3f8d7190ca86cb84a0498f718a9323a89fdd6c2d892d1161771c23c/genoray_cli-0.1.2-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/ac/8e/0eccb528701273640dd4f13678a0c1352176166aecd1ee7f4fa29355132b/hirola-0.3.0-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/f0/0f/310fb31e39e2d734ccaa2c0fb981ee41f7bd5056ce9bc29b2248bd569169/humanfriendly-10.0-py2.py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/fe/af/85fc237de98b181dbbe8647324331238d6c52a3554327ccdc83ced28efba/llvmlite-0.45.1-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
@@ -897,7 +897,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/55/e2/2537ebcff11c1ee1ff17d8d0b6f4db75873e3b0fb32c2d4a2ee31ecb310a/docstring_parser-0.17.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/11/a8/c6a4b901d17399c77cd81fb001ce8961e9f5e04d3daf27e8925cb012e163/docutils-0.22.3-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/eb/02/a6b21098b1d5d6249b7c5ab69dde30108a71e4e819d4a9778f1de1d5b70d/fsspec-2025.10.0-py3-none-any.whl
-      - pypi: https://files.pythonhosted.org/packages/4e/d2/59de71bdbecedeb616d8b9ae226841e78e83a5a1b02dbbc20d9d884665cf/genoray_cli-0.1.1-py3-none-any.whl
+      - pypi: https://files.pythonhosted.org/packages/31/c7/002ee3f8d7190ca86cb84a0498f718a9323a89fdd6c2d892d1161771c23c/genoray_cli-0.1.2-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/ac/8e/0eccb528701273640dd4f13678a0c1352176166aecd1ee7f4fa29355132b/hirola-0.3.0-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/f0/0f/310fb31e39e2d734ccaa2c0fb981ee41f7bd5056ce9bc29b2248bd569169/humanfriendly-10.0-py2.py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/96/76/0f7154952f037cb320b83e1c952ec4a19d5d689cf7d27cb8a26887d7bbc1/llvmlite-0.45.1-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
@@ -1073,7 +1073,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/55/e2/2537ebcff11c1ee1ff17d8d0b6f4db75873e3b0fb32c2d4a2ee31ecb310a/docstring_parser-0.17.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/11/a8/c6a4b901d17399c77cd81fb001ce8961e9f5e04d3daf27e8925cb012e163/docutils-0.22.3-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/eb/02/a6b21098b1d5d6249b7c5ab69dde30108a71e4e819d4a9778f1de1d5b70d/fsspec-2025.10.0-py3-none-any.whl
-      - pypi: https://files.pythonhosted.org/packages/4e/d2/59de71bdbecedeb616d8b9ae226841e78e83a5a1b02dbbc20d9d884665cf/genoray_cli-0.1.1-py3-none-any.whl
+      - pypi: https://files.pythonhosted.org/packages/31/c7/002ee3f8d7190ca86cb84a0498f718a9323a89fdd6c2d892d1161771c23c/genoray_cli-0.1.2-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/ac/8e/0eccb528701273640dd4f13678a0c1352176166aecd1ee7f4fa29355132b/hirola-0.3.0-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/f0/0f/310fb31e39e2d734ccaa2c0fb981ee41f7bd5056ce9bc29b2248bd569169/humanfriendly-10.0-py2.py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/e0/d0/889e9705107db7b1ec0767b03f15d7b95b4c4f9fdf91928ab1c7e9ffacf6/llvmlite-0.43.0-cp39-cp39-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
@@ -2620,7 +2620,7 @@ packages:
 - pypi: ./
   name: genoray
   version: 0.16.0
-  sha256: f070551dddaec1477ceaabef874148464a9bc1ffdc3ac616aae5de388675fd5a
+  sha256: 446d564ea916622215e0e46e99e5502ea04ce4bad211f1ace8f7c60ed18f6963
   requires_dist:
   - seqpro>=0.8.0
   - genoray>=0.15.0
@@ -2643,13 +2643,13 @@ packages:
   - cyclopts
   - zstandard
   - pydantic
-  - genoray-cli ; extra == 'cli'
+  - genoray-cli>=0.1.2 ; extra == 'cli'
   requires_python: '>=3.9,<3.13'
   editable: true
-- pypi: https://files.pythonhosted.org/packages/4e/d2/59de71bdbecedeb616d8b9ae226841e78e83a5a1b02dbbc20d9d884665cf/genoray_cli-0.1.1-py3-none-any.whl
+- pypi: https://files.pythonhosted.org/packages/31/c7/002ee3f8d7190ca86cb84a0498f718a9323a89fdd6c2d892d1161771c23c/genoray_cli-0.1.2-py3-none-any.whl
   name: genoray-cli
-  version: 0.1.1
-  sha256: 64bbe087ee51362221e217030b5611b7600f9c7e5a0f8b4fd6b7fdaa513271ec
+  version: 0.1.2
+  sha256: c85ea9badf07d71e4f42eba24ab3f05ea28398c76e2d4bdf6bf6275ca548074b
   requires_dist:
   - cyclopts
   - genoray
