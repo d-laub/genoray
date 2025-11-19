@@ -1,3 +1,10 @@
+## 0.16.1 (2025-11-19)
+
+### Fix
+
+- **cli**: bump cli version
+- type hints
+
 ## 0.16.0 (2025-10-20)
 
 ### Feat
