@@ -16,6 +16,7 @@ from numpy.typing import ArrayLike, NDArray
 from polars._typing import IntoExpr
 from pydantic import BaseModel
 from seqpro.rag import OFFSET_TYPE, Ragged, lengths_to_offsets
+import seqpro as sp
 from tqdm.auto import tqdm
 
 from ._pgen import PGEN
@@ -668,6 +669,125 @@ class SparseVar:
         attr_df = index.select(*attrs)
         return granges, attr_df
 
+    def annotate_with_gtf(
+        self,
+        gtf: str | pl.DataFrame,
+        level_filter: int | None = 1,
+        write_back: bool = True,
+        *,
+        strand_encoding: dict[str | None, int] | None = None,
+        codon_null_token: int | None = None,
+    ) -> pl.DataFrame:
+        """
+        Annotate variants with gene_id, strand, and codon_pos from GTF CDS features.
+
+        Computes codon position for SNVs only; indels receive strand but null codon_pos.
+
+        Parameters
+        ----------
+        gtf : str or pl.DataFrame
+            Path to GTF file (.gtf or .gtf.gz) or pre-loaded Polars DataFrame.
+        level_filter : int or None, default 1
+            If set, keep rows with GTF 'level' <= level_filter (1 = highest quality).
+        write_back : bool, default True
+            If True, update self.attrs in-place and write to index.arrow file.
+        strand_encoding : dict or None, optional
+            Encode strand as integers. Example: {'+': 0, '-': 1, None: 2}
+        codon_null_token : int or None, optional
+            Replace null codon_pos with this integer for ML models.
+
+        Returns
+        -------
+        pl.DataFrame
+            Columns: varID (UInt32), gene_id (Utf8), strand (Utf8/Int16), codon_pos (Int8/Int16)
+
+        Examples
+        --------
+        >>> svar = SparseVar("data.svar")
+        >>> annot = svar.annotate_with_gtf("gencode.v45.gtf.gz")
+        >>> annot.head()
+        """
+        # Validate inputs
+        if level_filter is not None and not isinstance(level_filter, int):
+            raise TypeError(
+                f"level_filter must be int or None, got {type(level_filter)}"
+            )
+        if strand_encoding is not None and not isinstance(strand_encoding, dict):
+            raise TypeError("strand_encoding must be dict or None")
+        if codon_null_token is not None and not isinstance(codon_null_token, int):
+            raise TypeError("codon_null_token must be int or None")
+
+        logger.info("Loading GTF for CDS annotation")
+
+        with tqdm(total=3, desc="GTF annotation", unit="step") as pbar:
+            # Load GTF
+            pbar.set_description("Loading GTF")
+            gtf_df = _load_gtf(gtf)
+            if level_filter is not None and "level" in gtf_df.columns:
+                gtf_df = gtf_df.filter(pl.col("level").cast(pl.Int32) <= level_filter)
+            pbar.update(1)
+
+            # Get variant IDs and ILEN
+            ilen_df = self.attrs.select(pl.col("ILEN").list.first()).with_row_index(
+                "varID"
+            )
+
+            # CDS Annotation
+            pbar.set_description("CDS annotation")
+
+            # Extract CDS features with gene_biotype
+            cds_df = gtf_df.filter(pl.col("feature") == "CDS").select(
+                "chrom",
+                "start",
+                "end",
+                "strand",
+                "frame",
+                "gene_id",
+                "transcript_id",
+                "gene_biotype",
+                "transcript_support_level",
+                "tag",
+            )
+
+            if len(cds_df) == 0:
+                annot = _empty_annot()
+            else:
+                annot = _get_strand_and_codon_pos(
+                    cds_df, self.granges, ilen_df, self._c_norm
+                )
+            pbar.update(1)
+
+            # Apply encoding
+            pbar.set_description("Finalizing")
+            if strand_encoding is not None:
+                str_map = {k: v for k, v in strand_encoding.items() if k is not None}
+                null_val = strand_encoding.get(None)
+                strand_expr = pl.col("strand").replace_strict(str_map, default=null_val)
+                annot = annot.with_columns(strand_expr.cast(pl.Int16).alias("strand"))
+
+            if codon_null_token is not None:
+                annot = annot.with_columns(
+                    pl.col("codon_pos").fill_null(codon_null_token).cast(pl.Int16)
+                )
+
+            # Write back if requested
+            if write_back:
+                self._load_all_attrs()
+                self.attrs = (
+                    self.attrs.lazy()
+                    .with_row_index("varID")
+                    .join(annot.lazy(), on="varID", how="left")
+                    .drop("varID")
+                    .collect()
+                )
+                df = self._to_df()
+                df.write_ipc(self._index_path(self.path))
+                logger.info("Wrote gene_id, strand, codon_pos to index.arrow")
+
+            pbar.update(1)
+
+        return annot
+
     def cache_afs(self):
         """Cache the allele frequencies on disk. Will also load all possible attributes and add the AF column in-memory."""
         self._load_all_attrs()
@@ -1067,3 +1187,177 @@ def _find_starts_ends_with_length(
     out = out[:, unsorter]
 
     return out
+
+
+def _empty_annot() -> pl.DataFrame:
+    """Return an empty annotation DataFrame with the correct schema."""
+    return pl.DataFrame(
+        {"varID": [], "gene_id": [], "strand": [], "codon_pos": []},
+        schema={
+            "varID": pl.UInt32,
+            "gene_id": pl.Utf8,
+            "strand": pl.Utf8,
+            "codon_pos": pl.Int8,
+        },
+    )
+
+
+def _get_strand_and_codon_pos(
+    cds_df: pl.DataFrame,
+    granges: pr.PyRanges,
+    ilen_df: pl.DataFrame,
+    contig_normalizer: ContigNormalizer,
+) -> pl.DataFrame:
+    """
+    Calculate strand and codon position for variants overlapping CDS regions.
+
+    Parameters
+    ----------
+    cds_df : pl.DataFrame
+        CDS features from GTF with columns: chrom, start, end, strand, frame,
+        gene_id, transcript_id, gene_biotype, transcript_support_level, tag
+    granges : pr.PyRanges
+        Variant genomic ranges
+    ilen_df : pl.DataFrame
+        DataFrame with varID and ILEN columns
+    contig_normalizer : ContigNormalizer
+        Normalizer to match chromosome names between CDS and granges
+
+
+    Returns
+    -------
+    pl.DataFrame
+        Annotation with varID, gene_id, strand, codon_pos
+    """
+
+    # Normalize CDS chromosome names to match granges
+    # Cast to string first to avoid categorical comparison issues
+    cds_df = cds_df.with_columns(
+        pl.col("chrom").cast(pl.Utf8).replace(contig_normalizer.contig_map)
+    )
+
+    # Filter out CDS features with chromosomes not in granges
+    cds_df = cds_df.filter(pl.col("chrom").is_in(contig_normalizer.contigs))
+
+    pr_cds = _to_pyranges(cds_df)
+    joined_cds = granges.join(pr_cds, apply_strand_suffix=False)
+
+    if len(joined_cds) == 0:
+        return _empty_annot()
+
+    annot = (
+        pl.from_pandas(joined_cds.df)
+        .with_columns(
+            pl.col("index").cast(pl.UInt32).alias("varID"),
+            # Keep PyRanges 0-based coordinates for direct offset calculation
+            pl.col("Start").alias("pos"),
+            pl.col("Start_b").alias("cds_start"),
+            cds_end="End_b",  # Used only for computing CDS span length
+        )
+        .join(ilen_df, on="varID", how="left")
+        # Positive strand: (rel_pos - frame) % 3
+        # Negative strand: (2 * (rel_pos - frame)) % 3 (reverse complement pattern)
+        .with_columns(
+            pl.when(
+                pl.col("frame").is_not_null()
+                & (pl.col("frame") <= 2)
+                & (pl.col("ILEN") == 0)
+            )
+            .then(
+                pl.when(pl.col("Strand") == "+")
+                .then((pl.col("pos") - pl.col("cds_start") - pl.col("frame")) % 3)
+                .otherwise(
+                    (2 * (pl.col("pos") - pl.col("cds_start") - pl.col("frame"))) % 3
+                )
+            )
+            .cast(pl.Int8)
+            .alias("codon_pos")
+        )
+        # Get the gene_id, strand, and codon_pos.
+        # If there are any duplicates, choose the one with the best rank, breaking ties by choosing the first seen.
+        .with_columns(
+            # Rank 0 is best, higher ranks are worse
+            pl.when(pl.col("gene_biotype") == "protein_coding")
+            .then(0)
+            .otherwise(1)
+            .alias("rank_pc"),
+            pl.when(
+                pl.col("tag").is_not_null()
+                & pl.col("tag").str.contains(r"^(canonical|appris_principal)")
+            )
+            .then(0)
+            .otherwise(1)
+            .alias("rank_canonical"),
+            pl.when(pl.col("transcript_support_level").is_not_null())
+            .then(
+                pl.col("transcript_support_level")
+                .str.extract(r"(\d+)", 1)
+                .cast(pl.Int16, strict=False)
+            )
+            .otherwise(9999)
+            .alias("rank_tsl"),
+            # Negative span so larger spans get rank 0 (best)
+            -(pl.col("cds_end") - pl.col("cds_start")).alias("rank_span"),
+        )
+        .sort(
+            [
+                "varID",
+                "rank_pc",
+                "rank_canonical",
+                "rank_tsl",
+                "rank_span",
+                "transcript_id",
+            ],
+            descending=[
+                False,
+                False,
+                False,
+                False,
+                False,
+                False,
+            ],  # kept this for code clarity (default also the same)
+        )
+        .group_by("varID", maintain_order=True)
+        .agg(
+            pl.col("gene_id").first(),
+            pl.col("Strand").first().alias("strand"),
+            pl.col("codon_pos").first(),
+        )
+    )
+
+    return annot
+
+
+def _load_gtf(gtf: str | pl.DataFrame) -> pl.DataFrame:
+    """Load GTF file as Polars DataFrame."""
+    if isinstance(gtf, pl.DataFrame):
+        return gtf.rename({"seqname": "chrom"}, strict=False)
+
+    return (
+        sp.gtf.scan(str(gtf))
+        .with_columns(
+            sp.gtf.attr("gene_id"),
+            sp.gtf.attr("transcript_id"),
+            sp.gtf.attr("gene_name"),
+            sp.gtf.attr("gene_biotype"),
+            sp.gtf.attr("transcript_support_level"),
+            sp.gtf.attr("level"),
+            sp.gtf.attr("tag"),
+        )
+        .collect()
+        .rename({"seqname": "chrom"}, strict=False)
+    )
+
+
+def _to_pyranges(df: pl.DataFrame) -> pr.PyRanges:
+    """Convert 1-based polars DataFrame to PyRanges, e.g. a GTF."""
+    return pr.PyRanges(
+        df.with_columns(
+            pl.col("chrom").alias("Chromosome"),
+            (pl.col("start") - 1).alias("Start"),
+            pl.col("end").alias("End"),
+            pl.col("strand").alias("Strand"),
+        )
+        .drop("chrom", "start", "end", "strand")
+        .to_pandas()
+    )
