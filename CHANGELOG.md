@@ -1,3 +1,14 @@
+## 0.17.0 (2025-12-03)
+
+### Feat
+
+- add CDS-based GTF annotation workflow and codon logic
+
+### Fix
+
+- check contig has variants for concatenate
+- pyranges natsorts chroms, changing order wrt index
+
 ## 0.16.1 (2025-11-19)
 
 ### Fix
