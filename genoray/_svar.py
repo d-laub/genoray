@@ -5,10 +5,12 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Generator, Literal, TypeVar, Union, cast, overload
 
+import awkward as ak
 import numba as nb
 import numpy as np
 import polars as pl
 import pyranges as pr
+from awkward.contents import Content, NumpyArray
 from hirola import HashTable
 from loguru import logger
 from natsort import natsorted
@@ -114,6 +116,7 @@ class SparseVar:
     available_samples: list[str]
     ploidy: int
     contigs: list[str]
+    """Contigs in the order they appear in the dataset. Variants are only sorted within each contig."""
     genos: SparseGenotypes
     dosages: SparseDosages | None
     granges: pr.PyRanges
@@ -323,7 +326,7 @@ class SparseVar:
 
         Returns
         -------
-            Shape: (ranges, samples, ploidy, 2). The first column is the start index of the variant
+            Shape: (2, ranges, samples, ploidy). The first column is the start index of the variant
             and the second column is the end index of the variant.
         """
         if not self._is_biallelic:
@@ -351,6 +354,8 @@ class SparseVar:
         # (r 2)
         var_ranges = self.var_ranges(contig, starts, ends)
 
+        v_starts = np.concatenate([self.granges.dfs[c]["Start"] for c in self.contigs])  # type: ignore
+
         # (2 r s p)
         out = _find_starts_ends_with_length(
             self.genos.data,
@@ -358,7 +363,7 @@ class SparseVar:
             starts,
             ends,
             var_ranges,
-            self.granges.Start.to_numpy(),
+            v_starts,
             self.attrs["ILEN"].list.first().to_numpy(),
             s_idxs,
             self.ploidy,
@@ -824,6 +829,16 @@ class SparseVar:
         df = chr_pos.hstack(self.attrs)
         return df
 
+    def _load_genos(self):
+        def memmap2array(layout: Content, **kwargs):
+            if isinstance(layout, NumpyArray):
+                data = layout.data
+                if isinstance(data, np.memmap):
+                    data = data[:]
+                return NumpyArray(data)
+
+        self.genos = ak.transform(memmap2array, self.genos)
+
 
 @nb.njit(nogil=True, cache=True)
 def _nb_af_helper(afs, v_idxs, offsets, max_count):
@@ -1121,8 +1136,8 @@ def _find_starts_ends_with_length(
             max_idx = np.searchsorted(sp_genos, contig_max_idx + 1)
             start_idxs = np.searchsorted(sp_genos, var_ranges[:, 0])
 
-            for r in nb.prange(n_ranges):
-                start_idx = start_idxs[r]
+            for r in range(n_ranges):
+                start_idx: np.intp = start_idxs[r]
 
                 if var_ranges[r, 0] == var_ranges[r, 1]:
                     out[:, r, s, p] = np.iinfo(OFFSET_TYPE).max
@@ -1143,7 +1158,7 @@ def _find_starts_ends_with_length(
                 geno_idx = start_idx
                 for geno_idx in range(start_idx, max_idx):
                     v_idx: V_IDX_TYPE = sp_genos[geno_idx]
-                    v_start = v_starts[v_idx]
+                    v_start: np.int32 = v_starts[v_idx]
                     ilen: np.int32 = ilens[v_idx]
 
                     # only add atomized length if v_start >= ref_start
