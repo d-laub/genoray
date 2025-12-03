@@ -10,6 +10,7 @@ import numba as nb
 import numpy as np
 import polars as pl
 import pyranges as pr
+import seqpro as sp
 from awkward.contents import Content, NumpyArray
 from hirola import HashTable
 from loguru import logger
@@ -18,7 +19,6 @@ from numpy.typing import ArrayLike, NDArray
 from polars._typing import IntoExpr
 from pydantic import BaseModel
 from seqpro.rag import OFFSET_TYPE, Ragged, lengths_to_offsets
-import seqpro as sp
 from tqdm.auto import tqdm
 
 from ._pgen import PGEN
@@ -354,7 +354,13 @@ class SparseVar:
         # (r 2)
         var_ranges = self.var_ranges(contig, starts, ends)
 
-        v_starts = np.concatenate([self.granges.dfs[c]["Start"] for c in self.contigs])  # type: ignore
+        v_starts = np.concatenate(
+            [
+                self.granges.dfs[c]["Start"]  # type: ignore
+                for c in self.contigs
+                if c in self.granges.dfs  # type: ignore
+            ]
+        )
 
         # (2 r s p)
         out = _find_starts_ends_with_length(
