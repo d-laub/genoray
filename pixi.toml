@@ -22,6 +22,7 @@ ruff = "*"
 pytest-cases = "*"
 ipykernel = "*"
 ipywidgets = "*"
+memray = ">=1.12.0,<2"
 
 [pypi-dependencies]
 genoray = { path = ".", editable = true, extras = ["cli"] }
