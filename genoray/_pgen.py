@@ -358,7 +358,8 @@ class PGEN:
         n_variants
             Shape: :code:`(ranges)`. Number of variants in the given ranges.
         """
-        starts = np.atleast_1d(np.asarray(starts, POS_TYPE))
+        #! need to clip or else PyRanges can give wrong results
+        starts = np.atleast_1d(np.asarray(starts, POS_TYPE)).clip(min=0)
         n_ranges = len(starts)
 
         c = self._c_norm.norm(contig)
@@ -376,7 +377,7 @@ class PGEN:
             ).to_pandas(use_pyarrow_extension_array=True)
         )
         return (
-            queries.count_overlaps(self._index)
+            queries.count_overlaps(self._index[c])
             .df["NumberOverlaps"]
             .to_numpy()
             .astype(np.uint32)
@@ -424,7 +425,7 @@ class PGEN:
             .with_row_index("query")
             .to_pandas(use_pyarrow_extension_array=True)
         )
-        join = pl.from_pandas(queries.join(self._index).df)
+        join = pl.from_pandas(queries.join(self._index[c]).df)
 
         if join.height == 0:
             return np.empty(0, V_IDX_TYPE), np.zeros(n_ranges + 1, OFFSET_TYPE)

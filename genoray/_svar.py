@@ -202,7 +202,8 @@ class SparseVar:
             Shape: :code:`(ranges, 2)`. The first column is the start index of the variant
             and the second column is the end index of the variant.
         """
-        starts = np.atleast_1d(np.asarray(starts, POS_TYPE))
+        #! need to clip or else PyRanges can give wrong results
+        starts = np.atleast_1d(np.asarray(starts, POS_TYPE)).clip(min=0)
         n_ranges = len(starts)
 
         c = self._c_norm.norm(contig)
@@ -221,7 +222,7 @@ class SparseVar:
             .with_row_index("query")
             .to_pandas(use_pyarrow_extension_array=True)
         )
-        join = queries.join(self.granges)
+        join = queries.join(self.granges[c])
 
         if len(join) == 0:
             return np.full((n_ranges, 2), np.iinfo(V_IDX_TYPE).max, V_IDX_TYPE)

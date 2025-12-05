@@ -504,7 +504,7 @@ class VCF:
             .with_row_index("query")
             .to_pandas(use_pyarrow_extension_array=True)
         )
-        join = pl.from_pandas(queries.join(self._index.gr).df)
+        join = pl.from_pandas(queries.join(self._index.gr[c]).df)
         if join.height == 0:
             return np.empty(0, np.uint32), np.zeros(n_ranges + 1, OFFSET_TYPE)
 
