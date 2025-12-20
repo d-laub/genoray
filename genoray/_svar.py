@@ -755,7 +755,7 @@ class SparseVar:
         df.write_ipc(self._index_path(self.path))
 
     def _to_df(self) -> pl.DataFrame:
-        return self.var_table
+        return self.var_table.drop("index")
 
     def _load_genos(self):
         def memmap2array(layout: Content, **kwargs):
