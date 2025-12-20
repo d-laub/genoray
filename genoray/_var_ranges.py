@@ -78,9 +78,14 @@ def var_ranges(
     # ║    3    ║   4   ║        N        ║        Y        ║
     # ╚═════════╩═══════╩═════════════════╩═════════════════╝
     e_idx = _backward_sub_scan(v_ends, s_idx, upper_bound_e_idx, max_v_len, starts)
+    no_vars = s_idx == n_vars
+    s_idx[no_vars] = 0
+    e_idx[no_vars] = 0
+    s_idx = var_table[s_idx, "index"].to_numpy()
+    e_idx = var_table[e_idx, "index"].to_numpy() + 1  # exclusive end
 
     var_ranges = np.stack([s_idx, e_idx], axis=1, dtype=V_IDX_TYPE)
-    var_ranges[s_idx >= e_idx] = np.iinfo(V_IDX_TYPE).max
+    var_ranges[no_vars] = np.iinfo(V_IDX_TYPE).max
 
     return var_ranges
 
@@ -118,10 +123,10 @@ def _backward_sub_scan(
     q_start: int | np.integer | NDArray[np.integer],
     indices: NDArray[np.integer] = None,  # type: ignore
 ) -> NDArray[np.integer]:  # type: ignore
-    """Find last index where q_start < v_ends[i] (backward scan), returns exclusive end."""
+    """Find last index where q_start < v_ends[i] (backward scan)."""
     for i in range(upper_bound - 1, lower_bound - 1, -1):
         if q_start < v_ends[i]:
-            indices[0] = i + 1  # exclusive end
+            indices[0] = i
             break
     else:
         indices[0] = lower_bound  # no overlap found

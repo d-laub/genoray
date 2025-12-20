@@ -2748,8 +2748,8 @@ packages:
   requires_python: '>=3.10'
 - pypi: ./
   name: genoray
-  version: 0.17.0
-  sha256: a7633d17e074f73369de1526d912226e01d0737826f889a16165c9cd2655d00c
+  version: 1.0.0
+  sha256: 049c58a8a850277b1637e4b619a74861fb1bbbb43fba308f64920f1551f21d2e
   requires_dist:
   - seqpro>=0.8.0
   - genoray>=0.15.0
