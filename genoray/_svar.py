@@ -1193,7 +1193,12 @@ def _get_strand_and_codon_pos(
         return _empty_annot()
 
     joined_cds = (
-        cast(pl.LazyFrame, pb.overlap(var_intervals, cds_df, use_zero_based=False))
+        cast(
+            pl.LazyFrame,
+            pb.overlap(
+                var_intervals, cds_df, use_zero_based=False, projection_pushdown=True
+            ),
+        )
         .rename(
             {
                 "start_1": "pos",
