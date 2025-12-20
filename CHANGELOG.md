@@ -1,3 +1,18 @@
+## 1.0.0 (2025-12-20)
+
+### Feat
+
+- no more SparseVar.granges, switched to polars bio. faster and lower mem alg for var_ranges.
+
+### Fix
+
+- don't include index in svar._to_df()
+- negative start queries for PGEN, SVAR (#16)
+
+### Perf
+
+- enable projection pushdown
+
 ## 0.17.0 (2025-12-03)
 
 ### Feat
