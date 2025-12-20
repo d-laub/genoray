@@ -1050,7 +1050,7 @@ def _gen_with_length(
             yield out, last_end, var_idx
             return
 
-        initial_len = max(length, last_end - q_start)
+        initial_len = max(length, last_end - q_start)  # type: ignore
 
         if isinstance(out, Genos):
             # (s p)

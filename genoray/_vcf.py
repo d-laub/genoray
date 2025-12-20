@@ -560,7 +560,7 @@ class VCF:
             )
             return mode.empty(self.n_samples, ploidy, 0)
 
-        start = max(0, start)
+        start = max(0, start)  # type: ignore
 
         vcf = self._vcf(f"{c}:{int(start + 1)}-{end}")  # range string is 1-based
         if out is None:
@@ -676,7 +676,7 @@ class VCF:
             yield mode.empty(self.n_samples, ploidy, 0)
             return
 
-        start = max(0, start)
+        start = max(0, start)  # type: ignore
 
         n_variants: int = self.n_vars_in_ranges(c, start, end)[0]
         if n_variants == 0:
