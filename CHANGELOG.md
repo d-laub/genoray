@@ -1,3 +1,9 @@
+## 1.0.1 (2025-12-20)
+
+### Fix
+
+- indices from var_ranges need to be converted from relative to absolute
+
 ## 1.0.0 (2025-12-20)
 
 ### Feat
