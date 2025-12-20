@@ -200,4 +200,4 @@ def test_compute_afs(svar: SparseVar):
 
 
 def test_cache_afs(svar: SparseVar):
-    np.testing.assert_equal(svar.attrs["AF"], afs)
+    np.testing.assert_equal(svar.var_table["AF"], afs)

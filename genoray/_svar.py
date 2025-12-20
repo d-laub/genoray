@@ -3,13 +3,13 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, Generator, Literal, TypeVar, Union, cast, overload
+from typing import Any, Generator, Iterable, Literal, Union, cast, overload
 
 import awkward as ak
 import numba as nb
 import numpy as np
 import polars as pl
-import pyranges as pr
+import polars_bio as pb
 import seqpro as sp
 from awkward.contents import Content, NumpyArray
 from hirola import HashTable
@@ -22,15 +22,10 @@ from seqpro.rag import OFFSET_TYPE, Ragged, lengths_to_offsets
 from tqdm.auto import tqdm
 
 from ._pgen import PGEN
+from ._types import DOSAGE_TYPE, DTYPE, INT64_MAX, POS_TYPE, V_IDX_TYPE
 from ._utils import ContigNormalizer
+from ._var_ranges import var_ranges
 from ._vcf import VCF
-
-POS_TYPE = np.int64
-V_IDX_TYPE = np.int32
-DOSAGE_TYPE = np.float32
-INT64_MAX = np.iinfo(POS_TYPE).max
-DTYPE = TypeVar("DTYPE", bound=np.generic)
-
 
 SparseGenotypes = Ragged[V_IDX_TYPE]
 SparseDosages = Ragged[DOSAGE_TYPE]
@@ -119,8 +114,9 @@ class SparseVar:
     """Contigs in the order they appear in the dataset. Variants are only sorted within each contig."""
     genos: SparseGenotypes
     dosages: SparseDosages | None
-    granges: pr.PyRanges
-    attrs: pl.DataFrame
+    var_table: pl.DataFrame
+    """Table of variants with columns: `CHROM`, `POS`, `REF`, `ALT`, `ILEN`, and any additional
+    attributes specified in `attrs` on construction."""
     _c_norm: ContigNormalizer
     _s2i: HashTable
     _c_max_idxs: dict[str, int]
@@ -134,7 +130,7 @@ class SparseVar:
     @property
     def n_variants(self) -> int:
         """Number of variants in the dataset."""
-        return len(self.granges)
+        return self.var_table.height
 
     @property
     def has_dosages(self) -> bool:
@@ -170,12 +166,18 @@ class SparseVar:
         else:
             self.dosages = None
         logger.info("Loading genoray index")
-        self.granges, self.attrs = self._load_index(attrs)
-        self._is_biallelic = (self.attrs["ALT"].list.len() == 1).all()
-        vars_per_contig = np.array(
-            [len(self.granges[c]) for c in self.contigs]
-        ).cumsum()
-        self._c_max_idxs = {c: v - 1 for c, v in zip(self.contigs, vars_per_contig)}
+        self.var_table = self._load_var_table(attrs)
+        self._is_biallelic = (self.var_table["ALT"].list.len() == 1).all()
+        vars_per_contig = self.var_table.group_by("CHROM", maintain_order=True).agg(
+            n_variants=pl.len()
+        )
+        self._c_max_idxs = {
+            c: v - 1
+            for c, v in zip(
+                vars_per_contig["CHROM"], vars_per_contig["n_variants"].cum_sum()
+            )
+        }
+        self._c_max_idxs |= {c: 0 for c in self.contigs if c not in self._c_max_idxs}
 
     def var_ranges(
         self,
@@ -202,55 +204,7 @@ class SparseVar:
             Shape: :code:`(ranges, 2)`. The first column is the start index of the variant
             and the second column is the end index of the variant.
         """
-        #! need to clip or else PyRanges can give wrong results
-        starts = np.atleast_1d(np.asarray(starts, POS_TYPE)).clip(min=0)
-        n_ranges = len(starts)
-
-        c = self._c_norm.norm(contig)
-        if c is None:
-            return np.full((n_ranges, 2), np.iinfo(V_IDX_TYPE).max, V_IDX_TYPE)
-
-        ends = np.atleast_1d(np.asarray(ends, POS_TYPE))
-        queries = pr.PyRanges(
-            pl.DataFrame(
-                {
-                    "Chromosome": np.full(n_ranges, c),
-                    "Start": starts,
-                    "End": ends,
-                }
-            )
-            .with_row_index("query")
-            .to_pandas(use_pyarrow_extension_array=True)
-        )
-        join = queries.join(self.granges[c])
-
-        if len(join) == 0:
-            return np.full((n_ranges, 2), np.iinfo(V_IDX_TYPE).max, V_IDX_TYPE)
-
-        join = pl.from_pandas(join.df).select("query", "index")
-
-        missing_queries = np.setdiff1d(
-            np.arange(n_ranges, dtype=np.uint32),
-            join["query"].unique(),
-            assume_unique=True,
-        ).astype(np.uint32)
-        if (missing_queries).size > 0:
-            missing_join = pl.DataFrame(
-                {"query": missing_queries},
-            ).with_columns(index=pl.lit(None).cast(pl.UInt32))
-            join = join.vstack(missing_join)
-
-        var_ranges = (
-            join.group_by("query")
-            .agg(start=pl.col("index").min(), end=pl.col("index").max() + 1)
-            .with_columns(pl.col("start", "end").fill_null(np.iinfo(V_IDX_TYPE).max))
-            .sort("query")
-            .drop("query")
-            .to_numpy()
-            .astype(V_IDX_TYPE)
-        )
-
-        return var_ranges
+        return var_ranges(self._c_norm, self.var_table, contig, starts, ends)
 
     def _find_starts_ends(
         self,
@@ -355,13 +309,7 @@ class SparseVar:
         # (r 2)
         var_ranges = self.var_ranges(contig, starts, ends)
 
-        v_starts = np.concatenate(
-            [
-                self.granges.dfs[c]["Start"]  # type: ignore
-                for c in self.contigs
-                if c in self.granges.dfs  # type: ignore
-            ]
-        )
+        v_starts = (self.var_table["POS"] - 1).to_numpy()
 
         # (2 r s p)
         out = _find_starts_ends_with_length(
@@ -371,7 +319,7 @@ class SparseVar:
             ends,
             var_ranges,
             v_starts,
-            self.attrs["ILEN"].list.first().to_numpy(),
+            self.var_table["ILEN"].list.first().to_numpy(),
             s_idxs,
             self.ploidy,
             self._c_max_idxs[c],
@@ -648,38 +596,26 @@ class SparseVar:
         """Path to the index file."""
         return root / "index.arrow"
 
-    def _load_index(
-        self, attrs: IntoExpr | None = None
-    ) -> tuple[pr.PyRanges, pl.DataFrame]:
-        """Load the index file and return the granges and attributes."""
+    def _load_var_table(self, attrs: IntoExpr | None = None) -> pl.DataFrame:
+        """Load the variant table from the index file."""
 
-        min_attrs: list[Any] = ["ALT", "ILEN"]
+        min_attrs: set[Any] = {"ALT", "ILEN"}
         if attrs is not None:
-            if isinstance(attrs, list):
-                min_attrs.extend(attrs)
+            if not isinstance(attrs, str) and isinstance(attrs, Iterable):
+                min_attrs.update(attrs)
             else:
-                min_attrs.append(attrs)
-        attrs = min_attrs
+                min_attrs.add(attrs)
+        attrs = list(min_attrs)
 
         index = (
             pl.scan_ipc(
                 self._index_path(self.path), row_index_name="index", memory_map=False
             )
-            .select("CHROM", "POS", "REF", "index", *attrs)
+            .select("index", "CHROM", "POS", "REF", *attrs)
             .collect()
         )
 
-        granges = pr.PyRanges(
-            index.select(
-                "index",
-                Chromosome="CHROM",
-                Start=pl.col("POS") - 1,
-                # SVAR is exclusively bi-allelic, so use first in list
-                End=pl.col("POS") - pl.col("ILEN").list.first().clip(upper_bound=0),
-            ).to_pandas()
-        )
-        attr_df = index.select(*attrs)
-        return granges, attr_df
+        return index
 
     def annotate_with_gtf(
         self,
@@ -702,7 +638,7 @@ class SparseVar:
         level_filter : int or None, default 1
             If set, keep rows with GTF 'level' <= level_filter (1 = highest quality).
         write_back : bool, default True
-            If True, update self.attrs in-place and write to index.arrow file.
+            If True, update self.var_table in-place and write to index.arrow file.
         strand_encoding : dict or None, optional
             Encode strand as integers. Example: {'+': 0, '-': 1, None: 2}
         codon_null_token : int or None, optional
@@ -739,11 +675,6 @@ class SparseVar:
                 gtf_df = gtf_df.filter(pl.col("level").cast(pl.Int32) <= level_filter)
             pbar.update(1)
 
-            # Get variant IDs and ILEN
-            ilen_df = self.attrs.select(pl.col("ILEN").list.first()).with_row_index(
-                "varID"
-            )
-
             # CDS Annotation
             pbar.set_description("CDS annotation")
 
@@ -764,10 +695,8 @@ class SparseVar:
             if len(cds_df) == 0:
                 annot = _empty_annot()
             else:
-                annot = _get_strand_and_codon_pos(
-                    cds_df, self.granges, ilen_df, self._c_norm
-                )
-            pbar.update(1)
+                annot = _get_strand_and_codon_pos(cds_df, self.var_table, self._c_norm)
+            pbar.update()
 
             # Apply encoding
             pbar.set_description("Finalizing")
@@ -785,8 +714,8 @@ class SparseVar:
             # Write back if requested
             if write_back:
                 self._load_all_attrs()
-                self.attrs = (
-                    self.attrs.lazy()
+                self.var_table = (
+                    self.var_table.lazy()
                     .with_row_index("varID")
                     .join(annot.lazy(), on="varID", how="left")
                     .drop("varID")
@@ -804,21 +733,20 @@ class SparseVar:
         """Cache the allele frequencies on disk. Will also load all possible attributes and add the AF column in-memory."""
         self._load_all_attrs()
         afs = self._compute_afs()
-        self.attrs = self.attrs.with_columns(AF=pl.Series(afs))
+        self.var_table = self.var_table.with_columns(AF=pl.Series(afs))
         self._write_afs()
 
     def _load_all_attrs(self):
         idx_df = pl.scan_ipc(self._index_path(self.path))
         schema = idx_df.collect_schema()
-        missing = set(schema) - set(self.attrs.columns) - {"CHROM", "POS"}
+        missing = set(schema) - set(self.var_table.columns)
         missing_attrs = idx_df.select(*missing).collect()
-        self.attrs = self.attrs.hstack(missing_attrs)
+        self.var_table = self.var_table.hstack(missing_attrs)
 
     def _compute_afs(self) -> NDArray[np.float32]:
         n_samples, ploidy, _ = cast(tuple[int, int, None], self.genos.shape)
         max_count = n_samples * ploidy
-        n_variants = len(self.granges)
-        afs = np.zeros(n_variants, np.float32)
+        afs = np.zeros(self.n_variants, np.float32)
         _nb_af_helper(afs, self.genos.data, self.genos.offsets, max_count)
         return afs
 
@@ -827,14 +755,7 @@ class SparseVar:
         df.write_ipc(self._index_path(self.path))
 
     def _to_df(self) -> pl.DataFrame:
-        chr_pos = pl.DataFrame(
-            {
-                "CHROM": pl.from_pandas(self.granges.Chromosome),
-                "POS": pl.from_pandas(self.granges.Start + 1),
-            }
-        )
-        df = chr_pos.hstack(self.attrs)
-        return df
+        return self.var_table
 
     def _load_genos(self):
         def memmap2array(layout: Content, **kwargs):
@@ -844,7 +765,7 @@ class SparseVar:
                     data = data[:]
                 return NumpyArray(data)
 
-        self.genos = ak.transform(memmap2array, self.genos)
+        self.genos = ak.transform(memmap2array, self.genos)  # type: ignore
 
 
 @nb.njit(nogil=True, cache=True)
@@ -1159,7 +1080,7 @@ def _find_starts_ends_with_length(
 
                 q_start: POS_TYPE = q_starts[r]
                 q_len: POS_TYPE = q_ends[r] - q_start
-                last_v_end = q_start
+                last_v_end: POS_TYPE = q_start
                 written_len = 0
                 # ensure geno_idx is assigned when start_idx == n_vars
                 geno_idx = start_idx
@@ -1179,7 +1100,7 @@ def _find_starts_ends_with_length(
                             break
 
                         v_write_len = (
-                            max(0, ilen)  # insertion length
+                            max(0, ilen)  # insertion length  # type: ignore
                             + maybe_add_one  # maybe add atomized length
                         )
 
@@ -1197,10 +1118,10 @@ def _find_starts_ends_with_length(
 
                     v_end = (
                         v_start
-                        - min(0, ilen)  # deletion length
+                        - min(0, ilen)  # deletion length  # type: ignore
                         + maybe_add_one  # maybe add atomized length
                     )
-                    last_v_end = max(last_v_end, v_end)
+                    last_v_end = max(last_v_end, v_end)  # type: ignore
 
                 # add o_s to make indices relative to whole array
                 out[1, r, s, p] = geno_idx + o_s + 1
@@ -1225,10 +1146,7 @@ def _empty_annot() -> pl.DataFrame:
 
 
 def _get_strand_and_codon_pos(
-    cds_df: pl.DataFrame,
-    granges: pr.PyRanges,
-    ilen_df: pl.DataFrame,
-    contig_normalizer: ContigNormalizer,
+    cds_df: pl.DataFrame, var_table: pl.DataFrame, contig_normalizer: ContigNormalizer
 ) -> pl.DataFrame:
     """
     Calculate strand and codon position for variants overlapping CDS regions.
@@ -1238,10 +1156,10 @@ def _get_strand_and_codon_pos(
     cds_df : pl.DataFrame
         CDS features from GTF with columns: chrom, start, end, strand, frame,
         gene_id, transcript_id, gene_biotype, transcript_support_level, tag
-    granges : pr.PyRanges
-        Variant genomic ranges
-    ilen_df : pl.DataFrame
-        DataFrame with varID and ILEN columns
+        coordinates should be 1-based
+    var_table : pl.DataFrame
+        Variant table with columns: index, CHROM, POS, ILEN, ...
+        POS should be 1-based
     contig_normalizer : ContigNormalizer
         Normalizer to match chromosome names between CDS and granges
 
@@ -1261,22 +1179,38 @@ def _get_strand_and_codon_pos(
     # Filter out CDS features with chromosomes not in granges
     cds_df = cds_df.filter(pl.col("chrom").is_in(contig_normalizer.contigs))
 
-    pr_cds = _to_pyranges(cds_df)
-    joined_cds = granges.join(pr_cds, apply_strand_suffix=False)
+    # Prepare var_table for pb.overlap by creating interval columns
+    var_intervals = var_table.select(
+        pl.col("ILEN").list.first(),
+        var_id="index",
+        chrom="CHROM",
+        start=pl.col("POS"),
+        end=pl.col("POS") - pl.col("ILEN").list.first().clip(upper_bound=0),
+    )
 
-    if len(joined_cds) == 0:
+    # Check if CDS or var_table is empty
+    if cds_df.is_empty() or var_table.is_empty():
+        return _empty_annot()
+
+    joined_cds = (
+        cast(pl.LazyFrame, pb.overlap(var_intervals, cds_df, use_zero_based=False))
+        .rename(
+            {
+                "start_1": "pos",
+                "start_2": "cds_start",
+                "end_2": "cds_end",
+            }
+        )
+        .drop("end_1", "chrom_1", "chrom_2")
+        .rename(lambda c: c.replace("_2", "").replace("_1", ""))
+        .collect()
+    )
+
+    if joined_cds.height == 0:
         return _empty_annot()
 
     annot = (
-        pl.from_pandas(joined_cds.df)
-        .with_columns(
-            pl.col("index").cast(pl.UInt32).alias("varID"),
-            # Keep PyRanges 0-based coordinates for direct offset calculation
-            pl.col("Start").alias("pos"),
-            pl.col("Start_b").alias("cds_start"),
-            cds_end="End_b",  # Used only for computing CDS span length
-        )
-        .join(ilen_df, on="varID", how="left")
+        joined_cds
         # Positive strand: (rel_pos - frame) % 3
         # Negative strand: (2 * (rel_pos - frame)) % 3 (reverse complement pattern)
         .with_columns(
@@ -1286,7 +1220,7 @@ def _get_strand_and_codon_pos(
                 & (pl.col("ILEN") == 0)
             )
             .then(
-                pl.when(pl.col("Strand") == "+")
+                pl.when(pl.col("strand") == "+")
                 .then((pl.col("pos") - pl.col("cds_start") - pl.col("frame")) % 3)
                 .otherwise(
                     (2 * (pl.col("pos") - pl.col("cds_start") - pl.col("frame"))) % 3
@@ -1323,7 +1257,7 @@ def _get_strand_and_codon_pos(
         )
         .sort(
             [
-                "varID",
+                "var_id",
                 "rank_pc",
                 "rank_canonical",
                 "rank_tsl",
@@ -1339,19 +1273,15 @@ def _get_strand_and_codon_pos(
                 False,
             ],  # kept this for code clarity (default also the same)
         )
-        .group_by("varID", maintain_order=True)
-        .agg(
-            pl.col("gene_id").first(),
-            pl.col("Strand").first().alias("strand"),
-            pl.col("codon_pos").first(),
-        )
+        .group_by("var_id", maintain_order=True)
+        .agg(pl.col("gene_id", "strand", "codon_pos").first())
     )
 
     return annot
 
 
 def _load_gtf(gtf: str | pl.DataFrame) -> pl.DataFrame:
-    """Load GTF file as Polars DataFrame."""
+    """Load GTF file as a 1-based polars DataFrame."""
     if isinstance(gtf, pl.DataFrame):
         return gtf.rename({"seqname": "chrom"}, strict=False)
 
@@ -1368,18 +1298,4 @@ def _load_gtf(gtf: str | pl.DataFrame) -> pl.DataFrame:
         )
         .collect()
         .rename({"seqname": "chrom"}, strict=False)
-    )
-
-
-def _to_pyranges(df: pl.DataFrame) -> pr.PyRanges:
-    """Convert 1-based polars DataFrame to PyRanges, e.g. a GTF."""
-    return pr.PyRanges(
-        df.with_columns(
-            pl.col("chrom").alias("Chromosome"),
-            (pl.col("start") - 1).alias("Start"),
-            pl.col("end").alias("End"),
-            pl.col("strand").alias("Strand"),
-        )
-        .drop("chrom", "start", "end", "strand")
-        .to_pandas()
     )
