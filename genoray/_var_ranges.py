@@ -1,20 +1,24 @@
 from __future__ import annotations
 
+from typing import cast
+
 import numba as nb
 import numpy as np
 import polars as pl
+import polars_bio as pb
 from numpy.typing import ArrayLike, NDArray
+from seqpro.rag import OFFSET_TYPE, lengths_to_offsets
 
-from ._types import INT64_MAX, POS_TYPE, V_IDX_TYPE
-from ._utils import ContigNormalizer
+from ._types import POS_TYPE, V_IDX_TYPE
+from ._utils import DTYPE, ContigNormalizer, np_to_pl_dtype
 
 
 def var_ranges(
     contig_normalizer: ContigNormalizer,
     var_table: pl.DataFrame,
     contig: str,
-    starts: ArrayLike = 0,
-    ends: ArrayLike = INT64_MAX,
+    starts: ArrayLike,
+    ends: ArrayLike,
 ) -> NDArray[V_IDX_TYPE]:
     """Get variant index ranges for each query range. i.e.
     For each query range, return the minimum and maximum variant that overlaps.
@@ -35,7 +39,7 @@ def var_ranges(
         Shape: :code:`(ranges, 2)`. The first column is the start index of the variant
         and the second column is the end index of the variant.
     """
-    starts = np.atleast_1d(np.asarray(starts, POS_TYPE))
+    starts = np.atleast_1d(np.asarray(starts, POS_TYPE)).clip(min=0)
     n_ranges = len(starts)
 
     c = contig_normalizer.norm(contig)
@@ -88,6 +92,114 @@ def var_ranges(
     var_ranges[no_vars] = np.iinfo(V_IDX_TYPE).max
 
     return var_ranges
+
+
+def var_indices(
+    idx_dtype: type[DTYPE],
+    contig_normalizer: ContigNormalizer,
+    var_table: pl.DataFrame | pl.LazyFrame,
+    contig: str,
+    starts: ArrayLike,
+    ends: ArrayLike,
+) -> tuple[NDArray[DTYPE], NDArray[OFFSET_TYPE]]:
+    """Get variant indices for each query range."""
+    starts = np.atleast_1d(np.asarray(starts, POS_TYPE)).clip(min=0)
+    n_ranges = len(starts)
+    if n_ranges == 0:
+        return np.empty(0, idx_dtype), np.zeros(n_ranges + 1, OFFSET_TYPE)
+
+    c = contig_normalizer.norm(contig)
+    if c is None:
+        return np.empty(0, idx_dtype), np.zeros(n_ranges + 1, OFFSET_TYPE)
+
+    ends = np.atleast_1d(np.asarray(ends, POS_TYPE))
+
+    var_table = (
+        var_table.lazy()
+        .filter(pl.col("CHROM") == c)
+        .select(
+            pl.col("index").cast(np_to_pl_dtype(idx_dtype)),
+            chrom=pl.col("CHROM").cast(pl.Utf8),
+            start=pl.col("POS") - 1,
+            end=pl.col("POS") - pl.col("ILEN").list.first().clip(upper_bound=0),
+        )
+    )
+
+    queries = (
+        pl.DataFrame({"chrom": c, "start": starts, "end": ends})
+        .lazy()
+        .with_row_index("query")
+    )
+    join = (
+        cast(
+            pl.LazyFrame,
+            pb.overlap(
+                queries, var_table, use_zero_based=True, projection_pushdown=True
+            ),
+        )
+        .sort("query_1", "index_2")
+        .collect()
+    )
+
+    if join.height == 0:
+        return np.empty(0, idx_dtype), np.zeros(n_ranges + 1, OFFSET_TYPE)
+
+    idxs = join["index_2"].to_numpy()
+    lens = join.group_by("query_1", maintain_order=True).len()["len"].to_numpy()
+    offsets = lengths_to_offsets(lens)
+    return idxs, offsets
+
+
+def var_counts(
+    contig_normalizer: ContigNormalizer,
+    var_table: pl.DataFrame | pl.LazyFrame,
+    contig: str,
+    starts: ArrayLike,
+    ends: ArrayLike,
+) -> NDArray[np.uint32]:
+    starts = np.atleast_1d(np.asarray(starts, POS_TYPE)).clip(min=0)
+    n_ranges = len(starts)
+    if n_ranges == 0:
+        return np.zeros(n_ranges, dtype=np.uint32)
+
+    c = contig_normalizer.norm(contig)
+    if c is None:
+        return np.zeros(n_ranges, dtype=np.uint32)
+
+    ends = np.atleast_1d(np.asarray(ends, POS_TYPE))
+
+    var_table = (
+        var_table.lazy()
+        .filter(pl.col("CHROM") == c)
+        .select(
+            chrom=pl.col("CHROM").cast(pl.Utf8),
+            start=pl.col("POS") - 1,
+            end=pl.col("POS") - pl.col("ILEN").list.first().clip(upper_bound=0),
+        )
+    )
+
+    queries = (
+        pl.DataFrame({"chrom": c, "start": starts, "end": ends})
+        .lazy()
+        .with_row_index("query")
+    )
+    counts = (
+        cast(
+            pl.LazyFrame,
+            pb.overlap(
+                queries, var_table, use_zero_based=True, projection_pushdown=True
+            ),
+        )
+        .group_by("query_1", maintain_order=True)
+        .len()
+        .with_columns(pl.col("len").cast(pl.UInt32))
+        .collect()
+    )
+
+    if counts.height == 0:
+        return np.zeros(n_ranges, dtype=np.uint32)
+
+    return counts["len"].to_numpy()
 
 
 @nb.guvectorize(

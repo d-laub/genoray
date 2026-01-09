@@ -9,27 +9,22 @@ from typing import Any, Callable, Generator, TypeVar, cast
 import numpy as np
 import pgenlib
 import polars as pl
-import pyranges as pr
 from hirola import HashTable
 from loguru import logger
 from more_itertools import mark_ends, windowed
 from numpy.typing import ArrayLike, NDArray
 from phantom import Phantom
-from seqpro.rag import OFFSET_TYPE, lengths_to_offsets
+from seqpro.rag import OFFSET_TYPE
 from typing_extensions import Self, TypeGuard, assert_never
 from zstandard import ZstdDecompressor
 
+from ._types import POS_MAX, POS_TYPE
 from ._utils import ContigNormalizer, format_memory, hap_ilens, parse_memory
+from ._var_ranges import var_counts, var_indices
 from .exprs import ILEN, is_biallelic
-
-POS_TYPE = np.int64
-"""Dtype for PGEN range indices. This determines the maximum size of a contig in genoray.
-We have to use int64 because this is what PyRanges uses."""
 
 V_IDX_TYPE = np.uint32
 """Dtype for PGEN variant indices (uint32). This determines the maximum number of unique variants in a file."""
-
-INT64_MAX = np.iinfo(POS_TYPE).max
 
 
 def _is_genos(obj: Any) -> TypeGuard[Genos]:
@@ -171,7 +166,7 @@ class PGEN:
     """Ploidy of the samples. The PGEN format currently only supports diploid (2)."""
     contigs: list[str]
     """Naturally sorted list of contig names in the PGEN file."""
-    _index: pr.PyRanges
+    _index: pl.DataFrame
     _geno_pgen: pgenlib.PgenReader
     _dose_pgen: pgenlib.PgenReader
     _s_idx: NDArray[np.uint32] | slice
@@ -237,10 +232,15 @@ class PGEN:
             self._dose_pgen = self._geno_pgen
         self._dose_path = dosage_path
 
-        self._index, self._sei, self.contigs = _read_index(self._index_path(), filter)
+        self._index, self._sei, self.contigs = _load_index(self._index_path(), filter)
         self._c_norm = ContigNormalizer(self.contigs)
-        vars_per_contig = np.array([len(self._index[c]) for c in self.contigs]).cumsum()
-        self._c_max_idxs = {c: v - 1 for c, v in zip(self.contigs, vars_per_contig)}
+        # what variant index does each contig start at
+        contig_var_offsets = (
+            self._index.group_by("CHROM", maintain_order=True)
+            .agg(offset=pl.col("index").max())["offset"]
+            .to_numpy()
+        )
+        self._c_max_idxs = {c: v for c, v in zip(self.contigs, contig_var_offsets)}
 
     @property
     def current_samples(self) -> list[str]:
@@ -264,17 +264,20 @@ class PGEN:
     @filter.setter
     def filter(self, filter: pl.Expr | None):
         """Set the Polars expression to filter variants. Should return True for variants to keep."""
-        self._index, self._sei, _ = _read_index(self._index_path(), filter)
+        self._index, self._sei, _ = _load_index(self._index_path(), filter)
         self._filter = filter
 
     def _index_path(self) -> Path:
         """Path to the index file."""
         # check whether pvar or pvar.zst
         index = self._geno_path.with_suffix(".pvar")
+
         if not index.exists():
             index = self._geno_path.with_suffix(".pvar.zst")
+
         if not index.exists():
             raise FileNotFoundError("No index file found.")
+
         return index.with_suffix(f"{index.suffix}.gvi")
 
     def set_samples(self, samples: ArrayLike | None) -> Self:
@@ -340,7 +343,7 @@ class PGEN:
         self,
         contig: str,
         starts: ArrayLike = 0,
-        ends: ArrayLike = INT64_MAX,
+        ends: ArrayLike = POS_MAX,
     ) -> NDArray[np.uint32]:
         """Return the start and end indices of the variants in the given ranges.
 
@@ -358,36 +361,13 @@ class PGEN:
         n_variants
             Shape: :code:`(ranges)`. Number of variants in the given ranges.
         """
-        #! need to clip or else PyRanges can give wrong results
-        starts = np.atleast_1d(np.asarray(starts, POS_TYPE)).clip(min=0)
-        n_ranges = len(starts)
-
-        c = self._c_norm.norm(contig)
-        if c is None:
-            return np.zeros_like(starts, dtype=np.uint32)
-
-        ends = np.atleast_1d(np.asarray(ends, POS_TYPE))
-        queries = pr.PyRanges(
-            pl.DataFrame(
-                {
-                    "Chromosome": np.full(n_ranges, c),
-                    "Start": starts,
-                    "End": ends,
-                }
-            ).to_pandas(use_pyarrow_extension_array=True)
-        )
-        return (
-            queries.count_overlaps(self._index[c])
-            .df["NumberOverlaps"]
-            .to_numpy()
-            .astype(np.uint32)
-        )
+        return var_counts(self._c_norm, self._index, contig, starts, ends)
 
     def var_idxs(
         self,
         contig: str,
         starts: ArrayLike = 0,
-        ends: ArrayLike = INT64_MAX,
+        ends: ArrayLike = POS_MAX,
     ) -> tuple[NDArray[V_IDX_TYPE], NDArray[OFFSET_TYPE]]:
         """Get variant indices and the number of indices per range.
 
@@ -406,43 +386,14 @@ class PGEN:
 
             Shape: (ranges+1). Offsets to get variant indices for each range.
         """
-        starts = np.atleast_1d(np.asarray(starts, POS_TYPE))
-        n_ranges = len(starts)
-
-        c = self._c_norm.norm(contig)
-        if c is None:
-            return np.empty(0, V_IDX_TYPE), np.zeros(n_ranges + 1, OFFSET_TYPE)
-
-        ends = np.atleast_1d(np.asarray(ends, POS_TYPE))
-        queries = pr.PyRanges(
-            pl.DataFrame(
-                {
-                    "Chromosome": np.full(n_ranges, c),
-                    "Start": starts,
-                    "End": ends,
-                }
-            )
-            .with_row_index("query")
-            .to_pandas(use_pyarrow_extension_array=True)
-        )
-        join = pl.from_pandas(queries.join(self._index[c]).df)
-
-        if join.height == 0:
-            return np.empty(0, V_IDX_TYPE), np.zeros(n_ranges + 1, OFFSET_TYPE)
-
-        join = join.sort("query", "index")
-        idxs = join["index"].to_numpy()
-        lens = self.n_vars_in_ranges(c, starts, ends)
-        offsets = lengths_to_offsets(lens)
-        return idxs, offsets
+        return var_indices(V_IDX_TYPE, self._c_norm, self._index, contig, starts, ends)
 
     def read(
         self,
         contig: str,
         start: int | np.integer = 0,
-        end: int | np.integer = INT64_MAX,
+        end: int | np.integer = POS_MAX,
         mode: type[T] = Genos,
-        out: T | None = None,
     ) -> T:
         """Read genotypes and/or dosages for a range.
 
@@ -457,11 +408,6 @@ class PGEN:
         mode
             Type of data to read. Can be :code:`Genos`, :code:`Dosages`, :code:`GenosPhasing`,
             :code:`GenosDosages`, or :code:`GenosPhasingDosages`.
-        out
-            Array to write the data to. If None, a new array will be created. The shape and dtype of the array
-            should match the expected output shape for the given mode. For example, if mode is :code:`Genos`,
-            the shape should be :code:`(samples ploidy variants)`. If mode is :code:`Dosages`, the shape should
-            be :code:`(samples variants)`.
 
         Returns
         -------
@@ -476,39 +422,30 @@ class PGEN:
 
         var_idxs, _ = self.var_idxs(c, start, end)
         n_variants = len(var_idxs)
+
         if n_variants == 0:
             return mode.empty(self.n_samples, self.ploidy, 0)
 
         if issubclass(mode, Genos):
-            if out is not None:
-                out = mode.parse(out)
-            _out = self._read_genos(var_idxs, out)
+            out = self._read_genos(var_idxs)
         elif issubclass(mode, Dosages):
-            if out is not None:
-                out = mode.parse(out)
-            _out = self._read_dosages(var_idxs, out)
+            out = self._read_dosages(var_idxs)
         elif issubclass(mode, GenosPhasing):
-            if out is not None:
-                out = mode.parse(out)
-            _out = self._read_genos_phasing(var_idxs, out)
+            out = self._read_genos_phasing(var_idxs)
         elif issubclass(mode, GenosDosages):
-            if out is not None:
-                out = mode.parse(out)
-            _out = self._read_genos_dosages(var_idxs, out)
+            out = self._read_genos_dosages(var_idxs)
         elif issubclass(mode, GenosPhasingDosages):
-            if out is not None:
-                out = mode.parse(out)
-            _out = self._read_genos_phasing_dosages(var_idxs, out)
+            out = self._read_genos_phasing_dosages(var_idxs)
         else:
             assert_never(mode)
 
-        return _out  # type: ignore
+        return cast(T, out)
 
     def chunk(
         self,
         contig: str,
         start: int | np.integer = 0,
-        end: int | np.integer = INT64_MAX,
+        end: int | np.integer = POS_MAX,
         max_mem: int | str = "4g",
         mode: type[T] = Genos,
     ) -> Generator[T]:
@@ -582,7 +519,7 @@ class PGEN:
         self,
         contig: str,
         starts: ArrayLike = 0,
-        ends: ArrayLike = INT64_MAX,
+        ends: ArrayLike = POS_MAX,
         mode: type[T] = Genos,
     ) -> tuple[T, NDArray[OFFSET_TYPE]]:
         """Read genotypes and/or dosages for multiple ranges.
@@ -655,7 +592,7 @@ class PGEN:
         self,
         contig: str,
         starts: ArrayLike = 0,
-        ends: ArrayLike = INT64_MAX,
+        ends: ArrayLike = POS_MAX,
         max_mem: int | str = "4g",
         mode: type[T] = Genos,
     ) -> Generator[Generator[T]]:
@@ -754,7 +691,7 @@ class PGEN:
         self,
         contig: str,
         starts: ArrayLike = 0,
-        ends: ArrayLike = INT64_MAX,
+        ends: ArrayLike = POS_MAX,
         max_mem: int | str = "4g",
         mode: type[L] = Genos,
     ) -> Generator[
@@ -927,82 +864,49 @@ class PGEN:
 
         return mem
 
-    def _read_genos(
-        self, var_idxs: NDArray[V_IDX_TYPE], out: Genos | None = None
-    ) -> Genos:
-        if out is None:
-            _out = np.empty(
-                (len(var_idxs), self.n_samples * self.ploidy), dtype=np.int32
-            )
-        else:
-            _out = out
-        self._geno_pgen.read_alleles_list(var_idxs, _out)
-        _out = _out.reshape(len(var_idxs), self.n_samples, self.ploidy).transpose(
+    def _read_genos(self, var_idxs: NDArray[V_IDX_TYPE]) -> Genos:
+        out = np.empty(
+            (len(var_idxs), self.n_samples * self.ploidy), dtype=Genos._dtype
+        )
+        self._geno_pgen.read_alleles_list(var_idxs, out)
+        out = out.reshape(len(var_idxs), self.n_samples, self.ploidy).transpose(
             1, 2, 0
         )[self._s_sorter]
-        _out[_out == -9] = -1
-        return Genos(_out)
+        out[out == -9] = -1
+        return cast(Genos, out)
 
-    def _read_dosages(
-        self, var_idxs: NDArray[V_IDX_TYPE], out: Dosages | None = None
-    ) -> Dosages:
-        if out is None:
-            _out = np.empty((len(var_idxs), self.n_samples), dtype=np.float32)
-        else:
-            _out = out
+    def _read_dosages(self, var_idxs: NDArray[V_IDX_TYPE]) -> Dosages:
+        out = np.empty((len(var_idxs), self.n_samples), dtype=Dosages._dtype)
+        self._dose_pgen.read_dosages_list(var_idxs, out)
+        out = out.transpose(1, 0)[self._s_sorter]
+        out[out == -9] = np.nan
+        return cast(Dosages, out)
 
-        self._dose_pgen.read_dosages_list(var_idxs, _out)
-        _out = _out.transpose(1, 0)[self._s_sorter]
-        _out[_out == -9] = np.nan
+    def _read_genos_dosages(self, var_idxs: NDArray[V_IDX_TYPE]) -> GenosDosages:
+        genos = self._read_genos(var_idxs)
+        dosages = self._read_dosages(var_idxs)
+        return cast(GenosDosages, (genos, dosages))
 
-        return Dosages.parse(_out)
-
-    def _read_genos_dosages(
-        self, var_idxs: NDArray[V_IDX_TYPE], out: GenosDosages | None = None
-    ) -> GenosDosages:
-        if out is None:
-            _out = (None, None)
-        else:
-            _out = out
-
-        genos = self._read_genos(var_idxs, _out[0])
-        dosages = self._read_dosages(var_idxs, _out[1])
-
-        return GenosDosages((genos, dosages))
-
-    def _read_genos_phasing(
-        self, var_idxs: NDArray[V_IDX_TYPE], out: GenosPhasing | None = None
-    ) -> GenosPhasing:
-        if out is None:
-            genos = np.empty(
-                (len(var_idxs), self.n_samples * self.ploidy), dtype=np.int32
-            )
-            phasing = np.empty((len(var_idxs), self.n_samples), dtype=np.bool_)
-        else:
-            genos = out[0]
-            phasing = out[1]
-
-        self._dose_pgen.read_alleles_and_phasepresent_list(var_idxs, genos, phasing)
+    def _read_genos_phasing(self, var_idxs: NDArray[V_IDX_TYPE]) -> GenosPhasing:
+        genos = np.empty(
+            (len(var_idxs), self.n_samples * self.ploidy), dtype=Genos._dtype
+        )
+        phasing = np.empty((len(var_idxs), self.n_samples), dtype=Phasing._dtype)
+        self._geno_pgen.read_alleles_and_phasepresent_list(var_idxs, genos, phasing)
         genos = genos.reshape(len(var_idxs), self.n_samples, self.ploidy).transpose(
             1, 2, 0
         )[self._s_sorter]
         genos[genos == -9] = -1
         phasing = phasing.transpose(1, 0)[self._s_sorter]
 
-        return GenosPhasing.parse((genos, phasing))
+        return cast(GenosPhasing, (genos, phasing))
 
     def _read_genos_phasing_dosages(
-        self, var_idxs: NDArray[V_IDX_TYPE], out: GenosPhasingDosages | None = None
+        self, var_idxs: NDArray[V_IDX_TYPE]
     ) -> GenosPhasingDosages:
-        if out is None:
-            _out = (None, None)
-        else:
-            _out = (GenosPhasing(out[:2]), out[2])
-
-        genos_phasing = self._read_genos_phasing(var_idxs, _out[0])
-        dosages = self._read_dosages(var_idxs, _out[1])
-
-        return GenosPhasingDosages((*genos_phasing, dosages))
+        genos_phasing = self._read_genos_phasing(var_idxs)
+        dosages = self._read_dosages(var_idxs)
+        return cast(GenosPhasingDosages, (*genos_phasing, dosages))
 
 
 def _gen_with_length(
@@ -1160,9 +1064,9 @@ def _valid_index(index_path: Path) -> bool:
     return index_mtime > pvar_mtime
 
 
-def _read_index(
+def _load_index(
     index_path: Path, filter: pl.Expr | None
-) -> tuple[pr.PyRanges, StartsEndsIlens | None, list[str]]:
+) -> tuple[pl.DataFrame, StartsEndsIlens | None, list[str]]:
     if not _valid_index(index_path):
         logger.info("Genoray PVAR index not found or out-of-date, creating index.")
         _write_index(index_path)
@@ -1171,9 +1075,17 @@ def _read_index(
     index = pl.scan_ipc(
         index_path, row_index_name="index", memory_map=False
     ).with_columns(
-        Start=pl.col("POS") - 1,
-        End=pl.col("POS") + pl.col("REF").str.len_bytes() - 1,
+        pl.col("index").cast(pl.UInt32),
+        start=pl.col("POS") - 1,
+        end=pl.col("POS") + pl.col("REF").str.len_bytes() - 1,
     )
+
+    schema = index.collect_schema()
+    if schema["ALT"] == pl.Utf8:
+        index = index.with_columns(pl.col("ALT").str.split(","))
+
+    if "ILEN" not in schema:
+        index = index.with_columns(ILEN=ILEN)
 
     if filter is None:
         has_multiallelics = index.select((~is_biallelic).any()).collect().item()
@@ -1189,17 +1101,17 @@ def _read_index(
         # anyway, so they won't be accessed
         # if the filter is changed, the index is invalidated and re-read (see filter setter)
         if filter is None:
-            data = index.select("Start", "End", pl.col("ILEN", "ALT").list.first())
+            data = index.select("start", "end", pl.col("ILEN", "ALT").list.first())
         else:
             data = index.with_columns(
                 ILEN=pl.when(filter)
                 .then(pl.col("ILEN").list.first())
                 .otherwise(pl.lit(0))
             )
-            data = data.select("Start", "End", "ILEN", pl.col("ALT").list.first())
+            data = data.select("start", "end", "ILEN", pl.col("ALT").list.first())
         data = data.collect()
-        v_starts = data["Start"].to_numpy()
-        v_ends = data["End"].to_numpy()
+        v_starts = data["start"].to_numpy()
+        v_ends = data["end"].to_numpy()
         ilens = data["ILEN"].to_numpy()
         alt = data["ALT"]
         sei = StartsEndsIlens(v_starts, v_ends, ilens, alt)
@@ -1207,26 +1119,18 @@ def _read_index(
     if filter is not None:
         index = index.filter(filter)
 
-    index = index.select("index", "Start", "End", Chromosome="CHROM").collect()
+    index = index.select("index", "CHROM", "POS", "REF", "ALT", "ILEN").collect()
     # PVAR contigs are not necessarily sorted, only guaranteed to be sorted within a contig
-    contigs = index["Chromosome"].unique(maintain_order=True).to_list()
-    pyr = pr.PyRanges(index.to_pandas(use_pyarrow_extension_array=True))
-    return pyr, sei, contigs
+    contigs = index["CHROM"].unique(maintain_order=True).to_list()
+    return index, sei, contigs
 
 
-# TODO: can this be implemented using the NCLS lib underlying PyRanges? Then we can
-# pass np.memmap arrays directly instead of having to futz with DataFrames? This will likely make
-# filtering less ergonomic/harder to make ergonomic though, but a memmap approach should be scalable
-# to datasets with billions+ unique variants (reduce memory), reduce instantion time, but ~increase query time.
-# Unless, NCLS creates a bunch of data structures in memory anyway.
 def _write_index(index_path: Path):
     """Write PVAR index."""
 
     (
         _scan_pvar(index_path.with_suffix(""))
         .rename({"#CHROM": "CHROM"})
-        .with_columns(ALT=pl.col("ALT").str.split(","))
-        .with_columns(ILEN=ILEN)
         .sink_ipc(index_path)
     )
 

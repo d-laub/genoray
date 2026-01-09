@@ -10,7 +10,7 @@ dependencies = [
     "seqpro>=0.8.0",
     "genoray>=0.15.0",
     "numpy>=1.26",
-    "pandas>=2.2.2",
+    "pandas>=2.2.3",
     "hirola>=0.3.0",
     "pgenlib>=0.91.0",
     "cyvcf2>=0.31.1",
@@ -29,6 +29,7 @@ dependencies = [
     "cyclopts",
     "zstandard",
     "pydantic",
+    "oxbow>=0.5.1, <0.6",
 ]
 
 [project.optional-dependencies]

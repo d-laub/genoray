@@ -15,14 +15,22 @@ Applicable for PGEN files and the experimental :meth:`VCF._load_index` method.
 
 import polars as pl
 
+"""
+on-disk schema is same as in-memory except:
+CHROM is cat or enum
+ALT can be comma delimited str or list[str]
+ILEN is optional list[int]
+"""
+
+# in-memory schema
 IndexSchema = {
-    "CHROM": pl.Categorical,
+    "CHROM": pl.Enum,
     "POS": pl.Int64,
     "REF": pl.Utf8,
     "ALT": pl.List(pl.Utf8),
     "ILEN": pl.List(pl.Int32),
 }
-"""Minimum schema for a genoray index file (extension :code:`.gvi`)."""
+"""Minimum in-memory schema for a genoray index file (extension :code:`.gvi`)."""
 
 is_snp = pl.col("ILEN").list.eval(pl.element() == 0).list.all()
 """True if all ALT alleles are SNPs (single nucleotide polymorphisms)."""

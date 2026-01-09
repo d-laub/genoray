@@ -10,6 +10,7 @@ py39 = ["py39"]
 py310 = ["py310"]
 py311 = ["py311"]
 py312 = ["py312"]
+sbox = ['sbox']
 
 [dependencies]
 uv = "*"
@@ -47,6 +48,7 @@ seqpro = "*"
 cyclopts = "*"
 zstandard = "*"
 pydantic = "*"
+oxbow = "*"
 
 [tasks]
 gen = { cmd = "sh tests/data/gen_from_vcf.sh" }
@@ -61,7 +63,7 @@ publish = """
 
 [feature.dev.pypi-dependencies]
 numpy = "==1.26"
-pandas = "==2.2.2"
+pandas = "==2.2.3"
 polars = "==1.30"
 polars-bio = "==0.19.0"
 typing-extensions = ">=4.11"
@@ -83,6 +85,7 @@ zstandard = "*"
 pydantic = "*"
 # non-pkg dependencies
 seaborn = "*"
+oxbow = "==0.5.1"
 
 [feature.dev.tasks]
 i-kernel = "ipython kernel install --user --name genoray"
@@ -127,3 +130,13 @@ python = "3.11.*"
 
 [feature.py312.dependencies]
 python = "3.12.*"
+
+[feature.sbox.dependencies]
+python = "3.12.*"
+
+[feature.sbox.pypi-dependencies]
+xarray = ">=2024.7.0, <2026"
+zarr = ">=2.18.2, <4"
+
+[feature.sbox.tasks]
+i-kernel-sbox = "ipython kernel install --user --name genoray-sbox"

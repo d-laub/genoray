@@ -6,8 +6,9 @@ from pathlib import Path
 from typing import Any, Iterable, TypeVar, overload
 
 import numpy as np
+import polars as pl
 from hirola import HashTable
-from numpy.typing import ArrayLike, NDArray
+from numpy.typing import ArrayLike, DTypeLike, NDArray
 from typing_extensions import TypeGuard
 
 DTYPE = TypeVar("DTYPE", bound=np.generic)
@@ -155,3 +156,50 @@ def variant_file_type(path: str | Path):
         and path.with_suffix(".psam").exists()
     ):
         return "pgen"
+
+
+def np_to_pl_dtype(dtype: DTypeLike) -> type[pl.DataType]:
+    dtype = np.dtype(dtype)
+
+    if dtype == np.float16:
+        return pl.Float16
+    elif dtype == np.float32:
+        return pl.Float32
+    elif dtype == np.float64:
+        return pl.Float64
+
+    elif dtype == np.int8:
+        return pl.Int8
+    elif dtype == np.int16:
+        return pl.Int16
+    elif dtype == np.int32:
+        return pl.Int32
+    elif dtype == np.int64:
+        return pl.Int64
+
+    elif dtype == np.uint8:
+        return pl.UInt8
+    elif dtype == np.uint16:
+        return pl.UInt16
+    elif dtype == np.uint32:
+        return pl.UInt32
+    elif dtype == np.uint64:
+        return pl.UInt64
+
+    elif dtype == np.datetime64:
+        return pl.Datetime
+    elif dtype == np.timedelta64:
+        return pl.Duration
+
+    elif dtype == np.str_:
+        return pl.Utf8
+    elif dtype == np.bytes_:
+        return pl.Binary
+
+    elif dtype == np.bool_:
+        return pl.Boolean
+    elif dtype == np.object_:
+        return pl.Object
+
+    else:
+        raise ValueError(f"Unsupported dtype: {dtype}")
