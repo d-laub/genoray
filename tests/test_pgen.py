@@ -6,7 +6,7 @@ import numpy as np
 from numpy.typing import ArrayLike, NDArray
 from pytest_cases import parametrize_with_cases
 
-from genoray._pgen import PGEN, POS_TYPE, V_IDX_TYPE
+from genoray._pgen import PGEN, POS_MAX, V_IDX_TYPE
 
 tdir = Path(__file__).parent
 ddir = tdir / "data"
@@ -262,7 +262,7 @@ def test_chunk_with_length(
 def n_vars_miss_chr():
     contig = "chr3"
     starts = 0
-    ends = np.iinfo(np.int64).max
+    ends = POS_MAX
     desired = np.array([0], dtype=np.uint32)
     return contig, starts, ends, desired
 
@@ -278,7 +278,7 @@ def n_vars_none():
 def n_vars_all():
     contig = "chr1"
     starts = 0
-    ends = np.iinfo(np.int64).max
+    ends = POS_MAX
     desired = np.array([3], dtype=np.uint32)
     return contig, starts, ends, desired
 
@@ -307,7 +307,7 @@ def test_n_vars_in_ranges(
 def var_idxs_miss_chr():
     contig = "chr3"
     starts = 0
-    ends = np.iinfo(POS_TYPE).max
+    ends = POS_MAX
     desired = (np.array([], dtype=V_IDX_TYPE), np.array([0, 0], dtype=np.uint64))
     return contig, starts, ends, desired
 
@@ -323,7 +323,7 @@ def var_idxs_none():
 def var_idxs_all():
     contig = "chr1"
     starts = 0
-    ends = np.iinfo(POS_TYPE).max
+    ends = POS_MAX
     desired = (np.array([0, 1, 2], dtype=V_IDX_TYPE), np.array([0, 3], dtype=np.uint64))
     return contig, starts, ends, desired
 

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import shutil
+import warnings
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, Generator, Iterable, Literal, Union, cast, overload
+from typing import Generator, Iterable, Literal, Union, cast, overload
 
 import awkward as ak
 import numba as nb
@@ -22,10 +23,11 @@ from seqpro.rag import OFFSET_TYPE, Ragged, lengths_to_offsets
 from tqdm.auto import tqdm
 
 from ._pgen import PGEN
-from ._types import DOSAGE_TYPE, DTYPE, INT64_MAX, POS_TYPE, V_IDX_TYPE
+from ._types import DOSAGE_TYPE, DTYPE, POS_MAX, POS_TYPE, V_IDX_TYPE
 from ._utils import ContigNormalizer
 from ._var_ranges import var_ranges
 from ._vcf import VCF
+from .exprs import ILEN
 
 SparseGenotypes = Ragged[V_IDX_TYPE]
 SparseDosages = Ragged[DOSAGE_TYPE]
@@ -114,7 +116,7 @@ class SparseVar:
     """Contigs in the order they appear in the dataset. Variants are only sorted within each contig."""
     genos: SparseGenotypes
     dosages: SparseDosages | None
-    var_table: pl.DataFrame
+    index: pl.DataFrame
     """Table of variants with columns: `CHROM`, `POS`, `REF`, `ALT`, `ILEN`, and any additional
     attributes specified in `attrs` on construction."""
     _c_norm: ContigNormalizer
@@ -130,7 +132,7 @@ class SparseVar:
     @property
     def n_variants(self) -> int:
         """Number of variants in the dataset."""
-        return self.var_table.height
+        return self.index.height
 
     @property
     def has_dosages(self) -> bool:
@@ -166,9 +168,9 @@ class SparseVar:
         else:
             self.dosages = None
         logger.info("Loading genoray index")
-        self.var_table = self._load_var_table(attrs)
-        self._is_biallelic = (self.var_table["ALT"].list.len() == 1).all()
-        vars_per_contig = self.var_table.group_by("CHROM", maintain_order=True).agg(
+        self.index = self._load_index(attrs)
+        self._is_biallelic = (self.index["ALT"].list.len() == 1).all()
+        vars_per_contig = self.index.group_by("CHROM", maintain_order=True).agg(
             n_variants=pl.len()
         )
         self._c_max_idxs = {
@@ -183,7 +185,7 @@ class SparseVar:
         self,
         contig: str,
         starts: ArrayLike = 0,
-        ends: ArrayLike = INT64_MAX,
+        ends: ArrayLike = POS_MAX,
     ) -> NDArray[V_IDX_TYPE]:
         """Get variant index ranges for each query range. i.e.
         For each query range, return the minimum and maximum variant that overlaps.
@@ -204,13 +206,13 @@ class SparseVar:
             Shape: :code:`(ranges, 2)`. The first column is the start index of the variant
             and the second column is the end index of the variant.
         """
-        return var_ranges(self._c_norm, self.var_table, contig, starts, ends)
+        return var_ranges(self._c_norm, self.index, contig, starts, ends)
 
     def _find_starts_ends(
         self,
         contig: str,
         starts: ArrayLike = 0,
-        ends: ArrayLike = INT64_MAX,
+        ends: ArrayLike = POS_MAX,
         samples: ArrayLike | None = None,
     ) -> NDArray[OFFSET_TYPE]:
         """Find the start and end offsets of the sparse genotypes for each range.
@@ -260,7 +262,7 @@ class SparseVar:
         self,
         contig: str,
         starts: ArrayLike = 0,
-        ends: ArrayLike = INT64_MAX,
+        ends: ArrayLike = POS_MAX,
         samples: ArrayLike | None = None,
         out: NDArray[OFFSET_TYPE] | None = None,
     ) -> NDArray[OFFSET_TYPE]:
@@ -309,7 +311,7 @@ class SparseVar:
         # (r 2)
         var_ranges = self.var_ranges(contig, starts, ends)
 
-        v_starts = (self.var_table["POS"] - 1).to_numpy()
+        v_starts = (self.index["POS"] - 1).to_numpy()
 
         # (2 r s p)
         out = _find_starts_ends_with_length(
@@ -319,7 +321,7 @@ class SparseVar:
             ends,
             var_ranges,
             v_starts,
-            self.var_table["ILEN"].list.first().to_numpy(),
+            self.index["ILEN"].list.first().to_numpy(),
             s_idxs,
             self.ploidy,
             self._c_max_idxs[c],
@@ -331,7 +333,7 @@ class SparseVar:
         self,
         contig: str,
         starts: ArrayLike = 0,
-        ends: ArrayLike = INT64_MAX,
+        ends: ArrayLike = POS_MAX,
         samples: ArrayLike | None = None,
     ) -> SparseGenotypes:
         """Read the genotypes for the given ranges.
@@ -375,7 +377,7 @@ class SparseVar:
         self,
         contig: str,
         starts: ArrayLike = 0,
-        ends: ArrayLike = INT64_MAX,
+        ends: ArrayLike = POS_MAX,
         samples: ArrayLike | None = None,
     ) -> SparseGenotypes:
         """Read the genotypes for the given ranges such that each entry of variants is guaranteed to have
@@ -596,24 +598,35 @@ class SparseVar:
         """Path to the index file."""
         return root / "index.arrow"
 
-    def _load_var_table(self, attrs: IntoExpr | None = None) -> pl.DataFrame:
-        """Load the variant table from the index file."""
+    def _load_index(self, attrs: IntoExpr | None = None) -> pl.DataFrame:
+        """Load the .gvi index."""
 
-        min_attrs: set[Any] = {"ALT", "ILEN"}
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            index = pl.scan_ipc(self._index_path(self.path), row_index_name="index")
+
+        schema = index.collect_schema()
+
+        if schema["ALT"] == pl.Utf8:
+            index = index.with_columns(pl.col("ALT").cast(pl.List(pl.Utf8)))
+
+        _attrs: set[IntoExpr] = {"ALT"}
+
         if attrs is not None:
             if not isinstance(attrs, str) and isinstance(attrs, Iterable):
-                min_attrs.update(attrs)
+                _attrs.update(attrs)
             else:
-                min_attrs.add(attrs)
-        attrs = list(min_attrs)
+                _attrs.add(attrs)
+            _attrs.discard("ILEN")
 
-        index = (
-            pl.scan_ipc(
-                self._index_path(self.path), row_index_name="index", memory_map=False
-            )
-            .select("index", "CHROM", "POS", "REF", *attrs)
-            .collect()
-        )
+        attrs = list(_attrs)
+
+        if "ILEN" in schema:
+            attrs.append("ILEN")
+        elif "ILEN" not in schema:
+            attrs.append(ILEN.alias("ILEN"))
+
+        index = index.select("index", "CHROM", "POS", "REF", *attrs).collect()
 
         return index
 
@@ -695,7 +708,7 @@ class SparseVar:
             if len(cds_df) == 0:
                 annot = _empty_annot()
             else:
-                annot = _get_strand_and_codon_pos(cds_df, self.var_table, self._c_norm)
+                annot = _get_strand_and_codon_pos(cds_df, self.index, self._c_norm)
             pbar.update()
 
             # Apply encoding
@@ -714,8 +727,8 @@ class SparseVar:
             # Write back if requested
             if write_back:
                 self._load_all_attrs()
-                self.var_table = (
-                    self.var_table.lazy()
+                self.index = (
+                    self.index.lazy()
                     .with_row_index("varID")
                     .join(annot.lazy(), on="varID", how="left")
                     .drop("varID")
@@ -733,15 +746,15 @@ class SparseVar:
         """Cache the allele frequencies on disk. Will also load all possible attributes and add the AF column in-memory."""
         self._load_all_attrs()
         afs = self._compute_afs()
-        self.var_table = self.var_table.with_columns(AF=pl.Series(afs))
+        self.index = self.index.with_columns(AF=pl.Series(afs))
         self._write_afs()
 
     def _load_all_attrs(self):
         idx_df = pl.scan_ipc(self._index_path(self.path))
         schema = idx_df.collect_schema()
-        missing = set(schema) - set(self.var_table.columns)
+        missing = set(schema) - set(self.index.columns)
         missing_attrs = idx_df.select(*missing).collect()
-        self.var_table = self.var_table.hstack(missing_attrs)
+        self.index = self.index.hstack(missing_attrs)
 
     def _compute_afs(self) -> NDArray[np.float32]:
         n_samples, ploidy, _ = cast(tuple[int, int, None], self.genos.shape)
@@ -755,7 +768,7 @@ class SparseVar:
         df.write_ipc(self._index_path(self.path))
 
     def _to_df(self) -> pl.DataFrame:
-        return self.var_table.drop("index")
+        return self.index.drop("index")
 
     def _load_genos(self):
         def memmap2array(layout: Content, **kwargs):

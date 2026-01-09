@@ -5,6 +5,7 @@ notebooks/
 dist/
 docs/build/
 data/
+tmp/
 
 # pixi environments
 .pixi
