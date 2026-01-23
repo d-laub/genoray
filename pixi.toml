@@ -54,11 +54,6 @@ gen = { cmd = "sh tests/data/gen_from_vcf.sh" }
 test = { cmd = "pytest tests", depends-on = "gen" }
 pre-commit = "pre-commit install --hook-type commit-msg"
 bump-dry = "cz bump --dry-run"
-publish = """
-    git checkout main && cz bump && git push --follow-tags && rm -rf dist && uv build && uv publish
-    && git checkout stable && git pull origin stable && git merge main && git push origin stable
-    && git checkout main
-    """
 
 [feature.dev.pypi-dependencies]
 numpy = "==1.26"
