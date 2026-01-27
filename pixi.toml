@@ -51,7 +51,7 @@ oxbow = "*"
 [tasks]
 gen = "sh tests/data/gen_from_vcf.sh"
 test = { cmd = "pytest tests", depends-on = "gen" }
-prek = "prek install"
+prek-install = "prek install"
 bump-dry = "cz bump --dry-run"
 
 [feature.dev.pypi-dependencies]
