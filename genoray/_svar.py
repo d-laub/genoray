@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import shutil
 import warnings
+from collections.abc import Generator, Iterable
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Generator, Iterable, Literal, Union, cast, overload
+from typing import Literal, Union, cast, overload
 
 import awkward as ak
 import numba as nb
@@ -22,6 +23,7 @@ from pydantic import BaseModel
 from seqpro.rag import OFFSET_TYPE, Ragged, lengths_to_offsets
 from tqdm.auto import tqdm
 
+from ._pb_utils import pb_zero_based
 from ._pgen import PGEN
 from ._types import DOSAGE_TYPE, DTYPE, POS_MAX, POS_TYPE, V_IDX_TYPE
 from ._utils import ContigNormalizer
@@ -1205,24 +1207,24 @@ def _get_strand_and_codon_pos(
     if cds_df.is_empty() or var_table.is_empty():
         return _empty_annot()
 
-    joined_cds = (
-        cast(
-            pl.LazyFrame,
-            pb.overlap(
-                var_intervals, cds_df, use_zero_based=False, projection_pushdown=True
-            ),
+    with pb_zero_based(False), warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        joined_cds = (
+            cast(
+                pl.LazyFrame,
+                pb.overlap(var_intervals, cds_df, projection_pushdown=True),
+            )
+            .rename(
+                {
+                    "start_1": "pos",
+                    "start_2": "cds_start",
+                    "end_2": "cds_end",
+                }
+            )
+            .drop("end_1", "chrom_1", "chrom_2")
+            .rename(lambda c: c.replace("_2", "").replace("_1", ""))
+            .collect()
         )
-        .rename(
-            {
-                "start_1": "pos",
-                "start_2": "cds_start",
-                "end_2": "cds_end",
-            }
-        )
-        .drop("end_1", "chrom_1", "chrom_2")
-        .rename(lambda c: c.replace("_2", "").replace("_1", ""))
-        .collect()
-    )
 
     if joined_cds.height == 0:
         return _empty_annot()

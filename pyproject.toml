@@ -5,7 +5,7 @@ description = "Add your description here"
 authors = [{ name = "David Laub", email = "dlaub@ucsd.edu" }]
 readme = "README.md"
 license = { file = "LICENSE.txt" }
-requires-python = ">=3.9,<3.13" # blocked by cyvcf2
+requires-python = ">=3.10,<3.13" # blocked by cyvcf2
 dependencies = [
     "seqpro>=0.8.0",
     "genoray>=0.15.0",
@@ -14,8 +14,8 @@ dependencies = [
     "hirola>=0.3.0",
     "pgenlib>=0.91.0",
     "cyvcf2>=0.31.1",
-    "polars>=1.30",
-    "polars-bio>=0.19.0",
+    "polars>=1.37.1",
+    "polars-bio>=0.20.1",
     "pyranges>=0.1.3",
     "typing-extensions>=4.11",
     "pyarrow>=21",
@@ -49,3 +49,7 @@ requires = ["hatchling"]
 
 [tool.pytest.ini_options]
 filterwarnings = ["ignore::DeprecationWarning:sorted_nearest.*"]
+
+[tool.basedpyright]
+enableTypeIgnoreComments = true
+reportMissingTypeArgument = false

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from typing import cast
 
 import numba as nb
@@ -9,6 +10,7 @@ import polars_bio as pb
 from numpy.typing import ArrayLike, NDArray
 from seqpro.rag import OFFSET_TYPE, lengths_to_offsets
 
+from ._pb_utils import pb_zero_based
 from ._types import POS_TYPE, V_IDX_TYPE
 from ._utils import DTYPE, ContigNormalizer, np_to_pl_dtype
 
@@ -66,9 +68,7 @@ def var_ranges(
     upper_bound_e_idx = np.searchsorted(v_starts, ends)
 
     # Find first overlapping (q_start < v_end)
-    s_idx = _forward_sub_scan(
-        v_ends, lower_bound_s_idx, upper_bound_e_idx, max_v_len, starts
-    )
+    s_idx = _forward_sub_scan(v_ends, lower_bound_s_idx, upper_bound_e_idx, starts)
     # Find last overlapping (q_start < v_end), returns exclusive end
     # Needed when there are no variants after the first overlapping that should be included.
     # Example: q = [2, 3)
@@ -81,7 +81,7 @@ def var_ranges(
     # ╠═════════╬═══════╬═════════════════╬═════════════════╣
     # ║    3    ║   4   ║        N        ║        Y        ║
     # ╚═════════╩═══════╩═════════════════╩═════════════════╝
-    e_idx = _backward_sub_scan(v_ends, s_idx, upper_bound_e_idx, max_v_len, starts)
+    e_idx = _backward_sub_scan(v_ends, s_idx, upper_bound_e_idx, starts)
     no_vars = s_idx == n_vars
     s_idx[no_vars] = 0
     e_idx[no_vars] = 0
@@ -130,16 +130,13 @@ def var_indices(
         .lazy()
         .with_row_index("query")
     )
-    join = (
-        cast(
-            pl.LazyFrame,
-            pb.overlap(
-                queries, var_table, use_zero_based=True, projection_pushdown=True
-            ),
+    with pb_zero_based(True), warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        join = (
+            cast(pl.LazyFrame, pb.overlap(queries, var_table, projection_pushdown=True))
+            .sort("query_1", "index_2")
+            .collect()
         )
-        .sort("query_1", "index_2")
-        .collect()
-    )
 
     if join.height == 0:
         return np.empty(0, idx_dtype), np.zeros(n_ranges + 1, OFFSET_TYPE)
@@ -183,18 +180,15 @@ def var_counts(
         .lazy()
         .with_row_index("query")
     )
-    counts = (
-        cast(
-            pl.LazyFrame,
-            pb.overlap(
-                queries, var_table, use_zero_based=True, projection_pushdown=True
-            ),
+    with pb_zero_based(True), warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        counts = (
+            cast(pl.LazyFrame, pb.overlap(queries, var_table, projection_pushdown=True))
+            .group_by("query_1", maintain_order=True)
+            .len()
+            .with_columns(pl.col("len").cast(pl.UInt32))
+            .collect()
         )
-        .group_by("query_1", maintain_order=True)
-        .len()
-        .with_columns(pl.col("len").cast(pl.UInt32))
-        .collect()
-    )
 
     if counts.height == 0:
         return np.zeros(n_ranges, dtype=np.uint32)
@@ -203,14 +197,13 @@ def var_counts(
 
 
 @nb.guvectorize(
-    [(nb.int_[:], nb.int_, nb.int_, nb.int_, nb.int_, nb.int_[:])],
-    "(n),(),(),(),()->()",
+    [(nb.int_[:], nb.int_, nb.int_, nb.int_, nb.int_[:])],
+    "(n),(),(),()->()",
 )
 def _forward_sub_scan(
     v_ends: NDArray[np.integer],
     lower_bound: int | np.integer | NDArray[np.integer],
     upper_bound: int | np.integer | NDArray[np.integer],
-    max_v_len: int | np.integer | NDArray[np.integer],
     q_start: int | np.integer | NDArray[np.integer],
     indices: NDArray[np.integer] = None,  # type: ignore
 ) -> NDArray[np.integer]:  # type: ignore
@@ -224,14 +217,13 @@ def _forward_sub_scan(
 
 
 @nb.guvectorize(
-    [(nb.int_[:], nb.int_, nb.int_, nb.int_, nb.int_, nb.int_[:])],
-    "(n),(),(),(),()->()",
+    [(nb.int_[:], nb.int_, nb.int_, nb.int_, nb.int_[:])],
+    "(n),(),(),()->()",
 )
 def _backward_sub_scan(
     v_ends: NDArray[np.integer],
     lower_bound: int | np.integer | NDArray[np.integer],
     upper_bound: int | np.integer | NDArray[np.integer],
-    max_v_len: int | np.integer | NDArray[np.integer],
     q_start: int | np.integer | NDArray[np.integer],
     indices: NDArray[np.integer] = None,  # type: ignore
 ) -> NDArray[np.integer]:  # type: ignore
