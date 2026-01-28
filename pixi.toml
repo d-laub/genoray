@@ -9,6 +9,7 @@ doc = ["doc", "py312"]
 py310 = ["py310"]
 py311 = ["py311"]
 py312 = ["py312"]
+py313 = ["py313"]
 
 [dependencies]
 uv = "*"
@@ -120,3 +121,6 @@ python = "3.11.*"
 
 [feature.py312.dependencies]
 python = "3.12.*"
+
+[feature.py313.dependencies]
+python = "3.13.*"
