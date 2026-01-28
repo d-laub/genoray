@@ -1,3 +1,16 @@
+## 2.0.0 (2026-01-28)
+
+### Feat
+
+- support python 3.13
+
+### Fix
+
+- use polars_config_meta to set coordinate system for polars_bio==0.20.1
+- update to polars-bio 0.20.1, deprecates Python 3.9
+- remove broken `out` argument from `PGEN.read`
+- remove broken `out` argument from `PGEN.read`
+
 ## 1.0.1 (2025-12-20)
 
 ### Fix
