@@ -1948,7 +1948,7 @@ packages:
 - pypi: ./
   name: genoray
   version: 1.0.1
-  sha256: 6e813bbf2d0cd7966ee4f977fad1d9f20ed09d0c62354dfb51c182ab9dda9a29
+  sha256: 3696772c6efa41c70ccf41b28825bbbd0db402835e8e698838bdfcf4f32cd8b1
   requires_dist:
   - seqpro>=0.8.0
   - genoray>=0.15.0
@@ -1958,7 +1958,7 @@ packages:
   - pgenlib>=0.91.0
   - cyvcf2>=0.31.1
   - polars>=1.37.1
-  - polars-bio>=0.20.1
+  - polars-bio>=0.20.1,<0.21
   - pyranges>=0.1.3
   - typing-extensions>=4.11
   - pyarrow>=21
