@@ -1,16 +1,15 @@
 from __future__ import annotations
 
-import warnings
 from typing import cast
 
 import numba as nb
 import numpy as np
 import polars as pl
 import polars_bio as pb
+import polars_config_meta  # noqa: F401
 from numpy.typing import ArrayLike, NDArray
 from seqpro.rag import OFFSET_TYPE, lengths_to_offsets
 
-from ._pb_utils import pb_zero_based
 from ._types import POS_TYPE, V_IDX_TYPE
 from ._utils import DTYPE, ContigNormalizer, np_to_pl_dtype
 
@@ -124,19 +123,20 @@ def var_indices(
             end=pl.col("POS") - pl.col("ILEN").list.first().clip(upper_bound=0),
         )
     )
+    var_table.config_meta.set(coordinate_system_zero_based=True)  # type: ignore
 
     queries = (
         pl.DataFrame({"chrom": c, "start": starts, "end": ends})
         .lazy()
         .with_row_index("query")
     )
-    with pb_zero_based(True), warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        join = (
-            cast(pl.LazyFrame, pb.overlap(queries, var_table, projection_pushdown=True))
-            .sort("query_1", "index_2")
-            .collect()
-        )
+    queries.config_meta.set(coordinate_system_zero_based=True)  # type: ignore
+
+    join = (
+        cast(pl.LazyFrame, pb.overlap(queries, var_table, projection_pushdown=True))
+        .sort("query_1", "index_2")
+        .collect()
+    )
 
     if join.height == 0:
         return np.empty(0, idx_dtype), np.zeros(n_ranges + 1, OFFSET_TYPE)
@@ -174,21 +174,22 @@ def var_counts(
             end=pl.col("POS") - pl.col("ILEN").list.first().clip(upper_bound=0),
         )
     )
+    var_table.config_meta.set(coordinate_system_zero_based=True)  # type: ignore
 
     queries = (
         pl.DataFrame({"chrom": c, "start": starts, "end": ends})
         .lazy()
         .with_row_index("query")
     )
-    with pb_zero_based(True), warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        counts = (
-            cast(pl.LazyFrame, pb.overlap(queries, var_table, projection_pushdown=True))
-            .group_by("query_1", maintain_order=True)
-            .len()
-            .with_columns(pl.col("len").cast(pl.UInt32))
-            .collect()
-        )
+    queries.config_meta.set(coordinate_system_zero_based=True)  # type: ignore
+
+    counts = (
+        cast(pl.LazyFrame, pb.overlap(queries, var_table, projection_pushdown=True))
+        .group_by("query_1", maintain_order=True)
+        .len()
+        .with_columns(pl.col("len").cast(pl.UInt32))
+        .collect()
+    )
 
     if counts.height == 0:
         return np.zeros(n_ranges, dtype=np.uint32)

@@ -12,6 +12,7 @@ import numba as nb
 import numpy as np
 import polars as pl
 import polars_bio as pb
+import polars_config_meta  # noqa: F401
 import seqpro as sp
 from awkward.contents import Content, NumpyArray
 from hirola import HashTable
@@ -23,7 +24,6 @@ from pydantic import BaseModel
 from seqpro.rag import OFFSET_TYPE, Ragged, lengths_to_offsets
 from tqdm.auto import tqdm
 
-from ._pb_utils import pb_zero_based
 from ._pgen import PGEN
 from ._types import DOSAGE_TYPE, DTYPE, POS_MAX, POS_TYPE, V_IDX_TYPE
 from ._utils import ContigNormalizer
@@ -1193,6 +1193,7 @@ def _get_strand_and_codon_pos(
 
     # Filter out CDS features with chromosomes not in granges
     cds_df = cds_df.filter(pl.col("chrom").is_in(contig_normalizer.contigs))
+    cds_df.config_meta.set(coordinate_system_zero_based=False)  # type: ignore
 
     # Prepare var_table for pb.overlap by creating interval columns
     var_intervals = var_table.select(
@@ -1202,29 +1203,28 @@ def _get_strand_and_codon_pos(
         start=pl.col("POS"),
         end=pl.col("POS") - pl.col("ILEN").list.first().clip(upper_bound=0),
     )
+    var_intervals.config_meta.set(coordinate_system_zero_based=False)  # type: ignore
 
     # Check if CDS or var_table is empty
     if cds_df.is_empty() or var_table.is_empty():
         return _empty_annot()
 
-    with pb_zero_based(False), warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        joined_cds = (
-            cast(
-                pl.LazyFrame,
-                pb.overlap(var_intervals, cds_df, projection_pushdown=True),
-            )
-            .rename(
-                {
-                    "start_1": "pos",
-                    "start_2": "cds_start",
-                    "end_2": "cds_end",
-                }
-            )
-            .drop("end_1", "chrom_1", "chrom_2")
-            .rename(lambda c: c.replace("_2", "").replace("_1", ""))
-            .collect()
+    joined_cds = (
+        cast(
+            pl.LazyFrame,
+            pb.overlap(var_intervals, cds_df, projection_pushdown=True),
         )
+        .rename(
+            {
+                "start_1": "pos",
+                "start_2": "cds_start",
+                "end_2": "cds_end",
+            }
+        )
+        .drop("end_1", "chrom_1", "chrom_2")
+        .rename(lambda c: c.replace("_2", "").replace("_1", ""))
+        .collect()
+    )
 
     if joined_cds.height == 0:
         return _empty_annot()
