@@ -647,59 +647,74 @@ class VCF:
 
         start = max(0, start)  # type: ignore
 
-        n_variants: int = self.n_vars_in_ranges(c, start, end)[0]
-        if n_variants == 0:
-            yield mode.empty(self.n_samples, ploidy, 0)
-            return
-
-        if self._pbar is not None and self._pbar.total is None:
-            self._pbar.total = n_variants
-            self._pbar.refresh()
-
         mem_per_v = self._mem_per_variant(mode)
-        vars_per_chunk = min(max_mem // mem_per_v, n_variants)
+        vars_per_chunk = max_mem // mem_per_v
         if vars_per_chunk == 0:
             raise ValueError(
                 f"Maximum memory {format_memory(max_mem)} insufficient to read a single variant."
-                f" Memory per variant: {format_memory(mem_per_v)}."
+                + f" Memory per variant: {format_memory(mem_per_v)}."
             )
 
-        n_chunks, final_chunk = divmod(n_variants, vars_per_chunk)
-        if final_chunk == 0:
-            # perfectly divisible so there is no final chunk
-            chunk_sizes = np.full(n_chunks, vars_per_chunk)
-        elif n_chunks == 0:
-            # n_vars < vars_per_chunk, so we just use the remainder
-            chunk_sizes = np.array([final_chunk])
+        buffer = mode.empty(self.n_samples, ploidy, vars_per_chunk)
+        if isinstance(buffer, (Genos8, Genos16)):
+            gt_buffer = buffer
+            ds_buffer = None
+        elif isinstance(buffer, Dosages):
+            gt_buffer = None
+            ds_buffer = buffer
         else:
-            # have a final chunk that is smaller than the rest
-            chunk_sizes = np.full(n_chunks + 1, vars_per_chunk)
-            chunk_sizes[-1] = final_chunk
+            gt_buffer, ds_buffer = buffer
 
         vcf = self._vcf(f"{c}:{int(start + 1)}-{end}")  # range string is 1-based
+        if self.progress and self._pbar is None:
+            vcf = tqdm(vcf, desc="Reading VCF", unit=" variant")
         ploidy = self.ploidy + self.phasing
-        for chunk_size in chunk_sizes:
-            if issubclass(mode, (Genos8, Genos16)):
-                out = mode.empty(self.n_samples, ploidy, chunk_size)
-                self._fill_genos(vcf, out)
-            elif issubclass(mode, Dosages):
-                out = mode.empty(self.n_samples, ploidy, chunk_size)
-                self._fill_dosages(
-                    vcf,
-                    out,
-                    self.dosage_field,  # type: ignore | guaranteed to be str by guard clause
-                )
-            elif issubclass(mode, (Genos8Dosages, Genos16Dosages)):
-                out = mode.empty(self.n_samples, ploidy, chunk_size)
-                self._fill_genos_and_dosages(
-                    vcf,
-                    out,
-                    self.dosage_field,  # type: ignore | guaranteed to be str by guard clause
-                )
-            else:
-                assert_never(mode)
+        i = 0
+        for v in vcf:
+            if gt_buffer is not None:
+                if self.phasing:
+                    # (s p+1) np.int16
+                    gt_buffer[..., i] = v.genotype.array()[self._s_sorter]
+                else:
+                    gt_buffer[..., i] = v.genotype.array()[
+                        self._s_sorter, : self.ploidy
+                    ]
 
-            yield mode.parse(out)
+            if ds_buffer is not None:
+                d = v.format(self.dosage_field)
+                if d is None:
+                    raise DosageFieldError(
+                        f"Dosage field '{self.dosage_field}' not found for record {repr(v)}"
+                    )
+                if d.shape[1] > 1:
+                    raise MultiallelicDosageError(
+                        f"Multiallelic dosages are not supported, encountered in VCF record {repr(v)}"
+                    )
+                ds_buffer[..., i] = d.squeeze(1)[self._s_sorter]
+
+            i += 1
+
+            if self._pbar is not None:
+                self._pbar.update()
+
+            if i == vars_per_chunk:
+                yield buffer
+                i = 0
+
+        if i != 0:
+            buffer = []
+            if gt_buffer is not None:
+                gt_buffer = gt_buffer[..., :i]
+                buffer.append(gt_buffer)
+            if ds_buffer is not None:
+                ds_buffer = ds_buffer[..., :i]
+                buffer.append(ds_buffer)
+            buffer = tuple(buffer)
+
+            if len(buffer) == 1:
+                yield buffer[0]
+            else:
+                yield buffer
 
     def _chunk_ranges_with_length(
         self,
