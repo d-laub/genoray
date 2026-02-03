@@ -23,6 +23,7 @@ pytest = "*"
 pytest-cases = "*"
 ipykernel = "*"
 ipywidgets = "*"
+icecream = "*"
 
 [pypi-dependencies]
 genoray = { path = ".", editable = true, extras = ["cli"] }

@@ -164,19 +164,20 @@ class PGEN:
     """Polars expression to filter variants. Should return True for variants to keep."""
     ploidy = 2
     """Ploidy of the samples. The PGEN format currently only supports diploid (2)."""
-    contigs: list[str]
+    contigs: list[str] | None = None
     """Naturally sorted list of contig names in the PGEN file."""
-    _index: pl.DataFrame
+    _index: pl.DataFrame | None = None
     _geno_pgen: pgenlib.PgenReader
     _dose_pgen: pgenlib.PgenReader
     _s_idx: NDArray[np.uint32] | slice
     _s_sorter: NDArray[np.intp] | slice
     _geno_path: Path
     _dose_path: Path | None
-    _sei: StartsEndsIlens | None  # unfiltered so that var_idxs map correctly
+    _sei: StartsEndsIlens | None = None  # unfiltered so that var_idxs map correctly
     """Variant 0-based starts, ends, ILEN, and ALT alleles if the PGEN with filters is bi-allelic."""
     _s2i: HashTable
-    _c_max_idxs: dict[str, int]
+    _c_norm: ContigNormalizer | None = None
+    _c_max_idxs: dict[str, int] | None = None
 
     Genos = Genos
     """:code:`(samples ploidy variants) int32`"""
@@ -199,6 +200,7 @@ class PGEN:
         geno_path: str | Path,
         filter: pl.Expr | None = None,
         dosage_path: str | Path | None = None,
+        load_index: bool = True,
     ):
         self._filter = filter
 
@@ -232,7 +234,16 @@ class PGEN:
             self._dose_pgen = self._geno_pgen
         self._dose_path = dosage_path
 
-        self._index, self._sei, self.contigs = _load_index(self._index_path(), filter)
+        if load_index:
+            self._init_index()
+
+    def _init_index(self):
+        """Initialize the index and all derived data structures if they have not been yet."""
+        if self._index is not None:
+            return
+        self._index, self._sei, self.contigs = _load_index(
+            self._index_path(), self._filter
+        )
         self._c_norm = ContigNormalizer(self.contigs)
         # what variant index does each contig start at
         contig_var_offsets = (
@@ -366,6 +377,9 @@ class PGEN:
         n_variants
             Shape: :code:`(ranges)`. Number of variants in the given ranges.
         """
+        if self._c_norm is None or self._index is None:
+            self._init_index()
+            assert self._c_norm is not None and self._index is not None
         return var_counts(self._c_norm, self._index, contig, starts, ends)
 
     def var_idxs(
@@ -391,6 +405,9 @@ class PGEN:
 
             Shape: (ranges+1). Offsets to get variant indices for each range.
         """
+        if self._c_norm is None or self._index is None:
+            self._init_index()
+            assert self._c_norm is not None and self._index is not None
         return var_indices(V_IDX_TYPE, self._c_norm, self._index, contig, starts, ends)
 
     def read(
@@ -421,6 +438,9 @@ class PGEN:
             have value np.nan. If just using genotypes or dosages, will be a single array, otherwise
             will be a tuple of arrays.
         """
+        if self._c_norm is None or self._index is None:
+            self._init_index()
+            assert self._c_norm is not None and self._index is not None
         c = self._c_norm.norm(contig)
         if c is None:
             return mode.empty(self.n_samples, self.ploidy, 0)
@@ -479,6 +499,10 @@ class PGEN:
             will be a tuple of arrays.
         """
         max_mem = parse_memory(max_mem)
+
+        if self._c_norm is None or self._index is None:
+            self._init_index()
+            assert self._c_norm is not None and self._index is not None
 
         c = self._c_norm.norm(contig)
         if c is None:
@@ -562,6 +586,10 @@ class PGEN:
         starts = np.atleast_1d(np.asarray(starts, POS_TYPE))
         n_ranges = len(starts)
 
+        if self._c_norm is None or self._index is None:
+            self._init_index()
+            assert self._c_norm is not None and self._index is not None
+
         c = self._c_norm.norm(contig)
         if c is None:
             logger.warning(
@@ -640,6 +668,11 @@ class PGEN:
         max_mem = parse_memory(max_mem)
 
         starts = np.atleast_1d(np.asarray(starts, POS_TYPE))
+
+        if self._c_norm is None or self._index is None:
+            self._init_index()
+            assert self._c_norm is not None and self._index is not None
+
         c = self._c_norm.norm(contig)
         if c is None:
             logger.warning(
@@ -758,6 +791,14 @@ class PGEN:
 
         starts = np.atleast_1d(np.asarray(starts, POS_TYPE))
         ends = np.atleast_1d(np.asarray(ends, POS_TYPE))
+
+        if self._c_norm is None or self._index is None or self._c_max_idxs is None:
+            self._init_index()
+            assert (
+                self._c_norm is not None
+                and self._index is not None
+                and self._c_max_idxs is not None
+            )
 
         c = self._c_norm.norm(contig)
         if c is None:
