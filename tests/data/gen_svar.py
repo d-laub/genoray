@@ -17,7 +17,7 @@ def main():
     SparseVar.from_vcf(vcf_path, vcf, "1g", overwrite=True, with_dosages=True)
     SparseVar(vcf_path).cache_afs()
 
-    pgen = PGEN(ddir / "biallelic.pgen")
+    pgen = PGEN(ddir / "biallelic.pgen", dosage_path=ddir / "biallelic.pgen")
 
     pgen_path = ddir / "biallelic.pgen.svar"
     if pgen_path.exists():

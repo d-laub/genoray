@@ -314,6 +314,11 @@ class PGEN:
         return self
 
     @property
+    def geno_path(self) -> Path:
+        """Path to the genotype file."""
+        return self._geno_path
+
+    @property
     def dosage_path(self) -> Path | None:
         """Path to the dosage file."""
         return self._dose_path

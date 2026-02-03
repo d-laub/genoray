@@ -29,7 +29,9 @@ dependencies = [
     "cyclopts",
     "zstandard",
     "pydantic",
-    "oxbow>=0.5.1, <0.6",
+    "oxbow>=0.5.1,<0.6",
+    "joblib>=1.4.2,<2",
+    "joblib-progress>=1.0.6,<2",
 ]
 
 [project.optional-dependencies]
