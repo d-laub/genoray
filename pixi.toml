@@ -48,8 +48,8 @@ cyclopts = "*"
 zstandard = "*"
 pydantic = "*"
 oxbow = "*"
-joblib = "==1.4.2"
-joblib-progress = ">=1.0.6, <2"
+joblib = "*"
+joblib-progress = "*"
 
 [tasks]
 gen = "sh tests/data/gen_from_vcf.sh"
@@ -79,9 +79,10 @@ seqpro = "==0.8.0"
 cyclopts = "*"
 zstandard = "*"
 pydantic = "*"
-# non-pkg dependencies
 seaborn = "*"
 oxbow = "==0.5.1"
+joblib = "==1.4.2"
+joblib-progress = "==1.0.6"
 
 [feature.dev.tasks]
 i-kernel = "ipython kernel install --user --name genoray"
