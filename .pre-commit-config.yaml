@@ -17,11 +17,3 @@ repos:
   hooks:
   - id: commitizen
     stages: [commit-msg]
-- repo: local
-  hooks:
-  - id: pixi-lock
-    name: pixi-lock
-    entry: pixi lock
-    language: system
-    files: ^pixi\.toml$
-    pass_filenames: false
