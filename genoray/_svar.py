@@ -17,10 +17,12 @@ import polars_config_meta  # noqa: F401
 import seqpro as sp
 from awkward.contents import Content, NumpyArray
 from hirola import HashTable
+from icecream import ic
 from joblib_progress import joblib_progress
 from loguru import logger
 from natsort import natsorted
 from numpy.typing import ArrayLike, NDArray
+from pgenlib import PgenReader
 from polars._typing import IntoExpr
 from pydantic import BaseModel
 from seqpro.rag import OFFSET_TYPE, Ragged, lengths_to_offsets
@@ -28,7 +30,7 @@ from tqdm.auto import tqdm
 
 from ._pgen import PGEN
 from ._types import DOSAGE_TYPE, DTYPE, POS_MAX, POS_TYPE, V_IDX_TYPE
-from ._utils import ContigNormalizer
+from ._utils import ContigNormalizer, format_memory, parse_memory
 from ._var_ranges import var_ranges
 from ._vcf import VCF
 from .exprs import ILEN
@@ -461,6 +463,7 @@ class SparseVar:
         if not vcf._index_path().exists():
             logger.info("Genoray VCF index not found, creating index.")
             vcf._write_gvi_index()
+        shutil.copy(vcf._index_path(), cls._index_path(out))
 
         contigs = vcf.contigs
         with open(out / "metadata.json", "w") as f:
@@ -472,7 +475,8 @@ class SparseVar:
             ).model_dump_json()
             f.write(json)
 
-        shutil.copy(vcf._index_path(), cls._index_path(out))
+        max_mem = parse_memory(max_mem)
+        job_mem = max_mem // joblib.cpu_count()
 
         with TemporaryDirectory() as chunk_dir:
             chunk_dir = Path(chunk_dir)
@@ -483,7 +487,7 @@ class SparseVar:
                 task = joblib.delayed(_process_contig_vcf)(
                     vcf.path,
                     dosage_field=vcf.dosage_field if with_dosages else None,
-                    max_mem=max_mem,
+                    max_mem=job_mem,
                     contig=c,
                     tdir=chunk_dir,
                     chunk_idx=chunk_idx,
@@ -494,7 +498,7 @@ class SparseVar:
                 joblib_progress(description="Processing contigs", total=len(tasks)),
                 joblib.Parallel(n_jobs=-1) as parallel,
             ):
-                vars_per_contig: list[int] = list(parallel(tasks))
+                vars_per_contig: list[int] = list(parallel(tasks))  # type: ignore
 
             logger.info("Concatenating intermediate chunks")
             _concat_data(
@@ -509,6 +513,7 @@ class SparseVar:
         max_mem: int | str,
         overwrite: bool = False,
         with_dosages: bool = False,
+        n_jobs: int = -1,
     ):
         """Create a Sparse Variant (.svar) from a PGEN.
 
@@ -524,6 +529,8 @@ class SparseVar:
             Whether to overwrite the output directory if it exists.
         with_dosages
             Whether to write dosages.
+        n_jobs
+            Number of jobs to use for parallel processing.
         """
         out = Path(out)
 
@@ -535,6 +542,10 @@ class SparseVar:
                 f"Output path {out} already exists. Use overwrite=True to overwrite."
             )
         out.mkdir(parents=True, exist_ok=True)
+
+        pgen._init_index()
+        assert pgen.contigs is not None
+        assert pgen._c_max_idxs is not None
 
         contigs = pgen.contigs
         with open(out / "metadata.json", "w") as f:
@@ -552,17 +563,38 @@ class SparseVar:
             if pgen._sei is None:
                 raise ValueError("PGEN must be bi-allelic with filters applied")
 
+        max_mem = parse_memory(max_mem)
+        effective_n_jobs = joblib.cpu_count() if n_jobs == -1 else n_jobs
+        job_mem = max_mem // effective_n_jobs
+        mem_per_var = pgen._mem_per_variant(
+            pgen.GenosDosages if with_dosages else pgen.Genos
+        )
+        offsets = np.array(
+            [0] + [pgen._c_max_idxs[c] + 1 for c in contigs], dtype=np.uint32
+        )
+        ic(offsets)
+
         shape = (pgen.n_samples, pgen.ploidy)
         with TemporaryDirectory() as tdir:
             tdir = Path(tdir)
 
             tasks = []
-            for chunk_idx, c in enumerate(contigs):
+            for chunk_idx, (start, end) in enumerate(
+                np.lib.stride_tricks.sliding_window_view(offsets, 2)
+            ):
+                n_vars = end - start
+                if n_vars == 0:
+                    continue
+
                 task = joblib.delayed(_process_contig_pgen)(
-                    pgen.geno_path,
+                    geno_path=pgen.geno_path,
                     dosage_path=pgen.dosage_path if with_dosages else None,
-                    max_mem=max_mem,
-                    contig=c,
+                    max_mem=job_mem,
+                    start_idx=start,
+                    end_idx=end,
+                    mem_per_var=mem_per_var,
+                    n_samples=pgen.n_samples,
+                    ploidy=pgen.ploidy,
                     tdir=tdir,
                     chunk_idx=chunk_idx,
                 )
@@ -570,9 +602,9 @@ class SparseVar:
 
             with (
                 joblib_progress(description="Processing contigs", total=len(tasks)),
-                joblib.Parallel(n_jobs=-1) as parallel,
+                joblib.Parallel(n_jobs=n_jobs) as parallel,
             ):
-                vars_per_contig: list[int] = list(parallel(tasks))
+                vars_per_contig: list[int] = list(parallel(tasks))  # type: ignore
 
             logger.info("Concatenating intermediate chunks")
             _concat_data(out, tdir, shape, vars_per_contig, with_dosages=with_dosages)
@@ -814,27 +846,67 @@ def _process_contig_vcf(
 def _process_contig_pgen(
     geno_path: str | Path,
     dosage_path: str | Path | None,
-    max_mem: int | str,
-    contig: str,
+    max_mem: int,
+    start_idx: V_IDX_TYPE,
+    end_idx: V_IDX_TYPE,
+    mem_per_var: int,
+    n_samples: int,
+    ploidy: int,
     tdir: Path,
     chunk_idx: int,
 ) -> int:
-    pgen = PGEN(geno_path, dosage_path=dosage_path)
-    if dosage_path is not None:
-        chunker = pgen.chunk(contig, max_mem=max_mem, mode=PGEN.GenosDosages)
-    else:
-        chunker = pgen.chunk(contig, max_mem=max_mem, mode=PGEN.Genos)
+    geno_reader = PgenReader(bytes(Path(geno_path)), n_samples)
+    dose_reader = (
+        PgenReader(bytes(Path(dosage_path))) if dosage_path is not None else None
+    )
+
+    total_vars = int(end_idx - start_idx)
+    vars_per_chunk = min(max_mem // mem_per_var, total_vars)
+    if vars_per_chunk == 0:
+        raise ValueError(
+            f"Maximum memory {format_memory(max_mem)} insufficient to read a single variant."
+            + f" Memory per variant: {format_memory(mem_per_var)}."
+        )
+
+    n_chunks = -(-total_vars // vars_per_chunk)
+    chunk_offsets = np.empty(n_chunks + 1, dtype=np.uint32)
+    arange = np.arange(start_idx, end_idx, vars_per_chunk, dtype=np.uint32)
+    chunk_offsets[: len(arange)] = arange
+    if len(arange) < n_chunks + 1:
+        chunk_offsets[len(arange)] = end_idx
+
+    ic(total_vars, vars_per_chunk, n_chunks, chunk_offsets)
+
+    out_path = tdir / str(chunk_idx)
+    out_path.mkdir(parents=True, exist_ok=True)
+
     total_vars = 0
-    for data in chunker:
-        if isinstance(data, tuple):
-            genos, dosages = data
-        else:
-            genos = data
-            dosages = None
-        n_vars = genos.shape[-1]
+    for start, end in np.lib.stride_tricks.sliding_window_view(chunk_offsets, 2):
+        n_vars = end - start
         if n_vars == 0:
             continue
+
+        # Read Genotypes
+        # (v s p) -> (v s*p)
+        genos = np.empty((n_vars, n_samples * ploidy), dtype=np.int32)
+        geno_reader.read_alleles_range(start, end, genos)
+        genos = genos.astype(np.int8)
+        # (v s p) -> (s p v)
+        genos = genos.reshape(n_vars, n_samples, ploidy).transpose(1, 2, 0)
+        genos[genos == -9] = -1
+
+        dosages = None
+        if dose_reader is not None:
+            # (v s)
+            dosages = np.empty((n_vars, n_samples), dtype=np.float32)
+            dose_reader.read_dosages_range(start, end, dosages)
+            # (s v)
+            dosages = dosages.transpose(1, 0)
+            dosages[dosages == -9] = np.nan
+
+        # Convert to sparse
         var_idxs = np.arange(total_vars, total_vars + n_vars, dtype=np.int32)
+
         if dosages is not None:
             sp_genos, sp_dosages = dense2sparse(
                 genos.astype(np.int8), var_idxs, dosages
@@ -844,6 +916,7 @@ def _process_contig_pgen(
         else:
             sp_genos = dense2sparse(genos.astype(np.int8), var_idxs)
             _write_genos(tdir / str(chunk_idx), sp_genos)
+
         total_vars += n_vars
     return total_vars
 

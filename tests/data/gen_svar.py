@@ -9,7 +9,6 @@ def main():
 
     vcf = VCF(ddir / "biallelic.vcf.gz", dosage_field="DS")
     vcf._write_gvi_index()
-    vcf._load_index()
 
     vcf_path = ddir / "biallelic.vcf.svar"
     if vcf_path.exists():
