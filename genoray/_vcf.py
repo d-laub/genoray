@@ -882,7 +882,6 @@ class VCF:
         end: int | np.integer | None = None,
         fields: list[str] | None = None,
         info: list[str] | None = None,
-        *,
         lazy: Literal[False] = ...,
     ) -> pl.DataFrame: ...
     @overload
@@ -894,7 +893,7 @@ class VCF:
         fields: list[str] | None = None,
         info: list[str] | None = None,
         *,
-        lazy: Literal[True] = ...,
+        lazy: Literal[True],
     ) -> pl.LazyFrame: ...
     @overload
     def get_record_info(
@@ -904,7 +903,6 @@ class VCF:
         end: int | np.integer | None = None,
         fields: list[str] | None = None,
         info: list[str] | None = None,
-        *,
         lazy: bool = False,
     ) -> pl.DataFrame | pl.LazyFrame: ...
     def get_record_info(
@@ -914,7 +912,6 @@ class VCF:
         end: int | np.integer | None = None,
         fields: list[str] | None = None,
         info: list[str] | None = None,
-        *,
         lazy: bool = False,
     ) -> pl.DataFrame | pl.LazyFrame:
         """Get a DataFrame of any non-FORMAT fields in the VCF for a given range or the entire VCF.
