@@ -6,6 +6,7 @@ dist/
 docs/build/
 data/
 tmp/
+memray_flamegraphs/
 
 # pixi environments
 .pixi
