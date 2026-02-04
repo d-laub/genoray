@@ -1,3 +1,9 @@
+## 2.1.0 (2026-02-04)
+
+### Feat
+
+- specify number of jobs for X->SVAR conversion
+
 ## 2.0.1 (2026-02-04)
 
 ### Fix

@@ -1,6 +1,6 @@
 [project]
 name = "genoray"
-version = "2.0.1"
+version = "2.1.0"
 description = "Add your description here"
 authors = [{ name = "David Laub", email = "dlaub@ucsd.edu" }]
 readme = "README.md"
