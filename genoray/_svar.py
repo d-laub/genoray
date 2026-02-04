@@ -598,8 +598,17 @@ class SparseVar:
                 )
                 tasks.append(task)
 
+            pgen._free_index()
+            # PgenReaders can be multi-GB allocations, close them to free memory
+            pgen._geno_pgen.close()
+            if pgen.dosage_path is not None:
+                pgen._dose_pgen.close()
+
             with (
-                joblib_progress(description="Processing contigs", total=len(tasks)),
+                joblib_progress(
+                    description=f"Processing contigs using {effective_n_jobs} jobs",
+                    total=len(tasks),
+                ),
                 joblib.Parallel(n_jobs=n_jobs) as parallel,
             ):
                 vars_per_contig: list[int] = list(parallel(tasks))  # type: ignore

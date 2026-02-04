@@ -253,6 +253,11 @@ class PGEN:
         )
         self._c_max_idxs = {c: v for c, v in zip(self.contigs, contig_var_offsets)}
 
+    def _free_index(self):
+        """Free large allocations from the index."""
+        self._index = None
+        self._sei = None
+
     @property
     def current_samples(self) -> list[str]:
         """List of samples that are currently being used, in order."""
