@@ -17,7 +17,6 @@ import polars_config_meta  # noqa: F401
 import seqpro as sp
 from awkward.contents import Content, NumpyArray
 from hirola import HashTable
-from icecream import ic
 from joblib_progress import joblib_progress
 from loguru import logger
 from natsort import natsorted
@@ -572,7 +571,6 @@ class SparseVar:
         offsets = np.array(
             [0] + [pgen._c_max_idxs[c] + 1 for c in contigs], dtype=np.uint32
         )
-        ic(offsets)
 
         shape = (pgen.n_samples, pgen.ploidy)
         with TemporaryDirectory() as tdir:
@@ -874,8 +872,6 @@ def _process_contig_pgen(
     chunk_offsets[: len(arange)] = arange
     if len(arange) < n_chunks + 1:
         chunk_offsets[len(arange)] = end_idx
-
-    ic(total_vars, vars_per_chunk, n_chunks, chunk_offsets)
 
     out_path = tdir / str(chunk_idx)
     out_path.mkdir(parents=True, exist_ok=True)
