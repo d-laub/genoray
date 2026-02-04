@@ -1,3 +1,11 @@
+## 2.0.1 (2026-02-04)
+
+### Fix
+
+- **perf**: reduce memory usage for PGEN->SVAR
+- VCF.chunk no longer requires an index
+- **perf**: write SVAR with parallelization over contigs
+
 ## 2.0.0 (2026-01-28)
 
 ### Feat
