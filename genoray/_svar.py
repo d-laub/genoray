@@ -432,6 +432,7 @@ class SparseVar:
         max_mem: int | str,
         overwrite: bool = False,
         with_dosages: bool = False,
+        n_jobs: int = -1,
     ):
         """Create a Sparse Variant (.svar) from a VCF/BCF.
 
@@ -447,6 +448,8 @@ class SparseVar:
             Whether to overwrite the output directory if it exists.
         with_dosages
             Whether to write dosages.
+        n_jobs
+            Number of jobs to use for parallel processing.
         """
         out = Path(out)
 
@@ -475,7 +478,8 @@ class SparseVar:
             f.write(json)
 
         max_mem = parse_memory(max_mem)
-        job_mem = max_mem // joblib.cpu_count()
+        effective_n_jobs = joblib.cpu_count() if n_jobs == -1 else n_jobs
+        job_mem = max_mem // effective_n_jobs
 
         with TemporaryDirectory() as chunk_dir:
             chunk_dir = Path(chunk_dir)
@@ -495,7 +499,7 @@ class SparseVar:
 
             with (
                 joblib_progress(description="Processing contigs", total=len(tasks)),
-                joblib.Parallel(n_jobs=-1) as parallel,
+                joblib.Parallel(n_jobs=n_jobs) as parallel,
             ):
                 vars_per_contig: list[int] = list(parallel(tasks))  # type: ignore
 
