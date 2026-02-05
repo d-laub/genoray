@@ -19,7 +19,6 @@ from awkward.contents import Content, NumpyArray
 from hirola import HashTable
 from joblib_progress import joblib_progress
 from loguru import logger
-from natsort import natsorted
 from numpy.typing import ArrayLike, NDArray
 from pgenlib import PgenReader
 from polars._typing import IntoExpr
@@ -60,13 +59,13 @@ def dense2sparse(
     if genos.ndim < 3:
         raise ValueError(
             "Sparse genotypes must have at least 3 dimensions, with the final three dimensions corresponding"
-            " to (samples, ploidy, variants)"
+            + " to (samples, ploidy, variants)"
         )
     if dosages is not None:
         if dosages.ndim < 2:
             raise ValueError(
                 "Sparse dosages must have at least 2 dimensions, with the final two dimensions corresponding"
-                " to (samples, variants)"
+                + " to (samples, variants)"
             )
         if dosages.shape[-1] != genos.shape[-1]:
             raise ValueError(
@@ -479,6 +478,7 @@ class SparseVar:
 
         max_mem = parse_memory(max_mem)
         effective_n_jobs = joblib.cpu_count() if n_jobs == -1 else n_jobs
+        effective_n_jobs = min(effective_n_jobs, len(contigs))
         job_mem = max_mem // effective_n_jobs
 
         with TemporaryDirectory() as chunk_dir:
@@ -492,7 +492,7 @@ class SparseVar:
                     dosage_field=vcf.dosage_field if with_dosages else None,
                     max_mem=job_mem,
                     contig=c,
-                    tdir=chunk_dir,
+                    chunk_dir=chunk_dir,
                     chunk_idx=chunk_idx,
                 )
                 tasks.append(task)
@@ -502,14 +502,12 @@ class SparseVar:
                     description=f"Processing contigs using {effective_n_jobs} jobs",
                     total=len(tasks),
                 ),
-                joblib.Parallel(n_jobs=n_jobs) as parallel,
+                joblib.Parallel(n_jobs=effective_n_jobs) as parallel,
             ):
-                vars_per_contig: list[int] = list(parallel(tasks))  # type: ignore
+                results: list[tuple[int, int]] = list(parallel(tasks))  # type: ignore
 
             logger.info("Concatenating intermediate chunks")
-            _concat_data(
-                out, chunk_dir, shape, vars_per_contig, with_dosages=with_dosages
-            )
+            _concat_data(out, chunk_dir, shape, results, with_dosages=with_dosages)
 
     @classmethod
     def from_pgen(
@@ -571,17 +569,18 @@ class SparseVar:
 
         max_mem = parse_memory(max_mem)
         effective_n_jobs = joblib.cpu_count() if n_jobs == -1 else n_jobs
+        effective_n_jobs = min(effective_n_jobs, len(contigs))
         job_mem = max_mem // effective_n_jobs
         mem_per_var = pgen._mem_per_variant(
-            pgen.GenosDosages if with_dosages else pgen.Genos
+            pgen.GenosDosages if with_dosages else pgen.Genos  # type: ignore
         )
         offsets = np.array(
             [0] + [pgen._c_max_idxs[c] + 1 for c in contigs], dtype=np.uint32
         )
 
         shape = (pgen.n_samples, pgen.ploidy)
-        with TemporaryDirectory() as tdir:
-            tdir = Path(tdir)
+        with TemporaryDirectory() as contig_dir:
+            contig_dir = Path(contig_dir)
 
             tasks = []
             for chunk_idx, (start, end) in enumerate(
@@ -600,7 +599,7 @@ class SparseVar:
                     mem_per_var=mem_per_var,
                     n_samples=pgen.n_samples,
                     ploidy=pgen.ploidy,
-                    tdir=tdir,
+                    chunk_dir=contig_dir,
                     chunk_idx=chunk_idx,
                 )
                 tasks.append(task)
@@ -616,12 +615,12 @@ class SparseVar:
                     description=f"Processing contigs using {effective_n_jobs} jobs",
                     total=len(tasks),
                 ),
-                joblib.Parallel(n_jobs=n_jobs) as parallel,
+                joblib.Parallel(n_jobs=effective_n_jobs) as parallel,
             ):
-                vars_per_contig: list[int] = list(parallel(tasks))  # type: ignore
+                results: list[tuple[int, int]] = list(parallel(tasks))  # type: ignore
 
             logger.info("Concatenating intermediate chunks")
-            _concat_data(out, tdir, shape, vars_per_contig, with_dosages=with_dosages)
+            _concat_data(out, contig_dir, shape, results, with_dosages=with_dosages)
 
     @classmethod
     def _index_path(cls, root: Path):
@@ -825,9 +824,9 @@ def _process_contig_vcf(
     dosage_field: str | None,
     max_mem: int | str,
     contig: str,
-    tdir: Path,
+    chunk_dir: Path,
     chunk_idx: int,
-) -> int:
+) -> tuple[int, int]:
     vcf = VCF(path, dosage_field=dosage_field)
     if dosage_field is not None:
         chunker = vcf.chunk(contig, max_mem=max_mem, mode=VCF.Genos8Dosages)
@@ -835,7 +834,17 @@ def _process_contig_vcf(
         chunker = vcf.chunk(contig, max_mem=max_mem, mode=VCF.Genos8)
 
     total_vars = 0
-    for data in chunker:
+    n_chunks = 0
+
+    # Create a subdirectory for this contig to avoid collision
+    contig_dir = chunk_dir / f"c{chunk_idx}"
+    contig_dir.mkdir(parents=True, exist_ok=True)
+
+    for i, data in enumerate(chunker):
+        out_path = contig_dir / str(i)
+        out_path.mkdir(parents=True, exist_ok=True)
+        n_chunks += 1
+
         if isinstance(data, tuple):
             genos, dosages = data
         else:
@@ -848,13 +857,13 @@ def _process_contig_vcf(
         var_idxs = np.arange(total_vars, total_vars + n_vars, dtype=np.int32)
         if dosages is not None:
             sp_genos, sp_dosages = dense2sparse(genos, var_idxs, dosages)
-            _write_genos(tdir / str(chunk_idx), sp_genos)
-            _write_dosages(tdir / str(chunk_idx), sp_dosages.data)
+            _write_genos(out_path, sp_genos)
+            _write_dosages(out_path, sp_dosages.data)
         else:
             sp_genos = dense2sparse(genos, var_idxs)
-            _write_genos(tdir / str(chunk_idx), sp_genos)
+            _write_genos(out_path, sp_genos)
         total_vars += n_vars
-    return total_vars
+    return total_vars, n_chunks
 
 
 def _process_contig_pgen(
@@ -866,9 +875,9 @@ def _process_contig_pgen(
     mem_per_var: int,
     n_samples: int,
     ploidy: int,
-    tdir: Path,
+    chunk_dir: Path,
     chunk_idx: int,
-) -> int:
+) -> tuple[int, int]:
     geno_reader = PgenReader(bytes(Path(geno_path)), n_samples)
     dose_reader = (
         PgenReader(bytes(Path(dosage_path))) if dosage_path is not None else None
@@ -882,21 +891,30 @@ def _process_contig_pgen(
             + f" Memory per variant: {format_memory(mem_per_var)}."
         )
 
-    n_chunks = -(-total_vars // vars_per_chunk)
-    chunk_offsets = np.empty(n_chunks + 1, dtype=np.uint32)
+    n_chunks_est = -(-total_vars // vars_per_chunk)
+    chunk_offsets = np.empty(n_chunks_est + 1, dtype=np.uint32)
     arange = np.arange(start_idx, end_idx, vars_per_chunk, dtype=np.uint32)
     chunk_offsets[: len(arange)] = arange
-    if len(arange) < n_chunks + 1:
+    if len(arange) < n_chunks_est + 1:
         chunk_offsets[len(arange)] = end_idx
 
-    out_path = tdir / str(chunk_idx)
-    out_path.mkdir(parents=True, exist_ok=True)
-
     total_vars = 0
-    for start, end in np.lib.stride_tricks.sliding_window_view(chunk_offsets, 2):
+    n_chunks = 0
+
+    # Create a subdirectory for this contig to avoid collision
+    contig_dir = chunk_dir / f"c{chunk_idx}"
+    contig_dir.mkdir(parents=True, exist_ok=True)
+
+    for i, (start, end) in enumerate(
+        np.lib.stride_tricks.sliding_window_view(chunk_offsets, 2)
+    ):
         n_vars = end - start
         if n_vars == 0:
             continue
+        n_chunks += 1
+
+        out_path = contig_dir / str(i)
+        out_path.mkdir(parents=True, exist_ok=True)
 
         # Read Genotypes
         # (v s p) -> (v s*p)
@@ -923,14 +941,14 @@ def _process_contig_pgen(
             sp_genos, sp_dosages = dense2sparse(
                 genos.astype(np.int8), var_idxs, dosages
             )
-            _write_genos(tdir / str(chunk_idx), sp_genos)
-            _write_dosages(tdir / str(chunk_idx), sp_dosages.data)
+            _write_genos(out_path, sp_genos)
+            _write_dosages(out_path, sp_dosages.data)
         else:
             sp_genos = dense2sparse(genos.astype(np.int8), var_idxs)
-            _write_genos(tdir / str(chunk_idx), sp_genos)
+            _write_genos(out_path, sp_genos)
 
         total_vars += n_vars
-    return total_vars
+    return total_vars, n_chunks
 
 
 def _open_genos(path: Path, shape: tuple[int | None, ...], mode: Literal["r", "r+"]):
@@ -990,19 +1008,38 @@ def _concat_data(
     out_path: Path,
     chunk_dir: Path,
     shape: tuple[int, int],
-    vars_per_contig: list[int],
+    contig_results: list[tuple[int, int]],
     with_dosages: bool = False,
 ):
     out_path.mkdir(parents=True, exist_ok=True)
 
-    # [1, 2, 3, ...]
-    chunk_dirs = natsorted(chunk_dir.iterdir())
+    # Flatten chunk directories and calculate offsets
+    chunk_offsets: list[int] = []
+    contig_offset = 0
+    global_chunk_idx = 0
 
-    contig_offsets = lengths_to_offsets(np.asarray(vars_per_contig))[:-1]
+    for chunk_idx, (n_vars, n_chunks) in enumerate(contig_results):
+        contig_subdir = chunk_dir / f"c{chunk_idx}"
+
+        if n_chunks > 0:
+            for i in range(n_chunks):
+                src = contig_subdir / str(i)
+                dest = chunk_dir / str(global_chunk_idx)
+                src.rename(dest)
+                chunk_offsets.append(contig_offset)
+                global_chunk_idx += 1
+
+        if contig_subdir.exists():
+            shutil.rmtree(contig_subdir)
+
+        contig_offset += n_vars
+
+    # [1, 2, 3, ...]
+    chunk_dirs = [chunk_dir / str(i) for i in range(len(chunk_offsets))]
 
     vars_per_sp = np.zeros(shape, dtype=np.int32)
     ls_sp_genos: list[SparseGenotypes] = []
-    for offset, chunk_dir in zip(contig_offsets, chunk_dirs):
+    for offset, chunk_dir in zip(chunk_offsets, chunk_dirs):
         sp_genos = _open_genos(chunk_dir, (*shape, None), mode="r+")
         sp_genos.data[:] += offset
         vars_per_sp += sp_genos.lengths
