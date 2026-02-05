@@ -164,7 +164,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/93/83/71a2ee6158bb9f39a90c0dea1637f81d5eef866e188e1971a1b1ab01a35a/filelock-3.0.12-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/69/69/4ca02ee367d2c98edcaeb83fc278d20972502ee071214ad9d8ca85e06080/fonttools-4.61.1-cp310-cp310-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/01/c9/97cc5aae1648dcb851958a3ddf73ccd7dbe5650d95203ecb4d7720b4cdbf/fsspec-2026.1.0-py3-none-any.whl
-      - pypi: https://files.pythonhosted.org/packages/31/c7/002ee3f8d7190ca86cb84a0498f718a9323a89fdd6c2d892d1161771c23c/genoray_cli-0.1.2-py3-none-any.whl
+      - pypi: https://files.pythonhosted.org/packages/62/ae/6ae8f6293c4915888e37eb592b2f48b253b16289aeb17cdbf13d26d376ad/genoray_cli-0.2.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/ac/8e/0eccb528701273640dd4f13678a0c1352176166aecd1ee7f4fa29355132b/hirola-0.3.0-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/f0/0f/310fb31e39e2d734ccaa2c0fb981ee41f7bd5056ce9bc29b2248bd569169/humanfriendly-10.0-py2.py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/91/29/df4b9b42f2be0b623cbd5e2140cafcaa2bef0759a00b7b70104dcfe2fb51/joblib-1.4.2-py3-none-any.whl
@@ -415,7 +415,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/93/83/71a2ee6158bb9f39a90c0dea1637f81d5eef866e188e1971a1b1ab01a35a/filelock-3.0.12-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/b7/37/82dbef0f6342eb01f54bca073ac1498433d6ce71e50c3c3282b655733b31/fonttools-4.61.1-cp312-cp312-manylinux1_x86_64.manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_5_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/01/c9/97cc5aae1648dcb851958a3ddf73ccd7dbe5650d95203ecb4d7720b4cdbf/fsspec-2026.1.0-py3-none-any.whl
-      - pypi: https://files.pythonhosted.org/packages/31/c7/002ee3f8d7190ca86cb84a0498f718a9323a89fdd6c2d892d1161771c23c/genoray_cli-0.1.2-py3-none-any.whl
+      - pypi: https://files.pythonhosted.org/packages/62/ae/6ae8f6293c4915888e37eb592b2f48b253b16289aeb17cdbf13d26d376ad/genoray_cli-0.2.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/ac/8e/0eccb528701273640dd4f13678a0c1352176166aecd1ee7f4fa29355132b/hirola-0.3.0-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/f0/0f/310fb31e39e2d734ccaa2c0fb981ee41f7bd5056ce9bc29b2248bd569169/humanfriendly-10.0-py2.py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/91/29/df4b9b42f2be0b623cbd5e2140cafcaa2bef0759a00b7b70104dcfe2fb51/joblib-1.4.2-py3-none-any.whl
@@ -625,7 +625,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/93/83/71a2ee6158bb9f39a90c0dea1637f81d5eef866e188e1971a1b1ab01a35a/filelock-3.0.12-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/69/69/4ca02ee367d2c98edcaeb83fc278d20972502ee071214ad9d8ca85e06080/fonttools-4.61.1-cp310-cp310-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/01/c9/97cc5aae1648dcb851958a3ddf73ccd7dbe5650d95203ecb4d7720b4cdbf/fsspec-2026.1.0-py3-none-any.whl
-      - pypi: https://files.pythonhosted.org/packages/31/c7/002ee3f8d7190ca86cb84a0498f718a9323a89fdd6c2d892d1161771c23c/genoray_cli-0.1.2-py3-none-any.whl
+      - pypi: https://files.pythonhosted.org/packages/62/ae/6ae8f6293c4915888e37eb592b2f48b253b16289aeb17cdbf13d26d376ad/genoray_cli-0.2.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/ac/8e/0eccb528701273640dd4f13678a0c1352176166aecd1ee7f4fa29355132b/hirola-0.3.0-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/f0/0f/310fb31e39e2d734ccaa2c0fb981ee41f7bd5056ce9bc29b2248bd569169/humanfriendly-10.0-py2.py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/91/29/df4b9b42f2be0b623cbd5e2140cafcaa2bef0759a00b7b70104dcfe2fb51/joblib-1.4.2-py3-none-any.whl
@@ -836,7 +836,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/93/83/71a2ee6158bb9f39a90c0dea1637f81d5eef866e188e1971a1b1ab01a35a/filelock-3.0.12-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/79/61/1ca198af22f7dd22c17ab86e9024ed3c06299cfdb08170640e9996d501a0/fonttools-4.61.1-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/01/c9/97cc5aae1648dcb851958a3ddf73ccd7dbe5650d95203ecb4d7720b4cdbf/fsspec-2026.1.0-py3-none-any.whl
-      - pypi: https://files.pythonhosted.org/packages/31/c7/002ee3f8d7190ca86cb84a0498f718a9323a89fdd6c2d892d1161771c23c/genoray_cli-0.1.2-py3-none-any.whl
+      - pypi: https://files.pythonhosted.org/packages/62/ae/6ae8f6293c4915888e37eb592b2f48b253b16289aeb17cdbf13d26d376ad/genoray_cli-0.2.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/ac/8e/0eccb528701273640dd4f13678a0c1352176166aecd1ee7f4fa29355132b/hirola-0.3.0-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/f0/0f/310fb31e39e2d734ccaa2c0fb981ee41f7bd5056ce9bc29b2248bd569169/humanfriendly-10.0-py2.py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/91/29/df4b9b42f2be0b623cbd5e2140cafcaa2bef0759a00b7b70104dcfe2fb51/joblib-1.4.2-py3-none-any.whl
@@ -1050,7 +1050,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/93/83/71a2ee6158bb9f39a90c0dea1637f81d5eef866e188e1971a1b1ab01a35a/filelock-3.0.12-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/b7/37/82dbef0f6342eb01f54bca073ac1498433d6ce71e50c3c3282b655733b31/fonttools-4.61.1-cp312-cp312-manylinux1_x86_64.manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_5_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/01/c9/97cc5aae1648dcb851958a3ddf73ccd7dbe5650d95203ecb4d7720b4cdbf/fsspec-2026.1.0-py3-none-any.whl
-      - pypi: https://files.pythonhosted.org/packages/31/c7/002ee3f8d7190ca86cb84a0498f718a9323a89fdd6c2d892d1161771c23c/genoray_cli-0.1.2-py3-none-any.whl
+      - pypi: https://files.pythonhosted.org/packages/62/ae/6ae8f6293c4915888e37eb592b2f48b253b16289aeb17cdbf13d26d376ad/genoray_cli-0.2.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/ac/8e/0eccb528701273640dd4f13678a0c1352176166aecd1ee7f4fa29355132b/hirola-0.3.0-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/f0/0f/310fb31e39e2d734ccaa2c0fb981ee41f7bd5056ce9bc29b2248bd569169/humanfriendly-10.0-py2.py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/91/29/df4b9b42f2be0b623cbd5e2140cafcaa2bef0759a00b7b70104dcfe2fb51/joblib-1.4.2-py3-none-any.whl
@@ -1264,7 +1264,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/93/83/71a2ee6158bb9f39a90c0dea1637f81d5eef866e188e1971a1b1ab01a35a/filelock-3.0.12-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/a3/4b/d67eedaed19def5967fade3297fed8161b25ba94699efc124b14fb68cdbc/fonttools-4.61.1-cp313-cp313-manylinux1_x86_64.manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_5_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/01/c9/97cc5aae1648dcb851958a3ddf73ccd7dbe5650d95203ecb4d7720b4cdbf/fsspec-2026.1.0-py3-none-any.whl
-      - pypi: https://files.pythonhosted.org/packages/31/c7/002ee3f8d7190ca86cb84a0498f718a9323a89fdd6c2d892d1161771c23c/genoray_cli-0.1.2-py3-none-any.whl
+      - pypi: https://files.pythonhosted.org/packages/62/ae/6ae8f6293c4915888e37eb592b2f48b253b16289aeb17cdbf13d26d376ad/genoray_cli-0.2.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/ac/8e/0eccb528701273640dd4f13678a0c1352176166aecd1ee7f4fa29355132b/hirola-0.3.0-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/f0/0f/310fb31e39e2d734ccaa2c0fb981ee41f7bd5056ce9bc29b2248bd569169/humanfriendly-10.0-py2.py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/91/29/df4b9b42f2be0b623cbd5e2140cafcaa2bef0759a00b7b70104dcfe2fb51/joblib-1.4.2-py3-none-any.whl
@@ -2509,8 +2509,8 @@ packages:
   requires_python: '>=3.10'
 - pypi: ./
   name: genoray
-  version: 2.0.1
-  sha256: 3f843872ef21ec1d7bc2dd61a9f4a2966a659964268bce762c8bdeb33c732f0e
+  version: 2.1.0
+  sha256: 45b04f6174a6b9df6cb84b1c32266fa276c5e7f7213796a4f779afcce715c018
   requires_dist:
   - seqpro>=0.8.0
   - numpy>=1.26
@@ -2537,16 +2537,16 @@ packages:
   - joblib>=1.4.2,<2
   - joblib-progress>=1.0.6,<2
   - filelock>3,<4
-  - genoray-cli>=0.1.2 ; extra == 'cli'
+  - genoray-cli>=0.2.0 ; extra == 'cli'
   requires_python: '>=3.10,<3.14'
-- pypi: https://files.pythonhosted.org/packages/31/c7/002ee3f8d7190ca86cb84a0498f718a9323a89fdd6c2d892d1161771c23c/genoray_cli-0.1.2-py3-none-any.whl
+- pypi: https://files.pythonhosted.org/packages/62/ae/6ae8f6293c4915888e37eb592b2f48b253b16289aeb17cdbf13d26d376ad/genoray_cli-0.2.0-py3-none-any.whl
   name: genoray-cli
-  version: 0.1.2
-  sha256: c85ea9badf07d71e4f42eba24ab3f05ea28398c76e2d4bdf6bf6275ca548074b
+  version: 0.2.0
+  sha256: 4275fa3ed7421d1365d05381525a6c710e788d6f6616b17f3f7a4974a17241a9
   requires_dist:
   - cyclopts
-  - genoray
-  requires_python: '>=3.9,<3.13'
+  - genoray>=2.1.0
+  requires_python: '>=3.10,<3.14'
 - conda: https://conda.anaconda.org/conda-forge/linux-64/gmp-6.3.0-hac33072_2.conda
   sha256: 309cf4f04fec0c31b6771a5809a1909b4b3154a2208f52351e1ada006f4c750c
   md5: c94a5994ef49749880a8139cf9afcbe1
