@@ -1,3 +1,9 @@
+## 2.1.1 (2026-02-05)
+
+### Fix
+
+- overwriting chunks when chunks smaller than full contig
+
 ## 2.1.0 (2026-02-04)
 
 ### Feat
