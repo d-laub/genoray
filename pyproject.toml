@@ -35,7 +35,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-cli = ["genoray-cli>=0.1.2"]
+cli = ["genoray-cli>=0.2.0"]
 
 [tool.commitizen]
 name = "cz_conventional_commits"
