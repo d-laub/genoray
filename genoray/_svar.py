@@ -23,6 +23,7 @@ from numpy.typing import ArrayLike, NDArray
 from pgenlib import PgenReader
 from polars._typing import IntoExpr
 from pydantic import BaseModel
+from rich.progress import MofNCompleteColumn, Progress
 from seqpro.rag import OFFSET_TYPE, Ragged, lengths_to_offsets
 from tqdm.auto import tqdm
 
@@ -1069,8 +1070,15 @@ def _concat_data(
     # Use in-memory array for write offsets to avoid disk I/O
     write_offsets = offsets[:-1].copy()
 
+    pbar = Progress(*Progress.get_default_columns(), MofNCompleteColumn())
+    pbar.start()
+
     # Pass 2: Copy Genotypes
-    for offset, chunk_dir in zip(chunk_offsets, chunk_dirs):
+    for offset, chunk_dir in pbar.track(
+        zip(chunk_offsets, chunk_dirs),
+        total=len(chunk_dirs),
+        description="Copying genotypes",
+    ):
         # We process chunks sequentially to minimize memory usage
         sp_genos = _open_genos(chunk_dir, (*shape, None), mode="r")
 
@@ -1097,7 +1105,9 @@ def _concat_data(
             out_path / "dosages.npy", dtype=DOSAGE_TYPE, mode="w+", shape=offsets[-1]
         )
 
-        for chunk_dir in chunk_dirs:
+        for chunk_dir in pbar.track(
+            chunk_dirs, total=len(chunk_dirs), description="Copying dosages"
+        ):
             sp_dosages = _open_dosages(chunk_dir, (*shape, None), mode="r")
 
             _copy_chunk_dosages_helper(
@@ -1111,6 +1121,8 @@ def _concat_data(
             del sp_dosages
 
         dosages_memmap.flush()
+
+    pbar.stop()
 
 
 @nb.njit(parallel=True, nogil=True, cache=True)
