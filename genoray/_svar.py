@@ -1038,12 +1038,20 @@ def _concat_data(
     chunk_dirs = [chunk_dir / str(i) for i in range(len(chunk_offsets))]
 
     vars_per_sp = np.zeros(shape, dtype=np.int32)
-    ls_sp_genos: list[SparseGenotypes] = []
-    for offset, chunk_dir in zip(chunk_offsets, chunk_dirs):
-        sp_genos = _open_genos(chunk_dir, (*shape, None), mode="r+")
-        sp_genos.data[:] += offset
-        vars_per_sp += sp_genos.lengths
-        ls_sp_genos.append(sp_genos)
+
+    # Pass 1: Compute lengths
+    # We explicitly map only the offsets to avoid mapping the potentially large variant_idxs
+    for chunk_dir in chunk_dirs:
+        # Load offsets
+        chunk_offsets_arr = np.memmap(
+            chunk_dir / "offsets.npy", dtype=np.int64, mode="r"
+        )
+        # Compute lengths: (n_samples * ploidy,) -> (n_samples, ploidy)
+        chunk_lengths = np.diff(chunk_offsets_arr).reshape(shape)
+        vars_per_sp += chunk_lengths
+
+        # Close memmap
+        del chunk_offsets_arr
 
     # offsets should be relatively small even for ultra-large datasets
     # scales O(n_samples * ploidy)
@@ -1057,56 +1065,101 @@ def _concat_data(
     var_idxs_memmap = np.memmap(
         out_path / "variant_idxs.npy", dtype=V_IDX_TYPE, mode="w+", shape=offsets[-1]
     )
-    _concat_helper(
-        var_idxs_memmap,
-        offsets,
-        [a.data for a in ls_sp_genos],
-        [a.offsets for a in ls_sp_genos],
-        shape,
-    )
+
+    # Use in-memory array for write offsets to avoid disk I/O
+    write_offsets = offsets[:-1].copy()
+
+    # Pass 2: Copy Genotypes
+    for offset, chunk_dir in zip(chunk_offsets, chunk_dirs):
+        # We process chunks sequentially to minimize memory usage
+        sp_genos = _open_genos(chunk_dir, (*shape, None), mode="r")
+
+        _copy_chunk_helper(
+            var_idxs_memmap,
+            write_offsets,
+            sp_genos.data,
+            sp_genos.offsets,
+            offset,
+            shape[0],
+            shape[1],
+        )
+
+        # Close memmaps
+        del sp_genos
+
     var_idxs_memmap.flush()
 
     if with_dosages:
-        ls_: list[SparseDosages] = []
-        for chunk_dir in chunk_dirs:
-            sp_dosages = _open_dosages(chunk_dir, (*shape, None), mode="r")
-            vars_per_sp += sp_dosages.lengths
-            ls_.append(sp_dosages)
+        # Reset write offsets
+        write_offsets = offsets[:-1].copy()
+
         dosages_memmap = np.memmap(
             out_path / "dosages.npy", dtype=DOSAGE_TYPE, mode="w+", shape=offsets[-1]
         )
-        _concat_helper(
-            dosages_memmap,
-            offsets,
-            [a.data for a in ls_],
-            [a.offsets for a in ls_],
-            shape,
-        )
+
+        for chunk_dir in chunk_dirs:
+            sp_dosages = _open_dosages(chunk_dir, (*shape, None), mode="r")
+
+            _copy_chunk_dosages_helper(
+                dosages_memmap,
+                write_offsets,
+                sp_dosages.data,
+                sp_dosages.offsets,
+                shape[0],
+                shape[1],
+            )
+            del sp_dosages
+
         dosages_memmap.flush()
 
 
 @nb.njit(parallel=True, nogil=True, cache=True)
-def _concat_helper(
+def _copy_chunk_helper(
     out_data: NDArray[DTYPE],
-    out_offsets: NDArray[OFFSET_TYPE],
-    in_data: list[NDArray[DTYPE]],
-    in_offsets: list[NDArray[OFFSET_TYPE]],
-    shape: tuple[int, int],
+    write_offsets: NDArray[OFFSET_TYPE],
+    in_data: NDArray[DTYPE],
+    in_offsets: NDArray[OFFSET_TYPE],
+    variant_offset: int,
+    n_samples: int,
+    ploidy: int,
 ):
-    n_samples, ploidy = shape
-    n_chunks = len(in_data)
-    assert len(in_offsets) == n_chunks
     for s in nb.prange(n_samples):
-        for p in nb.prange(ploidy):
+        for p in range(ploidy):
             sp = s * ploidy + p
-            o_s, o_e = out_offsets[sp], out_offsets[sp + 1]
-            sp_out_idxs = out_data[o_s:o_e]
-            offset = 0
-            for chunk in range(n_chunks):
-                i_s, i_e = in_offsets[chunk][sp], in_offsets[chunk][sp + 1]
-                chunk_len = i_e - i_s
-                sp_out_idxs[offset : offset + chunk_len] = in_data[chunk][i_s:i_e]
-                offset += chunk_len
+
+            i_s, i_e = in_offsets[sp], in_offsets[sp + 1]
+            length = i_e - i_s
+
+            o_s = write_offsets[sp]
+
+            # Copy and add offset
+            for i in range(length):
+                out_data[o_s + i] = in_data[i_s + i] + variant_offset
+
+            write_offsets[sp] += length
+
+
+@nb.njit(parallel=True, nogil=True, cache=True)
+def _copy_chunk_dosages_helper(
+    out_data: NDArray[DOSAGE_TYPE],
+    write_offsets: NDArray[OFFSET_TYPE],
+    in_data: NDArray[DOSAGE_TYPE],
+    in_offsets: NDArray[OFFSET_TYPE],
+    n_samples: int,
+    ploidy: int,
+):
+    for s in nb.prange(n_samples):
+        for p in range(ploidy):
+            sp = s * ploidy + p
+
+            i_s, i_e = in_offsets[sp], in_offsets[sp + 1]
+            length = i_e - i_s
+
+            o_s = write_offsets[sp]
+
+            out_data[o_s : o_s + length] = in_data[i_s:i_e]
+
+            write_offsets[sp] += length
 
 
 @nb.njit(parallel=True, nogil=True, cache=True)
