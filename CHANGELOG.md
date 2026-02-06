@@ -1,3 +1,9 @@
+## 2.1.2 (2026-02-06)
+
+### Fix
+
+- too many open memmaps during X->SVAR
+
 ## 2.1.1 (2026-02-05)
 
 ### Fix
