@@ -10,6 +10,7 @@ py310 = ["py310"]
 py311 = ["py311"]
 py312 = ["py312"]
 py313 = ["py313"]
+sbox = ["sbox", "py310"]
 
 [dependencies]
 uv = "*"
@@ -36,7 +37,6 @@ gen = "sh tests/data/gen_from_vcf.sh"
 test = { cmd = "pytest tests", depends-on = "gen" }
 prek-install = "prek install"
 bump-dry = "cz bump --dry-run"
-i-kernel = "ipython kernel install --user --name genoray"
 
 [feature.doc.dependencies]
 sphinx = "*"
@@ -89,3 +89,9 @@ python = "3.13.*"
 
 [feature.py313.pypi-dependencies]
 numpy = ">=2"
+
+[feature.sbox.pypi-dependencies]
+fast-histogram = "*"
+
+[feature.sbox.tasks]
+i-kernel = "ipython kernel install --user --name genoray"
