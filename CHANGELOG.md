@@ -1,3 +1,9 @@
+## 2.1.3 (2026-02-10)
+
+### Fix
+
+- no variants with no VCF gvi index
+
 ## 2.1.2 (2026-02-06)
 
 ### Fix
