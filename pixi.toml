@@ -35,7 +35,7 @@ seaborn = "*"
 [tasks]
 gen = "sh tests/data/gen_from_vcf.sh"
 test = { cmd = "pytest tests", depends-on = "gen" }
-prek-install = "prek install"
+prek-install = "prek install -t pre-commit -t pre-push"
 bump-dry = "cz bump --dry-run"
 
 [feature.doc.dependencies]

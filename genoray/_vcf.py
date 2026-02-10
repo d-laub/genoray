@@ -46,7 +46,7 @@ def _is_genos8(obj: Any) -> TypeGuard[NDArray[np.int8]]:
         isinstance(obj, np.ndarray)
         and obj.dtype.type == np.int8
         and obj.ndim == 3
-        and obj.shape[1] in (2, 3)
+        and obj.shape[1] in (2, 3)  # diploid with/without phasing
     )
 
 
@@ -54,8 +54,10 @@ class Genos8(NDArray[np.int8], Phantom, predicate=_is_genos8):
     _gdtype = np.int8
 
     @classmethod
-    def empty(cls, n_samples: int, ploidy: int, n_variants: int) -> Genos8:
-        return cls.parse(np.empty((n_samples, ploidy, n_variants), np.int8))
+    def empty(
+        cls, n_samples: int, ploidy: int, n_variants: int, phasing: bool
+    ) -> Genos8:
+        return cls.parse(np.empty((n_samples, ploidy + phasing, n_variants), np.int8))
 
 
 def _is_genos16(obj: Any) -> TypeGuard[NDArray[np.int16]]:
@@ -63,7 +65,7 @@ def _is_genos16(obj: Any) -> TypeGuard[NDArray[np.int16]]:
         isinstance(obj, np.ndarray)
         and obj.dtype.type == np.int16
         and obj.ndim == 3
-        and obj.shape[1] in (2, 3)
+        and obj.shape[1] in (2, 3)  # diploid with/without phasing
     )
 
 
@@ -71,8 +73,10 @@ class Genos16(NDArray[np.int16], Phantom, predicate=_is_genos16):
     _gdtype = np.int16
 
     @classmethod
-    def empty(cls, n_samples: int, ploidy: int, n_variants: int) -> Genos16:
-        return cls.parse(np.empty((n_samples, ploidy, n_variants), np.int16))
+    def empty(
+        cls, n_samples: int, ploidy: int, n_variants: int, phasing: bool
+    ) -> Genos16:
+        return cls.parse(np.empty((n_samples, ploidy + phasing, n_variants), np.int16))
 
 
 def _is_dosages(obj: Any) -> TypeGuard[NDArray[np.float32]]:
@@ -83,11 +87,13 @@ def _is_dosages(obj: Any) -> TypeGuard[NDArray[np.float32]]:
 
 class Dosages(NDArray[np.float32], Phantom, predicate=_is_dosages):
     @classmethod
-    def empty(cls, n_samples: int, ploidy: int, n_variants: int) -> Dosages:
+    def empty(
+        cls, n_samples: int, ploidy: int, n_variants: int, phasing: bool
+    ) -> Dosages:
         return cls.parse(np.empty((n_samples, n_variants), np.float32))
 
 
-def _is_genos8_dosages(obj) -> TypeGuard[tuple[Genos8, Dosages]]:
+def _is_genos8_dosages(obj: Any) -> TypeGuard[tuple[Genos8, Dosages]]:
     """Check if the object is a tuple of genotypes and dosages.
 
     Parameters
@@ -112,11 +118,13 @@ class Genos8Dosages(tuple[Genos8, Dosages], Phantom, predicate=_is_genos8_dosage
     _gdtype = np.int8
 
     @classmethod
-    def empty(cls, n_samples: int, ploidy: int, n_variants: int) -> Genos8Dosages:
+    def empty(
+        cls, n_samples: int, ploidy: int, n_variants: int, phasing: bool
+    ) -> Genos8Dosages:
         return cls.parse(
             (
-                Genos8.empty(n_samples, ploidy, n_variants),
-                Dosages.empty(n_samples, ploidy, n_variants),
+                Genos8.empty(n_samples, ploidy, n_variants, phasing),
+                Dosages.empty(n_samples, ploidy, n_variants, phasing),
             )
         )
 
@@ -146,11 +154,13 @@ class Genos16Dosages(tuple[Genos16, Dosages], Phantom, predicate=_is_genos16_dos
     _gdtype = np.int16
 
     @classmethod
-    def empty(cls, n_samples: int, ploidy: int, n_variants: int) -> Genos16Dosages:
+    def empty(
+        cls, n_samples: int, ploidy: int, n_variants: int, phasing: bool
+    ) -> Genos16Dosages:
         return cls.parse(
             (
-                Genos16.empty(n_samples, ploidy, n_variants),
-                Dosages.empty(n_samples, ploidy, n_variants),
+                Genos16.empty(n_samples, ploidy, n_variants, phasing),
+                Dosages.empty(n_samples, ploidy, n_variants, phasing),
             )
         )
 
@@ -219,7 +229,7 @@ class VCF:
     """List of available samples in the VCF file."""
     contigs: list[str]
     """Naturally sorted list of available contigs in the VCF file."""
-    ploidy = 2
+    ploidy: int = 2
     """Ploidy of the VCF file. This is currently always 2 since we use cyvcf2."""
     _filter: Callable[[cyvcf2.Variant], bool] | None
     """Function to filter variants. Should return True for variants to keep."""
@@ -534,14 +544,13 @@ class VCF:
             raise ValueError(
                 "Dosage field not specified. Set the VCF reader's `dosage_field` parameter."
             )
-        ploidy = self.ploidy + self.phasing
 
         c = self._c_norm.norm(contig)
         if c is None:
             logger.warning(
                 f"Query contig {contig} not found in VCF file, even after normalizing for UCSC/Ensembl nomenclature."
             )
-            return mode.empty(self.n_samples, ploidy, 0)
+            return mode.empty(self.n_samples, self.ploidy, 0, self.phasing)
 
         start = max(0, start)  # type: ignore
 
@@ -550,7 +559,7 @@ class VCF:
             if self._index is not None:
                 n_variants = self.n_vars_in_ranges(c, start, end)[0]
                 if n_variants == 0:
-                    return mode.empty(self.n_samples, ploidy, 0)
+                    return mode.empty(self.n_samples, self.ploidy, 0, self.phasing)
             else:
                 n_variants = None
 
@@ -558,21 +567,27 @@ class VCF:
                 if n_variants is None:
                     data = None
                 else:
-                    data = mode.empty(self.n_samples, ploidy, n_variants)
+                    data = mode.empty(
+                        self.n_samples, self.ploidy, n_variants, self.phasing
+                    )
                 data, _ = self._fill_genos(vcf, data, mode=mode)
             elif issubclass(mode, Dosages):
                 assert self.dosage_field is not None
                 if n_variants is None:
                     data = None
                 else:
-                    data = mode.empty(self.n_samples, ploidy, n_variants)
+                    data = mode.empty(
+                        self.n_samples, self.ploidy, n_variants, self.phasing
+                    )
                 data, _ = self._fill_dosages(vcf, data, self.dosage_field)
             elif issubclass(mode, (Genos8Dosages, Genos16Dosages)):
                 assert self.dosage_field is not None
                 if n_variants is None:
                     data = None
                 else:
-                    data = mode.empty(self.n_samples, ploidy, n_variants)
+                    data = mode.empty(
+                        self.n_samples, self.ploidy, n_variants, self.phasing
+                    )
                 data, _ = self._fill_genos_and_dosages(
                     vcf, data, self.dosage_field, mode=mode
                 )
@@ -633,8 +648,6 @@ class VCF:
                 "Dosage field not specified. Set the VCF reader's `dosage_field` parameter."
             )
 
-        ploidy = self.ploidy + self.phasing
-
         max_mem = parse_memory(max_mem)
 
         c = self._c_norm.norm(contig)
@@ -642,7 +655,7 @@ class VCF:
             logger.warning(
                 f"Query contig {contig} not found in VCF file, even after normalizing for UCSC/Ensembl nomenclature."
             )
-            yield mode.empty(self.n_samples, ploidy, 0)
+            yield mode.empty(self.n_samples, self.ploidy, 0, self.phasing)
             return
 
         start = max(0, start)  # type: ignore
@@ -655,7 +668,7 @@ class VCF:
                 + f" Memory per variant: {format_memory(mem_per_v)}."
             )
 
-        buffer = mode.empty(self.n_samples, ploidy, vars_per_chunk)
+        buffer = mode.empty(self.n_samples, self.ploidy, vars_per_chunk, self.phasing)
         if isinstance(buffer, (Genos8, Genos16)):
             gt_buffer = buffer
             ds_buffer = None
@@ -668,7 +681,6 @@ class VCF:
         vcf = self._vcf(f"{c}:{int(start + 1)}-{end}")  # range string is 1-based
         if self.progress and self._pbar is None:
             vcf = tqdm(vcf, desc="Reading VCF", unit=" variant")
-        ploidy = self.ploidy + self.phasing
         i = 0
         for v in vcf:
             if gt_buffer is not None:
@@ -714,7 +726,7 @@ class VCF:
             if len(buffer) == 1:
                 yield buffer[0]
             else:
-                yield buffer
+                yield buffer  # type: ignore
 
     def _chunk_ranges_with_length(
         self,
@@ -761,7 +773,6 @@ class VCF:
             raise ValueError(
                 "Dosage field not specified. Set the VCF reader's `dosage_field` parameter."
             )
-        ploidy = self.ploidy + self.phasing
         mode = cast(type[L], mode)
 
         max_mem = parse_memory(max_mem)
@@ -774,14 +785,20 @@ class VCF:
                 f"Query contig {contig} not found in VCF file, even after normalizing for UCSC/Ensembl nomenclature."
             )
             for e in ends:
-                yield ((mode.empty(self.n_samples, ploidy, 0), e, 0) for _ in range(1))
+                yield (
+                    (mode.empty(self.n_samples, self.ploidy, 0, self.phasing), e, 0)
+                    for _ in range(1)
+                )
             return
 
         n_variants = self.n_vars_in_ranges(c, starts, ends)
         tot_variants = n_variants.sum()
         if tot_variants == 0:
             for e in ends:
-                yield ((mode.empty(self.n_samples, ploidy, 0), e, 0) for _ in range(1))
+                yield (
+                    (mode.empty(self.n_samples, self.ploidy, 0, self.phasing), e, 0)
+                    for _ in range(1)
+                )
             return
 
         mem_per_v = self._mem_per_variant(mode)
@@ -797,7 +814,10 @@ class VCF:
 
         for s, e, n in zip(starts, ends, n_variants):
             if n == 0:
-                yield ((mode.empty(self.n_samples, ploidy, 0), e, 0) for _ in range(1))
+                yield (
+                    (mode.empty(self.n_samples, self.ploidy, 0, self.phasing), e, 0)
+                    for _ in range(1)
+                )
                 continue
 
             yield self._chunk_with_length_helper(n, vars_per_chunk, c, s, e, mode)
@@ -832,19 +852,19 @@ class VCF:
             chunk_sizes[-1] = final_chunk
 
         vcf = self._vcf(f"{contig}:{start}-{end}")
-        ploidy = self.ploidy + self.phasing
         hap_lens = np.full((self.n_samples, self.ploidy), end - start, dtype=np.int32)
         for _, is_last, chunk_size in mark_ends(chunk_sizes):
             ilens = np.empty(chunk_size, dtype=np.int32)
             if issubclass(mode, (Genos8, Genos16)):
                 out = cast(
-                    Genos8 | Genos16, mode.empty(self.n_samples, ploidy, chunk_size)
+                    Genos8 | Genos16,
+                    mode.empty(self.n_samples, self.ploidy, chunk_size, self.phasing),
                 )
                 out, last_end = self._fill_genos(vcf, out, ilens)
                 hap_lens += hap_ilens(out[:, : self.ploidy], ilens)
             elif issubclass(mode, (Genos8Dosages, Genos16Dosages)):
                 self.dosage_field = cast(str, self.dosage_field)
-                out = mode.empty(self.n_samples, ploidy, chunk_size)
+                out = mode.empty(self.n_samples, self.ploidy, chunk_size, self.phasing)
                 out, last_end = self._fill_genos_and_dosages(
                     vcf, out, self.dosage_field, ilens
                 )
@@ -1114,7 +1134,7 @@ class VCF:
                     self._pbar.update()
 
             if len(out_ls) == 0:
-                return mode.empty(self.n_samples, self.ploidy, 0), v.end
+                return mode.empty(self.n_samples, self.ploidy, 0, self.phasing), 0
 
             # (s p v)
             out = cast(
@@ -1122,7 +1142,7 @@ class VCF:
                 np.stack(out_ls, axis=-1, dtype=mode._gdtype)[self._s_sorter],
             )
 
-            return out, v.end
+            return out, v.end  # type: ignore
 
         #! assumes n_variants > 0
         n_variants = out.shape[-1]
@@ -1165,12 +1185,29 @@ class VCF:
         if out is None:
             out_ls = []
             for v in vcf:
-                out_ls.append(v.format(dosage_field))
+                d = v.format(dosage_field)
+                if d is None:
+                    raise DosageFieldError(
+                        f"Dosage field '{dosage_field}' not found for record {repr(v)}"
+                    )
+                if d.shape[1] > 1:
+                    raise MultiallelicDosageError(
+                        f"Multiallelic dosages are not supported, encountered in VCF record {repr(v)}"
+                    )
+
+                out_ls.append(d.squeeze(1))
+
                 if self._pbar is not None:
                     self._pbar.update()
 
-            _out = np.stack(out_ls, axis=-1, dtype=Dosages._gdtype)[self._s_sorter]
-            return _out, v.end
+            if len(out_ls) == 0:
+                return Dosages.empty(self.n_samples, self.ploidy, 0, self.phasing), 0
+
+            _out = cast(
+                Dosages, np.stack(out_ls, axis=-1, dtype=np.float32)[self._s_sorter]
+            )
+
+            return _out, v.end  # type: ignore
 
         #! assumes n_variants > 0
         n_variants = out.shape[-1]
@@ -1223,13 +1260,29 @@ class VCF:
             for i, v in enumerate(vcf):
                 if self.phasing:
                     # (s p+1) np.int16
-                    geno_ls.append(v.genotype.array()[self._s_sorter])
+                    geno_ls.append(v.genotype.array())
                 else:
                     # (s p) np.int16
-                    geno_ls.append(v.genotype.array()[self._s_sorter, : self.ploidy])
-                dosage_ls.append(v.format(dosage_field)[self._s_sorter])
+                    geno_ls.append(v.genotype.array()[:, : self.ploidy])
+
+                d = v.format(dosage_field)
+                if d is None:
+                    raise DosageFieldError(
+                        f"Dosage field '{dosage_field}' not found for record {repr(v)}"
+                    )
+                if d.shape[1] > 1:
+                    raise MultiallelicDosageError(
+                        f"Multiallelic dosages are not supported, encountered in VCF record {repr(v)}"
+                    )
+
+                dosage_ls.append(d.squeeze(1))
+
                 if self._pbar is not None:
                     self._pbar.update()
+
+            if len(geno_ls) == 0:
+                out = mode.empty(self.n_samples, self.ploidy, 0, self.phasing)
+                return out, 0
 
             genos = cast(
                 Genos8 | Genos16,
@@ -1240,7 +1293,7 @@ class VCF:
             )
 
             out = cast(Genos8Dosages | Genos16Dosages, (genos, dosages))
-            return out, v.end
+            return out, v.end  # type: ignore
 
         #! assumes n_variants > 0
         n_variants = out[0].shape[-1]
