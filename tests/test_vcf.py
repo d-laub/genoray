@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import pytest
 from numpy.typing import ArrayLike, NDArray
 from pytest_cases import fixture, parametrize_with_cases
 
@@ -15,9 +16,15 @@ N_SAMPLES = 2
 PLOIDY = 2
 
 
-@fixture  # type: ignore
-def vcf():
-    return VCF(ddir / "biallelic.vcf.gz", dosage_field="DS")
+@fixture
+@pytest.mark.parametrize("with_gvi_index", [True, False])
+def vcf(with_gvi_index: bool):
+    return VCF(
+        ddir / "biallelic.vcf.gz",
+        phasing=True,
+        dosage_field="DS",
+        with_gvi_index=with_gvi_index,
+    )
 
 
 def read_all():
@@ -43,7 +50,7 @@ def read_spanning_del():
 def read_missing_contig():
     cse = "🥸", 81261, 81263
     # (s p v)
-    genos_phasing, dosages = VCF.Genos8Dosages.empty(N_SAMPLES, VCF.ploidy + 1, 0)
+    genos_phasing, dosages = VCF.Genos8Dosages.empty(N_SAMPLES, VCF.ploidy, 0, True)
     genos, phasing = np.array_split(genos_phasing, 2, 1)
     phasing = phasing.squeeze(1).astype(bool)
     return cse, genos, phasing, dosages
@@ -52,7 +59,7 @@ def read_missing_contig():
 def read_none():
     cse = "chr1", 0, 1
     # (s p v)
-    genos_phasing, dosages = VCF.Genos8Dosages.empty(N_SAMPLES, VCF.ploidy + 1, 0)
+    genos_phasing, dosages = VCF.Genos8Dosages.empty(N_SAMPLES, VCF.ploidy, 0, True)
     genos, phasing = np.array_split(genos_phasing, 2, 1)
     phasing = phasing.squeeze(1).astype(bool)
     return cse, genos, phasing, dosages
@@ -66,6 +73,7 @@ def test_read(
     phasing: NDArray[np.bool_],
     dosages: NDArray[np.float32],
 ):
+    vcf.phasing = False
     # (s p v)
     g = vcf.read(*cse, VCF.Genos8)
     np.testing.assert_equal(g, genos)
@@ -109,7 +117,6 @@ def test_chunk(
     dosages: NDArray[np.float32],
 ):
     vcf.phasing = True
-
     n_variants = genos.shape[2]
     max_mem = vcf._mem_per_variant(VCF.Genos16Dosages)
     gpd = vcf.chunk(*cse, max_mem, VCF.Genos16Dosages)
@@ -202,7 +209,7 @@ def length_ext():
 def length_none():
     cse = "chr1", 0, 1
     # (s p v)
-    genos_phasing, dosages = VCF.Genos8Dosages.empty(N_SAMPLES, VCF.ploidy + 1, 0)
+    genos_phasing, dosages = VCF.Genos8Dosages.empty(N_SAMPLES, VCF.ploidy, 0, True)
     genos, phasing = np.array_split(genos_phasing, 2, 1)
     phasing = phasing.squeeze(1).astype(bool)
     last_end = 1
