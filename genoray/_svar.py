@@ -235,7 +235,7 @@ class SparseVar:
 
         Returns
         -------
-            Shape: (ranges, samples, ploidy, 2). The first column is the start index of the variant
+            Shape: (2, ranges, samples, ploidy). The first column is the start index of the variant
             and the second column is the end index of the variant.
         """
         if samples is None:
