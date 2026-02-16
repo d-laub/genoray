@@ -46,8 +46,8 @@ update_changelog_on_bump = true
 annotated_tag = true
 
 [build-system]
-build-backend = "hatchling.build"
-requires = ["hatchling"]
+build-backend = "maturin"
+requires = ["maturin>=1.0,<2.0"]
 
 [tool.pytest.ini_options]
 filterwarnings = ["ignore::DeprecationWarning:sorted_nearest.*"]
@@ -55,3 +55,8 @@ filterwarnings = ["ignore::DeprecationWarning:sorted_nearest.*"]
 [tool.basedpyright]
 enableTypeIgnoreComments = true
 reportMissingTypeArgument = false
+
+[tool.maturin]
+python-source = "python"
+module-name = "genoray._core"
+bindings = "pyo3"
