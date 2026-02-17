@@ -1,0 +1,11 @@
+[package]
+name = "genoray"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "genoray_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module"] }
