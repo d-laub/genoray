@@ -828,7 +828,7 @@ def _process_contig_vcf(
     chunk_dir: Path,
     chunk_idx: int,
 ) -> tuple[int, int]:
-    vcf = VCF(path, dosage_field=dosage_field)
+    vcf = VCF(path, dosage_field=dosage_field, with_gvi_index=False)
     if dosage_field is not None:
         chunker = vcf.chunk(contig, max_mem=max_mem, mode=VCF.Genos8Dosages)
     else:
