@@ -219,6 +219,7 @@ class SparseVar:
         starts: ArrayLike = 0,
         ends: ArrayLike = POS_MAX,
         samples: ArrayLike | None = None,
+        out: NDArray[OFFSET_TYPE] | None = None,
     ) -> NDArray[OFFSET_TYPE]:
         """Find the start and end offsets of the sparse genotypes for each range.
 
@@ -232,6 +233,8 @@ class SparseVar:
             0-based, exclusive end positions of the ranges.
         samples
             List of sample names to read. If None, read all samples.
+        out
+            Output array to write to. If None, a new array will be created.
 
         Returns
         -------
@@ -252,16 +255,29 @@ class SparseVar:
 
         c = self._c_norm.norm(contig)
         if c is None:
-            return np.full((n_ranges, len(samples), self.ploidy, 2), -1, OFFSET_TYPE)
+            if out is None:
+                return np.full(
+                    (n_ranges, len(samples), self.ploidy, 2), -1, OFFSET_TYPE
+                )
+            else:
+                out[:] = -1
+                return out
 
         ends = np.atleast_1d(np.asarray(ends, POS_TYPE))
         # (r 2)
         var_ranges = self.var_ranges(contig, starts, ends)
-        # (2 r s p)
-        starts_ends = _find_starts_ends(
-            self.genos.data, self.genos.offsets, var_ranges, s_idxs, self.ploidy
+        if out is None:
+            # (2 r s p)
+            out = np.empty((2, n_ranges, len(samples), self.ploidy), dtype=OFFSET_TYPE)
+        _find_starts_ends(
+            self.genos.data,
+            self.genos.offsets,
+            var_ranges,
+            s_idxs,
+            self.ploidy,
+            out_offsets=out,
         )
-        return starts_ends
+        return out
 
     def _find_starts_ends_with_length(
         self,
@@ -1181,6 +1197,7 @@ def _find_starts_ends(
     var_ranges: NDArray[V_IDX_TYPE],
     sample_idxs: NDArray[np.int64],
     ploidy: int,
+    out_offsets: NDArray[OFFSET_TYPE] | None = None,
 ):
     """Find the start and end offsets of the sparse genotypes for each range.
 
@@ -1192,6 +1209,12 @@ def _find_starts_ends(
         Genotype offsets
     var_ranges
         Shape = (ranges 2) Variant index ranges.
+    sample_idxs
+        Sample indices
+    ploidy
+        Ploidy
+    out_offsets
+        Output array to write to. If None, a new array will be created.
 
     Returns
     -------
@@ -1200,7 +1223,8 @@ def _find_starts_ends(
     """
     n_ranges = len(var_ranges)
     n_samples = len(sample_idxs)
-    out_offsets = np.empty((2, n_ranges, n_samples, ploidy), dtype=OFFSET_TYPE)
+    if out_offsets is None:
+        out_offsets = np.empty((2, n_ranges, n_samples, ploidy), dtype=OFFSET_TYPE)
     sorter = np.argsort(var_ranges[:, 0])
     var_ranges = var_ranges[sorter]
 
@@ -1217,7 +1241,7 @@ def _find_starts_ends(
     out_offsets[:, no_vars] = np.iinfo(OFFSET_TYPE).max
 
     unsorter = sorter[sorter]
-    out_offsets = out_offsets[:, unsorter]
+    out_offsets[:] = out_offsets[:, unsorter]
 
     return out_offsets
 
@@ -1333,7 +1357,7 @@ def _find_starts_ends_with_length(
                 out[1, r, s, p] = geno_idx + o_s + 1
 
     unsorter = sorter[sorter]
-    out = out[:, unsorter]
+    out[:] = out[:, unsorter]
 
     return out
 
