@@ -7,7 +7,17 @@ docs/build/
 data/
 tmp/
 memray_flamegraphs/
+.ipynb_checkpoints/
 
 # pixi environments
 .pixi
 *.egg-info
+
+# Maturin / extensions
+*.so
+*.pyd
+*.dll
+
+# Added by cargo
+
+/target
