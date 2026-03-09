@@ -1,3 +1,10 @@
+## 2.2.0 (2026-03-09)
+
+### Feat
+
+- **private**: unify interface to _find_starts_and_ends methods
+- **perf**: index-free VCF->SVAR to reduce memory usage
+
 ## 2.1.3 (2026-02-10)
 
 ### Fix
