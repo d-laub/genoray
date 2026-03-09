@@ -134,16 +134,19 @@ def var_indices(
 
     join = (
         cast(pl.LazyFrame, pb.overlap(queries, var_table, projection_pushdown=True))
-        .sort("query_1", "index_2")
+        .rename({"query_1": "query", "index_2": "index"})
+        .sort("query", "index")
         .collect()
     )
 
     if join.height == 0:
         return np.empty(0, idx_dtype), np.zeros(n_ranges + 1, OFFSET_TYPE)
 
-    idxs = join["index_2"].to_numpy()
-    lens = join.group_by("query_1", maintain_order=True).len()["len"].to_numpy()
-    offsets = lengths_to_offsets(lens)
+    idxs = join["index"].to_numpy()
+    lengths = np.zeros(n_ranges, dtype=np.uint32)
+    lens = join.group_by("query").len()
+    lengths[lens["query"].to_numpy()] = lens["len"].to_numpy()
+    offsets = lengths_to_offsets(lengths)
     return idxs, offsets
 
 
