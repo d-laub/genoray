@@ -8,4 +8,7 @@ name = "genoray_core"
 crate-type = ["cdylib"]
 
 [dependencies]
+memmap2 = "0.9.10"
+ndarray = "0.17.2"
+num-traits = "0.2.19"
 pyo3 = { version = "0.22", features = ["extension-module"] }
