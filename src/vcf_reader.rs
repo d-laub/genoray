@@ -33,22 +33,19 @@ impl VcfChunkReader {
     }
 
     // pulls the next `chunk_size` variants from the disk and builds the DenseChunk
-    pub fn read_next_chunk(&mut self, chunk_size: usize, chunk_id: usize) -> DenseChunk<u32> {
+    // returns Option so that the thread knows exactly when EOF is reached
+    pub fn read_next_chunk(&mut self, chunk_size: usize, chunk_id: usize) -> Option<DenseChunk<u32>> {
         // pre-allocate the arrays
         let mut pos = Vec::with_capacity(chunk_size);
+        let mut ilens = Vec::with_capacity(chunk_size);
         
-        let mut refe = Vec::new(); // flat array of all REF characters
-        let mut ref_offsets = Vec::with_capacity(chunk_size + 1);
-        ref_offsets.push(0u32);
-        
-        let mut alt = Vec::new(); // flat array of all ALT characters
+        let mut alt = Vec::with_capacity(chunk_size * 5); // flat array of all ALT characters
         let mut alt_offsets = Vec::with_capacity(chunk_size + 1);
         alt_offsets.push(0u32); 
         
         let mut genos_flat = vec![false; chunk_size * self.num_samples * self.ploidy];
         
         let mut current_v_idx = 0;
-        let mut current_ref_offset = 0u32;
         let mut current_alt_offset = 0u32;
 
         let mut record = self.inner_reader.empty_record();
@@ -62,24 +59,21 @@ impl VcfChunkReader {
             // position
             pos.push(record.pos() as u32);
 
-            // alleles (REF and ALT)
+            // alleles ALT and ILEN
             let alleles = record.alleles();
-            
-            // handling REF
-            let ref_allele = alleles[0];
-            refe.extend_from_slice(ref_allele);
-            current_ref_offset += ref_allele.len() as u32;
-            ref_offsets.push(current_ref_offset);
+            let ref_len = alleles[0].len() as i32;
+            let mut alt_len = 0i32;
 
             // handling ALT -> Taking the first ALT if multi-allelic
             if alleles.len() > 1 {
                 let alt_allele = alleles[1];
                 alt.extend_from_slice(alt_allele);
-                current_alt_offset += alt_allele.len() as u32;
-            } else {
-                // if there is no ALT allele, the offset doesn't change
+                alt_len = alt_allele.len() as i32;
+                current_alt_offset += alt_len as u32;
             }
+            // if there is no ALT allele, the offset doesn't change
             alt_offsets.push(current_alt_offset);
+            ilens.push(alt_len - ref_len); // storing ilen directly
 
             // genotypes
             let genotypes = record.genotypes().expect("Failed to read genotypes");
@@ -87,42 +81,36 @@ impl VcfChunkReader {
             for (s_idx, sample_gt) in genotypes.into_iter().enumerate() {
                 if s_idx >= self.num_samples { break; }
 
-                let allele_1 = match sample_gt[0] {
-                    GenotypeAllele::Unphased(1) | GenotypeAllele::Phased(1) => true,
-                    _ => false, 
-                };
-
-                // safe parsing for allele 2 - Haploid fallback
+                let allele_1 = matches!(sample_gt[0], GenotypeAllele::Unphased(1) | GenotypeAllele::Phased(1));
+                
                 let allele_2 = if sample_gt.len() > 1 {
-                    match sample_gt[1] {
-                        GenotypeAllele::Unphased(1) | GenotypeAllele::Phased(1) => true,
-                        _ => false,
-                    }
+                    matches!(sample_gt[1], GenotypeAllele::Unphased(1) | GenotypeAllele::Phased(1))
                 } else {
                     false 
                 };
 
                 // 1D to 3D Memory Mapping
-                // The shape of our tensor block
-                let shape = [chunk_size, self.num_samples, self.ploidy];
-                
-                // Raveling the 3D coordinates into a 1D memory pointer
-                let base_idx = ravel!(shape, [current_v_idx, s_idx, 0]);
-
+                let base_idx = (current_v_idx * self.num_samples * self.ploidy) + (s_idx * self.ploidy);
                 genos_flat[base_idx] = allele_1;
                 genos_flat[base_idx + 1] = allele_2;
+
+                //this is for the ravel operation - need to check on this
+                // // The shape of our tensor block
+                // let shape = [chunk_size, self.num_samples, self.ploidy];
+                
+                // // Raveling the 3D coordinates into a 1D memory pointer
+                // let base_idx = ravel!(shape, [current_v_idx, s_idx, 0]);
+
+                // genos_flat[base_idx] = allele_1;
+                // genos_flat[base_idx + 1] = allele_2;
             }
 
             current_v_idx += 1;
         }
 
-        // if no read, return an empty chunk to signal EOF
+        // if no read, return None to signal EOF
         if current_v_idx == 0 {
-            return DenseChunk {
-                chunk_id, pos: vec![], refe: vec![], ref_offsets: vec![],
-                alt: vec![], alt_offsets: vec![],
-                genos: Array3::from_shape_vec((0, 0, 0), vec![]).unwrap(),
-            };
+            return None;
         }
 
         // truncate the flat genos array if we hit EOF and didn't fill the whole chunk size
@@ -134,45 +122,47 @@ impl VcfChunkReader {
             genos_flat
         ).expect("Failed to reshape genos array");
 
-        DenseChunk {
+        Some(DenseChunk {
             chunk_id,
             pos,
-            refe,
-            ref_offsets,
+            ilens,
             alt,
             alt_offsets,
             genos: genos_3d,
-        }
+            num_variants: current_v_idx,
+        })
     }
 }
 
-// executes a 1st Pass over the VCF to calculate the exact 
-// byte size required for the Long Allele Memory-Mapped Table.
-// It skips genotype parsing to maximize disk read speed.
-pub fn long_allele_table_byte_size(vcf_path: &str, chrom: &str) -> usize {
-    let mut reader = IndexedReader::from_path(vcf_path)
-        .expect("Failed to open VCF/BCF index.");
 
-    reader.fetch(chrom).expect("Failed to fetch chromosome");
+// No more 1st pass
+// // executes a 1st Pass over the VCF to calculate the exact 
+// // byte size required for the Long Allele Memory-Mapped Table.
+// // It skips genotype parsing to maximize disk read speed.
+// pub fn long_allele_table_byte_size(vcf_path: &str, chrom: &str) -> usize {
+//     let mut reader = IndexedReader::from_path(vcf_path)
+//         .expect("Failed to open VCF/BCF index.");
 
-    let mut total_mmap_bytes = 0usize;
-    let mut record = reader.empty_record();
+//     reader.fetch(chrom).expect("Failed to fetch chromosome");
 
-    while reader.read(&mut record).unwrap_or(false) {
-        let alleles = record.alleles();
+//     let mut total_mmap_bytes = 0usize;
+//     let mut record = reader.empty_record();
+
+//     while reader.read(&mut record).unwrap_or(false) {
+//         let alleles = record.alleles();
         
-        // Check if there is an ALT allele
-        if alleles.len() > 1 {
-            let alt_allele = alleles[1];
+//         // Check if there is an ALT allele
+//         if alleles.len() > 1 {
+//             let alt_allele = alleles[1];
             
-            // If it's larger than your vk packing limit -> 13bp
-            if alt_allele.len() > 13 {
-                total_mmap_bytes += alt_allele.len();
-            }
-        }
-    }
-    total_mmap_bytes
-}
+//             // If it's larger than your vk packing limit -> 13bp
+//             if alt_allele.len() > 13 {
+//                 total_mmap_bytes += alt_allele.len();
+//             }
+//         }
+//     }
+//     total_mmap_bytes
+// }
 
 
 // /*

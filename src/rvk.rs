@@ -40,29 +40,29 @@ fn ascii_to_2bit(base: u8) -> u32 {
 /// SIMD Within A Register (SWAR) string encoder.
 /// Packs up to 13 DNA bases into a single u32.
 #[inline(always)]
-fn encode_swar_inline(alt_allele: &[u8], len: u32) -> u32 {
-    debug_assert!(len <= 13); // for optimizations purposes
+fn encode_alt_inline(alt_allele: &[u8], len: u32) -> u32 {
+    debug_assert!(len <= 13);
 
-    // Create a fixed 16-byte memory block initialized to zero
+    // fixed 16-byte memory block initialized to zero
     let mut padded = [0u8; 16];
     
     padded[..len as usize].copy_from_slice(alt_allele);
 
-    // Read the DNA at once into two 64-bit CPU registers
+    // read the DNA at once into two 64-bit CPU registers
     // using little-endian to ensure predictable bit layouts.
     let block1 = u64::from_le_bytes(padded[0..8].try_into().unwrap());
     let block2 = u64::from_le_bytes(padded[8..16].try_into().unwrap());
 
-    // 3. ASCII-to-2-bit math on 8 characters SIMULTANEOUSLY.
-    // The mask 0x0303030303030303 applies the `& 3` logic to all 8 bytes at once.
+    // ASCII-to-2-bit math on 8 characters at once.
+    // the mask 0x0303030303030303 applies the "& 3" logic to all 8 bytes at once.
     let bits1 = (block1 >> 1) & 0x0303030303030303;
     let bits2 = (block2 >> 1) & 0x0303030303030303;
 
-    // 4. Compress the dispersed bits down into 32-bit space.
+    // compressing the bits down into 32-bit space.
     // The shifts align the target 2 bits from each byte into a contiguous block.
     let mut payload = 0u32;
     
-    // Pack Block 1 (Bases 0 to 7) -> Occupies bits 0 to 15
+    // packing Block 1 (Bases 0 to 7) -> Occupies bits 0 to 15
     payload |= ((bits1 >> 0)  & 0x00000003) as u32;
     payload |= ((bits1 >> 6)  & 0x0000000C) as u32;
     payload |= ((bits1 >> 12) & 0x00000030) as u32;
@@ -72,7 +72,7 @@ fn encode_swar_inline(alt_allele: &[u8], len: u32) -> u32 {
     payload |= ((bits1 >> 36) & 0x00003000) as u32;
     payload |= ((bits1 >> 42) & 0x0000C000) as u32;
 
-    // Pack Block 2 (Bases 8 to 12) -> Occupies bits 16 to 25
+    // packing Block 2 (Bases 8 to 12) -> Occupies bits 16 to 25
     let mut payload2 = 0u32;
     payload2 |= ((bits2 >> 0)  & 0x00000003) as u32;
     payload2 |= ((bits2 >> 6)  & 0x0000000C) as u32;
@@ -80,16 +80,19 @@ fn encode_swar_inline(alt_allele: &[u8], len: u32) -> u32 {
     payload2 |= ((bits2 >> 18) & 0x000000C0) as u32;
     payload2 |= ((bits2 >> 24) & 0x00000300) as u32;
 
-    // Combine them (Block 2 is shifted up by 16 bits to sit right above Block 1)
+
+    // TODO: have to check for correctness beyond this point
+
+    // combine them (Block 2 is shifted up by 16 bits to sit right above Block 1)
     payload |= payload2 << 16;
 
-    // 5. Mask out any garbage bits that came from the padded zeros
+    // masking any extra bits that came from the padded zeros
     // If len = 3, we want to keep 6 bits. (1 << 6) - 1 = 00111111 binary.
     let valid_bits_mask = (1 << (len * 2)) - 1;
     payload &= valid_bits_mask;
     
-    // 6. Add the length tag to bits 27-30 and return. 
-    // Bit 31 naturally remains 0, confirming this is an inline payload.
+    // adding the length tag to bits 27-30 and return. 
+    // Bit 31 remains 0, confirming this is an inline payload.
     payload | (len << 27)
 }
 
@@ -191,10 +194,10 @@ fn encode_variant_key(
 
 pub fn dense2sparse_vk<I: PrimInt>(
     chunk: &DenseChunk<I>,
-    long_allele_bank: &Arc<SharedArena>, // thread-safe wrapper around memmap
+    long_allele_bank: &Arc<SharedArena>, 
 ) -> SparseChunk {
     
-    // setup capacity for output vectors
+    // TODO
 
     // 1. Iterate Sample-Major (for s in 0..samples { for p in 0..ploidy { for v in 0..variants } })
     // 2. Check if chunk.genos[[v, s, p]] is true
@@ -203,7 +206,7 @@ pub fn dense2sparse_vk<I: PrimInt>(
     // 5. Push to call_positions and call_keys
     // 6. Track the number of calls for this specific sample and push to sample_lengths
     
-    // Return the perfectly formatted SparseChunk ready for the Writer Thread
+    // Return formatted SparseChunk ready for the Writer Thread
     SparseChunk {
         chunk_id: chunk.chunk_id,
         call_positions, // Vec<u32>
