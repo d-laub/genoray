@@ -16,13 +16,15 @@ pub struct DenseChunk<I: PrimInt> {
 
     // Variant Metadata
     pub pos: Vec<u32>,
-    pub refe: Vec<u8>,
-    pub ref_offsets: Vec<I>,
+    // pub refe: Vec<u8>,
+    // pub ref_offsets: Vec<I>,
+    pub ilens: Vec<i32>,       // Pre-calculated (ALT len - REF len)
     pub alt: Vec<u8>,
     pub alt_offsets: Vec<I>,
 
     // Dense Genotype Tensor - Shape (Variants, Samples, Ploidy)
     pub genos: Array3<bool>, // (V, S, P)
+    pub num_variants: usize,
 }
 
 // The transposed, sparse packet produced by the Compute Thread and consumed by the Writer Thread
