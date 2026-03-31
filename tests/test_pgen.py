@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import pytest
 from numpy.typing import ArrayLike, NDArray
 from pytest_cases import parametrize_with_cases
 
@@ -165,7 +166,29 @@ def samples_none():
 
 
 def samples_second():
-    samples = "sample1"
+    samples = "sample2"
+    return samples
+
+
+def samples_reverse():
+    samples = ["sample2", "sample1"]
+    return samples
+
+
+@pytest.mark.xfail(raises=ValueError, reason="sample3 not in file")
+def samples_missing():
+    samples = ["sample1", "sample3"]
+    return samples
+
+
+def samples_all():
+    samples = ["sample1", "sample2"]
+    return samples
+
+
+@pytest.mark.xfail(raises=ValueError, reason="samples must be unique")
+def samples_repeat():
+    samples = ["sample1", "sample2", "sample2"]
     return samples
 
 
@@ -183,13 +206,15 @@ def test_set_samples(
     pgen.set_samples(samples)
 
     if samples is None:
-        samples = pgen.available_samples
+        samples = np.asarray(pgen.available_samples)
         s_idx = slice(None)
     else:
         samples = np.atleast_1d(samples)
-        s_idx = np.intersect1d(pgen.available_samples, samples, return_indices=True)[1]
+        s_idx = pgen._s2i.get(samples).astype(np.uint32)
+        if (s_idx == np.arange(len(pgen.available_samples))).all():
+            s_idx = slice(None)
 
-    assert pgen.current_samples == samples
+    np.testing.assert_array_equal(pgen.current_samples, samples)
     assert pgen.n_samples == len(samples)
     np.testing.assert_equal(pgen._s_idx, s_idx)
 

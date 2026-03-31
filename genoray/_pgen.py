@@ -170,7 +170,8 @@ class PGEN:
     _geno_pgen: pgenlib.PgenReader
     _dose_pgen: pgenlib.PgenReader
     _s_idx: NDArray[np.uint32] | slice
-    _s_sorter: NDArray[np.intp] | slice
+    _s_unsorter: NDArray[np.intp] | slice
+    """pgenlib always returns samples in the order they exist in the file. This array re-orders them to the order specified by the user."""
     _geno_path: Path
     _dose_path: Path | None
     _sei: StartsEndsIlens | None = None  # unfiltered so that var_idxs map correctly
@@ -219,7 +220,7 @@ class PGEN:
         )
         self._s2i.add(samples)
         self._s_idx = slice(None)
-        self._s_sorter = slice(None)
+        self._s_unsorter = slice(None)
         self._geno_pgen = pgenlib.PgenReader(bytes(geno_path), len(samples))
 
         if dosage_path is not None:
@@ -261,16 +262,16 @@ class PGEN:
     @property
     def current_samples(self) -> list[str]:
         """List of samples that are currently being used, in order."""
-        if isinstance(self._s_sorter, slice):
+        if isinstance(self._s_unsorter, slice):
             return self.available_samples
         return cast(list[str], self._s2i.keys[self._s_idx].tolist())
 
     @property
     def n_samples(self) -> int:
         """Number of samples in the file."""
-        if isinstance(self._s_sorter, slice):
+        if isinstance(self._s_unsorter, slice):
             return len(self.available_samples)
-        return len(self._s_sorter)
+        return len(self._s_unsorter)
 
     @property
     def filter(self) -> pl.Expr | None:
@@ -313,20 +314,26 @@ class PGEN:
             and (samples == np.asarray(self.available_samples)).all()
         ):
             self._s_idx = slice(None)
-            self._s_sorter = slice(None)
+            self._s_unsorter = slice(None)
             return self
 
-        s_idx = self._s2i.get(samples).astype(np.uint32)
-        if len(missing := samples[s_idx == -1]) > 0:
+        s_idx = self._s2i.get(samples)
+        if (s_idx == -1).any():
+            missing = samples[s_idx == -1]
             raise ValueError(f"Samples {missing} not found in the file.")
+        s_idx = s_idx.astype(np.uint32)
+        if len(np.unique(s_idx)) != len(s_idx):
+            raise ValueError("Samples must be unique.")
 
         self._s_idx = s_idx
-        self._s_sorter = np.argsort(s_idx)
+        sorter = np.argsort(s_idx, kind="stable")
+        sorted_s_idx = s_idx[sorter]
+        self._s_unsorter = np.argsort(sorter, kind="stable")
         # if dose path is None, then dose pgen is just a reference to geno pgen so
         # we're also (somewhat unsafely) mutating the dose pgen here
-        self._geno_pgen.change_sample_subset(np.sort(s_idx))
+        self._geno_pgen.change_sample_subset(sorted_s_idx)
         if self._dose_path is not None:
-            self._dose_pgen.change_sample_subset(np.sort(s_idx))
+            self._dose_pgen.change_sample_subset(sorted_s_idx)
         return self
 
     @property
@@ -910,7 +917,7 @@ class PGEN:
         else:
             assert_never(mode)
 
-        if isinstance(self._s_sorter, np.ndarray):
+        if isinstance(self._s_unsorter, np.ndarray):
             mem *= 2  # have to make a copy to sort by samples
 
         return mem
@@ -922,14 +929,14 @@ class PGEN:
         self._geno_pgen.read_alleles_list(var_idxs, out)
         out = out.reshape(len(var_idxs), self.n_samples, self.ploidy).transpose(
             1, 2, 0
-        )[self._s_sorter]
+        )[self._s_unsorter]
         out[out == -9] = -1
         return cast(Genos, out)
 
     def _read_dosages(self, var_idxs: NDArray[V_IDX_TYPE]) -> Dosages:
         out = np.empty((len(var_idxs), self.n_samples), dtype=Dosages._dtype)
         self._dose_pgen.read_dosages_list(var_idxs, out)
-        out = out.transpose(1, 0)[self._s_sorter]
+        out = out.transpose(1, 0)[self._s_unsorter]
         out[out == -9] = np.nan
         return cast(Dosages, out)
 
@@ -946,9 +953,9 @@ class PGEN:
         self._geno_pgen.read_alleles_and_phasepresent_list(var_idxs, genos, phasing)
         genos = genos.reshape(len(var_idxs), self.n_samples, self.ploidy).transpose(
             1, 2, 0
-        )[self._s_sorter]
+        )[self._s_unsorter]
         genos[genos == -9] = -1
-        phasing = phasing.transpose(1, 0)[self._s_sorter]
+        phasing = phasing.transpose(1, 0)[self._s_unsorter]
 
         return cast(GenosPhasing, (genos, phasing))
 
