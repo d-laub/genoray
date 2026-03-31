@@ -1,3 +1,9 @@
+## 2.2.2 (2026-03-31)
+
+### Fix
+
+- sample reordering and selection for PGEN
+
 ## 2.2.1 (2026-03-09)
 
 ### Fix
