@@ -1,12 +1,10 @@
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
-use std::path::Path;
+use crossbeam_channel::Sender;
 
-// strictly bounded memory bank for long alleles.
+// strictly bounded memory bank for long alleles (non-blocking, double-buffered memory)
 // Public API
 pub struct LongAlleleTable {
-    disk_writer: BufWriter<File>,
-    alt_offsets: Vec<u32>, 
+    tx_long: Sender<Vec<u8>>, //channel to the writer thread
+    alt_offsets: Vec<u32>, // TODO - should this be u32 or u64
     buffer: Vec<u8>, // staging area
     global_offset: usize,     // The exact byte position
     row_index: u32, // Tracks the number of long alleles and 31-bit integer returned to the variant key
@@ -15,17 +13,7 @@ pub struct LongAlleleTable {
 impl LongAlleleTable {
     // because we need to map the file, it must be pre-allocated to the exact 
     // byte size calculated during your 1st Pass.
-    pub fn new(output_dir: &str, filename: &str) -> Self {
-        let file_path = Path::new(output_dir).join(filename);
-
-        // open in Append Mode
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(file_path)
-            .expect("Failed to open long allele file");
-        
+    pub fn new(tx_long: Sender<Vec<u8>>) -> Self {
         // 128 MB RAM Limit to prevent OOM crashes -> can be changed or made run time
         let buffer_capacity = 128 * 1024 * 1024;
 
@@ -34,7 +22,7 @@ impl LongAlleleTable {
 
         Self {
             buffer: Vec::with_capacity(buffer_capacity),
-            disk_writer: BufWriter::with_capacity(1024 * 1024, file), // 1MB OS buffer
+            tx_long,
             global_offset: 0,
             row_index: 0,
             alt_offsets: initial_offsets,
@@ -72,22 +60,31 @@ impl LongAlleleTable {
         current_index & 0x7FFFFFFF
     }
 
-    // synch OS write. Halts the Executor thread until the drive finishes.
+    // Double-Buffer Swap 
     #[cold]
     fn flush_buffer(&mut self) {
         if self.buffer.is_empty() { return; }
 
-        // blast the 128MB block to drive
-        self.disk_writer.write_all(&self.buffer).expect("Critical NVMe write failure");
+        // empty 128MB vector.
+        let fresh_buffer = Vec::with_capacity(128 * 1024 * 1024);
         
-        self.global_offset += self.buffer.len();
-        self.buffer.clear(); 
+        // swap full buffer with new
+        let full_buffer = std::mem::replace(&mut self.buffer, fresh_buffer);
+
+        // send the full buffer to the background writer thread.
+        self.tx_long.send(full_buffer).expect("Long Allele Writer Thread panicked");
+        
+        // update the global byte tracker so offsets remain accurate.
+        self.global_offset += 128 * 1024 * 1024;
     }
 
-    // called by the Executor at the very end of Phase 1 to flush any remaining bytes
-    pub fn finalize(mut self) -> Vec<u64> {
-        self.flush_buffer();
-        self.disk_writer.flush().unwrap();
+    // called by the Executor at the very end to flush any remaining bytes
+    pub fn finalize(mut self) -> Vec<u32> {
+        if !self.buffer.is_empty() {
+            // send the final partial buffer
+            let final_buffer = std::mem::take(&mut self.buffer);
+            self.tx_long.send(final_buffer).unwrap();
+        }
         self.alt_offsets
     }
 }
