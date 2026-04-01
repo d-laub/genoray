@@ -62,50 +62,35 @@ fn encode_alt_inline(alt_allele: &[u8], len: u32) -> u32 {
     // The shifts align the target 2 bits from each byte into a contiguous block.
     let mut payload = 0u32;
     
-    // packing Block 1 (Bases 0 to 7) -> Occupies bits 0 to 15
-    payload |= ((bits1 >> 0)  & 0x00000003) as u32;
-    payload |= ((bits1 >> 6)  & 0x0000000C) as u32;
-    payload |= ((bits1 >> 12) & 0x00000030) as u32;
-    payload |= ((bits1 >> 18) & 0x000000C0) as u32;
-    payload |= ((bits1 >> 24) & 0x00000300) as u32;
-    payload |= ((bits1 >> 30) & 0x00000C00) as u32;
-    payload |= ((bits1 >> 36) & 0x00003000) as u32;
-    payload |= ((bits1 >> 42) & 0x0000C000) as u32;
+    // left-aligned packing starting exactly at Bit 26
+    // Because the 2-bit chunk occupies bits 25 and 26 -> shift by 25.
+    payload |= ((bits1 >> 0)  & 3) as u32 << 25; // shift to make major, 
+    // then get last 2 bits, then upshift to correct position in payload
+    payload |= ((bits1 >> 8)  & 3) as u32 << 23; 
+    payload |= ((bits1 >> 16) & 3) as u32 << 21; 
+    payload |= ((bits1 >> 24) & 3) as u32 << 19; 
+    payload |= ((bits1 >> 32) & 3) as u32 << 17; 
+    payload |= ((bits1 >> 40) & 3) as u32 << 15; 
+    payload |= ((bits1 >> 48) & 3) as u32 << 13; 
+    payload |= ((bits1 >> 56) & 3) as u32 << 11; 
 
-    // packing Block 2 (Bases 8 to 12) -> Occupies bits 16 to 25
-    let mut payload2 = 0u32;
-    payload2 |= ((bits2 >> 0)  & 0x00000003) as u32;
-    payload2 |= ((bits2 >> 6)  & 0x0000000C) as u32;
-    payload2 |= ((bits2 >> 12) & 0x00000030) as u32;
-    payload2 |= ((bits2 >> 18) & 0x000000C0) as u32;
-    payload2 |= ((bits2 >> 24) & 0x00000300) as u32;
+    // block 2
+    payload |= ((bits2 >> 0)  & 3) as u32 << 9;  
+    payload |= ((bits2 >> 8)  & 3) as u32 << 7;  
+    payload |= ((bits2 >> 16) & 3) as u32 << 5;  
+    payload |= ((bits2 >> 24) & 3) as u32 << 3;  
+    payload |= ((bits2 >> 32) & 3) as u32 << 1;  
 
-
-    // TODO: have to check for correctness beyond this point
-
-    // combine them (Block 2 is shifted up by 16 bits to sit right above Block 1)
-    payload |= payload2 << 16;
-
-    // masking any extra bits that came from the padded zeros
-    // If len = 3, we want to keep 6 bits. (1 << 6) - 1 = 00111111 binary.
-    let valid_bits_mask = (1 << (len * 2)) - 1;
-    payload &= valid_bits_mask;
-    
-    // adding the length tag to bits 27-30 and return. 
-    // Bit 31 remains 0, confirming this is an inline payload.
-    payload | (len << 27)
+    // tag the length into the top 5 bits and return
+    payload | (len << 27) // this will also keep the lsb 0 which is demarking no lookup
+}
 }
 
 // SIMD version of generate variant key for better parallel encoding
 #[inline(always)]
 pub fn pack_variant(
-    ref_len: usize,
-    alt_len: usize,
-    alt_allele: &[u8],
-    long_allele_table: &LongAlleleTable,
+    ilen: i32, alt_allele: &[u8], bank: &mut LongAlleleTable
 ) -> u32 {
-    let ilen: i32 = (alt_len as i32) - (ref_len as i32);
-
     // this evaluates (MIN_I31 <= ilen <= 13)
     if (ilen.wrapping_sub(MIN_I31) as u32) <= VALID_RANGE_SPAN {
         // Reversible Packing
@@ -123,7 +108,7 @@ pub fn pack_variant(
     } else {
         // Long Allele Table
         // either an insertion (> 13) or a deletion (< MIN_I31)
-        let row_index = long_allele_table.push_allele(alt_allele);
+        let row_index = bank.push_long_allele(alt_allele);
         return (row_index << 1) | 1; // Return the pointer with the lsb (lookup bit) flagged to 1
     }
 }
@@ -192,9 +177,11 @@ fn encode_variant_key(
     seq_bits
 }
 
+// The core Dense-to-Sparse Matrix Transposer.
+// Flips Row-Major VCF data into Column-Major (Sample-Major) Sparse Tensors.
 pub fn dense2sparse_vk<I: PrimInt>(
     chunk: &DenseChunk<I>,
-    long_allele_bank: &Arc<SharedArena>, 
+    bank: &mut LongAlleleTable,
 ) -> SparseChunk {
     
     // TODO
@@ -207,6 +194,59 @@ pub fn dense2sparse_vk<I: PrimInt>(
     // 6. Track the number of calls for this specific sample and push to sample_lengths
     
     // Return formatted SparseChunk ready for the Writer Thread
+
+    let shape = chunk.genos.shape();
+    let v_variants = shape[0];
+    let num_samples = shape[1];
+    let ploidy = shape[2];
+    let columns = num_samples * ploidy;
+
+    // pre-allocate assuming roughly 5% sparsity to prevent heap allocations
+    let estimated_nnz = (v_variants * columns) / 20;
+    let mut call_positions = Vec::with_capacity(estimated_nnz);
+    let mut call_keys = Vec::with_capacity(estimated_nnz);
+    let mut sample_lengths = Vec::with_capacity(columns);
+
+    // Get a flat slice to completely bypass ndarray bounds-checking overhead
+    let genos_slice = chunk.genos.as_slice().expect("Genos array must be contiguous");
+
+    // Outer loops are Sample/Ploidy, Inner loop is Variants.
+    for s in 0..num_samples {
+        for p in 0..ploidy {
+            
+            let mut current_sample_calls = 0u32;
+            
+            // Fixed stride for perfect CPU cache prefetching
+            let base_idx = (s * ploidy) + p;
+            let stride = columns;
+
+            for v in 0..v_variants {
+                let flat_idx = (v * stride) + base_idx;
+
+                if unsafe { *genos_slice.get_unchecked(flat_idx) } {
+                    
+                    let pos = chunk.pos[v];
+                    let ilen = chunk.ilens[v];
+                    
+                    let start_idx = chunk.alt_offsets[v] as usize;
+                    let end_idx = chunk.alt_offsets[v + 1] as usize;
+                    
+                    let alt_allele = unsafe { 
+                        chunk.alt.get_unchecked(start_idx..end_idx) 
+                    };
+
+                    let packed_key = pack_variant(ilen, alt_allele, bank);
+
+                    call_positions.push(pos);
+                    call_keys.push(packed_key);
+                    
+                    current_sample_calls += 1;
+                }
+            }
+            sample_lengths.push(current_sample_calls);
+        }
+    }
+
     SparseChunk {
         chunk_id: chunk.chunk_id,
         call_positions, // Vec<u32>

@@ -1,7 +1,7 @@
 use crossbeam_channel::{Receiver, Sender};
 use crate::types::{DenseChunk, SparseChunk};
 use crate::nrvk::LongAlleleTable;
-use crate::compute::convert_dense_to_sparse;
+use crate::rvk::convert_dense_to_sparse;
 
 
 // pulls raw chunks, does the math, manages the Bank, 
@@ -21,7 +21,7 @@ pub fn run_compute_engine(
         
         // hand the chunk and our exclusive mutable reference of the bank to the math engine.
         // Zero Mutex locking occurs here.
-        let sparse_chunk = convert_dense_to_sparse(&chunk, &mut bank);
+        let sparse_chunk = dense2sparse_vk(&chunk, &mut bank);
 
         // copy just the tiny array of u32 counts into our Phase 2 tracking ledger.
         ram_ledger.push(sparse_chunk.sample_lengths.clone());
@@ -36,9 +36,9 @@ pub fn run_compute_engine(
     println!("Executor: VCF fully processed. Flushing remaining long alleles...");
     
     // Force the bank to write any remaining bytes in its 128MB buffer to disk,
-    // and extract the PyTorch sidecar tensor.
-    let final_alt_offsets = bank.finalize();
+    // and extract the offsets tensor.
+    let long_allele_offsets = bank.finalize();
 
     // Return the Phase 2 metadata to the orchestrator
-    (ram_ledger, final_alt_offsets)
+    (ram_ledger, long_allele_offsets)
 }
