@@ -1,126 +1,94 @@
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
+use std::io::{BufWriter, Write};
 use std::path::Path;
-use std::sync::Mutex;
-use memmap2::MmapMut;
-use ndarray::Array1;
-use ndarray_npy::write_npy;
 
-// A thread-safe, buffered Memory-Mapped struct for storing Long Alleles.
+// strictly bounded memory bank for long alleles.
 // Public API
 pub struct LongAlleleTable {
-    inner: Mutex<MmapWriteContext>,
-    output_dir: String, // Need to store this to save the long allele table .npy file later
-}
-
-// Contains the mmap struct, MmapMut initialization, and long allele read/write methods.
-// isolated inside mutex
-struct MmapWriteContext {
-    mmap: MmapMut, // virtual mem map -> change to vec for in mem
+    disk_writer: BufWriter<File>,
     alt_offsets: Vec<u32>, 
     buffer: Vec<u8>, // staging area
-    global_offset: usize,     // The exact byte position in the memmap
-    row_index: u32, // Tracks the number of long alleles
+    global_offset: usize,     // The exact byte position
+    row_index: u32, // Tracks the number of long alleles and 31-bit integer returned to the variant key
 }
 
 impl LongAlleleTable {
     // because we need to map the file, it must be pre-allocated to the exact 
     // byte size calculated during your 1st Pass.
-    pub fn new(output_dir: &str, filename: &str, exact_byte_size: usize) -> Self {
+    pub fn new(output_dir: &str, filename: &str) -> Self {
         let file_path = Path::new(output_dir).join(filename);
 
-        // open and stretch the file to the exact required size
+        // open in Append Mode
         let file = OpenOptions::new()
-            .read(true)
-            .write(true)
             .create(true)
-            .truncate(true) //wipes it if it already exists
-            .open(&file_path)
+            .write(true)
+            .truncate(true)
+            .open(file_path)
             .expect("Failed to open long allele file");
-
-        file.set_len(exact_byte_size as u64)
-            .expect("Failed to stretch long allele file");
-
-        // request the OS to map the file into virtual memory
-        let mmap = unsafe {
-            MmapMut::map_mut(&file).expect("Failed to map long allele arena into memory")
-        };
+        
+        // 128 MB RAM Limit to prevent OOM crashes -> can be changed or made run time
+        let buffer_capacity = 128 * 1024 * 1024;
 
         let mut initial_offsets = Vec::with_capacity(1_000_000); //hardcoded capacity for now, can optimize
         initial_offsets.push(0); // The first allele starts at byte 0
 
         Self {
-            output_dir: output_dir.to_string(),
-            inner: Mutex::new(MmapWriteContext {
-                mmap,
-                buffer: Vec::with_capacity(1024 * 1024), // 1MB buffer -> can be user defined
-                global_offset: 0,
-                row_index: 0,
-                alt_offsets: initial_offsets,
-            }),
+            buffer: Vec::with_capacity(buffer_capacity),
+            disk_writer: BufWriter::with_capacity(1024 * 1024, file), // 1MB OS buffer
+            global_offset: 0,
+            row_index: 0,
+            alt_offsets: initial_offsets,
         }
     }
 
-    // Pushes a long allele into the mmap and returns the 32-bit pointer (offset)
+    // Pushes a long allele into the buffer and returns the 31-bit pointer (offset)
     // to be stored in Variant Key array.
-    pub fn push_long_allele(&self, alt_bytes: &[u8]) -> usize {
-        // acquire the lock, and because this is per-chromosome, there is almost zero contention.
-        let mut state = self.inner.lock().unwrap();
+    #[inline(always)]
+    pub fn push_long_allele(&mut self, alt_bytes: &[u8]) -> u32 {
+        // checking Capacity Bounds
+        // If this string pushes us over 128MB, trigger the synchronous hardware flush
+        if self.buffer.len() + alt_bytes.len() > self.buffer.capacity() {
+            self.flush_buffer();
+        }
 
         // enforcing the 31-bit capacity constraint
         assert!(
-            state.row_index <= 0x7FFFFFFF,
+            self.row_index <= 0x7FFFFFFF,
             "Exceeded 31-bit index capacity! Cannot proceed with this many long alleles!"
         );
 
-        // Check if this new sequence pushes us over the buffer limit
-        if state.buffer.len() + alt_bytes.len() > state.buffer.capacity() {
-            
-            // bulk-copy the buffer directly into the memory-mapped file
-            let start = state.global_offset;
-            let end = start + state.buffer.len();
-            state.mmap[start..end].copy_from_slice(&state.buffer);
-            
-            // update the global disk pointer and clear the buffer
-            state.global_offset = end;
-            state.buffer.clear(); 
-        }
+        // store the current index to return later
+        let current_index = self.row_index;
 
-        let current_index = state.row_index;
-        
-        //pPush the new bytes into the buffer
-        state.buffer.extend_from_slice(alt_bytes);
+        self.buffer.extend_from_slice(alt_bytes); //pushing to ram
 
-        let next_byte_offset = state.global_offset + state.buffer.len();
-        state.alt_offsets.push(next_byte_offset);
+        // calculate where this string logically lives
+        let next_byte_offset = (self.global_offset + self.buffer.len()) as u32;
+        self.alt_offsets.push(next_byte_offset);
 
-        // increment the tracker for the next allele
-        state.row_index += 1;
+        self.row_index += 1;
 
-        // the lock is automatically released here
         // return strictly the 31 LSBs (masking out the 32nd bit just in case)
         current_index & 0x7FFFFFFF
     }
 
-    // called by the Main thread when the VCF is fully parsed to ensure 
-    // any remaining bytes in the buffer are safely written to the memmap.
-    pub fn final_flush(&self) {
-        let mut state = self.inner.lock().unwrap();
+    // synch OS write. Halts the Executor thread until the drive finishes.
+    #[cold]
+    fn flush_buffer(&mut self) {
+        if self.buffer.is_empty() { return; }
+
+        // blast the 128MB block to drive
+        self.disk_writer.write_all(&self.buffer).expect("Critical NVMe write failure");
         
-        if !state.buffer.is_empty() {
-            let start = state.global_offset;
-            let end = start + state.buffer.len();
-            state.mmap[start..end].copy_from_slice(&state.buffer);
-            
-            state.global_offset = end;
-            state.buffer.clear();
-        }
-        
-        // MmapMut safely flushes to physical disk automatically when it is dropped,
-        // but calling state.mmap.flush() here to immediately flush it
-        state.mmap.flush().expect("Failed to flush mmap to physical disk");
-        let offsets_array = Array1::from_vec(state.alt_offsets.clone());
-        let npy_path = format!("{}/long_allele_table_offsets.npy", self.output_dir);
-        write_npy(&npy_path, &offsets_array).expect("Failed to write long allele offsets");
+        self.global_offset += self.buffer.len();
+        self.buffer.clear(); 
+    }
+
+    // called by the Executor at the very end of Phase 1 to flush any remaining bytes
+    pub fn finalize(mut self) -> Vec<u64> {
+        self.flush_buffer();
+        self.disk_writer.flush().unwrap();
+        self.alt_offsets
     }
 }
 
