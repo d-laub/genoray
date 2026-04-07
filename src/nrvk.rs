@@ -1,8 +1,11 @@
 use crossbeam_channel::Sender;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::Path;
 
 // strictly bounded memory bank for long alleles (non-blocking, double-buffered memory)
 // Public API
-pub struct LongAlleleTable {
+pub struct LongAlleleTableWriter {
     tx_long: Sender<Vec<u8>>, //channel to the writer thread
     alt_offsets: Vec<u32>, // TODO - should this be u32 or u64
     buffer: Vec<u8>, // staging area
@@ -10,7 +13,7 @@ pub struct LongAlleleTable {
     row_index: u32, // Tracks the number of long alleles and 31-bit integer returned to the variant key
 }
 
-impl LongAlleleTable {
+impl LongAlleleTableWriter {
     // because we need to map the file, it must be pre-allocated to the exact 
     // byte size calculated during your 1st Pass.
     pub fn new(tx_long: Sender<Vec<u8>>) -> Self {
@@ -47,7 +50,6 @@ impl LongAlleleTable {
 
         // store the current index to return later
         let current_index = self.row_index;
-
         self.buffer.extend_from_slice(alt_bytes); //pushing to ram
 
         // calculate where this string logically lives
@@ -88,6 +90,50 @@ impl LongAlleleTable {
         self.alt_offsets
     }
 }
+
+// Immutable state - Exists after conversion (phase 1)
+pub struct LongAlleleReader {
+    file: File,
+    offsets: Vec<u64>, // TODO Decide vector will be u64 or u32
+}
+
+impl LongAlleleReader {
+    // TODO: Decide which will call this (or create this instance)
+    pub fn new(output_dir: &str, chrom: &str) -> Self {
+        let chrom_dir = format!("{}/{}", output_dir, chrom);
+        
+        let file_path = Path::new(&chrom_dir).join("long_alleles.bin");
+        let file = File::open(file_path).expect("Failed to open long_alleles.bin");
+
+        let offsets_path = Path::new(&chrom_dir).join("long_allele_offsets.npy");
+        let offsets_array: ndarray::Array1<u64> = ndarray_npy::read_npy(offsets_path)
+            .expect("Failed to load offsets npy");
+
+        Self {
+            file,
+            offsets: offsets_array.into_raw_vec(),
+        }
+    }
+
+    // Fetches the exact DNA string from the disk using the 31-bit row index.
+    pub fn get_allele(&mut self, row_index: u32) -> Vec<u8> {
+        let idx = row_index as usize;
+        let start_byte = self.offsets[idx];
+        let end_byte = self.offsets[idx + 1];
+        let len = (end_byte - start_byte) as usize;
+
+        let mut string_buffer = vec![0u8; len];
+        self.file.seek(SeekFrom::Start(start_byte)).unwrap();
+        self.file.read_exact(&mut string_buffer).unwrap();
+
+        string_buffer
+    }
+}
+
+
+
+
+
 
 // // Contains the NonReversibleLongAllele struct, MmapMut initialization, and long allele read/write methods.
 // pub struct NonReversibleLongAllele {

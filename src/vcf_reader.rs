@@ -1,7 +1,6 @@
 use ndarray::{Array, Array3, Ix3};
 use rust_htslib::bcf::{self, Read, IndexedReader, record::GenotypeAllele};
 use crate::types::DenseChunk;
-use crate::{ravel, unravel};
 
 pub struct VcfChunkReader {
     inner_reader: IndexedReader,
@@ -14,16 +13,22 @@ impl VcfChunkReader {
     pub fn new(
         vcf_path: &str, 
         chrom: &str, 
-        samples: &[&str]) 
+        samples: &[&str],
+        htslib_threads: usize) 
     -> Self {
         let mut reader = IndexedReader::from_path(vcf_path)
             .expect("Failed to open VCF/BCF index. Is there a .tbi or .csi file?");
+        
+        // Tells C library to spawn exactly N background decompression threads.
+        reader.set_threads(htslib_threads)
+            .expect("Failed to allocate HTSlib background threads");
 
         // converting string slices to byte slices for htslib
         let sample_bytes: Vec<&[u8]> = samples.iter().map(|s| s.as_bytes()).collect();
         
-        reader.set_samples(&sample_bytes).expect("Failed to set sample subset");
-        reader.fetch(chrom).expect("Failed to fetch chromosome");
+        // TODO: Replace these by explicit sample filtering and passing the rid
+        // reader.set_samples(&sample_bytes).expect("Failed to set sample subset");
+        // reader.fetch(chrom).expect("Failed to fetch chromosome");
 
         Self {
             inner_reader: reader,

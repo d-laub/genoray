@@ -1,16 +1,16 @@
 use crossbeam_channel::{Receiver, Sender};
 use crate::types::{DenseChunk, SparseChunk};
-use crate::nrvk::LongAlleleTable;
-use crate::rvk::convert_dense_to_sparse;
+use crate::nrvk::LongAlleleTableWriter;
+use crate::rvk::dense2sparse_vk;
 
 
 // pulls raw chunks, does the math, manages the Bank, 
 // and streams the payloads to the Writer.
 pub fn run_compute_engine(
-    rx_dense: Receiver<DenseChunk>,
+    rx_dense: Receiver<DenseChunk<I>>,
     tx_sparse: Sender<SparseChunk>,
-    mut bank: LongAlleleTable,
-) -> (Vec<Vec<u32>>, Vec<u64>) {
+    mut bank: LongAlleleTableWriter,
+) -> (Vec<Vec<u32>>, Vec<u32>) { // TODO: decide on offsets being u32 or u64
     
     // The ram ledge -> Stores the lengths array for every single chunk.
     let mut ram_ledger: Vec<Vec<u32>> = Vec::with_capacity(10_000); 

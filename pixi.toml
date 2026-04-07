@@ -29,6 +29,8 @@ typing-extensions = "<4.15"
 rust = ">=1.93.1,<1.94"
 maturin = ">=1.12.0,<2"
 pip = ">=26.0.1,<27"
+clang = ">=22.1.0,<23"
+clangdev = ">=22.1.0,<23"
 
 [pypi-dependencies]
 genoray = { path = ".", editable = true, extras = ["cli"] }

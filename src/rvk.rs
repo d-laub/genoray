@@ -1,8 +1,8 @@
-use crate::nrvk::LongAlleleTable;
+use crate::nrvk::LongAlleleTableWriter;
 use ndarray::{Array, Array1, Array3, ArrayView3, Ix1, Ix3, s};
 use num_traits::PrimInt;
 use std::sync::Arc;
-use crate::types::{DenseChunk, SparseChunk};
+use crate::types::{MIN_I31,VALID_RANGE_SPAN, DenseChunk, SparseChunk};
 use packed_seq::{PackedSeqVec, Seq};
 
 // fn hasher()
@@ -64,32 +64,31 @@ fn encode_alt_inline(alt_allele: &[u8], len: u32) -> u32 {
     
     // left-aligned packing starting exactly at Bit 26
     // Because the 2-bit chunk occupies bits 25 and 26 -> shift by 25.
-    payload |= ((bits1 >> 0)  & 3) as u32 << 25; // shift to make major, 
+    payload |= (((bits1 >> 0)  & 3) as u32) << 25; // shift to make major, 
     // then get last 2 bits, then upshift to correct position in payload
-    payload |= ((bits1 >> 8)  & 3) as u32 << 23; 
-    payload |= ((bits1 >> 16) & 3) as u32 << 21; 
-    payload |= ((bits1 >> 24) & 3) as u32 << 19; 
-    payload |= ((bits1 >> 32) & 3) as u32 << 17; 
-    payload |= ((bits1 >> 40) & 3) as u32 << 15; 
-    payload |= ((bits1 >> 48) & 3) as u32 << 13; 
-    payload |= ((bits1 >> 56) & 3) as u32 << 11; 
+    payload |= (((bits1 >> 8)  & 3) as u32) << 23; 
+    payload |= (((bits1 >> 16) & 3) as u32) << 21; 
+    payload |= (((bits1 >> 24) & 3) as u32) << 19; 
+    payload |= (((bits1 >> 32) & 3) as u32) << 17; 
+    payload |= (((bits1 >> 40) & 3) as u32) << 15; 
+    payload |= (((bits1 >> 48) & 3) as u32) << 13; 
+    payload |= (((bits1 >> 56) & 3) as u32) << 11; 
 
     // block 2
-    payload |= ((bits2 >> 0)  & 3) as u32 << 9;  
-    payload |= ((bits2 >> 8)  & 3) as u32 << 7;  
-    payload |= ((bits2 >> 16) & 3) as u32 << 5;  
-    payload |= ((bits2 >> 24) & 3) as u32 << 3;  
-    payload |= ((bits2 >> 32) & 3) as u32 << 1;  
+    payload |= (((bits2 >> 0)  & 3) as u32) << 9;  
+    payload |= (((bits2 >> 8)  & 3) as u32) << 7;  
+    payload |= (((bits2 >> 16) & 3) as u32) << 5;  
+    payload |= (((bits2 >> 24) & 3) as u32) << 3;  
+    payload |= (((bits2 >> 32) & 3) as u32) << 1;  
 
     // tag the length into the top 5 bits and return
     payload | (len << 27) // this will also keep the lsb 0 which is demarking no lookup
-}
 }
 
 // SIMD version of generate variant key for better parallel encoding
 #[inline(always)]
 pub fn pack_variant(
-    ilen: i32, alt_allele: &[u8], bank: &mut LongAlleleTable
+    ilen: i32, alt_allele: &[u8], bank: &mut LongAlleleTableWriter
 ) -> u32 {
     // this evaluates (MIN_I31 <= ilen <= 13)
     if (ilen.wrapping_sub(MIN_I31) as u32) <= VALID_RANGE_SPAN {
@@ -115,73 +114,73 @@ pub fn pack_variant(
 
 
 
-// encoding the ilen, and alt allele (with rk or nrk) into a single key
-#[inline(always)]
-fn encode_variant_key(
-    ref_len: usize,
-    alt_len: usize,
-    alt_allele: &[u8],
-    long_allele_bank: &mut NonReversibleLongAllele,
-) -> u32 {
-    // will have to check based on the size so that cn decide if to use the ptr or not
-    // lookup flag ->
-    // 		true -> when ilen is > 13 or if ilen if < minimum value of i31
-    //		false -> o.w. it is an actual vk not a pointer
-    /* if lookup flag {
-            1. yes -> 31 bits for an unsigned address
-            2. no ->
-                a. if ilen >= 0 then ilen = i5 and alt = 26 bits of 2 bit each nucleotide
-                b. if ilen < 0 then ilen = i31
-        }
-    */
-    // AC 
-    // 0010 00000000000 >> 5 | ilen | flag
+// // encoding the ilen, and alt allele (with rk or nrk) into a single key
+// #[inline(always)]
+// fn encode_variant_key(
+//     ref_len: usize,
+//     alt_len: usize,
+//     alt_allele: &[u8],
+//     long_allele_bank: &mut NonReversibleLongAllele,
+// ) -> u32 {
+//     // will have to check based on the size so that cn decide if to use the ptr or not
+//     // lookup flag ->
+//     // 		true -> when ilen is > 13 or if ilen if < minimum value of i31
+//     //		false -> o.w. it is an actual vk not a pointer
+//     /* if lookup flag {
+//             1. yes -> 31 bits for an unsigned address
+//             2. no ->
+//                 a. if ilen >= 0 then ilen = i5 and alt = 26 bits of 2 bit each nucleotide
+//                 b. if ilen < 0 then ilen = i31
+//         }
+//     */
+//     // AC 
+//     // 0010 00000000000 >> 5 | ilen | flag
 
 
-    let ilen: i32 = (alt_len as i32) - (ref_len as i32);
-    let min_i31: i32 = -(1 << 30); //constant
-    let mut seq_bits: u32 = 0; //vk
+//     let ilen: i32 = (alt_len as i32) - (ref_len as i32);
+//     let min_i31: i32 = -(1 << 30); //constant
+//     let mut seq_bits: u32 = 0; //vk
 
-    if (ilen >= 0 && ilen <= 13) || (ilen < 0 && ilen >= min_i31) {
-        // Path A: Reversible Packing (when +ve ilen but <= 13 alt len, or when -ve but in range of i31)
-        if ilen >= 0 {
-            //then it can fit in the 31 bits with last bit being 0
-            let key = ((ilen as u32) & 0x1F) << 27; //write decimal instead of hex
-            for (i, &b) in alt_allele.iter().enumerate() {
-                // prevent shifting out of bounds if a rogue string gets through
-                if i >= 13 {
-                    break; //panic 
-                }
-                // u8s to bits -> vectorized 
-                // calculate exactly how far left to push this specific base -> left aligned
-                // Base 0 shifts by 25. Base 1 shifts by 23. Base 2 shifts by 21...
-                let shift_amount = 25 - (i * 2);
+//     if (ilen >= 0 && ilen <= 13) || (ilen < 0 && ilen >= min_i31) {
+//         // Path A: Reversible Packing (when +ve ilen but <= 13 alt len, or when -ve but in range of i31)
+//         if ilen >= 0 {
+//             //then it can fit in the 31 bits with last bit being 0
+//             let key = ((ilen as u32) & 0x1F) << 27; //write decimal instead of hex
+//             for (i, &b) in alt_allele.iter().enumerate() {
+//                 // prevent shifting out of bounds if a rogue string gets through
+//                 if i >= 13 {
+//                     break; //panic 
+//                 }
+//                 // u8s to bits -> vectorized 
+//                 // calculate exactly how far left to push this specific base -> left aligned
+//                 // Base 0 shifts by 25. Base 1 shifts by 23. Base 2 shifts by 21...
+//                 let shift_amount = 25 - (i * 2);
 
-                // encoding the base and dropping it to the assigned slot
-                // eg: Alt: ACGT ilen = 4 -> seq_bits = 00100 00011011 000000000000000000 0
-                seq_bits |= encode_base(b) << shift_amount;
-            }
-            seq_bits |= key;
-        } else {
-            // shift left by 1 -> LSB = 0 and MSB 31 bits are signed ilen i31
-            seq_bits = (ilen as u32) << 1;
-        }
-    } else {
-        // Path B: Ptr Fallback for large variants (> 13 alt len or more than i31 deletions)
-        // 31 bits for an usigned add + 1 bit for flag True
-        // modifies the data of long allele bank and returns the pointer to that with lsb 1 as lookup flag
-        row_index = long_allele_bank.push_variant(ilen, alt_allele); // should not couple in table 
-        // tagging the lsb to 1
-        return (row_index << 1) | 1;
-    }
-    seq_bits
-}
+//                 // encoding the base and dropping it to the assigned slot
+//                 // eg: Alt: ACGT ilen = 4 -> seq_bits = 00100 00011011 000000000000000000 0
+//                 seq_bits |= encode_base(b) << shift_amount;
+//             }
+//             seq_bits |= key;
+//         } else {
+//             // shift left by 1 -> LSB = 0 and MSB 31 bits are signed ilen i31
+//             seq_bits = (ilen as u32) << 1;
+//         }
+//     } else {
+//         // Path B: Ptr Fallback for large variants (> 13 alt len or more than i31 deletions)
+//         // 31 bits for an usigned add + 1 bit for flag True
+//         // modifies the data of long allele bank and returns the pointer to that with lsb 1 as lookup flag
+//         row_index = long_allele_bank.push_variant(ilen, alt_allele); // should not couple in table 
+//         // tagging the lsb to 1
+//         return (row_index << 1) | 1;
+//     }
+//     seq_bits
+// }
 
 // The core Dense-to-Sparse Matrix Transposer.
 // Flips Row-Major VCF data into Column-Major (Sample-Major) Sparse Tensors.
 pub fn dense2sparse_vk<I: PrimInt>(
     chunk: &DenseChunk<I>,
-    bank: &mut LongAlleleTable,
+    bank: &mut LongAlleleTableWriter,
 ) -> SparseChunk {
     
     // TODO
