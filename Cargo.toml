@@ -8,7 +8,13 @@ name = "genoray_core"
 crate-type = ["cdylib"]
 
 [dependencies]
+bytemuck = "1.25.0"
+crossbeam-channel = "0.5.15"
 memmap2 = "0.9.10"
 ndarray = "0.17.2"
+ndarray-npy = "0.10.0"
 num-traits = "0.2.19"
+packed-seq = "4.4.2"
 pyo3 = { version = "0.22", features = ["extension-module"] }
+rayon = "1.11.0"
+rust-htslib = "1.0.0"

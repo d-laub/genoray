@@ -1,12 +1,12 @@
 use ndarray::{Array, Array3, Ix3};
 use rust_htslib::bcf::{self, Read, IndexedReader, record::GenotypeAllele};
 use crate::types::DenseChunk;
-use crate::{ravel, unravel};
 
 pub struct VcfChunkReader {
     inner_reader: IndexedReader,
     num_samples: usize,
     ploidy: usize,
+    sample_indices: Vec<usize>,
 }
 
 impl VcfChunkReader {
@@ -14,27 +14,46 @@ impl VcfChunkReader {
     pub fn new(
         vcf_path: &str, 
         chrom: &str, 
-        samples: &[&str]) 
+        samples: &[&str],
+        htslib_threads: usize,
+        ploidy: usize,
+    ) 
     -> Self {
         let mut reader = IndexedReader::from_path(vcf_path)
             .expect("Failed to open VCF/BCF index. Is there a .tbi or .csi file?");
-
-        // converting string slices to byte slices for htslib
-        let sample_bytes: Vec<&[u8]> = samples.iter().map(|s| s.as_bytes()).collect();
         
-        reader.set_samples(&sample_bytes).expect("Failed to set sample subset");
-        reader.fetch(chrom).expect("Failed to fetch chromosome");
+        // Tells C library to spawn exactly N background decompression threads.
+        reader.set_threads(htslib_threads)
+            .expect("Failed to allocate HTSlib background threads");
+
+        // Clone the header to extract Region IDs and Sample IDs
+        let header = reader.header().clone();
+
+        // Resolve the string to a numeric Region ID (rid)
+        let rid = header.name2rid(chrom.as_bytes())
+            .expect("Chromosome not found in VCF header");
+            
+        // Fetch the entire chromosome (start: 0, end: None)
+        reader.fetch(rid, 0, None)
+            .expect("Failed to fetch chromosome region");
+
+        // Map requested sample strings to their integer indices in the VCF
+        let sample_indices: Vec<usize> = samples.iter().map(|name| {
+            header.sample_id(name.as_bytes())
+                .unwrap_or_else(|| panic!("Sample {} not found in VCF", name)) as usize
+        }).collect();
 
         Self {
             inner_reader: reader,
             num_samples: samples.len(),
-            ploidy: 2, // hardcoded to diploid for this package -> can be changed later (can cause issues)
+            ploidy, //: 2, // hardcoded to diploid for this package -> can be changed later (can cause issues)
+            sample_indices,
         }
     }
 
     // pulls the next `chunk_size` variants from the disk and builds the DenseChunk
     // returns Option so that the thread knows exactly when EOF is reached
-    pub fn read_next_chunk(&mut self, chunk_size: usize, chunk_id: usize) -> Option<DenseChunk<u32>> {
+    pub fn read_next_chunk(&mut self, chunk_size: usize, chunk_id: usize) -> Option<DenseChunk> {
         // pre-allocate the arrays
         let mut pos = Vec::with_capacity(chunk_size);
         let mut ilens = Vec::with_capacity(chunk_size);
@@ -52,8 +71,10 @@ impl VcfChunkReader {
 
         while current_v_idx < chunk_size {
             // read the next row. If it fails, we've hit EOF for this chromosome.
-            if !self.inner_reader.read(&mut record).unwrap_or(false) {
-                break;
+            match self.inner_reader.read(&mut record) {
+                Some(Ok(_)) => {},
+                Some(Err(e)) => panic!("VCF Read Error: {}", e), // fail on corruption
+                None => break,     // End of file (or end of chromosome region)
             }
 
             // position
@@ -78,8 +99,12 @@ impl VcfChunkReader {
             // genotypes
             let genotypes = record.genotypes().expect("Failed to read genotypes");
             
-            for (s_idx, sample_gt) in genotypes.into_iter().enumerate() {
+            // Loop through your pre-mapped sample indices instead!
+            for (s_idx, &real_vcf_idx) in self.sample_indices.iter().enumerate() {
                 if s_idx >= self.num_samples { break; }
+
+                // Fetch the genotype for this specific sample
+                let sample_gt = genotypes.get(real_vcf_idx);
 
                 let allele_1 = matches!(sample_gt[0], GenotypeAllele::Unphased(1) | GenotypeAllele::Phased(1));
                 
