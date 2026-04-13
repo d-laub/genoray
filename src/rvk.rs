@@ -37,11 +37,13 @@ fn ascii_to_2bit(base: u8) -> u32 {
 }
 // instead of doing this do by taking a slice of alt
 
-/// SIMD Within A Register (SWAR) string encoder.
-/// Packs up to 13 DNA bases into a single u32.
+// SIMD Within A Register (SWAR) string encoder.
+// Packs up to 13 DNA bases into a single u32.
 #[inline(always)]
 fn encode_alt_inline(alt_allele: &[u8], len: u32) -> u32 {
-    debug_assert!(len <= 13);
+    if len > 13 { 
+        panic!("Inline ALT must be 13 bases or fewer"); 
+    }
 
     // fixed 16-byte memory block initialized to zero
     let mut padded = [0u8; 16];
@@ -83,6 +85,22 @@ fn encode_alt_inline(alt_allele: &[u8], len: u32) -> u32 {
 
     // tag the length into the top 5 bits and return
     payload | (len << 27) // this will also keep the lsb 0 which is demarking no lookup
+}
+
+#[inline(always)]
+pub fn decode_alt_inline(payload: u32) -> Vec<u8> {
+    let len = (payload >> 27) as usize;
+    let mut decoded = Vec::with_capacity(len);
+    
+    const BASES: [u8; 4] = [b'A', b'C', b'T', b'G'];
+    
+    for i in 0..len {
+        let shift = 25 - (i * 2);
+        let bit_val = ((payload >> shift) & 3) as usize;
+        decoded.push(BASES[bit_val]);
+    }
+    
+    decoded
 }
 
 // SIMD version of generate variant key for better parallel encoding
@@ -178,8 +196,8 @@ pub fn pack_variant(
 
 // The core Dense-to-Sparse Matrix Transposer.
 // Flips Row-Major VCF data into Column-Major (Sample-Major) Sparse Tensors.
-pub fn dense2sparse_vk<I: PrimInt>(
-    chunk: &DenseChunk<I>,
+pub fn dense2sparse_vk (
+    chunk: &DenseChunk,
     bank: &mut LongAlleleTableWriter,
 ) -> SparseChunk {
     
@@ -349,3 +367,65 @@ pub fn dense2sparse_vk<I: PrimInt>(
 //     }
 //     (out_pos, ilen_alt, offsets)
 // }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_encoding_roundtrip() {
+        let original = b"GATTACA";
+        let payload = encode_alt_inline(original, original.len() as u32);
+        let decoded = decode_alt_inline(payload);
+        assert_eq!(original, &decoded[..], "ALT decoder corrupted the sequence");
+    }
+
+    #[test]
+    fn test_alt_exact_binary_layout() {
+        // We will encode "ACGT" (Length = 4)
+        // Expected Bit Layout based on encoder:
+        // Length (4) -> Top 5 bits: 4 << 27
+        // 'A' (00)   -> bit 25:     0 << 25
+        // 'C' (01)   -> bit 23:     1 << 23
+        // 'G' (11)   -> bit 21:     3 << 21
+        // 'T' (10)   -> bit 19:     2 << 19
+        // ------------------------------------
+        // Expected Hex: 0x20F00000
+        
+        let seq = b"ACGT";
+        let payload = encode_alt_inline(seq, 4);
+        
+        // Assert against the exact hexadecimal signature
+        assert_eq!(
+            payload, 
+            0x20F00000, 
+            "ALT binary layout changed! This will break compatibility."
+        );
+
+        let seq = b"ACGTTGCAGCATT";
+        let payload = encode_alt_inline(seq, 13);
+        
+        // Assert against the exact hexadecimal signature
+        assert_eq!(
+            payload, 
+            0x68F5A694, 
+            "ALT binary layout changed! This will break compatibility."
+        );
+
+        let seq = b"ACGTTGCAGC";
+        let payload = encode_alt_inline(seq, 10);
+        
+        // Assert against the exact hexadecimal signature
+        assert_eq!(
+            payload, 
+            0x50F5A680, 
+            "ALT binary layout changed! This will break compatibility."
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Inline ALT must be 13 bases or fewer")]
+    fn test_alt_overflow_protection() {
+        encode_alt_inline(b"ACGTACGTACGTACGT", 16);
+    }
+}

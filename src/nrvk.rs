@@ -7,7 +7,7 @@ use std::path::Path;
 // Public API
 pub struct LongAlleleTableWriter {
     tx_long: Sender<Vec<u8>>, //channel to the writer thread
-    alt_offsets: Vec<u32>, // TODO - should this be u32 or u64
+    alt_offsets: Vec<u64>, // using 64 bits as same is used in seek - no extra casting
     buffer: Vec<u8>, // staging area
     global_offset: usize,     // The exact byte position
     row_index: u32, // Tracks the number of long alleles and 31-bit integer returned to the variant key
@@ -16,12 +16,12 @@ pub struct LongAlleleTableWriter {
 impl LongAlleleTableWriter {
     // because we need to map the file, it must be pre-allocated to the exact 
     // byte size calculated during your 1st Pass.
-    pub fn new(tx_long: Sender<Vec<u8>>) -> Self {
+    pub fn new(tx_long: Sender<Vec<u8>>, buffer_capacity: usize) -> Self {
         // 128 MB RAM Limit to prevent OOM crashes -> can be changed or made run time
-        let buffer_capacity = 128 * 1024 * 1024;
+        // let buffer_capacity = 128 * 1024 * 1024; -> now parameter
 
         let mut initial_offsets = Vec::with_capacity(1_000_000); //hardcoded capacity for now, can optimize
-        initial_offsets.push(0); // The first allele starts at byte 0
+        initial_offsets.push(0u64); // The first allele starts at byte 0
 
         Self {
             buffer: Vec::with_capacity(buffer_capacity),
@@ -36,24 +36,25 @@ impl LongAlleleTableWriter {
     // to be stored in Variant Key array.
     #[inline(always)]
     pub fn push_long_allele(&mut self, alt_bytes: &[u8]) -> u32 {
-        // checking Capacity Bounds
-        // If this string pushes us over 128MB, trigger the synchronous hardware flush
-        if self.buffer.len() + alt_bytes.len() > self.buffer.capacity() {
-            self.flush_buffer();
-        }
 
         // enforcing the 31-bit capacity constraint
         assert!(
             self.row_index <= 0x7FFFFFFF,
-            "Exceeded 31-bit index capacity! Cannot proceed with this many long alleles!"
+            "Exceeded 31-bit (4,294,967,295) index capacity! Cannot proceed with this many long alleles!"
         );
+
+        // checking Capacity Bounds
+        // If this string pushes us over buffer cap, trigger the synchronous hardware flush
+        if self.buffer.len() + alt_bytes.len() > self.buffer.capacity() {
+            self.flush_buffer();
+        }
 
         // store the current index to return later
         let current_index = self.row_index;
         self.buffer.extend_from_slice(alt_bytes); //pushing to ram
 
         // calculate where this string logically lives
-        let next_byte_offset = (self.global_offset + self.buffer.len()) as u32;
+        let next_byte_offset = (self.global_offset + self.buffer.len()) as u64;
         self.alt_offsets.push(next_byte_offset);
 
         self.row_index += 1;
@@ -67,21 +68,21 @@ impl LongAlleleTableWriter {
     fn flush_buffer(&mut self) {
         if self.buffer.is_empty() { return; }
 
-        // empty 128MB vector.
-        let fresh_buffer = Vec::with_capacity(128 * 1024 * 1024);
+        // empty vector
+        let fresh_buffer = Vec::with_capacity(self.buffer.capacity());
         
         // swap full buffer with new
         let full_buffer = std::mem::replace(&mut self.buffer, fresh_buffer);
 
+        // update the global byte tracker so offsets remain accurate.
+        self.global_offset += full_buffer.len();
+
         // send the full buffer to the background writer thread.
         self.tx_long.send(full_buffer).expect("Long Allele Writer Thread panicked");
-        
-        // update the global byte tracker so offsets remain accurate.
-        self.global_offset += 128 * 1024 * 1024;
     }
 
     // called by the Executor at the very end to flush any remaining bytes
-    pub fn finalize(mut self) -> Vec<u32> {
+    pub fn finalize(mut self) -> Vec<u64> {
         if !self.buffer.is_empty() {
             // send the final partial buffer
             let final_buffer = std::mem::take(&mut self.buffer);
@@ -94,7 +95,7 @@ impl LongAlleleTableWriter {
 // Immutable state - Exists after conversion (phase 1)
 pub struct LongAlleleReader {
     file: File,
-    offsets: Vec<u64>, // TODO Decide vector will be u64 or u32
+    offsets: Vec<u64>,
 }
 
 impl LongAlleleReader {
@@ -111,7 +112,7 @@ impl LongAlleleReader {
 
         Self {
             file,
-            offsets: offsets_array.into_raw_vec(),
+            offsets: offsets_array.into_raw_vec_and_offset().0,
         }
     }
 
@@ -214,3 +215,25 @@ impl LongAlleleReader {
 //     }
 
 // }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossbeam_channel::bounded;
+
+    #[test]
+    fn test_global_u64_offsets() {
+        let (tx, _rx) = bounded(10);
+        let mut bank = LongAlleleTableWriter::new(tx, 1024);
+        
+        // Push 10 bytes, then 5 bytes
+        bank.push_long_allele(b"0123456789"); 
+        bank.push_long_allele(b"ABCDE");
+        
+        let offsets = bank.finalize();
+        
+        // First allele starts at 0, second at 10, EOF at 15.
+        // MUST perfectly match OS SeekFrom requirements.
+        assert_eq!(offsets, vec![0u64, 10u64, 15u64]); 
+    }
+}

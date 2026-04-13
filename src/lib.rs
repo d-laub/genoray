@@ -18,6 +18,34 @@ mod merge;
 use vcf_reader::VcfChunkReader;
 use nrvk::LongAlleleTableWriter;
 
+/*
+ARCHITECTURE & TENSOR LAYOUT LIFECYCLE
+
+This pipeline converts sequential VCF rows into Sample-Major Sparse Tensors via a 3-Stage 
+parallel memory architecture.
+
+1. Stage 1: Reader -> DenseChunk
+    - Layout: (V, S, P) -> (Variants, Samples, Ploidy)
+    - The VCF is read horizontally row-by-row. Data is packed into a dense 3D boolean grid.
+
+2. Stage 2: RVK/Executor -> SparseChunk
+    - Layout: (S, P, ~V) -> (Samples, Ploidy, sparse Variants)
+    - The dense grid is transposed and compressed. For each sample/ploidy, we only store 
+     the variants (~V) that are actually mutated.
+    * NOTE: Rearranging (v, s, p) -> (s, p, ~v) in these tiny temporary chunks does not 
+     offer an obvious IO benefit during the final merge. However, we do it here because 
+     it provides a massive CPU cache-locality advantage during the SIMD encoding phase, 
+     and it allows the Phase 3 Tile-Merger to confidently copy continuous blocks of memory 
+     using `copy_from_slice` rather than picking single scattered elements.
+
+3. Stage 3: Merge Phase -> Final Tensors
+    - Layout: (S, P, ~V) -> Monolithic 1D Array
+    - N-many temporary SparseChunks are interleaved. All Chunk 0 -> Chunk N data for 
+     Sample 0 is stitched together in RAM, then Sample 1, etc., achieving the final 
+     read-optimized layout for the PyTorch dataloader.
+
+*/
+
 //The rust pipeline (Per chromosome conversion from Dense to Sparse)
 pub fn process_chromosome(
     vcf_path: &str,
@@ -27,9 +55,10 @@ pub fn process_chromosome(
     chunk_size: usize,
     ploidy: usize,
     htslib_threads: usize,
+    long_allele_capacity: usize, 
 )   {
-
-        let chrom_out_dir = format!("{}/{}", base_out_dir, chrom);
+        // Directory Formatting: svar2/{contig}/var_key
+        let chrom_out_dir = format!("{}/{}/var_key", base_out_dir, chrom);
         fs::create_dir_all(&chrom_out_dir).expect("Failed to create chromosome output directory");
 
         // the buffer channels
@@ -41,11 +70,13 @@ pub fn process_chromosome(
         let reader_thread = thread::spawn({
             let vcf = vcf_path.to_string();
             let chr = chrom.to_string();
-            let s: Vec<&str> = samples.to_vec();
+            // Convert references into owned Strings that can safely live forever in the thread
+            let s_owned: Vec<String> = samples.iter().map(|&s| s.to_string()).collect();
             
             move || {
                 // passing the thread budget down to HTSLib
-                let mut reader = VcfChunkReader::new(&vcf, &chr, &s, htslib_threads);
+                let s_refs: Vec<&str> = s_owned.iter().map(|s| s.as_str()).collect();
+                let mut reader = VcfChunkReader::new(&vcf, &chr, &s_refs, htslib_threads, ploidy);
                 let mut chunk_id = 0;
                 while let Some(dense_chunk) = reader.read_next_chunk(chunk_size, chunk_id) {
                     tx_dense.send(dense_chunk).unwrap();
@@ -59,7 +90,7 @@ pub fn process_chromosome(
             let num_samples = samples.len();
             
             move || {
-                let bank = LongAlleleTableWriter::new(tx_long);
+                let bank = LongAlleleTableWriter::new(tx_long, long_allele_capacity);
                 executor::run_compute_engine(rx_dense, tx_sparse, bank)
             }
         });
@@ -121,7 +152,7 @@ pub fn process_chromosome(
 
 //The Python Wrapper and resource allocator
 #[pyfunction]
-#[pyo3(signature = (vcf_path, chroms, output_dir, samples, chunk_size=10_000, ploidy=2, max_threads=None))]
+#[pyo3(signature = (vcf_path, chroms, output_dir, samples, chunk_size=10_000, ploidy=2, max_threads=None, long_allele_capacity=104_857_600))]
 fn run_conversion_pipeline(
     py: Python,
     vcf_path: String,
@@ -131,6 +162,7 @@ fn run_conversion_pipeline(
     chunk_size: usize,
     ploidy: usize,
     max_threads: Option<usize>, // accepts an optional integer from Python
+    long_allele_capacity: usize, // default set as 100MB -> pass as bytes
 ) -> PyResult<()> {
 
     let sample_refs: Vec<&str> = samples.iter().map(|s| s.as_str()).collect();
@@ -179,7 +211,7 @@ fn run_conversion_pipeline(
         pool.install(|| {
             chroms.par_iter().for_each(|chrom| {
                 println!("==> Processing {}", chrom);
-                process_chromosome(&vcf_path, chrom, &output_dir, &sample_refs, chunk_size, ploidy, htslib_threads);
+                process_chromosome(&vcf_path, chrom, &output_dir, &sample_refs, chunk_size, ploidy, htslib_threads, long_allele_capacity);
             });
         });
 
