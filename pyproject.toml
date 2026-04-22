@@ -51,6 +51,7 @@ requires = ["hatchling"]
 
 [tool.pytest.ini_options]
 filterwarnings = ["ignore::DeprecationWarning:sorted_nearest.*"]
+markers = ["network: requires network access (deselect with '-m not network')"]
 
 [tool.basedpyright]
 enableTypeIgnoreComments = true
