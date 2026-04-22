@@ -1,3 +1,9 @@
+## 2.2.3 (2026-04-22)
+
+### Fix
+
+- var_counts scatter non-zero counts by query index
+
 ## 2.2.2 (2026-03-31)
 
 ### Fix
