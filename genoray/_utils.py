@@ -15,6 +15,10 @@ DTYPE = TypeVar("DTYPE", bound=np.generic)
 
 
 class ContigNormalizer:
+    """Normalizes contig name(s) to match alternative naming schemes. For example, "chr1" to "1" or "1" to "chr1".
+    Note: this does not handle the special case of equivalence between M and MT.
+    """
+
     contigs: list[str]
     contig_map: dict[str, str]
 

@@ -194,10 +194,10 @@ def var_counts(
         .collect()
     )
 
-    if counts.height == 0:
-        return np.zeros(n_ranges, dtype=np.uint32)
-
-    return counts["len"].to_numpy()
+    result = np.zeros(n_ranges, dtype=np.uint32)
+    if counts.height > 0:
+        result[counts["query_1"].to_numpy()] = counts["len"].to_numpy()
+    return result
 
 
 @nb.guvectorize(
