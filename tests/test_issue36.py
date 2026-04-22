@@ -7,6 +7,7 @@ pre-allocate a buffer it can't fill -> ValueError.
 
 Minimal reprex: 2 regions where the first has 0 variants.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -30,7 +31,9 @@ pytestmark = pytest.mark.network
 def vcf_1kgp() -> VCF:
     CACHE.mkdir(parents=True, exist_ok=True)
     vcf_path = Path(
-        pooch.retrieve(url=VCF_URL, known_hash=VCF_HASH, path=CACHE, fname="chr22.vcf.gz")
+        pooch.retrieve(
+            url=VCF_URL, known_hash=VCF_HASH, path=CACHE, fname="chr22.vcf.gz"
+        )
     )
     pooch.retrieve(url=TBI_URL, known_hash=None, path=CACHE, fname="chr22.vcf.gz.tbi")
     vcf = VCF(vcf_path)
