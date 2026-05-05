@@ -39,7 +39,7 @@ pooch = "*"
 [tasks]
 gen = "sh tests/data/gen_from_vcf.sh"
 test = { cmd = "pytest tests", depends-on = "gen" }
-prek-install = "prek install -t pre-commit -t pre-push"
+prek-install = "prek install -t pre-commit -t pre-push -t commit-msg"
 bump-dry = "cz bump --dry-run"
 
 [feature.doc.dependencies]
