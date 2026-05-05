@@ -1,7 +1,7 @@
 [workspace]
 name = "genoray"
 channels = ["conda-forge", "bioconda"]
-platforms = ["linux-64"]
+platforms = ["linux-64", 'osx-arm64']
 
 [environments]
 default = ["py310"]
@@ -15,7 +15,6 @@ sbox = ["sbox", "py310"]
 [dependencies]
 uv = "*"
 bcftools = "*"
-plink2 = "*"
 commitizen = "*"
 prek = "*"
 ruff = "*"
@@ -26,6 +25,10 @@ ipykernel = "*"
 ipywidgets = "*"
 icecream = "*"
 typing-extensions = "<4.15"
+
+[target.linux-64.dependencies]
+# needs to be installed manually for osx-arm64
+plink2 = "*"
 
 [pypi-dependencies]
 genoray = { path = ".", editable = true, extras = ["cli"] }
