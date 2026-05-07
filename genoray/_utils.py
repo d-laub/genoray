@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import math
 import re
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Iterable, TypeVar, overload
+from typing import Any, TypeGuard, TypeVar, overload
 
 import numpy as np
 import polars as pl
 from hirola import HashTable
 from numpy.typing import ArrayLike, DTypeLike, NDArray
-from typing_extensions import TypeGuard
 
 DTYPE = TypeVar("DTYPE", bound=np.generic)
 
