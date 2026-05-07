@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import copy
 import shutil
 import warnings
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Literal, Union, cast, overload
+from typing import Generic, Literal, TypeVar, cast, overload
 
 import awkward as ak
 import joblib
@@ -19,12 +20,12 @@ from awkward.contents import Content, NumpyArray
 from hirola import HashTable
 from joblib_progress import joblib_progress
 from loguru import logger
-from numpy.typing import ArrayLike, NDArray
+from numpy.typing import ArrayLike, DTypeLike, NDArray
 from pgenlib import PgenReader
 from polars._typing import IntoExpr
 from pydantic import BaseModel
 from rich.progress import MofNCompleteColumn, Progress
-from seqpro.rag import OFFSET_TYPE, Ragged, lengths_to_offsets
+from seqpro.rag import OFFSET_TYPE, RDTYPE, Ragged, lengths_to_offsets
 from tqdm.auto import tqdm
 
 from ._pgen import PGEN
@@ -34,27 +35,24 @@ from ._var_ranges import var_ranges
 from ._vcf import VCF
 from .exprs import ILEN
 
-SparseGenotypes = Ragged[V_IDX_TYPE]
-SparseDosages = Ragged[DOSAGE_TYPE]
-
 
 @overload
 def dense2sparse(
     genos: NDArray[np.int8],
     var_idxs: NDArray[V_IDX_TYPE],
     dosages: None = None,
-) -> SparseGenotypes: ...
+) -> Ragged[V_IDX_TYPE]: ...
 @overload
 def dense2sparse(
     genos: NDArray[np.int8],
     var_idxs: NDArray[V_IDX_TYPE],
     dosages: NDArray[DOSAGE_TYPE],
-) -> tuple[SparseGenotypes, SparseDosages]: ...
+) -> tuple[Ragged[V_IDX_TYPE], Ragged[DOSAGE_TYPE]]: ...
 def dense2sparse(
     genos: NDArray[np.int8],
     var_idxs: NDArray[V_IDX_TYPE],
     dosages: NDArray[DOSAGE_TYPE] | None = None,
-) -> SparseGenotypes | tuple[SparseGenotypes, SparseDosages]:
+) -> Ragged[V_IDX_TYPE] | tuple[Ragged[V_IDX_TYPE], Ragged[DOSAGE_TYPE]]:
     """Convert dense genotypes (and dosages) to sparse genotypes."""
     # (s p v)
     if genos.ndim < 3:
@@ -82,12 +80,12 @@ def dense2sparse(
     lengths = keep.sum(-1)
     shape = (*lengths.shape, None)
     offsets = lengths_to_offsets(lengths)
-    rag = SparseGenotypes.from_offsets(data, shape, offsets)
+    rag = Ragged[V_IDX_TYPE].from_offsets(data, shape, offsets)
 
     if dosages is not None:
         # (s v) -> (s p v)
         dosage_data = np.broadcast_to(dosages[:, None], genos.shape)[keep]
-        _dosages = SparseDosages.from_offsets(dosage_data, shape, offsets)
+        _dosages = Ragged[DOSAGE_TYPE].from_offsets(dosage_data, shape, offsets)
         return rag, _dosages
     return rag
 
@@ -96,13 +94,16 @@ CURRENT_VERSION = 1
 
 
 class SparseVarMetadata(BaseModel):
-    version: Union[int, None] = None
+    version: int | None = None
     samples: list[str]
     ploidy: int
     contigs: list[str]
 
 
-class SparseVar:
+_SRT = TypeVar("_SRT")
+
+
+class SparseVar(Generic[_SRT]):
     """Open a Sparse Variant (SVAR) directory.
 
     Parameters
@@ -111,6 +112,10 @@ class SparseVar:
         Path to the SVAR directory.
     attrs
         Expression of attributes to load in addition to the ALT and ILEN columns.
+    fields
+        Mapping of field names to dtypes to load from the SVAR directory. Only numeric
+        dtypes are supported. Only VCF FORMAT fields with ``Number=G`` are currently
+        supported as custom fields.
     """
 
     path: Path
@@ -119,8 +124,8 @@ class SparseVar:
     ploidy: int
     contigs: list[str]
     """Contigs in the order they appear in the dataset. Variants are only sorted within each contig."""
-    genos: SparseGenotypes
-    dosages: SparseDosages | None
+    genos: Ragged[V_IDX_TYPE]
+    fields: dict[str, Ragged]
     index: pl.DataFrame
     """Table of variants with columns: `CHROM`, `POS`, `REF`, `ALT`, `ILEN`, and any additional
     attributes specified in `attrs` on construction."""
@@ -139,13 +144,46 @@ class SparseVar:
         """Number of variants in the dataset."""
         return self.index.height
 
-    @property
-    def has_dosages(self) -> bool:
-        return (self.path / "dosages.npy").exists()
-
-    def __init__(self, path: str | Path, attrs: IntoExpr | None = None):
+    @overload
+    def __init__(
+        self: "SparseVar[Ragged[V_IDX_TYPE]]",
+        path: str | Path,
+        attrs: IntoExpr | None = None,
+        fields: None = None,
+    ) -> None: ...
+    @overload
+    def __init__(
+        self: "SparseVar[Ragged[np.void]]",
+        path: str | Path,
+        attrs: IntoExpr | None = None,
+        fields: Mapping[str, DTypeLike] = ...,
+    ) -> None: ...
+    def __init__(
+        self,
+        path: str | Path,
+        attrs: IntoExpr | None = None,
+        fields: Mapping[str, DTypeLike] | None = None,
+    ):
         path = Path(path)
         self.path = path
+        if fields is None:
+            fields = {}
+        else:
+            available_fields = [
+                p.stem
+                for p in path.glob("*.npy")
+                if p.stem not in {"variant_idxs", "offsets"}
+            ]
+            if missing := set(fields.keys()) - set(available_fields):
+                raise ValueError(f"Fields {missing} not found in the dataset.")
+            if any(
+                not np.issubdtype(np.dtype(type_), np.number)
+                for type_ in fields.values()
+            ):
+                raise ValueError("Fields must be numeric.")
+            fields = {name: np.dtype(type_) for name, type_ in fields.items()}
+        fields = cast(dict[str, np.dtype[np.number]], fields)
+
         if not self.path.exists():
             raise FileNotFoundError(f"SVAR directory {self.path} does not exist.")
 
@@ -164,14 +202,12 @@ class SparseVar:
         self._s2i.add(samples)
 
         self._c_norm = ContigNormalizer(contigs)
-        self.genos = _open_genos(path, (self.n_samples, self.ploidy, None), "r")
-        if (path / "dosages.npy").exists():
-            dosage_data = np.memmap(path / "dosages.npy", dtype=DOSAGE_TYPE, mode="r")
-            self.dosages = SparseDosages.from_offsets(
-                dosage_data, self.genos.shape, self.genos.offsets
-            )
-        else:
-            self.dosages = None
+        shape = (self.n_samples, self.ploidy, None)
+        self.genos = _open_genos(path, shape, "r")
+        self.fields = {
+            name: _open_fmt(name, type_, path, shape, "r")
+            for name, type_ in fields.items()
+        }
         logger.info("Loading genoray index")
         self.index = self._load_index(attrs)
         self._is_biallelic = (self.index["ALT"].list.len() == 1).all()
@@ -356,7 +392,7 @@ class SparseVar:
         starts: ArrayLike = 0,
         ends: ArrayLike = POS_MAX,
         samples: ArrayLike | None = None,
-    ) -> SparseGenotypes:
+    ) -> _SRT:
         """Read the genotypes for the given ranges.
 
         Parameters
@@ -372,8 +408,12 @@ class SparseVar:
 
         Returns
         -------
-            SparseGenotypes with shape :code:`(ranges, samples, ploidy, ~variants)`. Note that the genotypes will be backed by
-            a memory mapped read-only array of the full file so the only data in memory will be the offsets.
+            When no fields are loaded: ``Ragged[V_IDX_TYPE]`` with shape
+            ``(ranges, samples, ploidy, ~variants)``. When fields are loaded: an awkward
+            record array of the same outer shape where ``result.genos`` is
+            ``Ragged[V_IDX_TYPE]`` and each additional field (e.g. ``result.dosages``) is
+            a ``Ragged`` of its respective dtype. All arrays are backed by memory-mapped
+            data so only the offsets reside in RAM.
         """
         if samples is None:
             samples = np.atleast_1d(np.array(self.available_samples))
@@ -388,11 +428,21 @@ class SparseVar:
 
         # (2 r s p)
         starts_ends = self._find_starts_ends(contig, starts, ends, samples)
-        return SparseGenotypes.from_offsets(
-            self.genos.data,
-            (n_ranges, n_samples, self.ploidy, None),
-            starts_ends.reshape(2, -1),
+        shape = (n_ranges, n_samples, self.ploidy, None)
+        flat_offsets = starts_ends.reshape(2, -1)
+
+        genos_result = Ragged[V_IDX_TYPE].from_offsets(
+            self.genos.data, shape, flat_offsets
         )
+
+        if not self.fields:
+            return genos_result  # type: ignore[return-value]
+
+        field_results = {
+            name: Ragged.from_offsets(field.data, shape, flat_offsets)
+            for name, field in self.fields.items()
+        }
+        return ak.zip({"genos": genos_result, **field_results})  # type: ignore[return-value]
 
     def read_ranges_with_length(
         self,
@@ -400,7 +450,7 @@ class SparseVar:
         starts: ArrayLike = 0,
         ends: ArrayLike = POS_MAX,
         samples: ArrayLike | None = None,
-    ) -> SparseGenotypes:
+    ) -> _SRT:
         """Read the genotypes for the given ranges such that each entry of variants is guaranteed to have
         the minimum amount of variants to reach the query length. This can mean either fewer or more variants
         than would be returned than by :code:`read_ranges`, depending on the presence of indels.
@@ -418,8 +468,7 @@ class SparseVar:
 
         Returns
         -------
-            SparseGenotypes with shape :code:`(ranges, samples, ploidy, ~variants)`. Note that the genotypes will be backed by
-            a memory mapped read-only array of the full file so the only data in memory will be the offsets.
+            Same return structure as :meth:`read_ranges`.
         """
         if samples is None:
             samples = np.atleast_1d(np.array(self.available_samples))
@@ -434,11 +483,70 @@ class SparseVar:
 
         # (2 r s p)
         starts_ends = self._find_starts_ends_with_length(contig, starts, ends, samples)
-        return SparseGenotypes.from_offsets(
-            self.genos.data,
-            (n_ranges, n_samples, self.ploidy, None),
-            starts_ends.reshape(2, -1),
+        shape = (n_ranges, n_samples, self.ploidy, None)
+        flat_offsets = starts_ends.reshape(2, -1)
+
+        genos_result = Ragged[V_IDX_TYPE].from_offsets(
+            self.genos.data, shape, flat_offsets
         )
+
+        if not self.fields:
+            return genos_result  # type: ignore[return-value]
+
+        field_results = {
+            name: Ragged.from_offsets(field.data, shape, flat_offsets)
+            for name, field in self.fields.items()
+        }
+        return ak.zip({"genos": genos_result, **field_results})  # type: ignore[return-value]
+
+    @overload
+    def with_fields(
+        self, fields: Mapping[str, DTypeLike]
+    ) -> "SparseVar[Ragged[np.void]]": ...
+    @overload
+    def with_fields(
+        self, fields: Literal[False]
+    ) -> "SparseVar[Ragged[V_IDX_TYPE]]": ...
+    @overload
+    def with_fields(self, fields: None = None) -> "SparseVar[_SRT]": ...
+    def with_fields(
+        self,
+        fields: Mapping[str, DTypeLike] | Literal[False] | None = None,
+    ) -> "SparseVar":
+        """Return a shallow copy of this ``SparseVar`` with updated fields.
+
+        Parameters
+        ----------
+        fields
+            - ``None``: leave fields unchanged (returns shallow copy).
+            - ``Mapping[str, DTypeLike]``: load these numeric fields from the SVAR directory.
+              Only VCF FORMAT fields with ``Number=G`` are currently supported.
+            - ``False``: drop all fields, returning a ``SparseVar[Ragged[V_IDX_TYPE]]``.
+        """
+        new = copy.copy(self)
+
+        if fields is None:
+            return new
+
+        if fields is False:
+            new.fields = {}
+            return new
+
+        available = {
+            p.stem
+            for p in self.path.glob("*.npy")
+            if p.stem not in {"variant_idxs", "offsets"}
+        }
+        if missing := set(fields) - available:
+            raise ValueError(f"Fields {missing} not found in the dataset.")
+        if any(not np.issubdtype(np.dtype(t), np.number) for t in fields.values()):
+            raise ValueError("Fields must be numeric.")
+        shape = (self.n_samples, self.ploidy, None)
+        new.fields = {
+            name: _open_fmt(name, np.dtype(dtype), self.path, shape, "r")
+            for name, dtype in fields.items()
+        }
+        return new
 
     @classmethod
     def from_vcf(
@@ -580,9 +688,8 @@ class SparseVar:
 
         shutil.copy(pgen._index_path(), cls._index_path(out))
 
-        if with_dosages:
-            if pgen._sei is None:
-                raise ValueError("PGEN must be bi-allelic with filters applied")
+        if with_dosages and pgen._sei is None:
+            raise ValueError("PGEN must be bi-allelic with filters applied")
 
         max_mem = parse_memory(max_mem)
         effective_n_jobs = joblib.cpu_count() if n_jobs == -1 else n_jobs
@@ -973,20 +1080,26 @@ def _open_genos(path: Path, shape: tuple[int | None, ...], mode: Literal["r", "r
     var_idxs = np.memmap(path / "variant_idxs.npy", dtype=V_IDX_TYPE, mode=mode)
     offsets = np.memmap(path / "offsets.npy", dtype=np.int64, mode=mode)
 
-    sp_genos = SparseGenotypes.from_offsets(var_idxs, shape, offsets)
+    sp_genos = Ragged[V_IDX_TYPE].from_offsets(var_idxs, shape, offsets)
     return sp_genos
 
 
-def _open_dosages(path: Path, shape: tuple[int | None, ...], mode: Literal["r", "r+"]):
+def _open_fmt(
+    name: str,
+    type_: RDTYPE | np.dtype[RDTYPE] | type[RDTYPE],
+    path: Path,
+    shape: tuple[int | None, ...],
+    mode: Literal["r", "r+"],
+) -> Ragged[RDTYPE]:
     # Load the memory-mapped files
-    dosages = np.memmap(path / "dosages.npy", dtype=DOSAGE_TYPE, mode=mode)
+    data = np.memmap(path / f"{name}.npy", dtype=type_, mode=mode)
     offsets = np.memmap(path / "offsets.npy", dtype=np.int64, mode=mode)
 
-    sp_genos = SparseDosages.from_offsets(dosages, shape, offsets)
+    sp_genos = Ragged.from_offsets(data, shape, offsets)
     return sp_genos
 
 
-def _write_genos(path: Path, sp_genos: SparseGenotypes):
+def _write_genos(path: Path, sp_genos: Ragged[V_IDX_TYPE]):
     path.mkdir(parents=True, exist_ok=True)
 
     var_idxs = np.memmap(
@@ -1058,11 +1171,9 @@ def _concat_data(
 
     # Pass 1: Compute lengths
     # We explicitly map only the offsets to avoid mapping the potentially large variant_idxs
-    for chunk_dir in chunk_dirs:
+    for c_dir in chunk_dirs:
         # Load offsets
-        chunk_offsets_arr = np.memmap(
-            chunk_dir / "offsets.npy", dtype=np.int64, mode="r"
-        )
+        chunk_offsets_arr = np.memmap(c_dir / "offsets.npy", dtype=np.int64, mode="r")
         # Compute lengths: (n_samples * ploidy,) -> (n_samples, ploidy)
         chunk_lengths = np.diff(chunk_offsets_arr).reshape(shape)
         vars_per_sp += chunk_lengths
@@ -1090,13 +1201,13 @@ def _concat_data(
     pbar.start()
 
     # Pass 2: Copy Genotypes
-    for offset, chunk_dir in pbar.track(
+    for offset, c_dir in pbar.track(
         zip(chunk_offsets, chunk_dirs),
         total=len(chunk_dirs),
         description="Copying genotypes",
     ):
         # We process chunks sequentially to minimize memory usage
-        sp_genos = _open_genos(chunk_dir, (*shape, None), mode="r")
+        sp_genos = _open_genos(c_dir, (*shape, None), mode="r")
 
         _copy_chunk_helper(
             var_idxs_memmap,
@@ -1121,10 +1232,12 @@ def _concat_data(
             out_path / "dosages.npy", dtype=DOSAGE_TYPE, mode="w+", shape=offsets[-1]
         )
 
-        for chunk_dir in pbar.track(
+        for c_dir in pbar.track(
             chunk_dirs, total=len(chunk_dirs), description="Copying dosages"
         ):
-            sp_dosages = _open_dosages(chunk_dir, (*shape, None), mode="r")
+            sp_dosages = _open_fmt(
+                "dosages", DOSAGE_TYPE, c_dir, (*shape, None), mode="r"
+            )
 
             _copy_chunk_dosages_helper(
                 dosages_memmap,
@@ -1162,7 +1275,7 @@ def _copy_chunk_helper(
 
             # Copy and add offset
             for i in range(length):
-                out_data[o_s + i] = in_data[i_s + i] + variant_offset
+                out_data[o_s + i] = in_data[i_s + i] + variant_offset  # type: ignore
 
             write_offsets[sp] += length
 

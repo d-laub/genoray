@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import re
 import warnings
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Generator, Literal, TypeVar, cast, overload
+from typing import Any, Literal, TypeGuard, TypeVar, cast, overload
 
 import cyvcf2
 import numpy as np
@@ -18,7 +19,7 @@ from numpy.typing import ArrayLike, NDArray
 from phantom import Phantom
 from seqpro.rag import OFFSET_TYPE
 from tqdm.auto import tqdm
-from typing_extensions import Self, TypeGuard, assert_never
+from typing_extensions import Self, assert_never
 
 from ._types import POS_MAX, POS_TYPE
 from ._utils import ContigNormalizer, format_memory, hap_ilens, parse_memory
@@ -696,11 +697,11 @@ class VCF:
                 d = v.format(self.dosage_field)
                 if d is None:
                     raise DosageFieldError(
-                        f"Dosage field '{self.dosage_field}' not found for record {repr(v)}"
+                        f"Dosage field '{self.dosage_field}' not found for record {v!r}"
                     )
                 if d.shape[1] > 1:
                     raise MultiallelicDosageError(
-                        f"Multiallelic dosages are not supported, encountered in VCF record {repr(v)}"
+                        f"Multiallelic dosages are not supported, encountered in VCF record {v!r}"
                     )
                 ds_buffer[..., i] = d.squeeze(1)[self._s_sorter]
 
@@ -1188,11 +1189,11 @@ class VCF:
                 d = v.format(dosage_field)
                 if d is None:
                     raise DosageFieldError(
-                        f"Dosage field '{dosage_field}' not found for record {repr(v)}"
+                        f"Dosage field '{dosage_field}' not found for record {v!r}"
                     )
                 if d.shape[1] > 1:
                     raise MultiallelicDosageError(
-                        f"Multiallelic dosages are not supported, encountered in VCF record {repr(v)}"
+                        f"Multiallelic dosages are not supported, encountered in VCF record {v!r}"
                     )
 
                 out_ls.append(d.squeeze(1))
@@ -1224,11 +1225,11 @@ class VCF:
             d = v.format(dosage_field)
             if d is None:
                 raise DosageFieldError(
-                    f"Dosage field '{dosage_field}' not found for record {repr(v)}"
+                    f"Dosage field '{dosage_field}' not found for record {v!r}"
                 )
             if d.shape[1] > 1:
                 raise MultiallelicDosageError(
-                    f"Multiallelic dosages are not supported, encountered in VCF record {repr(v)}"
+                    f"Multiallelic dosages are not supported, encountered in VCF record {v!r}"
                 )
             out[..., i] = d.squeeze(1)[self._s_sorter]
 
@@ -1268,11 +1269,11 @@ class VCF:
                 d = v.format(dosage_field)
                 if d is None:
                     raise DosageFieldError(
-                        f"Dosage field '{dosage_field}' not found for record {repr(v)}"
+                        f"Dosage field '{dosage_field}' not found for record {v!r}"
                     )
                 if d.shape[1] > 1:
                     raise MultiallelicDosageError(
-                        f"Multiallelic dosages are not supported, encountered in VCF record {repr(v)}"
+                        f"Multiallelic dosages are not supported, encountered in VCF record {v!r}"
                     )
 
                 dosage_ls.append(d.squeeze(1))
@@ -1318,11 +1319,11 @@ class VCF:
             d = v.format(dosage_field)
             if d is None:
                 raise DosageFieldError(
-                    f"Dosage field '{dosage_field}' not found for record {repr(v)}"
+                    f"Dosage field '{dosage_field}' not found for record {v!r}"
                 )
             if d.shape[1] > 1:
                 raise MultiallelicDosageError(
-                    f"Multiallelic dosages are not supported, encountered in VCF record {repr(v)}"
+                    f"Multiallelic dosages are not supported, encountered in VCF record {v!r}"
                 )
             out[1][..., i] = d.squeeze(1)[self._s_sorter]
 
@@ -1449,7 +1450,7 @@ class VCF:
                 dosages = v.format(dosage_field)
                 if dosages is None:
                     raise DosageFieldError(
-                        f"Dosage field '{dosage_field}' not found for record {repr(v)}"
+                        f"Dosage field '{dosage_field}' not found for record {v!r}"
                     )
                 # (s, 1, 1) or (s, 1)? -> (s)
                 dosages = dosages.squeeze(1)[self._s_sorter, None]

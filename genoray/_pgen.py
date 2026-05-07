@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from collections.abc import Callable, Generator
 from functools import partial
 from io import TextIOWrapper
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Callable, Generator, TypeVar, cast
+from typing import Any, TypeGuard, TypeVar, cast
 
 import numpy as np
 import pgenlib
@@ -15,7 +16,7 @@ from more_itertools import mark_ends, windowed
 from numpy.typing import ArrayLike, NDArray
 from phantom import Phantom
 from seqpro.rag import OFFSET_TYPE
-from typing_extensions import Self, TypeGuard, assert_never
+from typing_extensions import Self, assert_never
 from zstandard import ZstdDecompressor
 
 from ._types import POS_MAX, POS_TYPE
@@ -904,10 +905,7 @@ class PGEN:
             mem += self.n_samples * self.ploidy * mode._dtype().itemsize
         elif issubclass(mode, Dosages):
             mem += self.n_samples * mode._dtype().itemsize
-        elif issubclass(mode, GenosPhasing):
-            mem += self.n_samples * self.ploidy * mode._dtypes[0]().itemsize
-            mem += self.n_samples * mode._dtypes[1]().itemsize
-        elif issubclass(mode, GenosDosages):
+        elif issubclass(mode, GenosPhasing) or issubclass(mode, GenosDosages):
             mem += self.n_samples * self.ploidy * mode._dtypes[0]().itemsize
             mem += self.n_samples * mode._dtypes[1]().itemsize
         elif issubclass(mode, GenosPhasingDosages):

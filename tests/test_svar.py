@@ -9,7 +9,8 @@ from pytest_cases import parametrize_with_cases
 from seqpro.rag import OFFSET_TYPE, lengths_to_offsets
 
 from genoray import SparseVar
-from genoray._svar import DOSAGE_TYPE, V_IDX_TYPE, SparseDosages, SparseGenotypes
+from genoray._svar import DOSAGE_TYPE, V_IDX_TYPE
+from seqpro.rag import Ragged
 
 ddir = Path(__file__).parent / "data"
 
@@ -25,21 +26,23 @@ afs = counts / (N_SAMPLES * PLOIDY)
 
 def get_missing_contig_desired(
     svar: SparseVar, n_ranges: int, n_samples: int
-) -> SparseGenotypes:
+) -> Ragged[V_IDX_TYPE]:
     # (r s p 2)
     offsets = np.full((2, n_ranges, n_samples, svar.ploidy), -1, OFFSET_TYPE)
-    return SparseGenotypes.from_offsets(
+    return Ragged[V_IDX_TYPE].from_offsets(
         svar.genos.data, (n_ranges, n_samples, svar.ploidy), offsets.reshape(2, -1)
     )
 
 
 def svar_vcf():
-    svar = SparseVar(ddir / "biallelic.vcf.svar", "AF")
+    svar = SparseVar(ddir / "biallelic.vcf.svar", "AF", fields={"dosages": DOSAGE_TYPE})
     return svar
 
 
 def svar_pgen():
-    svar = SparseVar(ddir / "biallelic.pgen.svar", "AF")
+    svar = SparseVar(
+        ddir / "biallelic.pgen.svar", "AF", fields={"dosages": DOSAGE_TYPE}
+    )
     return svar
 
 
@@ -53,8 +56,8 @@ def svar():
 def test_contents(svar: SparseVar):
     # (s p)
     lengths = LENGTHS
-    desired_genos = SparseGenotypes.from_lengths(DATA, lengths)
-    desired_ccfs = SparseDosages.from_lengths(DOSAGES, lengths)
+    desired_genos = Ragged[V_IDX_TYPE].from_lengths(DATA, lengths)
+    desired_dosages = Ragged[DOSAGE_TYPE].from_lengths(DOSAGES, lengths)
 
     if svar.path.suffixes[0] == ".vcf":
         assert svar.contigs == ["chr1", "chr2", "chr3"]
@@ -65,10 +68,11 @@ def test_contents(svar: SparseVar):
     np.testing.assert_equal(svar.genos.data, desired_genos.data)
     np.testing.assert_equal(svar.genos.offsets, desired_genos.offsets)
 
-    assert svar.dosages is not None
-    assert svar.dosages.shape == desired_genos.shape
-    np.testing.assert_allclose(svar.dosages.data, desired_ccfs.data, atol=5e-5)
-    np.testing.assert_equal(svar.dosages.offsets, desired_ccfs.offsets)
+    dosages = svar.fields.get("dosages")
+    assert dosages is not None
+    assert dosages.shape == desired_genos.shape
+    np.testing.assert_allclose(dosages.data, desired_dosages.data, atol=5e-5)
+    np.testing.assert_equal(dosages.offsets, desired_dosages.offsets)
 
 
 def case_all():
@@ -78,7 +82,7 @@ def case_all():
     # (s p)
     shape = (1, N_SAMPLES, PLOIDY, None)
     offsets = np.array([[0, 2, 4, 6], [1, 3, 5, 8]], dtype=OFFSET_TYPE)
-    desired = SparseGenotypes.from_offsets(DATA, shape, offsets)
+    desired = Ragged[V_IDX_TYPE].from_offsets(DATA, shape, offsets)
     return cse, var_ranges, desired
 
 
@@ -89,7 +93,7 @@ def case_spanning_del():
     shape = (1, N_SAMPLES, PLOIDY, None)
     # (s p)
     offsets = np.array([[0, 2, 4, 6], [0, 3, 5, 7]], dtype=OFFSET_TYPE)
-    desired = SparseGenotypes.from_offsets(DATA, shape, offsets)
+    desired = Ragged[V_IDX_TYPE].from_offsets(DATA, shape, offsets)
     return cse, var_ranges, desired
 
 
@@ -100,7 +104,7 @@ def case_missing_contig():
     shape = (1, N_SAMPLES, PLOIDY, None)
     # (r s p 2)
     offsets = np.full((2, N_SAMPLES, PLOIDY, 1), -1, OFFSET_TYPE)
-    desired = SparseGenotypes.from_offsets(DATA, shape, offsets.reshape(2, -1))
+    desired = Ragged[V_IDX_TYPE].from_offsets(DATA, shape, offsets.reshape(2, -1))
     return cse, var_ranges, desired
 
 
@@ -111,7 +115,7 @@ def case_no_vars():
     shape = (1, N_SAMPLES, PLOIDY, None)
     # (2 r s p)
     offsets = np.full((2, N_SAMPLES, PLOIDY, 1), np.iinfo(OFFSET_TYPE).max, OFFSET_TYPE)
-    desired = SparseGenotypes.from_offsets(DATA, shape, offsets.reshape(2, -1))
+    desired = Ragged[V_IDX_TYPE].from_offsets(DATA, shape, offsets.reshape(2, -1))
     return cse, var_ranges, desired
 
 
@@ -120,7 +124,7 @@ def test_var_ranges(
     svar: SparseVar,
     cse: tuple[str, int, int],
     var_ranges: NDArray[V_IDX_TYPE],
-    desired: SparseGenotypes | None,
+    desired: Ragged[V_IDX_TYPE] | None,
 ):
     actual = svar.var_ranges(*cse)
 
@@ -132,7 +136,7 @@ def test_read_ranges(
     svar: SparseVar,
     cse: tuple[str, int, int],
     var_ranges: NDArray[V_IDX_TYPE],
-    desired: SparseGenotypes | None,
+    desired: Ragged[V_IDX_TYPE] | None,
 ):
     actual = svar.read_ranges(*cse)
 
@@ -149,7 +153,7 @@ def test_read_ranges_sample_subset(
     svar: SparseVar,
     cse: tuple[str, int, int],
     var_ranges: NDArray[V_IDX_TYPE],
-    desired: SparseGenotypes | None,
+    desired: Ragged[V_IDX_TYPE] | None,
 ):
     sample = "sample2"
     s_idx = svar.available_samples.index(sample)
@@ -170,7 +174,7 @@ def length_no_ext():
     shape = (1, 2, 2, None)
     # (s p)
     offsets = np.array([[0, 3, 5, 8], [1, 3, 5, 8]], OFFSET_TYPE)
-    desired = SparseGenotypes.from_offsets(DATA, shape, offsets)
+    desired = Ragged[V_IDX_TYPE].from_offsets(DATA, shape, offsets)
     return cse, desired
 
 
@@ -179,13 +183,13 @@ def length_ext():
     shape = (1, N_SAMPLES, PLOIDY, None)
     # (s p)
     offsets = np.array([[0, 2, 4, 6], [0, 3, 5, 8]], OFFSET_TYPE)
-    desired = SparseGenotypes.from_offsets(DATA, shape, offsets)
+    desired = Ragged[V_IDX_TYPE].from_offsets(DATA, shape, offsets)
     return cse, desired
 
 
 @parametrize_with_cases("cse, desired", cases=".", prefix="length_")
 def test_read_ranges_with_length(
-    svar: SparseVar, cse: tuple[str, int, int], desired: SparseGenotypes
+    svar: SparseVar, cse: tuple[str, int, int], desired: Ragged[V_IDX_TYPE]
 ):
     actual = svar.read_ranges_with_length(*cse)
 
@@ -201,3 +205,31 @@ def test_compute_afs(svar: SparseVar):
 
 def test_cache_afs(svar: SparseVar):
     np.testing.assert_equal(svar.index["AF"], afs)
+
+
+def test_with_fields_adds_fields(svar: SparseVar):
+    svar_with = svar.with_fields({"dosages": np.float32})
+    plain = svar.read_ranges("chr1", 81261, 81265)
+    result = svar_with.read_ranges("chr1", 81261, 81265)
+    # record exposes .genos and .dosages with matching outer shape
+    assert result.genos.shape == plain.shape
+    assert result.dosages.shape == plain.shape
+    assert result.dosages.data.dtype == np.float32
+    # genos data values are a subset of the full genos memmap
+    assert set(result.genos.data.tolist()).issubset(set(svar.genos.data.tolist()))
+
+
+def test_with_fields_none_is_identity(svar: SparseVar):
+    shallow = svar.with_fields(None)
+    assert shallow.fields == svar.fields
+    assert shallow.genos is svar.genos
+
+
+def test_with_fields_false_drops_fields():
+    svar_with = SparseVar(ddir / "biallelic.vcf.svar", fields={"dosages": np.float32})
+    svar_no_fields = svar_with.with_fields(False)
+    assert svar_no_fields.fields == {}
+    plain = svar_no_fields.read_ranges("chr1", 81261, 81265)
+    with_genos = svar_with.read_ranges("chr1", 81261, 81265).genos
+    # both should have the same outer shape
+    assert plain.shape == with_genos.shape
