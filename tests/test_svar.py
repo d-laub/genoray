@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import pytest
 from numpy.typing import NDArray
 from pytest import fixture
 from pytest_cases import parametrize_with_cases
@@ -233,3 +234,25 @@ def test_with_fields_false_drops_fields():
     with_genos = svar_with.read_ranges("chr1", 81261, 81265).genos
     # both should have the same outer shape
     assert plain.shape == with_genos.shape
+
+
+def test_fields_missing_raises():
+    with pytest.raises(ValueError, match="not found"):
+        SparseVar(ddir / "biallelic.vcf.svar", fields={"nonexistent": np.float32})
+
+
+def test_with_fields_missing_raises():
+    svar = SparseVar(ddir / "biallelic.vcf.svar")
+    with pytest.raises(ValueError, match="not found"):
+        svar.with_fields({"nonexistent": np.float32})
+
+
+def test_fields_non_numeric_raises():
+    with pytest.raises(ValueError, match="numeric"):
+        SparseVar(ddir / "biallelic.vcf.svar", fields={"dosages": np.str_})
+
+
+def test_with_fields_non_numeric_raises():
+    svar = SparseVar(ddir / "biallelic.vcf.svar")
+    with pytest.raises(ValueError, match="numeric"):
+        svar.with_fields({"dosages": np.str_})
