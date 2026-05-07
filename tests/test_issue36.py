@@ -12,37 +12,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pooch
-import pytest
-
 from genoray import VCF
 
-VCF_URL = "https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/data_collections/1000G_2504_high_coverage/working/20220422_3202_phased_SNV_INDEL_SV/1kGP_high_coverage_Illumina.chr22.filtered.SNV_INDEL_SV_phased_panel.vcf.gz"
-TBI_URL = VCF_URL + ".tbi"
-VCF_HASH = "md5:a2653cc7a1c8d03a96ca4f14d0fabdd2"
-
-CACHE = Path(__file__).parent / "data" / "issue36_cache"
+ddir = Path(__file__).parent / "data"
 
 
-pytestmark = pytest.mark.network
-
-
-@pytest.fixture(scope="session")
-def vcf_1kgp() -> VCF:
-    CACHE.mkdir(parents=True, exist_ok=True)
-    vcf_path = Path(
-        pooch.retrieve(
-            url=VCF_URL, known_hash=VCF_HASH, path=CACHE, fname="chr22.vcf.gz"
-        )
-    )
-    pooch.retrieve(url=TBI_URL, known_hash=None, path=CACHE, fname="chr22.vcf.gz.tbi")
-    vcf = VCF(vcf_path)
-    vcf._write_gvi_index()
-    vcf._load_index()
-    return vcf
-
-
-def test_chunk_with_length_empty_region_misalignment(vcf_1kgp: VCF):
+def test_chunk_with_length_empty_region_misalignment():
     """Two regions: first has 0 variants, second has >0 variants.
 
     Before fix: var_counts returns [count_region1] (length 1 not 2).
@@ -52,13 +27,21 @@ def test_chunk_with_length_empty_region_misalignment(vcf_1kgp: VCF):
     After fix: var_counts returns [0, count_region1]; region 0 is
     correctly skipped; region 1 reads normally.
 
-    Region [17165208, 17165244) is 36 bp on chr22 — very likely 0 variants.
-    Region [17181485, 17181576) is 91 bp — likely has variants.
+    biallelic.vcf.gz has variants on chr1 at 81262 and 81265.
+    Region [1, 100) on chr1 is empty; region [81260, 81270) has variants.
     """
-    contig = "chr22"
-    starts = [17165208, 17181485]
-    ends = [17165244, 17181576]
+    vcf = VCF(ddir / "biallelic.vcf.gz")
+    contig = "chr1"
+    starts = [1, 81260]
+    ends = [100, 81270]
 
-    for region_chunks in vcf_1kgp._chunk_ranges_with_length(contig, starts, ends):
-        for _chunk, _end, _n_ext in region_chunks:
-            pass
+    results = [
+        list(region_chunks)
+        for region_chunks in vcf._chunk_ranges_with_length(contig, starts, ends)
+    ]
+    # Empty region: one chunk with 0 variants (not a ValueError)
+    assert len(results[0]) == 1
+    assert results[0][0][0].shape[-1] == 0, "empty region chunk should have 0 variants"
+    # Populated region: chunk with actual variants
+    assert len(results[1]) >= 1
+    assert results[1][0][0].shape[-1] > 0, "populated region chunk should have variants"
