@@ -1,3 +1,10 @@
+## 2.3.0 (2026-05-08)
+
+### Feat
+
+- bump seqpro to 0.11, add available_fields attr, simplify fields/attrs API
+- add arbitrary field loading to SparseVar
+
 ## 2.2.3 (2026-04-22)
 
 ### Fix
