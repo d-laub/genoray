@@ -36,14 +36,12 @@ def get_missing_contig_desired(
 
 
 def svar_vcf():
-    svar = SparseVar(ddir / "biallelic.vcf.svar", "AF", fields={"dosages": DOSAGE_TYPE})
+    svar = SparseVar(ddir / "biallelic.vcf.svar", "AF", fields=["dosages"])
     return svar
 
 
 def svar_pgen():
-    svar = SparseVar(
-        ddir / "biallelic.pgen.svar", "AF", fields={"dosages": DOSAGE_TYPE}
-    )
+    svar = SparseVar(ddir / "biallelic.pgen.svar", "AF", fields=["dosages"])
     return svar
 
 
@@ -199,6 +197,23 @@ def test_read_ranges_with_length(
     np.testing.assert_equal(actual.offsets, desired.offsets)
 
 
+def test_attrs_numeric_in_index():
+    svar = SparseVar(ddir / "biallelic.vcf.svar", attrs="AF")
+    assert "AF" in svar.index.columns
+    assert svar.index["AF"].dtype.is_numeric()
+    np.testing.assert_allclose(svar.index["AF"].to_numpy(), afs, atol=1e-6)
+
+
+def test_attrs_non_numeric_raises():
+    with pytest.raises(ValueError, match="numeric"):
+        SparseVar(ddir / "biallelic.vcf.svar", attrs="REF")
+
+
+def test_attrs_not_in_index_without_request():
+    svar = SparseVar(ddir / "biallelic.vcf.svar")
+    assert "AF" not in svar.index.columns
+
+
 def test_compute_afs(svar: SparseVar):
     actual_afs = svar._compute_afs()
     np.testing.assert_equal(actual_afs, afs)
@@ -209,7 +224,7 @@ def test_cache_afs(svar: SparseVar):
 
 
 def test_with_fields_adds_fields(svar: SparseVar):
-    svar_with = svar.with_fields({"dosages": np.float32})
+    svar_with = svar.with_fields(["dosages"])
     plain = svar.read_ranges("chr1", 81261, 81265)
     result = svar_with.read_ranges("chr1", 81261, 81265)
     # record exposes .genos and .dosages with matching outer shape
@@ -227,7 +242,7 @@ def test_with_fields_none_is_identity(svar: SparseVar):
 
 
 def test_with_fields_false_drops_fields():
-    svar_with = SparseVar(ddir / "biallelic.vcf.svar", fields={"dosages": np.float32})
+    svar_with = SparseVar(ddir / "biallelic.vcf.svar", fields=["dosages"])
     svar_no_fields = svar_with.with_fields(False)
     assert svar_no_fields.fields == {}
     plain = svar_no_fields.read_ranges("chr1", 81261, 81265)
@@ -238,21 +253,15 @@ def test_with_fields_false_drops_fields():
 
 def test_fields_missing_raises():
     with pytest.raises(ValueError, match="not found"):
-        SparseVar(ddir / "biallelic.vcf.svar", fields={"nonexistent": np.float32})
+        SparseVar(ddir / "biallelic.vcf.svar", fields=["nonexistent"])
 
 
 def test_with_fields_missing_raises():
     svar = SparseVar(ddir / "biallelic.vcf.svar")
     with pytest.raises(ValueError, match="not found"):
-        svar.with_fields({"nonexistent": np.float32})
+        svar.with_fields(["nonexistent"])
 
 
-def test_fields_non_numeric_raises():
-    with pytest.raises(ValueError, match="numeric"):
-        SparseVar(ddir / "biallelic.vcf.svar", fields={"dosages": np.str_})
-
-
-def test_with_fields_non_numeric_raises():
-    svar = SparseVar(ddir / "biallelic.vcf.svar")
-    with pytest.raises(ValueError, match="numeric"):
-        svar.with_fields({"dosages": np.str_})
+def test_available_fields(svar: SparseVar):
+    assert "dosages" in svar.available_fields
+    assert svar.available_fields["dosages"] == np.dtype(DOSAGE_TYPE)

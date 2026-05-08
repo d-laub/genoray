@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 import shutil
 import warnings
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Sequence
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Generic, Literal, TypeVar, cast, overload
@@ -20,12 +20,12 @@ from awkward.contents import Content, NumpyArray
 from hirola import HashTable
 from joblib_progress import joblib_progress
 from loguru import logger
-from numpy.typing import ArrayLike, DTypeLike, NDArray
+from numpy.typing import ArrayLike, NDArray
 from pgenlib import PgenReader
 from polars._typing import IntoExpr
 from pydantic import BaseModel
 from rich.progress import MofNCompleteColumn, Progress
-from seqpro.rag import OFFSET_TYPE, RDTYPE, Ragged, lengths_to_offsets
+from seqpro.rag import OFFSET_TYPE, Ragged, lengths_to_offsets
 from tqdm.auto import tqdm
 
 from ._pgen import PGEN
@@ -34,6 +34,8 @@ from ._utils import ContigNormalizer, format_memory, parse_memory
 from ._var_ranges import var_ranges
 from ._vcf import VCF
 from .exprs import ILEN
+
+NUMERIC = TypeVar("NUMERIC", bound=np.number)
 
 
 @overload
@@ -98,6 +100,7 @@ class SparseVarMetadata(BaseModel):
     samples: list[str]
     ploidy: int
     contigs: list[str]
+    fields: dict[str, str] = {}  # field_name -> numpy dtype name (e.g. "float32")
 
 
 _SRT = TypeVar("_SRT")
@@ -113,8 +116,8 @@ class SparseVar(Generic[_SRT]):
     attrs
         Expression of attributes to load in addition to the ALT and ILEN columns.
     fields
-        Mapping of field names to dtypes to load from the SVAR directory. Only numeric
-        dtypes are supported. Only VCF FORMAT fields with ``Number=G`` are currently
+        Names of fields to load from the SVAR directory. Must be keys of
+        :attr:`available_fields`. Only VCF FORMAT fields with ``Number=G`` are currently
         supported as custom fields.
     """
 
@@ -125,7 +128,8 @@ class SparseVar(Generic[_SRT]):
     contigs: list[str]
     """Contigs in the order they appear in the dataset. Variants are only sorted within each contig."""
     genos: Ragged[V_IDX_TYPE]
-    fields: dict[str, Ragged]
+    available_fields: dict[str, np.dtype[np.number]]
+    fields: dict[str, Ragged[np.number]]
     index: pl.DataFrame
     """Table of variants with columns: `CHROM`, `POS`, `REF`, `ALT`, `ILEN`, and any additional
     attributes specified in `attrs` on construction."""
@@ -146,43 +150,26 @@ class SparseVar(Generic[_SRT]):
 
     @overload
     def __init__(
-        self: "SparseVar[Ragged[V_IDX_TYPE]]",
+        self: SparseVar[Ragged[V_IDX_TYPE]],
         path: str | Path,
         attrs: IntoExpr | None = None,
         fields: None = None,
     ) -> None: ...
     @overload
     def __init__(
-        self: "SparseVar[Ragged[np.void]]",
+        self: SparseVar[Ragged[np.void]],
         path: str | Path,
         attrs: IntoExpr | None = None,
-        fields: Mapping[str, DTypeLike] = ...,
+        fields: Sequence[str] = ...,
     ) -> None: ...
     def __init__(
         self,
         path: str | Path,
         attrs: IntoExpr | None = None,
-        fields: Mapping[str, DTypeLike] | None = None,
+        fields: Sequence[str] | None = None,
     ):
         path = Path(path)
         self.path = path
-        if fields is None:
-            fields = {}
-        else:
-            available_fields = [
-                p.stem
-                for p in path.glob("*.npy")
-                if p.stem not in {"variant_idxs", "offsets"}
-            ]
-            if missing := set(fields.keys()) - set(available_fields):
-                raise ValueError(f"Fields {missing} not found in the dataset.")
-            if any(
-                not np.issubdtype(np.dtype(type_), np.number)
-                for type_ in fields.values()
-            ):
-                raise ValueError("Fields must be numeric.")
-            fields = {name: np.dtype(type_) for name, type_ in fields.items()}
-        fields = cast(dict[str, np.dtype[np.number]], fields)
 
         if not self.path.exists():
             raise FileNotFoundError(f"SVAR directory {self.path} does not exist.")
@@ -194,6 +181,13 @@ class SparseVar(Generic[_SRT]):
         self.contigs = contigs
         self.available_samples = metadata.samples
         self.ploidy = metadata.ploidy
+        self.available_fields = {
+            name: np.dtype(dtype_str) for name, dtype_str in metadata.fields.items()
+        }
+
+        if fields is not None and (missing := set(fields) - set(self.available_fields)):
+            raise ValueError(f"Fields {missing} not found in the dataset.")
+
         samples = np.array(self.available_samples)
         self._s2i = HashTable(
             len(samples) * 2,  # type: ignore
@@ -205,8 +199,8 @@ class SparseVar(Generic[_SRT]):
         shape = (self.n_samples, self.ploidy, None)
         self.genos = _open_genos(path, shape, "r")
         self.fields = {
-            name: _open_fmt(name, type_, path, shape, "r")
-            for name, type_ in fields.items()
+            name: _open_fmt(name, self.available_fields[name], path, shape, "r")
+            for name in (fields or [])
         }
         logger.info("Loading genoray index")
         self.index = self._load_index(attrs)
@@ -500,27 +494,23 @@ class SparseVar(Generic[_SRT]):
         return ak.zip({"genos": genos_result, **field_results})  # type: ignore[return-value]
 
     @overload
-    def with_fields(
-        self, fields: Mapping[str, DTypeLike]
-    ) -> "SparseVar[Ragged[np.void]]": ...
+    def with_fields(self, fields: Sequence[str]) -> SparseVar[Ragged[np.void]]: ...
     @overload
-    def with_fields(
-        self, fields: Literal[False]
-    ) -> "SparseVar[Ragged[V_IDX_TYPE]]": ...
+    def with_fields(self, fields: Literal[False]) -> SparseVar[Ragged[V_IDX_TYPE]]: ...
     @overload
-    def with_fields(self, fields: None = None) -> "SparseVar[_SRT]": ...
+    def with_fields(self, fields: None = None) -> SparseVar[_SRT]: ...
     def with_fields(
         self,
-        fields: Mapping[str, DTypeLike] | Literal[False] | None = None,
-    ) -> "SparseVar":
+        fields: Sequence[str] | Literal[False] | None = None,
+    ) -> SparseVar:
         """Return a shallow copy of this ``SparseVar`` with updated fields.
 
         Parameters
         ----------
         fields
             - ``None``: leave fields unchanged (returns shallow copy).
-            - ``Mapping[str, DTypeLike]``: load these numeric fields from the SVAR directory.
-              Only VCF FORMAT fields with ``Number=G`` are currently supported.
+            - ``Sequence[str]``: names of fields to load from the SVAR directory.
+              Must be keys of :attr:`available_fields`.
             - ``False``: drop all fields, returning a ``SparseVar[Ragged[V_IDX_TYPE]]``.
         """
         new = copy.copy(self)
@@ -532,19 +522,12 @@ class SparseVar(Generic[_SRT]):
             new.fields = {}
             return new
 
-        available = {
-            p.stem
-            for p in self.path.glob("*.npy")
-            if p.stem not in {"variant_idxs", "offsets"}
-        }
-        if missing := set(fields) - available:
+        if missing := set(fields) - set(self.available_fields):
             raise ValueError(f"Fields {missing} not found in the dataset.")
-        if any(not np.issubdtype(np.dtype(t), np.number) for t in fields.values()):
-            raise ValueError("Fields must be numeric.")
         shape = (self.n_samples, self.ploidy, None)
         new.fields = {
-            name: _open_fmt(name, np.dtype(dtype), self.path, shape, "r")
-            for name, dtype in fields.items()
+            name: _open_fmt(name, self.available_fields[name], self.path, shape, "r")
+            for name in fields
         }
         return new
 
@@ -598,6 +581,7 @@ class SparseVar(Generic[_SRT]):
                 contigs=contigs,
                 samples=vcf.available_samples,
                 ploidy=vcf.ploidy,
+                fields={"dosages": np.dtype(DOSAGE_TYPE).name} if with_dosages else {},
             ).model_dump_json()
             f.write(json)
 
@@ -683,6 +667,7 @@ class SparseVar(Generic[_SRT]):
                 contigs=contigs,
                 samples=pgen.available_samples,
                 ploidy=pgen.ploidy,
+                fields={"dosages": np.dtype(DOSAGE_TYPE).name} if with_dosages else {},
             ).model_dump_json()
             f.write(json)
 
@@ -771,6 +756,11 @@ class SparseVar(Generic[_SRT]):
             else:
                 _attrs.add(attrs)
             _attrs.discard("ILEN")
+            user_attr_names = [a for a in _attrs - {"ALT"} if isinstance(a, str)]
+            if non_numeric := [
+                a for a in user_attr_names if not schema[a].is_numeric()
+            ]:
+                raise ValueError(f"Attrs {non_numeric} must be numeric.")
 
         attrs = list(_attrs)
 
@@ -1086,11 +1076,11 @@ def _open_genos(path: Path, shape: tuple[int | None, ...], mode: Literal["r", "r
 
 def _open_fmt(
     name: str,
-    type_: RDTYPE | np.dtype[RDTYPE] | type[RDTYPE],
+    type_: NUMERIC | np.dtype[NUMERIC] | type[NUMERIC],
     path: Path,
     shape: tuple[int | None, ...],
     mode: Literal["r", "r+"],
-) -> Ragged[RDTYPE]:
+) -> Ragged[NUMERIC]:
     # Load the memory-mapped files
     data = np.memmap(path / f"{name}.npy", dtype=type_, mode=mode)
     offsets = np.memmap(path / "offsets.npy", dtype=np.int64, mode=mode)
