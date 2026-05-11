@@ -1,3 +1,9 @@
+## 2.3.1 (2026-05-11)
+
+### Fix
+
+- VCF set_samples now returns genotypes in requested sample order
+
 ## 2.3.0 (2026-05-08)
 
 ### Feat
