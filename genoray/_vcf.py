@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Literal, TypeGuard, TypeVar, cast, overload
 
 import cyvcf2
+from hirola import HashTable
 import numpy as np
 import oxbow
 import polars as pl
@@ -294,6 +295,9 @@ class VCF:
         self.available_samples = vcf.samples
         self.contigs = natsorted(vcf.seqnames)
         self._c_norm = ContigNormalizer(vcf.seqnames)
+        avail = np.asarray(self.available_samples)
+        self._s2i = HashTable(max=len(avail) * 2, dtype=avail.dtype)
+        self._s2i.add(avail)
 
         self.set_samples(None)
 
@@ -360,9 +364,8 @@ class VCF:
             )
 
         vcf = self._open()
-        _, s_idx, _ = np.intersect1d(vcf.samples, samples, return_indices=True)
         self._samples = samples
-        self._s_sorter = np.argsort(s_idx)
+        self._s_sorter = self._s2i.get(np.asarray(samples))
         self._vcf = vcf
         return self
 

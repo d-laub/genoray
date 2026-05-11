@@ -158,15 +158,13 @@ def test_set_samples(
     if samples is None:
         samples = vcf.available_samples
         s_idx = slice(None)
-        s_sorter = slice(None)
     else:
         samples = np.atleast_1d(samples)
-        s_idx = np.intersect1d(vcf.available_samples, samples, return_indices=True)[1]
-        s_sorter = np.argsort(s_idx)
+        s_idx = vcf._s2i.get(np.asarray(samples))
 
     assert vcf.current_samples == samples
     assert vcf.n_samples == len(samples)
-    np.testing.assert_equal(vcf._s_sorter, s_sorter)
+    np.testing.assert_equal(vcf._s_sorter, s_idx)
 
     vcf.phasing = True
     gpd = vcf.read(*cse, VCF.Genos16Dosages)
@@ -180,6 +178,27 @@ def test_set_samples(
         np.testing.assert_equal(g, genos[s_idx])
         np.testing.assert_equal(p, phasing[s_idx])
         np.testing.assert_equal(d, dosages[s_idx])
+
+
+def test_sample_reorder(vcf: VCF):
+    # available_samples = ["sample1", "sample2"]
+    # sample1: genos [[0,-1],[1,-1]], dosages [1.0, nan]
+    # sample2: genos [[1, 0],[1, 1]], dosages [2.0, 1.0]
+    cse = "chr1", 81261, 81263
+    vcf.set_samples(["sample2", "sample1"])
+    vcf.phasing = True
+
+    gp, d = vcf.read(*cse, VCF.Genos8Dosages)
+    g, p = np.array_split(gp, 2, 1)
+    p = p.squeeze(1).astype(bool)
+
+    assert vcf.current_samples == ["sample2", "sample1"]
+    # row 0 must be sample2, row 1 must be sample1
+    np.testing.assert_equal(
+        g, np.array([[[1, 0], [1, 1]], [[0, -1], [1, -1]]], np.int8)
+    )
+    np.testing.assert_equal(p, np.array([[1, 0], [1, 0]], np.bool_))
+    np.testing.assert_equal(d, np.array([[2.0, 1.0], [1.0, np.nan]], np.float32))
 
 
 def length_no_ext():

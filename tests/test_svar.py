@@ -168,6 +168,16 @@ def test_read_ranges_sample_subset(
     np.testing.assert_equal(actual.offsets, desired.offsets)
 
 
+def test_read_ranges_sample_reorder(svar: SparseVar):
+    cse = "chr1", 81261, 81265
+    actual = svar.read_ranges(*cse, samples=["sample2", "sample1"])
+    desired = svar.read_ranges(*cse)[:, [1, 0]]
+
+    assert actual.shape == desired.shape
+    np.testing.assert_equal(actual.data, desired.data)
+    np.testing.assert_equal(actual.offsets, desired.offsets)
+
+
 def length_no_ext():
     cse = "chr1", 81264, 81265
     shape = (1, 2, 2, None)
