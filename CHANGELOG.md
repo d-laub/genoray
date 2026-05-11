@@ -1,3 +1,14 @@
+## 2.3.1 (2026-05-11)
+
+### Fix
+
+- `VCF.set_samples`: use the correct permutation when reordering cyvcf2's
+  per-variant genotype array. The previous implementation applied
+  `np.argsort(s_idx)` — the inverse of the permutation needed — which
+  silently desynced sample names from their genotypes whenever the input
+  VCF column order wasn't already alphabetical. Surfaced via
+  [mcvickerlab/GenVarLoader#159](https://github.com/mcvickerlab/GenVarLoader/issues/159).
+
 ## 2.3.0 (2026-05-08)
 
 ### Feat

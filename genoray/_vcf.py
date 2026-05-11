@@ -360,9 +360,18 @@ class VCF:
             )
 
         vcf = self._open()
-        _, s_idx, _ = np.intersect1d(vcf.samples, samples, return_indices=True)
+        _, vcf_idx, samples_idx = np.intersect1d(
+            vcf.samples, samples, return_indices=True
+        )
         self._samples = samples
-        self._s_sorter = np.argsort(s_idx)
+        # ``vcf_idx`` lists VCF-file positions in sorted-common order. Reorder
+        # to the caller's ``samples`` order so that
+        # ``v.genotype.array()[self._s_sorter]`` returns rows in the order the
+        # caller asked for. Previously this used ``np.argsort(s_idx)``, which
+        # is the *inverse* permutation — correct only when ``samples`` was
+        # already in the VCF's column order, silently wrong otherwise. See
+        # https://github.com/mcvickerlab/GenVarLoader/issues/159
+        self._s_sorter = vcf_idx[np.argsort(samples_idx)]
         self._vcf = vcf
         return self
 
