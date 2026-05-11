@@ -160,6 +160,29 @@ def test_chunk_ranges(
                 np.testing.assert_allclose(d, dosages, rtol=1e-5)
 
 
+@parametrize_with_cases("pgen", cases=".", prefix="pgen_", scope="session")
+def test_sample_reorder(pgen: PGEN):
+    # available_samples = ["sample1", "sample2"]
+    # sample1: genos [[0,-1],[1,-1]], dosages [1.0, nan]
+    # sample2: genos [[1, 0],[1, 1]], dosages [2.0, 1.0]
+    cse = "chr1", 81261, 81262
+    pgen.set_samples(["sample2", "sample1"])
+
+    g, p, d = pgen.read(*cse, PGEN.GenosPhasingDosages)
+
+    assert list(pgen.current_samples) == ["sample2", "sample1"]
+    # row 0 must be sample2, row 1 must be sample1
+    np.testing.assert_equal(
+        g, np.array([[[1, 0], [1, 1]], [[0, -1], [1, -1]]], np.int32)
+    )
+    np.testing.assert_equal(p, np.array([[1, 0], [1, 0]], np.bool_))
+    np.testing.assert_allclose(
+        d, np.array([[2.0, 1.0], [1.0, np.nan]], np.float32), rtol=1e-5
+    )
+
+    pgen.set_samples(None)  # reset for other tests
+
+
 def samples_none():
     samples = None
     return samples
