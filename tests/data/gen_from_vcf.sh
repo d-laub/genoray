@@ -7,6 +7,7 @@ ddir=$(realpath "$ddir")
 
 bi=$ddir/biallelic.vcf
 multi=$ddir/multiallelic.vcf
+unsorted=$ddir/three_samples_unsorted.vcf
 
 echo "Bgzipping and indexing VCF files..."
 bgzip -c "$bi" >| "$bi".gz
@@ -16,6 +17,10 @@ rm -f "$bi".gz.gvi
 bgzip -c "$multi" >| "$multi".gz
 bcftools index "$multi".gz
 rm -f "$multi".gz.gvi
+
+bgzip -c "$unsorted" >| "$unsorted".gz
+bcftools index "$unsorted".gz
+rm -f "$unsorted".gz.gvi
 
 echo "Converting VCF to PLINK format..."
 prefix="${bi%.vcf}"
