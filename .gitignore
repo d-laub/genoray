@@ -4,7 +4,8 @@ notebooks/
 .venv/
 dist/
 docs/build/
-data/
+data/*
+tests/data/*
 tmp/
 memray_flamegraphs/
 
