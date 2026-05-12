@@ -1343,7 +1343,7 @@ def _find_starts_ends(
     no_vars = var_ranges[:, 0] == var_ranges[:, 1]
     out_offsets[:, no_vars] = np.iinfo(OFFSET_TYPE).max
 
-    unsorter = sorter[sorter]
+    unsorter = np.argsort(sorter)
     out_offsets[:] = out_offsets[:, unsorter]
 
     return out_offsets
@@ -1373,6 +1373,16 @@ def _find_starts_ends_with_length(
         Genotype offsets
     var_ranges
         Shape = (ranges 2) Variant index ranges.
+
+    Notes
+    -----
+    Correctness requires that ``argsort(q_starts) == argsort(var_ranges[:, 0])``,
+    i.e. that the per-range query positions and variant-index ranges are
+    co-monotone in input order. This holds whenever ``var_ranges`` is derived
+    from ``(q_starts, q_ends)`` (e.g. via ``SparseVar.var_ranges``). The
+    function sorts ``var_ranges`` internally but indexes ``q_starts`` /
+    ``q_ends`` by the same sorted position, so violating this invariant will
+    produce results aligned to the wrong query.
 
     Returns
     -------
@@ -1412,7 +1422,8 @@ def _find_starts_ends_with_length(
                     continue
 
                 q_start: POS_TYPE = q_starts[r]
-                q_len: POS_TYPE = q_ends[r] - q_start
+                q_end: POS_TYPE = q_ends[r]
+                q_len: POS_TYPE = q_end - q_start
                 last_v_end: POS_TYPE = q_start
                 written_len = 0
                 # ensure geno_idx is assigned when start_idx == n_vars
@@ -1424,11 +1435,14 @@ def _find_starts_ends_with_length(
 
                     # only add atomized length if v_start >= ref_start
                     maybe_add_one = POS_TYPE(v_start >= q_start)
+                    # variants strictly inside [q_start, q_end) must always be included;
+                    # length budget only governs extension past q_end
+                    past_query = v_start >= q_end
 
                     # only variants within query can add to write length
                     if v_start >= q_start:
                         written_len += v_start - last_v_end
-                        if written_len >= q_len:
+                        if past_query and written_len >= q_len:
                             geno_idx -= 1
                             break
 
@@ -1446,7 +1460,7 @@ def _find_starts_ends_with_length(
                         # v_len -= clip_right
 
                         written_len += v_write_len
-                        if written_len >= q_len:
+                        if past_query and written_len >= q_len:
                             break
 
                     v_end = (
@@ -1459,7 +1473,7 @@ def _find_starts_ends_with_length(
                 # add o_s to make indices relative to whole array
                 out[1, r, s, p] = geno_idx + o_s + 1
 
-    unsorter = sorter[sorter]
+    unsorter = np.argsort(sorter)
     out[:] = out[:, unsorter]
 
     return out
