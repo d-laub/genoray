@@ -1,3 +1,9 @@
+## 2.3.2 (2026-05-12)
+
+### Fix
+
+- **svar**: correct inverse permutation and length-budget early-exit in _find_starts_ends*
+
 ## 2.3.1 (2026-05-11)
 
 ### Fix
