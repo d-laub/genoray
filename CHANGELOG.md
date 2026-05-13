@@ -1,3 +1,9 @@
+## 2.3.3 (2026-05-13)
+
+### Fix
+
+- **vcf**: open subset VCF with only requested samples; fix _s_sorter for repeated set_samples calls
+
 ## 2.3.2 (2026-05-12)
 
 ### Fix
