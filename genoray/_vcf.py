@@ -363,10 +363,14 @@ class VCF:
                 f"Available samples: {self.available_samples}"
             )
 
-        vcf = self._open()
         self._samples = samples
-        self._s_sorter = self._s2i.get(np.asarray(samples))
-        self._vcf = vcf
+        avail_indices = self._s2i.get(np.asarray(samples))
+        vcf_order = np.argsort(avail_indices, kind="stable")
+        if np.all(vcf_order == np.arange(len(samples))):
+            self._s_sorter = slice(None)
+        else:
+            self._s_sorter = np.argsort(vcf_order, kind="stable")
+        self._vcf = self._open()
         return self
 
     @contextmanager

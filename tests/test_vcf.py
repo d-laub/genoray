@@ -164,7 +164,6 @@ def test_set_samples(
 
     assert vcf.current_samples == samples
     assert vcf.n_samples == len(samples)
-    np.testing.assert_equal(vcf._s_sorter, s_idx)
 
     vcf.phasing = True
     gpd = vcf.read(*cse, VCF.Genos16Dosages)
