@@ -275,3 +275,10 @@ def test_with_fields_missing_raises():
 def test_available_fields(svar: SparseVar):
     assert "dosages" in svar.available_fields
     assert svar.available_fields["dosages"] == np.dtype(DOSAGE_TYPE)
+
+
+def test_svar_nbytes_index_only():
+    svar = SparseVar(ddir / "biallelic.vcf.svar")
+    # nbytes counts only the resident polars index, not the mmap'd genos/fields
+    assert svar.nbytes == svar.index.estimated_size()
+    assert svar.nbytes > 0

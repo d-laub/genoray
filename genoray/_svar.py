@@ -148,6 +148,14 @@ class SparseVar(Generic[_SRT]):
         """Number of variants in the dataset."""
         return self.index.height
 
+    @property
+    def nbytes(self) -> int:
+        """Total in-memory footprint, in bytes, of resident (non-mmap'd) data
+        held by this reader. Only the polars variant index counts; `genos`
+        and `fields` are memory-mapped and excluded.
+        """
+        return self.index.estimated_size()
+
     @overload
     def __init__(
         self: SparseVar[Ragged[V_IDX_TYPE]],
