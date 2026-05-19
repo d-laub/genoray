@@ -275,6 +275,24 @@ class PGEN:
         return len(self._s_unsorter)
 
     @property
+    def nbytes(self) -> int:
+        """Total in-memory footprint, in bytes, of resident (non-mmap'd) data
+        structures held by this reader. Sums the gvi variant index dataframe
+        and the StartsEndsIlens cache. Returns 0 after `_free_index()`.
+        """
+        n = 0
+        if self._index is not None:
+            n += self._index.estimated_size()
+        if self._sei is not None:
+            n += (
+                self._sei.v_starts.nbytes
+                + self._sei.v_ends.nbytes
+                + self._sei.ilens.nbytes
+                + self._sei.alt.estimated_size()
+            )
+        return n
+
+    @property
     def filter(self) -> pl.Expr | None:
         """Polars expression to filter variants. Should return True for variants to keep."""
         return self._filter
