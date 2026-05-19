@@ -261,3 +261,21 @@ def test_chunk_with_length(
             np.testing.assert_equal(d, dosages)
             assert end == last_end
             assert n_ext == n_extension
+
+
+def test_nbytes_zero_before_index_loaded():
+    # _load_index is not called when with_gvi_index=False and no auto-load occurs
+    vcf = VCF(ddir / "biallelic.vcf.gz", with_gvi_index=False)
+    assert vcf._index is None
+    assert vcf.nbytes == 0
+
+
+def test_nbytes_positive_after_index_loaded():
+    vcf = VCF(ddir / "biallelic.vcf.gz")
+    if not vcf._valid_index():
+        vcf._write_gvi_index()
+    vcf._load_index()
+    assert vcf._index is not None
+    assert vcf.nbytes > 0
+    # sanity: at least one byte per row across CHROM/POS/REF/ALT
+    assert vcf.nbytes >= vcf._index.height
