@@ -71,7 +71,7 @@ def _coerce_bed_schema(df: pl.DataFrame) -> pl.DataFrame:
 
 
 def _normalize_regions(
-    regions,
+    regions: "str | tuple[str, int, int] | PathLike | object",
     cnorm: ContigNormalizer,
 ) -> pl.DataFrame:
     """Normalize *regions* to a DataFrame with columns chrom (Utf8), start (Int32),
@@ -108,27 +108,55 @@ def _normalize_regions(
             {"chrom": [chrom], "start": [int(start)], "end": [int(end)]},
             schema={"chrom": pl.Utf8, "start": pl.Int32, "end": pl.Int32},
         )
-    elif isinstance(regions, (Path, PathLike)) or (
-        not isinstance(regions, pl.DataFrame) and hasattr(regions, "__fspath__")
-    ):
+    elif isinstance(regions, PathLike):
         raw = sp.bed.read(Path(regions))
         df = _coerce_bed_schema(raw)
     else:
-        # Polars DataFrame or similar frame-like object
-        if not isinstance(regions, pl.DataFrame):
-            regions = pl.from_pandas(regions)
-        df = _coerce_bed_schema(regions)
+        # Frame-like
+        if isinstance(regions, pl.DataFrame):
+            df = regions
+        else:
+            # Try pandas
+            try:
+                import pandas as pd
+            except ImportError:
+                pd = None
+            if pd is not None and isinstance(regions, pd.DataFrame):
+                df = pl.from_pandas(regions)
+            else:
+                # Try pyranges (v0 or v1)
+                pyr_df = None
+                for mod_name in ("pyranges", "pyranges1"):
+                    try:
+                        pyr_mod = __import__(mod_name)
+                    except ImportError:
+                        continue
+                    pr_cls = getattr(pyr_mod, "PyRanges", None)
+                    if pr_cls is not None and isinstance(regions, pr_cls):
+                        # pyranges0 exposes .df; pyranges1 exposes .to_pandas()
+                        if hasattr(regions, "df"):
+                            pyr_df = pl.from_pandas(regions.df)
+                        else:
+                            pyr_df = pl.from_pandas(regions.to_pandas())
+                        break
+                if pyr_df is None:
+                    raise TypeError(
+                        f"Unsupported regions type: {type(regions).__name__}. "
+                        "Expected str, tuple, PathLike, or a polars/pandas/pyranges frame."
+                    )
+                df = pyr_df
+        df = _coerce_bed_schema(df)
 
     normed = [cnorm.norm(c) for c in df["chrom"].to_list()]
+    normed_chroms = [n for n in normed if n is not None]
     keep_mask = [n is not None for n in normed]
     if not all(keep_mask):
         n_dropped = sum(1 for k in keep_mask if not k)
         warnings.warn(
             f"{n_dropped} region(s) dropped: contig not in dataset.", stacklevel=2
         )
-    normed_chroms = [n if n is not None else "" for n in normed]
-    df = df.with_columns(pl.Series("chrom", normed_chroms))
     df = df.filter(pl.Series(keep_mask))
+    df = df.with_columns(pl.Series("chrom", normed_chroms))
     return df
 
 

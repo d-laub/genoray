@@ -47,7 +47,10 @@ def test_normalize_regions_bed_file(tmp_path: Path, cnorm):
     bed.write_text("chr1\t100\t200\nchr2\t300\t400\n")
     df = _normalize_regions(bed, cnorm)
     assert df.height == 2
-    assert sorted(df["chrom"].to_list()) == ["chr1", "chr2"]
+    df_sorted = df.sort("chrom")
+    assert df_sorted["chrom"].to_list() == ["chr1", "chr2"]
+    assert df_sorted["start"].to_list() == [100, 300]
+    assert df_sorted["end"].to_list() == [200, 400]
 
 
 def test_normalize_regions_frame_polars_bio_schema(cnorm):
@@ -55,3 +58,33 @@ def test_normalize_regions_frame_polars_bio_schema(cnorm):
     df = _normalize_regions(frame, cnorm)
     assert df["start"].to_list() == [5]
     assert df["end"].to_list() == [25]
+
+
+def test_normalize_regions_pandas_frame(cnorm):
+    import pandas as pd
+
+    pdf = pd.DataFrame({"chrom": ["chr1", "chr2"], "start": [10, 20], "end": [30, 40]})
+    df = _normalize_regions(pdf, cnorm)
+    assert df.height == 2
+    df_sorted = df.sort("chrom")
+    assert df_sorted["chrom"].to_list() == ["chr1", "chr2"]
+    assert df_sorted["start"].to_list() == [10, 20]
+    assert df_sorted["end"].to_list() == [30, 40]
+
+
+def test_normalize_regions_pyranges(cnorm):
+    pr = pytest.importorskip("pyranges")
+    regions = pr.PyRanges(
+        chromosomes=["chr1", "chr2"], starts=[100, 200], ends=[150, 250]
+    )
+    df = _normalize_regions(regions, cnorm)
+    assert df.height == 2
+    df_sorted = df.sort("chrom")
+    assert df_sorted["chrom"].to_list() == ["chr1", "chr2"]
+    assert df_sorted["start"].to_list() == [100, 200]
+    assert df_sorted["end"].to_list() == [150, 250]
+
+
+def test_normalize_regions_unsupported_type_raises(cnorm):
+    with pytest.raises(TypeError, match="Unsupported regions type"):
+        _normalize_regions(42, cnorm)  # type: ignore
