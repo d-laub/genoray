@@ -327,6 +327,16 @@ class VCF:
         self._filter = filter
 
     @property
+    def nbytes(self) -> int:
+        """Total in-memory footprint, in bytes, of resident (non-mmap'd) data
+        structures held by this reader. Currently this is the gvi variant
+        index (CHROM/POS/REF/ALT/ILEN). Returns 0 before the index is loaded.
+        """
+        if self._index is None:
+            return 0
+        return self._index.estimated_size()
+
+    @property
     def current_samples(self) -> list[str]:
         """List of samples currently being read from the VCF file."""
         return self._samples

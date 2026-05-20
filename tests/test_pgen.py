@@ -396,3 +396,20 @@ def test_var_idxs(
     var_idxs, offsets = pgen.var_idxs(contig, starts, ends)
     assert np.array_equal(var_idxs, desired[0])
     assert np.array_equal(offsets, desired[1])
+
+
+def test_pgen_nbytes_positive_after_init():
+    # PGEN auto-loads the index in __init__ via _init_index
+    pgen = PGEN(ddir / "biallelic.pgen")
+    assert pgen._index is not None
+    assert pgen.nbytes > 0
+    # both the index dataframe and the StartsEndsIlens cache should contribute
+    assert pgen.nbytes >= pgen._index.estimated_size()
+
+
+def test_pgen_nbytes_zero_after_free():
+    pgen = PGEN(ddir / "biallelic.pgen")
+    pgen._free_index()
+    assert pgen._index is None
+    assert pgen._sei is None
+    assert pgen.nbytes == 0
