@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import copy
+import re
 import shutil
 import warnings
 from collections.abc import Iterable, Sequence
+from os import PathLike
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Generic, Literal, TypeVar, cast, overload
@@ -36,6 +38,98 @@ from ._vcf import VCF
 from .exprs import ILEN
 
 NUMERIC = TypeVar("NUMERIC", bound=np.number)
+
+_REGION_STR_RE = re.compile(r"^(?P<chrom>[^:]+):(?P<start>\d+)-(?P<end>\d+)$")
+
+
+def _coerce_bed_schema(df: pl.DataFrame) -> pl.DataFrame:
+    """Coerce a BED-like frame to columns chrom (Utf8), start (Int32), end (Int32).
+
+    Handles both the seqpro convention (chromStart/chromEnd) and the
+    polars-bio convention (start/end), as well as PyRanges-style
+    (Chromosome/Start/End) via sp.bed.from_pyr.
+    """
+    rename: dict[str, str] = {}
+    cols = set(df.columns)
+    for src, dst in (
+        ("Chromosome", "chrom"),
+        ("CHROM", "chrom"),
+        ("chromStart", "start"),
+        ("chromEnd", "end"),
+        ("Start", "start"),
+        ("End", "end"),
+    ):
+        if src in cols and dst not in cols:
+            rename[src] = dst
+    if rename:
+        df = df.rename(rename)
+    return df.select(
+        pl.col("chrom").cast(pl.Utf8),
+        pl.col("start").cast(pl.Int32),
+        pl.col("end").cast(pl.Int32),
+    )
+
+
+def _normalize_regions(
+    regions,
+    cnorm: ContigNormalizer,
+) -> pl.DataFrame:
+    """Normalize *regions* to a DataFrame with columns chrom (Utf8), start (Int32),
+    end (Int32) using 0-based, end-exclusive coordinates.
+
+    Accepted input types:
+
+    * ``str`` — ``"chrom:start-end"`` (1-based inclusive, converted to 0-based half-open).
+    * ``tuple[str, int, int]`` — ``(chrom, start, end)`` already 0-based half-open.
+    * ``Path`` / ``PathLike`` — path to a BED3+ file; read via ``sp.bed.read``.
+    * ``pl.DataFrame`` (or any frame-like) — must already have ``chrom``, ``start``,
+      and ``end`` columns (or common aliases).
+
+    Rows whose contig is not recognised by *cnorm* are dropped with a ``UserWarning``.
+    """
+    if isinstance(regions, str):
+        m = _REGION_STR_RE.match(regions)
+        if m is None:
+            raise ValueError(
+                f"Region string {regions!r} does not match 'chrom:start-end'"
+            )
+        chrom = m["chrom"]
+        start = int(m["start"]) - 1  # 1-based inclusive → 0-based
+        end = int(m["end"])
+        df = pl.DataFrame(
+            {"chrom": [chrom], "start": [start], "end": [end]},
+            schema={"chrom": pl.Utf8, "start": pl.Int32, "end": pl.Int32},
+        )
+    elif (
+        isinstance(regions, tuple) and len(regions) == 3 and isinstance(regions[0], str)
+    ):
+        chrom, start, end = regions
+        df = pl.DataFrame(
+            {"chrom": [chrom], "start": [int(start)], "end": [int(end)]},
+            schema={"chrom": pl.Utf8, "start": pl.Int32, "end": pl.Int32},
+        )
+    elif isinstance(regions, (Path, PathLike)) or (
+        not isinstance(regions, pl.DataFrame) and hasattr(regions, "__fspath__")
+    ):
+        raw = sp.bed.read(Path(regions))
+        df = _coerce_bed_schema(raw)
+    else:
+        # Polars DataFrame or similar frame-like object
+        if not isinstance(regions, pl.DataFrame):
+            regions = pl.from_pandas(regions)
+        df = _coerce_bed_schema(regions)
+
+    normed = [cnorm.norm(c) for c in df["chrom"].to_list()]
+    keep_mask = [n is not None for n in normed]
+    if not all(keep_mask):
+        n_dropped = sum(1 for k in keep_mask if not k)
+        warnings.warn(
+            f"{n_dropped} region(s) dropped: contig not in dataset.", stacklevel=2
+        )
+    normed_chroms = [n if n is not None else "" for n in normed]
+    df = df.with_columns(pl.Series("chrom", normed_chroms))
+    df = df.filter(pl.Series(keep_mask))
+    return df
 
 
 @overload
