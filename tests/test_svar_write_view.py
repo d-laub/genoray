@@ -544,3 +544,44 @@ def test_write_view_roundtrip_genotype_values(tmp_path: Path, svar: SparseVar):
         np.testing.assert_array_equal(
             src_pp, view_pp, err_msg=f"positions differ at slot {i}"
         )
+
+
+def test_write_view_empty_regions_raises(tmp_path, svar):
+    with pytest.raises(ValueError, match="no variants"):
+        svar.write_view(
+            regions=(svar.contigs[0], 10**9, 10**9 + 1),  # past end of chromosome
+            samples=svar.available_samples[:1],
+            output=tmp_path / "empty.svar",
+        )
+    assert not (tmp_path / "empty.svar").exists()
+
+
+def test_write_view_empty_samples_raises(tmp_path, svar):
+    with pytest.raises(ValueError, match="at least one sample"):
+        svar.write_view(
+            regions=(svar.contigs[0], 0, 1_000_000),
+            samples=[],
+            output=tmp_path / "empty.svar",
+        )
+    assert not (tmp_path / "empty.svar").exists()
+
+
+def test_write_view_unknown_sample_raises(tmp_path, svar):
+    with pytest.raises(ValueError, match="not found"):
+        svar.write_view(
+            regions=(svar.contigs[0], 0, 1_000_000),
+            samples=["__nope__"],
+            output=tmp_path / "x.svar",
+        )
+    assert not (tmp_path / "x.svar").exists()
+
+
+def test_write_view_unknown_field_raises(tmp_path, svar):
+    with pytest.raises(ValueError, match="not found"):
+        svar.write_view(
+            regions=(svar.contigs[0], 0, 1_000_000),
+            samples=svar.available_samples[:1],
+            output=tmp_path / "x.svar",
+            fields=["__nope__"],
+        )
+    assert not (tmp_path / "x.svar").exists()
