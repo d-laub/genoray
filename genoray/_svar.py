@@ -1201,6 +1201,88 @@ def _nb_af_helper(afs, v_idxs, offsets, max_count):
     afs /= max_count
 
 
+@nb.njit(parallel=True, nogil=True, cache=True)
+def _nb_count_kept(
+    src_data, src_offsets, src_sample_idxs, ploidy, kept_var_idxs, out_lengths
+):
+    """Pass 1: count, per output (sample, ploidy) slot, how many source variant
+    indices fall in `kept_var_idxs`."""
+    n_out = src_sample_idxs.shape[0]
+    n_kept = kept_var_idxs.shape[0]
+    for i in nb.prange(n_out):
+        s = src_sample_idxs[i]
+        for p in range(ploidy):
+            src_slot = s * ploidy + p
+            count = 0
+            lo = src_offsets[src_slot]
+            hi = src_offsets[src_slot + 1]
+            for j in range(lo, hi):
+                v = src_data[j]
+                k = np.searchsorted(kept_var_idxs, v)
+                if k < n_kept and kept_var_idxs[k] == v:
+                    count += 1
+            out_lengths[i * ploidy + p] = count
+
+
+@nb.njit(parallel=True, nogil=True, cache=True)
+def _nb_write_var_idxs(
+    src_data,
+    src_offsets,
+    src_sample_idxs,
+    ploidy,
+    kept_var_idxs,
+    new_offsets,
+    out_var_idxs,
+):
+    """Pass 2: write remapped variant indices."""
+    n_out = src_sample_idxs.shape[0]
+    n_kept = kept_var_idxs.shape[0]
+    for i in nb.prange(n_out):
+        s = src_sample_idxs[i]
+        for p in range(ploidy):
+            src_slot = s * ploidy + p
+            out_slot = i * ploidy + p
+            wp = new_offsets[out_slot]
+            lo = src_offsets[src_slot]
+            hi = src_offsets[src_slot + 1]
+            for j in range(lo, hi):
+                v = src_data[j]
+                k = np.searchsorted(kept_var_idxs, v)
+                if k < n_kept and kept_var_idxs[k] == v:
+                    out_var_idxs[wp] = k
+                    wp += 1
+
+
+@nb.njit(parallel=True, nogil=True, cache=True)
+def _nb_write_field(
+    src_field,
+    src_data,
+    src_offsets,
+    src_sample_idxs,
+    ploidy,
+    kept_var_idxs,
+    new_offsets,
+    out_field,
+):
+    """Pass 2 (field variant): writes src_field values at filter-kept positions."""
+    n_out = src_sample_idxs.shape[0]
+    n_kept = kept_var_idxs.shape[0]
+    for i in nb.prange(n_out):
+        s = src_sample_idxs[i]
+        for p in range(ploidy):
+            src_slot = s * ploidy + p
+            out_slot = i * ploidy + p
+            wp = new_offsets[out_slot]
+            lo = src_offsets[src_slot]
+            hi = src_offsets[src_slot + 1]
+            for j in range(lo, hi):
+                v = src_data[j]
+                k = np.searchsorted(kept_var_idxs, v)
+                if k < n_kept and kept_var_idxs[k] == v:
+                    out_field[wp] = src_field[j]
+                    wp += 1
+
+
 def _process_contig_vcf(
     path: str | Path,
     dosage_field: str | None,

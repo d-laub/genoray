@@ -289,3 +289,101 @@ def test_resolve_kept_var_idxs_variant_matches_var_ranges_exclusive_end(svar_wv)
         else np.empty(0, dtype=np.int32)
     )
     np.testing.assert_array_equal(kept, expected)
+
+
+# ---------------------------------------------------------------------------
+# Task 5: numba kernels
+# ---------------------------------------------------------------------------
+
+
+def test_nb_count_kept_matches_python():
+    from genoray._svar import _nb_count_kept
+
+    # Two samples, ploidy=2 -> 4 slots
+    src_data = np.array([0, 2, 5, 1, 3, 5, 0, 4], dtype=np.int32)
+    src_offsets = np.array([0, 2, 4, 6, 8], dtype=np.int64)
+    src_sample_idxs = np.array([1, 0], dtype=np.int64)  # reorder: sample1 first
+    kept_var_idxs = np.array([0, 1, 5], dtype=np.int32)
+    ploidy = 2
+
+    out_lengths = np.zeros(2 * 2, dtype=np.int64)
+    _nb_count_kept(
+        src_data, src_offsets, src_sample_idxs, ploidy, kept_var_idxs, out_lengths
+    )
+
+    # Expected per output slot:
+    # (out 0, p 0) = src slot 2 [3, 5] -> kept {5} -> 1
+    # (out 0, p 1) = src slot 3 [0, 4] -> kept {0} -> 1
+    # (out 1, p 0) = src slot 0 [0, 2] -> kept {0} -> 1
+    # (out 1, p 1) = src slot 1 [5, 1] -> kept {5, 1} -> 2
+    assert out_lengths.tolist() == [1, 1, 1, 2]
+
+
+def test_nb_write_var_idxs_matches_python():
+    from seqpro.rag import lengths_to_offsets
+
+    from genoray._svar import _nb_count_kept, _nb_write_var_idxs
+
+    src_data = np.array([0, 2, 5, 1, 3, 5, 0, 4], dtype=np.int32)
+    src_offsets = np.array([0, 2, 4, 6, 8], dtype=np.int64)
+    src_sample_idxs = np.array([1, 0], dtype=np.int64)
+    kept_var_idxs = np.array([0, 1, 5], dtype=np.int32)
+    ploidy = 2
+
+    out_lengths = np.zeros(2 * 2, dtype=np.int64)
+    _nb_count_kept(
+        src_data, src_offsets, src_sample_idxs, ploidy, kept_var_idxs, out_lengths
+    )
+    new_offsets = lengths_to_offsets(out_lengths.reshape(2, ploidy))
+    out_var_idxs = np.empty(int(new_offsets[-1]), dtype=np.int32)
+
+    _nb_write_var_idxs(
+        src_data,
+        src_offsets,
+        src_sample_idxs,
+        ploidy,
+        kept_var_idxs,
+        new_offsets.ravel(),
+        out_var_idxs,
+    )
+    # slot 0: src [3, 5] kept {5} -> [2]
+    # slot 1: src [0, 4] kept {0} -> [0]
+    # slot 2: src [0, 2] kept {0} -> [0]
+    # slot 3: src [5, 1] kept {5, 1} -> [2, 1]
+    assert out_var_idxs.tolist() == [2, 0, 0, 2, 1]
+
+
+def test_nb_write_field_matches_python():
+    from seqpro.rag import lengths_to_offsets
+
+    from genoray._svar import _nb_count_kept, _nb_write_field
+
+    src_data = np.array([0, 2, 5, 1, 3, 5, 0, 4], dtype=np.int32)
+    src_offsets = np.array([0, 2, 4, 6, 8], dtype=np.int64)
+    src_field = np.array([10, 20, 30, 40, 50, 60, 70, 80], dtype=np.float32)
+    src_sample_idxs = np.array([1, 0], dtype=np.int64)
+    kept_var_idxs = np.array([0, 1, 5], dtype=np.int32)
+    ploidy = 2
+
+    out_lengths = np.zeros(2 * 2, dtype=np.int64)
+    _nb_count_kept(
+        src_data, src_offsets, src_sample_idxs, ploidy, kept_var_idxs, out_lengths
+    )
+    new_offsets = lengths_to_offsets(out_lengths.reshape(2, ploidy))
+    out_field = np.empty(int(new_offsets[-1]), dtype=np.float32)
+
+    _nb_write_field(
+        src_field,
+        src_data,
+        src_offsets,
+        src_sample_idxs,
+        ploidy,
+        kept_var_idxs,
+        new_offsets.ravel(),
+        out_field,
+    )
+    # out 0 = sample 1, ploidy 0 -> src slot 2, data[4:6]=[3,5]; kept: v=5->field[5]=60
+    # out 0 = sample 1, ploidy 1 -> src slot 3, data[6:8]=[0,4]; kept: v=0->field[6]=70
+    # out 1 = sample 0, ploidy 0 -> src slot 0, data[0:2]=[0,2]; kept: v=0->field[0]=10
+    # out 1 = sample 0, ploidy 1 -> src slot 1, data[2:4]=[5,1]; kept: v=5->field[2]=30, v=1->field[3]=40
+    assert out_field.tolist() == [60.0, 70.0, 10.0, 30.0, 40.0]
