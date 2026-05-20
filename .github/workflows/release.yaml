@@ -16,11 +16,12 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
+          token: ${{ secrets.GH_ACTIONS }}
       - name: Create bump and changelog
         id: cz
         uses: commitizen-tools/commitizen-action@338bbd841b75aaee6bf5340e1fa12f6ab58ff9ff # 0.27.1
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+          github_token: ${{ secrets.GH_ACTIONS }}
           branch: main
           changelog_increment_filename: body.md
       - name: Release
@@ -28,7 +29,7 @@ jobs:
         with:
           body_path: body.md
           tag_name: ${{ steps.cz.outputs.version }}
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.GH_ACTIONS }}
 
   publish:
     name: Publish to PyPI
@@ -65,6 +66,7 @@ jobs:
         with:
           ref: stable
           fetch-depth: 0
+          token: ${{ secrets.GH_ACTIONS }}
       - name: Config git
         run: |
           git config --global user.name "github-actions[bot]"
