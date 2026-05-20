@@ -1233,16 +1233,7 @@ class SparseVar(Generic[_SRT]):
 
         output = Path(output)
 
-        # --- 1. Output directory ---
-        if output.exists():
-            if not overwrite:
-                raise FileExistsError(
-                    f"Output path {output} already exists. Use overwrite=True to overwrite."
-                )
-            shutil.rmtree(output)
-        output.mkdir(parents=True)
-
-        # --- 2. Normalize inputs ---
+        # --- 1. Normalize inputs ---
         regions_df = _normalize_regions(regions, self._c_norm)
         caller_samples = _normalize_samples(samples, self.available_samples)
         fields_to_write = _validate_fields(fields, self.available_fields)
@@ -1250,12 +1241,21 @@ class SparseVar(Generic[_SRT]):
         if not caller_samples:
             raise ValueError("write_view requires at least one sample")
 
-        # --- 3. Resolve kept variant indices ---
+        # --- 2. Resolve kept variant indices ---
         kept_var_idxs = _resolve_kept_var_idxs(
             self, regions_df, regions_overlap, merge_overlapping
         )
         if len(kept_var_idxs) == 0:
             raise ValueError("no variants selected by `regions`")
+
+        # --- 3. Output directory (after all validation, so no partial dir on error) ---
+        if output.exists():
+            if not overwrite:
+                raise FileExistsError(
+                    f"Output path {output} already exists. Use overwrite=True to overwrite."
+                )
+            shutil.rmtree(output)
+        output.mkdir(parents=True)
 
         # --- 4. Setup ---
         n_out = len(caller_samples)

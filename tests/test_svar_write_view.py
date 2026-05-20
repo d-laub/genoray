@@ -505,3 +505,42 @@ def test_write_view_fields_explicit_empty_drops_dosages(
     )
     v = SparseVar(view_out)
     assert v.available_fields == {}
+
+
+def test_write_view_roundtrip_genotype_values(tmp_path: Path, svar: SparseVar):
+    """Verify genotype data round-trips correctly: for each (sample, ploidy) slot,
+    the *positions* of carried alt alleles must match between source and view."""
+    out = tmp_path / "view.svar"
+    contig = svar.contigs[0]
+    samples = svar.available_samples[:2]
+    svar.write_view(regions=(contig, 0, 1_000_000), samples=samples, output=out)
+    sv2 = SparseVar(out)
+
+    # Read full range from both; shape (1, n_samples, ploidy, ~variants)
+    rag_src = svar.read_ranges(
+        contig,
+        np.array([0], dtype=np.int32),
+        np.array([1_000_000], dtype=np.int32),
+        samples=samples,
+    )
+    rag_view = sv2.read_ranges(
+        contig,
+        np.array([0], dtype=np.int32),
+        np.array([1_000_000], dtype=np.int32),
+    )
+
+    src_pos = svar.index["POS"].to_numpy()
+    view_pos = sv2.index["POS"].to_numpy()
+
+    # offsets has shape (2, n_slots): row 0 = starts, row 1 = ends
+    n_slots = rag_src.offsets.shape[1]
+    assert n_slots == rag_view.offsets.shape[1], "slot counts differ"
+
+    for i in range(n_slots):
+        s_src, e_src = rag_src.offsets[0, i], rag_src.offsets[1, i]
+        s_view, e_view = rag_view.offsets[0, i], rag_view.offsets[1, i]
+        src_pp = src_pos[rag_src.data[s_src:e_src]]
+        view_pp = view_pos[rag_view.data[s_view:e_view]]
+        np.testing.assert_array_equal(
+            src_pp, view_pp, err_msg=f"positions differ at slot {i}"
+        )
