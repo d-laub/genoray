@@ -1,3 +1,20 @@
+## 2.5.0 (2026-05-20)
+
+### Feat
+
+- **svar**: add SparseVar.write_view for region+sample subsetting
+- **svar**: add numba kernels for write_view (count + write var_idxs + write field)
+- **svar**: add _resolve_kept_var_idxs with pos/record/variant modes
+- **svar**: add _normalize_samples and _validate_fields helpers
+- **svar**: add _normalize_regions helper
+- **utils**: add _resolve_threads and numba_threads context manager
+
+### Fix
+
+- **svar**: defer write_view output mkdir until after validation; verify genotype round-trip
+- **svar**: _resolve_kept_var_idxs use exclusive end from var_ranges
+- **svar**: support pandas/pyranges in _normalize_regions; tighten tests and types
+
 ## 2.4.0 (2026-05-20)
 
 ### Feat
