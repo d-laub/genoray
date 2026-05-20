@@ -1,3 +1,11 @@
+## 2.4.0 (2026-05-20)
+
+### Feat
+
+- **svar**: add nbytes property covering resident index only
+- **pgen**: add nbytes property summing index + StartsEndsIlens
+- **vcf**: add nbytes property for resident memory size
+
 ## 2.3.3 (2026-05-13)
 
 ### Fix
