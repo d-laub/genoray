@@ -603,3 +603,24 @@ def test_write_view_merge_overlapping_succeeds(tmp_path, svar):
     )
     sv2 = SparseVar(out)
     assert sv2.n_variants > 0
+
+
+def test_write_view_drops_mac_zero_variants(tmp_path: Path, svar_wv: SparseVar):
+    """A variant non-ref only in samples we exclude must not appear in the output."""
+    samples_all = list(svar_wv.available_samples)
+    keep = samples_all[1:]  # drop the first sample to provoke singleton drops
+    out = tmp_path / "subset.svar"
+    svar_wv.write_view(
+        regions=(svar_wv.contigs[0], 0, 10_000_000),
+        samples=keep,
+        output=out,
+    )
+    sub = SparseVar(out, attrs="AF")
+    # Each variant in the output must have AF > 0 (no MAC=0 variants).
+    assert (sub.index["AF"] > 0).all(), (
+        f"Output contains AF=0 variant(s); AF={sub.index['AF'].to_list()}"
+    )
+    assert sub.n_variants < svar_wv.n_variants, (
+        "expected at least one variant to be dropped by the MAC=0 pre-pass; "
+        "fixture may have changed"
+    )
