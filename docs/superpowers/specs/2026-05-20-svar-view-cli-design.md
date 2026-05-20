@@ -61,38 +61,62 @@ genoray/                                  (this repo)
 
 ### `view` command surface (in genoray-cli)
 
-Signature in `genoray_cli/__main__.py`:
+Adopts **bcftools-style flag pairs** for region/sample selection so the UX is
+familiar to the target audience, and so we cleanly separate inline values from
+file paths without leaning on heuristic type sniffing.
+
+```
+genoray view SOURCE OUT
+  ( -r/--regions      "chr:beg-end[,chr:beg-end ...]"
+  | -R/--regions-file PATH                              )   [required, mutually exclusive]
+  ( -s/--samples      "name[,name ...]"
+  | -S/--samples-file PATH                              )   [required, mutually exclusive]
+  [-f/--fields F ...]
+  [--merge-overlapping]
+  [--regions-overlap pos|record|variant]
+  [--overwrite]
+  [-@/--threads N]
+```
+
+Signature sketch in `genoray_cli/__main__.py`:
 
 ```python
 @app.command
 def view(
     source: Path,
     out: Path,
-    regions: Path | str,
-    samples: Path | str,
-    fields: list[str] | None = None,
+    *,
+    regions: str | None = None,           # -r, comma-list, 1-based inclusive
+    regions_file: Path | None = None,     # -R, BED (0-based half-open per _normalize_regions)
+    samples: str | None = None,           # -s, comma-list
+    samples_file: Path | None = None,     # -S, newline-delimited
+    fields: list[str] | None = None,      # -f
     merge_overlapping: bool = False,
     regions_overlap: Literal["pos", "record", "variant"] = "pos",
     overwrite: bool = False,
-    threads: int | None = None,
+    threads: int | None = None,           # -@
 ) -> None:
-    """Write a subset of an SVAR to a new SVAR directory."""
+    ...
 ```
 
-Behavior:
+Mutual exclusion is enforced by a cyclopts validator that raises if both or
+neither of each pair is set.
 
-1. Open `SparseVar(source)`.
-2. Forward all arguments verbatim to `sv.write_view(...)`.
-3. No additional argument parsing — `write_view` already accepts strings, BED
-   paths, and sample files via `_normalize_regions` / `_normalize_samples`.
+Translation to `write_view` arguments:
 
-`source` is the input SVAR directory (positional). `out` is the destination
-SVAR directory (positional). All other arguments are options matching the
-Python method's defaults.
+| CLI input                              | Value passed to `write_view`                                                                            |
+| -------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| `-r "chr:1-100"` (single entry)        | the string itself — `_normalize_regions` parses 1-based inclusive → 0-based half-open                  |
+| `-r "a:1-2,b:3-4"` (n>1)               | parse each entry with the same 1-based→0-based convention, build a `pl.DataFrame(chrom,start,end)`     |
+| `-R path.bed`                          | `Path(path.bed)`                                                                                        |
+| `-s "A,B"`                             | `["A", "B"]`                                                                                            |
+| `-S path.txt`                          | `Path(path.txt)`                                                                                        |
 
-Cyclopts will derive `--regions`, `--samples`, `--fields`, `--merge-overlapping`
-(boolean flag), `--regions-overlap`, `--overwrite`, `--threads` from the
-signature.
+The comma-list parser lives in `genoray_cli/__main__.py` (or a small helper
+module if it grows). It reuses the regex from `_normalize_regions` if
+exported, otherwise duplicates the simple `chrom:start-end` pattern — minor
+duplication is fine; the canonical normalization still happens inside
+`write_view` once we pass the DataFrame.
 
 Help text adapts the docstring from `SparseVar.write_view`.
 
@@ -150,3 +174,8 @@ they don't require an external release to land locally.
 - Progress bars, structured logging, or fancy error formatting beyond what
   `cyclopts` provides by default.
 - Backwards compatibility shims; this is additive.
+- **bcftools `^` exclusion prefix** for `-s/-S` (e.g. `-s ^A,B` = "all
+  samples except A and B"). `write_view` doesn't support exclusion; doing
+  this at the CLI layer is a one-liner against `sv.available_samples`, but
+  it deserves its own design pass (semantics of the exclusion + sample
+  ordering rules), so it's deferred.
