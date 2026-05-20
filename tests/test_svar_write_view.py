@@ -7,6 +7,7 @@ import pytest
 
 import numpy as np
 
+from genoray import SparseVar
 from genoray._svar import _normalize_regions, _normalize_samples, _validate_fields
 from genoray._utils import ContigNormalizer
 
@@ -131,3 +132,131 @@ def test_validate_fields_unknown_raises():
 
 def test_validate_fields_empty_list_returns_empty():
     assert _validate_fields([], {"dosages": np.dtype("float32")}) == []
+
+
+# ---------------------------------------------------------------------------
+# Task 4: _resolve_kept_var_idxs
+# ---------------------------------------------------------------------------
+
+ddir = Path(__file__).parent / "data"
+
+
+@pytest.fixture
+def svar_wv():
+    return SparseVar(ddir / "biallelic.vcf.svar")
+
+
+def test_resolve_kept_var_idxs_pos_mode(svar_wv):
+    from genoray._svar import _resolve_kept_var_idxs
+
+    regions = pl.DataFrame(
+        {"chrom": [svar_wv.contigs[0]], "start": [0], "end": [10_000]},
+        schema={"chrom": pl.Utf8, "start": pl.Int32, "end": pl.Int32},
+    )
+    kept = _resolve_kept_var_idxs(svar_wv, regions, mode="pos", merge_overlapping=False)
+    assert kept.dtype.kind == "i"
+    if len(kept) > 1:
+        assert np.all(np.diff(kept) > 0)  # sorted, unique
+
+
+def test_resolve_kept_var_idxs_empty_regions(svar_wv):
+    from genoray._svar import _resolve_kept_var_idxs
+
+    regions = pl.DataFrame(
+        {
+            "chrom": pl.Series([], dtype=pl.Utf8),
+            "start": pl.Series([], dtype=pl.Int32),
+            "end": pl.Series([], dtype=pl.Int32),
+        },
+    )
+    kept = _resolve_kept_var_idxs(svar_wv, regions, mode="pos", merge_overlapping=False)
+    assert len(kept) == 0
+
+
+def test_resolve_kept_var_idxs_overlap_raises(svar_wv):
+    from genoray._svar import _resolve_kept_var_idxs
+
+    regions = pl.DataFrame(
+        {"chrom": [svar_wv.contigs[0]] * 2, "start": [0, 5], "end": [10, 20]},
+        schema={"chrom": pl.Utf8, "start": pl.Int32, "end": pl.Int32},
+    )
+    with pytest.raises(ValueError, match="overlap"):
+        _resolve_kept_var_idxs(svar_wv, regions, mode="pos", merge_overlapping=False)
+
+
+def test_resolve_kept_var_idxs_overlap_merges(svar_wv):
+    from genoray._svar import _resolve_kept_var_idxs
+
+    regions = pl.DataFrame(
+        {"chrom": [svar_wv.contigs[0]] * 2, "start": [0, 5], "end": [10, 20]},
+        schema={"chrom": pl.Utf8, "start": pl.Int32, "end": pl.Int32},
+    )
+    kept = _resolve_kept_var_idxs(svar_wv, regions, mode="pos", merge_overlapping=True)
+    assert len(np.unique(kept)) == len(kept)
+
+
+def test_resolve_kept_var_idxs_record_includes_at_least_as_much_as_pos(svar_wv):
+    from genoray._svar import _resolve_kept_var_idxs
+
+    regions = pl.DataFrame(
+        {"chrom": [svar_wv.contigs[0]], "start": [0], "end": [50]},
+        schema={"chrom": pl.Utf8, "start": pl.Int32, "end": pl.Int32},
+    )
+    k_pos = _resolve_kept_var_idxs(
+        svar_wv, regions, mode="pos", merge_overlapping=False
+    )
+    k_rec = _resolve_kept_var_idxs(
+        svar_wv, regions, mode="record", merge_overlapping=False
+    )
+    assert len(k_rec) >= len(k_pos)
+
+
+def test_resolve_kept_var_idxs_variant_includes_at_least_as_much_as_pos(svar_wv):
+    from genoray._svar import _resolve_kept_var_idxs
+
+    regions = pl.DataFrame(
+        {"chrom": [svar_wv.contigs[0]], "start": [0], "end": [50]},
+        schema={"chrom": pl.Utf8, "start": pl.Int32, "end": pl.Int32},
+    )
+    k_pos = _resolve_kept_var_idxs(
+        svar_wv, regions, mode="pos", merge_overlapping=False
+    )
+    k_var = _resolve_kept_var_idxs(
+        svar_wv, regions, mode="variant", merge_overlapping=False
+    )
+    assert len(k_var) >= len(k_pos)
+
+
+def test_resolve_kept_var_idxs_all_modes_return_sorted_unique(svar_wv):
+    from genoray._svar import _resolve_kept_var_idxs
+
+    regions = pl.DataFrame(
+        {"chrom": [svar_wv.contigs[0]], "start": [81_000], "end": [82_000]},
+        schema={"chrom": pl.Utf8, "start": pl.Int32, "end": pl.Int32},
+    )
+    for mode in ("pos", "record", "variant"):
+        kept = _resolve_kept_var_idxs(
+            svar_wv, regions, mode=mode, merge_overlapping=False
+        )
+        assert len(kept) == len(np.unique(kept)), f"mode={mode}: not unique"
+        if len(kept) > 1:
+            assert np.all(np.diff(kept) > 0), f"mode={mode}: not sorted"
+
+
+def test_resolve_kept_var_idxs_pos_mode_hits_known_variant(svar_wv):
+    """biallelic.vcf has variants at chr1:81262 and chr1:81265 (1-based POS).
+
+    Region [81261, 81265) in 0-based half-open should cover POS=81262 (0-based 81261)
+    but not POS=81265 (0-based 81264).  Region [81261, 81266) should cover both.
+    """
+    from genoray._svar import _resolve_kept_var_idxs
+
+    # Wide region: covers POS 81262 and 81265 (0-based 81261 and 81264)
+    regions = pl.DataFrame(
+        {"chrom": ["chr1"], "start": [81261], "end": [81266]},
+        schema={"chrom": pl.Utf8, "start": pl.Int32, "end": pl.Int32},
+    )
+    kept = _resolve_kept_var_idxs(svar_wv, regions, mode="pos", merge_overlapping=False)
+    assert len(kept) >= 1
+    assert np.all(kept >= 0)
+    assert np.all(kept < svar_wv.n_variants)

@@ -203,6 +203,101 @@ def _validate_fields(
     return fields
 
 
+def _resolve_kept_var_idxs(
+    sv: "SparseVar",
+    regions: pl.DataFrame,
+    mode: Literal["pos", "record", "variant"],
+    merge_overlapping: bool,
+) -> "NDArray[V_IDX_TYPE]":
+    """Return a sorted, deduplicated array of source variant indices to keep.
+
+    Parameters
+    ----------
+    sv
+        The SparseVar to query.
+    regions
+        Normalised BED-like frame with columns ``chrom`` (Utf8), ``start`` (Int32),
+        ``end`` (Int32).  Coordinates are 0-based, half-open.
+    mode
+        ``"variant"`` — any variant whose span (accounting for ILEN) overlaps the
+        region is kept, as returned by ``var_ranges``.
+        ``"pos"`` — keep only variants whose POS-1 (0-based) falls strictly inside
+        ``[start, end)``.
+        ``"record"`` — like ``"pos"`` but widen the end by 1, i.e. POS-1 in
+        ``[start, end + 1)``.
+    merge_overlapping
+        If *True*, overlapping regions are silently merged before querying.
+        If *False* and overlapping regions are detected, raise ``ValueError``.
+
+    Returns
+    -------
+    NDArray[V_IDX_TYPE]
+        Sorted, deduplicated 1-D array of variant indices.
+    """
+    if regions.height == 0:
+        return np.empty(0, dtype=V_IDX_TYPE)
+
+    # --- overlap detection / optional merge ---
+    # sp.bed.to_pyr requires chromStart/chromEnd column names.
+    pyr_input = regions.rename({"start": "chromStart", "end": "chromEnd"})
+    pyr = sp.bed.to_pyr(pyr_input)
+    mod = type(pyr).__module__.split(".")[0]
+    if mod == "pyranges":
+        merged = pyr.merge()
+    elif mod == "pyranges1":
+        merged = pyr.merge_overlaps()
+    else:
+        raise RuntimeError(f"Unexpected PyRanges module: {type(pyr)!r}")
+
+    if len(merged) != regions.height:
+        if not merge_overlapping:
+            raise ValueError("regions overlap; pass merge_overlapping=True to dedupe")
+        regions = _coerce_bed_schema(sp.bed.from_pyr(merged))
+
+    # --- collect candidate variant indices via var_ranges ---
+    kept_chunks: list[NDArray[V_IDX_TYPE]] = []
+    sentinel = np.iinfo(V_IDX_TYPE).max
+    for contig_key, sub in regions.group_by("chrom", maintain_order=False):
+        c = contig_key[0] if isinstance(contig_key, tuple) else contig_key
+        starts = sub["start"].to_numpy()
+        ends = sub["end"].to_numpy()
+        vr = sv.var_ranges(c, starts, ends)  # shape (n_ranges, 2)
+        valid = vr[:, 0] != sentinel
+        for s, e in vr[valid]:
+            kept_chunks.append(np.arange(s, e + 1, dtype=V_IDX_TYPE))
+
+    if not kept_chunks:
+        return np.empty(0, dtype=V_IDX_TYPE)
+    candidates = np.unique(np.concatenate(kept_chunks))
+
+    # "variant" mode: var_ranges already does ILEN-aware overlap — return as-is.
+    if mode == "variant":
+        return candidates
+
+    # --- pos / record mode: filter by POS membership ---
+    region_by_contig: dict[str, tuple[NDArray, NDArray]] = {}
+    for contig_key, sub in regions.group_by("chrom", maintain_order=False):
+        c = contig_key[0] if isinstance(contig_key, tuple) else contig_key
+        region_by_contig[c] = (sub["start"].to_numpy(), sub["end"].to_numpy())
+
+    idx_slice = sv.index[candidates.tolist()]
+    cand_pos0 = idx_slice["POS"].to_numpy() - 1  # 1-based POS → 0-based
+    cand_chrom = idx_slice["CHROM"].to_list()
+
+    end_offset = 0 if mode == "pos" else 1  # "record" widens end by 1
+    keep_mask = np.zeros(len(candidates), dtype=bool)
+    for i in range(len(candidates)):
+        pair = region_by_contig.get(cand_chrom[i])
+        if pair is None:
+            continue
+        r_starts, r_ends = pair
+        p = cand_pos0[i]
+        if np.any((r_starts <= p) & (p < r_ends + end_offset)):
+            keep_mask[i] = True
+
+    return candidates[keep_mask]
+
+
 @overload
 def dense2sparse(
     genos: NDArray[np.int8],
