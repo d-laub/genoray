@@ -1228,6 +1228,13 @@ class SparseVar(Generic[_SRT]):
             Whether to overwrite *output* if it already exists.
         threads
             Number of Numba threads to use.  ``None`` uses all available CPUs.
+
+        Notes
+        -----
+        Variants whose minor allele count is 0 in the chosen sample subset are
+        dropped from the output. If every candidate variant drops, a
+        :class:`ValueError` is raised — the same code path that fires when
+        ``regions`` itself selects no variants.
         """
         from ._utils import _resolve_threads, numba_threads
 
