@@ -12,3 +12,5 @@ memray_flamegraphs/
 # pixi environments
 .pixi
 *.egg-info
+
+.claude/worktrees/
