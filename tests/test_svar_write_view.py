@@ -585,3 +585,21 @@ def test_write_view_unknown_field_raises(tmp_path, svar):
             fields=["__nope__"],
         )
     assert not (tmp_path / "x.svar").exists()
+
+
+def test_write_view_merge_overlapping_succeeds(tmp_path, svar):
+    """write_view should accept overlapping regions when merge_overlapping=True."""
+    out = tmp_path / "view.svar"
+    contig = svar.contigs[0]
+    regions = pl.DataFrame(
+        {"chrom": [contig, contig], "start": [81261, 81263], "end": [81264, 81266]},
+        schema={"chrom": pl.Utf8, "start": pl.Int32, "end": pl.Int32},
+    )
+    svar.write_view(
+        regions=regions,
+        samples=svar.available_samples[:1],
+        output=out,
+        merge_overlapping=True,
+    )
+    sv2 = SparseVar(out)
+    assert sv2.n_variants > 0

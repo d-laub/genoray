@@ -1193,8 +1193,8 @@ class SparseVar(Generic[_SRT]):
 
     def write_view(
         self,
-        regions,
-        samples,
+        regions: str | tuple[str, int, int] | Path,
+        samples: str | Sequence[str] | Path,
         output: str | Path,
         fields: Sequence[str] | None = None,
         merge_overlapping: bool = False,
