@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+from unittest.mock import patch
+
+import pytest
 from pytest_cases import parametrize_with_cases
 
 from genoray._utils import (
     ContigNormalizer,
+    _resolve_threads,
     format_memory,
     parse_memory,
     variant_file_type,
@@ -209,3 +213,57 @@ def file_path_pgen_preceding_dots():
 @parametrize_with_cases("path, desired", cases=".", prefix="file_path_")
 def test_variant_file_type(path: str, desired: str):
     assert variant_file_type(path) == desired
+
+
+def test_resolve_threads_explicit():
+    assert _resolve_threads(4) == 4
+    assert _resolve_threads(1) == 1
+
+
+def test_resolve_threads_default_uses_affinity():
+    with patch("os.sched_getaffinity", return_value={0, 1, 2}, create=True):
+        assert _resolve_threads(None) == 3
+
+
+def test_resolve_threads_default_falls_back_to_cpu_count():
+    with (
+        patch("os.sched_getaffinity", side_effect=AttributeError, create=True),
+        patch("os.cpu_count", return_value=8),
+    ):
+        assert _resolve_threads(None) == 8
+
+
+def test_resolve_threads_default_falls_back_to_one():
+    with (
+        patch("os.sched_getaffinity", side_effect=AttributeError, create=True),
+        patch("os.cpu_count", return_value=None),
+    ):
+        assert _resolve_threads(None) == 1
+
+
+def test_numba_threads_sets_and_restores():
+    import numba
+
+    from genoray._utils import numba_threads
+
+    original = numba.get_num_threads()
+    target = max(1, original - 1) if original > 1 else 1
+
+    with numba_threads(target):
+        assert numba.get_num_threads() == target
+    assert numba.get_num_threads() == original
+
+
+def test_numba_threads_restores_on_exception():
+    import numba
+
+    from genoray._utils import numba_threads
+
+    original = numba.get_num_threads()
+    target = max(1, original - 1) if original > 1 else 1
+
+    with pytest.raises(RuntimeError):
+        with numba_threads(target):
+            assert numba.get_num_threads() == target
+            raise RuntimeError("boom")
+    assert numba.get_num_threads() == original

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import math
+import os
 import re
 from collections.abc import Iterable
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, TypeGuard, TypeVar, overload
 
@@ -207,3 +209,30 @@ def np_to_pl_dtype(dtype: DTypeLike) -> type[pl.DataType]:
 
     else:
         raise ValueError(f"Unsupported dtype: {dtype}")
+
+
+def _resolve_threads(threads: int | None) -> int:
+    """Resolve the effective number of threads.
+
+    - If `threads` is given, return it as-is.
+    - Else prefer `os.sched_getaffinity(0)` (Linux), else `os.cpu_count()`, else 1.
+    """
+    if threads is not None:
+        return threads
+    try:
+        return len(os.sched_getaffinity(0))  # type: ignore[attr-defined]
+    except AttributeError:
+        return os.cpu_count() or 1
+
+
+@contextmanager
+def numba_threads(n: int):
+    """Temporarily set the numba thread count, restoring the previous value on exit."""
+    import numba
+
+    prev = numba.get_num_threads()
+    numba.set_num_threads(n)
+    try:
+        yield
+    finally:
+        numba.set_num_threads(prev)
