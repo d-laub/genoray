@@ -1,7 +1,7 @@
 # `genoray view` CLI for `SparseVar.write_view`
 
 **Date:** 2026-05-20
-**Branch:** `feat/svar-view-cli` (cut from `feat/svar-write-subset`)
+**Branch:** `feat/svar-view-cli` (based on `main`; `feat/svar-write-subset` already merged)
 **Companion repo:** [d-laub/genoray-cli](https://github.com/d-laub/genoray-cli)
 
 ## Goal
@@ -20,14 +20,23 @@ In scope:
   changes are reflected without reinstalling.
 - Add a `view` subcommand to `genoray_cli/__main__.py` that is a thin wrapper
   over `SparseVar.write_view`.
+- Enforce the no-op guard at the CLI layer: at least one of regions or samples
+  must be supplied.
+- **`write_view` enhancement (this branch):** drop output variants whose
+  minor allele count across the kept samples is zero. The sparse format has
+  nothing to store for them; leaving them in the index is dead weight and a
+  leaky abstraction.
 - Add a CLI smoke test in `genoray-cli` that subprocess-invokes `genoray view`
   on a tiny SVAR fixture and verifies the output is a valid `SparseVar`.
 
 Out of scope:
 
-- Changes to `SparseVar.write_view` itself (already covered by the prior spec).
 - Any other new CLI commands.
 - Refactoring of the existing `index` / `write` cli subcommands.
+- Enforcing the MAC>0 invariant **format-wide** in `dense2sparse`, `from_vcf`,
+  `from_pgen`, or as a standalone validator. The aspiration is that every
+  variant in an SVAR has MAC>0, but the wider enforcement is a separate PR
+  train tracked under follow-up issue *TBD-link* (open after this branch).
 
 ## Architecture
 
@@ -120,6 +129,49 @@ duplication is fine; the canonical normalization still happens inside
 
 Help text adapts the docstring from `SparseVar.write_view`.
 
+### No-op guard and "all" defaults
+
+The `view` command requires the user to express *some* selection. Because an
+SVAR has no human-readable representation, an unfiltered `view` is just a
+slow copy — refuse it.
+
+| User provides           | CLI behavior                                                                                                              |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| regions only            | synthesize "all samples" = `sv.available_samples`, pass to `write_view`                                                   |
+| samples only            | synthesize "all variants" = one row per contig from `sv.index` (`start=0`, `end=max(POS)+1`), build a `pl.DataFrame`      |
+| neither                 | **error**: *"at least one of --regions/--regions-file or --samples/--samples-file is required"*                           |
+| both                    | passthrough (already designed above)                                                                                      |
+| `-f`/`--fields` alone   | still errors — fields-only subsetting is not what `view` is for                                                            |
+
+This keeps `write_view`'s Python contract unchanged (regions and samples
+remain required); the CLI is the only layer that synthesizes "all".
+
+### `write_view` change: drop MAC=0 variants in output
+
+After resolving `kept_var_idxs` and `caller_samples`, `write_view` will:
+
+1. Run the existing pass-1 count kernel (`_nb_count_kept`).
+2. Compute per-variant MAC across kept samples from that count (it's already
+   counting non-ref entries per (sample, ploidy) slot — sum across the kept
+   sample-axis dimension).
+3. Drop any variants where MAC == 0 from `kept_var_idxs` *before* allocating
+   output buffers or running pass 2.
+4. Log/warn the number of dropped variants when > 0.
+5. The output index reflects only retained variants.
+
+Implementation notes:
+
+- This is at most an extra reduction over an array already produced in pass
+  1; no extra read pass needed.
+- Edge case: if *all* kept variants are dropped, raise the same
+  `"no variants selected by regions"`-style error rather than writing an
+  empty SVAR. Reuse the existing error path.
+- Tests: extend `tests/test_svar_write_view.py` with a case where a
+  sample-subset zeros out the MAC of some variants and assert they don't
+  appear in the output index.
+- The `write_view` docstring updates to document the MAC>0 guarantee on
+  outputs.
+
 ### Test plan
 
 `genoray-cli/tests/test_view_cli.py`:
@@ -131,27 +183,45 @@ Help text adapts the docstring from `SparseVar.write_view`.
   second `tmp_path`.
 - Assert the output dir exists, opens as a `SparseVar`, has the expected
   sample list and a non-empty variant count.
-- One edge case: passing a BED file path for `--regions` and a newline-file
-  for `--samples`, to confirm the CLI string-vs-path dispatch reaches
-  `_normalize_*`.
+- One edge case: passing a BED file path for `-R` and a newline-file for
+  `-S`, to confirm the path flags reach `_normalize_*`.
+- No-op guard: invoking `genoray view src out` with no `-r/-R/-s/-S` exits
+  non-zero with the expected error message.
+- "All samples" synthesis: `-r chr1:1-100` alone produces an output whose
+  sample list matches `sv.available_samples`.
+- "All variants" synthesis: `-s name` alone produces an output covering
+  every contig in the source.
 
-No new genoray-side tests; `write_view` correctness is covered by
-`tests/test_svar_write_view.py`.
+Genoray-side tests (`tests/test_svar_write_view.py`):
+
+- MAC>0 drop: construct a small SVAR where some variants are non-ref only in
+  samples `X, Y`; call `write_view` keeping samples `Z, W`; assert the
+  dropped variants do not appear in the output index and the kept ones do.
+- "Everything drops": `write_view` against a sample-subset that zeros out
+  every variant raises the same error as "no variants selected".
 
 ## Release sequencing
 
-1. **genoray:** merge `feat/svar-write-subset` (incl. `write_view`) → release
-   `genoray 2.5.0` (next minor; exact version per cz bump).
-2. **genoray-cli:** merge the `view` command branch → release
-   `genoray-cli 0.3.0` with `dependencies = ["genoray>=2.5.0", "cyclopts"]`.
-3. **genoray (this branch, feat/svar-view-cli):**
+`feat/svar-write-subset` is already merged on `main`; the `write_view`
+function ships in the next `genoray` release.
+
+1. **genoray (this branch, feat/svar-view-cli):**
+   - Add the `write_view` MAC>0 enhancement (genoray-side commits in
+     `genoray/_svar.py` + tests).
+   - Add `genoray-cli` as a submodule and wire `pixi.toml` to install it
+     editably.
+   - Merge → release `genoray` minor bump (the new `write_view` semantics
+     are an output-shape change; bump minor, e.g. `2.5.0`).
+2. **genoray-cli:** merge the `view` command branch in the cli repo →
+   release `genoray-cli 0.3.0` with `dependencies = ["genoray>=2.5.0",
+   "cyclopts"]`.
+3. **genoray (follow-up commit):**
    - Bump `[cli]` extra floor to `genoray-cli>=0.3.0`.
    - Update the submodule pointer to the released cli commit/tag.
-   - Merge.
 
-Steps 1 and 2 must precede step 3's final merge, but the submodule + pixi
-wiring on `feat/svar-view-cli` can be authored and reviewed in parallel —
-they don't require an external release to land locally.
+The submodule + pixi wiring on `feat/svar-view-cli` can be developed in
+parallel with the cli `view` command (the submodule pointer can track the
+cli's working branch during dev, then move to the released tag at step 3).
 
 ## Risks / open questions
 
