@@ -624,3 +624,18 @@ def test_write_view_drops_mac_zero_variants(tmp_path: Path, svar_wv: SparseVar):
         "expected at least one variant to be dropped by the MAC=0 pre-pass; "
         "fixture may have changed"
     )
+
+
+def test_write_view_raises_when_all_variants_drop(tmp_path: Path, svar_wv: SparseVar):
+    """If every candidate variant has MAC=0 in the kept sample set, raise."""
+    samples_all = list(svar_wv.available_samples)
+    # samples_all[1] (sample2) has no non-ref call at variant 2 (chr1:81265 T>C),
+    # which is the only variant selected by this 1-bp window.
+    one = [samples_all[1]]
+    out = tmp_path / "empty.svar"
+    with pytest.raises(ValueError, match="MAC=0"):
+        svar_wv.write_view(
+            regions=(svar_wv.contigs[0], 81264, 81265),
+            samples=one,
+            output=out,
+        )
