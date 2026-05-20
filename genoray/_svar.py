@@ -160,6 +160,49 @@ def _normalize_regions(
     return df
 
 
+def _normalize_samples(
+    samples: "str | Sequence[str] | PathLike",
+    available: Sequence[str],
+) -> list[str]:
+    """Normalize `samples` to a list of valid sample names, preserving caller order
+    and deduping by first occurrence. Raises ValueError on unknown samples."""
+    if isinstance(samples, str):
+        candidates: list[str] = [samples]
+    elif isinstance(samples, PathLike) or hasattr(samples, "__fspath__"):
+        candidates = Path(samples).read_text().splitlines()
+        candidates = [s for s in candidates if s.strip()]
+    else:
+        candidates = list(samples)
+
+    avail_set = set(available)
+    missing = [s for s in candidates if s not in avail_set]
+    if missing:
+        raise ValueError(f"Samples not found in dataset: {missing}")
+
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for s in candidates:
+        if s not in seen:
+            seen.add(s)
+            deduped.append(s)
+    return deduped
+
+
+def _validate_fields(
+    fields: "Sequence[str] | None",
+    available: "dict[str, np.dtype]",
+) -> list[str]:
+    """Validate field selection. `None` returns all available fields; a sequence is
+    validated as a subset of `available`. Raises ValueError on unknown fields."""
+    if fields is None:
+        return list(available)
+    fields = list(fields)
+    missing = [f for f in fields if f not in available]
+    if missing:
+        raise ValueError(f"Fields not found in dataset: {missing}")
+    return fields
+
+
 @overload
 def dense2sparse(
     genos: NDArray[np.int8],

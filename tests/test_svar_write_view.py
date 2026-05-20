@@ -5,7 +5,9 @@ from pathlib import Path
 import polars as pl
 import pytest
 
-from genoray._svar import _normalize_regions
+import numpy as np
+
+from genoray._svar import _normalize_regions, _normalize_samples, _validate_fields
 from genoray._utils import ContigNormalizer
 
 
@@ -88,3 +90,44 @@ def test_normalize_regions_pyranges(cnorm):
 def test_normalize_regions_unsupported_type_raises(cnorm):
     with pytest.raises(TypeError, match="Unsupported regions type"):
         _normalize_regions(42, cnorm)  # type: ignore
+
+
+def test_normalize_samples_str():
+    assert _normalize_samples("s1", ["s0", "s1", "s2"]) == ["s1"]
+
+
+def test_normalize_samples_list_preserves_order():
+    assert _normalize_samples(["s2", "s0"], ["s0", "s1", "s2"]) == ["s2", "s0"]
+
+
+def test_normalize_samples_dedupe_first_occurrence():
+    assert _normalize_samples(["s2", "s0", "s2"], ["s0", "s1", "s2"]) == ["s2", "s0"]
+
+
+def test_normalize_samples_unknown_raises():
+    with pytest.raises(ValueError, match="not found"):
+        _normalize_samples(["s9"], ["s0", "s1"])
+
+
+def test_normalize_samples_file(tmp_path):
+    p = tmp_path / "s.txt"
+    p.write_text("s2\ns0\n")
+    assert _normalize_samples(p, ["s0", "s1", "s2"]) == ["s2", "s0"]
+
+
+def test_validate_fields_none_returns_all():
+    assert _validate_fields(None, {"dosages": np.dtype("float32")}) == ["dosages"]
+
+
+def test_validate_fields_subset_ok():
+    avail = {"dosages": np.dtype("float32"), "GQ": np.dtype("float32")}
+    assert _validate_fields(["dosages"], avail) == ["dosages"]
+
+
+def test_validate_fields_unknown_raises():
+    with pytest.raises(ValueError, match="not found"):
+        _validate_fields(["bogus"], {"dosages": np.dtype("float32")})
+
+
+def test_validate_fields_empty_list_returns_empty():
+    assert _validate_fields([], {"dosages": np.dtype("float32")}) == []
