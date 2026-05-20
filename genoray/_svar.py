@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import copy
+import re
 import shutil
 import warnings
 from collections.abc import Iterable, Sequence
+from os import PathLike
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Generic, Literal, TypeVar, cast, overload
@@ -36,6 +38,264 @@ from ._vcf import VCF
 from .exprs import ILEN
 
 NUMERIC = TypeVar("NUMERIC", bound=np.number)
+
+_REGION_STR_RE = re.compile(r"^(?P<chrom>[^:]+):(?P<start>\d+)-(?P<end>\d+)$")
+
+
+def _coerce_bed_schema(df: pl.DataFrame) -> pl.DataFrame:
+    """Coerce a BED-like frame to columns chrom (Utf8), start (Int32), end (Int32).
+
+    Handles both the seqpro convention (chromStart/chromEnd) and the
+    polars-bio convention (start/end), as well as PyRanges-style
+    (Chromosome/Start/End) via sp.bed.from_pyr.
+    """
+    rename: dict[str, str] = {}
+    cols = set(df.columns)
+    for src, dst in (
+        ("Chromosome", "chrom"),
+        ("CHROM", "chrom"),
+        ("chromStart", "start"),
+        ("chromEnd", "end"),
+        ("Start", "start"),
+        ("End", "end"),
+    ):
+        if src in cols and dst not in cols:
+            rename[src] = dst
+    if rename:
+        df = df.rename(rename)
+    return df.select(
+        pl.col("chrom").cast(pl.Utf8),
+        pl.col("start").cast(pl.Int32),
+        pl.col("end").cast(pl.Int32),
+    )
+
+
+def _normalize_regions(
+    regions: "str | tuple[str, int, int] | PathLike | object",
+    cnorm: ContigNormalizer,
+) -> pl.DataFrame:
+    """Normalize *regions* to a DataFrame with columns chrom (Utf8), start (Int32),
+    end (Int32) using 0-based, end-exclusive coordinates.
+
+    Accepted input types:
+
+    * ``str`` — ``"chrom:start-end"`` (1-based inclusive, converted to 0-based half-open).
+    * ``tuple[str, int, int]`` — ``(chrom, start, end)`` already 0-based half-open.
+    * ``Path`` / ``PathLike`` — path to a BED3+ file; read via ``sp.bed.read``.
+    * ``pl.DataFrame`` (or any frame-like) — must already have ``chrom``, ``start``,
+      and ``end`` columns (or common aliases).
+
+    Rows whose contig is not recognised by *cnorm* are dropped with a ``UserWarning``.
+    """
+    if isinstance(regions, str):
+        m = _REGION_STR_RE.match(regions)
+        if m is None:
+            raise ValueError(
+                f"Region string {regions!r} does not match 'chrom:start-end'"
+            )
+        chrom = m["chrom"]
+        start = int(m["start"]) - 1  # 1-based inclusive → 0-based
+        end = int(m["end"])
+        df = pl.DataFrame(
+            {"chrom": [chrom], "start": [start], "end": [end]},
+            schema={"chrom": pl.Utf8, "start": pl.Int32, "end": pl.Int32},
+        )
+    elif (
+        isinstance(regions, tuple) and len(regions) == 3 and isinstance(regions[0], str)
+    ):
+        chrom, start, end = regions
+        df = pl.DataFrame(
+            {"chrom": [chrom], "start": [int(start)], "end": [int(end)]},
+            schema={"chrom": pl.Utf8, "start": pl.Int32, "end": pl.Int32},
+        )
+    elif isinstance(regions, PathLike):
+        raw = sp.bed.read(Path(regions))
+        df = _coerce_bed_schema(raw)
+    else:
+        # Frame-like
+        if isinstance(regions, pl.DataFrame):
+            df = regions
+        else:
+            # Try pandas
+            try:
+                import pandas as pd
+            except ImportError:
+                pd = None
+            if pd is not None and isinstance(regions, pd.DataFrame):
+                df = pl.from_pandas(regions)
+            else:
+                # Try pyranges (v0 or v1)
+                pyr_df = None
+                for mod_name in ("pyranges", "pyranges1"):
+                    try:
+                        pyr_mod = __import__(mod_name)
+                    except ImportError:
+                        continue
+                    pr_cls = getattr(pyr_mod, "PyRanges", None)
+                    if pr_cls is not None and isinstance(regions, pr_cls):
+                        # pyranges0 exposes .df; pyranges1 exposes .to_pandas()
+                        if hasattr(regions, "df"):
+                            pyr_df = pl.from_pandas(regions.df)
+                        else:
+                            pyr_df = pl.from_pandas(regions.to_pandas())
+                        break
+                if pyr_df is None:
+                    raise TypeError(
+                        f"Unsupported regions type: {type(regions).__name__}. "
+                        "Expected str, tuple, PathLike, or a polars/pandas/pyranges frame."
+                    )
+                df = pyr_df
+        df = _coerce_bed_schema(df)
+
+    normed = [cnorm.norm(c) for c in df["chrom"].to_list()]
+    normed_chroms = [n for n in normed if n is not None]
+    keep_mask = [n is not None for n in normed]
+    if not all(keep_mask):
+        n_dropped = sum(1 for k in keep_mask if not k)
+        warnings.warn(
+            f"{n_dropped} region(s) dropped: contig not in dataset.", stacklevel=2
+        )
+    df = df.filter(pl.Series(keep_mask))
+    df = df.with_columns(pl.Series("chrom", normed_chroms))
+    return df
+
+
+def _normalize_samples(
+    samples: "str | Sequence[str] | PathLike",
+    available: Sequence[str],
+) -> list[str]:
+    """Normalize `samples` to a list of valid sample names, preserving caller order
+    and deduping by first occurrence. Raises ValueError on unknown samples."""
+    if isinstance(samples, str):
+        candidates: list[str] = [samples]
+    elif isinstance(samples, PathLike) or hasattr(samples, "__fspath__"):
+        candidates = Path(samples).read_text().splitlines()
+        candidates = [s for s in candidates if s.strip()]
+    else:
+        candidates = list(samples)
+
+    avail_set = set(available)
+    missing = [s for s in candidates if s not in avail_set]
+    if missing:
+        raise ValueError(f"Samples not found in dataset: {missing}")
+
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for s in candidates:
+        if s not in seen:
+            seen.add(s)
+            deduped.append(s)
+    return deduped
+
+
+def _validate_fields(
+    fields: "Sequence[str] | None",
+    available: "dict[str, np.dtype]",
+) -> list[str]:
+    """Validate field selection. `None` returns all available fields; a sequence is
+    validated as a subset of `available`. Raises ValueError on unknown fields."""
+    if fields is None:
+        return list(available)
+    fields = list(fields)
+    missing = [f for f in fields if f not in available]
+    if missing:
+        raise ValueError(f"Fields not found in dataset: {missing}")
+    return fields
+
+
+def _resolve_kept_var_idxs(
+    sv: "SparseVar",
+    regions: pl.DataFrame,
+    mode: Literal["pos", "record", "variant"],
+    merge_overlapping: bool,
+) -> "NDArray[V_IDX_TYPE]":
+    """Return a sorted, deduplicated array of source variant indices to keep.
+
+    Parameters
+    ----------
+    sv
+        The SparseVar to query.
+    regions
+        Normalised BED-like frame with columns ``chrom`` (Utf8), ``start`` (Int32),
+        ``end`` (Int32).  Coordinates are 0-based, half-open.
+    mode
+        ``"variant"`` — any variant whose span (accounting for ILEN) overlaps the
+        region is kept, as returned by ``var_ranges``.
+        ``"pos"`` — keep only variants whose POS-1 (0-based) falls strictly inside
+        ``[start, end)``.
+        ``"record"`` — like ``"pos"`` but widen the end by 1, i.e. POS-1 in
+        ``[start, end + 1)``.
+    merge_overlapping
+        If *True*, overlapping regions are silently merged before querying.
+        If *False* and overlapping regions are detected, raise ``ValueError``.
+
+    Returns
+    -------
+    NDArray[V_IDX_TYPE]
+        Sorted, deduplicated 1-D array of variant indices.
+    """
+    if regions.height == 0:
+        return np.empty(0, dtype=V_IDX_TYPE)
+
+    # --- overlap detection / optional merge ---
+    # sp.bed.to_pyr requires chromStart/chromEnd column names.
+    pyr_input = regions.rename({"start": "chromStart", "end": "chromEnd"})
+    pyr = sp.bed.to_pyr(pyr_input)
+    mod = type(pyr).__module__.split(".")[0]
+    if mod == "pyranges":
+        merged = pyr.merge()
+    elif mod == "pyranges1":
+        merged = pyr.merge_overlaps()
+    else:
+        raise RuntimeError(f"Unexpected PyRanges module: {type(pyr)!r}")
+
+    if len(merged) != regions.height:
+        if not merge_overlapping:
+            raise ValueError("regions overlap; pass merge_overlapping=True to dedupe")
+        regions = _coerce_bed_schema(sp.bed.from_pyr(merged))
+
+    # --- collect candidate variant indices via var_ranges ---
+    kept_chunks: list[NDArray[V_IDX_TYPE]] = []
+    sentinel = np.iinfo(V_IDX_TYPE).max
+    for contig_key, sub in regions.group_by("chrom", maintain_order=False):
+        c = contig_key[0] if isinstance(contig_key, tuple) else contig_key
+        starts = sub["start"].to_numpy()
+        ends = sub["end"].to_numpy()
+        vr = sv.var_ranges(c, starts, ends)  # shape (n_ranges, 2)
+        valid = vr[:, 0] != sentinel
+        for s, e in vr[valid]:
+            kept_chunks.append(np.arange(s, e, dtype=V_IDX_TYPE))
+
+    if not kept_chunks:
+        return np.empty(0, dtype=V_IDX_TYPE)
+    candidates = np.unique(np.concatenate(kept_chunks))
+
+    # "variant" mode: var_ranges already does ILEN-aware overlap — return as-is.
+    if mode == "variant":
+        return candidates
+
+    # --- pos / record mode: filter by POS membership ---
+    region_by_contig: dict[str, tuple[NDArray, NDArray]] = {}
+    for contig_key, sub in regions.group_by("chrom", maintain_order=False):
+        c = contig_key[0] if isinstance(contig_key, tuple) else contig_key
+        region_by_contig[c] = (sub["start"].to_numpy(), sub["end"].to_numpy())
+
+    idx_slice = sv.index[candidates.tolist()]
+    cand_pos0 = idx_slice["POS"].to_numpy() - 1  # 1-based POS → 0-based
+    cand_chrom = idx_slice["CHROM"].to_list()
+
+    end_offset = 0 if mode == "pos" else 1  # "record" widens end by 1
+    keep_mask = np.zeros(len(candidates), dtype=bool)
+    for i in range(len(candidates)):
+        pair = region_by_contig.get(cand_chrom[i])
+        if pair is None:
+            continue
+        r_starts, r_ends = pair
+        p = cand_pos0[i]
+        if np.any((r_starts <= p) & (p < r_ends + end_offset)):
+            keep_mask[i] = True
+
+    return candidates[keep_mask]
 
 
 @overload
@@ -931,6 +1191,177 @@ class SparseVar(Generic[_SRT]):
 
         self.genos = ak.transform(memmap2array, self.genos)  # type: ignore
 
+    def write_view(
+        self,
+        regions: str | tuple[str, int, int] | Path,
+        samples: str | Sequence[str] | Path,
+        output: str | Path,
+        fields: Sequence[str] | None = None,
+        merge_overlapping: bool = False,
+        regions_overlap: Literal["pos", "record", "variant"] = "pos",
+        overwrite: bool = False,
+        threads: int | None = None,
+    ) -> None:
+        """Write a subset of this SparseVar to a new directory.
+
+        Parameters
+        ----------
+        regions
+            Region(s) to include. Accepts the same input types as
+            :func:`_normalize_regions`: a ``"chrom:start-end"`` string, a
+            ``(chrom, start, end)`` tuple, a BED file path, or a
+            polars/pandas/pyranges frame.
+        samples
+            Samples to include.  Accepts a single sample name, a list, or a
+            path to a file of newline-separated names.
+        output
+            Destination directory for the new SparseVar.
+        fields
+            Fields to carry over (``None`` = all available; ``[]`` = none).
+        merge_overlapping
+            If ``True`` silently merge overlapping regions; if ``False``
+            raise ``ValueError`` when overlaps are detected.
+        regions_overlap
+            How variants are matched to regions — ``"pos"``, ``"record"``, or
+            ``"variant"``.  See :func:`_resolve_kept_var_idxs`.
+        overwrite
+            Whether to overwrite *output* if it already exists.
+        threads
+            Number of Numba threads to use.  ``None`` uses all available CPUs.
+        """
+        from ._utils import _resolve_threads, numba_threads
+
+        output = Path(output)
+
+        # --- 1. Normalize inputs ---
+        regions_df = _normalize_regions(regions, self._c_norm)
+        caller_samples = _normalize_samples(samples, self.available_samples)
+        fields_to_write = _validate_fields(fields, self.available_fields)
+
+        if not caller_samples:
+            raise ValueError("write_view requires at least one sample")
+
+        # --- 2. Resolve kept variant indices ---
+        kept_var_idxs = _resolve_kept_var_idxs(
+            self, regions_df, regions_overlap, merge_overlapping
+        )
+        if len(kept_var_idxs) == 0:
+            raise ValueError("no variants selected by `regions`")
+
+        # --- 3. Output directory (after all validation, so no partial dir on error) ---
+        if output.exists():
+            if not overwrite:
+                raise FileExistsError(
+                    f"Output path {output} already exists. Use overwrite=True to overwrite."
+                )
+            shutil.rmtree(output)
+        output.mkdir(parents=True)
+
+        # --- 4. Setup ---
+        n_out = len(caller_samples)
+        ploidy = self.ploidy
+        threads_resolved = _resolve_threads(threads)
+
+        src_sample_idxs = self._s2i[np.array(caller_samples)].astype(np.int64)
+
+        # --- 5. Pass 1: count kept entries per output slot ---
+        out_lengths = np.zeros(n_out * ploidy, dtype=np.int64)
+        with numba_threads(threads_resolved):
+            _nb_count_kept(
+                self.genos.data,
+                self.genos.offsets,
+                src_sample_idxs,
+                ploidy,
+                kept_var_idxs,
+                out_lengths,
+            )
+
+        new_offsets = lengths_to_offsets(out_lengths.reshape(n_out, ploidy))
+
+        # --- 6. Write offsets.npy ---
+        offsets_mm = np.memmap(
+            output / "offsets.npy",
+            dtype=np.int64,
+            mode="w+",
+            shape=new_offsets.shape,
+        )
+        offsets_mm[:] = new_offsets
+        offsets_mm.flush()
+
+        # Allocate output variant_idxs memmap
+        n_entries = int(new_offsets[-1])
+        out_var_idxs_mm = np.memmap(
+            output / "variant_idxs.npy",
+            dtype=V_IDX_TYPE,
+            mode="w+",
+            shape=(n_entries,),
+        )
+
+        # --- 7. Pass 2 (genos): write remapped variant indices ---
+        with numba_threads(threads_resolved):
+            _nb_write_var_idxs(
+                self.genos.data,
+                self.genos.offsets,
+                src_sample_idxs,
+                ploidy,
+                kept_var_idxs,
+                new_offsets.ravel(),
+                out_var_idxs_mm,
+            )
+        out_var_idxs_mm.flush()
+
+        # --- 8. Pass 2 (fields): write each field ---
+        for name in fields_to_write:
+            dtype = self.available_fields[name]
+            src_field_rag = _open_fmt(
+                name, dtype, self.path, (self.n_samples, ploidy, None), "r"
+            )
+            out_field_mm = np.memmap(
+                output / f"{name}.npy",
+                dtype=dtype,
+                mode="w+",
+                shape=(n_entries,),
+            )
+            with numba_threads(threads_resolved):
+                _nb_write_field(
+                    src_field_rag.data,
+                    self.genos.data,
+                    self.genos.offsets,
+                    src_sample_idxs,
+                    ploidy,
+                    kept_var_idxs,
+                    new_offsets.ravel(),
+                    out_field_mm,
+                )
+            out_field_mm.flush()
+            del src_field_rag
+
+        # --- 9. Build new index ---
+        new_index = self.index[kept_var_idxs.tolist()]
+        # Drop existing AF and row-index columns if present
+        cols_to_drop = [c for c in ("AF", "index") if c in new_index.columns]
+        if cols_to_drop:
+            new_index = new_index.drop(cols_to_drop)
+
+        # Compute AFs over the written genos
+        n_alleles = n_out * ploidy
+        afs = np.zeros(len(kept_var_idxs), dtype=np.float32)
+        _nb_af_helper(afs, out_var_idxs_mm, new_offsets.ravel(), n_alleles)
+
+        new_index = new_index.with_columns(AF=pl.Series(afs))
+        new_index.write_ipc(SparseVar._index_path(output))
+
+        # --- 10. Write metadata.json ---
+        with open(output / "metadata.json", "w") as f:
+            json_str = SparseVarMetadata(
+                version=CURRENT_VERSION,
+                samples=caller_samples,
+                ploidy=ploidy,
+                contigs=self.contigs,
+                fields={n: self.available_fields[n].name for n in fields_to_write},
+            ).model_dump_json()
+            f.write(json_str)
+
 
 @nb.njit(nogil=True, cache=True)
 def _nb_af_helper(afs, v_idxs, offsets, max_count):
@@ -939,6 +1370,88 @@ def _nb_af_helper(afs, v_idxs, offsets, max_count):
         v_slice = v_idxs[o_s:o_e]
         afs[v_slice] += 1
     afs /= max_count
+
+
+@nb.njit(parallel=True, nogil=True, cache=True)
+def _nb_count_kept(
+    src_data, src_offsets, src_sample_idxs, ploidy, kept_var_idxs, out_lengths
+):
+    """Pass 1: count, per output (sample, ploidy) slot, how many source variant
+    indices fall in `kept_var_idxs`."""
+    n_out = src_sample_idxs.shape[0]
+    n_kept = kept_var_idxs.shape[0]
+    for i in nb.prange(n_out):
+        s = src_sample_idxs[i]
+        for p in range(ploidy):
+            src_slot = s * ploidy + p
+            count = 0
+            lo = src_offsets[src_slot]
+            hi = src_offsets[src_slot + 1]
+            for j in range(lo, hi):
+                v = src_data[j]
+                k = np.searchsorted(kept_var_idxs, v)
+                if k < n_kept and kept_var_idxs[k] == v:
+                    count += 1
+            out_lengths[i * ploidy + p] = count
+
+
+@nb.njit(parallel=True, nogil=True, cache=True)
+def _nb_write_var_idxs(
+    src_data,
+    src_offsets,
+    src_sample_idxs,
+    ploidy,
+    kept_var_idxs,
+    new_offsets,
+    out_var_idxs,
+):
+    """Pass 2: write remapped variant indices."""
+    n_out = src_sample_idxs.shape[0]
+    n_kept = kept_var_idxs.shape[0]
+    for i in nb.prange(n_out):
+        s = src_sample_idxs[i]
+        for p in range(ploidy):
+            src_slot = s * ploidy + p
+            out_slot = i * ploidy + p
+            wp = new_offsets[out_slot]
+            lo = src_offsets[src_slot]
+            hi = src_offsets[src_slot + 1]
+            for j in range(lo, hi):
+                v = src_data[j]
+                k = np.searchsorted(kept_var_idxs, v)
+                if k < n_kept and kept_var_idxs[k] == v:
+                    out_var_idxs[wp] = k
+                    wp += 1
+
+
+@nb.njit(parallel=True, nogil=True, cache=True)
+def _nb_write_field(
+    src_field,
+    src_data,
+    src_offsets,
+    src_sample_idxs,
+    ploidy,
+    kept_var_idxs,
+    new_offsets,
+    out_field,
+):
+    """Pass 2 (field variant): writes src_field values at filter-kept positions."""
+    n_out = src_sample_idxs.shape[0]
+    n_kept = kept_var_idxs.shape[0]
+    for i in nb.prange(n_out):
+        s = src_sample_idxs[i]
+        for p in range(ploidy):
+            src_slot = s * ploidy + p
+            out_slot = i * ploidy + p
+            wp = new_offsets[out_slot]
+            lo = src_offsets[src_slot]
+            hi = src_offsets[src_slot + 1]
+            for j in range(lo, hi):
+                v = src_data[j]
+                k = np.searchsorted(kept_var_idxs, v)
+                if k < n_kept and kept_var_idxs[k] == v:
+                    out_field[wp] = src_field[j]
+                    wp += 1
 
 
 def _process_contig_vcf(
