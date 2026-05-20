@@ -17,7 +17,6 @@ jobs:
         with:
           fetch-depth: 0
           token: ${{ secrets.GH_ACTIONS }}
-          submodules: recursive
       - name: Create bump and changelog
         id: cz
         uses: commitizen-tools/commitizen-action@338bbd841b75aaee6bf5340e1fa12f6ab58ff9ff # 0.27.1
@@ -46,7 +45,6 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: ${{ needs.bump.outputs.version }}
-          submodules: recursive
       - name: Install uv
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
       - name: Install Python 3.13
@@ -69,7 +67,6 @@ jobs:
           ref: stable
           fetch-depth: 0
           token: ${{ secrets.GH_ACTIONS }}
-          submodules: recursive
       - name: Config git
         run: |
           git config --global user.name "github-actions[bot]"
