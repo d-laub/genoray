@@ -618,14 +618,14 @@ def _resolve_kept_var_idxs(
         starts = sub["start"].to_numpy()
         ends = sub["end"].to_numpy()
 
-        # var_ranges returns (n_ranges, 2) inclusive-on-both-ends in variant index space,
+        # var_ranges returns (n_ranges, 2) with exclusive end in variant index space,
         # using a sentinel iinfo(V_IDX_TYPE).max to denote "no overlap" rows.
         vr = sv.var_ranges(c, starts, ends)
         sentinel = np.iinfo(V_IDX_TYPE).max
         valid = vr[:, 0] != sentinel
         for s, e in vr[valid]:
-            # inclusive both ends
-            kept_chunks.append(np.arange(s, e + 1, dtype=V_IDX_TYPE))
+            # exclusive end
+            kept_chunks.append(np.arange(s, e, dtype=V_IDX_TYPE))
 
     if not kept_chunks:
         return np.empty(0, dtype=V_IDX_TYPE)

@@ -264,7 +264,7 @@ def _resolve_kept_var_idxs(
         vr = sv.var_ranges(c, starts, ends)  # shape (n_ranges, 2)
         valid = vr[:, 0] != sentinel
         for s, e in vr[valid]:
-            kept_chunks.append(np.arange(s, e + 1, dtype=V_IDX_TYPE))
+            kept_chunks.append(np.arange(s, e, dtype=V_IDX_TYPE))
 
     if not kept_chunks:
         return np.empty(0, dtype=V_IDX_TYPE)

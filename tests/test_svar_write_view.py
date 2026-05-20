@@ -260,3 +260,32 @@ def test_resolve_kept_var_idxs_pos_mode_hits_known_variant(svar_wv):
     assert len(kept) >= 1
     assert np.all(kept >= 0)
     assert np.all(kept < svar_wv.n_variants)
+
+
+def test_resolve_kept_var_idxs_variant_matches_var_ranges_exclusive_end(svar_wv):
+    """In variant mode, the kept set must equal the union of [s, e) ranges from
+    var_ranges (exclusive end)."""
+    from genoray._svar import _resolve_kept_var_idxs
+
+    contig = svar_wv.contigs[0]
+    regions = pl.DataFrame(
+        {"chrom": [contig], "start": [0], "end": [100_000]},
+        schema={"chrom": pl.Utf8, "start": pl.Int32, "end": pl.Int32},
+    )
+    kept = _resolve_kept_var_idxs(
+        svar_wv, regions, mode="variant", merge_overlapping=False
+    )
+
+    starts = np.array([0], dtype=np.int32)
+    ends = np.array([100_000], dtype=np.int32)
+    vr = svar_wv.var_ranges(contig, starts, ends)
+    sentinel = np.iinfo(np.int32).max
+    valid = vr[:, 0] != sentinel
+    expected = (
+        np.unique(
+            np.concatenate([np.arange(s, e, dtype=np.int32) for s, e in vr[valid]])
+        )
+        if valid.any()
+        else np.empty(0, dtype=np.int32)
+    )
+    np.testing.assert_array_equal(kept, expected)
