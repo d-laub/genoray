@@ -45,8 +45,9 @@ def write_view(
   index.arrow
   variant_idxs.npy   # ragged data, dtype V_IDX_TYPE
   offsets.npy        # length N_out * ploidy + 1
-  afs.npy            # recomputed
   <field>.npy        # one per field written
+                     # NOTE: AFs are stored as the "AF" column in index.arrow
+                     # (matching cache_afs/_write_afs), not as a separate file.
 ```
 
 ## Algorithm
@@ -184,13 +185,13 @@ def _resolve_threads(threads: int | None) -> int:
 ### 6. Index, AFs, metadata
 
 - **Index**: `new_index = self.index.gather(kept_var_idxs)` (or equivalent polars idiom). Write via existing `SparseVar._index_path` helper.
-- **AFs**: recompute over freshly written genos:
+- **AFs**: recompute over freshly written genos by reusing the existing `_nb_af_helper`:
   ```python
-  af_counts = np.zeros(len(kept_var_idxs), dtype=np.int64)
-  np.add.at(af_counts, out_var_idxs, 1)
-  afs = (af_counts / (N_out * ploidy)).astype(np.float32)
+  afs = np.zeros(len(kept_var_idxs), dtype=np.float32)
+  _nb_af_helper(afs, out_var_idxs_mm, new_offsets.ravel(), N_out * ploidy)
+  new_index = new_index.with_columns(AF=pl.Series(afs))
   ```
-  Persist using the same path/format as `_write_afs` / `cache_afs`.
+  Persisted as the `AF` column of `index.arrow` (matching `cache_afs`/`_write_afs`); no separate file.
 - **metadata.json**:
   ```python
   SparseVarMetadata(
