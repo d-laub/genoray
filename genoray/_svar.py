@@ -1191,6 +1191,177 @@ class SparseVar(Generic[_SRT]):
 
         self.genos = ak.transform(memmap2array, self.genos)  # type: ignore
 
+    def write_view(
+        self,
+        regions,
+        samples,
+        output: str | Path,
+        fields: Sequence[str] | None = None,
+        merge_overlapping: bool = False,
+        regions_overlap: Literal["pos", "record", "variant"] = "pos",
+        overwrite: bool = False,
+        threads: int | None = None,
+    ) -> None:
+        """Write a subset of this SparseVar to a new directory.
+
+        Parameters
+        ----------
+        regions
+            Region(s) to include. Accepts the same input types as
+            :func:`_normalize_regions`: a ``"chrom:start-end"`` string, a
+            ``(chrom, start, end)`` tuple, a BED file path, or a
+            polars/pandas/pyranges frame.
+        samples
+            Samples to include.  Accepts a single sample name, a list, or a
+            path to a file of newline-separated names.
+        output
+            Destination directory for the new SparseVar.
+        fields
+            Fields to carry over (``None`` = all available; ``[]`` = none).
+        merge_overlapping
+            If ``True`` silently merge overlapping regions; if ``False``
+            raise ``ValueError`` when overlaps are detected.
+        regions_overlap
+            How variants are matched to regions — ``"pos"``, ``"record"``, or
+            ``"variant"``.  See :func:`_resolve_kept_var_idxs`.
+        overwrite
+            Whether to overwrite *output* if it already exists.
+        threads
+            Number of Numba threads to use.  ``None`` uses all available CPUs.
+        """
+        from ._utils import _resolve_threads, numba_threads
+
+        output = Path(output)
+
+        # --- 1. Output directory ---
+        if output.exists():
+            if not overwrite:
+                raise FileExistsError(
+                    f"Output path {output} already exists. Use overwrite=True to overwrite."
+                )
+            shutil.rmtree(output)
+        output.mkdir(parents=True)
+
+        # --- 2. Normalize inputs ---
+        regions_df = _normalize_regions(regions, self._c_norm)
+        caller_samples = _normalize_samples(samples, self.available_samples)
+        fields_to_write = _validate_fields(fields, self.available_fields)
+
+        if not caller_samples:
+            raise ValueError("write_view requires at least one sample")
+
+        # --- 3. Resolve kept variant indices ---
+        kept_var_idxs = _resolve_kept_var_idxs(
+            self, regions_df, regions_overlap, merge_overlapping
+        )
+        if len(kept_var_idxs) == 0:
+            raise ValueError("no variants selected by `regions`")
+
+        # --- 4. Setup ---
+        n_out = len(caller_samples)
+        ploidy = self.ploidy
+        threads_resolved = _resolve_threads(threads)
+
+        src_sample_idxs = self._s2i[np.array(caller_samples)].astype(np.int64)
+
+        # --- 5. Pass 1: count kept entries per output slot ---
+        out_lengths = np.zeros(n_out * ploidy, dtype=np.int64)
+        with numba_threads(threads_resolved):
+            _nb_count_kept(
+                self.genos.data,
+                self.genos.offsets,
+                src_sample_idxs,
+                ploidy,
+                kept_var_idxs,
+                out_lengths,
+            )
+
+        new_offsets = lengths_to_offsets(out_lengths.reshape(n_out, ploidy))
+
+        # --- 6. Write offsets.npy ---
+        offsets_mm = np.memmap(
+            output / "offsets.npy",
+            dtype=np.int64,
+            mode="w+",
+            shape=new_offsets.shape,
+        )
+        offsets_mm[:] = new_offsets
+        offsets_mm.flush()
+
+        # Allocate output variant_idxs memmap
+        n_entries = int(new_offsets[-1])
+        out_var_idxs_mm = np.memmap(
+            output / "variant_idxs.npy",
+            dtype=V_IDX_TYPE,
+            mode="w+",
+            shape=(n_entries,),
+        )
+
+        # --- 7. Pass 2 (genos): write remapped variant indices ---
+        with numba_threads(threads_resolved):
+            _nb_write_var_idxs(
+                self.genos.data,
+                self.genos.offsets,
+                src_sample_idxs,
+                ploidy,
+                kept_var_idxs,
+                new_offsets.ravel(),
+                out_var_idxs_mm,
+            )
+        out_var_idxs_mm.flush()
+
+        # --- 8. Pass 2 (fields): write each field ---
+        for name in fields_to_write:
+            dtype = self.available_fields[name]
+            src_field_rag = _open_fmt(
+                name, dtype, self.path, (self.n_samples, ploidy, None), "r"
+            )
+            out_field_mm = np.memmap(
+                output / f"{name}.npy",
+                dtype=dtype,
+                mode="w+",
+                shape=(n_entries,),
+            )
+            with numba_threads(threads_resolved):
+                _nb_write_field(
+                    src_field_rag.data,
+                    self.genos.data,
+                    self.genos.offsets,
+                    src_sample_idxs,
+                    ploidy,
+                    kept_var_idxs,
+                    new_offsets.ravel(),
+                    out_field_mm,
+                )
+            out_field_mm.flush()
+            del src_field_rag
+
+        # --- 9. Build new index ---
+        new_index = self.index[kept_var_idxs.tolist()]
+        # Drop existing AF and row-index columns if present
+        cols_to_drop = [c for c in ("AF", "index") if c in new_index.columns]
+        if cols_to_drop:
+            new_index = new_index.drop(cols_to_drop)
+
+        # Compute AFs over the written genos
+        n_alleles = n_out * ploidy
+        afs = np.zeros(len(kept_var_idxs), dtype=np.float32)
+        _nb_af_helper(afs, out_var_idxs_mm, new_offsets.ravel(), n_alleles)
+
+        new_index = new_index.with_columns(AF=pl.Series(afs))
+        new_index.write_ipc(SparseVar._index_path(output))
+
+        # --- 10. Write metadata.json ---
+        with open(output / "metadata.json", "w") as f:
+            json_str = SparseVarMetadata(
+                version=CURRENT_VERSION,
+                samples=caller_samples,
+                ploidy=ploidy,
+                contigs=self.contigs,
+                fields={n: self.available_fields[n].name for n in fields_to_write},
+            ).model_dump_json()
+            f.write(json_str)
+
 
 @nb.njit(nogil=True, cache=True)
 def _nb_af_helper(afs, v_idxs, offsets, max_count):

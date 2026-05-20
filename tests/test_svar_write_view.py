@@ -387,3 +387,121 @@ def test_nb_write_field_matches_python():
     # out 1 = sample 0, ploidy 0 -> src slot 0, data[0:2]=[0,2]; kept: v=0->field[0]=10
     # out 1 = sample 0, ploidy 1 -> src slot 1, data[2:4]=[5,1]; kept: v=5->field[2]=30, v=1->field[3]=40
     assert out_field.tolist() == [60.0, 70.0, 10.0, 30.0, 40.0]
+
+
+# ---------------------------------------------------------------------------
+# Task 6: SparseVar.write_view
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def svar():
+    return SparseVar(ddir / "biallelic.vcf.svar")
+
+
+@pytest.fixture
+def svar_with_dosages():
+    return SparseVar(ddir / "biallelic.vcf.svar")
+
+
+def test_write_view_roundtrip_full(tmp_path: Path, svar: SparseVar):
+    out = tmp_path / "view.svar"
+    contig = svar.contigs[0]
+    samples = svar.available_samples[:2]
+    svar.write_view(
+        regions=(contig, 0, 1_000_000),
+        samples=samples,
+        output=out,
+    )
+    sv2 = SparseVar(out)
+    assert sv2.available_samples == samples
+    assert sv2.ploidy == svar.ploidy
+    assert sv2.contigs == svar.contigs
+
+    # Variant count equals number of variants on this contig in the source
+    src_idx_on_c = svar.index.filter(pl.col("CHROM") == contig)
+    assert sv2.index.filter(pl.col("CHROM") == contig).height == src_idx_on_c.height
+
+
+def test_write_view_sample_subset_and_order(tmp_path: Path, svar: SparseVar):
+    out = tmp_path / "view.svar"
+    contig = svar.contigs[0]
+    samples = [svar.available_samples[1], svar.available_samples[0]]  # reversed
+    svar.write_view(
+        regions=(contig, 0, 1_000_000),
+        samples=samples,
+        output=out,
+    )
+    sv2 = SparseVar(out)
+    assert sv2.available_samples == samples
+
+
+def test_write_view_overwrite_protection(tmp_path: Path, svar: SparseVar):
+    out = tmp_path / "view.svar"
+    contig = svar.contigs[0]
+    samples = svar.available_samples[:1]
+    svar.write_view(regions=(contig, 0, 1_000_000), samples=samples, output=out)
+    with pytest.raises(FileExistsError):
+        svar.write_view(regions=(contig, 0, 1_000_000), samples=samples, output=out)
+    svar.write_view(
+        regions=(contig, 0, 1_000_000), samples=samples, output=out, overwrite=True
+    )
+
+
+def test_write_view_afs_match_compute_afs(tmp_path: Path, svar: SparseVar):
+    out = tmp_path / "view.svar"
+    contig = svar.contigs[0]
+    samples = svar.available_samples[:2]
+    svar.write_view(
+        regions=(contig, 0, 1_000_000),
+        samples=samples,
+        output=out,
+    )
+    # Load AF column explicitly; AF is stored in index.arrow but not loaded by default
+    v = SparseVar(out, attrs="AF")
+    assert "AF" in v.index.columns
+    expected = v._compute_afs()
+    np.testing.assert_allclose(v.index["AF"].to_numpy(), expected, atol=1e-6)
+
+
+def test_write_view_threads_deterministic(tmp_path: Path, svar: SparseVar):
+    out1 = tmp_path / "v1.svar"
+    out2 = tmp_path / "v2.svar"
+    contig = svar.contigs[0]
+    samples = svar.available_samples[:2]
+    svar.write_view(
+        regions=(contig, 0, 1_000_000), samples=samples, output=out1, threads=1
+    )
+    svar.write_view(
+        regions=(contig, 0, 1_000_000), samples=samples, output=out2, threads=None
+    )
+    a = np.fromfile(out1 / "variant_idxs.npy", dtype=np.int32)
+    b = np.fromfile(out2 / "variant_idxs.npy", dtype=np.int32)
+    np.testing.assert_array_equal(a, b)
+
+
+def test_write_view_fields_default_carries_all(
+    tmp_path: Path, svar_with_dosages: SparseVar
+):
+    view_out = tmp_path / "view.svar"
+    svar_with_dosages.write_view(
+        regions=(svar_with_dosages.contigs[0], 0, 1_000_000),
+        samples=svar_with_dosages.available_samples[:1],
+        output=view_out,
+    )
+    v = SparseVar(view_out)
+    assert set(v.available_fields) == set(svar_with_dosages.available_fields)
+
+
+def test_write_view_fields_explicit_empty_drops_dosages(
+    tmp_path: Path, svar_with_dosages: SparseVar
+):
+    view_out = tmp_path / "view.svar"
+    svar_with_dosages.write_view(
+        regions=(svar_with_dosages.contigs[0], 0, 1_000_000),
+        samples=svar_with_dosages.available_samples[:1],
+        output=view_out,
+        fields=[],
+    )
+    v = SparseVar(view_out)
+    assert v.available_fields == {}
