@@ -1,3 +1,15 @@
+## 2.6.0 (2026-05-21)
+
+### Feat
+
+- **pkg**: expose genoray script; drop [cli] extra
+- **cli**: move cli source into genoray._cli
+- **svar**: drop MAC=0 variants from write_view output
+
+### Perf
+
+- **init**: make genoray.__init__ lazy via PEP 562 __getattr__
+
 ## 2.5.0 (2026-05-20)
 
 ### Feat
