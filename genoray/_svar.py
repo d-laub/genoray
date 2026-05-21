@@ -1228,6 +1228,13 @@ class SparseVar(Generic[_SRT]):
             Whether to overwrite *output* if it already exists.
         threads
             Number of Numba threads to use.  ``None`` uses all available CPUs.
+
+        Notes
+        -----
+        Variants whose minor allele count is 0 in the chosen sample subset are
+        dropped from the output. If every candidate variant drops, a
+        :class:`ValueError` is raised — the same code path that fires when
+        ``regions`` itself selects no variants.
         """
         from ._utils import _resolve_threads, numba_threads
 
@@ -1263,6 +1270,31 @@ class SparseVar(Generic[_SRT]):
         threads_resolved = _resolve_threads(threads)
 
         src_sample_idxs = self._s2i[np.array(caller_samples)].astype(np.int64)
+
+        # --- 4.5. Pre-pass: drop variants whose MAC across kept samples is 0 ---
+        mac_per_kept = np.zeros(len(kept_var_idxs), dtype=np.int64)
+        with numba_threads(threads_resolved):
+            _nb_count_mac_per_kept(
+                self.genos.data,
+                self.genos.offsets,
+                src_sample_idxs,
+                ploidy,
+                kept_var_idxs,
+                mac_per_kept,
+            )
+        keep_mask = mac_per_kept > 0
+        n_dropped = int((~keep_mask).sum())
+        if n_dropped:
+            warnings.warn(
+                f"write_view: dropping {n_dropped} variant(s) with MAC=0 in the output sample set",
+                stacklevel=2,
+            )
+            kept_var_idxs = kept_var_idxs[keep_mask]
+        if len(kept_var_idxs) == 0:
+            raise ValueError(
+                "all variants in the selected regions have MAC=0 in the "
+                "chosen sample subset; nothing to write"
+            )
 
         # --- 5. Pass 1: count kept entries per output slot ---
         out_lengths = np.zeros(n_out * ploidy, dtype=np.int64)
@@ -1393,6 +1425,30 @@ def _nb_count_kept(
                 if k < n_kept and kept_var_idxs[k] == v:
                     count += 1
             out_lengths[i * ploidy + p] = count
+
+
+@nb.njit(parallel=True, nogil=True, cache=True)
+def _nb_count_mac_per_kept(
+    src_data, src_offsets, src_sample_idxs, ploidy, kept_var_idxs, mac_out
+):
+    """Count, per kept variant, the number of non-ref entries across (sample, ploidy)
+    in the output. Outer prange is over kept variants so each writes its own slot —
+    no atomics needed."""
+    n_kept = kept_var_idxs.shape[0]
+    n_samples = src_sample_idxs.shape[0]
+    for k in nb.prange(n_kept):
+        v = kept_var_idxs[k]
+        count = 0
+        for i in range(n_samples):
+            s = src_sample_idxs[i]
+            for p in range(ploidy):
+                src_slot = s * ploidy + p
+                lo = src_offsets[src_slot]
+                hi = src_offsets[src_slot + 1]
+                idx = np.searchsorted(src_data[lo:hi], v)
+                if idx < (hi - lo) and src_data[lo + idx] == v:
+                    count += 1
+        mac_out[k] = count
 
 
 @nb.njit(parallel=True, nogil=True, cache=True)

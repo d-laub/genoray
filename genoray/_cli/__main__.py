@@ -1,0 +1,229 @@
+#! /usr/bin/env python
+
+from __future__ import annotations
+
+from importlib.metadata import version
+from pathlib import Path
+from typing import Annotated, Literal, Union
+
+from cyclopts import App, Parameter
+
+app = App(
+    help_on_error=True,
+    version=f"[magenta]genoray[/magenta] {version('genoray')}",
+    version_format="rich",
+    help="Tools for genoray, including SVAR files.",
+)
+
+
+@app.command
+def index(source: Path):
+    """Create a genoray index for a VCF or PGEN file."""
+    from genoray import VCF
+    from genoray._pgen import _write_index
+    from genoray._utils import variant_file_type
+
+    file_type = variant_file_type(source)
+    if file_type == "vcf":
+        vcf = VCF(source)
+        vcf._write_gvi_index()
+    elif file_type == "pgen":
+        index = source.with_suffix(".pvar")
+
+        if not index.exists():
+            index = source.with_suffix(".pvar.zst")
+
+        if not index.exists():
+            raise FileNotFoundError("No index file found.")
+
+        index = index.with_suffix(f"{index.suffix}.gvi")
+        _write_index(index)
+    else:
+        raise ValueError(f"Unsupported file type: {source}")
+
+
+@app.command
+def write(
+    source: Path,
+    out: Path,
+    max_mem: str = "1g",
+    overwrite: bool = False,
+    dosages: Union[str, None] = None,
+    threads: int | None = None,
+) -> None:
+    """
+    Convert a VCF or PGEN file to a SVAR file.
+
+    Parameters
+    ----------
+    source
+        Path to the input VCF or PGEN file.
+    out
+        Path to the output SVAR file.
+    max_mem
+        Maximum memory to use for conversion e.g. 1g, 250 MB, etc.
+    overwrite
+        Whether to overwrite the output file if it exists.
+    dosages
+        Whether to write dosages.
+        If `source` is a PGEN, this must be a path to a PGEN of dosages.
+        If `source` is a VCF, this must be the name of the FORMAT field to use for dosages.
+        If not provided, dosages will not be written.
+    threads
+        Number of threads to use for conversion. Defaults to the number of available CPU cores.
+    """
+    from genoray import PGEN, VCF, SparseVar
+    from genoray._utils import variant_file_type
+
+    file_type = variant_file_type(source)
+
+    if dosages is None:
+        with_dosages = False
+    else:
+        with_dosages = True
+
+    if threads is None:
+        threads = -1
+
+    if file_type == "vcf":
+        if dosages is not None and Path(dosages).exists():
+            raise ValueError(
+                "The `dosages` argument appears to be a path to an existing file, but VCF requires a FORMAT field name."
+            )
+
+        vcf = VCF(source, dosage_field=dosages)
+        SparseVar.from_vcf(
+            out, vcf, max_mem, overwrite, with_dosages=with_dosages, n_jobs=threads
+        )
+    elif file_type == "pgen":
+        pgen = PGEN(source, dosage_path=dosages)
+        SparseVar.from_pgen(
+            out, pgen, max_mem, overwrite, with_dosages=with_dosages, n_jobs=threads
+        )
+    else:
+        raise ValueError(f"Unsupported file type: {source}")
+
+
+@app.command
+def view(
+    source: Path,
+    out: Path,
+    *,
+    regions: Annotated[Union[str, None], Parameter(name=["--regions", "-r"])] = None,
+    regions_file: Annotated[
+        Union[Path, None], Parameter(name=["--regions-file", "-R"])
+    ] = None,
+    samples: Annotated[Union[str, None], Parameter(name=["--samples", "-s"])] = None,
+    samples_file: Annotated[
+        Union[Path, None], Parameter(name=["--samples-file", "-S"])
+    ] = None,
+    fields: Annotated[
+        Union[list[str], None], Parameter(name=["--fields", "-f"])
+    ] = None,
+    merge_overlapping: bool = False,
+    regions_overlap: Literal["pos", "record", "variant"] = "pos",
+    overwrite: bool = False,
+    threads: Annotated[Union[int, None], Parameter(name=["--threads", "-@"])] = None,
+) -> None:
+    """Write a subset of an SVAR to a new SVAR directory.
+
+    At least one of --regions/--regions-file or --samples/--samples-file is
+    required. The omitted side defaults to "all" (all samples or all variants).
+
+    Parameters
+    ----------
+    source
+        Path to the input SVAR directory.
+    out
+        Path to the output SVAR directory.
+    regions
+        Inline region(s): a single ``chrom:start-end`` (1-based inclusive, bcftools
+        convention) or a comma-separated list, e.g. ``chr1:1-100,chr2:200-300``.
+        Mutually exclusive with --regions-file.
+    regions_file
+        Path to a BED file (0-based half-open) of regions. Mutually exclusive
+        with --regions.
+    samples
+        Comma-separated list of sample names to keep, e.g. ``A,B,C``. Mutually
+        exclusive with --samples-file.
+    samples_file
+        Path to a file of sample names (one per line). Mutually exclusive with
+        --samples.
+    fields
+        Optional FORMAT fields to carry over (e.g. ``-f GT -f GQ``). Defaults to
+        all available fields. Use ``--empty-fields`` to carry over none.
+    merge_overlapping
+        If set, silently merge overlapping regions instead of raising.
+    regions_overlap
+        How variants are matched to regions: ``pos`` (default; match if the
+        variant POS falls in the range), ``record`` (match by VCF record extent),
+        or ``variant`` (match by full variant extent including ILEN).
+    overwrite
+        Overwrite the output directory if it already exists.
+    threads
+        Number of threads. Defaults to all available CPUs.
+    """
+    import polars as pl
+    from genoray import SparseVar
+
+    from ._view_helpers import parse_regions_arg
+
+    # No-op guard
+    if (
+        regions is None
+        and regions_file is None
+        and samples is None
+        and samples_file is None
+    ):
+        raise ValueError(
+            "at least one of --regions/--regions-file or --samples/--samples-file is required"
+        )
+
+    # Mutex within each pair
+    if regions is not None and regions_file is not None:
+        raise ValueError("--regions and --regions-file are mutually exclusive")
+    if samples is not None and samples_file is not None:
+        raise ValueError("--samples and --samples-file are mutually exclusive")
+
+    sv = SparseVar(source)
+
+    # Resolve regions arg
+    if regions is not None:
+        regions_arg: "pl.DataFrame | Path" = parse_regions_arg(regions)
+    elif regions_file is not None:
+        regions_arg = regions_file
+    else:
+        # "all variants" — one row per contig spanning [0, max_pos+1)
+        # Synthesize one row per contig covering [0, max(POS)+1)
+        bounds = (
+            sv.index.group_by("CHROM", maintain_order=True)
+            .agg(
+                start=pl.lit(0, dtype=pl.Int32),
+                end=(pl.col("POS").max() + 1).cast(pl.Int32),
+            )
+            .rename({"CHROM": "chrom"})
+        )
+        regions_arg = bounds.select("chrom", "start", "end")
+
+    # Resolve samples arg
+    if samples is not None:
+        samples_arg: "list[str] | Path" = [s for s in samples.split(",") if s]
+    elif samples_file is not None:
+        samples_arg = samples_file
+    else:
+        samples_arg = list(sv.available_samples)
+
+    sv.write_view(
+        regions=regions_arg,
+        samples=samples_arg,
+        output=out,
+        fields=fields,
+        merge_overlapping=merge_overlapping,
+        regions_overlap=regions_overlap,
+        overwrite=overwrite,
+        threads=threads,
+    )
+
+
+if __name__ == "__main__":
+    app()

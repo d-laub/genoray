@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging as _logging
 from typing import cast
 
 import numba as nb
@@ -12,6 +13,8 @@ from seqpro.rag import OFFSET_TYPE, lengths_to_offsets
 
 from ._types import POS_TYPE, V_IDX_TYPE
 from ._utils import DTYPE, ContigNormalizer, np_to_pl_dtype
+
+_logging.getLogger("polars_bio").setLevel(_logging.ERROR)
 
 
 def var_ranges(

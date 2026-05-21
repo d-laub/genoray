@@ -34,8 +34,8 @@ dependencies = [
     "filelock>3,<4",
 ]
 
-[project.optional-dependencies]
-cli = ["genoray-cli>=0.2.0"]
+[project.scripts]
+genoray = "genoray._cli.__main__:app"
 
 [tool.commitizen]
 name = "cz_conventional_commits"
