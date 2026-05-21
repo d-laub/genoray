@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from importlib.metadata import version
 from pathlib import Path
-from typing import Annotated, Literal, Union
+from typing import Annotated, Literal
 
 from cyclopts import App, Parameter
 
@@ -48,7 +48,7 @@ def write(
     out: Path,
     max_mem: str = "1g",
     overwrite: bool = False,
-    dosages: Union[str, None] = None,
+    dosages: str | None = None,
     threads: int | None = None,
 ) -> None:
     """
@@ -109,21 +109,19 @@ def view(
     source: Path,
     out: Path,
     *,
-    regions: Annotated[Union[str, None], Parameter(name=["--regions", "-r"])] = None,
+    regions: Annotated[str | None, Parameter(name=["--regions", "-r"])] = None,
     regions_file: Annotated[
-        Union[Path, None], Parameter(name=["--regions-file", "-R"])
+        Path | None, Parameter(name=["--regions-file", "-R"])
     ] = None,
-    samples: Annotated[Union[str, None], Parameter(name=["--samples", "-s"])] = None,
+    samples: Annotated[str | None, Parameter(name=["--samples", "-s"])] = None,
     samples_file: Annotated[
-        Union[Path, None], Parameter(name=["--samples-file", "-S"])
+        Path | None, Parameter(name=["--samples-file", "-S"])
     ] = None,
-    fields: Annotated[
-        Union[list[str], None], Parameter(name=["--fields", "-f"])
-    ] = None,
+    fields: Annotated[list[str] | None, Parameter(name=["--fields", "-f"])] = None,
     merge_overlapping: bool = False,
     regions_overlap: Literal["pos", "record", "variant"] = "pos",
     overwrite: bool = False,
-    threads: Annotated[Union[int, None], Parameter(name=["--threads", "-@"])] = None,
+    threads: Annotated[int | None, Parameter(name=["--threads", "-@"])] = None,
 ) -> None:
     """Write a subset of an SVAR to a new SVAR directory.
 
@@ -164,6 +162,7 @@ def view(
         Number of threads. Defaults to all available CPUs.
     """
     import polars as pl
+
     from genoray import SparseVar
 
     from ._view_helpers import parse_regions_arg
@@ -189,7 +188,7 @@ def view(
 
     # Resolve regions arg
     if regions is not None:
-        regions_arg: "pl.DataFrame | Path" = parse_regions_arg(regions)
+        regions_arg: pl.DataFrame | Path = parse_regions_arg(regions)
     elif regions_file is not None:
         regions_arg = regions_file
     else:
@@ -207,7 +206,7 @@ def view(
 
     # Resolve samples arg
     if samples is not None:
-        samples_arg: "list[str] | Path" = [s for s in samples.split(",") if s]
+        samples_arg: list[str] | Path = [s for s in samples.split(",") if s]
     elif samples_file is not None:
         samples_arg = samples_file
     else:
