@@ -54,3 +54,11 @@ ruff format genoray tests
 ### Commit convention
 
 All commits must follow [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `chore:`, etc.). Version bumps are managed by `commitizen` (`cz bump`).
+
+## Skills
+
+This repo ships an installable skill at `skills/genoray-api/SKILL.md` that documents the public API for agentic users (installable via [skills.sh](https://skills.sh/)).
+
+**Whenever a change adds, removes, renames, or alters the semantics of a public name** — anything reachable from `import genoray` without an underscore prefix, including class methods, mode constants, constructor kwargs, expressions in `genoray.exprs`, return shapes/dtypes, and coordinate/missing-value conventions — **the same PR MUST update `skills/genoray-api/SKILL.md`** to match. Treat this like docstring or CHANGELOG updates: not optional.
+
+If you are unsure whether a change is "public": if a downstream user could reach it via `import genoray` without underscores, it's public.
