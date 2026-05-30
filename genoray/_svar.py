@@ -352,6 +352,83 @@ def dense2sparse(
     return rag
 
 
+def _dense2sparse_with_length(
+    genos: NDArray[np.integer],
+    var_idxs: NDArray[V_IDX_TYPE],
+    q_start: int,
+    q_end: int,
+    v_starts: NDArray[np.int32],
+    ilens: NDArray[np.int32],
+    dosages: NDArray[DOSAGE_TYPE] | None = None,
+) -> Ragged[V_IDX_TYPE] | tuple[Ragged[V_IDX_TYPE], Ragged[DOSAGE_TYPE]]:
+    """Convert a dense ``with_length`` window (shared, over-extended across all
+    samples/haplotypes) into per-haplotype-minimal sparse output, identical to
+    ``SparseVar.read_ranges_with_length`` for the same query.
+
+    Parameters
+    ----------
+    genos
+        Dense genotypes for the window. Shape: (samples, ploidy, variants).
+    var_idxs
+        Global variant indices of the window, used only to populate the sparse
+        output. Shape: (variants,).
+    q_start, q_end
+        0-based, half-open original query span (before extension).
+    v_starts
+        0-based start positions of the window's variants (i.e. POS - 1).
+        Window-aligned: same length as the ``genos`` variant axis and
+        positionally aligned with ``var_idxs`` (NOT a global per-dataset array).
+        Shape: (variants,).
+    ilens
+        ILEN of the window's variants (ALT - REF length). Window-aligned, like
+        ``v_starts``. Shape: (variants,).
+    dosages
+        Optional dense dosages. Shape: (samples, variants).
+
+    Returns
+    -------
+        ``Ragged[V_IDX_TYPE]`` of shape (samples, ploidy, ~variants), or a tuple
+        with a matching ``Ragged[DOSAGE_TYPE]`` when ``dosages`` is given.
+    """
+    # single-range only: exactly (samples, ploidy, variants), no batch dimension
+    if genos.ndim != 3:
+        raise ValueError("Dense genotypes must have shape (samples, ploidy, variants).")
+    n_samples, ploidy, _ = genos.shape
+
+    v_starts = np.ascontiguousarray(v_starts, dtype=np.int32)
+    ilens = np.ascontiguousarray(ilens, dtype=np.int32)
+    var_idxs = np.ascontiguousarray(var_idxs, dtype=V_IDX_TYPE)
+
+    # Pass 1: per-haplotype kept counts (reuses the sparse path's length walk).
+    lengths = np.empty((n_samples, ploidy), dtype=np.int64)
+    _dense2sparse_count(
+        genos, v_starts, ilens, POS_TYPE(q_start), POS_TYPE(q_end), lengths
+    )
+
+    flat_offsets = lengths_to_offsets(lengths)
+    total = int(flat_offsets[-1])
+    shape = (n_samples, ploidy, None)
+
+    # Pass 2: fill the (and optionally the dosage) output in disjoint ranges.
+    out_data = np.empty(total, dtype=V_IDX_TYPE)
+    has_dose = dosages is not None
+    dose_in = (
+        np.ascontiguousarray(dosages, dtype=DOSAGE_TYPE)
+        if has_dose
+        else np.empty((0, 0), dtype=DOSAGE_TYPE)
+    )
+    out_dose = np.empty(total if has_dose else 0, dtype=DOSAGE_TYPE)
+    _dense2sparse_fill(
+        genos, var_idxs, dose_in, lengths, flat_offsets, out_data, out_dose, has_dose
+    )
+
+    rag = Ragged[V_IDX_TYPE].from_offsets(out_data, shape, flat_offsets)
+    if has_dose:
+        drag = Ragged[DOSAGE_TYPE].from_offsets(out_dose, shape, flat_offsets)
+        return rag, drag
+    return rag
+
+
 CURRENT_VERSION = 1
 
 
@@ -1926,6 +2003,106 @@ def _find_starts_ends(
     return out_offsets
 
 
+@nb.njit(nogil=True, cache=True)
+def _length_walk_n_keep(
+    sp_genos: NDArray[V_IDX_TYPE],
+    v_starts: NDArray[np.int32],
+    ilens: NDArray[np.int32],
+    start_idx: int,
+    max_idx: int,
+    q_start: POS_TYPE,
+    q_end: POS_TYPE,
+) -> int:
+    """Number of leading variants in ``sp_genos[start_idx:max_idx]`` to include
+    so one haplotype reaches ``q_end - q_start`` in length, extending past
+    ``q_end`` only as needed. Variants strictly inside ``[q_start, q_end)`` are
+    always included; the length budget only gates extension past ``q_end``.
+    Returns a count in ``[0, max_idx - start_idx]``."""
+    q_len = q_end - q_start
+    last_v_end = q_start
+    written_len = 0
+    for j in range(start_idx, max_idx):
+        v_idx = sp_genos[j]
+        v_start = v_starts[v_idx]
+        ilen = ilens[v_idx]
+
+        maybe_add_one = POS_TYPE(v_start >= q_start)
+
+        if v_start >= q_start:
+            past_query = v_start >= q_end
+            written_len += v_start - last_v_end
+            if past_query and written_len >= q_len:
+                return j - start_idx  # exclude this variant
+            written_len += max(0, ilen) + maybe_add_one
+            if past_query and written_len >= q_len:
+                return j - start_idx + 1  # include this variant
+
+        v_end = v_start - min(0, ilen) + maybe_add_one
+        last_v_end = max(last_v_end, v_end)
+
+    return max_idx - start_idx
+
+
+@nb.njit(parallel=True, nogil=True, cache=True)
+def _dense2sparse_count(
+    genos: NDArray[np.integer],
+    v_starts: NDArray[np.int32],
+    ilens: NDArray[np.int32],
+    q_start: POS_TYPE,
+    q_end: POS_TYPE,
+    out_lengths: NDArray[np.int64],
+) -> None:
+    """Pass 1: per (sample, haplotype), count the carried ALT calls to keep.
+
+    Gathers each haplotype's carried (``== 1``) window-local positions in order
+    and routes them through :func:`_length_walk_n_keep` (the SAME walk the sparse
+    path uses, so the two cannot drift). Writes the kept count to ``out_lengths``.
+    """
+    n_samples, ploidy, n_var = genos.shape
+    for s in nb.prange(n_samples):
+        carriers = np.empty(n_var, dtype=V_IDX_TYPE)
+        for p in range(ploidy):
+            nc = 0
+            for v in range(n_var):
+                if genos[s, p, v] == 1:
+                    carriers[nc] = v
+                    nc += 1
+            out_lengths[s, p] = _length_walk_n_keep(
+                carriers, v_starts, ilens, 0, nc, q_start, q_end
+            )
+
+
+@nb.njit(parallel=True, nogil=True, cache=True)
+def _dense2sparse_fill(
+    genos: NDArray[np.integer],
+    var_idxs: NDArray[V_IDX_TYPE],
+    dosages: NDArray[DOSAGE_TYPE],
+    out_lengths: NDArray[np.int64],
+    flat_offsets: NDArray[OFFSET_TYPE],
+    out_data: NDArray[V_IDX_TYPE],
+    out_dose: NDArray[DOSAGE_TYPE],
+    has_dose: bool,
+) -> None:
+    """Pass 2: emit the first ``out_lengths[s, p]`` carried ALT calls per
+    haplotype into the disjoint output range ``[flat_offsets[slot], ...)``."""
+    n_samples, ploidy, n_var = genos.shape
+    for s in nb.prange(n_samples):
+        for p in range(ploidy):
+            slot = s * ploidy + p
+            n_keep = out_lengths[s, p]
+            w = flat_offsets[slot]
+            kept = 0
+            for v in range(n_var):
+                if kept >= n_keep:
+                    break
+                if genos[s, p, v] == 1:
+                    out_data[w] = var_idxs[v]
+                    if has_dose:
+                        out_dose[w] = dosages[s, v]
+                    w += 1
+                    kept += 1
+
+
 @nb.njit(parallel=False, nogil=True, cache=True)
 def _find_starts_ends_with_length(
     genos: NDArray[V_IDX_TYPE],
@@ -1998,57 +2175,16 @@ def _find_starts_ends_with_length(
                     out[1, r, s, p] = start_idx + o_s
                     continue
 
-                q_start: POS_TYPE = q_starts[r]
-                q_end: POS_TYPE = q_ends[r]
-                q_len: POS_TYPE = q_end - q_start
-                last_v_end: POS_TYPE = q_start
-                written_len = 0
-                # ensure geno_idx is assigned when start_idx == n_vars
-                geno_idx = start_idx
-                for geno_idx in range(start_idx, max_idx):
-                    v_idx: V_IDX_TYPE = sp_genos[geno_idx]
-                    v_start: np.int32 = v_starts[v_idx]
-                    ilen: np.int32 = ilens[v_idx]
-
-                    # only add atomized length if v_start >= ref_start
-                    maybe_add_one = POS_TYPE(v_start >= q_start)
-                    # variants strictly inside [q_start, q_end) must always be included;
-                    # length budget only governs extension past q_end
-                    past_query = v_start >= q_end
-
-                    # only variants within query can add to write length
-                    if v_start >= q_start:
-                        written_len += v_start - last_v_end
-                        if past_query and written_len >= q_len:
-                            geno_idx -= 1
-                            break
-
-                        v_write_len = (
-                            max(0, ilen)  # insertion length  # type: ignore
-                            + maybe_add_one  # maybe add atomized length
-                        )
-
-                        # right-clip insertions
-                        # Not necessary since it's inconsequential to overshoot the target length
-                        # and insertions don't affect the ref length for getting tracks.
-                        # Nevertheless, here's the code to clip a final insertion if we ever wanted to:
-                        # missing_len = target_len - cum_write_len
-                        # clip_right = max(0, v_len - missing_len)
-                        # v_len -= clip_right
-
-                        written_len += v_write_len
-                        if past_query and written_len >= q_len:
-                            break
-
-                    v_end = (
-                        v_start
-                        - min(0, ilen)  # deletion length  # type: ignore
-                        + maybe_add_one  # maybe add atomized length
-                    )
-                    last_v_end = max(last_v_end, v_end)  # type: ignore
-
-                # add o_s to make indices relative to whole array
-                out[1, r, s, p] = geno_idx + o_s + 1
+                n_keep = _length_walk_n_keep(
+                    sp_genos,
+                    v_starts,
+                    ilens,
+                    start_idx,
+                    max_idx,
+                    q_starts[r],
+                    q_ends[r],
+                )
+                out[1, r, s, p] = start_idx + o_s + n_keep
 
     unsorter = np.argsort(sorter)
     out[:] = out[:, unsorter]

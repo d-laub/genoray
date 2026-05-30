@@ -279,3 +279,25 @@ def test_nbytes_positive_after_index_loaded():
     assert vcf.nbytes > 0
     # sanity: at least one byte per row across CHROM/POS/REF/ALT
     assert vcf.nbytes >= vcf._index.height
+
+
+def test_chunk_with_length_phased_indel_in_extension():
+    # Regression: with phasing=True, an indel in the EXTENSION region (past the
+    # query) previously crashed _ext_genos_*_with_length with a hap_lens
+    # broadcast error (shape (s, ploidy) vs (s, ploidy + phasing)). Region B of
+    # the indels fixture (query 1999-2006) extends across the -30 deletion that
+    # begins region C, exercising the indel-in-extension path.
+    vcf = VCF(ddir / "indels.vcf.gz", dosage_field="DS")
+    vcf.phasing = True
+    gen = vcf._chunk_ranges_with_length("chr1", 1999, 2006, "1g", VCF.Genos16Dosages)
+    chunks = []
+    for range_ in gen:
+        for chunk, end, n_ext in range_:
+            gp, d = chunk
+            chunks.append(gp)
+        break
+    genos_phasing = np.concatenate(chunks, axis=-1)
+    # phased Genos16 has a phasing-indicator row -> axis 1 == ploidy + 1
+    assert genos_phasing.shape[1] == vcf.ploidy + 1
+    # and it produced at least the query's variants without crashing
+    assert genos_phasing.shape[-1] > 0
