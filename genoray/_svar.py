@@ -1926,6 +1926,41 @@ def _find_starts_ends(
     return out_offsets
 
 
+@nb.njit(nogil=True, cache=True)
+def _length_walk_n_keep(sp_genos, v_starts, ilens, start_idx, max_idx, q_start, q_end):
+    """Number of leading carried variants (from start_idx) to keep so one
+    haplotype reaches q_end - q_start in length, extending past q_end only as
+    needed. Variants strictly inside [q_start, q_end) are always kept; the
+    length budget only gates extension past q_end. Returns a count in
+    [0, max_idx - start_idx]."""
+    q_len = q_end - q_start
+    last_v_end = q_start
+    written_len = 0
+    i = -1
+    for j in range(start_idx, max_idx):
+        i = j - start_idx
+        v_idx = sp_genos[j]
+        v_start = v_starts[v_idx]
+        ilen = ilens[v_idx]
+
+        maybe_add_one = POS_TYPE(v_start >= q_start)
+        past_query = v_start >= q_end
+
+        if v_start >= q_start:
+            written_len += v_start - last_v_end
+            if past_query and written_len >= q_len:
+                i -= 1
+                break
+            written_len += max(0, ilen) + maybe_add_one
+            if past_query and written_len >= q_len:
+                break
+
+        v_end = v_start - min(0, ilen) + maybe_add_one
+        last_v_end = max(last_v_end, v_end)
+
+    return i + 1
+
+
 @nb.njit(parallel=False, nogil=True, cache=True)
 def _find_starts_ends_with_length(
     genos: NDArray[V_IDX_TYPE],
@@ -1998,57 +2033,16 @@ def _find_starts_ends_with_length(
                     out[1, r, s, p] = start_idx + o_s
                     continue
 
-                q_start: POS_TYPE = q_starts[r]
-                q_end: POS_TYPE = q_ends[r]
-                q_len: POS_TYPE = q_end - q_start
-                last_v_end: POS_TYPE = q_start
-                written_len = 0
-                # ensure geno_idx is assigned when start_idx == n_vars
-                geno_idx = start_idx
-                for geno_idx in range(start_idx, max_idx):
-                    v_idx: V_IDX_TYPE = sp_genos[geno_idx]
-                    v_start: np.int32 = v_starts[v_idx]
-                    ilen: np.int32 = ilens[v_idx]
-
-                    # only add atomized length if v_start >= ref_start
-                    maybe_add_one = POS_TYPE(v_start >= q_start)
-                    # variants strictly inside [q_start, q_end) must always be included;
-                    # length budget only governs extension past q_end
-                    past_query = v_start >= q_end
-
-                    # only variants within query can add to write length
-                    if v_start >= q_start:
-                        written_len += v_start - last_v_end
-                        if past_query and written_len >= q_len:
-                            geno_idx -= 1
-                            break
-
-                        v_write_len = (
-                            max(0, ilen)  # insertion length  # type: ignore
-                            + maybe_add_one  # maybe add atomized length
-                        )
-
-                        # right-clip insertions
-                        # Not necessary since it's inconsequential to overshoot the target length
-                        # and insertions don't affect the ref length for getting tracks.
-                        # Nevertheless, here's the code to clip a final insertion if we ever wanted to:
-                        # missing_len = target_len - cum_write_len
-                        # clip_right = max(0, v_len - missing_len)
-                        # v_len -= clip_right
-
-                        written_len += v_write_len
-                        if past_query and written_len >= q_len:
-                            break
-
-                    v_end = (
-                        v_start
-                        - min(0, ilen)  # deletion length  # type: ignore
-                        + maybe_add_one  # maybe add atomized length
-                    )
-                    last_v_end = max(last_v_end, v_end)  # type: ignore
-
-                # add o_s to make indices relative to whole array
-                out[1, r, s, p] = geno_idx + o_s + 1
+                n_keep = _length_walk_n_keep(
+                    sp_genos,
+                    v_starts,
+                    ilens,
+                    start_idx,
+                    max_idx,
+                    q_starts[r],
+                    q_ends[r],
+                )
+                out[1, r, s, p] = start_idx + o_s + n_keep
 
     unsorter = np.argsort(sorter)
     out[:] = out[:, unsorter]
