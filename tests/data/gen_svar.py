@@ -48,6 +48,7 @@ def main():
     SparseVar(ivcf_path).cache_afs()
 
     ipgen = PGEN(ddir / "indels.pgen", dosage_path=ddir / "indels.pgen")
+
     ipgen_path = ddir / "indels.pgen.svar"
     if ipgen_path.exists():
         shutil.rmtree(ipgen_path)

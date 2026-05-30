@@ -2,7 +2,7 @@
 ##contig=<ID=chr1>
 ##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
 ##FORMAT=<ID=DS,Number=1,Type=Float,Description="Dosage">
-##COMMENT=Region C: -30 deletion + 40 dense SNPs, contrived to force PGENs multi-round extension loop. Not a realistic genome.
+##COMMENT=with_length edge-case fixture. Region A (POS 1000): -10 deletion + 6 SNPs (multi-variant extension). Region B (POS 2000): -4 deletion het on sample1 hapA only + 3 SNPs (per-haplotype divergence). Region C (POS 3000): -30 deletion + 40 dense SNPs, contrived to force PGENs multi-round extension loop. Region D (POS 5000): lone -10 deletion as last variant (contig-end clamp). Not a realistic genome.
 #CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	sample1	sample2
 chr1	1000	.	GAAAAAAAAAA	G	.	.	.	GT:DS	1|1:2.0	1|1:2.0
 chr1	1011	.	T	C	.	.	.	GT:DS	1|1:2.0	1|1:2.0

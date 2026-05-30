@@ -8,6 +8,7 @@ ddir=$(realpath "$ddir")
 bi=$ddir/biallelic.vcf
 multi=$ddir/multiallelic.vcf
 unsorted=$ddir/three_samples_unsorted.vcf
+indels=$ddir/indels.vcf
 
 echo "Bgzipping and indexing VCF files..."
 bgzip -c "$bi" >| "$bi".gz
@@ -22,7 +23,6 @@ bgzip -c "$unsorted" >| "$unsorted".gz
 bcftools index "$unsorted".gz
 rm -f "$unsorted".gz.gvi
 
-indels=$ddir/indels.vcf
 bgzip -c "$indels" >| "$indels".gz
 bcftools index "$indels".gz
 rm -f "$indels".gz.gvi
