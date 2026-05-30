@@ -390,6 +390,7 @@ def _dense2sparse_with_length(
         ``Ragged[V_IDX_TYPE]`` of shape (samples, ploidy, ~variants), or a tuple
         with a matching ``Ragged[DOSAGE_TYPE]`` when ``dosages`` is given.
     """
+    # single-range only: exactly (samples, ploidy, variants), no batch dimension
     if genos.ndim != 3:
         raise ValueError("Dense genotypes must have shape (samples, ploidy, variants).")
     n_samples, ploidy, _ = genos.shape
