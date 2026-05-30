@@ -30,6 +30,8 @@ from genoray import PGEN, VCF, SparseVar
 from genoray._svar import _dense2sparse_with_length
 from genoray._types import V_IDX_TYPE
 
+from _length_helpers import assert_parsimonious_with_length
+
 ddir = Path(__file__).parent / "data"
 
 # (label, contig, start, end, clamped)
@@ -129,6 +131,72 @@ def test_pgen_window_bridges_to_svar(label, contig, start, end, clamped):
 
     actual = svar.read_ranges_with_length(contig, start, end)[0]
     assert _ragged_to_lists(actual) == _ragged_to_lists(brag)
+
+
+@pytest.mark.parametrize("label,contig,start,end,clamped", REGIONS)
+def test_with_length_is_parsimonious(label, contig, start, end, clamped):
+    """The with_length selection (from every backend) is exactly the
+    parsimonious set of ALT calls whose start lies in the reference footprint
+    [start, start + (q_len - sum_ilen)) — i.e. enough that right-padding with
+    reference reaches the query length, and not one ALT call more. See
+    tests/_length_helpers.py for the formulation.
+    """
+    svar = SparseVar(ddir / "indels.pgen.svar")
+    v_starts_g, ilens_g = _global_attrs(svar)
+    q_len = end - start
+
+    # Full per-haplotype carried ALT calls over the whole contig (non-extended).
+    carried = [
+        np.asarray(x) for x in _ragged_to_lists(svar.read_ranges(contig, 0, 10_000)[0])
+    ]
+
+    def check(per_hap_lists, backend):
+        assert_parsimonious_with_length(
+            [np.asarray(x) for x in per_hap_lists],
+            carried,
+            start,
+            q_len,
+            v_starts_g,
+            ilens_g,
+            backend=backend,
+        )
+
+    # SparseVar: native per-haplotype selection.
+    sv = svar.read_ranges_with_length(contig, start, end)[0]
+    check(_ragged_to_lists(sv), "svar")
+
+    # PGEN: dense window -> bridge -> per-haplotype selection.
+    pgen = PGEN(ddir / "indels.pgen", dosage_path=ddir / "indels.pgen")
+    genos, dosages, var_idxs = _collect_pgen(pgen, contig, start, end)
+    idx = var_idxs.astype(np.intp)
+    pbrag, _ = _dense2sparse_with_length(
+        genos.astype(np.int8),
+        var_idxs,
+        start,
+        end,
+        v_starts_g[idx].astype(np.int32),
+        ilens_g[idx].astype(np.int32),
+        dosages,
+    )
+    check(_ragged_to_lists(pbrag), "pgen")
+
+    # VCF: dense window -> bridge -> per-haplotype selection (indices
+    # reconstructed from the contiguous genomic-order window).
+    vcf = VCF(ddir / "indels.vcf.gz", dosage_field="DS")
+    vgenos, vdosages = _collect_vcf(vcf, contig, start, end)
+    n = vgenos.shape[-1]
+    w_start = int(np.searchsorted(v_starts_g, start))
+    vvar = np.arange(w_start, w_start + n, dtype=V_IDX_TYPE)
+    vbrag, _ = _dense2sparse_with_length(
+        vgenos.astype(np.int8),
+        vvar,
+        start,
+        end,
+        v_starts_g[w_start : w_start + n].astype(np.int32),
+        ilens_g[w_start : w_start + n].astype(np.int32),
+        vdosages,
+    )
+    check(_ragged_to_lists(vbrag), "vcf")
 
 
 @pytest.mark.parametrize("label,contig,start,end,clamped", REGIONS)
