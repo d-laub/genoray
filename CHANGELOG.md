@@ -1,3 +1,22 @@
+## 2.7.0 (2026-05-30)
+
+### Feat
+
+- add private _dense2sparse_with_length bridge
+
+### Fix
+
+- VCF with_length hap_lens shape under phasing with indel in extension
+
+### Refactor
+
+- simplify _length_walk_n_keep to early-returns with type hints
+- extract shared _length_walk_n_keep helper for with_length
+
+### Perf
+
+- numba-accelerate _dense2sparse_with_length
+
 ## 2.6.0 (2026-05-21)
 
 ### Feat
