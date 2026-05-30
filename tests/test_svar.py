@@ -196,6 +196,17 @@ def length_ext():
     return cse, desired
 
 
+def length_none():
+    # missing contig -> sentinel offsets (INT64_MAX) per haplotype
+    cse = "chr3", 0, 1
+    shape = (1, N_SAMPLES, PLOIDY, None)
+    sentinel = np.iinfo(OFFSET_TYPE).max
+    # (s p)
+    offsets = np.full((2, N_SAMPLES * PLOIDY), sentinel, OFFSET_TYPE)
+    desired = Ragged[V_IDX_TYPE].from_offsets(DATA, shape, offsets)
+    return cse, desired
+
+
 @parametrize_with_cases("cse, desired", cases=".", prefix="length_")
 def test_read_ranges_with_length(
     svar: SparseVar, cse: tuple[str, int, int], desired: Ragged[V_IDX_TYPE]
