@@ -7,7 +7,8 @@ import pytest
 from numpy.typing import ArrayLike, NDArray
 from pytest_cases import parametrize_with_cases
 
-from genoray._pgen import PGEN, POS_MAX, V_IDX_TYPE
+from genoray._pgen import PGEN, Genos, POS_MAX, V_IDX_TYPE, _gen_with_length
+from genoray._types import POS_TYPE
 
 tdir = Path(__file__).parent
 ddir = tdir / "data"
@@ -405,6 +406,81 @@ def test_pgen_nbytes_positive_after_init():
     assert pgen.nbytes > 0
     # both the index dataframe and the StartsEndsIlens cache should contribute
     assert pgen.nbytes >= pgen._index.estimated_size()
+
+
+def _fake_read_factory(dense_genos):
+    """dense_genos: (s p V) global int32 array. Returns read(var_idx)->Genos."""
+
+    def read(var_idx):
+        return Genos.parse(dense_genos[:, :, var_idx].astype(np.int32))
+
+    return read
+
+
+def test_gen_with_length_multi_round_extension():
+    # 1 sample, ploidy 2 (required by Genos predicate). Variant 0 is a -60
+    # deletion (carried on both haplotypes). Variants 1..40 are SNPs 1bp apart
+    # starting just past the deletion's reference end. The first extension batch
+    # of ~20 variants spans only ~20 bp; with a -60 deletion the haplotype
+    # length deficit is still unmet, forcing a 2nd doubling round.
+    n = 41
+    v_starts = np.empty(n, dtype=POS_TYPE)
+    v_starts[0] = 2999  # deletion at 0-based 2999
+    v_starts[1:] = np.arange(3060, 3060 + (n - 1), dtype=POS_TYPE)
+    ilens = np.zeros(n, dtype=np.int32)
+    ilens[0] = -60
+    v_ends = v_starts + 1
+    v_ends[0] = 2999 + 61  # REF length 61
+
+    # all variants carried on both haplotypes (shape: s=1, p=2, V=n)
+    dense = np.ones((1, 2, n), dtype=np.int32)
+    read = _fake_read_factory(dense)
+
+    q_start, q_end = 2999, 3060  # len 61
+    v_chunks = [np.array([0], dtype=V_IDX_TYPE)]  # query window = just the deletion
+
+    out = list(
+        _gen_with_length(
+            v_chunks=v_chunks,
+            q_start=q_start,
+            q_end=q_end,
+            read=read,
+            v_starts=v_starts,
+            v_ends=v_ends,
+            ilens=ilens,
+            contig_max_idx=n - 1,
+        )
+    )
+    final_genos, _end, final_idx = out[-1]
+    assert final_idx[-1] > 20, (
+        f"multi-round extension not triggered; reached idx {final_idx[-1]}. "
+        f"All chunks: {[(np.asarray(g).shape, int(e), fi.tolist()) for g, e, fi in out]}"
+    )
+
+
+def test_gen_with_length_clamps_at_contig_end():
+    # Deletion is the last variant -> extension cannot proceed, must clamp.
+    v_starts = np.array([4999], dtype=POS_TYPE)
+    v_ends = np.array([4999 + 11], dtype=POS_TYPE)
+    ilens = np.array([-10], dtype=np.int32)
+    # shape: s=1, p=2, V=1 (ploidy=2 required by Genos predicate)
+    dense = np.ones((1, 2, 1), dtype=np.int32)
+    read = _fake_read_factory(dense)
+
+    out = list(
+        _gen_with_length(
+            v_chunks=[np.array([0], dtype=V_IDX_TYPE)],
+            q_start=4999,
+            q_end=5040,
+            read=read,
+            v_starts=v_starts,
+            v_ends=v_ends,
+            ilens=ilens,
+            contig_max_idx=0,  # this IS the last variant
+        )
+    )
+    final_genos, _end, final_idx = out[-1]
+    np.testing.assert_array_equal(final_idx, np.array([0], dtype=V_IDX_TYPE))
 
 
 def test_pgen_nbytes_zero_after_free():
