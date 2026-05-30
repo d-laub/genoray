@@ -352,6 +352,87 @@ def dense2sparse(
     return rag
 
 
+def _dense2sparse_with_length(
+    genos: NDArray[np.integer],
+    var_idxs: NDArray[V_IDX_TYPE],
+    q_start: int,
+    q_end: int,
+    v_starts: NDArray[np.int32],
+    ilens: NDArray[np.int32],
+    dosages: NDArray[DOSAGE_TYPE] | None = None,
+) -> Ragged[V_IDX_TYPE] | tuple[Ragged[V_IDX_TYPE], Ragged[DOSAGE_TYPE]]:
+    """Convert a dense ``with_length`` window (shared, over-extended across all
+    samples/haplotypes) into per-haplotype-minimal sparse output, identical to
+    ``SparseVar.read_ranges_with_length`` for the same query.
+
+    Parameters
+    ----------
+    genos
+        Dense genotypes for the window. Shape: (samples, ploidy, variants).
+    var_idxs
+        Global variant indices of the window, used only to populate the sparse
+        output. Shape: (variants,).
+    q_start, q_end
+        0-based, half-open original query span (before extension).
+    v_starts
+        0-based start positions of the window's variants (i.e. POS - 1).
+        Window-aligned: same length as the ``genos`` variant axis and
+        positionally aligned with ``var_idxs`` (NOT a global per-dataset array).
+        Shape: (variants,).
+    ilens
+        ILEN of the window's variants (ALT - REF length). Window-aligned, like
+        ``v_starts``. Shape: (variants,).
+    dosages
+        Optional dense dosages. Shape: (samples, variants).
+
+    Returns
+    -------
+        ``Ragged[V_IDX_TYPE]`` of shape (samples, ploidy, ~variants), or a tuple
+        with a matching ``Ragged[DOSAGE_TYPE]`` when ``dosages`` is given.
+    """
+    if genos.ndim != 3:
+        raise ValueError("Dense genotypes must have shape (samples, ploidy, variants).")
+    n_samples, ploidy, _ = genos.shape
+
+    lengths = np.empty((n_samples, ploidy), dtype=np.int64)
+    data_parts: list[NDArray[V_IDX_TYPE]] = []
+    dose_parts: list[NDArray[DOSAGE_TYPE]] = []
+
+    for s in range(n_samples):
+        for p in range(ploidy):
+            # local window indices of variants this haplotype carries (ALT);
+            # v_starts / ilens are window-local arrays aligned with var_idxs,
+            # so the helper must be indexed by local positions.
+            carried_local = np.flatnonzero(genos[s, p] == 1).astype(V_IDX_TYPE)
+            n_keep = _length_walk_n_keep(
+                carried_local,
+                v_starts,
+                ilens,
+                0,
+                len(carried_local),
+                POS_TYPE(q_start),
+                POS_TYPE(q_end),
+            )
+            kept_local = carried_local[:n_keep]
+            lengths[s, p] = n_keep
+            data_parts.append(var_idxs[kept_local])
+            if dosages is not None:
+                dose_parts.append(dosages[s, kept_local])
+
+    data = np.concatenate(data_parts) if data_parts else np.empty(0, dtype=V_IDX_TYPE)
+    offsets = lengths_to_offsets(lengths)
+    shape = (n_samples, ploidy, None)
+    rag = Ragged[V_IDX_TYPE].from_offsets(data, shape, offsets)
+
+    if dosages is not None:
+        dose_data = (
+            np.concatenate(dose_parts) if dose_parts else np.empty(0, dtype=DOSAGE_TYPE)
+        )
+        drag = Ragged[DOSAGE_TYPE].from_offsets(dose_data, shape, offsets)
+        return rag, drag
+    return rag
+
+
 CURRENT_VERSION = 1
 
 
