@@ -395,41 +395,36 @@ def _dense2sparse_with_length(
         raise ValueError("Dense genotypes must have shape (samples, ploidy, variants).")
     n_samples, ploidy, _ = genos.shape
 
+    v_starts = np.ascontiguousarray(v_starts, dtype=np.int32)
+    ilens = np.ascontiguousarray(ilens, dtype=np.int32)
+    var_idxs = np.ascontiguousarray(var_idxs, dtype=V_IDX_TYPE)
+
+    # Pass 1: per-haplotype kept counts (reuses the sparse path's length walk).
     lengths = np.empty((n_samples, ploidy), dtype=np.int64)
-    data_parts: list[NDArray[V_IDX_TYPE]] = []
-    dose_parts: list[NDArray[DOSAGE_TYPE]] = []
+    _dense2sparse_count(
+        genos, v_starts, ilens, POS_TYPE(q_start), POS_TYPE(q_end), lengths
+    )
 
-    for s in range(n_samples):
-        for p in range(ploidy):
-            # local window indices of variants this haplotype carries (ALT);
-            # v_starts / ilens are window-local arrays aligned with var_idxs,
-            # so the helper must be indexed by local positions.
-            carried_local = np.flatnonzero(genos[s, p] == 1).astype(V_IDX_TYPE)
-            n_keep = _length_walk_n_keep(
-                carried_local,
-                v_starts,
-                ilens,
-                0,
-                len(carried_local),
-                POS_TYPE(q_start),
-                POS_TYPE(q_end),
-            )
-            kept_local = carried_local[:n_keep]
-            lengths[s, p] = n_keep
-            data_parts.append(var_idxs[kept_local])
-            if dosages is not None:
-                dose_parts.append(dosages[s, kept_local])
-
-    data = np.concatenate(data_parts) if data_parts else np.empty(0, dtype=V_IDX_TYPE)
-    offsets = lengths_to_offsets(lengths)
+    flat_offsets = lengths_to_offsets(lengths)
+    total = int(flat_offsets[-1])
     shape = (n_samples, ploidy, None)
-    rag = Ragged[V_IDX_TYPE].from_offsets(data, shape, offsets)
 
-    if dosages is not None:
-        dose_data = (
-            np.concatenate(dose_parts) if dose_parts else np.empty(0, dtype=DOSAGE_TYPE)
-        )
-        drag = Ragged[DOSAGE_TYPE].from_offsets(dose_data, shape, offsets)
+    # Pass 2: fill the (and optionally the dosage) output in disjoint ranges.
+    out_data = np.empty(total, dtype=V_IDX_TYPE)
+    has_dose = dosages is not None
+    dose_in = (
+        np.ascontiguousarray(dosages, dtype=DOSAGE_TYPE)
+        if has_dose
+        else np.empty((0, 0), dtype=DOSAGE_TYPE)
+    )
+    out_dose = np.empty(total if has_dose else 0, dtype=DOSAGE_TYPE)
+    _dense2sparse_fill(
+        genos, var_idxs, dose_in, lengths, flat_offsets, out_data, out_dose, has_dose
+    )
+
+    rag = Ragged[V_IDX_TYPE].from_offsets(out_data, shape, flat_offsets)
+    if has_dose:
+        drag = Ragged[DOSAGE_TYPE].from_offsets(out_dose, shape, flat_offsets)
         return rag, drag
     return rag
 
@@ -2046,6 +2041,66 @@ def _length_walk_n_keep(
         last_v_end = max(last_v_end, v_end)
 
     return max_idx - start_idx
+
+
+@nb.njit(parallel=True, nogil=True, cache=True)
+def _dense2sparse_count(
+    genos: NDArray[np.integer],
+    v_starts: NDArray[np.int32],
+    ilens: NDArray[np.int32],
+    q_start: POS_TYPE,
+    q_end: POS_TYPE,
+    out_lengths: NDArray[np.int64],
+) -> None:
+    """Pass 1: per (sample, haplotype), count the carried ALT calls to keep.
+
+    Gathers each haplotype's carried (``== 1``) window-local positions in order
+    and routes them through :func:`_length_walk_n_keep` (the SAME walk the sparse
+    path uses, so the two cannot drift). Writes the kept count to ``out_lengths``.
+    """
+    n_samples, ploidy, n_var = genos.shape
+    for s in nb.prange(n_samples):
+        carriers = np.empty(n_var, dtype=V_IDX_TYPE)
+        for p in range(ploidy):
+            nc = 0
+            for v in range(n_var):
+                if genos[s, p, v] == 1:
+                    carriers[nc] = v
+                    nc += 1
+            out_lengths[s, p] = _length_walk_n_keep(
+                carriers, v_starts, ilens, 0, nc, q_start, q_end
+            )
+
+
+@nb.njit(parallel=True, nogil=True, cache=True)
+def _dense2sparse_fill(
+    genos: NDArray[np.integer],
+    var_idxs: NDArray[V_IDX_TYPE],
+    dosages: NDArray[DOSAGE_TYPE],
+    out_lengths: NDArray[np.int64],
+    flat_offsets: NDArray[OFFSET_TYPE],
+    out_data: NDArray[V_IDX_TYPE],
+    out_dose: NDArray[DOSAGE_TYPE],
+    has_dose: bool,
+) -> None:
+    """Pass 2: emit the first ``out_lengths[s, p]`` carried ALT calls per
+    haplotype into the disjoint output range ``[flat_offsets[slot], ...)``."""
+    n_samples, ploidy, n_var = genos.shape
+    for s in nb.prange(n_samples):
+        for p in range(ploidy):
+            slot = s * ploidy + p
+            n_keep = out_lengths[s, p]
+            w = flat_offsets[slot]
+            kept = 0
+            for v in range(n_var):
+                if kept >= n_keep:
+                    break
+                if genos[s, p, v] == 1:
+                    out_data[w] = var_idxs[v]
+                    if has_dose:
+                        out_dose[w] = dosages[s, v]
+                    w += 1
+                    kept += 1
 
 
 @nb.njit(parallel=False, nogil=True, cache=True)
