@@ -1423,7 +1423,9 @@ class VCF:
                 if v.is_indel:
                     ilen = len(v.ALT[0]) - len(v.REF)
                     dist = v.start - last_end
-                    hap_lens += dist + np.where(genos == 1, ilen, 0).squeeze(-1)
+                    hap_lens += dist + np.where(
+                        genos[:, : self.ploidy] == 1, ilen, 0
+                    ).squeeze(-1)
                     last_end = cast(int, v.end)
 
                 if i % _CHECK_LEN_EVERY_N == 0 and (hap_lens >= length).all():
@@ -1478,7 +1480,9 @@ class VCF:
                     ilen = len(v.ALT[0]) - len(v.REF)
                     dist = v.start - last_end
                     # (s p 1)
-                    hap_lens += dist + np.where(genos == 1, ilen, 0).squeeze(-1)
+                    hap_lens += dist + np.where(
+                        genos[:, : self.ploidy] == 1, ilen, 0
+                    ).squeeze(-1)
                     last_end = cast(int, v.end)
 
                 if i % _CHECK_LEN_EVERY_N == 0 and (hap_lens >= length).all():
