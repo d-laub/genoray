@@ -1927,38 +1927,43 @@ def _find_starts_ends(
 
 
 @nb.njit(nogil=True, cache=True)
-def _length_walk_n_keep(sp_genos, v_starts, ilens, start_idx, max_idx, q_start, q_end):
-    """Number of leading carried variants (from start_idx) to keep so one
-    haplotype reaches q_end - q_start in length, extending past q_end only as
-    needed. Variants strictly inside [q_start, q_end) are always kept; the
-    length budget only gates extension past q_end. Returns a count in
-    [0, max_idx - start_idx]."""
+def _length_walk_n_keep(
+    sp_genos: NDArray[V_IDX_TYPE],
+    v_starts: NDArray[np.int32],
+    ilens: NDArray[np.int32],
+    start_idx: int,
+    max_idx: int,
+    q_start: POS_TYPE,
+    q_end: POS_TYPE,
+) -> int:
+    """Number of leading variants in ``sp_genos[start_idx:max_idx]`` to include
+    so one haplotype reaches ``q_end - q_start`` in length, extending past
+    ``q_end`` only as needed. Variants strictly inside ``[q_start, q_end)`` are
+    always included; the length budget only gates extension past ``q_end``.
+    Returns a count in ``[0, max_idx - start_idx]``."""
     q_len = q_end - q_start
     last_v_end = q_start
     written_len = 0
-    i = -1
     for j in range(start_idx, max_idx):
-        i = j - start_idx
         v_idx = sp_genos[j]
         v_start = v_starts[v_idx]
         ilen = ilens[v_idx]
 
         maybe_add_one = POS_TYPE(v_start >= q_start)
-        past_query = v_start >= q_end
 
         if v_start >= q_start:
+            past_query = v_start >= q_end
             written_len += v_start - last_v_end
             if past_query and written_len >= q_len:
-                i -= 1
-                break
+                return j - start_idx  # exclude this variant
             written_len += max(0, ilen) + maybe_add_one
             if past_query and written_len >= q_len:
-                break
+                return j - start_idx + 1  # include this variant
 
         v_end = v_start - min(0, ilen) + maybe_add_one
         last_v_end = max(last_v_end, v_end)
 
-    return i + 1
+    return max_idx - start_idx
 
 
 @nb.njit(parallel=False, nogil=True, cache=True)
