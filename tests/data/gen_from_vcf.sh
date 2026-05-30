@@ -22,6 +22,11 @@ bgzip -c "$unsorted" >| "$unsorted".gz
 bcftools index "$unsorted".gz
 rm -f "$unsorted".gz.gvi
 
+indels=$ddir/indels.vcf
+bgzip -c "$indels" >| "$indels".gz
+bcftools index "$indels".gz
+rm -f "$indels".gz.gvi
+
 echo "Converting VCF to PLINK format..."
 prefix="${bi%.vcf}"
 plink2 --make-pgen --vcf "$bi".gz 'dosage=DS' --out "$prefix" --vcf-half-call r
@@ -38,6 +43,10 @@ plink2 --make-pgen vzs --vcf "$bi".gz 'dosage=DS' --out "$prefix" --vcf-half-cal
 rm -f "$prefix".log
 rm -f "$prefix".pvar.zst.gvi
 
+prefix="${indels%.vcf}"
+plink2 --make-pgen --vcf "$indels".gz 'dosage=DS' --out "$prefix" --vcf-half-call r
+rm -f "$prefix".log
+rm -f "$prefix".pvar.gvi
 
 echo "Converting VCF and PGEN to SVAR format..."
 python "$ddir"/gen_svar.py
