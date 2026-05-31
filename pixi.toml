@@ -32,7 +32,6 @@ plink2 = "*"
 
 [pypi-dependencies]
 genoray = { path = ".", editable = true }
-seqpro = { git = "https://github.com/ml4gland/seqpro.git", rev = "main" }
 # dev deps
 seaborn = "*"
 pooch = "*"
@@ -72,12 +71,7 @@ pyranges = "==0.1.*"
 pyarrow = "==21.0.*"
 phantom-types = "==3.0.*"
 loguru = "==0.7.*"
-attrs = "*"
-awkward = "*"
-numba = "*"
 seqpro = "==0.11.*"
-zstandard = "*"
-pydantic = "*"
 oxbow = "==0.5.*"
 joblib = "==1.4.*"
 joblib-progress = "==1.0.*"
