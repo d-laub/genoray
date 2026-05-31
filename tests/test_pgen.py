@@ -9,6 +9,10 @@ from pytest_cases import parametrize_with_cases
 
 from genoray._pgen import PGEN, Genos, POS_MAX, V_IDX_TYPE, _gen_with_length
 from genoray._types import POS_TYPE
+from tests import _oracle
+from tests.data.fixtures import FIXTURES
+
+_BIALLELIC = FIXTURES["biallelic"]().truth()
 
 tdir = Path(__file__).parent
 ddir = tdir / "data"
@@ -26,21 +30,20 @@ def pgen_vzs():
 
 def read_all():
     cse = "chr1", 81261, 81262  # just 81262 in VCF
-    # (s p v)
-    genos = np.array([[[0, -1], [1, -1]], [[1, 0], [1, 1]]], np.int32)
-    # (s v)
-    phasing = np.array([[1, 0], [1, 0]], np.bool_)
-    dosages = np.array([[1.0, np.nan], [2.0, 1.0]], np.float32)
+    # biallelic idx=[0,1]: chr1:81262 GAT>A (0|1,1|1) and chr1:81262 G>A (./.→-1,0/1)
+    # idx1 ./. → PGEN keeps as missing (-1); oracle agrees
+    genos = _oracle.genos(_BIALLELIC, [0, 1])
+    phasing = _oracle.phasing(_BIALLELIC, [0, 1])
+    dosages = _oracle.dosages(_BIALLELIC, [0, 1])
     return cse, genos, phasing, dosages
 
 
 def read_spanning_del():
     cse = "chr1", 81262, 81263  # just 81263 in VCF
-    # (s p v)
-    genos = np.array([[[0], [1]], [[1], [1]]], np.int32)
-    # (s v)
-    phasing = np.array([[1], [1]], np.bool_)
-    dosages = np.array([[1.0], [2.0]], np.float32)
+    # biallelic idx=[0]: chr1:81262 GAT>A (0|1,1|1), DS=(1.0,2.0)
+    genos = _oracle.genos(_BIALLELIC, [0])
+    phasing = _oracle.phasing(_BIALLELIC, [0])
+    dosages = _oracle.dosages(_BIALLELIC, [0])
     return cse, genos, phasing, dosages
 
 
@@ -173,13 +176,13 @@ def test_sample_reorder(pgen: PGEN):
 
     assert list(pgen.current_samples) == ["sample2", "sample1"]
     # row 0 must be sample2, row 1 must be sample1
-    np.testing.assert_equal(
-        g, np.array([[[1, 0], [1, 1]], [[0, -1], [1, -1]]], np.int32)
-    )
-    np.testing.assert_equal(p, np.array([[1, 0], [1, 0]], np.bool_))
-    np.testing.assert_allclose(
-        d, np.array([[2.0, 1.0], [1.0, np.nan]], np.float32), rtol=1e-5
-    )
+    # biallelic idx=[0,1], samples reversed: oracle[1,0] = [sample2, sample1]
+    _g = _oracle.genos(_BIALLELIC, [0, 1])[[1, 0]]
+    _p = _oracle.phasing(_BIALLELIC, [0, 1])[[1, 0]]
+    _d = _oracle.dosages(_BIALLELIC, [0, 1])[[1, 0]]
+    np.testing.assert_equal(g, _g)
+    np.testing.assert_equal(p, _p)
+    np.testing.assert_allclose(d, _d, rtol=1e-5)
 
     pgen.set_samples(None)  # reset for other tests
 
@@ -250,10 +253,10 @@ def test_set_samples(
 
 def length_no_ext():
     cse = "chr1", 81264, 81265  # just 81265 in VCF
-    # (s p v)
-    genos = np.array([[[1], [0]], [[-1], [-1]]], np.int8)
-    # (s v)
-    phasing = np.array([[1], [0]], np.bool_)
+    # biallelic idx=[2]: chr1:81265 T>C (1|0,./.)
+    genos = _oracle.genos(_BIALLELIC, [2])
+    phasing = _oracle.phasing(_BIALLELIC, [2])
+    # PGEN DS encoding produces 0.900024 for VCF DS=0.9; oracle has exact 0.9 → literal retained
     dosages = np.array([[0.900024], [np.nan]], np.float32)
     last_end = 81265
     var_idxs = np.array([2], dtype=V_IDX_TYPE)
@@ -262,10 +265,10 @@ def length_no_ext():
 
 def length_ext():
     cse = "chr1", 81262, 81263  # just 81263 in VCF
-    # (s p v)
-    genos = np.array([[[0, -1, 1], [1, -1, 0]], [[1, 0, -1], [1, 1, -1]]], np.int8)
-    # (s v)
-    phasing = np.array([[1, 0, 1], [1, 0, 0]], np.bool_)
+    # biallelic idx=[0,1,2]: chr1:81262 GAT>A, chr1:81262 G>A (./.→-1), chr1:81265 T>C (1|0,./.)
+    genos = _oracle.genos(_BIALLELIC, [0, 1, 2])
+    phasing = _oracle.phasing(_BIALLELIC, [0, 1, 2])
+    # PGEN DS encoding produces 0.900024 for VCF DS=0.9 at idx2; oracle has exact 0.9 → literal retained
     dosages = np.array([[1.0, np.nan, 0.900024], [2.0, 1.0, np.nan]], np.float32)
     last_end = 81265
     var_idxs = np.arange(3, dtype=V_IDX_TYPE)
