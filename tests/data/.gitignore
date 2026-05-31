@@ -1,6 +1,5 @@
 *
 !.gitignore
-!*.vcf
 !*.sh
 !*.py
 !README.md
