@@ -24,16 +24,14 @@ import numpy as np
 import pytest
 
 from genoray._vcf import VCF
+from tests import _oracle
+from tests.data.fixtures import FIXTURES
 
 DDIR = Path(__file__).parent / "data"
 
-# Per-sample phased GTs encoded in the fixture at chr1:100 T>A:
-# sample_C -> 0|1   sample_A -> 1|1   sample_B -> 0|0
-_FIXTURE_GT = {
-    "sample_A": (1, 1),
-    "sample_B": (0, 0),
-    "sample_C": (0, 1),
-}
+# GroundTruth oracle for the three_samples_unsorted fixture.
+# File-order samples: [sample_C(0), sample_A(1), sample_B(2)]
+_THREE = FIXTURES["three_samples_unsorted"]().truth()
 
 
 @pytest.mark.parametrize(
@@ -50,14 +48,15 @@ _FIXTURE_GT = {
     ],
 )
 def test_set_samples_preserves_genotype_alignment(requested: list[str]) -> None:
-    """``gt[i, p, 0]`` must equal ``_FIXTURE_GT[requested[i]][p]`` for every (i, p)."""
+    """``gt[i, p, 0]`` must equal the oracle genotype for ``requested[i]`` for every (i, p)."""
     vcf = VCF(DDIR / "three_samples_unsorted.vcf.gz", phasing=False)
     vcf.set_samples(requested)
     # read returns shape (n_samples, ploidy, n_variants); we have 1 variant.
     gt = vcf.read("chr1", 99, 100, VCF.Genos8)
-    expected = np.array(
-        [[_FIXTURE_GT[s][0], _FIXTURE_GT[s][1]] for s in requested], dtype=np.int8
-    )
+    # Build expected from oracle: genos(_THREE, [0]) -> (3, 2, 1) in file order
+    # [sample_C(0), sample_A(1), sample_B(2)]; index axis-0 to match requested order.
+    sample_positions = [_THREE.samples.index(n) for n in requested]
+    expected = _oracle.genos(_THREE, [0])[sample_positions, :, 0].astype(np.int8)
     assert gt is not None, "fixture variant chr1:100 missing from VCF"
     np.testing.assert_array_equal(
         gt[..., 0],
