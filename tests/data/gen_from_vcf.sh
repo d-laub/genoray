@@ -10,6 +10,9 @@ multi=$ddir/multiallelic.vcf
 unsorted=$ddir/three_samples_unsorted.vcf
 indels=$ddir/indels.vcf
 
+echo "Generating VCFs from vcfixture builders..."
+python "$ddir"/gen_vcfs.py
+
 echo "Bgzipping and indexing VCF files..."
 bgzip -c "$bi" >| "$bi".gz
 bcftools index "$bi".gz
