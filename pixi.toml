@@ -35,6 +35,7 @@ genoray = { path = ".", editable = true }
 # dev deps
 seaborn = "*"
 pooch = "*"
+vcfixture = { path = "/Users/david/projects/vcfixture/.worktrees/genoray-fixtures", editable = true }
 
 [tasks]
 gen = "sh tests/data/gen_from_vcf.sh"
