@@ -8,6 +8,10 @@ from numpy.typing import ArrayLike, NDArray
 from pytest_cases import fixture, parametrize_with_cases
 
 from genoray._vcf import VCF
+from tests import _oracle
+from tests.data.fixtures import FIXTURES
+
+_BIALLELIC = FIXTURES["biallelic"]().truth()
 
 tdir = Path(__file__).parent
 ddir = tdir / "data"
@@ -29,15 +33,15 @@ def vcf(with_gvi_index: bool):
 
 def read_all():
     cse = "chr1", 81261, 81263
-    # (s p v)
-    genos = np.array([[[0, -1], [1, -1]], [[1, 0], [1, 1]]], np.int8)
-    # (s v)
-    phasing = np.array([[1, 0], [1, 0]], np.bool_)
-    dosages = np.array([[1.0, np.nan], [2.0, 1.0]], np.float32)
+    idx = [0, 1]  # genoray returns chr1 records 0 and 1 for this range
+    genos = _oracle.genos(_BIALLELIC, idx).astype(np.int8)
+    phasing = _oracle.phasing(_BIALLELIC, idx)
+    dosages = _oracle.dosages(_BIALLELIC, idx)
     return cse, genos, phasing, dosages
 
 
 def read_spanning_del():
+    # spanning-del read shape is genoray-specific; not a clean oracle case
     cse = "chr1", 81262, 81263
     # (s p v)
     genos = np.array([[[0], [1]], [[1], [1]]], np.int8)
