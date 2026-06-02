@@ -50,6 +50,7 @@ def write(
     overwrite: bool = False,
     dosages: str | None = None,
     threads: int | None = None,
+    skip_symbolic_alts: bool = False,
 ) -> None:
     """
     Convert a VCF or PGEN file to a SVAR file.
@@ -71,6 +72,12 @@ def write(
         If not provided, dosages will not be written.
     threads
         Number of threads to use for conversion. Defaults to the number of available CPU cores.
+    skip_symbolic_alts
+        VCF only. If True, skip records whose ALT contains a symbolic allele
+        (``<DEL>``, ``<INS>``, etc.) per VCF 4.x. Recommended for SV-bearing
+        cohorts (e.g. 1kGP SNV_INDEL_SV panels) to avoid emitting literal
+        ``<DEL>`` ASCII bytes into downstream haplotype buffers. Default
+        False preserves prior behavior.
     """
     from genoray import PGEN, VCF, SparseVar
     from genoray._utils import variant_file_type
@@ -91,7 +98,11 @@ def write(
                 "The `dosages` argument appears to be a path to an existing file, but VCF requires a FORMAT field name."
             )
 
-        vcf = VCF(source, dosage_field=dosages)
+        vcf = VCF(
+            source,
+            dosage_field=dosages,
+            skip_symbolic_alts=skip_symbolic_alts,
+        )
         SparseVar.from_vcf(
             out, vcf, max_mem, overwrite, with_dosages=with_dosages, n_jobs=threads
         )

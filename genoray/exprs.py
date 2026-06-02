@@ -41,6 +41,25 @@ is_indel = pl.col("ILEN").list.eval(pl.element() != 0).list.all()
 is_biallelic = pl.col("ALT").list.len() == 1
 """True if the variant is biallelic (one ALT allele)."""
 
+is_symbolic = pl.col("ALT").list.eval(pl.element().str.starts_with("<")).list.any()
+"""True if any ALT allele is a symbolic allele (e.g. :code:`<DEL>`, :code:`<INS>`,
+:code:`<DUP>`, :code:`<INV>`, :code:`<CNV>`, :code:`<BND>` — anything matching ``<…>``
+per the VCF 4.x spec).
+
+Symbolic ALTs are placeholders for structural variants whose exact replacement
+nucleotides are unknown. Downstream haplotype injection (e.g. via
+``genvarloader``) cannot expand them — the literal ``<DEL>`` ASCII bytes end up
+in personalized DNA buffers and become non-canonical bytes for translators.
+Pair with :class:`~genoray.VCF`'s ``skip_symbolic_alts`` constructor flag to
+filter these out, or compose directly with other expressions.
+
+Example
+-------
+>>> import genoray
+>>> vcf = genoray.VCF("file.vcf.gz", pl_filter=~genoray.exprs.is_symbolic,
+...                   filter=lambda v: not v.ALT[0].startswith("<"))  # doctest: +SKIP
+"""
+
 ILEN = pl.col("ALT").list.eval(pl.element().str.len_bytes().cast(pl.Int32)) - pl.col(
     "REF"
 ).str.len_bytes().cast(pl.Int32)

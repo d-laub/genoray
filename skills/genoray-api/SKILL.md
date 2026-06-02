@@ -31,7 +31,7 @@ Prefer reading these over guessing:
 - `genoray/_vcf.py` — `VCF` class: constructor, `read`, `chunk`, mode constants near the top of the class
 - `genoray/_pgen.py` — `PGEN` class: constructor, `read`, `chunk`, `read_ranges`, `chunk_ranges`, mode constants near the top of the class
 - `genoray/_svar.py` — `SparseVar`: `__init__`, `from_vcf`, `from_pgen`, `read_ranges`, `with_fields`
-- `genoray/exprs.py` — the *complete* set of pre-built filter expressions (currently 4: `is_snp`, `is_indel`, `is_biallelic`, `ILEN`)
+- `genoray/exprs.py` — the *complete* set of pre-built filter expressions (currently 5: `is_snp`, `is_indel`, `is_biallelic`, `is_symbolic`, `ILEN`)
 
 When a signature, kwarg, or shape is unclear, **read the docstring in the
 source** rather than reasoning from first principles.
@@ -66,9 +66,10 @@ dosages)`; `VCF.Genos8Dosages` returns `(genos, dosages)`.
 ```python
 vcf = genoray.VCF(
     "file.vcf.gz",
-    phasing=True,           # constructor-time, not per-read
-    dosage_field="DS",      # required to read dosages; FORMAT field with Number=A
-    filter=lambda v: ...,   # cyvcf2.Variant -> bool
+    phasing=True,             # constructor-time, not per-read
+    dosage_field="DS",        # required to read dosages; FORMAT field with Number=A
+    filter=lambda v: ...,     # cyvcf2.Variant -> bool
+    skip_symbolic_alts=True,  # drop records whose ALT is <DEL>/<INS>/<DUP>/... (VCF 4.x SVs)
 )
 
 # Single range
@@ -135,7 +136,8 @@ Build:
 # From a configured VCF reader
 vcf = genoray.VCF("file.vcf.gz", dosage_field="DS")
 genoray.SparseVar.from_vcf("out.svar", vcf, max_mem="4g",
-                           with_dosages=True, overwrite=True)
+                           with_dosages=True, overwrite=True,
+                           skip_symbolic_alts=True)  # opt-in; defaults to vcf.skip_symbolic_alts
 
 # Or from a PGEN
 genoray.SparseVar.from_pgen("out.svar", "file.pgen", max_mem="4g")
@@ -186,6 +188,7 @@ PGEN: pass a polars `pl.Expr` returning a boolean mask, operating on the
 - `is_snp`
 - `is_indel`
 - `is_biallelic`
+- `is_symbolic` (True if any ALT is a VCF 4.x symbolic allele, i.e. starts with `<`)
 - `ILEN` (an expression yielding indel length, not a boolean)
 
 For anything else, write `pl.col(...)` against the `.gvi` schema — read

@@ -885,6 +885,7 @@ class SparseVar(Generic[_SRT]):
         overwrite: bool = False,
         with_dosages: bool = False,
         n_jobs: int = -1,
+        skip_symbolic_alts: bool | None = None,
     ):
         """Create a Sparse Variant (.svar) from a VCF/BCF.
 
@@ -902,6 +903,23 @@ class SparseVar(Generic[_SRT]):
             Whether to write dosages.
         n_jobs
             Number of jobs to use for parallel processing.
+        skip_symbolic_alts
+            If True, skip records whose ALT contains a symbolic allele
+            (``<DEL>``, ``<INS>``, ``<DUP>``, ``<INV>``, ``<CNV>``, ``<BND>``,
+            etc.) per VCF 4.x. Defaults to inheriting the setting from
+            ``vcf`` (i.e. whatever was passed to :class:`VCF`'s constructor).
+            Passing an explicit value here is a convenience for callers
+            that received an already-built ``VCF`` instance without the
+            flag set. When ``True``, this applies to both the parquet
+            index *and* the per-contig genotype scan performed by the
+            workers. See the :class:`VCF` constructor docs for
+            background on why opting in matters for SV-bearing VCFs.
+
+        .. note::
+            Full symbolic-allele *expansion* (resolving ``<DEL>`` to a
+            precise ``REF→first_ref_base`` deletion via ``INFO/END`` or
+            ``INFO/SVLEN``) is tracked as future work — this kwarg only
+            filters.
         """
         out = Path(out)
 
@@ -914,10 +932,75 @@ class SparseVar(Generic[_SRT]):
             )
         out.mkdir(parents=True, exist_ok=True)
 
+        # Resolve the effective skip flag: default to whatever the VCF was
+        # configured with so users who set it on the VCF don't need to repeat
+        # themselves here. An explicit True/False overrides.
+        effective_skip = (
+            vcf._skip_symbolic_alts
+            if skip_symbolic_alts is None
+            else skip_symbolic_alts
+        )
+        if effective_skip and not vcf._skip_symbolic_alts:
+            # Caller asked us to filter but the VCF wasn't built with the flag.
+            # Rebuild a sibling VCF with the same path/dosage_field/phasing so
+            # _write_gvi_index() below picks up the filter. We can't safely
+            # rebuild if the user supplied a custom `filter` (cyvcf2 callable)
+            # because we'd have to compose with it — punt with a clear error.
+            if vcf._filter is not None:
+                raise ValueError(
+                    "skip_symbolic_alts=True conflicts with a custom `filter` on "
+                    "the supplied VCF. Pass skip_symbolic_alts=True to VCF() at "
+                    "construction time so the filters compose, then call "
+                    "SparseVar.from_vcf(...) without overriding."
+                )
+            vcf = VCF(
+                vcf.path,
+                phasing=vcf.phasing,
+                dosage_field=vcf.dosage_field,
+                progress=vcf.progress,
+                with_gvi_index=False,
+                skip_symbolic_alts=True,
+            )
+
         if not vcf._index_path().exists():
             logger.info("Genoray VCF index not found, creating index.")
             vcf._write_gvi_index()
-        shutil.copy(vcf._index_path(), cls._index_path(out))
+
+        if effective_skip:
+            # The .gvi was written WITHOUT filters applied (by design — see
+            # _write_gvi_index), so we materialize a filtered copy directly
+            # into the SVAR. The per-contig workers below also filter at
+            # read time, keeping record counts in lockstep with the index.
+            unfiltered = pl.read_ipc(vcf._index_path())
+            schema = unfiltered.schema
+            alt_expr = (
+                pl.col("ALT").str.split(",")
+                if schema["ALT"] == pl.Utf8
+                else pl.col("ALT")
+            )
+            n_before = unfiltered.height
+            sym_mask = (
+                unfiltered.lazy()
+                .with_columns(
+                    _sym=alt_expr.list.eval(
+                        pl.element().str.starts_with("<")
+                    ).list.any()
+                )
+                .collect()["_sym"]
+            )
+            filtered = unfiltered.filter(~sym_mask)
+            n_after = filtered.height
+            filtered.write_ipc(cls._index_path(out), compression="zstd")
+            if n_before != n_after:
+                logger.info(
+                    "skip_symbolic_alts=True: dropped {} of {} records with "
+                    "symbolic ALT alleles from the SVAR index for {}.",
+                    n_before - n_after,
+                    n_before,
+                    vcf.path.name,
+                )
+        else:
+            shutil.copy(vcf._index_path(), cls._index_path(out))
 
         contigs = vcf.contigs
         with open(out / "metadata.json", "w") as f:
@@ -948,6 +1031,7 @@ class SparseVar(Generic[_SRT]):
                     contig=c,
                     chunk_dir=chunk_dir,
                     chunk_idx=chunk_idx,
+                    skip_symbolic_alts=effective_skip,
                 )
                 tasks.append(task)
 
@@ -1594,8 +1678,14 @@ def _process_contig_vcf(
     contig: str,
     chunk_dir: Path,
     chunk_idx: int,
+    skip_symbolic_alts: bool = False,
 ) -> tuple[int, int]:
-    vcf = VCF(path, dosage_field=dosage_field, with_gvi_index=False)
+    vcf = VCF(
+        path,
+        dosage_field=dosage_field,
+        with_gvi_index=False,
+        skip_symbolic_alts=skip_symbolic_alts,
+    )
     if dosage_field is not None:
         chunker = vcf.chunk(contig, max_mem=max_mem, mode=VCF.Genos8Dosages)
     else:
