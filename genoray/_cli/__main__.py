@@ -73,13 +73,14 @@ def write(
     threads
         Number of threads to use for conversion. Defaults to the number of available CPU cores.
     skip_symbolic_alts
-        VCF only. If True, skip records whose ALT contains a symbolic allele
-        (``<DEL>``, ``<INS>``, etc.) per VCF 4.x. Recommended for SV-bearing
-        cohorts (e.g. 1kGP SNV_INDEL_SV panels) to avoid emitting literal
-        ``<DEL>`` ASCII bytes into downstream haplotype buffers. Default
-        False preserves prior behavior.
+        If True, skip records whose ALT contains a symbolic allele
+        (``<DEL>``, ``<INS>``, etc.) per VCF 4.x. Applies to both VCF and
+        PGEN sources. Recommended for SV-bearing cohorts (e.g. 1kGP
+        SNV_INDEL_SV panels) to avoid emitting literal ``<DEL>`` ASCII bytes
+        into downstream haplotype buffers. Default False preserves prior
+        behavior.
     """
-    from genoray import PGEN, VCF, SparseVar
+    from genoray import PGEN, VCF, SparseVar, exprs
     from genoray._utils import variant_file_type
 
     file_type = variant_file_type(source)
@@ -98,16 +99,24 @@ def write(
                 "The `dosages` argument appears to be a path to an existing file, but VCF requires a FORMAT field name."
             )
 
-        vcf = VCF(
-            source,
-            dosage_field=dosages,
-            skip_symbolic_alts=skip_symbolic_alts,
-        )
+        if skip_symbolic_alts:
+            vcf = VCF(
+                source,
+                dosage_field=dosages,
+                filter=lambda rec: not any(a.startswith("<") for a in rec.ALT),
+                pl_filter=~exprs.is_symbolic,
+            )
+        else:
+            vcf = VCF(source, dosage_field=dosages)
         SparseVar.from_vcf(
             out, vcf, max_mem, overwrite, with_dosages=with_dosages, n_jobs=threads
         )
     elif file_type == "pgen":
-        pgen = PGEN(source, dosage_path=dosages)
+        pgen = PGEN(
+            source,
+            dosage_path=dosages,
+            filter=(~exprs.is_symbolic) if skip_symbolic_alts else None,
+        )
         SparseVar.from_pgen(
             out, pgen, max_mem, overwrite, with_dosages=with_dosages, n_jobs=threads
         )
