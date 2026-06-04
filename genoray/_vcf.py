@@ -223,28 +223,6 @@ class VCF:
         or VCF.Genos16Dosages.
     progress
         Whether to show a progress bar while reading the VCF file.
-    skip_symbolic_alts
-        If True, skip records whose ALT allele list contains any symbolic allele
-        (anything starting with ``<``, e.g. ``<DEL>``, ``<INS>``, ``<DUP>``,
-        ``<INV>``, ``<CNV>``, ``<BND>``) per the VCF 4.x spec. Default ``False``
-        preserves prior behavior.
-
-        Symbolic ALTs are placeholders for structural variants whose exact
-        replacement nucleotides are unknown. Downstream haplotype-construction
-        tools (e.g. ``genvarloader``) write the literal ``<DEL>`` ASCII bytes
-        into personalized DNA buffers, which become non-canonical bytes for
-        translators. Setting ``skip_symbolic_alts=True`` defends against this
-        at the variant-reading layer.
-
-        Composes safely with user-supplied ``filter`` / ``pl_filter`` —
-        records must pass both to be kept. The number of skipped records is
-        emitted via :mod:`loguru` after the index is written.
-
-        .. note::
-            This is an opt-in filter; the default remains permissive. Full
-            symbolic-allele *expansion* (resolving ``<DEL>`` to a precise
-            ``REF→first_ref_base`` deletion using ``INFO/END`` or
-            ``INFO/SVLEN``) is tracked as future work.
     """
 
     path: Path
@@ -259,8 +237,6 @@ class VCF:
     """Function to filter variants. Should return True for variants to keep."""
     _pl_filter: pl.Expr | None
     """Polars expression to filter variants. Should return True for variants to keep. Must match the filter function."""
-    _skip_symbolic_alts: bool
-    """Whether records with any symbolic ALT allele (e.g. ``<DEL>``) are skipped. See constructor."""
     phasing: bool
     """Whether to include phasing information on genotypes. If True, the ploidy axis will be length 3 such that
     phasing is indicated by the 3rd value: 0 = unphased, 1 = phased. If False, the ploidy axis will be length 2."""
@@ -295,7 +271,6 @@ class VCF:
         dosage_field: str | None = None,
         progress: bool = False,
         with_gvi_index: bool = True,
-        skip_symbolic_alts: bool = False,
     ):
         if (filter is not None and pl_filter is None) or (
             filter is None and pl_filter is not None
@@ -304,41 +279,12 @@ class VCF:
                 "If a filter function is provided, a polars expression must also be provided, and vice versa."
             )
 
-        _symbolic_only_filter = False
-        if skip_symbolic_alts:
-            # Compose the user filter (if any) with a symbolic-ALT skip.
-            # Both cyvcf2-level and polars-level filters must be installed
-            # in lock-step (see __init__ kwarg contract above).
-            from .exprs import is_symbolic as _is_symbolic_expr
-
-            _user_filter = filter
-            _user_pl_filter = pl_filter
-
-            def _not_symbolic_cyvcf2(v: cyvcf2.Variant) -> bool:
-                # cyvcf2 exposes ALT as a list[str]; symbolic alleles are kept
-                # as the literal ``<…>`` token. Reject if any ALT starts with ``<``.
-                return not any(a.startswith("<") for a in v.ALT)
-
-            if _user_filter is None:
-                filter = _not_symbolic_cyvcf2
-                pl_filter = ~_is_symbolic_expr
-                _symbolic_only_filter = True
-            else:
-                assert _user_pl_filter is not None  # paired by contract above
-
-                def _combined_filter(v: cyvcf2.Variant) -> bool:
-                    return _not_symbolic_cyvcf2(v) and _user_filter(v)  # type: ignore[misc]
-
-                filter = _combined_filter
-                pl_filter = (~_is_symbolic_expr) & _user_pl_filter
-
         self.path = Path(path)
         if not self.path.exists():
             raise FileNotFoundError(f"VCF file {self.path} does not exist.")
 
         self._filter = filter
         self._pl_filter = pl_filter
-        self._skip_symbolic_alts = skip_symbolic_alts
         self.phasing = phasing
         self.dosage_field = dosage_field
         self.progress = progress
@@ -355,13 +301,7 @@ class VCF:
 
         self.set_samples(None)
 
-        # Auto-load the index when:
-        # - no user filter is set (cyvcf2 lambda + polars expr aren't guaranteed
-        #   to agree, so we can't safely apply them at load time), OR
-        # - the only filter is the symbolic-ALT skip (which is paired
-        #   cyvcf2/polars-equivalent by construction above).
-        _safe_to_autoload = self._filter is None or _symbolic_only_filter
-        if with_gvi_index and self._valid_index() and _safe_to_autoload:
+        if with_gvi_index and self._valid_index() and self._filter is None:
             self._load_index()
 
     def _open(self) -> cyvcf2.VCF:
