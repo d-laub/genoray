@@ -72,3 +72,90 @@ ILEN = pl.col("ALT").list.eval(pl.element().str.len_bytes().cast(pl.Int32)) - pl
     "REF"
 ).str.len_bytes().cast(pl.Int32)
 """Indel length of the variant. Positive for insertions, negative for deletions, and zero for SNPs and MNPs."""
+
+
+def symbolic_ilen(
+    alt: str = "ALT",
+    ref: str = "REF",
+    svlen: str = "SVLEN",
+    end: str = "END",
+    imprecise: str = "IMPRECISE",
+) -> pl.Expr:
+    """Per-ALT corrected ILEN as ``List[Int32]``.
+
+    Non-symbolic ALTs use the literal ``len(ALT) - len(REF)``. Precise symbolic
+    ``<DEL>``/``<INS>``/``<DUP>`` use ``SVLEN`` magnitude (or ``|END - POS|`` for
+    ``<DEL>``/``<DUP>`` when ``SVLEN`` is absent): ``-|len|`` for ``<DEL>``,
+    ``+|len|`` for ``<INS>``/``<DUP>``. Everything we cannot size precisely
+    (``IMPRECISE`` flag, missing length, unsupported type such as ``<BND>``,
+    ``<CNV>``, ``<INV>``, ``<*>``) becomes ``null``.
+
+    ``svlen``/``end``/``imprecise`` name scalar columns already extracted by the
+    caller (per record). ``SVLEN`` magnitude is read as ``|SVLEN|`` so the VCF
+    4.3/4.4 sign-convention flip does not matter.
+    """
+    ref_len = pl.col(ref).str.len_bytes().cast(pl.Int32)
+    svlen_mag = pl.col(svlen).abs().cast(pl.Int32)
+    end_mag = (pl.col(end) - pl.col("POS")).abs().cast(pl.Int32)
+    mag = pl.coalesce(svlen_mag, end_mag)  # prefer SVLEN, fall back to END
+    imprecise_flag = pl.col(imprecise).fill_null(False)
+
+    # Extract the primary SV type per ALT element (e.g. "<DEL:ME>" -> "DEL").
+    # list.eval only allows pl.element(); outer columns are broadcast automatically.
+    sv_type_list = pl.col(alt).list.eval(
+        pl.element().str.extract(r"^<([A-Za-z0-9:]+)>", 1).str.split(":").list.first()
+    )
+    # Literal (non-symbolic) ILEN per element: len(ALT_tok) - len(REF)
+    literal_list = (
+        pl.col(alt).list.eval(pl.element().str.len_bytes().cast(pl.Int32)) - ref_len
+    )
+    # Whether each ALT element is symbolic
+    is_sym_list = pl.col(alt).list.eval(pl.element().str.starts_with("<"))
+
+    # Per-row scalar: sized SV length (sign-corrected), or null if un-sizable.
+    # This is broadcast across all symbolic ALTs in the row.
+    del_mag = pl.when(imprecise_flag | mag.is_null()).then(None).otherwise(-mag)
+    ins_dup_mag = pl.when(imprecise_flag | mag.is_null()).then(None).otherwise(mag)
+
+    # Build ILEN list element-wise using list.eval on a packed struct.
+    # Pack: sv_type string + is_sym flag + literal value.
+    packed = pl.struct(
+        sv_type=sv_type_list,
+        is_sym=is_sym_list,
+        literal=literal_list,
+        del_mag=del_mag,
+        ins_dup_mag=ins_dup_mag,
+    )
+
+    return packed.map_elements(_compute_ilen_row, return_dtype=pl.List(pl.Int32))
+
+
+def _compute_ilen_row(row: dict) -> list:
+    """Compute per-ALT ILEN for a single row (called via map_elements)."""
+    sv_types: list = row["sv_type"]
+    is_syms: list = row["is_sym"]
+    literals: list = row["literal"]
+    del_mag = row["del_mag"]
+    ins_dup_mag = row["ins_dup_mag"]
+
+    result = []
+    for sv_type, sym, lit in zip(sv_types, is_syms, literals):
+        if not sym:
+            result.append(lit)
+        elif sv_type == "DEL":
+            result.append(del_mag)
+        elif sv_type in ("INS", "DUP"):
+            result.append(ins_dup_mag)
+        else:
+            result.append(None)
+    return result
+
+
+is_imprecise = pl.col("ILEN").list.eval(pl.element().is_null()).list.any()
+"""True if any ALT allele's ILEN could not be precisely determined (an un-sizable
+symbolic allele — ``IMPRECISE``, missing ``SVLEN``/``END``, or an unsupported
+symbolic type). Such alleles carry ``null`` ILEN. Filter them out with
+``pl_filter=~genoray.exprs.is_imprecise`` to keep precise structural variants while
+dropping the rest; use ``~genoray.exprs.is_symbolic`` to drop *all* symbolic alleles
+(required for haplotype consumers such as genvarloader, which cannot expand any
+symbolic ALT)."""
