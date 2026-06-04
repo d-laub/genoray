@@ -35,7 +35,7 @@ genoray = { path = ".", editable = true }
 # dev deps
 seaborn = "*"
 pooch = "*"
-vcfixture = ">=0.2.1,<0.3"
+vcfixture = ">=0.6.0,<0.7"
 
 [tasks]
 gen = "sh tests/data/gen_from_vcf.sh"
