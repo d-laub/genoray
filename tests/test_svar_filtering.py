@@ -7,11 +7,14 @@ the source's filter.
 
 from __future__ import annotations
 
+import shutil
+import subprocess
 from pathlib import Path
 
+import pytest
 from vcfixture import Seq, Sym, VcfBuilder, VcfVersion
 
-from genoray import VCF, SparseVar
+from genoray import PGEN, VCF, SparseVar
 from genoray import exprs as gexprs
 
 
@@ -113,5 +116,48 @@ def test_from_vcf_no_filter_keeps_all(tmp_path):
     v = VCF(vcf_path)
     out = tmp_path / "all.svar"
     SparseVar.from_vcf(out, v, max_mem="1g", overwrite=True)
+    sv = SparseVar(out)
+    assert sv.n_variants == 4
+
+
+def _mixed_pgen(tmp_path: Path) -> Path:
+    """Convert the mixed VCF to PGEN via plink2 (symbolic alleles carried verbatim)."""
+    if shutil.which("plink2") is None:
+        pytest.skip("plink2 not available")
+    vcf_path = _mixed_vcf(tmp_path)
+    prefix = tmp_path / "mixed"
+    subprocess.run(
+        [
+            "plink2",
+            "--vcf",
+            str(vcf_path),
+            "--make-pgen",
+            "--out",
+            str(prefix),
+            "--allow-extra-chr",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return prefix.with_suffix(".pgen")
+
+
+def test_from_pgen_inherits_symbolic_filter(tmp_path):
+    pgen_path = _mixed_pgen(tmp_path)
+    pgen = PGEN(pgen_path, filter=~gexprs.is_symbolic)
+    out = tmp_path / "pg.svar"
+    SparseVar.from_pgen(out, pgen, max_mem="1g", overwrite=True)
+
+    sv = SparseVar(out)
+    assert sv.n_variants == 2
+    # symbolic POS 200/300 dropped; precise 100/400 kept
+    assert set(sv.index["POS"].to_list()) == {100, 400}
+
+
+def test_from_pgen_no_filter_keeps_all(tmp_path):
+    pgen_path = _mixed_pgen(tmp_path)
+    pgen = PGEN(pgen_path)
+    out = tmp_path / "pg_all.svar"
+    SparseVar.from_pgen(out, pgen, max_mem="1g", overwrite=True)
     sv = SparseVar(out)
     assert sv.n_variants == 4
