@@ -32,3 +32,24 @@ def test_symbolic_ilen_precise_and_unsizable():
 def test_is_imprecise_flags_only_unsizable():
     df = _frame().with_columns(ILEN=symbolic_ilen()).with_columns(imp=is_imprecise)
     assert df.get_column("imp").to_list() == [False, False, False, True, False, True]
+
+
+def test_mixed_literal_symbolic_alt():
+    """Regression: a single record whose ALT mixes a literal and a symbolic allele.
+
+    REF="G", ALT=["C", "<DEL>"], SVLEN=80 -> ILEN=[0, -80].
+    Locks the per-element-vector + per-row-scalar broadcast that motivates
+    the map_elements design.
+    """
+    df = pl.DataFrame(
+        {
+            "REF": ["G"],
+            "ALT": [["C", "<DEL>"]],
+            "SVLEN": [80],
+            "END": [None],
+            "IMPRECISE": [False],
+            "POS": [1000],
+        }
+    )
+    out = df.with_columns(ILEN=symbolic_ilen()).get_column("ILEN").to_list()
+    assert out[0] == [0, -80]

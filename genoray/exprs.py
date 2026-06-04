@@ -93,6 +93,10 @@ def symbolic_ilen(
     ``svlen``/``end``/``imprecise`` name scalar columns already extracted by the
     caller (per record). ``SVLEN`` magnitude is read as ``|SVLEN|`` so the VCF
     4.3/4.4 sign-convention flip does not matter.
+
+    .. note::
+        Evaluated per-record via a Python callback (``map_elements``) at
+        index-build time; expect one Python call per variant row.
     """
     ref_len = pl.col(ref).str.len_bytes().cast(pl.Int32)
     svlen_mag = pl.col(svlen).abs().cast(pl.Int32)
@@ -130,7 +134,7 @@ def symbolic_ilen(
     return packed.map_elements(_compute_ilen_row, return_dtype=pl.List(pl.Int32))
 
 
-def _compute_ilen_row(row: dict) -> list:
+def _compute_ilen_row(row: dict) -> list[int | None]:
     """Compute per-ALT ILEN for a single row (called via map_elements)."""
     sv_types: list = row["sv_type"]
     is_syms: list = row["is_sym"]
