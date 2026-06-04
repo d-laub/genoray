@@ -53,3 +53,15 @@ def test_mixed_literal_symbolic_alt():
     )
     out = df.with_columns(ILEN=symbolic_ilen()).get_column("ILEN").to_list()
     assert out[0] == [0, -80]
+
+
+def test_symbolic_fixture_builds_and_classifies():
+    from tests.data.fixtures import FIXTURES
+
+    truth = FIXTURES["symbolic"]().truth()
+    # records: 0 <DEL> precise, 1 <INS> precise, 2 <DUP> precise,
+    #          3 <DEL> IMPRECISE, 4 <CNV> (no usable SVLEN / unsupported)
+    assert len(truth.pos) == 5
+    assert truth.alts_truth[0][0].sv_type == "DEL"
+    assert truth.alts_truth[1][0].sv_type == "INS"
+    assert truth.alts_truth[2][0].sv_type == "DUP"

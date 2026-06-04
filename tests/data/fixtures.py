@@ -8,7 +8,7 @@ decoded GroundTruth oracle.
 
 from __future__ import annotations
 
-from vcfixture import Number, Seq, Type, VcfBuilder, VcfVersion
+from vcfixture import Number, Seq, Sym, Type, VcfBuilder, VcfVersion
 
 NAN = float("nan")
 
@@ -136,9 +136,72 @@ def indels() -> VcfBuilder:
     return b
 
 
+def symbolic() -> VcfBuilder:
+    """Symbolic structural variants for ILEN correctness tests.
+
+    Precise <DEL>/<INS>/<DUP> (SVLEN/SVCLAIM), then un-sizable cases:
+    an IMPRECISE <DEL> and a <CNV> with no usable SVLEN. VCF 4.4 so SVLEN is
+    positive and <DEL>/<DUP> carry SVCLAIM. (A <BND> row is added in Task 6.)
+    """
+    b = (
+        VcfBuilder(
+            samples=["sample1", "sample2"],
+            contigs=[("chr1", 1_000_000)],
+            version=VcfVersion.V4_4,
+        )
+        .fmt("GT")
+        .info("SVLEN")
+        .info("END")
+        .info("SVCLAIM")
+        .info("IMPRECISE")
+    )
+    b.record(
+        "chr1",
+        1000,
+        ref="G",
+        alt=[Sym.deletion()],
+        gt=["0|1", "1|1"],
+        info={"SVLEN": [100], "END": [1100], "SVCLAIM": ["D"]},
+    )
+    b.record(
+        "chr1",
+        2000,
+        ref="G",
+        alt=[Sym.insertion()],
+        gt=["0|1", "0|0"],
+        info={"SVLEN": [50]},
+    )
+    b.record(
+        "chr1",
+        3000,
+        ref="G",
+        alt=[Sym.duplication()],
+        gt=["1|0", "1|1"],
+        info={"SVLEN": [30], "END": [3030], "SVCLAIM": ["DJ"]},
+    )
+    b.record(
+        "chr1",
+        4000,
+        ref="G",
+        alt=[Sym.deletion()],
+        gt=["0|1", "0|0"],
+        info={"SVLEN": [200], "END": [4200], "SVCLAIM": ["D"], "IMPRECISE": True},
+    )
+    b.record(
+        "chr1",
+        5000,
+        ref="G",
+        alt=[Sym.cnv()],
+        gt=["0|1", "0|0"],
+        info={"SVLEN": [40], "END": [5040], "SVCLAIM": ["D"]},
+    )
+    return b
+
+
 FIXTURES = {
     "biallelic": biallelic,
     "multiallelic": multiallelic,
     "three_samples_unsorted": three_samples_unsorted,
     "indels": indels,
+    "symbolic": symbolic,
 }
