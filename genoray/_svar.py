@@ -1045,7 +1045,7 @@ class SparseVar(Generic[_SRT]):
             }
 
             tasks = []
-            for chunk_idx, c in enumerate(contigs):
+            for c in contigs:
                 keep_idxs = keep_by_contig.get(c)
                 if keep_idxs is None or len(keep_idxs) == 0:
                     continue
@@ -1059,7 +1059,7 @@ class SparseVar(Generic[_SRT]):
                     n_samples=pgen.n_samples,
                     ploidy=pgen.ploidy,
                     chunk_dir=contig_dir,
-                    chunk_idx=chunk_idx,
+                    chunk_idx=len(tasks),
                 )
                 tasks.append(task)
 

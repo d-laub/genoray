@@ -11,8 +11,9 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import polars as pl
 import pytest
-from vcfixture import Seq, Sym, VcfBuilder, VcfVersion
+from vcfixture import Number, Seq, Sym, Type, VcfBuilder, VcfVersion
 
 from genoray import PGEN, VCF, SparseVar
 from genoray import exprs as gexprs
@@ -194,3 +195,204 @@ def test_cli_write_skip_symbolic_pgen(tmp_path):
     sv = SparseVar(out)
     assert sv.n_variants == 2
     assert set(sv.index["POS"].to_list()) == {100, 400}
+
+
+# ---------------------------------------------------------------------------
+# Multi-contig filtered tests (Fix 2)
+# ---------------------------------------------------------------------------
+
+
+def _flat_var_idxs(ragged) -> list[int]:
+    """Extract the actual per-slot variant indices from a Ragged result.
+
+    In a multi-contig SVAR, ``ragged.data`` is the full backing store (all
+    contigs).  Reading per-slot via the Ragged offsets gives only the elements
+    that fall within the queried contig's global index range.
+    """
+    starts, ends = ragged.offsets[0].tolist(), ragged.offsets[1].tolist()
+    result = []
+    for s, e in zip(starts, ends):
+        if e > s:
+            result.extend(ragged.data[s:e].tolist())
+    return result
+
+
+def _two_contig_vcf(tmp_path: Path) -> Path:
+    """Two contigs, one symbolic record dropped per contig.
+
+    chr1: SNV A>T@100, <DEL>@200
+    chr2: SNV C>G@500, <INS>@600
+
+    After symbolic filter: chr1@100 (idx 0), chr2@500 (idx 1).
+    """
+    b = (
+        VcfBuilder(
+            samples=["s1", "s2"],
+            contigs=[("chr1", 1_000_000), ("chr2", 1_000_000)],
+            version=VcfVersion.V4_4,
+        )
+        .info("SVLEN")
+        .info("SVCLAIM")
+        .info("END")
+        .fmt("GT")
+    )
+    # chr1
+    b.record("chr1", 100, ref="A", alt=[Seq("T")], gt=["0|1", "1|1"])
+    b.record(
+        "chr1",
+        200,
+        ref="A",
+        alt=[Sym.deletion()],
+        gt=["0|1", "0|0"],
+        info={"SVLEN": [50], "SVCLAIM": ["D"], "END": [250]},
+    )
+    # chr2
+    b.record("chr2", 500, ref="C", alt=[Seq("G")], gt=["1|0", "0|1"])
+    b.record(
+        "chr2",
+        600,
+        ref="T",
+        alt=[Sym.insertion()],
+        gt=["0|0", "1|0"],
+        info={"SVLEN": [30]},
+    )
+    return b.write(tmp_path / "two_contig.vcf.gz", bgzip=True, index=True)
+
+
+def test_from_vcf_multi_contig_filtered(tmp_path):
+    """from_vcf with symbolic filter across 2 contigs: correct n_variants, per-contig
+    POS, and genotype/index alignment."""
+    vcf_path = _two_contig_vcf(tmp_path)
+    v = VCF(vcf_path, filter=_not_symbolic, pl_filter=~gexprs.is_symbolic)
+    out = tmp_path / "two_contig.svar"
+    SparseVar.from_vcf(out, v, max_mem="1g", overwrite=True)
+
+    sv = SparseVar(out)
+    assert sv.n_variants == 2
+    # Per-contig POS check via index
+    idx = sv.index
+    assert idx.filter(pl.col("CHROM") == "chr1")["POS"].to_list() == [100]
+    assert idx.filter(pl.col("CHROM") == "chr2")["POS"].to_list() == [500]
+
+    # chr1: s1=0|1, s2=1|1 → 3 alt calls, all var_idx 0
+    g1 = sv.read_ranges("chr1", 0, 1_000_000)
+    assert sorted(_flat_var_idxs(g1)) == [0, 0, 0]
+
+    # chr2: s1=1|0, s2=0|1 → 2 alt calls, both var_idx 1
+    g2 = sv.read_ranges("chr2", 0, 1_000_000)
+    assert sorted(_flat_var_idxs(g2)) == [1, 1]
+
+
+def test_from_pgen_multi_contig_filtered(tmp_path):
+    """from_pgen with symbolic filter across 2 contigs: exercises the compacted
+    chunk_idx path (Fix 1 footgun class) and asserts cross-contig ordering."""
+    if shutil.which("plink2") is None:
+        pytest.skip("plink2 not available")
+
+    vcf_path = _two_contig_vcf(tmp_path)
+    prefix = tmp_path / "two_contig"
+    subprocess.run(
+        [
+            "plink2",
+            "--vcf",
+            str(vcf_path),
+            "--make-pgen",
+            "--out",
+            str(prefix),
+            "--allow-extra-chr",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    pgen_path = prefix.with_suffix(".pgen")
+    pgen = PGEN(pgen_path, filter=~gexprs.is_symbolic)
+    out = tmp_path / "two_contig_pg.svar"
+    SparseVar.from_pgen(out, pgen, max_mem="1g", overwrite=True)
+
+    sv = SparseVar(out)
+    assert sv.n_variants == 2
+    # plink2 strips the "chr" prefix, so contigs may be "1"/"2" or "chr1"/"chr2".
+    # Assert per-contig POS using ContigNormalizer-aware queries via read_ranges.
+    assert set(sv.index["POS"].to_list()) == {100, 500}
+    # Contig-0 (POS=100) should map to global variant index 0.
+    contig0, contig1 = sv.contigs[0], sv.contigs[1]
+
+    # Only output indices {0, 1} should appear; no stale 2/3 from unfiltered scan.
+    g1 = sv.read_ranges(contig0, 0, 1_000_000)
+    assert sorted(_flat_var_idxs(g1)) == [0, 0, 0]
+    g2 = sv.read_ranges(contig1, 0, 1_000_000)
+    assert sorted(_flat_var_idxs(g2)) == [1, 1]
+
+
+# ---------------------------------------------------------------------------
+# Dosage filter test (Fix 3)
+# ---------------------------------------------------------------------------
+
+
+def _dosage_vcf(tmp_path: Path) -> Path:
+    """chr1: SNV A>T@100 with DS, <DEL>@200 (symbolic, will be filtered).
+
+    DS values:
+      s1 (hom-alt A>T):  DS=[1.9]
+      s2 (het A>T):      DS=[0.8]
+    """
+    b = (
+        VcfBuilder(
+            samples=["s1", "s2"],
+            contigs=[("chr1", 1_000_000)],
+            version=VcfVersion.V4_4,
+        )
+        .info("SVLEN")
+        .info("SVCLAIM")
+        .info("END")
+        .fmt("GT")
+        .fmt("DS", Number.A, Type.FLOAT)
+    )
+    b.record(
+        "chr1",
+        100,
+        ref="A",
+        alt=[Seq("T")],
+        gt=["1|1", "0|1"],
+        DS=[[1.9], [0.8]],
+    )
+    b.record(
+        "chr1",
+        200,
+        ref="A",
+        alt=[Sym.deletion()],
+        gt=["0|1", "0|0"],
+        DS=[[0.0], [0.0]],
+        info={"SVLEN": [50], "SVCLAIM": ["D"], "END": [250]},
+    )
+    return b.write(tmp_path / "dosage.vcf.gz", bgzip=True, index=True)
+
+
+def test_from_vcf_filtered_with_dosages(tmp_path):
+    """filtered from_vcf with with_dosages=True: only the kept variant's
+    dosages appear in the SVAR; the symbolic record's dosages are absent."""
+    vcf_path = _dosage_vcf(tmp_path)
+    v = VCF(
+        vcf_path,
+        filter=_not_symbolic,
+        pl_filter=~gexprs.is_symbolic,
+        dosage_field="DS",
+    )
+    out = tmp_path / "dosage.svar"
+    SparseVar.from_vcf(out, v, max_mem="1g", overwrite=True, with_dosages=True)
+
+    sv = SparseVar(out)
+    assert sv.n_variants == 1
+    assert sv.index["POS"].to_list() == [100]
+
+    # Read back via with_fields so dosages Ragged is populated.
+    sv_fields = sv.with_fields(["dosages"])
+    result = sv_fields.read_ranges("chr1", 0, 1_000_000)
+    # result is an awkward record array; .dosages is Ragged[float32]
+    # Flat data: one dosage per alt-call (s1 hom-alt → 2 calls, s2 het → 1 call).
+    dosages_flat = result["dosages"].data.tolist()
+    assert len(dosages_flat) == 3
+    # All non-zero (the kept variant has real dosages; symbolic zeros never written)
+    assert all(d > 0.0 for d in dosages_flat)
+    # s1 has DS=1.9 for both haplotypes (two calls); s2 has DS=0.8 (one call)
+    assert sorted(round(d, 1) for d in dosages_flat) == [0.8, 1.9, 1.9]
