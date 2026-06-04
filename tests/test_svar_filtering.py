@@ -153,6 +153,17 @@ def test_from_pgen_inherits_symbolic_filter(tmp_path):
     # symbolic POS 200/300 dropped; precise 100/400 kept
     assert set(sv.index["POS"].to_list()) == {100, 400}
 
+    # Alignment guard: sparse data must only reference output indices {0, 1}.
+    # Under the old bug (no filter applied during from_pgen) the worker would
+    # scan all 4 physical variants and assign output indices 0-3, so POS400
+    # would land at index 3 instead of 1 — caught by asserting no index ≥ 2.
+    # Also assert the full multiset: 3 alt-calls per kept variant (matching the
+    # VCF fixture), confirming plink2 did not swap alleles for these records.
+    #   POS100 (A>T):   s1=0|1, s2=1|1  -> 3 alt haplotypes -> 3 × var_idx 0
+    #   POS400 (G>GAT): s1=1|1, s2=0|1  -> 3 alt haplotypes -> 3 × var_idx 1
+    genos = sv.read_ranges("chr1", 0, 1_000_000)
+    assert sorted(genos.data.tolist()) == [0, 0, 0, 1, 1, 1]
+
 
 def test_from_pgen_no_filter_keeps_all(tmp_path):
     pgen_path = _mixed_pgen(tmp_path)

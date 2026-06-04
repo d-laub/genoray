@@ -1738,13 +1738,11 @@ def _process_contig_pgen(
         # Convert to sparse
         var_idxs = np.arange(total_vars, total_vars + n_vars, dtype=np.int32)
         if dosages is not None:
-            sp_genos, sp_dosages = dense2sparse(
-                genos.astype(np.int8), var_idxs, dosages
-            )
+            sp_genos, sp_dosages = dense2sparse(genos, var_idxs, dosages)
             _write_genos(out_path, sp_genos)
             _write_dosages(out_path, sp_dosages.data)
         else:
-            sp_genos = dense2sparse(genos.astype(np.int8), var_idxs)
+            sp_genos = dense2sparse(genos, var_idxs)
             _write_genos(out_path, sp_genos)
 
         total_vars += n_vars
