@@ -948,7 +948,7 @@ class SparseVar(Generic[_SRT]):
                     contig=c,
                     chunk_dir=chunk_dir,
                     chunk_idx=chunk_idx,
-                    filter=vcf._filter,
+                    cyvcf2_filter=vcf._filter,
                     pl_filter=vcf._pl_filter,
                 )
                 tasks.append(task)
@@ -1597,7 +1597,9 @@ def _write_filtered_index(src: Path, dst: Path, pl_filter: pl.Expr | None) -> No
     re-joined to the on-disk comma-Utf8 form so the SVAR index format is
     unchanged. ILEN is computed on-the-fly if absent so ILEN-dependent
     expressions (e.g. ``is_snp``) work correctly, then dropped from the output
-    to preserve the original on-disk schema.
+    to preserve the original on-disk schema. ILEN is always computed when absent
+    from the on-disk schema — even if the filter doesn't reference it — to avoid
+    introspecting the opaque Polars expression.
     """
     if pl_filter is None:
         shutil.copy(src, dst)
@@ -1625,12 +1627,12 @@ def _process_contig_vcf(
     contig: str,
     chunk_dir: Path,
     chunk_idx: int,
-    filter=None,
+    cyvcf2_filter=None,
     pl_filter=None,
 ) -> tuple[int, int]:
     vcf = VCF(
         path,
-        filter=filter,
+        filter=cyvcf2_filter,
         pl_filter=pl_filter,
         dosage_field=dosage_field,
         with_gvi_index=False,
