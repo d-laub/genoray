@@ -917,7 +917,7 @@ class SparseVar(Generic[_SRT]):
         if not vcf._index_path().exists():
             logger.info("Genoray VCF index not found, creating index.")
             vcf._write_gvi_index()
-        shutil.copy(vcf._index_path(), cls._index_path(out))
+        _write_filtered_index(vcf._index_path(), cls._index_path(out), vcf._pl_filter)
 
         contigs = vcf.contigs
         with open(out / "metadata.json", "w") as f:
@@ -948,6 +948,8 @@ class SparseVar(Generic[_SRT]):
                     contig=c,
                     chunk_dir=chunk_dir,
                     chunk_idx=chunk_idx,
+                    cyvcf2_filter=vcf._filter,
+                    pl_filter=vcf._pl_filter,
                 )
                 tasks.append(task)
 
@@ -1016,7 +1018,7 @@ class SparseVar(Generic[_SRT]):
             ).model_dump_json()
             f.write(json)
 
-        shutil.copy(pgen._index_path(), cls._index_path(out))
+        _write_filtered_index(pgen._index_path(), cls._index_path(out), pgen._filter)
 
         if with_dosages and pgen._sei is None:
             raise ValueError("PGEN must be bi-allelic with filters applied")
@@ -1028,33 +1030,36 @@ class SparseVar(Generic[_SRT]):
         mem_per_var = pgen._mem_per_variant(
             pgen.GenosDosages if with_dosages else pgen.Genos  # type: ignore
         )
-        offsets = np.array(
-            [0] + [pgen._c_max_idxs[c] + 1 for c in contigs], dtype=np.uint32
-        )
 
         shape = (pgen.n_samples, pgen.ploidy)
         with TemporaryDirectory() as contig_dir:
             contig_dir = Path(contig_dir)
 
+            keep_by_contig = {
+                chrom: np.asarray(idxs, dtype=np.uint32)
+                for chrom, idxs in (
+                    pgen._index.group_by("CHROM", maintain_order=True)
+                    .agg(pl.col("index"))
+                    .iter_rows()
+                )
+            }
+
             tasks = []
-            for chunk_idx, (start, end) in enumerate(
-                np.lib.stride_tricks.sliding_window_view(offsets, 2)
-            ):
-                n_vars = end - start
-                if n_vars == 0:
+            for c in contigs:
+                keep_idxs = keep_by_contig.get(c)
+                if keep_idxs is None or len(keep_idxs) == 0:
                     continue
 
                 task = joblib.delayed(_process_contig_pgen)(
                     geno_path=pgen.geno_path,
                     dosage_path=pgen.dosage_path if with_dosages else None,
                     max_mem=job_mem,
-                    start_idx=start,
-                    end_idx=end,
+                    keep_idxs=keep_idxs,
                     mem_per_var=mem_per_var,
                     n_samples=pgen.n_samples,
                     ploidy=pgen.ploidy,
                     chunk_dir=contig_dir,
-                    chunk_idx=chunk_idx,
+                    chunk_idx=len(tasks),
                 )
                 tasks.append(task)
 
@@ -1587,6 +1592,37 @@ def _nb_write_field(
                     wp += 1
 
 
+def _write_filtered_index(src: Path, dst: Path, pl_filter: pl.Expr | None) -> None:
+    """Stream a (possibly filtered) genoray index from ``src`` to ``dst``.
+
+    When ``pl_filter`` is None this is byte-equivalent to copying. Otherwise the
+    filter is applied lazily; ALT is normalized to list[str] for the filter and
+    re-joined to the on-disk comma-Utf8 form so the SVAR index format is
+    unchanged. ILEN is computed on-the-fly if absent so ILEN-dependent
+    expressions (e.g. ``is_snp``) work correctly, then dropped from the output
+    to preserve the original on-disk schema. ILEN is always computed when absent
+    from the on-disk schema — even if the filter doesn't reference it — to avoid
+    introspecting the opaque Polars expression.
+    """
+    if pl_filter is None:
+        shutil.copy(src, dst)
+        return
+    lf = pl.scan_ipc(src)
+    schema = lf.collect_schema()
+    alt_is_utf8 = schema["ALT"] == pl.Utf8
+    ilen_added = "ILEN" not in schema
+    if alt_is_utf8:
+        lf = lf.with_columns(pl.col("ALT").str.split(","))
+    if ilen_added:
+        lf = lf.with_columns(ILEN=ILEN)
+    lf = lf.filter(pl_filter)
+    if ilen_added:
+        lf = lf.drop("ILEN")
+    if alt_is_utf8:
+        lf = lf.with_columns(pl.col("ALT").list.join(","))
+    lf.sink_ipc(dst, compression="zstd")
+
+
 def _process_contig_vcf(
     path: str | Path,
     dosage_field: str | None,
@@ -1594,8 +1630,16 @@ def _process_contig_vcf(
     contig: str,
     chunk_dir: Path,
     chunk_idx: int,
+    cyvcf2_filter=None,
+    pl_filter=None,
 ) -> tuple[int, int]:
-    vcf = VCF(path, dosage_field=dosage_field, with_gvi_index=False)
+    vcf = VCF(
+        path,
+        filter=cyvcf2_filter,
+        pl_filter=pl_filter,
+        dosage_field=dosage_field,
+        with_gvi_index=False,
+    )
     if dosage_field is not None:
         chunker = vcf.chunk(contig, max_mem=max_mem, mode=VCF.Genos8Dosages)
     else:
@@ -1638,8 +1682,7 @@ def _process_contig_pgen(
     geno_path: str | Path,
     dosage_path: str | Path | None,
     max_mem: int,
-    start_idx: V_IDX_TYPE,
-    end_idx: V_IDX_TYPE,
+    keep_idxs: np.ndarray,
     mem_per_var: int,
     n_samples: int,
     ploidy: int,
@@ -1651,32 +1694,24 @@ def _process_contig_pgen(
         PgenReader(bytes(Path(dosage_path))) if dosage_path is not None else None
     )
 
-    total_vars = int(end_idx - start_idx)
-    vars_per_chunk = min(max_mem // mem_per_var, total_vars)
-    if vars_per_chunk == 0:
+    keep_idxs = np.ascontiguousarray(keep_idxs, dtype=np.uint32)
+    n_total = int(len(keep_idxs))
+    vars_per_chunk = min(max_mem // mem_per_var, n_total) if n_total else 0
+    if n_total and vars_per_chunk == 0:
         raise ValueError(
             f"Maximum memory {format_memory(max_mem)} insufficient to read a single variant."
             + f" Memory per variant: {format_memory(mem_per_var)}."
         )
 
-    n_chunks_est = -(-total_vars // vars_per_chunk)
-    chunk_offsets = np.empty(n_chunks_est + 1, dtype=np.uint32)
-    arange = np.arange(start_idx, end_idx, vars_per_chunk, dtype=np.uint32)
-    chunk_offsets[: len(arange)] = arange
-    if len(arange) < n_chunks_est + 1:
-        chunk_offsets[len(arange)] = end_idx
-
-    total_vars = 0
-    n_chunks = 0
-
     # Create a subdirectory for this contig to avoid collision
     contig_dir = chunk_dir / f"c{chunk_idx}"
     contig_dir.mkdir(parents=True, exist_ok=True)
 
-    for i, (start, end) in enumerate(
-        np.lib.stride_tricks.sliding_window_view(chunk_offsets, 2)
-    ):
-        n_vars = end - start
+    total_vars = 0
+    n_chunks = 0
+    for i, c0 in enumerate(range(0, n_total, vars_per_chunk) if n_total else []):
+        idxs = keep_idxs[c0 : c0 + vars_per_chunk]
+        n_vars = int(len(idxs))
         if n_vars == 0:
             continue
         n_chunks += 1
@@ -1684,35 +1719,30 @@ def _process_contig_pgen(
         out_path = contig_dir / str(i)
         out_path.mkdir(parents=True, exist_ok=True)
 
-        # Read Genotypes
-        # (v s p) -> (v s*p)
+        # Read genotypes for exactly the kept variant indices.
+        # (v, s*p)
         genos = np.empty((n_vars, n_samples * ploidy), dtype=np.int32)
-        geno_reader.read_alleles_range(start, end, genos)
+        geno_reader.read_alleles_list(idxs, genos)
         genos = genos.astype(np.int8)
-        # (v s p) -> (s p v)
+        # (v, s, p) -> (s, p, v)
         genos = genos.reshape(n_vars, n_samples, ploidy).transpose(1, 2, 0)
         genos[genos == -9] = -1
 
         dosages = None
         if dose_reader is not None:
-            # (v s)
             dosages = np.empty((n_vars, n_samples), dtype=np.float32)
-            dose_reader.read_dosages_range(start, end, dosages)
-            # (s v)
+            dose_reader.read_dosages_list(idxs, dosages)
             dosages = dosages.transpose(1, 0)
             dosages[dosages == -9] = np.nan
 
         # Convert to sparse
         var_idxs = np.arange(total_vars, total_vars + n_vars, dtype=np.int32)
-
         if dosages is not None:
-            sp_genos, sp_dosages = dense2sparse(
-                genos.astype(np.int8), var_idxs, dosages
-            )
+            sp_genos, sp_dosages = dense2sparse(genos, var_idxs, dosages)
             _write_genos(out_path, sp_genos)
             _write_dosages(out_path, sp_dosages.data)
         else:
-            sp_genos = dense2sparse(genos.astype(np.int8), var_idxs)
+            sp_genos = dense2sparse(genos, var_idxs)
             _write_genos(out_path, sp_genos)
 
         total_vars += n_vars

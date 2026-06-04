@@ -31,7 +31,7 @@ Prefer reading these over guessing:
 - `genoray/_vcf.py` — `VCF` class: constructor, `read`, `chunk`, mode constants near the top of the class
 - `genoray/_pgen.py` — `PGEN` class: constructor, `read`, `chunk`, `read_ranges`, `chunk_ranges`, mode constants near the top of the class
 - `genoray/_svar.py` — `SparseVar`: `__init__`, `from_vcf`, `from_pgen`, `read_ranges`, `with_fields`
-- `genoray/exprs.py` — the *complete* set of pre-built filter expressions (currently 4: `is_snp`, `is_indel`, `is_biallelic`, `ILEN`)
+- `genoray/exprs.py` — the *complete* set of pre-built filter expressions (currently 5: `is_snp`, `is_indel`, `is_biallelic`, `is_symbolic`, `ILEN`)
 
 When a signature, kwarg, or shape is unclear, **read the docstring in the
 source** rather than reasoning from first principles.
@@ -66,9 +66,10 @@ dosages)`; `VCF.Genos8Dosages` returns `(genos, dosages)`.
 ```python
 vcf = genoray.VCF(
     "file.vcf.gz",
-    phasing=True,           # constructor-time, not per-read
-    dosage_field="DS",      # required to read dosages; FORMAT field with Number=A
-    filter=lambda v: ...,   # cyvcf2.Variant -> bool
+    phasing=True,             # constructor-time, not per-read
+    dosage_field="DS",        # required to read dosages; FORMAT field with Number=A
+    filter=lambda v: ...,     # cyvcf2.Variant -> bool
+    pl_filter=~genoray.exprs.is_symbolic,  # drop <DEL>/<INS>/...; pair with a matching `filter` callable
 )
 
 # Single range
@@ -141,6 +142,8 @@ genoray.SparseVar.from_vcf("out.svar", vcf, max_mem="4g",
 genoray.SparseVar.from_pgen("out.svar", "file.pgen", max_mem="4g")
 ```
 
+`SparseVar.from_vcf` / `from_pgen` inherit and apply the source's filter — filter the VCF/PGEN to filter the SVAR.
+
 Read:
 
 ```python
@@ -177,7 +180,9 @@ are **0-based half-open**. Don't conflate them.
 
 ## Filtering
 
-VCF: pass a `Callable[[cyvcf2.Variant], bool]` to `filter=`.
+VCF: pass a `Callable[[cyvcf2.Variant], bool]` to `filter=`. For index-based
+predicates (e.g. `is_symbolic`), also pass the matching polars `pl.Expr` to
+`pl_filter=` — VCF requires **both** when filtering via the `.gvi` index.
 
 PGEN: pass a polars `pl.Expr` returning a boolean mask, operating on the
 `.gvi` index columns. Built-in expressions in `genoray.exprs` (the
@@ -186,6 +191,7 @@ PGEN: pass a polars `pl.Expr` returning a boolean mask, operating on the
 - `is_snp`
 - `is_indel`
 - `is_biallelic`
+- `is_symbolic` (True if any ALT is a VCF 4.x symbolic allele, i.e. starts with `<`)
 - `ILEN` (an expression yielding indel length, not a boolean)
 
 For anything else, write `pl.col(...)` against the `.gvi` schema — read

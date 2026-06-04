@@ -697,6 +697,8 @@ class VCF:
             gt_buffer, ds_buffer = buffer
 
         vcf = self._vcf(f"{c}:{int(start + 1)}-{end}")  # range string is 1-based
+        if self._filter is not None:
+            vcf = filter(self._filter, vcf)
         if self.progress and self._pbar is None:
             vcf = tqdm(vcf, desc="Reading VCF", unit=" variant")
         i = 0
@@ -1100,12 +1102,15 @@ class VCF:
                 self._index_path(), row_index_name="index"
             ).with_columns(pl.col("CHROM").cast(pl.Enum(self.contigs)))
 
-        if self._pl_filter is not None:
-            index = index.filter(self._pl_filter)
-
+        # Normalize ALT (on-disk comma-Utf8) to list[str] BEFORE applying the
+        # filter so the in-memory schema documented in genoray.exprs holds and
+        # list-typed expressions (is_symbolic, is_biallelic) work on this path.
         schema = index.collect_schema()
         if schema["ALT"] == pl.Utf8:
             index = index.with_columns(pl.col("ALT").str.split(","))
+
+        if self._pl_filter is not None:
+            index = index.filter(self._pl_filter)
 
         if "ILEN" not in schema:
             index = index.with_columns(ILEN=ILEN)
