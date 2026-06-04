@@ -697,6 +697,8 @@ class VCF:
             gt_buffer, ds_buffer = buffer
 
         vcf = self._vcf(f"{c}:{int(start + 1)}-{end}")  # range string is 1-based
+        if self._filter is not None:
+            vcf = filter(self._filter, vcf)
         if self.progress and self._pbar is None:
             vcf = tqdm(vcf, desc="Reading VCF", unit=" variant")
         i = 0

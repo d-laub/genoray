@@ -73,10 +73,19 @@ def test_from_vcf_inherits_symbolic_filter(tmp_path):
     sv = SparseVar(out)
     assert sv.n_variants == 2
     assert sv.index["POS"].to_list() == [100, 400]
-    # Genotype scan and index agree: reading the contig yields 2 variants.
+
+    # Genotype scan and index must agree: the sparse data stores global variant
+    # indices (0 = POS100, 1 = POS400).  If chunk() ignored self._filter the
+    # worker would scan all 4 variants and assign indices 0-3, so POS400 would
+    # land at index 3 instead of 1 — a value-level mismatch caught below.
+    #
+    # Fixture genotypes after filtering to {POS100, POS400}:
+    #   POS100 (A>T):   s1=0|1, s2=1|1  -> 3 alt haplotypes -> 3 × var_idx 0
+    #   POS400 (G>GAT): s1=1|1, s2=0|1  -> 3 alt haplotypes -> 3 × var_idx 1
     genos = sv.read_ranges("chr1", 0, 1_000_000)
-    # shape is (1 range, 2 samples, 2 ploidy, ~variants); flat data has 2*2*2 = 8 entries
-    assert len(genos.data) == 2 * 2 * 2  # n_variants * n_samples * ploidy
+    # read_ranges returns Ragged[V_IDX_TYPE]; .data is the flat array of
+    # variant indices for every alt-allele call across all ranges/samples/ploidy.
+    assert sorted(genos.data.tolist()) == [0, 0, 0, 1, 1, 1]
 
 
 def test_from_vcf_inherits_general_filter(tmp_path):
@@ -93,6 +102,9 @@ def test_from_vcf_inherits_general_filter(tmp_path):
     # Only the SNV A>T@100 is a pure SNP (200/300 symbolic, 400 indel).
     assert sv.n_variants == 1
     assert sv.index["POS"].to_list() == [100]
+    # POS100 (A>T): s1=0|1, s2=1|1 -> 3 alt calls, all variant index 0
+    genos = sv.read_ranges("chr1", 0, 1_000_000)
+    assert sorted(genos.data.tolist()) == [0, 0, 0]
 
 
 def test_from_vcf_no_filter_keeps_all(tmp_path):
