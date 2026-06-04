@@ -11,7 +11,7 @@ from pathlib import Path
 
 from vcfixture import Seq, Sym, VcfBuilder, VcfVersion
 
-from genoray import VCF
+from genoray import VCF, SparseVar
 from genoray import exprs as gexprs
 
 
@@ -62,3 +62,44 @@ def test_vcf_load_index_list_typed_filter(tmp_path):
     assert v._index is not None
     assert v._index.height == 2
     assert v._index["POS"].to_list() == [100, 400]
+
+
+def test_from_vcf_inherits_symbolic_filter(tmp_path):
+    vcf_path = _mixed_vcf(tmp_path)
+    v = VCF(vcf_path, filter=_not_symbolic, pl_filter=~gexprs.is_symbolic)
+    out = tmp_path / "out.svar"
+    SparseVar.from_vcf(out, v, max_mem="1g", overwrite=True)
+
+    sv = SparseVar(out)
+    assert sv.n_variants == 2
+    assert sv.index["POS"].to_list() == [100, 400]
+    # Genotype scan and index agree: reading the contig yields 2 variants.
+    genos = sv.read_ranges("chr1", 0, 1_000_000)
+    # shape is (1 range, 2 samples, 2 ploidy, ~variants); flat data has 2*2*2 = 8 entries
+    assert len(genos.data) == 2 * 2 * 2  # n_variants * n_samples * ploidy
+
+
+def test_from_vcf_inherits_general_filter(tmp_path):
+    """A non-symbolic filter (is_snp) is also honored, proving the path is general."""
+    vcf_path = _mixed_vcf(tmp_path)
+    v = VCF(
+        vcf_path,
+        filter=lambda rec: len(rec.REF) == 1 and all(len(a) == 1 for a in rec.ALT),
+        pl_filter=gexprs.is_snp,
+    )
+    out = tmp_path / "snp.svar"
+    SparseVar.from_vcf(out, v, max_mem="1g", overwrite=True)
+    sv = SparseVar(out)
+    # Only the SNV A>T@100 is a pure SNP (200/300 symbolic, 400 indel).
+    assert sv.n_variants == 1
+    assert sv.index["POS"].to_list() == [100]
+
+
+def test_from_vcf_no_filter_keeps_all(tmp_path):
+    """Back-compat: no filter -> all records written."""
+    vcf_path = _mixed_vcf(tmp_path)
+    v = VCF(vcf_path)
+    out = tmp_path / "all.svar"
+    SparseVar.from_vcf(out, v, max_mem="1g", overwrite=True)
+    sv = SparseVar(out)
+    assert sv.n_variants == 4
