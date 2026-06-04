@@ -50,14 +50,22 @@ Symbolic ALTs are placeholders for structural variants whose exact replacement
 nucleotides are unknown. Downstream haplotype injection (e.g. via
 ``genvarloader``) cannot expand them — the literal ``<DEL>`` ASCII bytes end up
 in personalized DNA buffers and become non-canonical bytes for translators.
-Pair with :class:`~genoray.VCF`'s ``skip_symbolic_alts`` constructor flag to
-filter these out, or compose directly with other expressions.
 
-Example
--------
->>> import genoray
->>> vcf = genoray.VCF("file.vcf.gz", pl_filter=~genoray.exprs.is_symbolic,
-...                   filter=lambda v: not v.ALT[0].startswith("<"))  # doctest: +SKIP
+To drop symbolic records, pass this as a filter. For PGEN, the single ``filter``
+expression suffices::
+
+    pgen = genoray.PGEN("file.pgen", filter=~genoray.exprs.is_symbolic)
+
+For VCF, pair it with the equivalent cyvcf2 ``filter`` (both are required)::
+
+    vcf = genoray.VCF(
+        "file.vcf.gz",
+        filter=lambda rec: not any(a.startswith("<") for a in rec.ALT),
+        pl_filter=~genoray.exprs.is_symbolic,
+    )
+
+``SparseVar.from_vcf`` / ``from_pgen`` inherit the source's filter, so the SVAR
+is filtered to match.
 """
 
 ILEN = pl.col("ALT").list.eval(pl.element().str.len_bytes().cast(pl.Int32)) - pl.col(

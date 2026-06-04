@@ -69,7 +69,7 @@ vcf = genoray.VCF(
     phasing=True,             # constructor-time, not per-read
     dosage_field="DS",        # required to read dosages; FORMAT field with Number=A
     filter=lambda v: ...,     # cyvcf2.Variant -> bool
-    skip_symbolic_alts=True,  # drop records whose ALT is <DEL>/<INS>/<DUP>/... (VCF 4.x SVs)
+    pl_filter=~genoray.exprs.is_symbolic,  # drop <DEL>/<INS>/...; pair with a matching `filter` callable
 )
 
 # Single range
@@ -136,12 +136,13 @@ Build:
 # From a configured VCF reader
 vcf = genoray.VCF("file.vcf.gz", dosage_field="DS")
 genoray.SparseVar.from_vcf("out.svar", vcf, max_mem="4g",
-                           with_dosages=True, overwrite=True,
-                           skip_symbolic_alts=True)  # opt-in; defaults to vcf.skip_symbolic_alts
+                           with_dosages=True, overwrite=True)
 
 # Or from a PGEN
 genoray.SparseVar.from_pgen("out.svar", "file.pgen", max_mem="4g")
 ```
+
+`SparseVar.from_vcf` / `from_pgen` inherit and apply the source's filter — filter the VCF/PGEN to filter the SVAR.
 
 Read:
 
@@ -179,7 +180,9 @@ are **0-based half-open**. Don't conflate them.
 
 ## Filtering
 
-VCF: pass a `Callable[[cyvcf2.Variant], bool]` to `filter=`.
+VCF: pass a `Callable[[cyvcf2.Variant], bool]` to `filter=`. For index-based
+predicates (e.g. `is_symbolic`), also pass the matching polars `pl.Expr` to
+`pl_filter=` — VCF requires **both** when filtering via the `.gvi` index.
 
 PGEN: pass a polars `pl.Expr` returning a boolean mask, operating on the
 `.gvi` index columns. Built-in expressions in `genoray.exprs` (the
