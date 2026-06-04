@@ -1160,48 +1160,15 @@ class VCF:
                 self._index_path(), row_index_name="index"
             ).with_columns(pl.col("CHROM").cast(pl.Enum(self.contigs)))
 
-        # When ``skip_symbolic_alts`` is in play, normalize ALT to
-        # ``list[str]`` BEFORE applying the filter so ``is_symbolic`` binds
-        # against the in-memory schema documented in ``genoray.exprs``.
-        # (Without this, the on-disk Utf8 representation breaks list-typed
-        # expressions like ``pl.col("ALT").list.eval(...)``.) We only do the
-        # early-split for this case to preserve the historical filter-order
-        # for user-supplied ``pl_filter`` callers.
-        schema = index.collect_schema()
-        if self._skip_symbolic_alts and schema["ALT"] == pl.Utf8:
-            index = index.with_columns(pl.col("ALT").str.split(","))
-
-            # Report symbolic-ALT skip count.
-            n_total = index.select(pl.len()).collect().item()
-            n_symbolic = (
-                index.select(
-                    pl.col("ALT")
-                    .list.eval(pl.element().str.starts_with("<"))
-                    .list.any()
-                    .alias("_sym")
-                )
-                .filter(pl.col("_sym"))
-                .select(pl.len())
-                .collect()
-                .item()
-            )
-            if n_symbolic:
-                logger.info(
-                    "skip_symbolic_alts=True: dropping {} of {} records with "
-                    "symbolic ALT alleles (e.g. <DEL>, <INS>) from {}.",
-                    n_symbolic,
-                    n_total,
-                    self.path.name,
-                )
-
-        if self._pl_filter is not None:
-            index = index.filter(self._pl_filter)
-
-        # Final schema-normalization fall-through (covers the non-skip path
-        # which kept ALT as Utf8 through filtering, matching prior behavior).
+        # Normalize ALT (on-disk comma-Utf8) to list[str] BEFORE applying the
+        # filter so the in-memory schema documented in genoray.exprs holds and
+        # list-typed expressions (is_symbolic, is_biallelic) work on this path.
         schema = index.collect_schema()
         if schema["ALT"] == pl.Utf8:
             index = index.with_columns(pl.col("ALT").str.split(","))
+
+        if self._pl_filter is not None:
+            index = index.filter(self._pl_filter)
 
         if "ILEN" not in schema:
             index = index.with_columns(ILEN=ILEN)
