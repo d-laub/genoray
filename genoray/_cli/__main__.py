@@ -100,6 +100,9 @@ def write(
             )
 
         if skip_symbolic_alts:
+            # VCF needs both filters: a cyvcf2 callable applied during the
+            # genotype scan and a polars expr applied to the index; both must
+            # express the same predicate.
             vcf = VCF(
                 source,
                 dosage_field=dosages,
