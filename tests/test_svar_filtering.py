@@ -13,7 +13,7 @@ from pathlib import Path
 
 import polars as pl
 import pytest
-from vcfixture import Number, Seq, Sym, Type, VcfBuilder, VcfVersion
+from vcfixture import Bnd, Number, Seq, Sym, Type, VcfBuilder, VcfVersion
 
 from genoray import PGEN, VCF, SparseVar
 from genoray import exprs as gexprs
@@ -414,3 +414,109 @@ def test_record_predicates_mirror_exprs():
     assert _record_is_breakend(["A", "T"]) is False
     # symbolic alleles are NOT breakends (distinct ALT class)
     assert _record_is_breakend(["<DEL>"]) is False
+
+
+# ---------------------------------------------------------------------------
+# Breakend filter tests
+# ---------------------------------------------------------------------------
+
+
+def _bnd_vcf(tmp_path: Path) -> Path:
+    """chr1: SNV A>T@100, BND G[chr1:500000[@200, <DEL>@300, ins G>GAT@400.
+
+    One of each droppable class plus two keepers, so the three filter modes
+    (none / no_breakend / no_symbolic / both) all produce distinct counts.
+    """
+    b = (
+        VcfBuilder(
+            samples=["s1", "s2"],
+            contigs=[("chr1", 1_000_000)],
+            version=VcfVersion.V4_4,
+        )
+        .info("SVLEN")
+        .info("SVCLAIM")
+        .info("END")
+        .fmt("GT")
+    )
+    b.record("chr1", 100, ref="A", alt=[Seq("T")], gt=["0|1", "1|1"])
+    b.record("chr1", 200, ref="G", alt=[Bnd("G[chr1:500000[")], gt=["0|1", "0|0"])
+    b.record(
+        "chr1",
+        300,
+        ref="A",
+        alt=[Sym.deletion()],
+        gt=["0|0", "0|1"],
+        info={"SVLEN": [50], "SVCLAIM": ["D"], "END": [350]},
+    )
+    b.record("chr1", 400, ref="G", alt=[Seq("GAT")], gt=["1|1", "0|1"])
+    return b.write(tmp_path / "bnd.vcf.gz", bgzip=True, index=True)
+
+
+def _bnd_pgen(tmp_path: Path) -> Path:
+    """Convert the BND VCF to PGEN via plink2 (BND/symbolic carried verbatim)."""
+    if shutil.which("plink2") is None:
+        pytest.skip("plink2 not available")
+    vcf_path = _bnd_vcf(tmp_path)
+    prefix = tmp_path / "bnd"
+    subprocess.run(
+        [
+            "plink2",
+            "--vcf",
+            str(vcf_path),
+            "--make-pgen",
+            "--out",
+            str(prefix),
+            "--allow-extra-chr",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return prefix.with_suffix(".pgen")
+
+
+def test_cli_write_no_breakend_vcf(tmp_path):
+    from genoray._cli.__main__ import write as cli_write
+
+    vcf_path = _bnd_vcf(tmp_path)
+    out = tmp_path / "nobnd.svar"
+    cli_write(vcf_path, out, max_mem="1g", overwrite=True, no_breakend=True)
+    sv = SparseVar(out)
+    # BND@200 dropped; SNV@100, <DEL>@300, ins@400 kept
+    assert sv.n_variants == 3
+    assert sv.index["POS"].to_list() == [100, 300, 400]
+
+
+def test_cli_write_no_breakend_pgen(tmp_path):
+    from genoray._cli.__main__ import write as cli_write
+
+    pgen_path = _bnd_pgen(tmp_path)
+    out = tmp_path / "nobnd_pg.svar"
+    cli_write(pgen_path, out, max_mem="1g", overwrite=True, no_breakend=True)
+    sv = SparseVar(out)
+    assert sv.n_variants == 3
+    assert set(sv.index["POS"].to_list()) == {100, 300, 400}
+
+
+def test_cli_write_no_symbolic_and_no_breakend_vcf(tmp_path):
+    from genoray._cli.__main__ import write as cli_write
+
+    vcf_path = _bnd_vcf(tmp_path)
+    out = tmp_path / "both.svar"
+    cli_write(
+        vcf_path, out, max_mem="1g", overwrite=True, no_symbolic=True, no_breakend=True
+    )
+    sv = SparseVar(out)
+    # BND@200 and <DEL>@300 both dropped; only plain SNV@100 + ins@400 remain
+    assert sv.n_variants == 2
+    assert sv.index["POS"].to_list() == [100, 400]
+
+
+def test_cli_write_no_flags_keeps_all_vcf(tmp_path):
+    """Back-compat: neither flag set -> all records written."""
+    from genoray._cli.__main__ import write as cli_write
+
+    vcf_path = _bnd_vcf(tmp_path)
+    out = tmp_path / "none.svar"
+    cli_write(vcf_path, out, max_mem="1g", overwrite=True)
+    sv = SparseVar(out)
+    assert sv.n_variants == 4
