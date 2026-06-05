@@ -66,27 +66,52 @@ def split_phased(gp: NDArray) -> tuple[NDArray, NDArray[np.bool_]]:
 def expected_ilen(truth: GroundTruth, idx: Index) -> list[list[int | None]]:
     """Per-record list of per-ALT expected ILEN from the vcfixture oracle.
 
-    DEL -> -|svlen|, INS/DUP -> +|svlen|, else (unsupported type or no svlen)
-    -> None. Mirrors genoray.exprs.symbolic_ilen for the symbolic case. For
-    literal ALTs, ILEN is len(ALT) - len(REF).
+    Mirrors genoray.exprs.symbolic_ilen exactly:
+    - Literal ALT: len(ALT) - len(REF).
+    - Symbolic DEL/INS/DUP: magnitude = abs(svlen) if svlen is not None, else
+      abs(sv_end - pos) if sv_end is not None, else None.
+      DEL -> -magnitude, INS/DUP -> +magnitude.
+    - IMPRECISE flag set, magnitude is None, or unsupported symbolic type -> None.
+      (IMPRECISE only nulls sized symbolic ALTs; literal ALTs are unaffected.)
 
     Note: AlleleTruth has no .alt attribute; literal sequences are read from
     truth.alts[ri][alt_idx] (list[list[str]] on GroundTruth).
+    truth.info[ri]["IMPRECISE"] is True when the IMPRECISE flag is set.
+    at.sv_end is 1-based inclusive end = pos + svlen, so abs(sv_end - pos) == svlen.
     """
     n_rec = len(truth.pos)
     rec_ids = list(range(n_rec))[idx] if isinstance(idx, slice) else list(idx)
     out: list[list[int | None]] = []
     for ri in rec_ids:
         ref = truth.ref[ri]
+        imprecise = truth.info[ri].get("IMPRECISE", False) is True
+        pos = int(truth.pos[ri])
         row: list[int | None] = []
         for ai, at in enumerate(truth.alts_truth[ri]):
             if at.is_sequence:
+                # Literal ALT: IMPRECISE does not affect this branch.
                 alt_str = truth.alts[ri][ai]
                 row.append(len(alt_str) - len(ref))
-            elif at.sv_type == "DEL" and at.svlen is not None:
-                row.append(-abs(int(at.svlen)))
-            elif at.sv_type in ("INS", "DUP") and at.svlen is not None:
-                row.append(abs(int(at.svlen)))
+            elif at.sv_type == "DEL":
+                if imprecise:
+                    row.append(None)
+                else:
+                    mag = (
+                        abs(int(at.svlen))
+                        if at.svlen is not None
+                        else (abs(at.sv_end - pos) if at.sv_end is not None else None)
+                    )
+                    row.append(-mag if mag is not None else None)
+            elif at.sv_type in ("INS", "DUP"):
+                if imprecise:
+                    row.append(None)
+                else:
+                    mag = (
+                        abs(int(at.svlen))
+                        if at.svlen is not None
+                        else (abs(at.sv_end - pos) if at.sv_end is not None else None)
+                    )
+                    row.append(mag if mag is not None else None)
             else:
                 row.append(None)
         out.append(row)

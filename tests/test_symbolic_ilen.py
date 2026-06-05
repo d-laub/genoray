@@ -78,4 +78,5 @@ def test_expected_ilen_from_oracle():
     assert exp[0] == [-100]  # <DEL>
     assert exp[1] == [50]  # <INS>
     assert exp[2] == [30]  # <DUP>
+    assert exp[3] == [None]  # IMPRECISE <DEL> -> null (mirrors symbolic_ilen)
     assert exp[4] == [None]  # <CNV> unsupported
