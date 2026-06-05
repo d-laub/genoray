@@ -340,3 +340,52 @@ def test_svar_inherits_symbolic_ilen(tmp_path):
     SparseVar.from_vcf(svar_path, vcf, max_mem="100MB", overwrite=True)
     svar = SparseVar(svar_path)
     assert svar.index.get_column("ILEN").to_list() == [[-100], [50], [30]]
+
+
+# ---------------------------------------------------------------------------
+# Task 9: Property test — symbolic ILEN matches oracle across random docs
+# ---------------------------------------------------------------------------
+
+
+def test_property_ilen_matches_oracle():
+    """Property test: genoray's persisted VCF ILEN matches the expected_ilen oracle
+    across randomly-generated symbolic VCF documents from vcfixture.
+
+    Strategy investigation findings (empirical, 200 examples):
+    - vs.symbolic_documents() generates: DEL, INS, DUP, CNV, INV, <*> (Unspecified).
+    - NO BND (breakend-notation) ALTs — divergence case #2 never occurs.
+    - NO END-only sized SVs (SVLEN always present when sv_end is set) — case #1 never occurs.
+    - NO IMPRECISE flag in generated docs.
+    - NO literal ALTs (is_sequence always False).
+    - CNV / INV / <*>: both oracle and symbolic_ilen return None → they AGREE.
+    Therefore the simple got == exp assertion is correct and meaningful.
+    """
+    import tempfile
+
+    from hypothesis import HealthCheck, given, settings
+    from vcfixture import strategies as vs
+
+    @settings(
+        max_examples=25, deadline=None, suppress_health_check=[HealthCheck.too_slow]
+    )
+    @given(vs.symbolic_documents())
+    def _prop(doc):
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            path = doc.write(tmp / "d.vcf.gz", bgzip=True, index=True)
+            vcf = VCF(str(path))
+            vcf._write_gvi_index()
+            vcf._load_index()
+            got = vcf._index.get_column("ILEN").to_list()
+            truth = doc.truth()
+            exp = _oracle.expected_ilen(truth, slice(None))
+            assert len(got) == len(exp), (
+                f"Row count mismatch: index has {len(got)} rows, oracle has {len(exp)}"
+            )
+            for ri, (g_row, e_row) in enumerate(zip(got, exp)):
+                assert g_row == e_row, (
+                    f"ILEN mismatch at record {ri}: got {g_row}, expected {e_row} "
+                    f"(variant_class={truth.variant_class[ri]})"
+                )
+
+    _prop()
