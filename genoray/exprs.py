@@ -13,6 +13,9 @@ Applicable for PGEN files and the experimental :meth:`VCF._load_index` method.
     For PGEN, all columns that existed in the underlying PVAR will be available in the index.
 """
 
+import re
+from collections.abc import Iterable
+
 import polars as pl
 
 """
@@ -110,6 +113,27 @@ un-expandable ALTs (symbolic + breakends) for haplotype consumers, combine::
 
     pl_filter=~genoray.exprs.is_symbolic & ~genoray.exprs.is_breakend
 """
+
+
+def _record_is_symbolic(alts: Iterable[str]) -> bool:
+    """Record-level mirror of :data:`is_symbolic` for a cyvcf2 ``Variant.ALT``.
+
+    True if any ALT allele is a symbolic allele (starts with ``<``). Used by the
+    CLI to build the cyvcf2 ``filter`` callable that must match the polars
+    ``pl_filter`` on the VCF path.
+    """
+    return any(a.startswith("<") for a in alts)
+
+
+def _record_is_breakend(alts: Iterable[str]) -> bool:
+    """Record-level mirror of :data:`is_breakend` for a cyvcf2 ``Variant.ALT``.
+
+    True if any ALT allele is a breakend (matches :data:`_BND_PATTERN`). Reuses
+    the same regex as :data:`is_breakend` so the cyvcf2 ``filter`` callable and
+    the polars ``pl_filter`` cannot drift apart.
+    """
+    return any(re.search(_BND_PATTERN, a) is not None for a in alts)
+
 
 ILEN = pl.col("ALT").list.eval(pl.element().str.len_bytes().cast(pl.Int32)) - pl.col(
     "REF"

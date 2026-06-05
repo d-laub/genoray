@@ -396,3 +396,21 @@ def test_from_vcf_filtered_with_dosages(tmp_path):
     assert all(d > 0.0 for d in dosages_flat)
     # s1 has DS=1.9 for both haplotypes (two calls); s2 has DS=0.8 (one call)
     assert sorted(round(d, 1) for d in dosages_flat) == [0.8, 1.9, 1.9]
+
+
+def test_record_predicates_mirror_exprs():
+    from genoray.exprs import _record_is_breakend, _record_is_symbolic
+
+    # symbolic: any ALT starting with "<"
+    assert _record_is_symbolic(["<DEL>"]) is True
+    assert _record_is_symbolic(["A", "<INS>"]) is True
+    assert _record_is_symbolic(["A", "T"]) is False
+
+    # breakend: any ALT in mate-pair or single-breakend notation
+    assert _record_is_breakend(["G[chr1:500000["]) is True
+    assert _record_is_breakend(["]chr2:321]G"]) is True
+    assert _record_is_breakend([".TGCA"]) is True
+    assert _record_is_breakend(["TGCA."]) is True
+    assert _record_is_breakend(["A", "T"]) is False
+    # symbolic alleles are NOT breakends (distinct ALT class)
+    assert _record_is_breakend(["<DEL>"]) is False
