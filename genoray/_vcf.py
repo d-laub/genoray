@@ -1116,12 +1116,22 @@ class VCF:
         finally:
             self._pl_filter = filt
 
-        # Fetch SV helper columns directly (oxbow requires uppercase and returns a struct)
-        if extra_sv:
-            sv_cols = self._fetch_info_cols(extra_sv)
-            index = pl.concat([index, sv_cols], how="horizontal")
-
         from .exprs import symbolic_ilen
+
+        # Fetch SV helper columns directly (oxbow requires uppercase and returns a struct).
+        # Both oxbow reads cover the identical full record set (no region, no filter, same
+        # file order), which is what makes the positional horizontal concat correct.
+        # WARNING: region-scoping or pre-concat filtering either call would silently
+        # misalign SVLEN/END/IMPRECISE to wrong variants, corrupting ILEN.
+        if extra_sv:
+            index_df = index.collect()
+            sv_cols_df = self._fetch_info_cols(extra_sv).collect()
+            if index_df.height != sv_cols_df.height:
+                raise AssertionError(
+                    f"Row count mismatch between base index ({index_df.height}) and SV INFO "
+                    f"columns ({sv_cols_df.height}); positional concat would misalign ILEN."
+                )
+            index = pl.concat([index_df, sv_cols_df], how="horizontal").lazy()
 
         # Ensure the columns symbolic_ilen references exist (nulls when absent).
         schema = index.collect_schema()
@@ -1141,8 +1151,13 @@ class VCF:
 
         index = index.with_columns(ILEN=symbolic_ilen())
 
-        # Drop the SV helper columns we added (keep any the user explicitly requested)
-        drop_cols = [c for c in extra_sv if c.upper() not in user_info_upper]
+        # Drop ALL of {SVLEN, END, IMPRECISE} that the user did not explicitly request
+        # via info=. This covers both fetched helper cols AND null-placeholder cols added
+        # above, so non-SV indexes don't gain stray all-null columns.
+        sv_cols_in_frame = {"SVLEN", "END", "IMPRECISE"} & set(
+            index.collect_schema().names()
+        )
+        drop_cols = [c for c in sv_cols_in_frame if c not in user_info_upper]
         if drop_cols:
             index = index.drop(drop_cols)
 
