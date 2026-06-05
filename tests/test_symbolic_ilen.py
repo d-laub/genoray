@@ -3,6 +3,7 @@ from __future__ import annotations
 import polars as pl
 
 from genoray.exprs import is_imprecise, symbolic_ilen
+from tests import _oracle
 
 
 def _frame():
@@ -67,3 +68,14 @@ def test_symbolic_fixture_builds_and_classifies():
     assert truth.alts_truth[2][0].sv_type == "DUP"
     assert truth.alts_truth[3][0].sv_type == "DEL"  # IMPRECISE <DEL>
     assert truth.alts_truth[4][0].sv_type == "CNV"  # <CNV> unsupported type
+
+
+def test_expected_ilen_from_oracle():
+    from tests.data.fixtures import FIXTURES
+
+    truth = FIXTURES["symbolic"]().truth()
+    exp = _oracle.expected_ilen(truth, slice(None))
+    assert exp[0] == [-100]  # <DEL>
+    assert exp[1] == [50]  # <INS>
+    assert exp[2] == [30]  # <DUP>
+    assert exp[4] == [None]  # <CNV> unsupported

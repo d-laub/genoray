@@ -61,3 +61,33 @@ def split_phased(gp: NDArray) -> tuple[NDArray, NDArray[np.bool_]]:
     """Split genoray phased output (s, ploidy+1, v) into (genos, phasing)."""
     g, p = np.array_split(gp, 2, axis=1)
     return g, p.squeeze(1).astype(bool)
+
+
+def expected_ilen(truth: GroundTruth, idx: Index) -> list[list[int | None]]:
+    """Per-record list of per-ALT expected ILEN from the vcfixture oracle.
+
+    DEL -> -|svlen|, INS/DUP -> +|svlen|, else (unsupported type or no svlen)
+    -> None. Mirrors genoray.exprs.symbolic_ilen for the symbolic case. For
+    literal ALTs, ILEN is len(ALT) - len(REF).
+
+    Note: AlleleTruth has no .alt attribute; literal sequences are read from
+    truth.alts[ri][alt_idx] (list[list[str]] on GroundTruth).
+    """
+    n_rec = len(truth.pos)
+    rec_ids = list(range(n_rec))[idx] if isinstance(idx, slice) else list(idx)
+    out: list[list[int | None]] = []
+    for ri in rec_ids:
+        ref = truth.ref[ri]
+        row: list[int | None] = []
+        for ai, at in enumerate(truth.alts_truth[ri]):
+            if at.is_sequence:
+                alt_str = truth.alts[ri][ai]
+                row.append(len(alt_str) - len(ref))
+            elif at.sv_type == "DEL" and at.svlen is not None:
+                row.append(-abs(int(at.svlen)))
+            elif at.sv_type in ("INS", "DUP") and at.svlen is not None:
+                row.append(abs(int(at.svlen)))
+            else:
+                row.append(None)
+        out.append(row)
+    return out
