@@ -140,9 +140,17 @@ def symbolic() -> VcfBuilder:
     """Symbolic structural variants for ILEN correctness tests.
 
     Precise <DEL>/<INS>/<DUP> (SVLEN/SVCLAIM), then un-sizable cases:
-    an IMPRECISE <DEL> and a <CNV> whose SVLEN is present but unusable because
-    the type is unsupported. VCF 4.4 so SVLEN is
-    positive and <DEL>/<DUP> carry SVCLAIM. (A <BND> row is added in Task 6.)
+    an IMPRECISE <DEL>, a <CNV> whose SVLEN is present but unusable because
+    the type is unsupported, and an <INV> (also unsupported / un-sizable).
+    VCF 4.4 so SVLEN is positive and <DEL>/<DUP> carry SVCLAIM.
+
+    Record layout (0-based index):
+      0 - POS 1000: <DEL> precise  (ILEN = -100)
+      1 - POS 2000: <INS> precise  (ILEN = +50)
+      2 - POS 3000: <DUP> precise  (ILEN = +30)
+      3 - POS 4000: <DEL> IMPRECISE (ILEN = null)
+      4 - POS 5000: <CNV> unsupported type (ILEN = null)
+      5 - POS 6000: <INV> unsupported type (ILEN = null)
     """
     b = (
         VcfBuilder(
@@ -195,6 +203,14 @@ def symbolic() -> VcfBuilder:
         alt=[Sym.cnv()],
         gt=["0|1", "0|0"],
         info={"SVLEN": [40], "END": [5040], "SVCLAIM": ["D"]},
+    )
+    b.record(
+        "chr1",
+        6000,
+        ref="G",
+        alt=[Sym.inversion()],
+        gt=["0|1", "0|0"],
+        info={"SVLEN": [50], "END": [6050]},
     )
     return b
 

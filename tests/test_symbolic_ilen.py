@@ -4,7 +4,7 @@ import numpy as np
 import polars as pl
 import pytest
 
-from genoray import VCF, SparseVar
+from genoray import VCF, SparseVar, exprs
 from genoray.exprs import is_imprecise, symbolic_ilen
 from tests import _oracle
 from tests.data.fixtures import FIXTURES as _FIXTURES
@@ -65,13 +65,14 @@ def test_symbolic_fixture_builds_and_classifies():
 
     truth = FIXTURES["symbolic"]().truth()
     # records: 0 <DEL> precise, 1 <INS> precise, 2 <DUP> precise,
-    #          3 <DEL> IMPRECISE, 4 <CNV> (no usable SVLEN / unsupported)
-    assert len(truth.pos) == 5
+    #          3 <DEL> IMPRECISE, 4 <CNV> (unsupported), 5 <INV> (unsupported)
+    assert len(truth.pos) == 6
     assert truth.alts_truth[0][0].sv_type == "DEL"
     assert truth.alts_truth[1][0].sv_type == "INS"
     assert truth.alts_truth[2][0].sv_type == "DUP"
     assert truth.alts_truth[3][0].sv_type == "DEL"  # IMPRECISE <DEL>
     assert truth.alts_truth[4][0].sv_type == "CNV"  # <CNV> unsupported type
+    assert truth.alts_truth[5][0].sv_type == "INV"  # <INV> unsupported type
 
 
 def test_expected_ilen_from_oracle():
@@ -84,6 +85,7 @@ def test_expected_ilen_from_oracle():
     assert exp[2] == [30]  # <DUP>
     assert exp[3] == [None]  # IMPRECISE <DEL> -> null (mirrors symbolic_ilen)
     assert exp[4] == [None]  # <CNV> unsupported
+    assert exp[5] == [None]  # <INV> unsupported
 
 
 @pytest.fixture
@@ -113,6 +115,7 @@ def test_vcf_persisted_ilen_matches_oracle(symbolic_vcf):
     # un-sizable rows are null
     assert got[3] == exp[3] == [None]  # IMPRECISE <DEL>
     assert got[4] == exp[4] == [None]  # <CNV>
+    assert got[5] == exp[5] == [None]  # <INV>
 
 
 def test_oracle_normalizes_compound_sv_type():
@@ -166,17 +169,17 @@ def test_var_ranges_handles_null_ilen(symbolic_vcf):
     # The eager var_ranges function (used by SparseVar) materialises ILEN to a
     # numpy array via numba ufuncs.  A null ILEN entry causes Polars to upcast
     # the column to Float64/NaN, which the numba typed ufunc cannot accept.
-    # This test calls var_ranges directly so the null rows (POS=4000 IMPRECISE
-    # and POS=5000 <CNV>) are always materialised.
+    # This test calls var_ranges directly so the null rows (POS=4000 IMPRECISE,
+    # POS=5000 <CNV>, and POS=6000 <INV>) are always materialised.
     from genoray._var_ranges import var_ranges
 
-    # Wide query spanning all 5 records — forces all ILEN rows through the
-    # numpy path including the two nulls.  The result covers variant indices
-    # [0, 5) — all five records are represented.
-    result = var_ranges(symbolic_vcf._c_norm, symbolic_vcf._index, "chr1", [0], [6_000])
+    # Wide query spanning all 6 records — forces all ILEN rows through the
+    # numpy path including the three nulls.  The result covers variant indices
+    # [0, 6) — all six records are represented.
+    result = var_ranges(symbolic_vcf._c_norm, symbolic_vcf._index, "chr1", [0], [7_000])
     assert result.shape == (1, 2)
-    # All 5 variants represented: exclusive end minus start = 5
-    assert result[0, 1] - result[0, 0] == 5
+    # All 6 variants represented: exclusive end minus start = 6
+    assert result[0, 1] - result[0, 0] == 6
 
     # Narrow query overlapping only the precise <DEL> at POS=1000.
     # ILEN=-100 means the variant spans [999, 1100) in 0-based coords.
@@ -193,20 +196,20 @@ def test_var_ranges_handles_null_ilen(symbolic_vcf):
 def test_var_counts_lazy_path_includes_null_ilen_variants(symbolic_vcf):
     # PRE-FIX (before .fill_null(0) in var_counts): null-ILEN rows upcast to
     # Float64/NaN in polars-bio overlap; the null interval end caused SILENT
-    # drops, returning 3 instead of 5.  This test exercises the LAZY path
+    # drops, returning 3 instead of 6.  This test exercises the LAZY path
     # (var_counts → VCF.n_vars_in_ranges → VCF.read allocation) and asserts
     # the correct count.
-    count = symbolic_vcf.n_vars_in_ranges("chr1", 0, 6_000)[0]
-    assert count == 5, (
-        f"Expected 5 variants over chr1:0-6000 (including 2 null-ILEN rows), got {count}"
+    count = symbolic_vcf.n_vars_in_ranges("chr1", 0, 7_000)[0]
+    assert count == 6, (
+        f"Expected 6 variants over chr1:0-7000 (including 3 null-ILEN rows), got {count}"
     )
 
     # Confirm this also flows through VCF.read: the allocated output array
-    # must have 5 variants on the variant axis.
-    genos = symbolic_vcf.read("chr1", 0, 6_000)
+    # must have 6 variants on the variant axis.
+    genos = symbolic_vcf.read("chr1", 0, 7_000)
     # shape is (samples, ploidy+phasing, variants) for Genos16
-    assert genos.shape[-1] == 5, (
-        f"VCF.read returned {genos.shape[-1]} variants, expected 5"
+    assert genos.shape[-1] == 6, (
+        f"VCF.read returned {genos.shape[-1]} variants, expected 6"
     )
 
 
@@ -230,11 +233,11 @@ def test_svar_with_length_null_ilen_no_float_corruption(symbolic_svar):
     # coordinates.  This test asserts correct *integer* offset values.
     svar = symbolic_svar
 
-    # Wide query over all 5 variants via the with-length read path.
+    # Wide query over all 6 variants via the with-length read path.
     starts_ends = svar._find_starts_ends_with_length(
         "chr1",
         np.array([0], dtype=np.int32),
-        np.array([6_000], dtype=np.int32),
+        np.array([7_000], dtype=np.int32),
     )
     # Shape is (2, ranges, samples, ploidy) = (2, 1, 2, 2)
     assert starts_ends.shape == (2, 1, 2, 2)
@@ -255,3 +258,32 @@ def test_svar_with_length_null_ilen_no_float_corruption(symbolic_svar):
     assert np.all(ends >= starts), (
         f"Some end offsets precede start offsets: starts={starts}, ends={ends}"
     )
+
+
+def test_filter_parity_symbolic_vs_imprecise(tmp_path):
+    builder = _FIXTURES["symbolic"]()
+    path = builder.write(tmp_path / "sym.vcf.gz", bgzip=True, index=True)
+
+    # Write the GVI index from an unfiltered VCF first.
+    base_vcf = VCF(str(path))
+    base_vcf._write_gvi_index()
+
+    # ~is_symbolic drops ALL symbolic -> empty index (all 6 rows are <...> symbolic)
+    vcf_all = VCF(
+        str(path),
+        filter=lambda r: not any(a.startswith("<") for a in r.ALT),
+        pl_filter=~exprs.is_symbolic,
+    )
+    vcf_all._load_index()
+    assert vcf_all._index.height == 0
+
+    # ~is_imprecise keeps the 3 precise SVs, drops the 3 un-sizable ones.
+    # pl_filter-only requires pairing with a no-op filter callable per the VCF API.
+    vcf_precise = VCF(
+        str(path),
+        filter=lambda r: True,
+        pl_filter=~exprs.is_imprecise,
+    )
+    vcf_precise._load_index()
+    assert vcf_precise._index.height == 3
+    assert vcf_precise._index.get_column("ILEN").to_list() == [[-100], [50], [30]]
