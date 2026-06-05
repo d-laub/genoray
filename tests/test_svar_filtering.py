@@ -180,7 +180,7 @@ def test_cli_write_skip_symbolic_vcf(tmp_path):
 
     vcf_path = _mixed_vcf(tmp_path)
     out = tmp_path / "cli.svar"
-    cli_write(vcf_path, out, max_mem="1g", overwrite=True, skip_symbolic_alts=True)
+    cli_write(vcf_path, out, max_mem="1g", overwrite=True, no_symbolic=True)
     sv = SparseVar(out)
     assert sv.n_variants == 2
     assert sv.index["POS"].to_list() == [100, 400]
@@ -191,7 +191,7 @@ def test_cli_write_skip_symbolic_pgen(tmp_path):
 
     pgen_path = _mixed_pgen(tmp_path)
     out = tmp_path / "cli_pg.svar"
-    cli_write(pgen_path, out, max_mem="1g", overwrite=True, skip_symbolic_alts=True)
+    cli_write(pgen_path, out, max_mem="1g", overwrite=True, no_symbolic=True)
     sv = SparseVar(out)
     assert sv.n_variants == 2
     assert set(sv.index["POS"].to_list()) == {100, 400}
