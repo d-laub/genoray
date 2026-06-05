@@ -101,13 +101,17 @@ def test_vcf_persisted_ilen_matches_oracle(symbolic_vcf):
     truth = _FIXTURES["symbolic"]().truth()
     exp = _oracle.expected_ilen(truth, slice(None))
     got = vcf._index.get_column("ILEN").to_list()
+    # SV helper columns must not leak into the persisted index
+    assert "SVLEN" not in vcf._index.columns
+    assert "END" not in vcf._index.columns
+    assert "IMPRECISE" not in vcf._index.columns
     # precise rows match the oracle exactly
     assert got[0] == exp[0] == [-100]
     assert got[1] == exp[1] == [50]
     assert got[2] == exp[2] == [30]
     # un-sizable rows are null
-    assert got[3] == [None]  # IMPRECISE <DEL>
-    assert got[4] == [None]  # <CNV>
+    assert got[3] == exp[3] == [None]  # IMPRECISE <DEL>
+    assert got[4] == exp[4] == [None]  # <CNV>
 
 
 def test_oracle_normalizes_compound_sv_type():

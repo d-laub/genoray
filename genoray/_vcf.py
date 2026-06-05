@@ -25,7 +25,7 @@ from typing_extensions import Self, assert_never
 from ._types import POS_MAX, POS_TYPE
 from ._utils import ContigNormalizer, format_memory, hap_ilens, parse_memory
 from ._var_ranges import var_counts, var_indices
-from .exprs import ILEN
+from .exprs import ILEN, symbolic_ilen
 
 """Dtype for VCF range indices. This determines the maximum size of a contig in genoray.
 We have to use int64 because this is what htslib uses for CSI indexes."""
@@ -960,6 +960,15 @@ class VCF:
         info: list[str] | None = None,
         lazy: bool = False,
     ) -> pl.DataFrame | pl.LazyFrame: ...
+    def _oxbow_reader(self) -> Callable:
+        """Return the oxbow reader callable appropriate for this file's extension."""
+        if self.path.suffix == ".bcf":
+            return oxbow.from_bcf
+        elif re.search(r"\.vcf(\.gz)?$", self.path.name) is not None:
+            return oxbow.from_vcf
+        else:
+            raise ValueError(f"Unsupported file extension: {self.path.suffix}")
+
     def get_record_info(
         self,
         contig: str | None = None,
@@ -1004,12 +1013,7 @@ class VCF:
         if info is not None:
             info = [f.lower() for f in info]
 
-        if self.path.suffix == ".bcf":
-            reader = oxbow.from_bcf
-        elif re.search(r"\.vcf(\.gz)?$", self.path.name) is not None:
-            reader = oxbow.from_vcf
-        else:
-            raise ValueError(f"Unsupported file extension: {self.path.suffix}")
+        reader = self._oxbow_reader()
 
         df = (
             cast(
@@ -1035,26 +1039,28 @@ class VCF:
         return df
 
     def _declared_info_fields(self, candidates: tuple[str, ...]) -> list[str]:
-        """Return which of ``candidates`` are declared as INFO fields in the VCF header."""
-        declared: list[str] = []
-        for c in candidates:
-            try:
-                htype = self._vcf.get_header_type(c)
-                if htype is not None:
-                    declared.append(c)
-            except (KeyError, ValueError):
-                continue
-        return declared
+        """Return which of ``candidates`` are declared as INFO fields in the VCF header.
+
+        Uses ``header_iter()`` rather than ``get_header_type()`` because the latter
+        matches both INFO and FORMAT declarations; a FORMAT-only field must NOT be
+        treated as an INFO field (it would error when passed to oxbow's info_fields=).
+        """
+        info_ids: set[str] = {
+            h.info()["ID"]
+            for h in self._vcf.header_iter()
+            if h.info().get("HeaderType") == "INFO"
+        }
+        return [c for c in candidates if c in info_ids]
 
     def _fetch_info_cols(self, info_names: list[str]) -> pl.LazyFrame:
         """Fetch a set of uppercase INFO field names directly from oxbow and unnest the
-        returned struct, returning a LazyFrame with those columns as top-level columns."""
-        if self.path.suffix == ".bcf":
-            reader = oxbow.from_bcf
-        elif re.search(r"\.vcf(\.gz)?$", self.path.name) is not None:
-            reader = oxbow.from_vcf
-        else:
-            raise ValueError(f"Unsupported file extension: {self.path.suffix}")
+        returned struct, returning a LazyFrame with POS and those INFO columns as
+        top-level columns. POS is retained so the caller can cross-check alignment
+        against the base frame before positional concat.
+
+        Returns a LazyFrame with columns: POS, <info_names...>
+        """
+        reader = self._oxbow_reader()
 
         # oxbow requires uppercase INFO field names; returns them nested in an 'info' struct
         raw = (
@@ -1063,11 +1069,12 @@ class VCF:
                 reader(
                     self.path,
                     samples=[],
-                    fields=["chrom", "pos", "ref", "alt"],
+                    fields=["pos"],
                     info_fields=info_names,
                 ).pl(lazy=True),
             )
-            .select("info")
+            .with_columns(pl.col("pos").alias("POS"))
+            .drop("pos")
             .unnest("info")
         )
         return raw
@@ -1116,21 +1123,29 @@ class VCF:
         finally:
             self._pl_filter = filt
 
-        from .exprs import symbolic_ilen
-
         # Fetch SV helper columns directly (oxbow requires uppercase and returns a struct).
         # Both oxbow reads cover the identical full record set (no region, no filter, same
         # file order), which is what makes the positional horizontal concat correct.
         # WARNING: region-scoping or pre-concat filtering either call would silently
         # misalign SVLEN/END/IMPRECISE to wrong variants, corrupting ILEN.
+        # POS is cross-checked element-wise to confirm the two reads are in identical order.
         if extra_sv:
             index_df = index.collect()
             sv_cols_df = self._fetch_info_cols(extra_sv).collect()
             if index_df.height != sv_cols_df.height:
-                raise AssertionError(
+                raise ValueError(
                     f"Row count mismatch between base index ({index_df.height}) and SV INFO "
                     f"columns ({sv_cols_df.height}); positional concat would misalign ILEN."
                 )
+            base_pos = index_df.get_column("POS")
+            sv_pos = sv_cols_df.get_column("POS")
+            if not base_pos.equals(sv_pos):
+                raise ValueError(
+                    "POS mismatch between base index and SV INFO columns; "
+                    "positional concat would misalign ILEN. This is a bug — please report it."
+                )
+            # Drop POS from sv_cols_df to avoid duplicate column before horizontal concat
+            sv_cols_df = sv_cols_df.drop("POS")
             index = pl.concat([index_df, sv_cols_df], how="horizontal").lazy()
 
         # Ensure the columns symbolic_ilen references exist (nulls when absent).
