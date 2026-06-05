@@ -1034,6 +1034,44 @@ class VCF:
 
         return df
 
+    def _declared_info_fields(self, candidates: tuple[str, ...]) -> list[str]:
+        """Return which of ``candidates`` are declared as INFO fields in the VCF header."""
+        declared: list[str] = []
+        for c in candidates:
+            try:
+                htype = self._vcf.get_header_type(c)
+                if htype is not None:
+                    declared.append(c)
+            except (KeyError, ValueError):
+                continue
+        return declared
+
+    def _fetch_info_cols(self, info_names: list[str]) -> pl.LazyFrame:
+        """Fetch a set of uppercase INFO field names directly from oxbow and unnest the
+        returned struct, returning a LazyFrame with those columns as top-level columns."""
+        if self.path.suffix == ".bcf":
+            reader = oxbow.from_bcf
+        elif re.search(r"\.vcf(\.gz)?$", self.path.name) is not None:
+            reader = oxbow.from_vcf
+        else:
+            raise ValueError(f"Unsupported file extension: {self.path.suffix}")
+
+        # oxbow requires uppercase INFO field names; returns them nested in an 'info' struct
+        raw = (
+            cast(
+                pl.LazyFrame,
+                reader(
+                    self.path,
+                    samples=[],
+                    fields=["chrom", "pos", "ref", "alt"],
+                    info_fields=info_names,
+                ).pl(lazy=True),
+            )
+            .select("info")
+            .unnest("info")
+        )
+        return raw
+
     def _write_gvi_index(
         self,
         fields: list[str] | None = None,
@@ -1065,12 +1103,48 @@ class VCF:
         if fields is not None:
             _fields.update(fields)
 
+        # Pull SVLEN/END/IMPRECISE when the header declares them so symbolic SVs
+        # can be sized. Requesting an undeclared INFO field can error in oxbow.
+        sv_info = self._declared_info_fields(("SVLEN", "END", "IMPRECISE"))
+        user_info_upper = {i.upper() for i in info} if info else set()
+        extra_sv = [f for f in sv_info if f.upper() not in user_info_upper]
+
         filt = self._pl_filter
         self._pl_filter = None
         try:
             index = self.get_record_info(fields=list(_fields), info=info, lazy=True)
         finally:
             self._pl_filter = filt
+
+        # Fetch SV helper columns directly (oxbow requires uppercase and returns a struct)
+        if extra_sv:
+            sv_cols = self._fetch_info_cols(extra_sv)
+            index = pl.concat([index, sv_cols], how="horizontal")
+
+        from .exprs import symbolic_ilen
+
+        # Ensure the columns symbolic_ilen references exist (nulls when absent).
+        schema = index.collect_schema()
+        for col in ("SVLEN", "END", "IMPRECISE"):
+            if col not in schema.names():
+                dtype = pl.Boolean if col == "IMPRECISE" else pl.Int64
+                index = index.with_columns(pl.lit(None, dtype=dtype).alias(col))
+
+        # SVLEN from oxbow is List(Int32) (Number=A); coerce to scalar via list.first()
+        schema = index.collect_schema()
+        coerce: list[pl.Expr] = []
+        for col in ("SVLEN", "END"):
+            if col in schema.names() and isinstance(schema[col], pl.List):
+                coerce.append(pl.col(col).list.first().alias(col))
+        if coerce:
+            index = index.with_columns(coerce)
+
+        index = index.with_columns(ILEN=symbolic_ilen())
+
+        # Drop the SV helper columns we added (keep any the user explicitly requested)
+        drop_cols = [c for c in extra_sv if c.upper() not in user_info_upper]
+        if drop_cols:
+            index = index.drop(drop_cols)
 
         index.with_columns(pl.col("ALT").list.join(",")).collect().write_ipc(
             self._index_path(), compression="zstd"

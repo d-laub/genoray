@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import polars as pl
+import pytest
 
+from genoray import VCF
 from genoray.exprs import is_imprecise, symbolic_ilen
 from tests import _oracle
+from tests.data.fixtures import FIXTURES as _FIXTURES
 
 
 def _frame():
@@ -80,6 +83,31 @@ def test_expected_ilen_from_oracle():
     assert exp[2] == [30]  # <DUP>
     assert exp[3] == [None]  # IMPRECISE <DEL> -> null (mirrors symbolic_ilen)
     assert exp[4] == [None]  # <CNV> unsupported
+
+
+@pytest.fixture
+def symbolic_vcf(tmp_path):
+    path = _FIXTURES["symbolic"]().write(
+        tmp_path / "symbolic.vcf.gz", bgzip=True, index=True
+    )
+    vcf = VCF(str(path))
+    vcf._write_gvi_index()
+    vcf._load_index()
+    return vcf
+
+
+def test_vcf_persisted_ilen_matches_oracle(symbolic_vcf):
+    vcf = symbolic_vcf
+    truth = _FIXTURES["symbolic"]().truth()
+    exp = _oracle.expected_ilen(truth, slice(None))
+    got = vcf._index.get_column("ILEN").to_list()
+    # precise rows match the oracle exactly
+    assert got[0] == exp[0] == [-100]
+    assert got[1] == exp[1] == [50]
+    assert got[2] == exp[2] == [30]
+    # un-sizable rows are null
+    assert got[3] == [None]  # IMPRECISE <DEL>
+    assert got[4] == [None]  # <CNV>
 
 
 def test_oracle_normalizes_compound_sv_type():
