@@ -31,7 +31,7 @@ Prefer reading these over guessing:
 - `genoray/_vcf.py` — `VCF` class: constructor, `read`, `chunk`, mode constants near the top of the class
 - `genoray/_pgen.py` — `PGEN` class: constructor, `read`, `chunk`, `read_ranges`, `chunk_ranges`, mode constants near the top of the class
 - `genoray/_svar.py` — `SparseVar`: `__init__`, `from_vcf`, `from_pgen`, `read_ranges`, `with_fields`
-- `genoray/exprs.py` — the *complete* set of pre-built filter expressions (currently 5: `is_snp`, `is_indel`, `is_biallelic`, `is_symbolic`, `ILEN`)
+- `genoray/exprs.py` — the *complete* set of pre-built filter expressions (currently 6: `is_snp`, `is_indel`, `is_biallelic`, `is_symbolic`, `is_imprecise`, `ILEN`)
 
 When a signature, kwarg, or shape is unclear, **read the docstring in the
 source** rather than reasoning from first principles.
@@ -192,7 +192,45 @@ PGEN: pass a polars `pl.Expr` returning a boolean mask, operating on the
 - `is_indel`
 - `is_biallelic`
 - `is_symbolic` (True if any ALT is a VCF 4.x symbolic allele, i.e. starts with `<`)
-- `ILEN` (an expression yielding indel length, not a boolean)
+- `is_imprecise` (True if any ALT's ILEN is `null` — an un-sizable symbolic allele)
+- `ILEN` (a `List[Int32]` expression — one value per ALT allele, not a boolean)
+
+**`ILEN` semantics for symbolic SVs.** For precise `<DEL>`/`<INS>`/`<DUP>`,
+ILEN is computed at index-build time from INFO fields: `-|SVLEN|` for `<DEL>`,
+`+|SVLEN|` for `<INS>`/`<DUP>` (falls back to `|END - POS|` when SVLEN is absent).
+For VCF, INFO fields are read from header-declared columns (via oxbow); for PGEN,
+they are parsed from the PVAR INFO string. Non-symbolic ALTs use the literal
+`len(ALT) - len(REF)`.
+
+**Un-sizable symbolic alleles carry `null` ILEN.** An allele is un-sizable when:
+the `IMPRECISE` INFO flag is set, `SVLEN`/`END` are both missing, or the symbolic
+type is unsupported (`<BND>`, `<CNV>`, `<INV>`, `<*>`/`<NON_REF>`). At NumPy
+materialization, `null` ILEN is coerced to 0 (treated as a point variant).
+
+**Filtering guidance** (no new constructor kwarg — use the existing `filter`/`pl_filter` API):
+
+- `~genoray.exprs.is_symbolic` — drops *all* symbolic alleles (precise or not).
+  Required for haplotype consumers (e.g. `genvarloader`) that cannot expand any
+  symbolic ALT into literal sequence:
+
+  ```python
+  # PGEN
+  pgen = genoray.PGEN("file.pgen", filter=~genoray.exprs.is_symbolic)
+  # VCF (both required)
+  vcf = genoray.VCF(
+      "file.vcf.gz",
+      filter=lambda rec: not any(a.startswith("<") for a in rec.ALT),
+      pl_filter=~genoray.exprs.is_symbolic,
+  )
+  ```
+
+- `~genoray.exprs.is_imprecise` — keeps precise symbolic SVs (correctly
+  sized/spanned) and drops only the un-sizable ones. Suitable for range/overlap
+  queries where precise SVs are queryable:
+
+  ```python
+  pgen = genoray.PGEN("file.pgen", filter=~genoray.exprs.is_imprecise)
+  ```
 
 For anything else, write `pl.col(...)` against the `.gvi` schema — read
 `genoray/exprs.py` for the available columns. Combining two `exprs`
