@@ -1,3 +1,33 @@
+## 2.8.0 (2026-06-05)
+
+### Feat
+
+- **pgen**: size symbolic SVs from PVAR INFO (SVLEN/END)
+- **vcf**: size symbolic SVs via SVLEN/END; persist corrected ILEN
+- **exprs**: symbolic_ilen helper + is_imprecise expression
+- **cli**: --skip-symbolic-alts builds source filter for VCF and PGEN
+- **vcf,svar**: add skip_symbolic_alts option to filter <DEL>/<INS>/<DUP>/...
+
+### Fix
+
+- **exprs**: is_snp/is_indel exclude null-ILEN symbolic SVs; test END fallback
+- **svar**: coerce null ILEN to 0 in with-length read + overlap; test lazy/svar paths
+- **ilen**: coerce null ILEN to 0 at numpy materialization boundaries
+- **vcf**: restrict INFO header detection to INFO; strengthen ILEN alignment guard
+- **vcf**: don't leak SV INFO placeholder cols; guard ILEN concat alignment
+- **svar**: use compacted chunk index in from_pgen dispatch; add multi-contig + dosage filter tests
+- **tests**: update fixtures.py to vcfixture 0.6.0 version= API
+- **svar**: from_pgen inherits and applies the source PGEN filter
+- **vcf**: apply cyvcf2 filter in chunk() so from_vcf genotypes match the filtered index
+- **svar**: from_vcf inherits and applies the source VCF filter
+- **vcf**: split ALT to list before applying pl_filter in _load_index
+
+### Refactor
+
+- **svar**: drop redundant int8 cast in _process_contig_pgen; harden pgen alignment test
+- **svar**: rename _process_contig_vcf filter param to avoid shadowing builtin
+- **vcf**: remove skip_symbolic_alts flag
+
 ## 2.7.3 (2026-06-01)
 
 ### Fix
