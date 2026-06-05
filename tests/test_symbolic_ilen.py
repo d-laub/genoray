@@ -65,3 +65,5 @@ def test_symbolic_fixture_builds_and_classifies():
     assert truth.alts_truth[0][0].sv_type == "DEL"
     assert truth.alts_truth[1][0].sv_type == "INS"
     assert truth.alts_truth[2][0].sv_type == "DUP"
+    assert truth.alts_truth[3][0].sv_type == "DEL"  # IMPRECISE <DEL>
+    assert truth.alts_truth[4][0].sv_type == "CNV"  # <CNV> unsupported type

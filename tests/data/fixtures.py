@@ -140,7 +140,8 @@ def symbolic() -> VcfBuilder:
     """Symbolic structural variants for ILEN correctness tests.
 
     Precise <DEL>/<INS>/<DUP> (SVLEN/SVCLAIM), then un-sizable cases:
-    an IMPRECISE <DEL> and a <CNV> with no usable SVLEN. VCF 4.4 so SVLEN is
+    an IMPRECISE <DEL> and a <CNV> whose SVLEN is present but unusable because
+    the type is unsupported. VCF 4.4 so SVLEN is
     positive and <DEL>/<DUP> carry SVCLAIM. (A <BND> row is added in Task 6.)
     """
     b = (
