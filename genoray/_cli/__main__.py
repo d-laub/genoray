@@ -50,7 +50,8 @@ def write(
     overwrite: bool = False,
     dosages: str | None = None,
     threads: int | None = None,
-    skip_symbolic_alts: bool = False,
+    no_symbolic: Annotated[bool, Parameter(name="--no-symbolic", negative="")] = False,
+    no_breakend: Annotated[bool, Parameter(name="--no-breakend", negative="")] = False,
 ) -> None:
     """
     Convert a VCF or PGEN file to a SVAR file.
@@ -72,13 +73,17 @@ def write(
         If not provided, dosages will not be written.
     threads
         Number of threads to use for conversion. Defaults to the number of available CPU cores.
-    skip_symbolic_alts
-        If True, skip records whose ALT contains a symbolic allele
-        (``<DEL>``, ``<INS>``, etc.) per VCF 4.x. Applies to both VCF and
-        PGEN sources. Recommended for SV-bearing cohorts (e.g. 1kGP
-        SNV_INDEL_SV panels) to avoid emitting literal ``<DEL>`` ASCII bytes
-        into downstream haplotype buffers. Default False preserves prior
-        behavior.
+    no_symbolic
+        If set, drop records whose ALT contains a symbolic allele
+        (``<DEL>``, ``<INS>``, etc.) per VCF 4.x. Applies to both VCF and PGEN
+        sources. Recommended for SV-bearing cohorts (e.g. 1kGP SNV_INDEL_SV
+        panels) to avoid emitting literal ``<DEL>`` ASCII bytes into downstream
+        haplotype buffers.
+    no_breakend
+        If set, drop records whose ALT contains a breakend (BND) in mate-pair or
+        single-breakend notation (``G[chr2:321[``, ``]chr2:321]G``, ``.TGCA``,
+        ``TGCA.``). A distinct ALT class from symbolic alleles; combine with
+        ``--no-symbolic`` to drop everything haplotype consumers cannot expand.
     """
     from genoray import PGEN, VCF, SparseVar, exprs
     from genoray._utils import variant_file_type
@@ -93,24 +98,46 @@ def write(
     if threads is None:
         threads = -1
 
+    # Compose the requested ALT-class filters. Each flag contributes a polars
+    # expr (used by both VCF index and PGEN) and a record-level predicate (used
+    # by the VCF cyvcf2 genotype scan). The two representations of each flag are
+    # kept in parity via genoray.exprs.
+    pl_terms = []
+    record_preds = []
+    if no_symbolic:
+        pl_terms.append(~exprs.is_symbolic)
+        record_preds.append(exprs._record_is_symbolic)
+    if no_breakend:
+        pl_terms.append(~exprs.is_breakend)
+        record_preds.append(exprs._record_is_breakend)
+
+    if pl_terms:
+        from functools import reduce
+        from operator import and_
+
+        pl_filter = reduce(and_, pl_terms)
+
+        def record_filter(rec, _preds=tuple(record_preds)) -> bool:
+            return not any(pred(rec.ALT) for pred in _preds)
+    else:
+        pl_filter = None
+        record_filter = None
+
     if file_type == "vcf":
         if dosages is not None and Path(dosages).exists():
             raise ValueError(
                 "The `dosages` argument appears to be a path to an existing file, but VCF requires a FORMAT field name."
             )
 
-        if skip_symbolic_alts:
-            # VCF needs both filters: a cyvcf2 callable applied during the
-            # genotype scan and a polars expr applied to the index; both must
-            # express the same predicate.
-            vcf = VCF(
-                source,
-                dosage_field=dosages,
-                filter=lambda rec: not any(a.startswith("<") for a in rec.ALT),
-                pl_filter=~exprs.is_symbolic,
-            )
-        else:
-            vcf = VCF(source, dosage_field=dosages)
+        # VCF requires both filters together (or neither): a cyvcf2 callable
+        # applied during the genotype scan and a matching polars expr applied to
+        # the index; both must express the same predicate.
+        vcf = VCF(
+            source,
+            dosage_field=dosages,
+            filter=record_filter,
+            pl_filter=pl_filter,
+        )
         SparseVar.from_vcf(
             out, vcf, max_mem, overwrite, with_dosages=with_dosages, n_jobs=threads
         )
@@ -118,7 +145,7 @@ def write(
         pgen = PGEN(
             source,
             dosage_path=dosages,
-            filter=(~exprs.is_symbolic) if skip_symbolic_alts else None,
+            filter=pl_filter,
         )
         SparseVar.from_pgen(
             out, pgen, max_mem, overwrite, with_dosages=with_dosages, n_jobs=threads
