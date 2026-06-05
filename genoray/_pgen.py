@@ -1171,6 +1171,9 @@ def _load_index(
                 info_col.str.extract(r"(?:^|;)END=(\d+)", 1)
                 .cast(pl.Int64)
                 .alias("END"),
+                # IMPRECISE is a VCF Flag (Number=0): match the bare token only.
+                # Do NOT broaden to IMPRECISE=… — that would wrongly treat
+                # IMPRECISE=0 as set.
                 info_col.str.contains(r"(?:^|;)IMPRECISE(?:;|$)").alias("IMPRECISE"),
             )
             index = index.with_columns(ILEN=symbolic_ilen())
