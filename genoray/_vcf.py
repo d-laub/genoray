@@ -25,7 +25,7 @@ from typing_extensions import Self, assert_never
 from ._types import POS_MAX, POS_TYPE
 from ._utils import ContigNormalizer, format_memory, hap_ilens, parse_memory
 from ._var_ranges import var_counts, var_indices
-from .exprs import ILEN
+from .exprs import ILEN, symbolic_ilen
 
 """Dtype for VCF range indices. This determines the maximum size of a contig in genoray.
 We have to use int64 because this is what htslib uses for CSI indexes."""
@@ -960,6 +960,15 @@ class VCF:
         info: list[str] | None = None,
         lazy: bool = False,
     ) -> pl.DataFrame | pl.LazyFrame: ...
+    def _oxbow_reader(self) -> Callable:
+        """Return the oxbow reader callable appropriate for this file's extension."""
+        if self.path.suffix == ".bcf":
+            return oxbow.from_bcf
+        elif re.search(r"\.vcf(\.gz)?$", self.path.name) is not None:
+            return oxbow.from_vcf
+        else:
+            raise ValueError(f"Unsupported file extension: {self.path.suffix}")
+
     def get_record_info(
         self,
         contig: str | None = None,
@@ -1004,12 +1013,7 @@ class VCF:
         if info is not None:
             info = [f.lower() for f in info]
 
-        if self.path.suffix == ".bcf":
-            reader = oxbow.from_bcf
-        elif re.search(r"\.vcf(\.gz)?$", self.path.name) is not None:
-            reader = oxbow.from_vcf
-        else:
-            raise ValueError(f"Unsupported file extension: {self.path.suffix}")
+        reader = self._oxbow_reader()
 
         df = (
             cast(
@@ -1033,6 +1037,47 @@ class VCF:
             df = df.collect()
 
         return df
+
+    def _declared_info_fields(self, candidates: tuple[str, ...]) -> list[str]:
+        """Return which of ``candidates`` are declared as INFO fields in the VCF header.
+
+        Uses ``header_iter()`` rather than ``get_header_type()`` because the latter
+        matches both INFO and FORMAT declarations; a FORMAT-only field must NOT be
+        treated as an INFO field (it would error when passed to oxbow's info_fields=).
+        """
+        info_ids: set[str] = {
+            h.info()["ID"]
+            for h in self._vcf.header_iter()
+            if h.info().get("HeaderType") == "INFO"
+        }
+        return [c for c in candidates if c in info_ids]
+
+    def _fetch_info_cols(self, info_names: list[str]) -> pl.LazyFrame:
+        """Fetch a set of uppercase INFO field names directly from oxbow and unnest the
+        returned struct, returning a LazyFrame with POS and those INFO columns as
+        top-level columns. POS is retained so the caller can cross-check alignment
+        against the base frame before positional concat.
+
+        Returns a LazyFrame with columns: POS, <info_names...>
+        """
+        reader = self._oxbow_reader()
+
+        # oxbow requires uppercase INFO field names; returns them nested in an 'info' struct
+        raw = (
+            cast(
+                pl.LazyFrame,
+                reader(
+                    self.path,
+                    samples=[],
+                    fields=["pos"],
+                    info_fields=info_names,
+                ).pl(lazy=True),
+            )
+            .with_columns(pl.col("pos").alias("POS"))
+            .drop("pos")
+            .unnest("info")
+        )
+        return raw
 
     def _write_gvi_index(
         self,
@@ -1065,12 +1110,71 @@ class VCF:
         if fields is not None:
             _fields.update(fields)
 
+        # Pull SVLEN/END/IMPRECISE when the header declares them so symbolic SVs
+        # can be sized. Requesting an undeclared INFO field can error in oxbow.
+        sv_info = self._declared_info_fields(("SVLEN", "END", "IMPRECISE"))
+        user_info_upper = {i.upper() for i in info} if info else set()
+        extra_sv = [f for f in sv_info if f.upper() not in user_info_upper]
+
         filt = self._pl_filter
         self._pl_filter = None
         try:
             index = self.get_record_info(fields=list(_fields), info=info, lazy=True)
         finally:
             self._pl_filter = filt
+
+        # Fetch SV helper columns directly (oxbow requires uppercase and returns a struct).
+        # Both oxbow reads cover the identical full record set (no region, no filter, same
+        # file order), which is what makes the positional horizontal concat correct.
+        # WARNING: region-scoping or pre-concat filtering either call would silently
+        # misalign SVLEN/END/IMPRECISE to wrong variants, corrupting ILEN.
+        # POS is cross-checked element-wise to confirm the two reads are in identical order.
+        if extra_sv:
+            index_df = index.collect()
+            sv_cols_df = self._fetch_info_cols(extra_sv).collect()
+            if index_df.height != sv_cols_df.height:
+                raise ValueError(
+                    f"Row count mismatch between base index ({index_df.height}) and SV INFO "
+                    f"columns ({sv_cols_df.height}); positional concat would misalign ILEN."
+                )
+            base_pos = index_df.get_column("POS")
+            sv_pos = sv_cols_df.get_column("POS")
+            if not base_pos.equals(sv_pos):
+                raise ValueError(
+                    "POS mismatch between base index and SV INFO columns; "
+                    "positional concat would misalign ILEN. This is a bug — please report it."
+                )
+            # Drop POS from sv_cols_df to avoid duplicate column before horizontal concat
+            sv_cols_df = sv_cols_df.drop("POS")
+            index = pl.concat([index_df, sv_cols_df], how="horizontal").lazy()
+
+        # Ensure the columns symbolic_ilen references exist (nulls when absent).
+        schema = index.collect_schema()
+        for col in ("SVLEN", "END", "IMPRECISE"):
+            if col not in schema.names():
+                dtype = pl.Boolean if col == "IMPRECISE" else pl.Int64
+                index = index.with_columns(pl.lit(None, dtype=dtype).alias(col))
+
+        # SVLEN from oxbow is List(Int32) (Number=A); coerce to scalar via list.first()
+        schema = index.collect_schema()
+        coerce: list[pl.Expr] = []
+        for col in ("SVLEN", "END"):
+            if col in schema.names() and isinstance(schema[col], pl.List):
+                coerce.append(pl.col(col).list.first().alias(col))
+        if coerce:
+            index = index.with_columns(coerce)
+
+        index = index.with_columns(ILEN=symbolic_ilen())
+
+        # Drop ALL of {SVLEN, END, IMPRECISE} that the user did not explicitly request
+        # via info=. This covers both fetched helper cols AND null-placeholder cols added
+        # above, so non-SV indexes don't gain stray all-null columns.
+        sv_cols_in_frame = {"SVLEN", "END", "IMPRECISE"} & set(
+            index.collect_schema().names()
+        )
+        drop_cols = [c for c in sv_cols_in_frame if c not in user_info_upper]
+        if drop_cols:
+            index = index.drop(drop_cols)
 
         index.with_columns(pl.col("ALT").list.join(",")).collect().write_ipc(
             self._index_path(), compression="zstd"
