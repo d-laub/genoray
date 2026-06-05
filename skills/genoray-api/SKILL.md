@@ -31,7 +31,7 @@ Prefer reading these over guessing:
 - `genoray/_vcf.py` — `VCF` class: constructor, `read`, `chunk`, mode constants near the top of the class
 - `genoray/_pgen.py` — `PGEN` class: constructor, `read`, `chunk`, `read_ranges`, `chunk_ranges`, mode constants near the top of the class
 - `genoray/_svar.py` — `SparseVar`: `__init__`, `from_vcf`, `from_pgen`, `read_ranges`, `with_fields`
-- `genoray/exprs.py` — the *complete* set of pre-built filter expressions (currently 6: `is_snp`, `is_indel`, `is_biallelic`, `is_symbolic`, `is_imprecise`, `ILEN`)
+- `genoray/exprs.py` — the *complete* set of pre-built filter expressions (currently 7: `is_snp`, `is_indel`, `is_biallelic`, `is_symbolic`, `is_breakend`, `is_imprecise`, `ILEN`)
 
 When a signature, kwarg, or shape is unclear, **read the docstring in the
 source** rather than reasoning from first principles.
@@ -184,6 +184,16 @@ VCF: pass a `Callable[[cyvcf2.Variant], bool]` to `filter=`. For index-based
 predicates (e.g. `is_symbolic`), also pass the matching polars `pl.Expr` to
 `pl_filter=` — VCF requires **both** when filtering via the `.gvi` index.
 
+To change a VCF's filter after construction, assign a `(filter, pl_filter)`
+tuple to the `vcf.filter` setter (or `None` to clear both); the same
+both-or-neither invariant is enforced, and the in-memory index is invalidated.
+The getter still returns just the callable.
+
+```python
+vcf.filter = (lambda rec: ..., ~genoray.exprs.is_symbolic)  # set both
+vcf.filter = None                                           # clear both
+```
+
 PGEN: pass a polars `pl.Expr` returning a boolean mask, operating on the
 `.gvi` index columns. Built-in expressions in `genoray.exprs` (the
 *complete* list):
@@ -192,7 +202,8 @@ PGEN: pass a polars `pl.Expr` returning a boolean mask, operating on the
 - `is_indel` (True if **all** ALT alleles have ILEN != 0; rows with any `null` ILEN → False)
 - `is_biallelic`
 - `is_symbolic` (True if any ALT is a VCF 4.x symbolic allele, i.e. starts with `<`)
-- `is_imprecise` (True if any ALT's ILEN is `null` — an un-sizable symbolic allele)
+- `is_breakend` (True if any ALT is a VCF 4.x breakend in mate-pair / single-breakend notation, e.g. `G[chr2:321[`, `]chr2:321]G`, `.TGCA`, `TGCA.`. A *distinct* ALT class from symbolic alleles — `is_symbolic` does **not** flag breakends)
+- `is_imprecise` (True if any ALT's ILEN is `null` — an un-sizable symbolic allele **or** a breakend)
 - `ILEN` (a `List[Int32]` expression — one value per ALT allele, not a boolean)
 
 **`ILEN` semantics for symbolic SVs.** For precise `<DEL>`/`<INS>`/`<DUP>`,
@@ -203,8 +214,9 @@ they are parsed from the PVAR INFO string. Non-symbolic ALTs use the literal
 `len(ALT) - len(REF)`.
 
 **Un-sizable symbolic alleles carry `null` ILEN.** An allele is un-sizable when:
-the `IMPRECISE` INFO flag is set, `SVLEN`/`END` are both missing, or the symbolic
-type is unsupported (`<BND>`, `<CNV>`, `<INV>`, `<*>`/`<NON_REF>`). At NumPy
+the `IMPRECISE` INFO flag is set, `SVLEN`/`END` are both missing, the symbolic
+type is unsupported (`<BND>`, `<CNV>`, `<INV>`, `<*>`/`<NON_REF>`), or the ALT is
+a breakend in mate-pair / single-breakend notation (e.g. `G[chr2:321[`). At NumPy
 materialization, `null` ILEN is coerced to 0 (treated as a point variant).
 
 **Filtering guidance** (no new constructor kwarg — use the existing `filter`/`pl_filter` API):
@@ -225,11 +237,20 @@ materialization, `null` ILEN is coerced to 0 (treated as a point variant).
   ```
 
 - `~genoray.exprs.is_imprecise` — keeps precise symbolic SVs (correctly
-  sized/spanned) and drops only the un-sizable ones. Suitable for range/overlap
-  queries where precise SVs are queryable:
+  sized/spanned) and drops only the un-sizable ones (including breakends, which
+  are always un-sizable). Suitable for range/overlap queries where precise SVs
+  are queryable:
 
   ```python
   pgen = genoray.PGEN("file.pgen", filter=~genoray.exprs.is_imprecise)
+  ```
+
+- For haplotype consumers, drop *all* un-expandable ALTs (symbolic **and**
+  breakends) — breakends are not caught by `~is_symbolic`:
+
+  ```python
+  hap_safe = ~genoray.exprs.is_symbolic & ~genoray.exprs.is_breakend
+  pgen = genoray.PGEN("file.pgen", filter=hap_safe)
   ```
 
 For anything else, write `pl.col(...)` against the `.gvi` schema — read
