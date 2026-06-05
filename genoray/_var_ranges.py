@@ -62,7 +62,8 @@ def var_ranges(
     v_starts = var_table["POS"].to_numpy() - 1
     # 0-based, exclusive end
     v_ends = (
-        var_table["POS"] - var_table["ILEN"].list.first().clip(upper_bound=0)
+        var_table["POS"]
+        - var_table["ILEN"].list.first().clip(upper_bound=0).fill_null(0)
     ).to_numpy()
     max_v_len = (v_ends - v_starts).max()
 
@@ -123,7 +124,8 @@ def var_indices(
             pl.col("index").cast(np_to_pl_dtype(idx_dtype)),
             chrom=pl.col("CHROM").cast(pl.Utf8),
             start=pl.col("POS") - 1,
-            end=pl.col("POS") - pl.col("ILEN").list.first().clip(upper_bound=0),
+            end=pl.col("POS")
+            - pl.col("ILEN").list.first().clip(upper_bound=0).fill_null(0),
         )
     )
     var_table.config_meta.set(coordinate_system_zero_based=True)  # type: ignore
@@ -177,7 +179,8 @@ def var_counts(
         .select(
             chrom=pl.col("CHROM").cast(pl.Utf8),
             start=pl.col("POS") - 1,
-            end=pl.col("POS") - pl.col("ILEN").list.first().clip(upper_bound=0),
+            end=pl.col("POS")
+            - pl.col("ILEN").list.first().clip(upper_bound=0).fill_null(0),
         )
     )
     var_table.config_meta.set(coordinate_system_zero_based=True)  # type: ignore

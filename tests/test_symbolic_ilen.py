@@ -159,3 +159,26 @@ def test_oracle_normalizes_compound_sv_type():
     exp = _oracle.expected_ilen(truth, slice(None))
     assert exp[0] == [75], f"Expected [75] for <DUP:TANDEM>, got {exp[0]}"
     assert exp[1] == [-42], f"Expected [-42] for <DEL:ME>, got {exp[1]}"
+
+
+def test_var_ranges_handles_null_ilen(symbolic_vcf):
+    # The eager var_ranges function (used by SparseVar) materialises ILEN to a
+    # numpy array via numba ufuncs.  A null ILEN entry causes Polars to upcast
+    # the column to Float64/NaN, which the numba typed ufunc cannot accept.
+    # This test calls var_ranges directly so the null rows (POS=4000 IMPRECISE
+    # and POS=5000 <CNV>) are always materialised.
+    from genoray._var_ranges import var_ranges
+
+    # Wide query spanning all 5 records — forces all ILEN rows through the
+    # numpy path including the two nulls.
+    result = var_ranges(symbolic_vcf._c_norm, symbolic_vcf._index, "chr1", [0], [6_000])
+    # Should return a (1, 2) array of variant index boundaries without crashing.
+    assert result.shape == (1, 2)
+
+    # Narrow query overlapping only the precise <DEL> at POS=1000 (span 100 bp)
+    # should also work — the null rows still exist in the table even if not in
+    # the query result.
+    result2 = var_ranges(
+        symbolic_vcf._c_norm, symbolic_vcf._index, "chr1", [999], [1001]
+    )
+    assert result2.shape == (1, 2)

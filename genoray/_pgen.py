@@ -1175,11 +1175,16 @@ def _load_index(
         # anyway, so they won't be accessed
         # if the filter is changed, the index is invalidated and re-read (see filter setter)
         if filter is None:
-            data = index.select("start", "end", pl.col("ILEN", "ALT").list.first())
+            data = index.select(
+                "start",
+                "end",
+                pl.col("ILEN").list.first().fill_null(0).alias("ILEN"),
+                pl.col("ALT").list.first(),
+            )
         else:
             data = index.with_columns(
                 ILEN=pl.when(filter)
-                .then(pl.col("ILEN").list.first())
+                .then(pl.col("ILEN").list.first().fill_null(0))
                 .otherwise(pl.lit(0))
             )
             data = data.select("start", "end", "ILEN", pl.col("ALT").list.first())
