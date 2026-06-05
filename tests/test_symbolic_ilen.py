@@ -392,6 +392,34 @@ def test_pgen_symbolic_ilen_matches_oracle():
     )
 
 
+@pytest.mark.skipif(
+    not (_DATA / "symbolic.pgen").exists(),
+    reason="run `pixi run test` to generate symbolic PGEN fixtures",
+)
+def test_pgen_filter_parity_symbolic_vs_imprecise():
+    # PGEN parity for the VCF-path filter behavior in
+    # test_filter_parity_symbolic_vs_imprecise. The PGEN computes ILEN via a
+    # different code path (PVAR-INFO regex, not oxbow), so this confirms the
+    # is_symbolic / is_imprecise filters yield the same result on PGEN.
+    #
+    # NOTE: the symbolic PGEN fixture only carries the 4 DEL/INS/DUP-family rows
+    # (POS 1000/2000/3000 precise + 4000 IMPRECISE <DEL>); the <CNV>/<INV>
+    # unsupported-type rows are dropped at generation time because plink2 rejects
+    # them (see gen_from_vcf.sh). So this exercises the precise-vs-IMPRECISE
+    # distinction, not the unsupported-type un-sizable rows (covered on the VCF
+    # path by test_filter_parity_symbolic_vs_imprecise).
+
+    # ~is_symbolic drops ALL symbolic -> empty index (all 4 rows are <...> symbolic)
+    pgen_all = PGEN(str(_DATA / "symbolic.pgen"), filter=~exprs.is_symbolic)
+    assert pgen_all._index.height == 0
+
+    # ~is_imprecise keeps the 3 precise SVs, drops the IMPRECISE <DEL> at POS 4000.
+    # Matches the VCF path's [[-100], [50], [30]] exactly.
+    pgen_precise = PGEN(str(_DATA / "symbolic.pgen"), filter=~exprs.is_imprecise)
+    assert pgen_precise._index.height == 3
+    assert pgen_precise._index.get_column("ILEN").to_list() == [[-100], [50], [30]]
+
+
 # ---------------------------------------------------------------------------
 # Task 8: SparseVar inherits corrected symbolic ILEN from source VCF
 # ---------------------------------------------------------------------------
