@@ -22,7 +22,7 @@ from zstandard import ZstdDecompressor
 from ._types import POS_MAX, POS_TYPE
 from ._utils import ContigNormalizer, format_memory, hap_ilens, parse_memory
 from ._var_ranges import var_counts, var_indices
-from .exprs import ILEN, is_biallelic
+from .exprs import ILEN, is_biallelic, symbolic_ilen
 
 V_IDX_TYPE = np.uint32
 """Dtype for PGEN variant indices (uint32). This determines the maximum number of unique variants in a file."""
@@ -1159,7 +1159,24 @@ def _load_index(
         index = index.with_columns(pl.col("ALT").str.split(","))
 
     if "ILEN" not in schema:
-        index = index.with_columns(ILEN=ILEN)
+        if "INFO" in schema.names():
+            # Regex-extract SVLEN/END/IMPRECISE from the PVAR INFO string, then
+            # use the shared symbolic_ilen() helper so symbolic SVs get correct
+            # sign-adjusted lengths (DEL→-|len|, INS/DUP→+|len|, others→null).
+            info_col = pl.col("INFO").fill_null("")
+            index = index.with_columns(
+                info_col.str.extract(r"(?:^|;)SVLEN=(-?\d+)", 1)
+                .cast(pl.Int64)
+                .alias("SVLEN"),
+                info_col.str.extract(r"(?:^|;)END=(\d+)", 1)
+                .cast(pl.Int64)
+                .alias("END"),
+                info_col.str.contains(r"(?:^|;)IMPRECISE(?:;|$)").alias("IMPRECISE"),
+            )
+            index = index.with_columns(ILEN=symbolic_ilen())
+            index = index.drop("SVLEN", "END", "IMPRECISE")
+        else:
+            index = index.with_columns(ILEN=ILEN)
 
     if filter is None:
         has_multiallelics = index.select((~is_biallelic).any()).collect().item()

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import polars as pl
 import pytest
 
-from genoray import VCF, SparseVar, exprs
+from genoray import PGEN, VCF, SparseVar, exprs
 from genoray.exprs import is_imprecise, symbolic_ilen
 from tests import _oracle
 from tests.data.fixtures import FIXTURES as _FIXTURES
@@ -289,3 +291,28 @@ def test_filter_parity_symbolic_vs_imprecise(tmp_path):
     vcf_precise._load_index()
     assert vcf_precise._index.height == 3
     assert vcf_precise._index.get_column("ILEN").to_list() == [[-100], [50], [30]]
+
+
+# ---------------------------------------------------------------------------
+# Task 7: PGEN symbolic ILEN
+# ---------------------------------------------------------------------------
+
+_DATA = Path(__file__).parent / "data"
+
+
+@pytest.mark.skipif(
+    not (_DATA / "symbolic.pgen").exists(),
+    reason="run `pixi run test` to generate symbolic PGEN fixtures",
+)
+def test_pgen_symbolic_ilen_matches_oracle():
+    # The symbolic PGEN contains 4 rows (POS 1000/2000/3000/4000).
+    # POS is 1-based in the persisted index (matches PVAR convention).
+    pgen = PGEN(str(_DATA / "symbolic.pgen"))
+    ilen = dict(zip(pgen._index["POS"].to_list(), pgen._index["ILEN"].to_list()))
+    assert ilen[1000] == [-100], f"<DEL> POS=1000: expected [-100], got {ilen[1000]}"
+    assert ilen[2000] == [50], f"<INS> POS=2000: expected [50], got {ilen[2000]}"
+    assert ilen[3000] == [30], f"<DUP> POS=3000: expected [30], got {ilen[3000]}"
+    # IMPRECISE <DEL> at POS=4000 should have null ILEN
+    assert ilen[4000] == [None], (
+        f"IMPRECISE <DEL> POS=4000: expected [None], got {ilen[4000]}"
+    )
