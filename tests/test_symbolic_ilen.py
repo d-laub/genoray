@@ -268,10 +268,12 @@ def test_filter_parity_symbolic_vs_imprecise(tmp_path):
     base_vcf = VCF(str(path))
     base_vcf._write_gvi_index()
 
-    # ~is_symbolic drops ALL symbolic -> empty index (all 6 rows are <...> symbolic)
+    # ~is_symbolic drops ALL symbolic -> empty index (all 6 rows are <...> symbolic).
+    # The `_index` is filtered solely by `pl_filter`; the `filter` callable is an
+    # inert no-op required by the VCF constructor's filter/pl_filter pairing.
     vcf_all = VCF(
         str(path),
-        filter=lambda r: not any(a.startswith("<") for a in r.ALT),
+        filter=lambda r: True,
         pl_filter=~exprs.is_symbolic,
     )
     vcf_all._load_index()
