@@ -8,7 +8,7 @@ decoded GroundTruth oracle.
 
 from __future__ import annotations
 
-from vcfixture import Number, Seq, Sym, Type, VcfBuilder, VcfVersion
+from vcfixture import Bnd, Number, Seq, Sym, Type, VcfBuilder, VcfVersion
 
 NAN = float("nan")
 
@@ -141,7 +141,8 @@ def symbolic() -> VcfBuilder:
 
     Precise <DEL>/<INS>/<DUP> (SVLEN/SVCLAIM), then un-sizable cases:
     an IMPRECISE <DEL>, a <CNV> whose SVLEN is present but unusable because
-    the type is unsupported, and an <INV> (also unsupported / un-sizable).
+    the type is unsupported, an <INV> (also unsupported / un-sizable), and a
+    breakend (BND) in mate-pair notation (un-expandable, so un-sizable).
     VCF 4.4 so SVLEN is positive and <DEL>/<DUP> carry SVCLAIM.
 
     Record layout (0-based index):
@@ -151,6 +152,11 @@ def symbolic() -> VcfBuilder:
       3 - POS 4000: <DEL> IMPRECISE (ILEN = null)
       4 - POS 5000: <CNV> unsupported type (ILEN = null)
       5 - POS 6000: <INV> unsupported type (ILEN = null)
+      6 - POS 7000: breakend G[chr1:500000[ (ILEN = null)
+
+    The breakend uses a chr1-internal mate so no extra contig is needed. The
+    PGEN fixture (gen_from_vcf.sh) is filtered to <DEL>/<INS>/<DUP> only, so the
+    breakend never reaches PGEN — it exercises the VCF / oracle path only.
     """
     b = (
         VcfBuilder(
@@ -211,6 +217,13 @@ def symbolic() -> VcfBuilder:
         alt=[Sym.inversion()],
         gt=["0|1", "0|0"],
         info={"SVLEN": [50], "END": [6050]},
+    )
+    b.record(
+        "chr1",
+        7000,
+        ref="G",
+        alt=[Bnd("G[chr1:500000[")],
+        gt=["0|1", "0|0"],
     )
     return b
 

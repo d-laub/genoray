@@ -84,6 +84,33 @@ For VCF, pair it with the equivalent cyvcf2 ``filter`` (both are required)::
 is filtered to match.
 """
 
+_BND_PATTERN = r"[\[\]]|^\.[A-Za-z]|[A-Za-z]\.$"
+"""Regex matching a VCF breakend (BND) ALT replacement string.
+
+Catches the paired mate forms (``t[p[``, ``t]p]``, ``]p]t``, ``[p[t`` — all
+contain ``[`` or ``]``) and the single-breakend forms (``.t`` / ``t.`` — a ``.``
+adjacent to a base). A lone ``.`` (no-ALT) does not match because a base must
+sit beside the dot."""
+
+is_breakend = (
+    pl.col("ALT").list.eval(pl.element().str.contains(_BND_PATTERN)).list.any()
+)
+"""True if any ALT allele is a breakend (BND) in mate-pair / single-breakend
+notation (e.g. :code:`G[chr2:321[`, :code:`]chr2:321]G`, :code:`.TGCA`,
+:code:`TGCA.`), per the VCF 4.x spec (§5.4).
+
+Breakends are a *distinct* ALT class from symbolic ``<...>`` alleles, so
+:data:`is_symbolic` does **not** flag them. But like symbolic alleles they are
+not expandable into nucleotides — the bracket/colon/position bytes corrupt
+personalized DNA buffers in haplotype consumers (e.g. ``genvarloader``). Their
+:func:`symbolic_ilen` value is ``null`` (so they are also :data:`is_imprecise`).
+
+To drop breakends, pass ``pl_filter=~genoray.exprs.is_breakend``. To drop *all*
+un-expandable ALTs (symbolic + breakends) for haplotype consumers, combine::
+
+    pl_filter=~genoray.exprs.is_symbolic & ~genoray.exprs.is_breakend
+"""
+
 ILEN = pl.col("ALT").list.eval(pl.element().str.len_bytes().cast(pl.Int32)) - pl.col(
     "REF"
 ).str.len_bytes().cast(pl.Int32)
@@ -99,12 +126,13 @@ def symbolic_ilen(
 ) -> pl.Expr:
     """Per-ALT corrected ILEN as ``List[Int32]``.
 
-    Non-symbolic ALTs use the literal ``len(ALT) - len(REF)``. Precise symbolic
-    ``<DEL>``/``<INS>``/``<DUP>`` use ``SVLEN`` magnitude (or ``|END - POS|`` for
-    ``<DEL>``/``<DUP>`` when ``SVLEN`` is absent): ``-|len|`` for ``<DEL>``,
-    ``+|len|`` for ``<INS>``/``<DUP>``. Everything we cannot size precisely
-    (``IMPRECISE`` flag, missing length, unsupported type such as ``<BND>``,
-    ``<CNV>``, ``<INV>``, ``<*>``) becomes ``null``.
+    Non-symbolic, non-breakend ALTs use the literal ``len(ALT) - len(REF)``.
+    Precise symbolic ``<DEL>``/``<INS>``/``<DUP>`` use ``SVLEN`` magnitude (or
+    ``|END - POS|`` for ``<DEL>``/``<DUP>`` when ``SVLEN`` is absent):
+    ``-|len|`` for ``<DEL>``, ``+|len|`` for ``<INS>``/``<DUP>``. Everything we
+    cannot size precisely (``IMPRECISE`` flag, missing length, unsupported type
+    such as ``<BND>``, ``<CNV>``, ``<INV>``, ``<*>``, and breakend mate notation
+    such as ``G[chr2:321[``) becomes ``null``.
 
     ``svlen``/``end``/``imprecise`` name scalar columns already extracted by the
     caller (per record). ``SVLEN`` magnitude is read as ``|SVLEN|`` so the VCF
@@ -131,6 +159,8 @@ def symbolic_ilen(
     )
     # Whether each ALT element is symbolic
     is_sym_list = pl.col(alt).list.eval(pl.element().str.starts_with("<"))
+    # Whether each ALT element is a breakend (BND) — un-sizable like symbolic.
+    is_bnd_list = pl.col(alt).list.eval(pl.element().str.contains(_BND_PATTERN))
 
     # Per-row scalar: sized SV length (sign-corrected), or null if un-sizable.
     # This is broadcast across all symbolic ALTs in the row.
@@ -142,6 +172,7 @@ def symbolic_ilen(
     packed = pl.struct(
         sv_type=sv_type_list,
         is_sym=is_sym_list,
+        is_bnd=is_bnd_list,
         literal=literal_list,
         del_mag=del_mag,
         ins_dup_mag=ins_dup_mag,
@@ -154,13 +185,17 @@ def _compute_ilen_row(row: dict) -> list[int | None]:
     """Compute per-ALT ILEN for a single row (called via map_elements)."""
     sv_types: list = row["sv_type"]
     is_syms: list = row["is_sym"]
+    is_bnds: list = row["is_bnd"]
     literals: list = row["literal"]
     del_mag = row["del_mag"]
     ins_dup_mag = row["ins_dup_mag"]
 
     result = []
-    for sv_type, sym, lit in zip(sv_types, is_syms, literals):
-        if not sym:
+    for sv_type, sym, bnd, lit in zip(sv_types, is_syms, is_bnds, literals):
+        if bnd:
+            # Breakends carry no expandable length — un-sizable, like symbolic SVs.
+            result.append(None)
+        elif not sym:
             result.append(lit)
         elif sv_type == "DEL":
             result.append(del_mag)

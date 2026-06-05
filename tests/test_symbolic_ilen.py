@@ -7,7 +7,7 @@ import polars as pl
 import pytest
 
 from genoray import PGEN, VCF, SparseVar, exprs
-from genoray.exprs import is_imprecise, symbolic_ilen
+from genoray.exprs import is_breakend, is_imprecise, symbolic_ilen
 from tests import _oracle
 from tests.data.fixtures import FIXTURES as _FIXTURES
 
@@ -141,14 +141,18 @@ def test_symbolic_fixture_builds_and_classifies():
 
     truth = FIXTURES["symbolic"]().truth()
     # records: 0 <DEL> precise, 1 <INS> precise, 2 <DUP> precise,
-    #          3 <DEL> IMPRECISE, 4 <CNV> (unsupported), 5 <INV> (unsupported)
-    assert len(truth.pos) == 6
+    #          3 <DEL> IMPRECISE, 4 <CNV> (unsupported), 5 <INV> (unsupported),
+    #          6 breakend (BND mate notation)
+    assert len(truth.pos) == 7
     assert truth.alts_truth[0][0].sv_type == "DEL"
     assert truth.alts_truth[1][0].sv_type == "INS"
     assert truth.alts_truth[2][0].sv_type == "DUP"
     assert truth.alts_truth[3][0].sv_type == "DEL"  # IMPRECISE <DEL>
     assert truth.alts_truth[4][0].sv_type == "CNV"  # <CNV> unsupported type
     assert truth.alts_truth[5][0].sv_type == "INV"  # <INV> unsupported type
+    # breakend: not a sequence, no symbolic sv_type
+    assert truth.alts_truth[6][0].sv_type is None
+    assert truth.alts_truth[6][0].is_sequence is False
 
 
 def test_expected_ilen_from_oracle():
@@ -162,6 +166,7 @@ def test_expected_ilen_from_oracle():
     assert exp[3] == [None]  # IMPRECISE <DEL> -> null (mirrors symbolic_ilen)
     assert exp[4] == [None]  # <CNV> unsupported
     assert exp[5] == [None]  # <INV> unsupported
+    assert exp[6] == [None]  # breakend (BND) -> null
 
 
 @pytest.fixture
@@ -192,6 +197,7 @@ def test_vcf_persisted_ilen_matches_oracle(symbolic_vcf):
     assert got[3] == exp[3] == [None]  # IMPRECISE <DEL>
     assert got[4] == exp[4] == [None]  # <CNV>
     assert got[5] == exp[5] == [None]  # <INV>
+    assert got[6] == exp[6] == [None]  # breakend (BND)
 
 
 def test_oracle_normalizes_compound_sv_type():
@@ -246,16 +252,16 @@ def test_var_ranges_handles_null_ilen(symbolic_vcf):
     # numpy array via numba ufuncs.  A null ILEN entry causes Polars to upcast
     # the column to Float64/NaN, which the numba typed ufunc cannot accept.
     # This test calls var_ranges directly so the null rows (POS=4000 IMPRECISE,
-    # POS=5000 <CNV>, and POS=6000 <INV>) are always materialised.
+    # POS=5000 <CNV>, POS=6000 <INV>, and POS=7000 breakend) are always materialised.
     from genoray._var_ranges import var_ranges
 
-    # Wide query spanning all 6 records — forces all ILEN rows through the
-    # numpy path including the three nulls.  The result covers variant indices
-    # [0, 6) — all six records are represented.
-    result = var_ranges(symbolic_vcf._c_norm, symbolic_vcf._index, "chr1", [0], [7_000])
+    # Wide query spanning all 7 records — forces all ILEN rows through the
+    # numpy path including the four nulls.  The result covers variant indices
+    # [0, 7) — all seven records are represented.
+    result = var_ranges(symbolic_vcf._c_norm, symbolic_vcf._index, "chr1", [0], [8_000])
     assert result.shape == (1, 2)
-    # All 6 variants represented: exclusive end minus start = 6
-    assert result[0, 1] - result[0, 0] == 6
+    # All 7 variants represented: exclusive end minus start = 7
+    assert result[0, 1] - result[0, 0] == 7
 
     # Narrow query overlapping only the precise <DEL> at POS=1000.
     # ILEN=-100 means the variant spans [999, 1100) in 0-based coords.
@@ -275,17 +281,17 @@ def test_var_counts_lazy_path_includes_null_ilen_variants(symbolic_vcf):
     # drops, returning 3 instead of 6.  This test exercises the LAZY path
     # (var_counts → VCF.n_vars_in_ranges → VCF.read allocation) and asserts
     # the correct count.
-    count = symbolic_vcf.n_vars_in_ranges("chr1", 0, 7_000)[0]
-    assert count == 6, (
-        f"Expected 6 variants over chr1:0-7000 (including 3 null-ILEN rows), got {count}"
+    count = symbolic_vcf.n_vars_in_ranges("chr1", 0, 8_000)[0]
+    assert count == 7, (
+        f"Expected 7 variants over chr1:0-8000 (including 4 null-ILEN rows), got {count}"
     )
 
     # Confirm this also flows through VCF.read: the allocated output array
-    # must have 6 variants on the variant axis.
-    genos = symbolic_vcf.read("chr1", 0, 7_000)
+    # must have 7 variants on the variant axis.
+    genos = symbolic_vcf.read("chr1", 0, 8_000)
     # shape is (samples, ploidy+phasing, variants) for Genos16
-    assert genos.shape[-1] == 6, (
-        f"VCF.read returned {genos.shape[-1]} variants, expected 6"
+    assert genos.shape[-1] == 7, (
+        f"VCF.read returned {genos.shape[-1]} variants, expected 7"
     )
 
 
@@ -344,7 +350,9 @@ def test_filter_parity_symbolic_vs_imprecise(tmp_path):
     base_vcf = VCF(str(path))
     base_vcf._write_gvi_index()
 
-    # ~is_symbolic drops ALL symbolic -> empty index (all 6 rows are <...> symbolic).
+    # ~is_symbolic drops the 6 <...> symbolic rows but KEEPS the breakend, which
+    # is a distinct ALT class (is_symbolic only matches `<...>`).  This is the gap
+    # the breakend row was added to lock: ~is_symbolic alone is NOT haplotype-safe.
     # The `_index` is filtered solely by `pl_filter`; the `filter` callable is an
     # inert no-op required by the VCF constructor's filter/pl_filter pairing.
     vcf_all = VCF(
@@ -353,9 +361,20 @@ def test_filter_parity_symbolic_vs_imprecise(tmp_path):
         pl_filter=~exprs.is_symbolic,
     )
     vcf_all._load_index()
-    assert vcf_all._index.height == 0
+    assert vcf_all._index.height == 1
+    assert vcf_all._index.get_column("ALT").to_list() == [["G[chr1:500000["]]
 
-    # ~is_imprecise keeps the 3 precise SVs, drops the 3 un-sizable ones.
+    # ~is_symbolic & ~is_breakend drops everything un-expandable -> empty index.
+    vcf_hap = VCF(
+        str(path),
+        filter=lambda r: True,
+        pl_filter=~exprs.is_symbolic & ~exprs.is_breakend,
+    )
+    vcf_hap._load_index()
+    assert vcf_hap._index.height == 0
+
+    # ~is_imprecise keeps the 3 precise SVs, drops the 4 un-sizable ones
+    # (IMPRECISE <DEL>, <CNV>, <INV>, and the breakend).
     # pl_filter-only requires pairing with a no-op filter callable per the VCF API.
     vcf_precise = VCF(
         str(path),
@@ -491,3 +510,92 @@ def test_property_ilen_matches_oracle():
                 )
 
     _prop()
+
+
+# ---------------------------------------------------------------------------
+# Breakend (BND) ALTs: mate-pair / single-breakend notation
+# ---------------------------------------------------------------------------
+
+
+def test_is_breakend_detects_mate_and_single_notation():
+    """is_breakend matches the VCF 4.x breakend ALT grammar (bracketed mate
+    notation and single-breakend ``.``-forms) but NOT symbolic ``<...>`` alleles
+    or plain SNP/indel sequences."""
+    df = pl.DataFrame(
+        {
+            "ALT": [
+                ["G[chr2:321["],  # paired breakend (t[p[)
+                ["]chr2:321]G"],  # paired breakend (]p]t)
+                [".TGCA"],  # single breakend, left (.t)
+                ["TGCA."],  # single breakend, right (t.)
+                ["<DEL>"],  # symbolic, NOT a breakend
+                ["A"],  # SNP
+                ["AT"],  # insertion
+                ["AT", "G[chr2:1["],  # multiallelic: any breakend -> True
+            ]
+        },
+        schema={"ALT": pl.List(pl.Utf8)},
+    )
+    out = df.with_columns(bnd=is_breakend).get_column("bnd").to_list()
+    assert out == [True, True, True, True, False, False, False, True]
+
+
+def test_symbolic_ilen_breakend_is_null():
+    """Breakend ALTs are un-expandable like symbolic SVs, so their ILEN must be
+    null — NOT the literal ``len(ALT) - len(REF)`` (which would masquerade as a
+    large insertion and slip past ``~is_imprecise``)."""
+    df = pl.DataFrame(
+        {
+            "REF": ["G", "G", "A"],
+            "ALT": [["G[chr2:321["], [".TGCA"], ["T"]],
+            "SVLEN": [None, None, None],
+            "END": [None, None, None],
+            "IMPRECISE": [False, False, False],
+            "POS": [1000, 2000, 3000],
+        },
+        schema={
+            "REF": pl.Utf8,
+            "ALT": pl.List(pl.Utf8),
+            "SVLEN": pl.Int64,
+            "END": pl.Int64,
+            "IMPRECISE": pl.Boolean,
+            "POS": pl.Int64,
+        },
+    )
+    out = df.with_columns(ILEN=symbolic_ilen()).get_column("ILEN").to_list()
+    assert out[0] == [None], f"paired breakend should be null, got {out[0]}"
+    assert out[1] == [None], f"single breakend should be null, got {out[1]}"
+    assert out[2] == [0], f"SNP should be literal 0, got {out[2]}"
+
+
+def test_vcf_breakend_ilen_null_and_filter_parity(tmp_path):
+    """End-to-end: a breakend record written to a VCF gets null ILEN through the
+    index-build path, is flagged ``is_breakend`` & ``is_imprecise`` but NOT
+    ``is_symbolic``, and is dropped by ``~is_breakend`` / ``~is_imprecise`` while
+    surviving ``~is_symbolic``."""
+    from vcfixture import Bnd, VcfBuilder, VcfVersion
+
+    b = VcfBuilder(
+        samples=["s1"],
+        contigs=[("chr1", 1_000_000), ("chr2", 1_000_000)],
+        version=VcfVersion.V4_4,
+    ).fmt("GT")
+    b.record("chr1", 1000, ref="G", alt=[Bnd("G[chr2:321[")], gt=["0|1"])
+    path = b.build().write(tmp_path / "bnd.vcf.gz", bgzip=True, index=True)
+
+    vcf = VCF(str(path))
+    vcf._write_gvi_index()
+    vcf._load_index()
+
+    assert vcf._index.get_column("ILEN").to_list() == [[None]]
+
+    df = vcf._index
+    assert df.select(is_breakend).to_series().to_list() == [True]
+    assert df.select(exprs.is_symbolic).to_series().to_list() == [False]
+    assert df.select(is_imprecise).to_series().to_list() == [True]
+
+    # ~is_symbolic keeps the breakend (it is not a <...> symbolic allele).
+    assert df.filter(~exprs.is_symbolic).height == 1
+    # ~is_breakend and ~is_imprecise both drop it.
+    assert df.filter(~is_breakend).height == 0
+    assert df.filter(~is_imprecise).height == 0
