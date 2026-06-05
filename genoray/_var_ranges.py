@@ -61,6 +61,9 @@ def var_ranges(
     # 0-based
     v_starts = var_table["POS"].to_numpy() - 1
     # 0-based, exclusive end
+    # null ILEN = un-sizable symbolic SV (IMPRECISE / unsupported type); treat as a
+    # point variant.  A single null upcasts the Int32 column to Float64/NaN and breaks
+    # the numba coordinate kernels.
     v_ends = (
         var_table["POS"]
         - var_table["ILEN"].list.first().clip(upper_bound=0).fill_null(0)

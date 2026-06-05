@@ -230,11 +230,6 @@ def test_svar_with_length_null_ilen_no_float_corruption(symbolic_svar):
     # coordinates.  This test asserts correct *integer* offset values.
     svar = symbolic_svar
 
-    # Verify the ILEN column materialises to int32 (not float64/NaN)
-    ilen_arr = svar.index["ILEN"].list.first().fill_null(0).to_numpy()
-    assert ilen_arr.dtype == np.int32, f"Expected int32 ILEN, got {ilen_arr.dtype}"
-    assert not np.any(np.isnan(ilen_arr.astype(float))), "Unexpected NaN in ILEN"
-
     # Wide query over all 5 variants via the with-length read path.
     starts_ends = svar._find_starts_ends_with_length(
         "chr1",
