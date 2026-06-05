@@ -1,3 +1,12 @@
+## 2.9.0 (2026-06-05)
+
+### Feat
+
+- **vcf**: enforce filter/pl_filter pair invariant in VCF.filter setter
+- **cli**: replace --skip-symbolic-alts with --no-symbolic and --no-breakend
+- **exprs**: add record-level _record_is_symbolic/_record_is_breakend predicates
+- **exprs**: add is_breakend; treat breakend ALTs as un-sizable (null ILEN)
+
 ## 2.8.0 (2026-06-05)
 
 ### Feat
