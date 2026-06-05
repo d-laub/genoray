@@ -1160,6 +1160,13 @@ def _load_index(
 
     if "ILEN" not in schema:
         if "INFO" in schema.names():
+            # ILEN is intentionally recomputed from the persisted INFO string on
+            # each _load_index call.  PGEN does NOT persist the computed ILEN in
+            # the .gvi file (unlike the VCF path, which writes ILEN at index-build
+            # time).  Do NOT "optimise" this into persistence without also updating
+            # _write_index to store ILEN — otherwise old .gvi files would silently
+            # miss symbolic-SV ILEN corrections.
+            #
             # Regex-extract SVLEN/END/IMPRECISE from the PVAR INFO string, then
             # use the shared symbolic_ilen() helper so symbolic SVs get correct
             # sign-adjusted lengths (DEL→-|len|, INS/DUP→+|len|, others→null).

@@ -62,6 +62,80 @@ def test_mixed_literal_symbolic_alt():
     assert out[0] == [0, -80]
 
 
+def test_is_snp_is_indel_null_ilen_excluded():
+    """Regression: null-ILEN symbolic SVs must NOT be classified as SNP or indel.
+
+    Pre-fix, list.all() ignores nulls so [null] -> is_snp=True AND is_indel=True.
+    Post-fix, the null-aware predicate returns False for both.
+    """
+    df = pl.DataFrame(
+        {
+            "ILEN": [
+                [0],  # SNP
+                [-100],  # DEL (indel)
+                [None],  # un-sizable symbolic SV
+                [50],  # INS (indel)
+                [0, None],  # multiallelic: SNP + un-sizable -> neither
+            ]
+        },
+        schema={"ILEN": pl.List(pl.Int32)},
+    ).with_columns(
+        snp=pl.col("ILEN")
+        .list.eval((pl.element() == 0) & pl.element().is_not_null())
+        .list.all(),
+        indel=pl.col("ILEN")
+        .list.eval((pl.element() != 0) & pl.element().is_not_null())
+        .list.all(),
+    )
+    snp = df["snp"].to_list()
+    indel = df["indel"].to_list()
+    # SNP row
+    assert snp[0] is True and indel[0] is False
+    # DEL row
+    assert snp[1] is False and indel[1] is True
+    # null-ILEN row: must be NEITHER snp nor indel
+    assert snp[2] is False, f"null-ILEN row wrongly classified as SNP: {snp[2]}"
+    assert indel[2] is False, f"null-ILEN row wrongly classified as indel: {indel[2]}"
+    # INS row
+    assert snp[3] is False and indel[3] is True
+    # multiallelic SNP + null: null poisons the list -> neither
+    assert snp[4] is False and indel[4] is False
+
+
+def test_symbolic_ilen_end_fallback_no_svlen():
+    """Unit test: END-based fallback when SVLEN is absent (null).
+
+    Pins the |END - POS| convention used by symbolic_ilen() when coalesce()
+    falls back from SVLEN to END.  Every fixture row that has END also has
+    SVLEN, so this path was previously uncovered end-to-end.
+
+    Convention (0-based POS):
+      <DEL>  POS=1000, END=1100, SVLEN=null  -> ILEN = -(1100-1000) = -100
+      <DUP>  POS=2000, END=2030, SVLEN=null  -> ILEN = +(2030-2000) = +30
+    """
+    df = pl.DataFrame(
+        {
+            "REF": ["G", "G"],
+            "ALT": [["<DEL>"], ["<DUP>"]],
+            "SVLEN": [None, None],
+            "END": [1100, 2030],
+            "IMPRECISE": [False, False],
+            "POS": [1000, 2000],
+        },
+        schema={
+            "REF": pl.Utf8,
+            "ALT": pl.List(pl.Utf8),
+            "SVLEN": pl.Int64,
+            "END": pl.Int64,
+            "IMPRECISE": pl.Boolean,
+            "POS": pl.Int64,
+        },
+    )
+    out = df.with_columns(ILEN=symbolic_ilen()).get_column("ILEN").to_list()
+    assert out[0] == [-100], f"<DEL> END-fallback: expected [-100], got {out[0]}"
+    assert out[1] == [30], f"<DUP> END-fallback: expected [30], got {out[1]}"
+
+
 def test_symbolic_fixture_builds_and_classifies():
     from tests.data.fixtures import FIXTURES
 

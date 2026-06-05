@@ -32,11 +32,27 @@ IndexSchema = {
 }
 """Minimum in-memory schema for a genoray index file (extension :code:`.gvi`)."""
 
-is_snp = pl.col("ILEN").list.eval(pl.element() == 0).list.all()
-"""True if all ALT alleles are SNPs (single nucleotide polymorphisms)."""
+is_snp = (
+    pl.col("ILEN")
+    .list.eval((pl.element() == 0) & pl.element().is_not_null())
+    .list.all()
+)
+"""True if all ALT alleles are SNPs (single nucleotide polymorphisms).
 
-is_indel = pl.col("ILEN").list.eval(pl.element() != 0).list.all()
-"""True if all ALT alleles are indels (insertions or deletions)."""
+Un-sizable symbolic alleles (``null`` ILEN) are treated as neither SNP nor
+indel: a row containing any ``null`` ILEN element evaluates to ``False``.
+"""
+
+is_indel = (
+    pl.col("ILEN")
+    .list.eval((pl.element() != 0) & pl.element().is_not_null())
+    .list.all()
+)
+"""True if all ALT alleles are indels (insertions or deletions).
+
+Un-sizable symbolic alleles (``null`` ILEN) are treated as neither SNP nor
+indel: a row containing any ``null`` ILEN element evaluates to ``False``.
+"""
 
 is_biallelic = pl.col("ALT").list.len() == 1
 """True if the variant is biallelic (one ALT allele)."""

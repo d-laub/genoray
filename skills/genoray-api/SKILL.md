@@ -188,8 +188,8 @@ PGEN: pass a polars `pl.Expr` returning a boolean mask, operating on the
 `.gvi` index columns. Built-in expressions in `genoray.exprs` (the
 *complete* list):
 
-- `is_snp`
-- `is_indel`
+- `is_snp` (True if **all** ALT alleles have ILEN == 0; rows with any `null` ILEN → False)
+- `is_indel` (True if **all** ALT alleles have ILEN != 0; rows with any `null` ILEN → False)
 - `is_biallelic`
 - `is_symbolic` (True if any ALT is a VCF 4.x symbolic allele, i.e. starts with `<`)
 - `is_imprecise` (True if any ALT's ILEN is `null` — an un-sizable symbolic allele)
