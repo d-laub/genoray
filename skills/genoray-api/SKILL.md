@@ -184,6 +184,16 @@ VCF: pass a `Callable[[cyvcf2.Variant], bool]` to `filter=`. For index-based
 predicates (e.g. `is_symbolic`), also pass the matching polars `pl.Expr` to
 `pl_filter=` — VCF requires **both** when filtering via the `.gvi` index.
 
+To change a VCF's filter after construction, assign a `(filter, pl_filter)`
+tuple to the `vcf.filter` setter (or `None` to clear both); the same
+both-or-neither invariant is enforced, and the in-memory index is invalidated.
+The getter still returns just the callable.
+
+```python
+vcf.filter = (lambda rec: ..., ~genoray.exprs.is_symbolic)  # set both
+vcf.filter = None                                           # clear both
+```
+
 PGEN: pass a polars `pl.Expr` returning a boolean mask, operating on the
 `.gvi` index columns. Built-in expressions in `genoray.exprs` (the
 *complete* list):

@@ -272,12 +272,7 @@ class VCF:
         progress: bool = False,
         with_gvi_index: bool = True,
     ):
-        if (filter is not None and pl_filter is None) or (
-            filter is None and pl_filter is not None
-        ):
-            raise ValueError(
-                "If a filter function is provided, a polars expression must also be provided, and vice versa."
-            )
+        self._check_filter_pair(filter, pl_filter)
 
         self.path = Path(path)
         if not self.path.exists():
@@ -307,6 +302,19 @@ class VCF:
     def _open(self) -> cyvcf2.VCF:
         return cyvcf2.VCF(self.path, samples=self._samples, lazy=True)
 
+    @staticmethod
+    def _check_filter_pair(
+        filter: Callable[[cyvcf2.Variant], bool] | None,
+        pl_filter: pl.Expr | None,
+    ) -> None:
+        """Enforce the both-or-neither invariant on a (filter, pl_filter) pair."""
+        if (filter is not None and pl_filter is None) or (
+            filter is None and pl_filter is not None
+        ):
+            raise ValueError(
+                "If a filter function is provided, a polars expression must also be provided, and vice versa."
+            )
+
     @property
     def filter(self) -> Callable[[cyvcf2.Variant], bool] | None:
         """Function to filter variants. Should return True for variants to keep."""
@@ -321,10 +329,31 @@ class VCF:
             return base.with_suffix(".gvi.zst")
 
     @filter.setter
-    def filter(self, filter: Callable[[cyvcf2.Variant], bool] | None):
-        """Changing the filter invalidates the in-memory index."""
+    def filter(
+        self,
+        value: tuple[Callable[[cyvcf2.Variant], bool] | None, pl.Expr | None] | None,
+    ):
+        """Set the record filter and its matching polars expression together.
+
+        Assign a ``(filter, pl_filter)`` pair, or ``None`` to clear both. The VCF
+        path requires both a cyvcf2 record callable (for the genotype scan) and a
+        matching polars expression (for the ``.gvi`` index); they must be set
+        together, mirroring the constructor's both-or-neither invariant. Changing
+        the filter invalidates the in-memory index.
+        """
+        if value is None:
+            filter = pl_filter = None
+        elif isinstance(value, tuple) and len(value) == 2:
+            filter, pl_filter = value
+        else:
+            raise TypeError(
+                "VCF.filter must be assigned a (filter, pl_filter) tuple or None; "
+                f"got {type(value).__name__}."
+            )
+        self._check_filter_pair(filter, pl_filter)
         self._index = None
         self._filter = filter
+        self._pl_filter = pl_filter
 
     @property
     def nbytes(self) -> int:
