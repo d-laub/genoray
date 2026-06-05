@@ -80,3 +80,50 @@ def test_expected_ilen_from_oracle():
     assert exp[2] == [30]  # <DUP>
     assert exp[3] == [None]  # IMPRECISE <DEL> -> null (mirrors symbolic_ilen)
     assert exp[4] == [None]  # <CNV> unsupported
+
+
+def test_oracle_normalizes_compound_sv_type():
+    """Oracle correctly handles compound SV types like DUP:TANDEM and DEL:ME.
+
+    vcfixture stores sv_type as the full type_str (e.g. "DUP:TANDEM"), while
+    symbolic_ilen normalizes to the first ':'-delimited token.  The oracle must
+    apply the same normalization or subtyped SVs wrongly fall through to None.
+    """
+    from vcfixture import Sym, VcfBuilder, VcfVersion
+
+    b = (
+        VcfBuilder(
+            samples=["s1"],
+            contigs=[("chr1", 1_000_000)],
+            version=VcfVersion.V4_4,
+        )
+        .fmt("GT")
+        .info("SVLEN")
+        .info("END")
+        .info("SVCLAIM")
+    )
+    # <DUP:TANDEM> with SVLEN=75 -> +75
+    b.record(
+        "chr1",
+        1000,
+        ref="G",
+        alt=[Sym.duplication("TANDEM")],
+        gt=["0|1"],
+        info={"SVLEN": [75], "END": [1075], "SVCLAIM": ["DJ"]},
+    )
+    # <DEL:ME> with SVLEN=42 -> -42
+    b.record(
+        "chr1",
+        2000,
+        ref="G",
+        alt=[Sym.deletion("ME")],
+        gt=["0|1"],
+        info={"SVLEN": [42], "END": [2042], "SVCLAIM": ["D"]},
+    )
+    truth = b.build().truth()
+    # Confirm vcfixture stores full type_str
+    assert truth.alts_truth[0][0].sv_type == "DUP:TANDEM"
+    assert truth.alts_truth[1][0].sv_type == "DEL:ME"
+    exp = _oracle.expected_ilen(truth, slice(None))
+    assert exp[0] == [75], f"Expected [75] for <DUP:TANDEM>, got {exp[0]}"
+    assert exp[1] == [-42], f"Expected [-42] for <DEL:ME>, got {exp[1]}"
