@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import numpy as np
 import polars as pl
 import pytest
 
-from genoray import VCF
+from genoray import VCF, SparseVar
 from genoray.exprs import is_imprecise, symbolic_ilen
 from tests import _oracle
 from tests.data.fixtures import FIXTURES as _FIXTURES
@@ -170,15 +171,92 @@ def test_var_ranges_handles_null_ilen(symbolic_vcf):
     from genoray._var_ranges import var_ranges
 
     # Wide query spanning all 5 records — forces all ILEN rows through the
-    # numpy path including the two nulls.
+    # numpy path including the two nulls.  The result covers variant indices
+    # [0, 5) — all five records are represented.
     result = var_ranges(symbolic_vcf._c_norm, symbolic_vcf._index, "chr1", [0], [6_000])
-    # Should return a (1, 2) array of variant index boundaries without crashing.
     assert result.shape == (1, 2)
+    # All 5 variants represented: exclusive end minus start = 5
+    assert result[0, 1] - result[0, 0] == 5
 
-    # Narrow query overlapping only the precise <DEL> at POS=1000 (span 100 bp)
-    # should also work — the null rows still exist in the table even if not in
-    # the query result.
+    # Narrow query overlapping only the precise <DEL> at POS=1000.
+    # ILEN=-100 means the variant spans [999, 1100) in 0-based coords.
+    # The null-ILEN rows must not corrupt the coordinate math — they should
+    # be treated as point variants (ILEN=0 → end=POS).
     result2 = var_ranges(
         symbolic_vcf._c_norm, symbolic_vcf._index, "chr1", [999], [1001]
     )
     assert result2.shape == (1, 2)
+    # Exactly 1 variant (the <DEL>) overlaps this range.
+    assert result2[0, 1] - result2[0, 0] == 1
+
+
+def test_var_counts_lazy_path_includes_null_ilen_variants(symbolic_vcf):
+    # PRE-FIX (before .fill_null(0) in var_counts): null-ILEN rows upcast to
+    # Float64/NaN in polars-bio overlap; the null interval end caused SILENT
+    # drops, returning 3 instead of 5.  This test exercises the LAZY path
+    # (var_counts → VCF.n_vars_in_ranges → VCF.read allocation) and asserts
+    # the correct count.
+    count = symbolic_vcf.n_vars_in_ranges("chr1", 0, 6_000)[0]
+    assert count == 5, (
+        f"Expected 5 variants over chr1:0-6000 (including 2 null-ILEN rows), got {count}"
+    )
+
+    # Confirm this also flows through VCF.read: the allocated output array
+    # must have 5 variants on the variant axis.
+    genos = symbolic_vcf.read("chr1", 0, 6_000)
+    # shape is (samples, ploidy+phasing, variants) for Genos16
+    assert genos.shape[-1] == 5, (
+        f"VCF.read returned {genos.shape[-1]} variants, expected 5"
+    )
+
+
+@pytest.fixture
+def symbolic_svar(tmp_path):
+    path = _FIXTURES["symbolic"]().write(
+        tmp_path / "symbolic.vcf.gz", bgzip=True, index=True
+    )
+    vcf = VCF(str(path))
+    vcf._write_gvi_index()
+    vcf._load_index()
+    svar_path = tmp_path / "symbolic.svar"
+    SparseVar.from_vcf(svar_path, vcf, max_mem="100MB", overwrite=True)
+    return SparseVar(svar_path)
+
+
+def test_svar_with_length_null_ilen_no_float_corruption(symbolic_svar):
+    # _svar.py:720 materialises ILEN to numpy for the numba with-length kernel.
+    # Without .fill_null(0), null-ILEN rows upcast to float64/NaN and the njit
+    # kernel silently compiles a float64 specialisation, producing corrupt
+    # coordinates.  This test asserts correct *integer* offset values.
+    svar = symbolic_svar
+
+    # Verify the ILEN column materialises to int32 (not float64/NaN)
+    ilen_arr = svar.index["ILEN"].list.first().fill_null(0).to_numpy()
+    assert ilen_arr.dtype == np.int32, f"Expected int32 ILEN, got {ilen_arr.dtype}"
+    assert not np.any(np.isnan(ilen_arr.astype(float))), "Unexpected NaN in ILEN"
+
+    # Wide query over all 5 variants via the with-length read path.
+    starts_ends = svar._find_starts_ends_with_length(
+        "chr1",
+        np.array([0], dtype=np.int32),
+        np.array([6_000], dtype=np.int32),
+    )
+    # Shape is (2, ranges, samples, ploidy) = (2, 1, 2, 2)
+    assert starts_ends.shape == (2, 1, 2, 2)
+
+    # All offsets must be non-negative integers — no NaN/float corruption.
+    # (The offsets are seqpro OFFSET_TYPE = int64.)
+    assert starts_ends.dtype.kind in ("i", "u"), (
+        f"starts_ends dtype should be integer, got {starts_ends.dtype}"
+    )
+    flat = starts_ends.ravel()
+    assert np.all(flat >= 0), f"Negative offset values indicate corruption: {flat}"
+
+    # Point-variant null-ILEN rows (ILEN→0) must not artificially shrink or
+    # expand the window — the end offset must be >= the start offset for every
+    # (range, sample, ploidy) slice.
+    starts = starts_ends[0]  # (1, 2, 2)
+    ends = starts_ends[1]  # (1, 2, 2)
+    assert np.all(ends >= starts), (
+        f"Some end offsets precede start offsets: starts={starts}, ends={ends}"
+    )

@@ -717,7 +717,7 @@ class SparseVar(Generic[_SRT]):
             ends,
             var_ranges,
             v_starts,
-            self.index["ILEN"].list.first().to_numpy(),
+            self.index["ILEN"].list.first().fill_null(0).to_numpy(),
             s_idxs,
             self.ploidy,
             self._c_max_idxs[c],
@@ -2276,7 +2276,8 @@ def _get_strand_and_codon_pos(
         var_id="index",
         chrom="CHROM",
         start=pl.col("POS"),
-        end=pl.col("POS") - pl.col("ILEN").list.first().clip(upper_bound=0),
+        end=pl.col("POS")
+        - pl.col("ILEN").list.first().clip(upper_bound=0).fill_null(0),
     )
     var_intervals.config_meta.set(coordinate_system_zero_based=False)  # type: ignore
 
