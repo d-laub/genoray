@@ -316,3 +316,27 @@ def test_pgen_symbolic_ilen_matches_oracle():
     assert ilen[4000] == [None], (
         f"IMPRECISE <DEL> POS=4000: expected [None], got {ilen[4000]}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Task 8: SparseVar inherits corrected symbolic ILEN from source VCF
+# ---------------------------------------------------------------------------
+
+
+def test_svar_inherits_symbolic_ilen(tmp_path):
+    # Build a SparseVar from the symbolic fixture filtered to the 3 precise SVs
+    # (DEL/INS/DUP) by ~is_imprecise.  The SVAR passes the VCF's filtered GVI
+    # index through _write_filtered_index unchanged, so the corrected ILEN must
+    # be present verbatim.
+    path = _FIXTURES["symbolic"]().write(
+        tmp_path / "sym.vcf.gz", bgzip=True, index=True
+    )
+    vcf = VCF(
+        str(path),
+        filter=lambda r: True,
+        pl_filter=~exprs.is_imprecise,
+    )
+    svar_path = tmp_path / "sym.svar"
+    SparseVar.from_vcf(svar_path, vcf, max_mem="100MB", overwrite=True)
+    svar = SparseVar(svar_path)
+    assert svar.index.get_column("ILEN").to_list() == [[-100], [50], [30]]
