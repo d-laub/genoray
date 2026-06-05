@@ -187,11 +187,13 @@ predicates (e.g. `is_symbolic`), also pass the matching polars `pl.Expr` to
 To change a VCF's filter after construction, assign a `(filter, pl_filter)`
 tuple to the `vcf.filter` setter (or `None` to clear both); the same
 both-or-neither invariant is enforced, and the in-memory index is invalidated.
-The getter still returns just the callable.
+The getter returns the `(filter, pl_filter)` tuple, mirroring the setter
+(`(None, None)` when unset), so `vcf.filter = vcf.filter` round-trips.
 
 ```python
 vcf.filter = (lambda rec: ..., ~genoray.exprs.is_symbolic)  # set both
 vcf.filter = None                                           # clear both
+fn, expr = vcf.filter                                       # get both
 ```
 
 PGEN: pass a polars `pl.Expr` returning a boolean mask, operating on the

@@ -316,9 +316,16 @@ class VCF:
             )
 
     @property
-    def filter(self) -> Callable[[cyvcf2.Variant], bool] | None:
-        """Function to filter variants. Should return True for variants to keep."""
-        return self._filter
+    def filter(
+        self,
+    ) -> tuple[Callable[[cyvcf2.Variant], bool] | None, pl.Expr | None]:
+        """The ``(filter, pl_filter)`` pair currently in effect.
+
+        Returns the cyvcf2 record callable and its matching polars expression as
+        a tuple, mirroring what the setter accepts. Both elements are ``None``
+        when no filter is set. Assigning ``vcf.filter = vcf.filter`` round-trips.
+        """
+        return self._filter, self._pl_filter
 
     def _index_path(self) -> Path:
         """Path to the index file."""
