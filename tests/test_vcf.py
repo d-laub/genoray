@@ -322,13 +322,17 @@ def test_filter_setter_enforces_pair_invariant():
     # Setting a valid (filter, pl_filter) pair updates both and invalidates the index.
     vcf._index = "sentinel"
     vcf.filter = (record_fn, pl_expr)
-    assert vcf.filter is record_fn
+    assert vcf.filter == (record_fn, pl_expr)
     assert vcf._pl_filter is pl_expr
     assert vcf._index is None
 
-    # Assigning None clears both.
+    # The getter mirrors the setter, so assigning the getter back round-trips.
+    vcf.filter = vcf.filter
+    assert vcf.filter == (record_fn, pl_expr)
+
+    # Assigning None clears both; the getter returns (None, None).
     vcf.filter = None
-    assert vcf.filter is None
+    assert vcf.filter == (None, None)
     assert vcf._pl_filter is None
 
     # A mismatched pair raises ValueError and leaves state untouched.
@@ -336,7 +340,7 @@ def test_filter_setter_enforces_pair_invariant():
         vcf.filter = (record_fn, None)
     with pytest.raises(ValueError):
         vcf.filter = (None, pl_expr)
-    assert vcf.filter is None
+    assert vcf.filter == (None, None)
     assert vcf._pl_filter is None
 
     # A bare (non-tuple) value is rejected.
