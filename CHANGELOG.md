@@ -1,3 +1,9 @@
+## 2.9.1 (2026-06-07)
+
+### Fix
+
+- **vcf**: return (filter, pl_filter) tuple from VCF.filter getter
+
 ## 2.9.0 (2026-06-05)
 
 ### Feat
