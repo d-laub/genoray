@@ -56,3 +56,14 @@ markers = ["network: requires network access (deselect with '-m not network')"]
 [tool.basedpyright]
 enableTypeIgnoreComments = true
 reportMissingTypeArgument = false
+
+[tool.pyrefly]
+preset = "strict"
+project-includes = ["genoray"]
+# pgenlib is a compiled extension with no type stubs; treat it as untyped.
+replace-imports-with-any = ["pgenlib"]
+
+[tool.pyrefly.errors]
+# Mostly numpy-scalar noise (np.integer -> np.integer[Any]) and the Phantom
+# NDArray subclasses, which can't be cleanly parametrized. Keep the rest of strict.
+implicit-any-type-argument = false

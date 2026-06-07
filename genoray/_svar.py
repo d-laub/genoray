@@ -4,11 +4,11 @@ import copy
 import re
 import shutil
 import warnings
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from os import PathLike
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Generic, Literal, TypeVar, cast, overload
+from typing import Any, Generic, Literal, TypeVar, cast, overload
 
 import awkward as ak
 import joblib
@@ -168,7 +168,7 @@ def _normalize_samples(
     and deduping by first occurrence. Raises ValueError on unknown samples."""
     if isinstance(samples, str):
         candidates: list[str] = [samples]
-    elif isinstance(samples, PathLike) or hasattr(samples, "__fspath__"):
+    elif isinstance(samples, PathLike):
         candidates = Path(samples).read_text().splitlines()
         candidates = [s for s in candidates if s.strip()]
     else:
@@ -491,7 +491,7 @@ class SparseVar(Generic[_SRT]):
         held by this reader. Only the polars variant index counts; `genos`
         and `fields` are memory-mapped and excluded.
         """
-        return self.index.estimated_size()
+        return int(self.index.estimated_size())
 
     @overload
     def __init__(
@@ -1035,6 +1035,7 @@ class SparseVar(Generic[_SRT]):
         with TemporaryDirectory() as contig_dir:
             contig_dir = Path(contig_dir)
 
+            assert pgen._index is not None
             keep_by_contig = {
                 chrom: np.asarray(idxs, dtype=np.uint32)
                 for chrom, idxs in (
@@ -1044,7 +1045,7 @@ class SparseVar(Generic[_SRT]):
                 )
             }
 
-            tasks = []
+            tasks: list[Any] = []
             for c in contigs:
                 keep_idxs = keep_by_contig.get(c)
                 if keep_idxs is None or len(keep_idxs) == 0:
@@ -1264,7 +1265,7 @@ class SparseVar(Generic[_SRT]):
         return self.index.drop("index")
 
     def _load_genos(self):
-        def memmap2array(layout: Content, **kwargs):
+        def memmap2array(layout: Content, **kwargs: Any):
             if isinstance(layout, NumpyArray):
                 data = layout.data
                 if isinstance(data, np.memmap):
@@ -1275,7 +1276,7 @@ class SparseVar(Generic[_SRT]):
 
     def write_view(
         self,
-        regions: str | tuple[str, int, int] | Path,
+        regions: str | tuple[str, int, int] | Path | pl.DataFrame,
         samples: str | Sequence[str] | Path,
         output: str | Path,
         fields: Sequence[str] | None = None,
@@ -1478,7 +1479,12 @@ class SparseVar(Generic[_SRT]):
 
 
 @nb.njit(nogil=True, cache=True)
-def _nb_af_helper(afs, v_idxs, offsets, max_count):
+def _nb_af_helper(
+    afs: NDArray[np.float32],
+    v_idxs: NDArray[np.int32],
+    offsets: NDArray[np.int64],
+    max_count: int,
+):
     for i in range(len(offsets) - 1):
         o_s, o_e = offsets[i], offsets[i + 1]
         v_slice = v_idxs[o_s:o_e]
@@ -1488,13 +1494,18 @@ def _nb_af_helper(afs, v_idxs, offsets, max_count):
 
 @nb.njit(parallel=True, nogil=True, cache=True)
 def _nb_count_kept(
-    src_data, src_offsets, src_sample_idxs, ploidy, kept_var_idxs, out_lengths
+    src_data: NDArray[np.int32],
+    src_offsets: NDArray[np.int64],
+    src_sample_idxs: NDArray[np.int64],
+    ploidy: int,
+    kept_var_idxs: NDArray[np.int32],
+    out_lengths: NDArray[np.int64],
 ):
     """Pass 1: count, per output (sample, ploidy) slot, how many source variant
     indices fall in `kept_var_idxs`."""
     n_out = src_sample_idxs.shape[0]
     n_kept = kept_var_idxs.shape[0]
-    for i in nb.prange(n_out):
+    for i in nb.prange(n_out):  # type: ignore[not-iterable]
         s = src_sample_idxs[i]
         for p in range(ploidy):
             src_slot = s * ploidy + p
@@ -1511,14 +1522,19 @@ def _nb_count_kept(
 
 @nb.njit(parallel=True, nogil=True, cache=True)
 def _nb_count_mac_per_kept(
-    src_data, src_offsets, src_sample_idxs, ploidy, kept_var_idxs, mac_out
+    src_data: NDArray[np.int32],
+    src_offsets: NDArray[np.int64],
+    src_sample_idxs: NDArray[np.int64],
+    ploidy: int,
+    kept_var_idxs: NDArray[np.int32],
+    mac_out: NDArray[np.int64],
 ):
     """Count, per kept variant, the number of non-ref entries across (sample, ploidy)
     in the output. Outer prange is over kept variants so each writes its own slot —
     no atomics needed."""
     n_kept = kept_var_idxs.shape[0]
     n_samples = src_sample_idxs.shape[0]
-    for k in nb.prange(n_kept):
+    for k in nb.prange(n_kept):  # type: ignore[not-iterable]
         v = kept_var_idxs[k]
         count = 0
         for i in range(n_samples):
@@ -1535,18 +1551,18 @@ def _nb_count_mac_per_kept(
 
 @nb.njit(parallel=True, nogil=True, cache=True)
 def _nb_write_var_idxs(
-    src_data,
-    src_offsets,
-    src_sample_idxs,
-    ploidy,
-    kept_var_idxs,
-    new_offsets,
-    out_var_idxs,
+    src_data: NDArray[np.int32],
+    src_offsets: NDArray[np.int64],
+    src_sample_idxs: NDArray[np.int64],
+    ploidy: int,
+    kept_var_idxs: NDArray[np.int32],
+    new_offsets: NDArray[np.int64],
+    out_var_idxs: NDArray[np.int32],
 ):
     """Pass 2: write remapped variant indices."""
     n_out = src_sample_idxs.shape[0]
     n_kept = kept_var_idxs.shape[0]
-    for i in nb.prange(n_out):
+    for i in nb.prange(n_out):  # type: ignore[not-iterable]
         s = src_sample_idxs[i]
         for p in range(ploidy):
             src_slot = s * ploidy + p
@@ -1564,19 +1580,19 @@ def _nb_write_var_idxs(
 
 @nb.njit(parallel=True, nogil=True, cache=True)
 def _nb_write_field(
-    src_field,
-    src_data,
-    src_offsets,
-    src_sample_idxs,
-    ploidy,
-    kept_var_idxs,
-    new_offsets,
-    out_field,
+    src_field: NDArray[Any],
+    src_data: NDArray[np.int32],
+    src_offsets: NDArray[np.int64],
+    src_sample_idxs: NDArray[np.int64],
+    ploidy: int,
+    kept_var_idxs: NDArray[np.int32],
+    new_offsets: NDArray[np.int64],
+    out_field: NDArray[Any],
 ):
     """Pass 2 (field variant): writes src_field values at filter-kept positions."""
     n_out = src_sample_idxs.shape[0]
     n_kept = kept_var_idxs.shape[0]
-    for i in nb.prange(n_out):
+    for i in nb.prange(n_out):  # type: ignore[not-iterable]
         s = src_sample_idxs[i]
         for p in range(ploidy):
             src_slot = s * ploidy + p
@@ -1630,8 +1646,8 @@ def _process_contig_vcf(
     contig: str,
     chunk_dir: Path,
     chunk_idx: int,
-    cyvcf2_filter=None,
-    pl_filter=None,
+    cyvcf2_filter: Callable[..., bool] | None = None,
+    pl_filter: pl.Expr | None = None,
 ) -> tuple[int, int]:
     vcf = VCF(
         path,
@@ -1770,7 +1786,7 @@ def _open_fmt(
     offsets = np.memmap(path / "offsets.npy", dtype=np.int64, mode=mode)
 
     sp_genos = Ragged.from_offsets(data, shape, offsets)
-    return sp_genos
+    return sp_genos  # type: ignore[bad-return]
 
 
 def _write_genos(path: Path, sp_genos: Ragged[V_IDX_TYPE]):
@@ -1938,7 +1954,7 @@ def _copy_chunk_helper(
     n_samples: int,
     ploidy: int,
 ):
-    for s in nb.prange(n_samples):
+    for s in nb.prange(n_samples):  # type: ignore[not-iterable]
         for p in range(ploidy):
             sp = s * ploidy + p
 
@@ -1963,7 +1979,7 @@ def _copy_chunk_dosages_helper(
     n_samples: int,
     ploidy: int,
 ):
-    for s in nb.prange(n_samples):
+    for s in nb.prange(n_samples):  # type: ignore[not-iterable]
         for p in range(ploidy):
             sp = s * ploidy + p
 
@@ -2015,8 +2031,8 @@ def _find_starts_ends(
     sorter = np.argsort(var_ranges[:, 0])
     var_ranges = var_ranges[sorter]
 
-    for s in nb.prange(n_samples):
-        for p in nb.prange(ploidy):
+    for s in nb.prange(n_samples):  # type: ignore[not-iterable]
+        for p in nb.prange(ploidy):  # type: ignore[not-iterable]
             s_idx = sample_idxs[s]
             sp = s_idx * ploidy + p
             o_s, o_e = geno_offsets[sp], geno_offsets[sp + 1]
@@ -2068,7 +2084,7 @@ def _length_walk_n_keep(
                 return j - start_idx + 1  # include this variant
 
         v_end = v_start - min(0, ilen) + maybe_add_one
-        last_v_end = max(last_v_end, v_end)
+        last_v_end = max(last_v_end, v_end)  # type: ignore[bad-specialization]
 
     return max_idx - start_idx
 
@@ -2089,7 +2105,7 @@ def _dense2sparse_count(
     path uses, so the two cannot drift). Writes the kept count to ``out_lengths``.
     """
     n_samples, ploidy, n_var = genos.shape
-    for s in nb.prange(n_samples):
+    for s in nb.prange(n_samples):  # type: ignore[not-iterable]
         carriers = np.empty(n_var, dtype=V_IDX_TYPE)
         for p in range(ploidy):
             nc = 0
@@ -2116,7 +2132,7 @@ def _dense2sparse_fill(
     """Pass 2: emit the first ``out_lengths[s, p]`` carried ALT calls per
     haplotype into the disjoint output range ``[flat_offsets[slot], ...)``."""
     n_samples, ploidy, n_var = genos.shape
-    for s in nb.prange(n_samples):
+    for s in nb.prange(n_samples):  # type: ignore[not-iterable]
         for p in range(ploidy):
             slot = s * ploidy + p
             n_keep = out_lengths[s, p]
@@ -2181,8 +2197,8 @@ def _find_starts_ends_with_length(
     sorter = np.argsort(var_ranges[:, 0])
     var_ranges = var_ranges[sorter]
 
-    for s in nb.prange(n_samples):
-        for p in nb.prange(ploidy):
+    for s in nb.prange(n_samples):  # type: ignore[not-iterable]
+        for p in nb.prange(ploidy):  # type: ignore[not-iterable]
             s_idx = sample_idxs[s]
             sp = s_idx * ploidy + p
             o_s, o_e = geno_offsets[sp], geno_offsets[sp + 1]
@@ -2209,8 +2225,8 @@ def _find_starts_ends_with_length(
                     sp_genos,
                     v_starts,
                     ilens,
-                    start_idx,
-                    max_idx,
+                    int(start_idx),
+                    int(max_idx),
                     q_starts[r],
                     q_ends[r],
                 )
