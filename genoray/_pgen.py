@@ -16,7 +16,7 @@ from more_itertools import mark_ends, windowed
 from numpy.typing import ArrayLike, NDArray
 from phantom import Phantom
 from seqpro.rag import OFFSET_TYPE
-from typing_extensions import Self, assert_never
+from typing_extensions import Self, assert_never, override
 from zstandard import ZstdDecompressor
 
 from ._types import POS_MAX, POS_TYPE
@@ -71,7 +71,7 @@ class Phasing(NDArray[np.bool_], Phantom, predicate=_is_phasing):
         return cls.parse(np.empty((n_samples, n_variants), dtype=cls._dtype))
 
 
-def _is_genos_phasing(obj) -> TypeGuard[GenosPhasing]:
+def _is_genos_phasing(obj: object) -> TypeGuard[GenosPhasing]:
     return (
         isinstance(obj, tuple)
         and len(obj) == 2
@@ -93,7 +93,7 @@ class GenosPhasing(tuple[Genos, Phasing], Phantom, predicate=_is_genos_phasing):
         )
 
 
-def _is_genos_dosages(obj) -> TypeGuard[GenosDosages]:
+def _is_genos_dosages(obj: object) -> TypeGuard[GenosDosages]:
     return (
         isinstance(obj, tuple)
         and len(obj) == 2
@@ -115,7 +115,7 @@ class GenosDosages(tuple[Genos, Dosages], Phantom, predicate=_is_genos_dosages):
         )
 
 
-def _is_genos_phasing_dosages(obj) -> TypeGuard[GenosPhasingDosages]:
+def _is_genos_phasing_dosages(obj: object) -> TypeGuard[GenosPhasingDosages]:
     return (
         isinstance(obj, tuple)
         and len(obj) == 3
@@ -290,7 +290,7 @@ class PGEN:
                 + self._sei.ilens.nbytes
                 + self._sei.alt.estimated_size()
             )
-        return n
+        return int(n)
 
     @property
     def filter(self) -> pl.Expr | None:
@@ -493,7 +493,7 @@ class PGEN:
         elif issubclass(mode, GenosPhasingDosages):
             out = self._read_genos_phasing_dosages(var_idxs)
         else:
-            assert_never(mode)
+            assert_never(mode)  # type: ignore[bad-argument-type]
 
         return cast(T, out)
 
@@ -571,7 +571,7 @@ class PGEN:
             elif issubclass(mode, GenosPhasingDosages):
                 _out = self._read_genos_phasing_dosages(var_idx)
             else:
-                assert_never(mode)
+                assert_never(mode)  # type: ignore[bad-argument-type]
 
             yield mode.parse(_out)
 
@@ -648,7 +648,7 @@ class PGEN:
         elif issubclass(mode, GenosPhasingDosages):
             out = self._read_genos_phasing_dosages(var_idxs)
         else:
-            assert_never(mode)
+            assert_never(mode)  # type: ignore[bad-argument-type]
 
         return cast(T, out), offsets
 
@@ -752,7 +752,7 @@ class PGEN:
             elif issubclass(mode, GenosPhasingDosages):
                 read = self._read_genos_phasing_dosages
             else:
-                assert_never(mode)
+                assert_never(mode)  # type: ignore[bad-argument-type]
 
             yield (cast(T, read(var_idx)) for var_idx in v_chunks)
 
@@ -882,7 +882,7 @@ class PGEN:
         elif issubclass(mode, GenosPhasingDosages):
             read = self._read_genos_phasing_dosages
         else:
-            assert_never(mode)
+            assert_never(mode)  # type: ignore[bad-argument-type]
 
         read = cast(Callable[[NDArray[np.uint32]], L], read)
 
@@ -931,7 +931,7 @@ class PGEN:
             mem += self.n_samples * mode._dtypes[1]().itemsize
             mem += self.n_samples * mode._dtypes[2]().itemsize
         else:
-            assert_never(mode)
+            assert_never(mode)  # type: ignore[bad-argument-type]
 
         if isinstance(self._s_unsorter, np.ndarray):
             mem *= 2  # have to make a copy to sort by samples
@@ -1074,7 +1074,7 @@ def _gen_with_length(
             )
 
         var_idx = np.arange(var_idx[0], last_idx + 1, dtype=V_IDX_TYPE)
-        yield (
+        yield (  # type: ignore[invalid-yield]
             out,  # type: ignore
             last_end,
             var_idx,
@@ -1294,6 +1294,7 @@ class ZstdFile(TextIOWrapper):
         self.reader = ZstdDecompressor().stream_reader(open(path, "rb"))
         super().__init__(self.reader, newline="\n", encoding="utf-8")
 
+    @override
     def __exit__(
         self,
         exc_type: type[BaseException] | None,

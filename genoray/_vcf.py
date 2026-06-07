@@ -131,7 +131,7 @@ class Genos8Dosages(tuple[Genos8, Dosages], Phantom, predicate=_is_genos8_dosage
         )
 
 
-def _is_genos16_dosages(obj) -> TypeGuard[tuple[Genos8, Dosages]]:
+def _is_genos16_dosages(obj: object) -> TypeGuard[tuple[Genos8, Dosages]]:
     """Check if the object is a tuple of genotypes and dosages.
 
     Parameters
@@ -291,7 +291,7 @@ class VCF:
         self.contigs = natsorted(vcf.seqnames)
         self._c_norm = ContigNormalizer(vcf.seqnames)
         avail = np.asarray(self.available_samples)
-        self._s2i = HashTable(max=len(avail) * 2, dtype=avail.dtype)
+        self._s2i = HashTable(max=len(avail) * 2, dtype=avail.dtype)  # type: ignore[bad-argument-type]
         self._s2i.add(avail)
 
         self.set_samples(None)
@@ -370,7 +370,7 @@ class VCF:
         """
         if self._index is None:
             return 0
-        return self._index.estimated_size()
+        return int(self._index.estimated_size())
 
     @property
     def current_samples(self) -> list[str]:
@@ -646,7 +646,7 @@ class VCF:
                     vcf, data, self.dosage_field, mode=mode
                 )
             else:
-                assert_never(mode)
+                assert_never(mode)  # type: ignore[bad-argument-type]
 
             out = cast(T, data)
         else:
@@ -659,7 +659,7 @@ class VCF:
                 assert self.dosage_field is not None
                 self._fill_genos_and_dosages(vcf, out, self.dosage_field)
             else:
-                assert_never(mode)
+                assert_never(mode)  # type: ignore[bad-argument-type]
 
         return out
 
@@ -776,11 +776,11 @@ class VCF:
                 buffer.append(gt_buffer)
             if ds_buffer is not None:
                 ds_buffer = ds_buffer[..., :i]
-                buffer.append(ds_buffer)
+                buffer.append(ds_buffer)  # type: ignore[bad-argument-type]
             buffer = tuple(buffer)
 
             if len(buffer) == 1:
-                yield buffer[0]
+                yield buffer[0]  # type: ignore[invalid-yield]
             else:
                 yield buffer  # type: ignore
 
@@ -926,7 +926,7 @@ class VCF:
                 )
                 hap_lens += hap_ilens(out[0][:, : self.ploidy], ilens)
             else:
-                assert_never(mode)
+                assert_never(mode)  # type: ignore[bad-argument-type]
 
             if not is_last:
                 yield cast(L, out), last_end, 0
@@ -948,7 +948,7 @@ class VCF:
                     last_end,
                 )
             else:
-                assert_never(mode)
+                assert_never(mode)  # type: ignore[bad-argument-type]
 
             if len(ls_ext) > 0:
                 if issubclass(mode, (Genos8, Genos16)):
@@ -1283,7 +1283,7 @@ class VCF:
             assert mode is not None
             assert ilens is None, "caller should not provide ilens if out is None"
 
-            out_ls = []
+            out_ls: list[NDArray[np.int16]] = []
 
             for i, v in enumerate(vcf):
                 if self.phasing:
@@ -1346,7 +1346,7 @@ class VCF:
             vcf = filter(self._filter, vcf)
 
         if out is None:
-            out_ls = []
+            out_ls: list[NDArray[np.float32]] = []
             for v in vcf:
                 d = v.format(dosage_field)
                 if d is None:
@@ -1418,8 +1418,8 @@ class VCF:
             assert mode is not None
             assert ilens is None, "caller should not provide ilens if out is None"
 
-            geno_ls = []
-            dosage_ls = []
+            geno_ls: list[NDArray[np.int16]] = []
+            dosage_ls: list[NDArray[np.float32]] = []
             for i, v in enumerate(vcf):
                 if self.phasing:
                     # (s p+1) np.int16
@@ -1530,7 +1530,7 @@ class VCF:
             mem += self.n_samples * ploidy * mode._gdtype().itemsize
             mem += self.n_samples * np.float32().itemsize
         else:
-            assert_never(mode)
+            assert_never(mode)  # type: ignore[bad-argument-type]
 
         return mem
 

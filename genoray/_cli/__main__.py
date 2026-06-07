@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from importlib.metadata import version
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Callable, Literal
 
+import polars as pl
 from cyclopts import App, Parameter
 
 app = App(
@@ -102,8 +103,8 @@ def write(
     # expr (used by both VCF index and PGEN) and a record-level predicate (used
     # by the VCF cyvcf2 genotype scan). The two representations of each flag are
     # kept in parity via genoray.exprs.
-    pl_terms = []
-    record_preds = []
+    pl_terms: list[pl.Expr] = []
+    record_preds: list[Callable[[list[str]], bool]] = []
     if no_symbolic:
         pl_terms.append(~exprs.is_symbolic)
         record_preds.append(exprs._record_is_symbolic)
@@ -117,7 +118,10 @@ def write(
 
         pl_filter = reduce(and_, pl_terms)
 
-        def record_filter(rec, _preds=tuple(record_preds)) -> bool:
+        def record_filter(
+            rec: Any,
+            _preds: tuple[Callable[[list[str]], bool], ...] = tuple(record_preds),
+        ) -> bool:
             return not any(pred(rec.ALT) for pred in _preds)
     else:
         pl_filter = None
