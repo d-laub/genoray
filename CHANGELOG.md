@@ -1,3 +1,10 @@
+## 2.9.2 (2026-06-08)
+
+### Fix
+
+- **deps**: allow seqpro 0.15 (relax upper bound to <0.16)
+- **types**: add pyrefly hook and resolve strict type errors
+
 ## 2.9.1 (2026-06-07)
 
 ### Fix
