@@ -7713,7 +7713,7 @@ packages:
 - pypi: .
   name: genoray
   requires_dist:
-  - seqpro>=0.11,<0.15
+  - seqpro>=0.11,<0.16
   - numpy>=1.26
   - pandas>=2.2.3
   - hirola>=0.3.0
