@@ -30,7 +30,7 @@ from rich.progress import MofNCompleteColumn, Progress
 from seqpro.rag import OFFSET_TYPE, Ragged, lengths_to_offsets
 from tqdm.auto import tqdm
 
-from ._mutcat import MUTCAT_VERSION, build_entry_codes, classify_variants
+from ._mutcat import MUTCAT_VERSION, build_entry_codes, classify_variants, count_matrix
 from ._pgen import PGEN
 from ._reference import Reference
 from ._types import DOSAGE_TYPE, DTYPE, POS_MAX, POS_TYPE, V_IDX_TYPE
@@ -1475,7 +1475,14 @@ class SparseVar(Generic[_SRT]):
             or a path to a FASTA file (with a ``.fai`` index alongside it).
         write_back
             If ``True`` (default), persist ``mutcat.npy`` and update
-            ``metadata.json`` on disk.
+            ``metadata.json`` on disk so that subsequent ``SparseVar(...)``
+            opens and ``write_view`` calls with ``fields=["mutcat"]`` will see
+            the field.  If ``False``, the ``mutcat`` field lives only in memory
+            (``self.fields["mutcat"]``) and is NOT written to disk — reopening
+            the file or calling ``write_view`` with ``fields=["mutcat"]`` will
+            not find it.  Note: the ``metadata.json`` update is not safe
+            against concurrent writers; single-writer access is expected
+            (consistent with ``annotate_with_gtf``).
         """
         if not isinstance(reference, Reference):
             reference = Reference.from_path(reference)
@@ -1540,6 +1547,65 @@ class SparseVar(Generic[_SRT]):
             meta.mutcat_version = MUTCAT_VERSION
             with open(self.path / "metadata.json", "w") as f:
                 f.write(meta.model_dump_json())
+
+    def mutation_matrix(
+        self,
+        kind: Literal["SBS96", "DBS78", "ID83"],
+        *,
+        count: Literal["allele", "sample"] = "allele",
+    ) -> pl.DataFrame:
+        """Build a per-sample mutation count matrix.
+
+        Requires :meth:`annotate_mutations` to have been run (or the ``mutcat``
+        field to be loaded). Returns a DataFrame with a ``MutationType`` column
+        plus one column per sample (rows in fixed codebook order).
+
+        The ``mutcat`` field is resolved in the following priority order:
+
+        1. Already loaded in ``self.fields["mutcat"]`` (e.g. opened with
+           ``fields=["mutcat"]``).
+        2. Present on disk as ``mutcat.npy`` (written by a prior
+           :meth:`annotate_mutations` call with ``write_back=True``) — opened
+           lazily and cached into ``self.fields["mutcat"]`` for subsequent
+           calls.
+        3. Not found at all — raises :class:`ValueError`.
+
+        Parameters
+        ----------
+        kind
+            One of ``"SBS96"``, ``"DBS78"``, ``"ID83"``.
+        count
+            ``"allele"`` counts every non-ref allele copy; ``"sample"`` counts
+            each category at most once per sample (presence/absence).
+        """
+        if kind not in ("SBS96", "DBS78", "ID83"):
+            raise ValueError(f"Unknown matrix kind {kind!r}.")
+        if count not in ("allele", "sample"):
+            raise ValueError(
+                f"Unknown count mode {count!r}; choose 'allele' or 'sample'."
+            )
+        mut = self.fields.get("mutcat")
+        if mut is None:
+            if "mutcat" in self.available_fields:
+                shape = (self.n_samples, self.ploidy, None)
+                mut = _open_fmt(
+                    "mutcat", self.available_fields["mutcat"], self.path, shape, "r"
+                )
+                self.fields["mutcat"] = mut
+            else:
+                raise ValueError(
+                    "No 'mutcat' field found. Run annotate_mutations() first "
+                    "(or open with fields=['mutcat'])."
+                )
+        return count_matrix(
+            np.asarray(mut.data),
+            np.asarray(self.genos.offsets),
+            self.ploidy,
+            self.n_samples,
+            self.available_samples,
+            kind,
+            per_sample=(count == "sample"),
+        )
 
     def cache_afs(self):
         """Cache the allele frequencies on disk. Will also load all possible attributes and add the AF column in-memory."""

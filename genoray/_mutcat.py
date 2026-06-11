@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import Any, Literal
 
 import numba as nb
 import numpy as np
@@ -406,6 +407,62 @@ def build_entry_codes(
         np.int16(_DBS_PARTNER),
     )
     return out
+
+
+@nb.njit(nogil=True, cache=True)
+def _count_kernel(
+    data_codes: NDArray[np.int16],
+    offsets: NDArray[np.int64],
+    ploidy: np.int64,
+    n_samples: np.int64,
+    n_codes: np.int64,
+    per_sample: np.bool_,
+    out: NDArray[np.int64],
+) -> None:
+    """out[sample, code] accumulator over genotype entries.
+
+    ``data_codes`` is the per-entry int16 code array (aligned to genos.data).
+    When ``per_sample`` is True, a code is counted at most once per sample.
+    """
+    for slot in range(len(offsets) - 1):
+        sample = slot // ploidy
+        o_s, o_e = offsets[slot], offsets[slot + 1]
+        for j in range(o_s, o_e):
+            code = data_codes[j]
+            if code < 0 or code >= n_codes:
+                continue
+            if per_sample:
+                if out[sample, code] == 0:
+                    out[sample, code] = 1
+            else:
+                out[sample, code] += 1
+
+
+def count_matrix(
+    entry_codes: np.ndarray,
+    offsets: np.ndarray,
+    ploidy: int,
+    n_samples: int,
+    sample_names: list[str],
+    kind: Literal["SBS96", "DBS78", "ID83"],
+    per_sample: bool,
+) -> "pl.DataFrame":
+    counts = np.zeros((n_samples, N_CODES), dtype=np.int64)
+    _count_kernel(
+        entry_codes.astype(np.int16),
+        offsets.astype(np.int64),
+        np.int64(ploidy),
+        np.int64(n_samples),
+        np.int64(N_CODES),
+        np.bool_(per_sample),
+        counts,
+    )
+    lo, hi = code_ranges()[kind]
+    block = counts[:, lo:hi]  # (n_samples, n_categories)
+    out: dict[str, Any] = {"MutationType": labels(kind)}
+    for s_i, name in enumerate(sample_names):
+        out[name] = block[s_i]
+    return pl.DataFrame(out)
 
 
 def classify_variants(index: pl.DataFrame, reference: Reference) -> np.ndarray:
