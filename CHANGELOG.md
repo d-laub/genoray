@@ -1,3 +1,9 @@
+## Unreleased
+
+### Feat
+
+- **svar**: from_vcf/from_pgen accept regions/samples/merge_overlapping/regions_overlap to subset during conversion (MAC=0 drop on sample subsets), mirroring write_view
+
 ## 2.9.2 (2026-06-08)
 
 ### Fix
