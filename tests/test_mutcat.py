@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from genoray._mutcat import (
     DBS78,
+    DBS78_INDEX,
     ID83,
     SBS96,
     SENTINELS,
     SBS96_INDEX,
+    classify_dbs78,
     classify_sbs96,
     code_ranges,
 )
@@ -71,3 +73,19 @@ def test_sbs96_unclassified_cases():
     assert classify_sbs96(five=b"N", ref=b"C", alt=b"A", three=b"G") == unc
     # empty bytes
     assert classify_sbs96(five=b"A", ref=b"", alt=b"C", three=b"G") == unc
+
+
+def test_dbs78_direct_member():
+    # AC>CA is directly in the catalogue
+    assert classify_dbs78(b"AC", b"CA") == DBS78_INDEX["AC>CA"]
+
+
+def test_dbs78_folds_to_revcomp_member():
+    # GT>TG : revcomp of ref GT is AC, revcomp of alt TG is CA -> AC>CA
+    assert classify_dbs78(b"GT", b"TG") == DBS78_INDEX["AC>CA"]
+
+
+def test_dbs78_non_doublet_unclassified():
+    assert classify_dbs78(b"AC", b"AC") == SENTINELS["UNCLASSIFIED"]  # no change
+    assert classify_dbs78(b"ACG", b"TTT") == SENTINELS["UNCLASSIFIED"]  # >2bp
+    assert classify_dbs78(b"AN", b"CA") == SENTINELS["UNCLASSIFIED"]  # non-ACGT base

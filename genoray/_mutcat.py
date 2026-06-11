@@ -182,3 +182,29 @@ def classify_sbs96(five: bytes, ref: bytes, alt: bytes, three: bytes) -> int:
         f, t = _comp(t), _comp(f)  # flanks swap and complement
     label = f"{chr(f)}[{chr(r)}>{chr(a)}]{chr(t)}"
     return SBS96_INDEX[label]
+
+
+# ---- DBS-78 doublet classifier ----
+
+
+def _revcomp(seq: bytes) -> bytes:
+    return bytes(_comp(b) for b in reversed(seq))
+
+
+def classify_dbs78(ref: bytes, alt: bytes) -> int:
+    """Return the DBS-78 code for a 2bp doublet, or SENTINELS['UNCLASSIFIED'].
+
+    Tries the literal ``REF>ALT`` first, then its reverse-complement, since
+    DBS-78 collapses strand-equivalent doublets.
+    """
+    if len(ref) != 2 or len(alt) != 2 or ref == alt:
+        return SENTINELS["UNCLASSIFIED"]
+    if any(b not in _COMP for b in ref) or any(b not in _COMP for b in alt):
+        return SENTINELS["UNCLASSIFIED"]
+    key = f"{ref.decode()}>{alt.decode()}"
+    if key in DBS78_INDEX:
+        return DBS78_INDEX[key]
+    rc_key = f"{_revcomp(ref).decode()}>{_revcomp(alt).decode()}"
+    if rc_key in DBS78_INDEX:
+        return DBS78_INDEX[rc_key]
+    return SENTINELS["UNCLASSIFIED"]
