@@ -153,3 +153,32 @@ def labels(kind: str) -> list[str]:
             f"Unknown mutation kind {kind!r}; choose from {list(_LABELS)}."
         )
     return _LABELS[kind]
+
+
+# ---- SBS-96 single-variant classifier ----
+_COMP = {ord("A"): ord("T"), ord("T"): ord("A"), ord("C"): ord("G"), ord("G"): ord("C")}
+_PYR = {ord("C"), ord("T")}
+
+
+def _comp(b: int) -> int:
+    return _COMP.get(b, b)
+
+
+def classify_sbs96(five: bytes, ref: bytes, alt: bytes, three: bytes) -> int:
+    """Return the SBS-96 code for one SNV, or SENTINELS['UNCLASSIFIED'].
+
+    Each argument is expected to be a single-base bytes object (e.g. b"A").
+    Empty or otherwise invalid input yields SENTINELS['UNCLASSIFIED'].
+    """
+    if not (five and ref and alt and three):
+        return SENTINELS["UNCLASSIFIED"]
+    f, r, a, t = five[0], ref[0], alt[0], three[0]
+    if r not in _COMP or a not in _COMP or r == a:
+        return SENTINELS["UNCLASSIFIED"]
+    if f not in _COMP or t not in _COMP:
+        return SENTINELS["UNCLASSIFIED"]
+    if r not in _PYR:  # purine ref -> fold to reverse complement
+        r, a = _comp(r), _comp(a)
+        f, t = _comp(t), _comp(f)  # flanks swap and complement
+    label = f"{chr(f)}[{chr(r)}>{chr(a)}]{chr(t)}"
+    return SBS96_INDEX[label]

@@ -5,6 +5,8 @@ from genoray._mutcat import (
     ID83,
     SBS96,
     SENTINELS,
+    SBS96_INDEX,
+    classify_sbs96,
     code_ranges,
 )
 
@@ -43,3 +45,29 @@ def test_sentinels_outside_category_ranges():
     # sentinels must not collide with 0..256
     assert all(v < 0 for v in SENTINELS.values())
     assert SENTINELS["DBS_PARTNER"] != SENTINELS["UNCLASSIFIED"]
+
+
+def test_sbs96_pyrimidine_direct():
+    # context A[C>A]G : ref=C (pyrimidine), keep as-is
+    code = classify_sbs96(five=b"A", ref=b"C", alt=b"A", three=b"G")
+    assert code == SBS96_INDEX["A[C>A]G"]
+
+
+def test_sbs96_purine_folds_to_revcomp():
+    # ref=G>T in context T_A : revcomp -> T[C>A]A
+    # original T[G>T]A ; revcomp substitution G>T -> C>A ; flanks: comp(A)=T (new 5'),
+    # comp(T)=A (new 3') -> T[C>A]A
+    code = classify_sbs96(five=b"T", ref=b"G", alt=b"T", three=b"A")
+    assert code == SBS96_INDEX["T[C>A]A"]
+
+
+def test_sbs96_unclassified_cases():
+    unc = SENTINELS["UNCLASSIFIED"]
+    # identity mutation (ref == alt)
+    assert classify_sbs96(five=b"A", ref=b"C", alt=b"C", three=b"G") == unc
+    # non-ACGT ref
+    assert classify_sbs96(five=b"A", ref=b"N", alt=b"C", three=b"G") == unc
+    # non-ACGT flank
+    assert classify_sbs96(five=b"N", ref=b"C", alt=b"A", three=b"G") == unc
+    # empty bytes
+    assert classify_sbs96(five=b"A", ref=b"", alt=b"C", three=b"G") == unc
