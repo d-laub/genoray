@@ -144,6 +144,11 @@ genoray.SparseVar.from_pgen("out.svar", "file.pgen", max_mem="4g")
 
 `SparseVar.from_vcf` / `from_pgen` inherit and apply the source's filter — filter the VCF/PGEN to filter the SVAR.
 
+`SparseVar.from_vcf` / `from_pgen` accept `regions=`, `samples=`,
+`merge_overlapping=`, `regions_overlap=` to subset by region and/or sample
+during conversion (same semantics as `SparseVar.write_view`); a sample subset
+drops MAC=0 variants from the output.
+
 Read:
 
 ```python

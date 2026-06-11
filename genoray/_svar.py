@@ -203,18 +203,26 @@ def _validate_fields(
     return fields
 
 
-def _resolve_kept_var_idxs(
-    sv: "SparseVar",
+def _resolve_kept_rows(
+    index_df: pl.DataFrame,
+    c_norm: "ContigNormalizer",
     regions: pl.DataFrame,
     mode: Literal["pos", "record", "variant"],
     merge_overlapping: bool,
 ) -> "NDArray[V_IDX_TYPE]":
-    """Return a sorted, deduplicated array of source variant indices to keep.
+    """Return a sorted, deduplicated array of kept row positions (values from the
+    ``index`` column) in *index_df*.
+
+    *index_df* must have columns ``CHROM`` (Utf8), ``POS`` (Int32), ``ILEN``
+    (list[int]) and ``index`` (the id returned for kept rows). Coordinates in
+    *regions* are 0-based, half-open (chrom/start/end).
 
     Parameters
     ----------
-    sv
-        The SparseVar to query.
+    index_df
+        Variant index DataFrame with columns ``index``, ``CHROM``, ``POS``, ``ILEN``.
+    c_norm
+        ContigNormalizer for the dataset.
     regions
         Normalised BED-like frame with columns ``chrom`` (Utf8), ``start`` (Int32),
         ``end`` (Int32).  Coordinates are 0-based, half-open.
@@ -232,7 +240,7 @@ def _resolve_kept_var_idxs(
     Returns
     -------
     NDArray[V_IDX_TYPE]
-        Sorted, deduplicated 1-D array of variant indices.
+        Sorted, deduplicated 1-D array of ``index`` column values.
     """
     if regions.height == 0:
         return np.empty(0, dtype=V_IDX_TYPE)
@@ -254,14 +262,14 @@ def _resolve_kept_var_idxs(
             raise ValueError("regions overlap; pass merge_overlapping=True to dedupe")
         regions = _coerce_bed_schema(sp.bed.from_pyr(merged))
 
-    # --- collect candidate variant indices via var_ranges ---
+    # --- collect candidate index values via var_ranges ---
     kept_chunks: list[NDArray[V_IDX_TYPE]] = []
     sentinel = np.iinfo(V_IDX_TYPE).max
     for contig_key, sub in regions.group_by("chrom", maintain_order=False):
         c = contig_key[0] if isinstance(contig_key, tuple) else contig_key
         starts = sub["start"].to_numpy()
         ends = sub["end"].to_numpy()
-        vr = sv.var_ranges(c, starts, ends)  # shape (n_ranges, 2)
+        vr = var_ranges(c_norm, index_df, c, starts, ends)  # shape (n_ranges, 2)
         valid = vr[:, 0] != sentinel
         for s, e in vr[valid]:
             kept_chunks.append(np.arange(s, e, dtype=V_IDX_TYPE))
@@ -280,13 +288,17 @@ def _resolve_kept_var_idxs(
         c = contig_key[0] if isinstance(contig_key, tuple) else contig_key
         region_by_contig[c] = (sub["start"].to_numpy(), sub["end"].to_numpy())
 
-    idx_slice = sv.index[candidates.tolist()]
-    cand_pos0 = idx_slice["POS"].to_numpy() - 1  # 1-based POS → 0-based
-    cand_chrom = idx_slice["CHROM"].to_list()
+    # Filter index_df to candidate rows.  Both candidates (from np.unique) and the
+    # sorted filter result are ascending by index value, so the rows align without
+    # any explicit reordering.
+    by_id = index_df.filter(pl.col("index").is_in(candidates.tolist())).sort("index")
+    cand_pos0 = by_id["POS"].to_numpy() - 1  # 1-based POS → 0-based
+    cand_chrom = by_id["CHROM"].to_list()
+    cand_ids = by_id["index"].to_numpy()
 
     end_offset = 0 if mode == "pos" else 1  # "record" widens end by 1
-    keep_mask = np.zeros(len(candidates), dtype=bool)
-    for i in range(len(candidates)):
+    keep_mask = np.zeros(len(cand_ids), dtype=bool)
+    for i in range(len(cand_ids)):
         pair = region_by_contig.get(cand_chrom[i])
         if pair is None:
             continue
@@ -295,7 +307,18 @@ def _resolve_kept_var_idxs(
         if np.any((r_starts <= p) & (p < r_ends + end_offset)):
             keep_mask[i] = True
 
-    return candidates[keep_mask]
+    return cand_ids[keep_mask].astype(V_IDX_TYPE)
+
+
+def _resolve_kept_var_idxs(
+    sv: "SparseVar",
+    regions: pl.DataFrame,
+    mode: Literal["pos", "record", "variant"],
+    merge_overlapping: bool,
+) -> "NDArray[V_IDX_TYPE]":
+    """Backward-compatible wrapper used by ``write_view``; resolves against
+    ``sv.index`` (which carries CHROM/POS/ILEN/index)."""
+    return _resolve_kept_rows(sv.index, sv._c_norm, regions, mode, merge_overlapping)
 
 
 @overload
@@ -885,6 +908,11 @@ class SparseVar(Generic[_SRT]):
         overwrite: bool = False,
         with_dosages: bool = False,
         n_jobs: int = -1,
+        *,
+        regions: "str | tuple[str, int, int] | PathLike | object | None" = None,
+        samples: "str | Sequence[str] | PathLike | None" = None,
+        merge_overlapping: bool = False,
+        regions_overlap: Literal["pos", "record", "variant"] = "pos",
     ):
         """Create a Sparse Variant (.svar) from a VCF/BCF.
 
@@ -902,6 +930,23 @@ class SparseVar(Generic[_SRT]):
             Whether to write dosages.
         n_jobs
             Number of jobs to use for parallel processing.
+        regions
+            Region(s) to include. Accepts the same input types as ``write_view``:
+            a ``"chrom:start-end"`` string (1-based, end-inclusive), a
+            ``(chrom, start, end)`` tuple (0-based, end-exclusive), a BED file
+            path, or a frame-like. ``None`` (default) includes all regions.
+        samples
+            Sample name(s) to include (a name, a sequence of names, or a path to a
+            newline-delimited file). Caller order is preserved, deduped by first
+            occurrence. ``None`` (default) includes all samples. Variants whose
+            minor allele count is 0 across the chosen samples are dropped from the
+            output; if every variant drops, a ``ValueError`` is raised.
+        merge_overlapping
+            If ``False`` (default) raise on overlapping input regions; if ``True``
+            dedupe via pyranges merge.
+        regions_overlap
+            ``"pos"`` (default), ``"record"``, or ``"variant"`` — same semantics
+            as ``write_view``.
         """
         out = Path(out)
 
@@ -917,20 +962,83 @@ class SparseVar(Generic[_SRT]):
         if not vcf._index_path().exists():
             logger.info("Genoray VCF index not found, creating index.")
             vcf._write_gvi_index()
-        _write_filtered_index(vcf._index_path(), cls._index_path(out), vcf._pl_filter)
 
+        # --- resolve sample subset (None => all) ---
+        if samples is None:
+            caller_samples = list(vcf.available_samples)
+        else:
+            caller_samples = _normalize_samples(samples, vcf.available_samples)
+            if not caller_samples:
+                raise ValueError("from_vcf: `samples` selected no samples")
+
+        # --- build working index (filtered) and resolve kept rows ---
+        working_df, alt_is_utf8, ilen_added = _build_working_index(
+            vcf._index_path(), vcf._pl_filter
+        )
+        if regions is None:
+            kept_rows = working_df["index"].to_numpy().astype(V_IDX_TYPE)
+        else:
+            regions_df = _normalize_regions(regions, vcf._c_norm)
+            kept_rows = _resolve_kept_rows(
+                working_df, vcf._c_norm, regions_df, regions_overlap, merge_overlapping
+            )
+            if len(kept_rows) == 0:
+                raise ValueError("no variants selected by `regions`")
+            kept_rows = np.sort(kept_rows)
+
+        # rows kept on each contig, as positions LOCAL to that contig's filtered
+        # block (workers number variants per contig starting at 0).
         contigs = vcf.contigs
+        # maintain_order=True relies on working_df being in contig-contiguous file
+        # order — each contig must form a single contiguous block with no interleaving.
+        counts = working_df.group_by("CHROM", maintain_order=True).agg(
+            pl.len().alias("n")
+        )
+        # Verify each contig forms a single contiguous block (no interleaving):
+        # the number of CHROM runs must equal the number of distinct contigs.
+        # block_start offsets are only valid under this invariant.
+        chrom_col = working_df["CHROM"].to_numpy()
+        n_runs = (
+            1 + int((chrom_col[1:] != chrom_col[:-1]).sum()) if len(chrom_col) else 0
+        )
+        assert n_runs == working_df["CHROM"].n_unique(), (
+            "contig blocks are not contiguous — a contig appears in multiple disjoint spans"
+        )
+        block_start: dict[str, int] = {}
+        block_n: dict[str, int] = {}
+        running = 0
+        for c, n in zip(counts["CHROM"].to_list(), counts["n"].to_list()):
+            block_start[c] = running
+            block_n[c] = int(n)
+            running += n
+        keep_local_by_contig: dict[str, np.ndarray] = {}
+        for c in contigs:
+            if c not in block_start:
+                continue
+            start = block_start[c]
+            n = block_n[c]
+            in_block = kept_rows[(kept_rows >= start) & (kept_rows < start + n)]
+            keep_local_by_contig[c] = (in_block - start).astype(np.int64)
+
         with open(out / "metadata.json", "w") as f:
-            json = SparseVarMetadata(
+            json_str = SparseVarMetadata(
                 version=CURRENT_VERSION,
                 contigs=contigs,
-                samples=vcf.available_samples,
+                samples=caller_samples,
                 ploidy=vcf.ploidy,
                 fields={"dosages": np.dtype(DOSAGE_TYPE).name} if with_dosages else {},
             ).model_dump_json()
-            f.write(json)
+            f.write(json_str)
+
+        subsetting_samples = samples is not None
+        # When NOT subsetting samples, write the (region-restricted) index up front.
+        if not subsetting_samples:
+            _write_index_from_working(
+                working_df, kept_rows, cls._index_path(out), alt_is_utf8, ilen_added
+            )
 
         max_mem = parse_memory(max_mem)
+        n_out = len(caller_samples)
         effective_n_jobs = joblib.cpu_count() if n_jobs == -1 else n_jobs
         effective_n_jobs = min(effective_n_jobs, len(contigs))
         job_mem = max_mem // effective_n_jobs
@@ -938,7 +1046,7 @@ class SparseVar(Generic[_SRT]):
         with TemporaryDirectory() as chunk_dir:
             chunk_dir = Path(chunk_dir)
 
-            shape = (vcf.n_samples, vcf.ploidy)
+            shape = (n_out, vcf.ploidy)
             tasks = []
             for chunk_idx, c in enumerate(contigs):
                 task = joblib.delayed(_process_contig_vcf)(
@@ -950,6 +1058,8 @@ class SparseVar(Generic[_SRT]):
                     chunk_idx=chunk_idx,
                     cyvcf2_filter=vcf._filter,
                     pl_filter=vcf._pl_filter,
+                    caller_samples=None if samples is None else caller_samples,
+                    keep_local=keep_local_by_contig.get(c),
                 )
                 tasks.append(task)
 
@@ -965,6 +1075,23 @@ class SparseVar(Generic[_SRT]):
             logger.info("Concatenating intermediate chunks")
             _concat_data(out, chunk_dir, shape, results, with_dosages=with_dosages)
 
+            if subsetting_samples:
+                survivors, af = _subset_var_idxs_and_recompute_af(
+                    out,
+                    n_total=len(kept_rows),
+                    n_out=n_out,
+                    ploidy=vcf.ploidy,
+                    with_dosages=with_dosages,
+                )
+                _write_index_from_working(
+                    working_df,
+                    kept_rows[survivors],
+                    cls._index_path(out),
+                    alt_is_utf8,
+                    ilen_added,
+                    af=af,
+                )
+
     @classmethod
     def from_pgen(
         cls,
@@ -974,6 +1101,11 @@ class SparseVar(Generic[_SRT]):
         overwrite: bool = False,
         with_dosages: bool = False,
         n_jobs: int = -1,
+        *,
+        regions: "str | tuple[str, int, int] | PathLike | object | None" = None,
+        samples: "str | Sequence[str] | PathLike | None" = None,
+        merge_overlapping: bool = False,
+        regions_overlap: Literal["pos", "record", "variant"] = "pos",
     ):
         """Create a Sparse Variant (.svar) from a PGEN.
 
@@ -991,6 +1123,23 @@ class SparseVar(Generic[_SRT]):
             Whether to write dosages.
         n_jobs
             Number of jobs to use for parallel processing.
+        regions
+            Region(s) to include. Accepts the same input types as ``write_view``:
+            a ``"chrom:start-end"`` string (1-based, end-inclusive), a
+            ``(chrom, start, end)`` tuple (0-based, end-exclusive), a BED file
+            path, or a frame-like. ``None`` (default) includes all regions.
+        samples
+            Sample name(s) to include (a name, a sequence of names, or a path to a
+            newline-delimited file). Caller order is preserved, deduped by first
+            occurrence. ``None`` (default) includes all samples. Variants whose
+            minor allele count is 0 across the chosen samples are dropped from the
+            output; if every variant drops, a ``ValueError`` is raised.
+        merge_overlapping
+            If ``False`` (default) raise on overlapping input regions; if ``True``
+            dedupe via pyranges merge.
+        regions_overlap
+            ``"pos"`` (default), ``"record"``, or ``"variant"`` — same semantics
+            as ``write_view``.
         """
         out = Path(out)
 
@@ -1006,22 +1155,81 @@ class SparseVar(Generic[_SRT]):
         pgen._init_index()
         assert pgen.contigs is not None
         assert pgen._c_max_idxs is not None
+        assert pgen._c_norm is not None
+
+        # --- resolve sample subset ---
+        if samples is None:
+            caller_samples = list(pgen.available_samples)
+            sample_subset: np.ndarray | None = None
+        else:
+            caller_samples = _normalize_samples(samples, pgen.available_samples)
+            if not caller_samples:
+                raise ValueError("from_pgen: `samples` selected no samples")
+            sample_subset = pgen._s2i.get(np.asarray(caller_samples)).astype(np.uint32)
+        n_out = len(caller_samples)
+
+        # --- working index (filtered) for region resolution + output index ---
+        working_df, alt_is_utf8, ilen_added = _build_working_index(
+            pgen._index_path(), pgen._filter
+        )
+        assert pgen._index is not None
+        phys = pgen._index["index"].to_numpy().astype(np.uint32)
+        assert len(phys) == working_df.height, (
+            f"filtered index / pgen._index misaligned: "
+            f"pgen._index has {len(phys)} rows but working_df has {working_df.height}"
+        )
+        # Confirm ordering: pgen._index and working_df must be row-aligned.
+        # Length equality alone does NOT prove alignment; this POS comparison is the
+        # genuine guard that _load_index/_build_working_index produce the same ordering.
+        # The assert is stripped under python -O so runtime cost is negligible.
+        assert (pgen._index["POS"].to_numpy() == working_df["POS"].to_numpy()).all(), (
+            "pgen._index and working_df POS columns are not aligned — ordering mismatch"
+        )
 
         contigs = pgen.contigs
+
+        if regions is None:
+            kept_rows = working_df["index"].to_numpy().astype(V_IDX_TYPE)
+        else:
+            regions_df = _normalize_regions(regions, pgen._c_norm)
+            kept_rows = _resolve_kept_rows(
+                working_df, pgen._c_norm, regions_df, regions_overlap, merge_overlapping
+            )
+            if len(kept_rows) == 0:
+                raise ValueError("no variants selected by `regions`")
+            kept_rows = np.sort(kept_rows)
+
+        # physical keep ids per contig, in kept-row (= output var id) order.
+        # Unlike from_vcf (which passes contig-LOCAL offsets for sequential VCF
+        # streaming), here we pass PHYSICAL variant indices so _process_contig_pgen
+        # can call pgenlib's read_alleles_list for random access.
+        kept_chrom = working_df["CHROM"].to_numpy()[kept_rows]
+        kept_phys = phys[kept_rows]
+        keep_by_contig: dict[str, np.ndarray] = {}
+        for c in contigs:
+            m = kept_chrom == c
+            if m.any():
+                keep_by_contig[c] = np.ascontiguousarray(kept_phys[m], dtype=np.uint32)
+
         with open(out / "metadata.json", "w") as f:
-            json = SparseVarMetadata(
+            json_str = SparseVarMetadata(
                 version=CURRENT_VERSION,
                 contigs=contigs,
-                samples=pgen.available_samples,
+                samples=caller_samples,
                 ploidy=pgen.ploidy,
                 fields={"dosages": np.dtype(DOSAGE_TYPE).name} if with_dosages else {},
             ).model_dump_json()
-            f.write(json)
-
-        _write_filtered_index(pgen._index_path(), cls._index_path(out), pgen._filter)
+            f.write(json_str)
 
         if with_dosages and pgen._sei is None:
             raise ValueError("PGEN must be bi-allelic with filters applied")
+
+        subsetting_samples = samples is not None
+        # (mirrors from_vcf; keep in sync) metadata written + no-subset index path
+        if not subsetting_samples:
+            _write_index_from_working(
+                working_df, kept_rows, cls._index_path(out), alt_is_utf8, ilen_added
+            )
 
         max_mem = parse_memory(max_mem)
         effective_n_jobs = joblib.cpu_count() if n_jobs == -1 else n_jobs
@@ -1031,19 +1239,9 @@ class SparseVar(Generic[_SRT]):
             pgen.GenosDosages if with_dosages else pgen.Genos  # type: ignore
         )
 
-        shape = (pgen.n_samples, pgen.ploidy)
+        shape = (n_out, pgen.ploidy)
         with TemporaryDirectory() as contig_dir:
             contig_dir = Path(contig_dir)
-
-            assert pgen._index is not None
-            keep_by_contig = {
-                chrom: np.asarray(idxs, dtype=np.uint32)
-                for chrom, idxs in (
-                    pgen._index.group_by("CHROM", maintain_order=True)
-                    .agg(pl.col("index"))
-                    .iter_rows()
-                )
-            }
 
             tasks: list[Any] = []
             for c in contigs:
@@ -1061,6 +1259,7 @@ class SparseVar(Generic[_SRT]):
                     ploidy=pgen.ploidy,
                     chunk_dir=contig_dir,
                     chunk_idx=len(tasks),
+                    sample_subset=sample_subset,
                 )
                 tasks.append(task)
 
@@ -1081,6 +1280,24 @@ class SparseVar(Generic[_SRT]):
 
             logger.info("Concatenating intermediate chunks")
             _concat_data(out, contig_dir, shape, results, with_dosages=with_dosages)
+
+            # (mirrors from_vcf; keep in sync) MAC-drop + subset-sample index finalize
+            if subsetting_samples:
+                survivors, af = _subset_var_idxs_and_recompute_af(
+                    out,
+                    n_total=len(kept_rows),
+                    n_out=n_out,
+                    ploidy=pgen.ploidy,
+                    with_dosages=with_dosages,
+                )
+                _write_index_from_working(
+                    working_df,
+                    kept_rows[survivors],
+                    cls._index_path(out),
+                    alt_is_utf8,
+                    ilen_added,
+                    af=af,
+                )
 
     @classmethod
     def _index_path(cls, root: Path):
@@ -1639,6 +1856,115 @@ def _write_filtered_index(src: Path, dst: Path, pl_filter: pl.Expr | None) -> No
     lf.sink_ipc(dst, compression="zstd")
 
 
+def _subset_var_idxs_and_recompute_af(
+    out_path: Path,
+    n_total: int,
+    n_out: int,
+    ploidy: int,
+    with_dosages: bool,
+) -> tuple[NDArray[V_IDX_TYPE], NDArray[np.float32]]:
+    """After concat, drop variants whose MAC across the (already sample-subset)
+    output is 0 and remap surviving variant ids to a compacted range.
+
+    A MAC=0 variant contributes no entries to ``variant_idxs.npy`` (it is never
+    non-ref in any kept sample/ploidy slot), so dropping it requires only a
+    remap of the stored ids — no entries are removed and offsets are unchanged.
+
+    ``with_dosages`` is accepted for call-site symmetry with ``from_vcf`` /
+    ``from_pgen``; dosages are stored per-entry and need no remap since no
+    entries are dropped.
+
+    Returns ``(survivor_rows, af)`` where ``survivor_rows`` indexes into the
+    ``n_total`` candidate rows (use it to subset the index frame) and ``af`` is
+    the recomputed allele frequency for each survivor.
+    """
+    vi_path = out_path / "variant_idxs.npy"
+    # If file is missing or empty, treat every candidate as MAC=0 (no entries
+    # were ever written), so all variants will be dropped by the check below.
+    if not vi_path.exists() or vi_path.stat().st_size == 0:
+        mac: NDArray[np.int64] = np.zeros(n_total, dtype=np.int64)
+        var_idxs = None
+    else:
+        var_idxs = np.memmap(vi_path, dtype=V_IDX_TYPE, mode="r+")
+        mac = np.bincount(np.asarray(var_idxs, dtype=np.int64), minlength=n_total)
+    survivor_mask = mac > 0
+    n_surv = int(survivor_mask.sum())
+    if n_surv == 0:
+        raise ValueError(
+            "all selected variants have MAC=0 in the chosen sample subset; "
+            "nothing to write"
+        )
+    n_dropped = n_total - n_surv
+    if n_dropped:
+        warnings.warn(
+            f"dropping {n_dropped} variant(s) with MAC=0 in the output sample set",
+            stacklevel=2,
+        )
+    if var_idxs is not None:
+        remap = np.empty(n_total, dtype=V_IDX_TYPE)
+        remap[survivor_mask] = np.arange(n_surv, dtype=V_IDX_TYPE)
+        # every referenced id survives by construction, so this never hits a gap
+        var_idxs[:] = remap[np.asarray(var_idxs, dtype=np.int64)]
+        var_idxs.flush()
+        del var_idxs
+
+    survivor_rows = np.flatnonzero(survivor_mask).astype(V_IDX_TYPE)
+    af = (mac[survivor_mask] / (n_out * ploidy)).astype(np.float32)
+    return survivor_rows, af
+
+
+def _build_working_index(
+    src_index_path: Path, pl_filter: pl.Expr | None
+) -> tuple[pl.DataFrame, bool, bool]:
+    """Load the source index, apply ``pl_filter`` (if any), and return a working
+    frame with ALT as list[str], an ILEN list column, and an ``index`` column
+    holding each row's position (the SVAR variant id). Also returns
+    ``(alt_is_utf8, ilen_added)`` so the on-disk format can be reconstructed.
+    """
+    lf = pl.scan_ipc(src_index_path)
+    schema = lf.collect_schema()
+    alt_is_utf8 = schema["ALT"] == pl.Utf8
+    ilen_added = "ILEN" not in schema
+    if alt_is_utf8:
+        lf = lf.with_columns(pl.col("ALT").str.split(","))
+    if ilen_added:
+        lf = lf.with_columns(ILEN=ILEN)
+    if pl_filter is not None:
+        lf = lf.filter(pl_filter)
+    df = lf.collect().with_row_index("index")
+    return df, alt_is_utf8, ilen_added
+
+
+def _write_index_from_working(
+    working_df: "pl.DataFrame",
+    rows: "NDArray[V_IDX_TYPE]",
+    dst: Path,
+    alt_is_utf8: bool,
+    ilen_added: bool,
+    af: "NDArray[np.float32] | None" = None,
+) -> None:
+    """Write the rows of *working_df* selected by *rows* (in the given order) to
+    *dst* in the canonical SVAR on-disk index format: ALT re-joined to comma-Utf8
+    if it was originally Utf8, ILEN dropped if we added it, and the helper
+    ``index`` column dropped. If *af* is given, (re)sets an ``AF`` column.
+
+    *rows* must be a numpy array of positional row offsets into *working_df*
+    (i.e. values from the ``index`` column, which equals row position since
+    ``_build_working_index`` calls ``with_row_index`` after any filter).
+    """
+    frame = working_df[rows.tolist()]
+    if af is not None:
+        if "AF" in frame.columns:
+            frame = frame.drop("AF")
+        frame = frame.with_columns(AF=pl.Series(af))
+    if ilen_added and "ILEN" in frame.columns:
+        frame = frame.drop("ILEN")
+    if alt_is_utf8:
+        frame = frame.with_columns(pl.col("ALT").list.join(","))
+    frame = frame.drop("index")
+    frame.write_ipc(dst, compression="zstd")
+
+
 def _process_contig_vcf(
     path: str | Path,
     dosage_field: str | None,
@@ -1648,6 +1974,8 @@ def _process_contig_vcf(
     chunk_idx: int,
     cyvcf2_filter: Callable[..., bool] | None = None,
     pl_filter: pl.Expr | None = None,
+    caller_samples: list[str] | None = None,
+    keep_local: np.ndarray | None = None,
 ) -> tuple[int, int]:
     vcf = VCF(
         path,
@@ -1656,32 +1984,52 @@ def _process_contig_vcf(
         dosage_field=dosage_field,
         with_gvi_index=False,
     )
+    if caller_samples is not None:
+        vcf.set_samples(caller_samples)
+
     if dosage_field is not None:
         chunker = vcf.chunk(contig, max_mem=max_mem, mode=VCF.Genos8Dosages)
     else:
         chunker = vcf.chunk(contig, max_mem=max_mem, mode=VCF.Genos8)
 
+    keep_sorted = None if keep_local is None else np.asarray(keep_local, dtype=np.int64)
+
     total_vars = 0
     n_chunks = 0
+    contig_local_pos = 0  # running filtered-record position within this contig
 
     # Create a subdirectory for this contig to avoid collision
     contig_dir = chunk_dir / f"c{chunk_idx}"
     contig_dir.mkdir(parents=True, exist_ok=True)
 
     for i, data in enumerate(chunker):
-        out_path = contig_dir / str(i)
-        out_path.mkdir(parents=True, exist_ok=True)
-        n_chunks += 1
-
         if isinstance(data, tuple):
             genos, dosages = data
         else:
             genos = data
             dosages = None
 
+        n_in = genos.shape[-1]
+        if keep_sorted is not None:
+            # positions in [contig_local_pos, contig_local_pos + n_in) that are kept
+            lo = np.searchsorted(keep_sorted, contig_local_pos)
+            hi = np.searchsorted(keep_sorted, contig_local_pos + n_in)
+            sel = keep_sorted[lo:hi] - contig_local_pos
+            contig_local_pos += n_in
+            genos = genos[..., sel]
+            if dosages is not None:
+                dosages = dosages[..., sel]
+        else:
+            contig_local_pos += n_in
+
         n_vars = genos.shape[-1]
         if n_vars == 0:
             continue
+
+        out_path = contig_dir / str(n_chunks)
+        out_path.mkdir(parents=True, exist_ok=True)
+        n_chunks += 1
+
         var_idxs = np.arange(total_vars, total_vars + n_vars, dtype=np.int32)
         if dosages is not None:
             sp_genos, sp_dosages = dense2sparse(genos, var_idxs, dosages)
@@ -1704,11 +2052,26 @@ def _process_contig_pgen(
     ploidy: int,
     chunk_dir: Path,
     chunk_idx: int,
+    sample_subset: np.ndarray | None = None,
 ) -> tuple[int, int]:
     geno_reader = PgenReader(bytes(Path(geno_path)), n_samples)
     dose_reader = (
         PgenReader(bytes(Path(dosage_path))) if dosage_path is not None else None
     )
+
+    # --- sample subset: pgenlib requires sorted ascending indices ---
+    unsorter: np.ndarray | None = None
+    if sample_subset is not None:
+        ss = np.ascontiguousarray(sample_subset, dtype=np.uint32)
+        sorter = np.argsort(ss, kind="stable")
+        sorted_ss = ss[sorter]
+        unsorter = np.argsort(sorter, kind="stable")
+        geno_reader.change_sample_subset(sorted_ss)
+        if dose_reader is not None:
+            dose_reader.change_sample_subset(sorted_ss)
+        n_out = len(ss)
+    else:
+        n_out = n_samples
 
     keep_idxs = np.ascontiguousarray(keep_idxs, dtype=np.uint32)
     n_total = int(len(keep_idxs))
@@ -1736,20 +2099,26 @@ def _process_contig_pgen(
         out_path.mkdir(parents=True, exist_ok=True)
 
         # Read genotypes for exactly the kept variant indices.
-        # (v, s*p)
-        genos = np.empty((n_vars, n_samples * ploidy), dtype=np.int32)
+        # pgenlib returns (v, n_out*p) where n_out samples are in sorted_ss order.
+        genos = np.empty((n_vars, n_out * ploidy), dtype=np.int32)
         geno_reader.read_alleles_list(idxs, genos)
         genos = genos.astype(np.int8)
         # (v, s, p) -> (s, p, v)
-        genos = genos.reshape(n_vars, n_samples, ploidy).transpose(1, 2, 0)
+        genos = genos.reshape(n_vars, n_out, ploidy).transpose(1, 2, 0)
         genos[genos == -9] = -1
+        # Restore caller-order from sorted pgenlib order
+        if unsorter is not None:
+            genos = genos[unsorter]
 
         dosages = None
         if dose_reader is not None:
-            dosages = np.empty((n_vars, n_samples), dtype=np.float32)
+            dosages = np.empty((n_vars, n_out), dtype=np.float32)
             dose_reader.read_dosages_list(idxs, dosages)
+            # (v, s) -> (s, v)
             dosages = dosages.transpose(1, 0)
             dosages[dosages == -9] = np.nan
+            if unsorter is not None:
+                dosages = dosages[unsorter]
 
         # Convert to sparse
         var_idxs = np.arange(total_vars, total_vars + n_vars, dtype=np.int32)
