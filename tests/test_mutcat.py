@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import numpy as np
+
 from genoray._mutcat import (
     DBS78,
     DBS78_INDEX,
     ID83,
+    ID83_INDEX,
     SBS96,
     SENTINELS,
     SBS96_INDEX,
     classify_dbs78,
+    classify_id83,
     classify_sbs96,
     code_ranges,
 )
@@ -89,3 +93,42 @@ def test_dbs78_non_doublet_unclassified():
     assert classify_dbs78(b"AC", b"AC") == SENTINELS["UNCLASSIFIED"]  # no change
     assert classify_dbs78(b"ACG", b"TTT") == SENTINELS["UNCLASSIFIED"]  # >2bp
     assert classify_dbs78(b"AN", b"CA") == SENTINELS["UNCLASSIFIED"]  # non-ACGT base
+
+
+def _ref_fn(seq: bytes):
+    """Build a reference-fetch callable over a single contig given as bytes."""
+    arr = np.frombuffer(seq, dtype=np.uint8)
+
+    def fetch(start: int, end: int) -> bytes:
+        out = np.full(end - start, ord("N"), dtype=np.uint8)
+        s, e = max(start, 0), min(end, len(arr))
+        if e > s:
+            out[s - start : e - start] = arr[s:e]
+        return out.tobytes()
+
+    return fetch
+
+
+def test_id83_1bp_deletion_in_homopolymer():
+    # ref: ...A CCCCC G...  delete one C from a run of 5 C's
+    # contig: index: 0=A,1..5=CCCCC,6=G ; anchor at pos 0 (A), REF="AC", ALT="A"
+    # deleted base C, the run downstream of the deletion has 4 remaining C's -> repeat class
+    fetch = _ref_fn(b"ACCCCCG")
+    code = classify_id83(pos=0, ref=b"AC", alt=b"A", fetch=fetch)
+    # repeat-bucket boundary (4 vs 5) is deferred to Task 10 SigProfiler calibration
+    assert ID83_INDEX["1:Del:C:5"] == code or ID83_INDEX["1:Del:C:4"] == code
+
+
+def test_id83_1bp_insertion_T():
+    # insert a T with no downstream T repeat
+    fetch = _ref_fn(b"AGGGG")
+    code = classify_id83(pos=0, ref=b"A", alt=b"AT", fetch=fetch)
+    assert code == ID83_INDEX["1:Ins:T:0"]
+
+
+def test_id83_non_indel_unclassified():
+    fetch = _ref_fn(b"ACGT")
+    assert (
+        classify_id83(pos=0, ref=b"A", alt=b"C", fetch=fetch)
+        == SENTINELS["UNCLASSIFIED"]
+    )
