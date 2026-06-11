@@ -203,18 +203,26 @@ def _validate_fields(
     return fields
 
 
-def _resolve_kept_var_idxs(
-    sv: "SparseVar",
+def _resolve_kept_rows(
+    index_df: pl.DataFrame,
+    c_norm: "ContigNormalizer",
     regions: pl.DataFrame,
     mode: Literal["pos", "record", "variant"],
     merge_overlapping: bool,
 ) -> "NDArray[V_IDX_TYPE]":
-    """Return a sorted, deduplicated array of source variant indices to keep.
+    """Return a sorted, deduplicated array of kept row positions (values from the
+    ``index`` column) in *index_df*.
+
+    *index_df* must have columns ``CHROM`` (Utf8), ``POS`` (Int32), ``ILEN``
+    (list[int]) and ``index`` (the id returned for kept rows). Coordinates in
+    *regions* are 0-based, half-open (chrom/start/end).
 
     Parameters
     ----------
-    sv
-        The SparseVar to query.
+    index_df
+        Variant index DataFrame with columns ``index``, ``CHROM``, ``POS``, ``ILEN``.
+    c_norm
+        ContigNormalizer for the dataset.
     regions
         Normalised BED-like frame with columns ``chrom`` (Utf8), ``start`` (Int32),
         ``end`` (Int32).  Coordinates are 0-based, half-open.
@@ -232,7 +240,7 @@ def _resolve_kept_var_idxs(
     Returns
     -------
     NDArray[V_IDX_TYPE]
-        Sorted, deduplicated 1-D array of variant indices.
+        Sorted, deduplicated 1-D array of ``index`` column values.
     """
     if regions.height == 0:
         return np.empty(0, dtype=V_IDX_TYPE)
@@ -254,14 +262,14 @@ def _resolve_kept_var_idxs(
             raise ValueError("regions overlap; pass merge_overlapping=True to dedupe")
         regions = _coerce_bed_schema(sp.bed.from_pyr(merged))
 
-    # --- collect candidate variant indices via var_ranges ---
+    # --- collect candidate index values via var_ranges ---
     kept_chunks: list[NDArray[V_IDX_TYPE]] = []
     sentinel = np.iinfo(V_IDX_TYPE).max
     for contig_key, sub in regions.group_by("chrom", maintain_order=False):
         c = contig_key[0] if isinstance(contig_key, tuple) else contig_key
         starts = sub["start"].to_numpy()
         ends = sub["end"].to_numpy()
-        vr = sv.var_ranges(c, starts, ends)  # shape (n_ranges, 2)
+        vr = var_ranges(c_norm, index_df, c, starts, ends)  # shape (n_ranges, 2)
         valid = vr[:, 0] != sentinel
         for s, e in vr[valid]:
             kept_chunks.append(np.arange(s, e, dtype=V_IDX_TYPE))
@@ -280,13 +288,16 @@ def _resolve_kept_var_idxs(
         c = contig_key[0] if isinstance(contig_key, tuple) else contig_key
         region_by_contig[c] = (sub["start"].to_numpy(), sub["end"].to_numpy())
 
-    idx_slice = sv.index[candidates.tolist()]
-    cand_pos0 = idx_slice["POS"].to_numpy() - 1  # 1-based POS → 0-based
-    cand_chrom = idx_slice["CHROM"].to_list()
+    # Filter index_df to candidate rows, maintaining candidates order.
+    # candidates contains index column values; filter and sort to match candidates order.
+    by_id = index_df.filter(pl.col("index").is_in(candidates.tolist())).sort("index")
+    cand_pos0 = by_id["POS"].to_numpy() - 1  # 1-based POS → 0-based
+    cand_chrom = by_id["CHROM"].to_list()
+    cand_ids = by_id["index"].to_numpy()
 
     end_offset = 0 if mode == "pos" else 1  # "record" widens end by 1
-    keep_mask = np.zeros(len(candidates), dtype=bool)
-    for i in range(len(candidates)):
+    keep_mask = np.zeros(len(cand_ids), dtype=bool)
+    for i in range(len(cand_ids)):
         pair = region_by_contig.get(cand_chrom[i])
         if pair is None:
             continue
@@ -295,7 +306,18 @@ def _resolve_kept_var_idxs(
         if np.any((r_starts <= p) & (p < r_ends + end_offset)):
             keep_mask[i] = True
 
-    return candidates[keep_mask]
+    return cand_ids[keep_mask].astype(V_IDX_TYPE)
+
+
+def _resolve_kept_var_idxs(
+    sv: "SparseVar",
+    regions: pl.DataFrame,
+    mode: Literal["pos", "record", "variant"],
+    merge_overlapping: bool,
+) -> "NDArray[V_IDX_TYPE]":
+    """Backward-compatible wrapper used by ``write_view``; resolves against
+    ``sv.index`` (which carries CHROM/POS/ILEN/index)."""
+    return _resolve_kept_rows(sv.index, sv._c_norm, regions, mode, merge_overlapping)
 
 
 @overload
