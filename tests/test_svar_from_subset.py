@@ -135,3 +135,50 @@ def test_build_working_index_has_required_columns(tmp_path):
     assert df["index"].to_list() == list(range(df.height))
     # ALT present as list[str] for filtering
     assert df.schema["ALT"] == pl.List(pl.Utf8)
+
+
+def _read_all(sv: SparseVar):
+    """Return per-(sample,ploidy) sets of (CHROM, POS) for deep comparison."""
+    idx = sv.index
+    chrom = idx["CHROM"].to_list()
+    pos = idx["POS"].to_list()
+    return sv, [(c, p) for c, p in zip(chrom, pos)]
+
+
+def test_from_vcf_regions_only_matches_write_view(tmp_path):
+    vcf_path = "tests/data/biallelic.vcf.gz"
+    full = _make_svar_from_vcf(tmp_path, vcf_path)
+    sv_full = SparseVar(full)
+    contig = sv_full.contigs[0]
+    region = (contig, 0, 10_000_000)
+
+    # Convert-time subset
+    direct = tmp_path / "direct.svar"
+    SparseVar.from_vcf(
+        direct, VCF(vcf_path), max_mem="1g", overwrite=True, regions=region
+    )
+    sv_direct = SparseVar(direct)
+
+    # Post-hoc view over the same region, all samples
+    view = tmp_path / "view.svar"
+    sv_full.write_view(
+        regions=region, samples=list(sv_full.available_samples), output=view
+    )
+    sv_view = SparseVar(view)
+
+    assert sv_direct.index["POS"].to_list() == sv_view.index["POS"].to_list()
+    assert sv_direct.available_samples == list(sv_full.available_samples)
+
+
+def test_from_vcf_no_subset_unchanged(tmp_path):
+    vcf_path = "tests/data/biallelic.vcf.gz"
+    a = tmp_path / "a.svar"
+    b = tmp_path / "b.svar"
+    SparseVar.from_vcf(a, VCF(vcf_path), max_mem="1g", overwrite=True)
+    SparseVar.from_vcf(
+        b, VCF(vcf_path), max_mem="1g", overwrite=True, regions=None, samples=None
+    )
+    sa, sb = SparseVar(a), SparseVar(b)
+    assert sa.index["POS"].to_list() == sb.index["POS"].to_list()
+    assert sa.available_samples == sb.available_samples
+    assert sa.n_variants == sb.n_variants

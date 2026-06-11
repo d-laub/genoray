@@ -908,6 +908,11 @@ class SparseVar(Generic[_SRT]):
         overwrite: bool = False,
         with_dosages: bool = False,
         n_jobs: int = -1,
+        *,
+        regions: "str | tuple[str, int, int] | PathLike | object | None" = None,
+        samples: "str | Sequence[str] | PathLike | None" = None,
+        merge_overlapping: bool = False,
+        regions_overlap: Literal["pos", "record", "variant"] = "pos",
     ):
         """Create a Sparse Variant (.svar) from a VCF/BCF.
 
@@ -925,6 +930,19 @@ class SparseVar(Generic[_SRT]):
             Whether to write dosages.
         n_jobs
             Number of jobs to use for parallel processing.
+        regions
+            Region(s) to include. Accepts the same input types as ``write_view``:
+            a ``"chrom:start-end"`` string (1-based, end-inclusive), a
+            ``(chrom, start, end)`` tuple (0-based, end-exclusive), a BED file
+            path, or a frame-like. ``None`` (default) includes all regions.
+        samples
+            Sample name(s) to include. ``None`` (default) includes all samples.
+        merge_overlapping
+            If ``False`` (default) raise on overlapping input regions; if ``True``
+            dedupe via pyranges merge.
+        regions_overlap
+            ``"pos"`` (default), ``"record"``, or ``"variant"`` — same semantics
+            as ``write_view``.
         """
         out = Path(out)
 
@@ -940,20 +958,69 @@ class SparseVar(Generic[_SRT]):
         if not vcf._index_path().exists():
             logger.info("Genoray VCF index not found, creating index.")
             vcf._write_gvi_index()
-        _write_filtered_index(vcf._index_path(), cls._index_path(out), vcf._pl_filter)
 
+        # --- resolve sample subset (None => all) ---
+        if samples is None:
+            caller_samples = list(vcf.available_samples)
+        else:
+            caller_samples = _normalize_samples(samples, vcf.available_samples)
+            if not caller_samples:
+                raise ValueError("from_vcf: `samples` selected no samples")
+
+        # --- build working index (filtered) and resolve kept rows ---
+        working_df, alt_is_utf8, ilen_added = _build_working_index(
+            vcf._index_path(), vcf._pl_filter
+        )
+        if regions is None:
+            kept_rows = working_df["index"].to_numpy().astype(V_IDX_TYPE)
+        else:
+            regions_df = _normalize_regions(regions, vcf._c_norm)
+            kept_rows = _resolve_kept_rows(
+                working_df, vcf._c_norm, regions_df, regions_overlap, merge_overlapping
+            )
+            if len(kept_rows) == 0:
+                raise ValueError("no variants selected by `regions`")
+            kept_rows = np.sort(kept_rows)
+
+        # rows kept on each contig, as positions LOCAL to that contig's filtered
+        # block (workers number variants per contig starting at 0).
         contigs = vcf.contigs
+        counts = working_df.group_by("CHROM", maintain_order=True).agg(
+            pl.len().alias("n")
+        )
+        block_start: dict[str, int] = {}
+        running = 0
+        for c, n in zip(counts["CHROM"].to_list(), counts["n"].to_list()):
+            block_start[c] = running
+            running += n
+        keep_local_by_contig: dict[str, np.ndarray] = {}
+        for c in contigs:
+            if c not in block_start:
+                continue
+            start = block_start[c]
+            n = int(counts.filter(pl.col("CHROM") == c)["n"][0])
+            in_block = kept_rows[(kept_rows >= start) & (kept_rows < start + n)]
+            keep_local_by_contig[c] = (in_block - start).astype(np.int64)
+
         with open(out / "metadata.json", "w") as f:
-            json = SparseVarMetadata(
+            json_str = SparseVarMetadata(
                 version=CURRENT_VERSION,
                 contigs=contigs,
-                samples=vcf.available_samples,
+                samples=caller_samples,
                 ploidy=vcf.ploidy,
                 fields={"dosages": np.dtype(DOSAGE_TYPE).name} if with_dosages else {},
             ).model_dump_json()
-            f.write(json)
+            f.write(json_str)
+
+        subsetting_samples = samples is not None
+        # When NOT subsetting samples, write the (region-restricted) index up front.
+        if not subsetting_samples:
+            _write_index_from_working(
+                working_df, kept_rows, cls._index_path(out), alt_is_utf8, ilen_added
+            )
 
         max_mem = parse_memory(max_mem)
+        n_out = len(caller_samples)
         effective_n_jobs = joblib.cpu_count() if n_jobs == -1 else n_jobs
         effective_n_jobs = min(effective_n_jobs, len(contigs))
         job_mem = max_mem // effective_n_jobs
@@ -961,7 +1028,7 @@ class SparseVar(Generic[_SRT]):
         with TemporaryDirectory() as chunk_dir:
             chunk_dir = Path(chunk_dir)
 
-            shape = (vcf.n_samples, vcf.ploidy)
+            shape = (n_out, vcf.ploidy)
             tasks = []
             for chunk_idx, c in enumerate(contigs):
                 task = joblib.delayed(_process_contig_vcf)(
@@ -973,6 +1040,8 @@ class SparseVar(Generic[_SRT]):
                     chunk_idx=chunk_idx,
                     cyvcf2_filter=vcf._filter,
                     pl_filter=vcf._pl_filter,
+                    caller_samples=None if samples is None else caller_samples,
+                    keep_local=keep_local_by_contig.get(c),
                 )
                 tasks.append(task)
 
@@ -987,6 +1056,23 @@ class SparseVar(Generic[_SRT]):
 
             logger.info("Concatenating intermediate chunks")
             _concat_data(out, chunk_dir, shape, results, with_dosages=with_dosages)
+
+            if subsetting_samples:
+                survivors, af = _subset_var_idxs_and_recompute_af(  # type: ignore[name-defined]  # noqa: F821
+                    out,
+                    n_total=len(kept_rows),
+                    n_out=n_out,
+                    ploidy=vcf.ploidy,
+                    with_dosages=with_dosages,
+                )
+                _write_index_from_working(
+                    working_df,
+                    kept_rows[survivors],
+                    cls._index_path(out),
+                    alt_is_utf8,
+                    ilen_added,
+                    af=af,
+                )
 
     @classmethod
     def from_pgen(
@@ -1723,6 +1809,8 @@ def _process_contig_vcf(
     chunk_idx: int,
     cyvcf2_filter: Callable[..., bool] | None = None,
     pl_filter: pl.Expr | None = None,
+    caller_samples: list[str] | None = None,
+    keep_local: np.ndarray | None = None,
 ) -> tuple[int, int]:
     vcf = VCF(
         path,
@@ -1731,32 +1819,52 @@ def _process_contig_vcf(
         dosage_field=dosage_field,
         with_gvi_index=False,
     )
+    if caller_samples is not None:
+        vcf.set_samples(caller_samples)
+
     if dosage_field is not None:
         chunker = vcf.chunk(contig, max_mem=max_mem, mode=VCF.Genos8Dosages)
     else:
         chunker = vcf.chunk(contig, max_mem=max_mem, mode=VCF.Genos8)
 
+    keep_sorted = None if keep_local is None else np.asarray(keep_local, dtype=np.int64)
+
     total_vars = 0
     n_chunks = 0
+    contig_local_pos = 0  # running filtered-record position within this contig
 
     # Create a subdirectory for this contig to avoid collision
     contig_dir = chunk_dir / f"c{chunk_idx}"
     contig_dir.mkdir(parents=True, exist_ok=True)
 
     for i, data in enumerate(chunker):
-        out_path = contig_dir / str(i)
-        out_path.mkdir(parents=True, exist_ok=True)
-        n_chunks += 1
-
         if isinstance(data, tuple):
             genos, dosages = data
         else:
             genos = data
             dosages = None
 
+        n_in = genos.shape[-1]
+        if keep_sorted is not None:
+            # positions in [contig_local_pos, contig_local_pos + n_in) that are kept
+            lo = np.searchsorted(keep_sorted, contig_local_pos)
+            hi = np.searchsorted(keep_sorted, contig_local_pos + n_in)
+            sel = keep_sorted[lo:hi] - contig_local_pos
+            contig_local_pos += n_in
+            genos = genos[..., sel]
+            if dosages is not None:
+                dosages = dosages[..., sel]
+        else:
+            contig_local_pos += n_in
+
         n_vars = genos.shape[-1]
         if n_vars == 0:
             continue
+
+        out_path = contig_dir / str(n_chunks)
+        out_path.mkdir(parents=True, exist_ok=True)
+        n_chunks += 1
+
         var_idxs = np.arange(total_vars, total_vars + n_vars, dtype=np.int32)
         if dosages is not None:
             sp_genos, sp_dosages = dense2sparse(genos, var_idxs, dosages)
