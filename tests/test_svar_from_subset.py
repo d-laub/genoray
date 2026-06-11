@@ -1,9 +1,16 @@
 from pathlib import Path
 
+import numpy as np
 import polars as pl
+from seqpro.rag import lengths_to_offsets
 
 from genoray import VCF, SparseVar
-from genoray._svar import _build_working_index, _resolve_kept_rows
+from genoray._svar import (
+    V_IDX_TYPE,
+    _build_working_index,
+    _resolve_kept_rows,
+    _subset_var_idxs_and_recompute_af,
+)
 from genoray._utils import ContigNormalizer
 
 
@@ -182,3 +189,29 @@ def test_from_vcf_no_subset_unchanged(tmp_path):
     assert sa.index["POS"].to_list() == sb.index["POS"].to_list()
     assert sa.available_samples == sb.available_samples
     assert sa.n_variants == sb.n_variants
+
+
+def test_subset_var_idxs_drops_mac_zero(tmp_path):
+    # 1 sample, ploidy 2, 3 candidate variants (ids 0,1,2). Variant 1 has MAC 0.
+    out = tmp_path / "v.svar"
+    out.mkdir()
+    # slot 0 has variant 0; slot 1 has variant 2; variant 1 never appears.
+    data = np.array([0, 2], dtype=V_IDX_TYPE)
+    lengths = np.array([[1, 1]], dtype=np.int64)  # (n_samples=1, ploidy=2)
+    offsets = lengths_to_offsets(lengths)
+    np.memmap(out / "variant_idxs.npy", dtype=V_IDX_TYPE, mode="w+", shape=data.shape)[
+        :
+    ] = data
+    np.memmap(out / "offsets.npy", dtype=offsets.dtype, mode="w+", shape=offsets.shape)[
+        :
+    ] = offsets
+
+    survivors, af = _subset_var_idxs_and_recompute_af(
+        out, n_total=3, n_out=1, ploidy=2, with_dosages=False
+    )
+    assert survivors.tolist() == [0, 2]  # variant 1 dropped
+    # remapped ids: 0 -> 0, 2 -> 1
+    vi = np.memmap(out / "variant_idxs.npy", dtype=V_IDX_TYPE, mode="r")
+    assert sorted(vi.tolist()) == [0, 1]
+    # AF over n_out*ploidy = 2 alleles: each surviving variant present once
+    assert np.allclose(af, [0.5, 0.5])
