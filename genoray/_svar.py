@@ -1756,12 +1756,12 @@ def _write_filtered_index(src: Path, dst: Path, pl_filter: pl.Expr | None) -> No
 
 
 def _subset_var_idxs_and_recompute_af(
-    out_path: "Path",
+    out_path: Path,
     n_total: int,
     n_out: int,
     ploidy: int,
     with_dosages: bool,
-) -> "tuple[NDArray[V_IDX_TYPE], NDArray[np.float32]]":
+) -> tuple[NDArray[V_IDX_TYPE], NDArray[np.float32]]:
     """After concat, drop variants whose MAC across the (already sample-subset)
     output is 0 and remap surviving variant ids to a compacted range.
 
@@ -1769,20 +1769,23 @@ def _subset_var_idxs_and_recompute_af(
     non-ref in any kept sample/ploidy slot), so dropping it requires only a
     remap of the stored ids — no entries are removed and offsets are unchanged.
 
+    ``with_dosages`` is accepted for call-site symmetry with ``from_vcf`` /
+    ``from_pgen``; dosages are stored per-entry and need no remap since no
+    entries are dropped.
+
     Returns ``(survivor_rows, af)`` where ``survivor_rows`` indexes into the
     ``n_total`` candidate rows (use it to subset the index frame) and ``af`` is
     the recomputed allele frequency for each survivor.
     """
     vi_path = out_path / "variant_idxs.npy"
-    # Guard against empty file: memmap on a 0-byte file can behave oddly.
-    # If file is empty or missing, all candidates have MAC=0.
+    # If file is missing or empty, treat every candidate as MAC=0 (no entries
+    # were ever written), so all variants will be dropped by the check below.
     if not vi_path.exists() or vi_path.stat().st_size == 0:
-        raise ValueError(
-            "all selected variants have MAC=0 in the chosen sample subset; "
-            "nothing to write"
-        )
-    var_idxs = np.memmap(vi_path, dtype=V_IDX_TYPE, mode="r+")
-    mac = np.bincount(np.asarray(var_idxs, dtype=np.int64), minlength=n_total)
+        mac: NDArray[np.int64] = np.zeros(n_total, dtype=np.int64)
+        var_idxs = None
+    else:
+        var_idxs = np.memmap(vi_path, dtype=V_IDX_TYPE, mode="r+")
+        mac = np.bincount(np.asarray(var_idxs, dtype=np.int64), minlength=n_total)
     survivor_mask = mac > 0
     n_surv = int(survivor_mask.sum())
     if n_surv == 0:
@@ -1793,16 +1796,16 @@ def _subset_var_idxs_and_recompute_af(
     n_dropped = n_total - n_surv
     if n_dropped:
         warnings.warn(
-            f"from_*: dropping {n_dropped} variant(s) with MAC=0 in the output "
-            "sample set",
+            f"dropping {n_dropped} variant(s) with MAC=0 in the output sample set",
             stacklevel=2,
         )
-    remap = np.empty(n_total, dtype=V_IDX_TYPE)
-    remap[survivor_mask] = np.arange(n_surv, dtype=V_IDX_TYPE)
-    # every referenced id survives by construction, so this never hits a gap
-    var_idxs[:] = remap[np.asarray(var_idxs, dtype=np.int64)]
-    var_idxs.flush()
-    del var_idxs
+    if var_idxs is not None:
+        remap = np.empty(n_total, dtype=V_IDX_TYPE)
+        remap[survivor_mask] = np.arange(n_surv, dtype=V_IDX_TYPE)
+        # every referenced id survives by construction, so this never hits a gap
+        var_idxs[:] = remap[np.asarray(var_idxs, dtype=np.int64)]
+        var_idxs.flush()
+        del var_idxs
 
     survivor_rows = np.flatnonzero(survivor_mask).astype(V_IDX_TYPE)
     af = (mac[survivor_mask] / (n_out * ploidy)).astype(np.float32)
@@ -1810,8 +1813,8 @@ def _subset_var_idxs_and_recompute_af(
 
 
 def _build_working_index(
-    src_index_path: "Path", pl_filter: "pl.Expr | None"
-) -> "tuple[pl.DataFrame, bool, bool]":
+    src_index_path: Path, pl_filter: pl.Expr | None
+) -> tuple[pl.DataFrame, bool, bool]:
     """Load the source index, apply ``pl_filter`` (if any), and return a working
     frame with ALT as list[str], an ILEN list column, and an ``index`` column
     holding each row's position (the SVAR variant id). Also returns
