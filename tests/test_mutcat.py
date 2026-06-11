@@ -6,11 +6,13 @@ import polars as pl
 from genoray._mutcat import (
     DBS78,
     DBS78_INDEX,
+    DBS78_OFFSET,
     ID83,
     ID83_INDEX,
     SBS96,
     SENTINELS,
     SBS96_INDEX,
+    build_entry_codes,
     classify_dbs78,
     classify_id83,
     classify_sbs96,
@@ -162,3 +164,113 @@ def test_classify_variants_mixed(tmp_path):
     # second is a 1bp insertion -> within ID-83 range
     lo, hi = code_ranges()["ID83"]
     assert lo <= codes[1] < hi
+
+
+def test_build_entry_codes_marks_adjacent_dbs():
+    # 3 variants. var 0 and 1 are SNVs at adjacent positions p, p+1.
+    # var 2 is an isolated SNV.
+    var_code = np.array([10, 11, 12], dtype=np.int16)  # arbitrary SBS codes
+    var_pos = np.array([100, 101, 200], dtype=np.int64)
+    var_contig = np.array([0, 0, 0], dtype=np.int32)
+    var_is_snv = np.array([True, True, True])
+    var_ref_b = np.frombuffer(b"ACG", np.uint8).copy()  # ref base per variant
+    var_alt_b = np.frombuffer(b"GTA", np.uint8).copy()  # alt base per variant
+
+    # one sample, ploidy 1, track has all three variant indices
+    data = np.array([0, 1, 2], dtype=np.int32)
+    offsets = np.array([0, 3], dtype=np.int64)
+
+    codes = build_entry_codes(
+        data,
+        offsets,
+        var_code,
+        var_pos,
+        var_contig,
+        var_is_snv,
+        var_ref_b,
+        var_alt_b,
+    )
+    # entry for var0 -> a DBS code (>=DBS78_OFFSET), var1 -> DBS_PARTNER, var2 unchanged
+    assert codes[0] >= DBS78_OFFSET and codes[0] < DBS78_OFFSET + 78
+    assert codes[0] == classify_dbs78(b"AC", b"GT")
+    assert codes[1] == SENTINELS["DBS_PARTNER"]
+    assert codes[2] == 12
+
+
+def test_build_entry_codes_run_of_three_stays_sbs():
+    # 3 adjacent SNVs at positions 100, 101, 102.
+    # A run of >=3 adjacent SNVs must all stay as individual SBS — none should
+    # be collapsed into a DBS or marked DBS_PARTNER.
+    var_code = np.array([10, 11, 12], dtype=np.int16)
+    var_pos = np.array([100, 101, 102], dtype=np.int64)
+    var_contig = np.array([0, 0, 0], dtype=np.int32)
+    var_is_snv = np.array([True, True, True])
+    var_ref_b = np.frombuffer(b"ACG", np.uint8).copy()
+    var_alt_b = np.frombuffer(b"GTA", np.uint8).copy()
+
+    data = np.array([0, 1, 2], dtype=np.int32)
+    offsets = np.array([0, 3], dtype=np.int64)
+
+    codes = build_entry_codes(
+        data,
+        offsets,
+        var_code,
+        var_pos,
+        var_contig,
+        var_is_snv,
+        var_ref_b,
+        var_alt_b,
+    )
+    assert codes.tolist() == [10, 11, 12]
+
+
+def test_build_entry_codes_no_false_pair_when_not_adjacent():
+    var_code = np.array([10, 12], dtype=np.int16)
+    var_pos = np.array([100, 105], dtype=np.int64)
+    var_contig = np.array([0, 0], dtype=np.int32)
+    var_is_snv = np.array([True, True])
+    var_ref_b = np.frombuffer(b"AC", np.uint8).copy()
+    var_alt_b = np.frombuffer(b"GT", np.uint8).copy()
+    data = np.array([0, 1], dtype=np.int32)
+    offsets = np.array([0, 2], dtype=np.int64)
+    codes = build_entry_codes(
+        data,
+        offsets,
+        var_code,
+        var_pos,
+        var_contig,
+        var_is_snv,
+        var_ref_b,
+        var_alt_b,
+    )
+    assert codes.tolist() == [10, 12]
+
+
+def test_build_entry_codes_no_pair_across_tracks():
+    # Two SNVs at adjacent genomic positions (100, 101) on the same contig,
+    # but placed in separate tracks: track 0 contains variant 0, track 1
+    # contains variant 1.  The per-track loop must not pair entries across the
+    # track boundary, so both codes must remain their original var_code values.
+    var_code = np.array([10, 11], dtype=np.int16)
+    var_pos = np.array([100, 101], dtype=np.int64)
+    var_contig = np.array([0, 0], dtype=np.int32)
+    var_is_snv = np.array([True, True])
+    var_ref_b = np.frombuffer(b"AC", np.uint8).copy()
+    var_alt_b = np.frombuffer(b"GT", np.uint8).copy()
+
+    # data[0] -> variant 0 (track 0), data[1] -> variant 1 (track 1)
+    data = np.array([0, 1], dtype=np.int32)
+    offsets = np.array([0, 1, 2], dtype=np.int64)  # two single-entry tracks
+
+    codes = build_entry_codes(
+        data,
+        offsets,
+        var_code,
+        var_pos,
+        var_contig,
+        var_is_snv,
+        var_ref_b,
+        var_alt_b,
+    )
+    # Neither entry should be promoted to a DBS or marked DBS_PARTNER
+    assert codes.tolist() == [10, 11]

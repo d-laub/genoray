@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+import numba as nb
 import numpy as np
 import polars as pl
+from numpy.typing import NDArray
 
 from ._reference import Reference
 
@@ -289,6 +291,121 @@ def _microhomology_len(indel: bytes, downstream: bytes, ilen: int) -> int:
         if downstream[:k] == indel[:k]:
             mh = max(mh, k)
     return mh
+
+
+_BASE2IDX = np.full(256, -1, dtype=np.int64)
+_BASE2IDX[[ord("A"), ord("C"), ord("G"), ord("T")]] = [0, 1, 2, 3]
+
+
+def _build_dbs_table() -> np.ndarray:
+    """tbl[r0, r1, a0, a1] -> DBS-78 code or UNCLASSIFIED for doublets not in
+    the (folded) catalogue. Bases encoded A=0,C=1,G=2,T=3."""
+    tbl = np.full((4, 4, 4, 4), SENTINELS["UNCLASSIFIED"], dtype=np.int16)
+    bases = b"ACGT"
+    for r0 in range(4):
+        for r1 in range(4):
+            for a0 in range(4):
+                for a1 in range(4):
+                    ref = bytes([bases[r0], bases[r1]])
+                    alt = bytes([bases[a0], bases[a1]])
+                    tbl[r0, r1, a0, a1] = classify_dbs78(ref, alt)
+    return tbl
+
+
+_DBS_TABLE = _build_dbs_table()
+_DBS_PARTNER = SENTINELS["DBS_PARTNER"]
+
+
+@nb.njit(nogil=True, cache=True)
+def _entry_codes_kernel(
+    data: NDArray[np.int32],
+    offsets: NDArray[np.int64],
+    var_code: NDArray[np.int16],
+    var_pos: NDArray[np.int64],
+    var_contig: NDArray[np.int32],
+    var_is_snv: NDArray[np.bool_],
+    ref_idx: NDArray[np.int64],
+    alt_idx: NDArray[np.int64],
+    dbs_table: NDArray[np.int16],
+    out: NDArray[np.int16],
+    dbs_partner: np.int16,
+):
+    for slot in range(len(offsets) - 1):
+        o_s, o_e = offsets[slot], offsets[slot + 1]
+        j = o_s
+        while j < o_e:
+            v = data[j]
+            out[j] = var_code[v]
+            # try to pair with the next entry in this track
+            if j + 1 < o_e and var_is_snv[v]:
+                w = data[j + 1]
+                if (
+                    var_is_snv[w]
+                    and var_contig[v] == var_contig[w]
+                    and var_pos[w] - var_pos[v] == 1
+                ):
+                    # isolated pair only: neither a forward nor a backward
+                    # adjacent SNV must exist; otherwise this pair is part of
+                    # a run of >=3 adjacent SNVs and must stay individual SBS.
+                    isolated = True
+                    if j + 2 < o_e:
+                        x = data[j + 2]
+                        if (
+                            var_is_snv[x]
+                            and var_contig[w] == var_contig[x]
+                            and var_pos[x] - var_pos[w] == 1
+                        ):
+                            isolated = False
+                    if isolated and j > o_s:
+                        p = data[j - 1]
+                        if (
+                            var_is_snv[p]
+                            and var_contig[p] == var_contig[v]
+                            and var_pos[v] - var_pos[p] == 1
+                        ):
+                            isolated = False
+                    if isolated:
+                        ri0 = ref_idx[v]
+                        ri1 = ref_idx[w]
+                        ai0 = alt_idx[v]
+                        ai1 = alt_idx[w]
+                        if ri0 >= 0 and ri1 >= 0 and ai0 >= 0 and ai1 >= 0:
+                            code = dbs_table[ri0, ri1, ai0, ai1]
+                            out[j] = code
+                            out[j + 1] = dbs_partner
+                            j += 2
+                            continue
+            j += 1
+
+
+def build_entry_codes(
+    data: NDArray[np.int32],
+    offsets: NDArray[np.int64],
+    var_code: NDArray[np.int16],
+    var_pos: NDArray[np.int64],
+    var_contig: NDArray[np.int32],
+    var_is_snv: NDArray[np.bool_],
+    var_ref_b: NDArray[np.uint8],
+    var_alt_b: NDArray[np.uint8],
+) -> NDArray[np.int16]:
+    """Return int16 per-entry codes aligned to ``data`` (genos.data)."""
+    ref_idx = _BASE2IDX[var_ref_b]
+    alt_idx = _BASE2IDX[var_alt_b]
+    out = np.empty(len(data), dtype=np.int16)
+    _entry_codes_kernel(
+        data.astype(np.int32),
+        offsets.astype(np.int64),
+        var_code,
+        var_pos.astype(np.int64),
+        var_contig.astype(np.int32),
+        var_is_snv.astype(np.bool_),
+        ref_idx,
+        alt_idx,
+        _DBS_TABLE,
+        out,
+        np.int16(_DBS_PARTNER),
+    )
+    return out
 
 
 def classify_variants(index: pl.DataFrame, reference: Reference) -> np.ndarray:
