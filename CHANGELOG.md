@@ -1,8 +1,22 @@
-## Unreleased
+## 2.10.0 (2026-06-11)
 
 ### Feat
 
-- **svar**: from_vcf/from_pgen accept regions/samples/merge_overlapping/regions_overlap to subset during conversion (MAC=0 drop on sample subsets), mirroring write_view
+- **svar**: from_pgen region + sample subsetting during conversion
+- **svar**: from_vcf sample subsetting with MAC=0 drop during conversion
+- **svar**: MAC=0 drop + AF recompute finalize for conversion subsetting
+- **svar**: from_vcf region subsetting during conversion
+- **svar**: add working-index build/write helpers for conversion subsetting
+
+### Fix
+
+- **svar**: make from_vcf contig-contiguity assert actually detect interleaving
+
+### Refactor
+
+- **svar**: align MAC-drop messaging with write_view, dedupe + minimal diff
+- **svar**: simplify from_vcf keep_local + document contig-block invariant
+- **svar**: extract _resolve_kept_rows from _resolve_kept_var_idxs
 
 ## 2.9.2 (2026-06-08)
 
