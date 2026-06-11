@@ -461,3 +461,147 @@ def test_from_pgen_permuted_samples_genotype_order(tmp_path: Path):
                     f"Genotype mismatch for sample {sname!r} ploidy {p_i} "
                     f"on contig {contig!r}: direct={arr_d} vs view={arr_v}"
                 )
+
+
+# ---------------------------------------------------------------------------
+# Error-path tests (Task 7.1)
+# ---------------------------------------------------------------------------
+
+
+def test_from_vcf_regions_no_match_raises(tmp_path):
+    """A region that overlaps no variants must raise with 'no variants selected'."""
+    with pytest.raises(ValueError, match="no variants selected by `regions`"):
+        SparseVar.from_vcf(
+            tmp_path / "x.svar",
+            VCF("tests/data/biallelic.vcf.gz"),
+            max_mem="1g",
+            overwrite=True,
+            regions=("chr1", 999_000_000, 999_000_100),
+        )
+
+
+def test_from_vcf_overlapping_regions_raise(tmp_path):
+    """Overlapping regions without merge_overlapping=True must raise."""
+    regions = pl.DataFrame(
+        {
+            "chrom": ["chr1", "chr1"],
+            "start": pl.Series([0, 50], dtype=pl.Int32),
+            "end": pl.Series([100, 200], dtype=pl.Int32),
+        }
+    )
+    with pytest.raises(ValueError, match="regions overlap"):
+        SparseVar.from_vcf(
+            tmp_path / "x.svar",
+            VCF("tests/data/biallelic.vcf.gz"),
+            max_mem="1g",
+            overwrite=True,
+            regions=regions,
+            merge_overlapping=False,
+        )
+
+
+def test_from_vcf_unknown_sample_raises(tmp_path):
+    """A sample name not present in the VCF must raise with 'not found'."""
+    with pytest.raises(ValueError, match="not found"):
+        SparseVar.from_vcf(
+            tmp_path / "x.svar",
+            VCF("tests/data/biallelic.vcf.gz"),
+            max_mem="1g",
+            overwrite=True,
+            samples=["NOT_A_SAMPLE"],
+        )
+
+
+def test_from_vcf_empty_samples_raises(tmp_path):
+    """An empty samples list must raise with 'selected no samples'."""
+    with pytest.raises(ValueError, match="selected no samples"):
+        SparseVar.from_vcf(
+            tmp_path / "x.svar",
+            VCF("tests/data/biallelic.vcf.gz"),
+            max_mem="1g",
+            overwrite=True,
+            samples=[],
+        )
+
+
+# ---------------------------------------------------------------------------
+# Dosage subset test (Task 7.2)
+# ---------------------------------------------------------------------------
+
+
+def test_from_vcf_subset_with_dosages(tmp_path):
+    """Conversion-time region+sample subset with dosages must match write_view.
+
+    biallelic.vcf.gz has a DS FORMAT field (Number=A, Float).  Both direct
+    (from_vcf subsetting) and oracle (write_view on a full SVAR) are built with
+    with_dosages=True.  The test then compares:
+      1. POS lists (variant identity)
+      2. Raw dosage data arrays read via with_fields(["dosages"]) on both sides
+
+    This exercises the MAC-drop path: sample1 is ref-hom for some variants, so
+    _subset_var_idxs_and_recompute_af must drop them, and the dosage mmap must
+    remain coherent after remapping.
+    """
+    vcf_path = "tests/data/biallelic.vcf.gz"
+
+    # Build a full SVAR with dosages to derive oracle parameters
+    full = tmp_path / "full.svar"
+    SparseVar.from_vcf(
+        full,
+        VCF(vcf_path, dosage_field="DS"),
+        max_mem="1g",
+        overwrite=True,
+        with_dosages=True,
+    )
+    sv_full = SparseVar(full)
+    keep_samples = list(sv_full.available_samples)[:1]  # ["sample1"]
+    contig = sv_full.contigs[0]  # "chr1"
+
+    # Direct: convert-time subset (regions + samples + dosages)
+    direct = tmp_path / "d.svar"
+    SparseVar.from_vcf(
+        direct,
+        VCF(vcf_path, dosage_field="DS"),
+        max_mem="1g",
+        overwrite=True,
+        with_dosages=True,
+        regions=(contig, 0, 10_000_000),
+        samples=keep_samples,
+    )
+
+    # Oracle: write_view on the full SVAR
+    view = tmp_path / "v.svar"
+    sv_full.write_view(
+        regions=(contig, 0, 10_000_000), samples=keep_samples, output=view
+    )
+
+    sv_d = SparseVar(direct, fields=["dosages"])
+    sv_v = SparseVar(view, fields=["dosages"])
+
+    # 1. POS lists must match
+    assert sv_d.index["POS"].to_list() == sv_v.index["POS"].to_list(), (
+        f"POS mismatch: {sv_d.index['POS'].to_list()} vs {sv_v.index['POS'].to_list()}"
+    )
+
+    # 2. Both sides must have at least one surviving variant (MAC-drop may fire for
+    #    sample1 on some variants, but chr1 has variants where sample1 is non-ref)
+    assert sv_d.n_variants > 0, "expected at least one MAC>0 variant after subset"
+
+    # 3. Real dosage value comparison via read_ranges across the full contig
+    result_d = sv_d.read_ranges(contig, 0, 10_000_000, samples=keep_samples)
+    result_v = sv_v.read_ranges(contig, 0, 10_000_000, samples=keep_samples)
+
+    # result is an awkward record with .genos and .dosages fields
+    for p_i in range(sv_d.ploidy):
+        dosages_d = result_d[0, 0, p_i].dosages.to_numpy()
+        dosages_v = result_v[0, 0, p_i].dosages.to_numpy()
+        assert dosages_d.dtype == np.float32
+        np.testing.assert_allclose(
+            dosages_d,
+            dosages_v,
+            atol=1e-5,
+            err_msg=(
+                f"Dosage mismatch for sample {keep_samples[0]!r} ploidy {p_i}: "
+                f"direct={dosages_d} vs view={dosages_v}"
+            ),
+        )
