@@ -191,6 +191,87 @@ def test_from_vcf_no_subset_unchanged(tmp_path):
     assert sa.n_variants == sb.n_variants
 
 
+def test_from_vcf_samples_subset_matches_write_view(tmp_path):
+    # biallelic.vcf.gz has 3 contigs (chr1, chr2, chr3).  write_view requires an
+    # explicit regions arg, so we build a whole-genome BED frame covering all
+    # contigs.  Both sides must restrict to MAC>0 in the kept-sample set, so the
+    # equivalence assertion also verifies that the MAC-drop path fires.
+    #
+    # NOTE: the biallelic fixture has 2 samples (sample1, sample2) and 6 variants
+    # total; 2 of those 6 have MAC=0 in sample1, so the MAC-drop path IS genuinely
+    # exercised here (confirmed by inspection: variants at index 1 and 3 are
+    # ref-hom in sample1).
+    vcf_path = "tests/data/biallelic.vcf.gz"
+    full = _make_svar_from_vcf(tmp_path, vcf_path)
+    sv_full = SparseVar(full)
+    keep_samples = list(sv_full.available_samples)[:1]
+
+    direct = tmp_path / "direct.svar"
+    SparseVar.from_vcf(
+        direct, VCF(vcf_path), max_mem="1g", overwrite=True, samples=keep_samples
+    )
+    # Open with attrs="AF" so the on-disk AF column is loaded into .index
+    sv_direct = SparseVar(direct, attrs="AF")
+
+    # Oracle: write_view over all contigs (whole-genome BED) with same samples.
+    whole_genome = pl.DataFrame(
+        {
+            "chrom": sv_full.contigs,
+            "start": pl.Series([0] * len(sv_full.contigs), dtype=pl.Int32),
+            "end": pl.Series([1_000_000_000] * len(sv_full.contigs), dtype=pl.Int32),
+        }
+    )
+    view = tmp_path / "view.svar"
+    sv_full.write_view(regions=whole_genome, samples=keep_samples, output=view)
+    sv_view = SparseVar(view)
+
+    assert sv_direct.available_samples == keep_samples
+    assert sv_direct.index["CHROM"].to_list() == sv_view.index["CHROM"].to_list(), (
+        f"CHROM mismatch: {sv_direct.index['CHROM'].to_list()} vs {sv_view.index['CHROM'].to_list()}"
+    )
+    assert sv_direct.index["POS"].to_list() == sv_view.index["POS"].to_list(), (
+        f"POS mismatch: {sv_direct.index['POS'].to_list()} vs {sv_view.index['POS'].to_list()}"
+    )
+    # MAC>0 invariant: AF must be strictly positive for every surviving variant
+    assert (sv_direct.index["AF"] > 0).all(), (
+        f"AF must be >0 for all variants after MAC-drop; got {sv_direct.index['AF'].to_list()}"
+    )
+    # Confirm MAC-drop actually happened: direct must have fewer variants than the full SVAR
+    assert sv_direct.n_variants < sv_full.n_variants, (
+        "Expected MAC=0 variants to be dropped; none were"
+    )
+
+
+def test_from_vcf_regions_and_samples(tmp_path):
+    # Combined regions + samples subset — both sides must agree on POS list.
+    vcf_path = "tests/data/biallelic.vcf.gz"
+    full = _make_svar_from_vcf(tmp_path, vcf_path)
+    sv_full = SparseVar(full)
+    contig = sv_full.contigs[0]
+    keep_samples = list(sv_full.available_samples)[:1]
+    region = (contig, 0, 10_000_000)
+
+    direct = tmp_path / "d.svar"
+    SparseVar.from_vcf(
+        direct,
+        VCF(vcf_path),
+        max_mem="1g",
+        overwrite=True,
+        regions=region,
+        samples=keep_samples,
+    )
+    view = tmp_path / "v.svar"
+    sv_full.write_view(regions=region, samples=keep_samples, output=view)
+
+    sv_direct = SparseVar(direct, attrs="AF")
+    sv_view = SparseVar(view)
+    assert sv_direct.available_samples == keep_samples
+    assert sv_direct.index["POS"].to_list() == sv_view.index["POS"].to_list(), (
+        f"POS mismatch: {sv_direct.index['POS'].to_list()} vs {sv_view.index['POS'].to_list()}"
+    )
+    assert (sv_direct.index["AF"] > 0).all()
+
+
 def test_subset_var_idxs_drops_mac_zero(tmp_path):
     # 1 sample, ploidy 2, 3 candidate variants (ids 0,1,2). Variant 1 has MAC 0.
     out = tmp_path / "v.svar"
