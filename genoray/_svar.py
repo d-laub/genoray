@@ -994,6 +994,16 @@ class SparseVar(Generic[_SRT]):
         counts = working_df.group_by("CHROM", maintain_order=True).agg(
             pl.len().alias("n")
         )
+        # Verify each contig forms a single contiguous block (no interleaving):
+        # the number of CHROM runs must equal the number of distinct contigs.
+        # block_start offsets are only valid under this invariant.
+        chrom_col = working_df["CHROM"].to_numpy()
+        n_runs = (
+            1 + int((chrom_col[1:] != chrom_col[:-1]).sum()) if len(chrom_col) else 0
+        )
+        assert n_runs == working_df["CHROM"].n_unique(), (
+            "contig blocks are not contiguous — a contig appears in multiple disjoint spans"
+        )
         block_start: dict[str, int] = {}
         block_n: dict[str, int] = {}
         running = 0
@@ -1001,9 +1011,6 @@ class SparseVar(Generic[_SRT]):
             block_start[c] = running
             block_n[c] = int(n)
             running += n
-        assert running == working_df.height, (
-            "contig blocks are not contiguous — a contig appears in multiple disjoint spans"
-        )
         keep_local_by_contig: dict[str, np.ndarray] = {}
         for c in contigs:
             if c not in block_start:
