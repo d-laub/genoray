@@ -30,7 +30,9 @@ from rich.progress import MofNCompleteColumn, Progress
 from seqpro.rag import OFFSET_TYPE, Ragged, lengths_to_offsets
 from tqdm.auto import tqdm
 
+from ._mutcat import MUTCAT_VERSION, build_entry_codes, classify_variants
 from ._pgen import PGEN
+from ._reference import Reference
 from ._types import DOSAGE_TYPE, DTYPE, POS_MAX, POS_TYPE, V_IDX_TYPE
 from ._utils import ContigNormalizer, format_memory, parse_memory
 from ._var_ranges import var_ranges
@@ -461,6 +463,7 @@ class SparseVarMetadata(BaseModel):
     ploidy: int
     contigs: list[str]
     fields: dict[str, str] = {}  # field_name -> numpy dtype name (e.g. "float32")
+    mutcat_version: int | None = None  # set when annotate_mutations has run
 
 
 _SRT = TypeVar("_SRT")
@@ -1452,6 +1455,91 @@ class SparseVar(Generic[_SRT]):
             pbar.update(1)
 
         return annot
+
+    def annotate_mutations(
+        self,
+        reference: "Reference | str | Path",
+        *,
+        write_back: bool = True,
+    ) -> None:
+        """Classify every variant into SBS-96 / DBS-78 / ID-83 channels and store
+        a per-genotype-entry ``mutcat`` field (int16, enum-encoded).
+
+        Adjacent SNVs carried on the same haplotype are combined into DBS; the
+        5' entry receives the DBS code and the 3' entry a ``DBS_PARTNER`` sentinel.
+
+        Parameters
+        ----------
+        reference
+            Reference genome.  A :class:`~genoray._reference.Reference` instance,
+            or a path to a FASTA file (with a ``.fai`` index alongside it).
+        write_back
+            If ``True`` (default), persist ``mutcat.npy`` and update
+            ``metadata.json`` on disk.
+        """
+        if not isinstance(reference, Reference):
+            reference = Reference.from_path(reference)
+
+        # 1. intrinsic per-variant codes
+        var_code = classify_variants(self.index, reference)
+
+        # 2. per-variant arrays needed by the adjacency kernel
+        pos = self.index["POS"].to_numpy().astype(np.int64)
+        ref0 = self.index["REF"].to_list()
+        alt0 = self.index["ALT"].list.first().to_list()
+        is_snv = np.array(
+            [
+                r is not None and a is not None and len(r) == 1 and len(a) == 1
+                for r, a in zip(ref0, alt0)
+            ],
+            dtype=np.bool_,
+        )
+        # contig id per variant — equality semantics only (same contig ↔ same id)
+        contig_map = {c: i for i, c in enumerate(self.contigs)}
+        contig_codes = np.array(
+            [contig_map.get(c, -1) for c in self.index["CHROM"].to_list()],
+            dtype=np.int32,
+        )
+        ref_b = np.array([ord(r[0]) if r else 0 for r in ref0], dtype=np.uint8)
+        alt_b = np.array([ord(a[0]) if a else 0 for a in alt0], dtype=np.uint8)
+
+        # 3. broadcast to entries + DBS adjacency override
+        entry_codes = build_entry_codes(
+            self.genos.data,
+            self.genos.offsets,
+            var_code,
+            pos,
+            contig_codes,
+            is_snv,
+            ref_b,
+            alt_b,
+        )
+
+        # 4. register in-memory (mirrors how fields are opened in __init__)
+        shape = (self.n_samples, self.ploidy, None)
+        self.available_fields["mutcat"] = np.dtype("int16")
+        self.fields["mutcat"] = Ragged.from_offsets(
+            entry_codes, shape, self.genos.offsets
+        )
+
+        # 5. optionally persist
+        if write_back:
+            mm = np.memmap(
+                self.path / "mutcat.npy",
+                dtype=np.int16,
+                mode="w+",
+                shape=entry_codes.shape,
+            )
+            mm[:] = entry_codes
+            mm.flush()
+            del mm
+
+            with open(self.path / "metadata.json", "rb") as f:
+                meta = SparseVarMetadata.model_validate_json(f.read())
+            meta.fields["mutcat"] = "int16"
+            meta.mutcat_version = MUTCAT_VERSION
+            with open(self.path / "metadata.json", "w") as f:
+                f.write(meta.model_dump_json())
 
     def cache_afs(self):
         """Cache the allele frequencies on disk. Will also load all possible attributes and add the AF column in-memory."""
