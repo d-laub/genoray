@@ -1,6 +1,9 @@
+from pathlib import Path
+
 import polars as pl
 
-from genoray._svar import _resolve_kept_rows
+from genoray import VCF, SparseVar
+from genoray._svar import _build_working_index, _resolve_kept_rows
 from genoray._utils import ContigNormalizer
 
 
@@ -115,3 +118,20 @@ def test_resolve_kept_rows_variant_mode():
         "deletion POS outside region must be excluded in pos mode"
     )
     assert 21 in kept_pos.tolist(), "SNP inside region must be kept in pos mode"
+
+
+def _make_svar_from_vcf(tmp_path: Path, vcf_path: str) -> Path:
+    out = tmp_path / "full.svar"
+    SparseVar.from_vcf(out, VCF(vcf_path), max_mem="1g", overwrite=True)
+    return out
+
+
+def test_build_working_index_has_required_columns(tmp_path):
+    sv_path = _make_svar_from_vcf(tmp_path, "tests/data/biallelic.vcf.gz")
+    df, alt_is_utf8, ilen_added = _build_working_index(
+        SparseVar._index_path(sv_path), None
+    )
+    assert {"CHROM", "POS", "ILEN", "index"} <= set(df.columns)
+    assert df["index"].to_list() == list(range(df.height))
+    # ALT present as list[str] for filtering
+    assert df.schema["ALT"] == pl.List(pl.Utf8)

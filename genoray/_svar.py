@@ -1662,6 +1662,58 @@ def _write_filtered_index(src: Path, dst: Path, pl_filter: pl.Expr | None) -> No
     lf.sink_ipc(dst, compression="zstd")
 
 
+def _build_working_index(
+    src_index_path: Path, pl_filter: "pl.Expr | None"
+) -> "tuple[pl.DataFrame, bool, bool]":
+    """Load the source index, apply ``pl_filter`` (if any), and return a working
+    frame with ALT as list[str], an ILEN list column, and an ``index`` column
+    holding each row's position (the SVAR variant id). Also returns
+    ``(alt_is_utf8, ilen_added)`` so the on-disk format can be reconstructed.
+    """
+    lf = pl.scan_ipc(src_index_path)
+    schema = lf.collect_schema()
+    alt_is_utf8 = schema["ALT"] == pl.Utf8
+    ilen_added = "ILEN" not in schema
+    if alt_is_utf8:
+        lf = lf.with_columns(pl.col("ALT").str.split(","))
+    if ilen_added:
+        lf = lf.with_columns(ILEN=ILEN)
+    if pl_filter is not None:
+        lf = lf.filter(pl_filter)
+    df = lf.collect().with_row_index("index")
+    return df, alt_is_utf8, ilen_added
+
+
+def _write_index_from_working(
+    working_df: "pl.DataFrame",
+    rows: "NDArray[V_IDX_TYPE]",
+    dst: Path,
+    alt_is_utf8: bool,
+    ilen_added: bool,
+    af: "NDArray[np.float32] | None" = None,
+) -> None:
+    """Write the rows of *working_df* selected by *rows* (in the given order) to
+    *dst* in the canonical SVAR on-disk index format: ALT re-joined to comma-Utf8
+    if it was originally Utf8, ILEN dropped if we added it, and the helper
+    ``index`` column dropped. If *af* is given, (re)sets an ``AF`` column.
+
+    *rows* must be a numpy array of positional row offsets into *working_df*
+    (i.e. values from the ``index`` column, which equals row position since
+    ``_build_working_index`` calls ``with_row_index`` after any filter).
+    """
+    frame = working_df[rows.tolist()]
+    if af is not None:
+        if "AF" in frame.columns:
+            frame = frame.drop("AF")
+        frame = frame.with_columns(AF=pl.Series(af))
+    if ilen_added and "ILEN" in frame.columns:
+        frame = frame.drop("ILEN")
+    if alt_is_utf8:
+        frame = frame.with_columns(pl.col("ALT").list.join(","))
+    frame = frame.drop("index")
+    frame.write_ipc(dst, compression="zstd")
+
+
 def _process_contig_vcf(
     path: str | Path,
     dosage_field: str | None,
