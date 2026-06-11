@@ -936,7 +936,11 @@ class SparseVar(Generic[_SRT]):
             ``(chrom, start, end)`` tuple (0-based, end-exclusive), a BED file
             path, or a frame-like. ``None`` (default) includes all regions.
         samples
-            Sample name(s) to include. ``None`` (default) includes all samples.
+            Sample name(s) to include (a name, a sequence of names, or a path to a
+            newline-delimited file). Caller order is preserved, deduped by first
+            occurrence. ``None`` (default) includes all samples. Variants whose
+            minor allele count is 0 across the chosen samples are dropped from the
+            output; if every variant drops, a ``ValueError`` is raised.
         merge_overlapping
             If ``False`` (default) raise on overlapping input regions; if ``True``
             dedupe via pyranges merge.
@@ -1094,7 +1098,7 @@ class SparseVar(Generic[_SRT]):
         regions: "str | tuple[str, int, int] | PathLike | object | None" = None,
         samples: "str | Sequence[str] | PathLike | None" = None,
         merge_overlapping: bool = False,
-        regions_overlap: "Literal['pos', 'record', 'variant']" = "pos",
+        regions_overlap: Literal["pos", "record", "variant"] = "pos",
     ):
         """Create a Sparse Variant (.svar) from a PGEN.
 
@@ -1118,7 +1122,11 @@ class SparseVar(Generic[_SRT]):
             ``(chrom, start, end)`` tuple (0-based, end-exclusive), a BED file
             path, or a frame-like. ``None`` (default) includes all regions.
         samples
-            Sample name(s) to include. ``None`` (default) includes all samples.
+            Sample name(s) to include (a name, a sequence of names, or a path to a
+            newline-delimited file). Caller order is preserved, deduped by first
+            occurrence. ``None`` (default) includes all samples. Variants whose
+            minor allele count is 0 across the chosen samples are dropped from the
+            output; if every variant drops, a ``ValueError`` is raised.
         merge_overlapping
             If ``False`` (default) raise on overlapping input regions; if ``True``
             dedupe via pyranges merge.
