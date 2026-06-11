@@ -149,14 +149,6 @@ def test_build_working_index_has_required_columns(tmp_path):
     assert df.schema["ALT"] == pl.List(pl.Utf8)
 
 
-def _read_all(sv: SparseVar):
-    """Return per-(sample,ploidy) sets of (CHROM, POS) for deep comparison."""
-    idx = sv.index
-    chrom = idx["CHROM"].to_list()
-    pos = idx["POS"].to_list()
-    return sv, [(c, p) for c, p in zip(chrom, pos)]
-
-
 def test_from_vcf_regions_only_matches_write_view(tmp_path):
     vcf_path = "tests/data/biallelic.vcf.gz"
     full = _make_svar_from_vcf(tmp_path, vcf_path)
@@ -223,6 +215,7 @@ def test_from_vcf_samples_subset_matches_write_view(tmp_path):
         {
             "chrom": sv_full.contigs,
             "start": pl.Series([0] * len(sv_full.contigs), dtype=pl.Int32),
+            # 1e9 end is past any contig length: a whole-genome span per contig.
             "end": pl.Series([1_000_000_000] * len(sv_full.contigs), dtype=pl.Int32),
         }
     )
@@ -424,6 +417,7 @@ def test_from_pgen_permuted_samples_genotype_order(tmp_path: Path):
         {
             "chrom": sv_full.contigs,
             "start": pl.Series([0] * len(sv_full.contigs), dtype=pl.Int32),
+            # 1e9 end is past any contig length: a whole-genome span per contig.
             "end": pl.Series([1_000_000_000] * len(sv_full.contigs), dtype=pl.Int32),
         }
     )
