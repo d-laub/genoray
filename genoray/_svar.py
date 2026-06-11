@@ -985,20 +985,27 @@ class SparseVar(Generic[_SRT]):
         # rows kept on each contig, as positions LOCAL to that contig's filtered
         # block (workers number variants per contig starting at 0).
         contigs = vcf.contigs
+        # maintain_order=True relies on working_df being in contig-contiguous file
+        # order — each contig must form a single contiguous block with no interleaving.
         counts = working_df.group_by("CHROM", maintain_order=True).agg(
             pl.len().alias("n")
         )
         block_start: dict[str, int] = {}
+        block_n: dict[str, int] = {}
         running = 0
         for c, n in zip(counts["CHROM"].to_list(), counts["n"].to_list()):
             block_start[c] = running
+            block_n[c] = int(n)
             running += n
+        assert running == working_df.height, (
+            "contig blocks are not contiguous — a contig appears in multiple disjoint spans"
+        )
         keep_local_by_contig: dict[str, np.ndarray] = {}
         for c in contigs:
             if c not in block_start:
                 continue
             start = block_start[c]
-            n = int(counts.filter(pl.col("CHROM") == c)["n"][0])
+            n = block_n[c]
             in_block = kept_rows[(kept_rows >= start) & (kept_rows < start + n)]
             keep_local_by_contig[c] = (in_block - start).astype(np.int64)
 
