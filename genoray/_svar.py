@@ -1090,6 +1090,11 @@ class SparseVar(Generic[_SRT]):
         overwrite: bool = False,
         with_dosages: bool = False,
         n_jobs: int = -1,
+        *,
+        regions: "str | tuple[str, int, int] | PathLike | object | None" = None,
+        samples: "str | Sequence[str] | PathLike | None" = None,
+        merge_overlapping: bool = False,
+        regions_overlap: "Literal['pos', 'record', 'variant']" = "pos",
     ):
         """Create a Sparse Variant (.svar) from a PGEN.
 
@@ -1107,6 +1112,19 @@ class SparseVar(Generic[_SRT]):
             Whether to write dosages.
         n_jobs
             Number of jobs to use for parallel processing.
+        regions
+            Region(s) to include. Accepts the same input types as ``write_view``:
+            a ``"chrom:start-end"`` string (1-based, end-inclusive), a
+            ``(chrom, start, end)`` tuple (0-based, end-exclusive), a BED file
+            path, or a frame-like. ``None`` (default) includes all regions.
+        samples
+            Sample name(s) to include. ``None`` (default) includes all samples.
+        merge_overlapping
+            If ``False`` (default) raise on overlapping input regions; if ``True``
+            dedupe via pyranges merge.
+        regions_overlap
+            ``"pos"`` (default), ``"record"``, or ``"variant"`` — same semantics
+            as ``write_view``.
         """
         out = Path(out)
 
@@ -1122,22 +1140,74 @@ class SparseVar(Generic[_SRT]):
         pgen._init_index()
         assert pgen.contigs is not None
         assert pgen._c_max_idxs is not None
+        assert pgen._c_norm is not None
+
+        # --- resolve sample subset ---
+        if samples is None:
+            caller_samples = list(pgen.available_samples)
+            sample_subset: np.ndarray | None = None
+        else:
+            caller_samples = _normalize_samples(samples, pgen.available_samples)
+            if not caller_samples:
+                raise ValueError("from_pgen: `samples` selected no samples")
+            sample_subset = pgen._s2i.get(np.asarray(caller_samples)).astype(np.uint32)
+        n_out = len(caller_samples)
+
+        # --- working index (filtered) for region resolution + output index ---
+        working_df, alt_is_utf8, ilen_added = _build_working_index(
+            pgen._index_path(), pgen._filter
+        )
+        assert pgen._index is not None
+        phys = pgen._index["index"].to_numpy().astype(np.uint32)
+        assert len(phys) == working_df.height, (
+            f"filtered index / pgen._index misaligned: "
+            f"pgen._index has {len(phys)} rows but working_df has {working_df.height}"
+        )
+        # Confirm ordering: pgen._index and working_df must be row-aligned
+        assert (pgen._index["POS"].to_numpy() == working_df["POS"].to_numpy()).all(), (
+            "pgen._index and working_df POS columns are not aligned — ordering mismatch"
+        )
 
         contigs = pgen.contigs
+
+        if regions is None:
+            kept_rows = working_df["index"].to_numpy().astype(V_IDX_TYPE)
+        else:
+            regions_df = _normalize_regions(regions, pgen._c_norm)
+            kept_rows = _resolve_kept_rows(
+                working_df, pgen._c_norm, regions_df, regions_overlap, merge_overlapping
+            )
+            if len(kept_rows) == 0:
+                raise ValueError("no variants selected by `regions`")
+            kept_rows = np.sort(kept_rows)
+
+        # physical keep ids per contig, in kept-row (= output var id) order
+        kept_chrom = working_df["CHROM"].to_numpy()[kept_rows]
+        kept_phys = phys[kept_rows]
+        keep_by_contig: dict[str, np.ndarray] = {}
+        for c in contigs:
+            m = kept_chrom == c
+            if m.any():
+                keep_by_contig[c] = np.ascontiguousarray(kept_phys[m], dtype=np.uint32)
+
         with open(out / "metadata.json", "w") as f:
-            json = SparseVarMetadata(
+            json_str = SparseVarMetadata(
                 version=CURRENT_VERSION,
                 contigs=contigs,
-                samples=pgen.available_samples,
+                samples=caller_samples,
                 ploidy=pgen.ploidy,
                 fields={"dosages": np.dtype(DOSAGE_TYPE).name} if with_dosages else {},
             ).model_dump_json()
-            f.write(json)
-
-        _write_filtered_index(pgen._index_path(), cls._index_path(out), pgen._filter)
+            f.write(json_str)
 
         if with_dosages and pgen._sei is None:
             raise ValueError("PGEN must be bi-allelic with filters applied")
+
+        subsetting_samples = samples is not None
+        if not subsetting_samples:
+            _write_index_from_working(
+                working_df, kept_rows, cls._index_path(out), alt_is_utf8, ilen_added
+            )
 
         max_mem = parse_memory(max_mem)
         effective_n_jobs = joblib.cpu_count() if n_jobs == -1 else n_jobs
@@ -1147,19 +1217,9 @@ class SparseVar(Generic[_SRT]):
             pgen.GenosDosages if with_dosages else pgen.Genos  # type: ignore
         )
 
-        shape = (pgen.n_samples, pgen.ploidy)
+        shape = (n_out, pgen.ploidy)
         with TemporaryDirectory() as contig_dir:
             contig_dir = Path(contig_dir)
-
-            assert pgen._index is not None
-            keep_by_contig = {
-                chrom: np.asarray(idxs, dtype=np.uint32)
-                for chrom, idxs in (
-                    pgen._index.group_by("CHROM", maintain_order=True)
-                    .agg(pl.col("index"))
-                    .iter_rows()
-                )
-            }
 
             tasks: list[Any] = []
             for c in contigs:
@@ -1177,6 +1237,7 @@ class SparseVar(Generic[_SRT]):
                     ploidy=pgen.ploidy,
                     chunk_dir=contig_dir,
                     chunk_idx=len(tasks),
+                    sample_subset=sample_subset,
                 )
                 tasks.append(task)
 
@@ -1197,6 +1258,23 @@ class SparseVar(Generic[_SRT]):
 
             logger.info("Concatenating intermediate chunks")
             _concat_data(out, contig_dir, shape, results, with_dosages=with_dosages)
+
+            if subsetting_samples:
+                survivors, af = _subset_var_idxs_and_recompute_af(
+                    out,
+                    n_total=len(kept_rows),
+                    n_out=n_out,
+                    ploidy=pgen.ploidy,
+                    with_dosages=with_dosages,
+                )
+                _write_index_from_working(
+                    working_df,
+                    kept_rows[survivors],
+                    cls._index_path(out),
+                    alt_is_utf8,
+                    ilen_added,
+                    af=af,
+                )
 
     @classmethod
     def _index_path(cls, root: Path):
@@ -1951,11 +2029,26 @@ def _process_contig_pgen(
     ploidy: int,
     chunk_dir: Path,
     chunk_idx: int,
+    sample_subset: np.ndarray | None = None,
 ) -> tuple[int, int]:
     geno_reader = PgenReader(bytes(Path(geno_path)), n_samples)
     dose_reader = (
         PgenReader(bytes(Path(dosage_path))) if dosage_path is not None else None
     )
+
+    # --- sample subset: pgenlib requires sorted ascending indices ---
+    unsorter: np.ndarray | None = None
+    if sample_subset is not None:
+        ss = np.ascontiguousarray(sample_subset, dtype=np.uint32)
+        sorter = np.argsort(ss, kind="stable")
+        sorted_ss = ss[sorter]
+        unsorter = np.argsort(sorter, kind="stable")
+        geno_reader.change_sample_subset(sorted_ss)
+        if dose_reader is not None:
+            dose_reader.change_sample_subset(sorted_ss)
+        n_out = len(ss)
+    else:
+        n_out = n_samples
 
     keep_idxs = np.ascontiguousarray(keep_idxs, dtype=np.uint32)
     n_total = int(len(keep_idxs))
@@ -1983,20 +2076,26 @@ def _process_contig_pgen(
         out_path.mkdir(parents=True, exist_ok=True)
 
         # Read genotypes for exactly the kept variant indices.
-        # (v, s*p)
-        genos = np.empty((n_vars, n_samples * ploidy), dtype=np.int32)
+        # pgenlib returns (v, n_out*p) where n_out samples are in sorted_ss order.
+        genos = np.empty((n_vars, n_out * ploidy), dtype=np.int32)
         geno_reader.read_alleles_list(idxs, genos)
         genos = genos.astype(np.int8)
         # (v, s, p) -> (s, p, v)
-        genos = genos.reshape(n_vars, n_samples, ploidy).transpose(1, 2, 0)
+        genos = genos.reshape(n_vars, n_out, ploidy).transpose(1, 2, 0)
         genos[genos == -9] = -1
+        # Restore caller-order from sorted pgenlib order
+        if unsorter is not None:
+            genos = genos[unsorter]
 
         dosages = None
         if dose_reader is not None:
-            dosages = np.empty((n_vars, n_samples), dtype=np.float32)
+            dosages = np.empty((n_vars, n_out), dtype=np.float32)
             dose_reader.read_dosages_list(idxs, dosages)
+            # (v, s) -> (s, v)
             dosages = dosages.transpose(1, 0)
             dosages[dosages == -9] = np.nan
+            if unsorter is not None:
+                dosages = dosages[unsorter]
 
         # Convert to sparse
         var_idxs = np.arange(total_vars, total_vars + n_vars, dtype=np.int32)

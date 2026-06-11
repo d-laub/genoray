@@ -4,7 +4,12 @@ import numpy as np
 import polars as pl
 from seqpro.rag import lengths_to_offsets
 
-from genoray import VCF, SparseVar
+import shutil
+import subprocess
+
+import pytest
+
+from genoray import PGEN, VCF, SparseVar
 from genoray._svar import (
     V_IDX_TYPE,
     _build_working_index,
@@ -296,3 +301,160 @@ def test_subset_var_idxs_drops_mac_zero(tmp_path):
     assert sorted(vi.tolist()) == [0, 1]
     # AF over n_out*ploidy = 2 alleles: each surviving variant present once
     assert np.allclose(af, [0.5, 0.5])
+
+
+# ---------------------------------------------------------------------------
+# PGEN subsetting tests (guarded on plink2 availability)
+# ---------------------------------------------------------------------------
+
+VCF_FOR_PGEN = "tests/data/biallelic.vcf"
+
+
+def _vcf_to_pgen(tmp_path: Path, vcf_path: str) -> Path:
+    if shutil.which("plink2") is None:
+        pytest.skip("plink2 not available")
+    prefix = tmp_path / "conv"
+    subprocess.run(
+        [
+            "plink2",
+            "--vcf",
+            str(vcf_path),
+            "--make-pgen",
+            "--out",
+            str(prefix),
+            "--allow-extra-chr",
+            "--vcf-half-call",
+            "haploid",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return prefix.with_suffix(".pgen")
+
+
+def test_from_pgen_regions_and_samples(tmp_path: Path):
+    """from_pgen with regions+samples must produce the same POS list as write_view,
+    and AF must be >0 for all survivors (MAC-drop fired)."""
+    pgen_path = _vcf_to_pgen(tmp_path, VCF_FOR_PGEN)
+
+    full = tmp_path / "full.svar"
+    SparseVar.from_pgen(full, PGEN(pgen_path), max_mem="1g", overwrite=True)
+    sv_full = SparseVar(full)
+    contig = sv_full.contigs[0]
+    keep_samples = list(sv_full.available_samples)[:1]
+    region = (contig, 0, 10_000_000)
+
+    direct = tmp_path / "d.svar"
+    SparseVar.from_pgen(
+        direct,
+        PGEN(pgen_path),
+        max_mem="1g",
+        overwrite=True,
+        regions=region,
+        samples=keep_samples,
+    )
+    view = tmp_path / "v.svar"
+    sv_full.write_view(regions=region, samples=keep_samples, output=view)
+
+    sv_d = SparseVar(direct, attrs="AF")
+    sv_v = SparseVar(view)
+    assert sv_d.available_samples == keep_samples
+    assert sv_d.index["POS"].to_list() == sv_v.index["POS"].to_list(), (
+        f"POS mismatch: {sv_d.index['POS'].to_list()} vs {sv_v.index['POS'].to_list()}"
+    )
+    assert (sv_d.index["AF"] > 0).all(), (
+        f"AF must be >0 for all variants after MAC-drop; got {sv_d.index['AF'].to_list()}"
+    )
+
+
+def test_from_pgen_no_subset_unchanged(tmp_path: Path):
+    """from_pgen with no regions/samples must produce the same output as before."""
+    pgen_path = _vcf_to_pgen(tmp_path, VCF_FOR_PGEN)
+
+    a = tmp_path / "a.svar"
+    b = tmp_path / "b.svar"
+    SparseVar.from_pgen(a, PGEN(pgen_path), max_mem="1g", overwrite=True)
+    SparseVar.from_pgen(
+        b, PGEN(pgen_path), max_mem="1g", overwrite=True, regions=None, samples=None
+    )
+    sa, sb = SparseVar(a), SparseVar(b)
+    assert sa.index["POS"].to_list() == sb.index["POS"].to_list()
+    assert sa.available_samples == sb.available_samples
+    assert sa.n_variants == sb.n_variants
+
+
+def test_from_pgen_permuted_samples_genotype_order(tmp_path: Path):
+    """Verify that sample-order scrambling by pgenlib's sorted requirement is
+    correctly reversed.  Selects >=2 samples in REVERSED order and compares
+    per-sample genotype arrays between from_pgen and write_view (the oracle).
+
+    This test specifically guards the sort/unsort correctness fix in
+    _process_contig_pgen: if change_sample_subset is called without restoring
+    caller order, the genotypes for sample[0] and sample[1] will be swapped.
+    """
+    pgen_path = _vcf_to_pgen(tmp_path, VCF_FOR_PGEN)
+
+    full = tmp_path / "full.svar"
+    SparseVar.from_pgen(full, PGEN(pgen_path), max_mem="1g", overwrite=True)
+    sv_full = SparseVar(full)
+
+    all_samples = list(sv_full.available_samples)
+    if len(all_samples) < 2:
+        pytest.skip("need >=2 samples to test permuted order")
+
+    # Reverse the sample order to guarantee a non-identity permutation
+    permuted = list(reversed(all_samples))
+    assert permuted != all_samples, "permuted == original (unexpected for >1 sample)"
+
+    # --- direct conversion with permuted sample order ---
+    direct = tmp_path / "d.svar"
+    SparseVar.from_pgen(
+        direct,
+        PGEN(pgen_path),
+        max_mem="1g",
+        overwrite=True,
+        samples=permuted,
+    )
+
+    # --- oracle: write_view over same permuted samples (whole genome) ---
+    whole_genome = pl.DataFrame(
+        {
+            "chrom": sv_full.contigs,
+            "start": pl.Series([0] * len(sv_full.contigs), dtype=pl.Int32),
+            "end": pl.Series([1_000_000_000] * len(sv_full.contigs), dtype=pl.Int32),
+        }
+    )
+    view = tmp_path / "v.svar"
+    sv_full.write_view(regions=whole_genome, samples=permuted, output=view)
+
+    sv_d = SparseVar(direct)
+    sv_v = SparseVar(view)
+
+    # Sample list must match the caller-supplied permuted order
+    assert sv_d.available_samples == permuted, (
+        f"available_samples mismatch: {sv_d.available_samples} != {permuted}"
+    )
+    assert sv_v.available_samples == permuted
+
+    # POS lists must agree (after MAC-drop both sides apply the same filter)
+    assert sv_d.index["POS"].to_list() == sv_v.index["POS"].to_list(), (
+        f"POS mismatch after permuted subsetting: "
+        f"{sv_d.index['POS'].to_list()} vs {sv_v.index['POS'].to_list()}"
+    )
+
+    # Per-sample genotype comparison across all contigs.
+    # read_ranges returns Ragged[V_IDX_TYPE] with shape (ranges, samples, ploidy, ~variants).
+    # We compare the raw variant-index arrays: they encode which variants are non-ref
+    # for each (sample, ploidy) slot, so equality implies same genotype data.
+    for contig in sv_d.contigs:
+        r_d = sv_d.read_ranges(contig, 0, 2_000_000_000, samples=permuted)
+        r_v = sv_v.read_ranges(contig, 0, 2_000_000_000, samples=permuted)
+        # r_d / r_v shape: (1 range, n_samples, ploidy, ~variants)
+        for s_i, sname in enumerate(permuted):
+            for p_i in range(sv_d.ploidy):
+                arr_d = r_d[0, s_i, p_i].to_numpy()
+                arr_v = r_v[0, s_i, p_i].to_numpy()
+                assert np.array_equal(arr_d, arr_v), (
+                    f"Genotype mismatch for sample {sname!r} ploidy {p_i} "
+                    f"on contig {contig!r}: direct={arr_d} vs view={arr_v}"
+                )
