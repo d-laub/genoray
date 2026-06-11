@@ -5,6 +5,7 @@ import polars as pl
 import pysam
 import pytest
 
+import genoray
 from genoray import SparseVar
 from genoray._reference import Reference
 
@@ -181,3 +182,10 @@ def test_annotate_dbs_partner_present(annotated_svar):
     lo, hi = code_ranges()["DBS78"]
     assert lo <= mut[0] < hi
     assert mut[1] == SENTINELS["DBS_PARTNER"]
+
+
+def test_public_reference_export():
+    assert hasattr(genoray, "Reference")
+    from genoray import Reference as R
+
+    assert R is genoray.Reference

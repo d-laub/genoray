@@ -12,10 +12,11 @@ description: Use when writing or modifying Python code that imports `genoray` to
 
 `import genoray` exposes exactly:
 
-- `genoray.VCF` — VCF/BCF reader
 - `genoray.PGEN` — PLINK 2 PGEN reader
-- `genoray.SparseVar` — sparse `.svar` reader/writer
+- `genoray.Reference` — indexed-FASTA reference genome reader
+- `genoray.VCF` — VCF/BCF reader
 - `genoray.Reader` — type alias `VCF | PGEN | SparseVar`
+- `genoray.SparseVar` — sparse `.svar` reader/writer
 - `genoray.exprs` — polars filter expressions for `.gvi` indexes
 
 Nothing else is public. Anything starting with `_` (e.g. `genoray._vcf`) is
@@ -30,7 +31,8 @@ Prefer reading these over guessing:
 - `genoray/__init__.py` — confirms the public surface
 - `genoray/_vcf.py` — `VCF` class: constructor, `read`, `chunk`, mode constants near the top of the class
 - `genoray/_pgen.py` — `PGEN` class: constructor, `read`, `chunk`, `read_ranges`, `chunk_ranges`, mode constants near the top of the class
-- `genoray/_svar.py` — `SparseVar`: `__init__`, `from_vcf`, `from_pgen`, `read_ranges`, `with_fields`
+- `genoray/_svar.py` — `SparseVar`: `__init__`, `from_vcf`, `from_pgen`, `read_ranges`, `with_fields`, `annotate_mutations`, `mutation_matrix`
+- `genoray/_reference.py` — `Reference`: `from_path`, `fetch`
 - `genoray/exprs.py` — the *complete* set of pre-built filter expressions (currently 7: `is_snp`, `is_indel`, `is_biallelic`, `is_symbolic`, `is_breakend`, `is_imprecise`, `ILEN`)
 
 When a signature, kwarg, or shape is unclear, **read the docstring in the
@@ -265,6 +267,124 @@ For anything else, write `pl.col(...)` against the `.gvi` schema — read
 expressions with `&` / `|` works without importing polars; you only need
 `import polars as pl` to build custom predicates.
 
+## Reference — quick reference
+
+`genoray.Reference` is a pysam-backed indexed-FASTA reader used to supply
+flanking context for mutation-catalogue classification.
+
+```python
+ref = genoray.Reference.from_path("hg38.fa")          # auto-creates .fai if absent
+ref = genoray.Reference.from_path("hg38.fa", contigs=["chr1", "chr2"])
+
+seq: np.ndarray = ref.fetch("chr1", start=1_000_000, end=1_000_010)
+# returns uint8 NDArray, 0-based half-open [start, end)
+# bytes(seq) gives the ASCII sequence
+```
+
+Key properties:
+
+- `from_path(fasta, contigs=None)` — `fasta` is a `str | Path`; auto-calls `pysam.faidx` if the `.fai` index is missing. `contigs` filters which contigs the caller cares about (defaults to all in the FASTA).
+- `fetch(contig, start, end)` — 0-based half-open `[start, end)`. Positions outside the contig are N-padded. Returns `NDArray[np.uint8]`.
+- Contig-name agnostic: `"chr1"` and `"1"` both resolve correctly (`ContigNormalizer` under the hood).
+- One contig is cached in memory at a time; sequential per-contig access is efficient.
+
+## Mutation catalogues (SBS-96 / DBS-78 / ID-83)
+
+### Overview
+
+`SparseVar` supports COSMIC-style mutation catalogues. The workflow is:
+
+1. Call `svar.annotate_mutations(reference)` once to classify every variant and
+   write `mutcat.npy` to the `.svar` directory.
+2. Call `svar.mutation_matrix(kind)` to get a per-sample count matrix.
+
+### `SparseVar.annotate_mutations`
+
+```python
+svar = genoray.SparseVar("out.svar")
+ref  = genoray.Reference.from_path("hg38.fa")
+
+svar.annotate_mutations(ref)                   # write_back=True (default)
+svar.annotate_mutations(ref, write_back=False) # in-memory only; not persisted
+svar.annotate_mutations("hg38.fa")             # path accepted directly
+```
+
+Signature: `annotate_mutations(reference, *, write_back=True) -> None`
+
+- `reference` — a `genoray.Reference` instance **or** a path to a FASTA file
+  (auto-wraps via `Reference.from_path`).
+- `write_back=True` — persists `mutcat.npy` and updates `metadata.json` so
+  that subsequent `SparseVar(dir, fields=["mutcat"])` opens and `write_view`
+  calls with `fields=["mutcat"]` will see the field.
+- `write_back=False` — the `mutcat` field lives only in memory
+  (`svar.fields["mutcat"]`); reopening the file will NOT find it.
+- After the call, `svar.fields["mutcat"]` is populated regardless of
+  `write_back`.
+
+What it classifies:
+
+| Variant type | Channel |
+|---|---|
+| Isolated SNV | SBS-96 (trinucleotide context) |
+| Adjacent SNV pair on the same haplotype | DBS-78 (5' entry = DBS code, 3' entry = `DBS_PARTNER` sentinel) |
+| Runs of ≥ 3 adjacent SNVs | SBS (each stays independent; no DBS collapse) |
+| Native 2 bp MNV in the VCF | DBS-78 |
+| MNV > 2 bp, symbolic, non-ACGT | UNCLASSIFIED |
+| Insertion / deletion | ID-83 (size, repeat-context bucketing) |
+
+### `SparseVar.mutation_matrix`
+
+```python
+svar = genoray.SparseVar("out.svar", fields=["mutcat"])  # pre-load field
+df = svar.mutation_matrix("SBS96")                        # default count="allele"
+df = svar.mutation_matrix("DBS78", count="sample")
+df = svar.mutation_matrix("ID83",  count="allele")
+```
+
+Signature: `mutation_matrix(kind, *, count="allele") -> pl.DataFrame`
+
+- `kind` — one of `"SBS96"`, `"DBS78"`, `"ID83"`.
+- `count="allele"` — counts every non-ref allele copy (diploid homozygous = 2).
+- `count="sample"` — counts each category at most once per sample (presence/absence).
+- Returns a Polars `DataFrame` with a `MutationType` string column followed by
+  one `Int64` column per sample. Rows are in fixed COSMIC codebook order
+  (96 / 78 / 83 rows respectively).
+- Requires the `mutcat` field to be available: either loaded at open time with
+  `fields=["mutcat"]`, or already in memory from a prior `annotate_mutations`
+  call, or present on disk from a prior `annotate_mutations(write_back=True)`.
+  Raises `ValueError` if none of those hold.
+
+### The `mutcat` field
+
+`mutcat` is an `int16` field stored per genotype entry (same ragged layout as
+`genos`). The int16 code space is:
+
+| Range | Channel |
+|---|---|
+| `[0, 96)` | SBS-96 |
+| `[96, 174)` | DBS-78 |
+| `[174, 257)` | ID-83 |
+| `-1` | `DBS_PARTNER` — 3' half of an adjacent SNV pair; never counted |
+| `-2` | `UNCLASSIFIED` — symbolic / complex / MNV > 2 bp / non-ACGT |
+| `-3` | `MISSING` — no-call genotype entry |
+
+To read a previously annotated file:
+
+```python
+svar = genoray.SparseVar("out.svar", fields=["mutcat"])
+# svar.fields["mutcat"] is a Ragged[int16] mirroring svar.genos
+```
+
+### v1 scope limits (no strand-bias; calibrated against PCAWG/SigProfiler rules)
+
+- No strand-bias separation (no SBS-192 / transcriptional strand).
+- DBS collapse applies only to **isolated adjacent pairs** on the same
+  haplotype. Runs of ≥ 3 adjacent SNVs stay as individual SBS entries.
+- Indel channel (ID-83) bucketing follows PCAWG/SigProfiler published rules and
+  is pinned by the unit tests in `tests/test_mutcat.py`. Cross-validation
+  against SigProfilerMatrixGenerator is deferred (it is not a declared
+  dependency).
+
 ## Common mistakes
 
 | Mistake | Fix |
@@ -277,6 +397,10 @@ expressions with `&` / `|` works without importing polars; you only need
 | Expecting VCF to have `read_ranges` | VCF doesn't; loop over single-range `read` calls, or use PGEN/SparseVar |
 | Treating `svar.index["POS"]` as 0-based | It's 1-based; subtract 1 to compare with query coords |
 | Calling `read_ranges` and assuming a flat array | PGEN returns `(data, offsets)`; SparseVar returns a Ragged (or awkward record with `fields`) |
+| Calling `mutation_matrix` without a `mutcat` field | Run `annotate_mutations` first, or open with `fields=["mutcat"]` |
+| Expecting `mutation_matrix` to auto-run annotation | It does not; call `annotate_mutations` separately |
+| Re-opening SparseVar and losing the `mutcat` field | Use `write_back=True` (default) in `annotate_mutations`; then open with `SparseVar(dir, fields=["mutcat"])` |
+| Passing a FASTA path directly to `annotate_mutations` | Supported — it auto-wraps via `Reference.from_path` |
 
 ## When this skill needs updating
 
