@@ -288,8 +288,9 @@ def _resolve_kept_rows(
         c = contig_key[0] if isinstance(contig_key, tuple) else contig_key
         region_by_contig[c] = (sub["start"].to_numpy(), sub["end"].to_numpy())
 
-    # Filter index_df to candidate rows, maintaining candidates order.
-    # candidates contains index column values; filter and sort to match candidates order.
+    # Filter index_df to candidate rows.  Both candidates (from np.unique) and the
+    # sorted filter result are ascending by index value, so the rows align without
+    # any explicit reordering.
     by_id = index_df.filter(pl.col("index").is_in(candidates.tolist())).sort("index")
     cand_pos0 = by_id["POS"].to_numpy() - 1  # 1-based POS → 0-based
     cand_chrom = by_id["CHROM"].to_list()
