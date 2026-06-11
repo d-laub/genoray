@@ -1671,7 +1671,13 @@ class SparseVar(Generic[_SRT]):
         output
             Destination directory for the new SparseVar.
         fields
-            Fields to carry over (``None`` = all available; ``[]`` = none).
+            Fields to carry over (``None`` = all available except ``"mutcat"``; ``[]`` = none).
+            The derived ``mutcat`` field is intentionally excluded from the default
+            carry-over because its mutation codes — especially DBS adjacency — are
+            only valid for the full variant set; subsetting may drop a DBS partner
+            and leave a stale 5' code. Re-run :meth:`annotate_mutations` on the
+            output view to regenerate it.  To opt in anyway (advanced use), pass
+            ``fields=["mutcat", ...]`` explicitly.
         merge_overlapping
             If ``True`` silently merge overlapping regions; if ``False``
             raise ``ValueError`` when overlaps are detected.
@@ -1698,6 +1704,13 @@ class SparseVar(Generic[_SRT]):
         regions_df = _normalize_regions(regions, self._c_norm)
         caller_samples = _normalize_samples(samples, self.available_samples)
         fields_to_write = _validate_fields(fields, self.available_fields)
+        # When the caller passed fields=None ("carry all"), exclude the derived
+        # "mutcat" field: its codes encode cross-variant DBS adjacency that is
+        # only valid for the full variant set.  Subsetting can drop a DBS 3'
+        # partner, leaving an orphaned 5' code that mutation_matrix would
+        # miscount.  Re-run annotate_mutations on the output view to regenerate.
+        if fields is None:
+            fields_to_write = [f for f in fields_to_write if f != "mutcat"]
 
         if not caller_samples:
             raise ValueError("write_view requires at least one sample")

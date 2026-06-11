@@ -39,7 +39,7 @@ def _build_tiny_svar(path):
             "POS": np.array([1, 2, 8], dtype=np.int32),
             "REF": ["C", "G", "A"],
             "ALT": [["A"], ["T"], ["C"]],
-            "ILEN": np.array([0, 0, 0], dtype=np.int32),
+            "ILEN": pl.Series([[0], [0], [0]], dtype=pl.List(pl.Int32)),
         }
     )
     index.write_ipc(path / "index.arrow")
@@ -135,7 +135,7 @@ def _build_ploidy2_svar(path):
             "POS": np.array([7], dtype=np.int32),
             "REF": ["T"],
             "ALT": [["C"]],
-            "ILEN": np.array([0], dtype=np.int32),
+            "ILEN": pl.Series([[0]], dtype=pl.List(pl.Int32)),
         }
     )
     index.write_ipc(path / "index.arrow")
@@ -189,3 +189,30 @@ def test_public_reference_export():
     from genoray import Reference as R
 
     assert R is genoray.Reference
+
+
+def test_write_view_drops_mutcat_by_default(annotated_svar, tmp_path):
+    """write_view with fields=None must NOT carry the derived mutcat field.
+
+    mutcat codes encode cross-variant DBS adjacency that is only valid for the
+    full variant set.  Subsetting may drop a DBS partner, leaving a stale 5'
+    code that mutation_matrix would miscount.
+    """
+    svar = SparseVar(annotated_svar, fields=["mutcat"])
+    assert "mutcat" in svar.available_fields, (
+        "fixture must have mutcat to test the drop"
+    )
+
+    out = tmp_path / "view.svar"
+    # Keep all samples and a broad region (all 3 variants are on chr1 at POS 1,2,8).
+    svar.write_view(
+        regions=("chr1", 0, 100),
+        samples=svar.available_samples,
+        output=out,
+        # fields=None is the default — mutcat should be excluded
+    )
+    sv2 = SparseVar(out)
+    assert "mutcat" not in sv2.available_fields, (
+        "write_view with default fields=None should NOT carry mutcat; "
+        "re-run annotate_mutations on the view instead"
+    )

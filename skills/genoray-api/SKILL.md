@@ -314,8 +314,9 @@ Signature: `annotate_mutations(reference, *, write_back=True) -> None`
 - `reference` — a `genoray.Reference` instance **or** a path to a FASTA file
   (auto-wraps via `Reference.from_path`).
 - `write_back=True` — persists `mutcat.npy` and updates `metadata.json` so
-  that subsequent `SparseVar(dir, fields=["mutcat"])` opens and `write_view`
-  calls with `fields=["mutcat"]` will see the field.
+  that subsequent `SparseVar(dir, fields=["mutcat"])` opens will see the field.
+  **Note:** `write_view` with the default `fields=None` does NOT carry `mutcat`
+  to the output (see below); call `annotate_mutations` on the view to regenerate.
 - `write_back=False` — the `mutcat` field lives only in memory
   (`svar.fields["mutcat"]`); reopening the file will NOT find it.
 - After the call, `svar.fields["mutcat"]` is populated regardless of
@@ -366,7 +367,7 @@ Signature: `mutation_matrix(kind, *, count="allele") -> pl.DataFrame`
 | `[174, 257)` | ID-83 |
 | `-1` | `DBS_PARTNER` — 3' half of an adjacent SNV pair; never counted |
 | `-2` | `UNCLASSIFIED` — symbolic / complex / MNV > 2 bp / non-ACGT |
-| `-3` | `MISSING` — no-call genotype entry |
+| `-3` | `MISSING` — reserved sentinel (defined in the code space but not emitted by `annotate_mutations` v1; SparseVar stores only ALT-carrying entries, so no-call slots do not appear in the ragged field) |
 
 To read a previously annotated file:
 
@@ -400,6 +401,7 @@ svar = genoray.SparseVar("out.svar", fields=["mutcat"])
 | Calling `mutation_matrix` without a `mutcat` field | Run `annotate_mutations` first, or open with `fields=["mutcat"]` |
 | Expecting `mutation_matrix` to auto-run annotation | It does not; call `annotate_mutations` separately |
 | Re-opening SparseVar and losing the `mutcat` field | Use `write_back=True` (default) in `annotate_mutations`; then open with `SparseVar(dir, fields=["mutcat"])` |
+| Calling `write_view` and expecting `mutcat` to be in the output | `write_view` excludes `mutcat` by default (`fields=None`) because subsetting can invalidate DBS adjacency codes; call `annotate_mutations` on the output view to regenerate it |
 | Passing a FASTA path directly to `annotate_mutations` | Supported — it auto-wraps via `Reference.from_path` |
 
 ## When this skill needs updating
