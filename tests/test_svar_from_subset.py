@@ -325,6 +325,9 @@ def _vcf_to_pgen(tmp_path: Path, vcf_path: str) -> Path:
             "--allow-extra-chr",
             "--vcf-half-call",
             "haploid",
+            # biallelic.vcf contains a ./1 half-call that plink2 rejects under its
+            # default "error" mode; "haploid" treats the non-missing allele as
+            # homozygous, making this flag load-bearing for the fixture conversion.
         ],
         check=True,
         capture_output=True,

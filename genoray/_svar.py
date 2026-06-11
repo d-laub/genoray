@@ -1163,7 +1163,10 @@ class SparseVar(Generic[_SRT]):
             f"filtered index / pgen._index misaligned: "
             f"pgen._index has {len(phys)} rows but working_df has {working_df.height}"
         )
-        # Confirm ordering: pgen._index and working_df must be row-aligned
+        # Confirm ordering: pgen._index and working_df must be row-aligned.
+        # Length equality alone does NOT prove alignment; this POS comparison is the
+        # genuine guard that _load_index/_build_working_index produce the same ordering.
+        # The assert is stripped under python -O so runtime cost is negligible.
         assert (pgen._index["POS"].to_numpy() == working_df["POS"].to_numpy()).all(), (
             "pgen._index and working_df POS columns are not aligned — ordering mismatch"
         )
@@ -1181,7 +1184,10 @@ class SparseVar(Generic[_SRT]):
                 raise ValueError("no variants selected by `regions`")
             kept_rows = np.sort(kept_rows)
 
-        # physical keep ids per contig, in kept-row (= output var id) order
+        # physical keep ids per contig, in kept-row (= output var id) order.
+        # Unlike from_vcf (which passes contig-LOCAL offsets for sequential VCF
+        # streaming), here we pass PHYSICAL variant indices so _process_contig_pgen
+        # can call pgenlib's read_alleles_list for random access.
         kept_chrom = working_df["CHROM"].to_numpy()[kept_rows]
         kept_phys = phys[kept_rows]
         keep_by_contig: dict[str, np.ndarray] = {}
@@ -1204,6 +1210,7 @@ class SparseVar(Generic[_SRT]):
             raise ValueError("PGEN must be bi-allelic with filters applied")
 
         subsetting_samples = samples is not None
+        # (mirrors from_vcf; keep in sync) metadata written + no-subset index path
         if not subsetting_samples:
             _write_index_from_working(
                 working_df, kept_rows, cls._index_path(out), alt_is_utf8, ilen_added
@@ -1259,6 +1266,7 @@ class SparseVar(Generic[_SRT]):
             logger.info("Concatenating intermediate chunks")
             _concat_data(out, contig_dir, shape, results, with_dosages=with_dosages)
 
+            # (mirrors from_vcf; keep in sync) MAC-drop + subset-sample index finalize
             if subsetting_samples:
                 survivors, af = _subset_var_idxs_and_recompute_af(
                     out,
