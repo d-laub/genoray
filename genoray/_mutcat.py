@@ -4,6 +4,11 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+import numpy as np
+import polars as pl
+
+from ._reference import Reference
+
 # ---- SBS-96 (COSMIC order: substitution outer, 5' base, 3' base inner) ----
 _SBS_SUBS = ["C>A", "C>G", "C>T", "T>A", "T>C", "T>G"]
 _BASES = ["A", "C", "G", "T"]
@@ -284,3 +289,42 @@ def _microhomology_len(indel: bytes, downstream: bytes, ilen: int) -> int:
         if downstream[:k] == indel[:k]:
             mh = max(mh, k)
     return mh
+
+
+def classify_variants(index: pl.DataFrame, reference: Reference) -> np.ndarray:
+    """Return an int16 array of intrinsic mutation codes, one per row of ``index``.
+
+    ``index`` must have columns CHROM, POS (0-based int), REF (str), ALT
+    (List[str]; first ALT used). Reference context is fetched per contig.
+    """
+    chrom = index["CHROM"].to_numpy()
+    pos = index["POS"].to_numpy().astype(np.int64)
+    ref = index["REF"].to_list()
+    alt0 = index["ALT"].list.first().to_list()
+
+    out = np.full(index.height, SENTINELS["UNCLASSIFIED"], dtype=np.int16)
+
+    for i in range(index.height):
+        r = ref[i]
+        a = alt0[i]
+        if a is None or r is None:
+            continue
+        rb, ab = r.encode(), a.encode()
+        c = str(chrom[i])
+        p = int(pos[i])
+
+        if len(rb) == 1 and len(ab) == 1:  # SNV
+            five = reference.fetch(c, p - 1, p).tobytes()
+            three = reference.fetch(c, p + 1, p + 2).tobytes()
+            out[i] = classify_sbs96(five, rb, ab, three)
+        elif len(rb) == 2 and len(ab) == 2:  # native MNV doublet
+            out[i] = classify_dbs78(rb, ab)
+        elif len(rb) != len(ab):  # indel
+            _c = c  # capture per-iteration contig for closure
+
+            def _fetch(s: int, e: int, _c: str = _c) -> bytes:
+                return reference.fetch(_c, s, e).tobytes()
+
+            out[i] = classify_id83(p, rb, ab, _fetch)
+        # else: MNV>2bp or symbolic -> stays UNCLASSIFIED
+    return out

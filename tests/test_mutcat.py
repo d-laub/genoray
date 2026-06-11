@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import polars as pl
 
 from genoray._mutcat import (
     DBS78,
@@ -13,8 +14,10 @@ from genoray._mutcat import (
     classify_dbs78,
     classify_id83,
     classify_sbs96,
+    classify_variants,
     code_ranges,
 )
+from genoray._reference import Reference
 
 
 def test_codebook_sizes():
@@ -132,3 +135,30 @@ def test_id83_non_indel_unclassified():
         classify_id83(pos=0, ref=b"A", alt=b"C", fetch=fetch)
         == SENTINELS["UNCLASSIFIED"]
     )
+
+
+def test_classify_variants_mixed(tmp_path):
+    import pysam
+
+    fa = tmp_path / "ref.fa"
+    # chr1: A C G T A C G T  (0..7)
+    fa.write_text(">chr1\nACGTACGT\n")
+    pysam.faidx(str(fa))
+    ref = Reference.from_path(fa)
+
+    index = pl.DataFrame(
+        {
+            "CHROM": ["chr1", "chr1"],
+            "POS": [1, 2],  # 0-based
+            "REF": ["C", "G"],
+            "ALT": [["A"], ["GT"]],  # SNV ; insertion
+        }
+    )
+    codes = classify_variants(index, ref)
+    assert codes.dtype == np.int16
+    assert len(codes) == 2
+    # first is an SNV -> within SBS96 range
+    assert 0 <= codes[0] < 96
+    # second is a 1bp insertion -> within ID-83 range
+    lo, hi = code_ranges()["ID83"]
+    assert lo <= codes[1] < hi
