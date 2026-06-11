@@ -13,6 +13,7 @@ dependencies = [
     "hirola>=0.3.0",
     "pgenlib>=0.91.0",
     "cyvcf2>=0.31.1",
+    "pysam>=0.22",
     "polars>=1.37.1",
     "polars-bio>=0.20.1,<0.21",
     "pyranges>=0.1.3",

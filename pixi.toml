@@ -26,6 +26,7 @@ ipykernel = "*"
 ipywidgets = "*"
 icecream = "*"
 typing-extensions = "<4.15"
+pysam = ">=0.24.0,<0.25"
 
 [target.linux-64.dependencies]
 # needs to be installed manually for osx-arm64
