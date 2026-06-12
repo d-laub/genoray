@@ -13,6 +13,7 @@ dependencies = [
     "hirola>=0.3.0",
     "pgenlib>=0.91.0",
     "cyvcf2>=0.31.1",
+    "pysam>=0.22",
     "polars>=1.37.1",
     "polars-bio>=0.20.1,<0.21",
     "pyranges>=0.1.3",
@@ -32,6 +33,8 @@ dependencies = [
     "joblib>=1.4.2,<2",
     "joblib-progress>=1.0.6,<2",
     "filelock>3,<4",
+    "scipy>=1.10",
+    "pooch>=1.7",
 ]
 
 [project.scripts]
@@ -51,7 +54,10 @@ requires = ["hatchling"]
 
 [tool.pytest.ini_options]
 filterwarnings = ["ignore::DeprecationWarning:sorted_nearest.*"]
-markers = ["network: requires network access (deselect with '-m not network')"]
+markers = [
+    "network: requires network access (deselect with '-m not network')",
+    "sigprofiler: requires SigProfilerMatrixGenerator (run in the 'sigprofiler' pixi env)",
+]
 
 [tool.basedpyright]
 enableTypeIgnoreComments = true

@@ -13,14 +13,26 @@ from typing import TYPE_CHECKING
 
 __version__ = version("genoray")
 
-__all__ = ["PGEN", "VCF", "Reader", "SparseVar", "exprs"]
+__all__ = [
+    "PGEN",
+    "Reference",
+    "VCF",
+    "Reader",
+    "SparseVar",
+    "exprs",
+    "fit_signatures",
+    "cosmic_signatures",
+]
 
 # Public name -> (module path, attribute name | None for the module itself).
 _LAZY: dict[str, tuple[str, str | None]] = {
     "PGEN": ("genoray._pgen", "PGEN"),
+    "Reference": ("genoray._reference", "Reference"),
     "VCF": ("genoray._vcf", "VCF"),
     "SparseVar": ("genoray._svar", "SparseVar"),
     "exprs": ("genoray.exprs", None),
+    "fit_signatures": ("genoray._signatures", "fit_signatures"),
+    "cosmic_signatures": ("genoray._signatures", "cosmic_signatures"),
 }
 
 
@@ -45,6 +57,9 @@ def __getattr__(name: str):
 if TYPE_CHECKING:  # pragma: no cover
     from . import exprs as exprs
     from ._pgen import PGEN as PGEN
+    from ._reference import Reference as Reference
+    from ._signatures import cosmic_signatures as cosmic_signatures
+    from ._signatures import fit_signatures as fit_signatures
     from ._svar import SparseVar as SparseVar
     from ._vcf import VCF as VCF
 

@@ -30,7 +30,10 @@ from rich.progress import MofNCompleteColumn, Progress
 from seqpro.rag import OFFSET_TYPE, Ragged, lengths_to_offsets
 from tqdm.auto import tqdm
 
+from ._mutcat import MUTCAT_VERSION, build_entry_codes, classify_variants, count_matrix
 from ._pgen import PGEN
+from ._reference import Reference
+from ._signatures import _load_signature_file, cosmic_signatures, fit_signatures
 from ._types import DOSAGE_TYPE, DTYPE, POS_MAX, POS_TYPE, V_IDX_TYPE
 from ._utils import ContigNormalizer, format_memory, parse_memory
 from ._var_ranges import var_ranges
@@ -461,6 +464,7 @@ class SparseVarMetadata(BaseModel):
     ploidy: int
     contigs: list[str]
     fields: dict[str, str] = {}  # field_name -> numpy dtype name (e.g. "float32")
+    mutcat_version: int | None = None  # set when annotate_mutations has run
 
 
 _SRT = TypeVar("_SRT")
@@ -1453,6 +1457,200 @@ class SparseVar(Generic[_SRT]):
 
         return annot
 
+    def annotate_mutations(
+        self,
+        reference: "Reference | str | Path",
+        *,
+        write_back: bool = True,
+    ) -> None:
+        """Classify every variant into SBS-96 / DBS-78 / ID-83 channels and store
+        a per-genotype-entry ``mutcat`` field (int16, enum-encoded).
+
+        Adjacent SNVs carried on the same haplotype are combined into DBS; the
+        5' entry receives the DBS code and the 3' entry a ``DBS_PARTNER`` sentinel.
+
+        Parameters
+        ----------
+        reference
+            Reference genome.  A :class:`~genoray._reference.Reference` instance,
+            or a path to a FASTA file (with a ``.fai`` index alongside it).
+        write_back
+            If ``True`` (default), persist ``mutcat.npy`` and update
+            ``metadata.json`` on disk so that subsequent ``SparseVar(...)``
+            opens will see the field.  If ``False``, the ``mutcat`` field lives
+            only in memory (``self.fields["mutcat"]``) and is NOT written to
+            disk — reopening the file will not find it.  Note: the
+            ``metadata.json`` update is not safe against concurrent writers;
+            single-writer access is expected (consistent with
+            ``annotate_with_gtf``).
+        """
+        if not isinstance(reference, Reference):
+            reference = Reference.from_path(reference)
+
+        # 1. intrinsic per-variant codes
+        var_code = classify_variants(self.index, reference)
+
+        # 2. per-variant arrays needed by the adjacency kernel
+        pos = self.index["POS"].to_numpy().astype(np.int64)
+        ref0 = self.index["REF"].to_list()
+        alt0 = self.index["ALT"].list.first().to_list()
+        is_snv = np.array(
+            [
+                r is not None and a is not None and len(r) == 1 and len(a) == 1
+                for r, a in zip(ref0, alt0)
+            ],
+            dtype=np.bool_,
+        )
+        # contig id per variant — equality semantics only (same contig ↔ same id)
+        contig_map = {c: i for i, c in enumerate(self.contigs)}
+        contig_codes = np.array(
+            [contig_map.get(c, -1) for c in self.index["CHROM"].to_list()],
+            dtype=np.int32,
+        )
+        ref_b = np.array([ord(r[0]) if r else 0 for r in ref0], dtype=np.uint8)
+        alt_b = np.array([ord(a[0]) if a else 0 for a in alt0], dtype=np.uint8)
+
+        # 3. broadcast to entries + DBS adjacency override
+        entry_codes = build_entry_codes(
+            self.genos.data,
+            self.genos.offsets,
+            var_code,
+            pos,
+            contig_codes,
+            is_snv,
+            ref_b,
+            alt_b,
+        )
+
+        # 4. register in-memory (mirrors how fields are opened in __init__)
+        shape = (self.n_samples, self.ploidy, None)
+        self.available_fields["mutcat"] = np.dtype("int16")
+        self.fields["mutcat"] = Ragged.from_offsets(
+            entry_codes, shape, self.genos.offsets
+        )
+
+        # 5. optionally persist
+        if write_back:
+            mm = np.memmap(
+                self.path / "mutcat.npy",
+                dtype=np.int16,
+                mode="w+",
+                shape=entry_codes.shape,
+            )
+            mm[:] = entry_codes
+            mm.flush()
+            del mm
+
+            with open(self.path / "metadata.json", "rb") as f:
+                meta = SparseVarMetadata.model_validate_json(f.read())
+            meta.fields["mutcat"] = "int16"
+            meta.mutcat_version = MUTCAT_VERSION
+            with open(self.path / "metadata.json", "w") as f:
+                f.write(meta.model_dump_json())
+
+    def mutation_matrix(
+        self,
+        kind: Literal["SBS96", "DBS78", "ID83"],
+        *,
+        count: Literal["allele", "sample"] = "allele",
+    ) -> pl.DataFrame:
+        """Build a per-sample mutation count matrix.
+
+        Requires :meth:`annotate_mutations` to have been run (or the ``mutcat``
+        field to be loaded). Returns a DataFrame with a ``MutationType`` column
+        plus one column per sample (rows in fixed codebook order).
+
+        The ``mutcat`` field is resolved in the following priority order:
+
+        1. Already loaded in ``self.fields["mutcat"]`` (e.g. opened with
+           ``fields=["mutcat"]``).
+        2. Present on disk as ``mutcat.npy`` (written by a prior
+           :meth:`annotate_mutations` call with ``write_back=True``) — opened
+           lazily and cached into ``self.fields["mutcat"]`` for subsequent
+           calls.
+        3. Not found at all — raises :class:`ValueError`.
+
+        Parameters
+        ----------
+        kind
+            One of ``"SBS96"``, ``"DBS78"``, ``"ID83"``.
+        count
+            ``"allele"`` counts every non-ref allele copy; ``"sample"`` counts
+            each category at most once per sample (presence/absence).
+        """
+        if kind not in ("SBS96", "DBS78", "ID83"):
+            raise ValueError(f"Unknown matrix kind {kind!r}.")
+        if count not in ("allele", "sample"):
+            raise ValueError(
+                f"Unknown count mode {count!r}; choose 'allele' or 'sample'."
+            )
+        mut = self.fields.get("mutcat")
+        if mut is None:
+            if "mutcat" in self.available_fields:
+                shape = (self.n_samples, self.ploidy, None)
+                mut = _open_fmt(
+                    "mutcat", self.available_fields["mutcat"], self.path, shape, "r"
+                )
+                self.fields["mutcat"] = mut
+            else:
+                raise ValueError(
+                    "No 'mutcat' field found. Run annotate_mutations() first "
+                    "(or open with fields=['mutcat'])."
+                )
+        return count_matrix(
+            np.asarray(mut.data),
+            np.asarray(self.genos.offsets),
+            self.ploidy,
+            self.n_samples,
+            self.available_samples,
+            kind,
+            per_sample=(count == "sample"),
+        )
+
+    def assign_signatures(
+        self,
+        kind: Literal["SBS96", "DBS78", "ID83"],
+        *,
+        reference: "pl.DataFrame | str | Path | None" = None,
+        count: Literal["allele", "sample"] = "allele",
+        max_delta: float = 0.01,
+        min_activity: float = 0.005,
+    ) -> "pl.DataFrame":
+        """Refit this object's mutation catalogue against COSMIC signatures.
+
+        Builds the ``kind`` catalogue via :meth:`mutation_matrix` and decomposes
+        it into per-sample activities via :func:`genoray.fit_signatures`.
+
+        Parameters
+        ----------
+        kind
+            One of ``"SBS96"``, ``"DBS78"``, ``"ID83"``.
+        reference
+            Reference signatures as a Polars ``DataFrame`` (``MutationType`` +
+            signature columns), a path to a COSMIC-style TSV, or ``None`` to fetch
+            the default COSMIC set via :func:`genoray.cosmic_signatures`.
+        count
+            Counting unit passed to :meth:`mutation_matrix`.
+        max_delta, min_activity
+            Forwarded to :func:`genoray.fit_signatures`.
+
+        Returns
+        -------
+        pl.DataFrame
+            One row per sample: ``Sample``, one column per signature, and
+            ``cosine_similarity``.
+        """
+        catalogue = self.mutation_matrix(kind, count=count)
+        if reference is None:
+            ref = cosmic_signatures(kind)
+        elif isinstance(reference, pl.DataFrame):
+            ref = reference
+        else:
+            ref = _load_signature_file(reference)
+        return fit_signatures(
+            catalogue, ref, max_delta=max_delta, min_activity=min_activity
+        )
+
     def cache_afs(self):
         """Cache the allele frequencies on disk. Will also load all possible attributes and add the AF column in-memory."""
         self._load_all_attrs()
@@ -1497,6 +1695,7 @@ class SparseVar(Generic[_SRT]):
         samples: str | Sequence[str] | Path,
         output: str | Path,
         fields: Sequence[str] | None = None,
+        reference: "Reference | str | Path | None" = None,
         merge_overlapping: bool = False,
         regions_overlap: Literal["pos", "record", "variant"] = "pos",
         overwrite: bool = False,
@@ -1517,7 +1716,22 @@ class SparseVar(Generic[_SRT]):
         output
             Destination directory for the new SparseVar.
         fields
-            Fields to carry over (``None`` = all available; ``[]`` = none).
+            Fields to carry over (``None`` = all available except ``"mutcat"``; ``[]`` = none).
+            The derived ``mutcat`` field is **never** copied positionally by
+            ``write_view`` because its mutation codes — especially DBS adjacency —
+            are only valid for the full variant set; subsetting may drop a DBS
+            partner and leave a stale 5' code.  Pass ``reference=`` to recompute
+            ``mutcat`` on the subset instead (see below).  Explicitly including
+            ``"mutcat"`` in *fields* without also providing *reference* raises a
+            :class:`ValueError`.
+        reference
+            If provided (a :class:`~genoray._reference.Reference` instance, or a
+            path to a FASTA file), :meth:`annotate_mutations` is called on the
+            output view after all other data have been written, recomputing
+            ``mutcat`` codes for the subset.  This is the supported way to get a
+            valid ``mutcat`` field on a view.  When ``None`` (default), no
+            annotation is performed and the output will not have a ``mutcat``
+            field.
         merge_overlapping
             If ``True`` silently merge overlapping regions; if ``False``
             raise ``ValueError`` when overlaps are detected.
@@ -1540,10 +1754,27 @@ class SparseVar(Generic[_SRT]):
 
         output = Path(output)
 
+        # --- Early validation: mutcat cannot be positionally copied ---
+        if fields is not None and "mutcat" in fields:
+            if reference is None:
+                raise ValueError(
+                    "'mutcat' cannot be copied through write_view because its codes "
+                    "are dataset-specific (DBS adjacency is only valid for the full "
+                    "variant set; subsetting may leave stale codes). "
+                    "Pass reference= to recompute mutcat on the subset, or call "
+                    "annotate_mutations() on the output view yourself."
+                )
+
         # --- 1. Normalize inputs ---
         regions_df = _normalize_regions(regions, self._c_norm)
         caller_samples = _normalize_samples(samples, self.available_samples)
         fields_to_write = _validate_fields(fields, self.available_fields)
+        # Always exclude the derived "mutcat" field from positional copy:
+        # its codes encode cross-variant DBS adjacency that is only valid for
+        # the full variant set.  Subsetting can drop a DBS 3' partner, leaving
+        # an orphaned 5' code that mutation_matrix would miscount.
+        # Use reference= to recompute mutcat on the output view instead.
+        fields_to_write = [f for f in fields_to_write if f != "mutcat"]
 
         if not caller_samples:
             raise ValueError("write_view requires at least one sample")
@@ -1693,6 +1924,11 @@ class SparseVar(Generic[_SRT]):
                 fields={n: self.available_fields[n].name for n in fields_to_write},
             ).model_dump_json()
             f.write(json_str)
+
+        # --- 11. Optionally recompute mutcat on the output view ---
+        if reference is not None:
+            out_svar = SparseVar(output)
+            out_svar.annotate_mutations(reference, write_back=True)
 
 
 @nb.njit(nogil=True, cache=True)
