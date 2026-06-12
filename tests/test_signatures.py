@@ -1,8 +1,19 @@
+from pathlib import Path
+
 import numpy as np
 import polars as pl
 import pytest
 
-from genoray._signatures import _cosine, _fit_one, _nnls, fit_signatures
+from genoray._signatures import (
+    _cosine,
+    _fit_one,
+    _load_signature_file,
+    _nnls,
+    cosmic_signatures,
+    fit_signatures,
+)
+
+DATA = Path(__file__).parent / "data"
 
 
 def test_cosine_identical_is_one():
@@ -129,3 +140,26 @@ def test_fit_signatures_missing_type_raises():
     ref_missing = ref.head(3)  # drop a row present in the catalogue
     with pytest.raises(ValueError, match="MutationType"):
         fit_signatures(cat, ref_missing)
+
+
+def test_load_signature_file_renames_type_column():
+    df = _load_signature_file(DATA / "cosmic_mini.txt")
+    assert df.columns[0] == "MutationType"
+    assert "SBS1" in df.columns and "SBS5" in df.columns
+    assert df["MutationType"].to_list()[0] == "A[C>A]A"
+
+
+def test_load_signature_file_path_as_str():
+    df = _load_signature_file(str(DATA / "cosmic_mini.txt"))
+    assert df.height == 4
+
+
+@pytest.mark.network
+def test_cosmic_signatures_sbs96_row_order():
+    from genoray._mutcat import labels
+
+    df = cosmic_signatures("SBS96")
+    assert df.columns[0] == "MutationType"
+    assert df["MutationType"].to_list() == labels("SBS96")  # canonical 96 rows
+    # signature columns are the COSMIC SBS set
+    assert any(c.startswith("SBS") for c in df.columns[1:])
