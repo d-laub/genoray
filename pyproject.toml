@@ -52,7 +52,10 @@ requires = ["hatchling"]
 
 [tool.pytest.ini_options]
 filterwarnings = ["ignore::DeprecationWarning:sorted_nearest.*"]
-markers = ["network: requires network access (deselect with '-m not network')"]
+markers = [
+    "network: requires network access (deselect with '-m not network')",
+    "sigprofiler: requires SigProfilerMatrixGenerator (run in the 'sigprofiler' pixi env)",
+]
 
 [tool.basedpyright]
 enableTypeIgnoreComments = true

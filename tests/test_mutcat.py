@@ -120,8 +120,8 @@ def test_id83_1bp_deletion_in_homopolymer():
     # deleted base C, the run downstream of the deletion has 4 remaining C's -> repeat class
     fetch = _ref_fn(b"ACCCCCG")
     code = classify_id83(pos=0, ref=b"AC", alt=b"A", fetch=fetch)
-    # repeat-bucket boundary (4 vs 5) is deferred to Task 10 SigProfiler calibration
-    assert ID83_INDEX["1:Del:C:5"] == code or ID83_INDEX["1:Del:C:4"] == code
+    # SigProfiler confirmed: repeat count = homopolymer_length - 1 (4 remaining C's -> bucket 4)
+    assert code == ID83_INDEX["1:Del:C:4"]
 
 
 def test_id83_1bp_insertion_T():

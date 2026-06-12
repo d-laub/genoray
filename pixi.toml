@@ -11,6 +11,7 @@ py311 = ["py311"]
 py312 = ["py312"]
 py313 = ["py313"]
 sbox = ["sbox", "py310"]
+sigprofiler = ["sigprofiler"]
 
 [dependencies]
 uv = "*"
@@ -98,3 +99,9 @@ fast-histogram = "*"
 
 [feature.sbox.tasks]
 i-kernel = "ipython kernel install --user --name genoray"
+
+[feature.sigprofiler.dependencies]
+python = "3.10.*"
+
+[feature.sigprofiler.pypi-dependencies]
+sigprofilermatrixgenerator = ">=1.3, <2"
