@@ -173,3 +173,12 @@ def test_cosmic_signatures_unknown_kind_raises():
 def test_cosmic_signatures_unregistered_combo_raises():
     with pytest.raises(ValueError, match="No COSMIC URL registered"):
         cosmic_signatures("SBS96", version="9.9", genome="GRCh38")
+
+
+def test_public_exports():
+    import genoray
+
+    assert hasattr(genoray, "fit_signatures")
+    assert hasattr(genoray, "cosmic_signatures")
+    assert "fit_signatures" in genoray.__all__
+    assert "cosmic_signatures" in genoray.__all__
