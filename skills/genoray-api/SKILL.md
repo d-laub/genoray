@@ -18,6 +18,8 @@ description: Use when writing or modifying Python code that imports `genoray` to
 - `genoray.Reader` — type alias `VCF | PGEN | SparseVar`
 - `genoray.SparseVar` — sparse `.svar` reader/writer
 - `genoray.exprs` — polars filter expressions for `.gvi` indexes
+- `genoray.cosmic_signatures` — fetch/cache COSMIC reference signatures
+- `genoray.fit_signatures` — sparse forward-selection signature refit
 
 Nothing else is public. Anything starting with `_` (e.g. `genoray._vcf`) is
 internal — do not import it from user code.
@@ -31,7 +33,8 @@ Prefer reading these over guessing:
 - `genoray/__init__.py` — confirms the public surface
 - `genoray/_vcf.py` — `VCF` class: constructor, `read`, `chunk`, mode constants near the top of the class
 - `genoray/_pgen.py` — `PGEN` class: constructor, `read`, `chunk`, `read_ranges`, `chunk_ranges`, mode constants near the top of the class
-- `genoray/_svar.py` — `SparseVar`: `__init__`, `from_vcf`, `from_pgen`, `read_ranges`, `with_fields`, `annotate_mutations`, `mutation_matrix`
+- `genoray/_svar.py` — `SparseVar`: `__init__`, `from_vcf`, `from_pgen`, `read_ranges`, `with_fields`, `annotate_mutations`, `mutation_matrix`, `assign_signatures`
+- `genoray/_signatures.py` — `cosmic_signatures`, `fit_signatures`
 - `genoray/_reference.py` — `Reference`: `from_path`, `fetch`
 - `genoray/exprs.py` — the *complete* set of pre-built filter expressions (currently 7: `is_snp`, `is_indel`, `is_biallelic`, `is_symbolic`, `is_breakend`, `is_imprecise`, `ILEN`)
 
@@ -386,6 +389,41 @@ svar = genoray.SparseVar("out.svar", fields=["mutcat"])
   is pinned by the unit tests in `tests/test_mutcat.py`. Cross-validation
   against SigProfilerMatrixGenerator is deferred (it is not a declared
   dependency).
+
+### Signature refitting (COSMIC)
+
+Decompose a catalogue into per-sample COSMIC signature activities.
+
+```python
+import genoray
+
+ref = genoray.cosmic_signatures("SBS96")        # pooch-fetched + cached
+cat = svar.mutation_matrix("SBS96")              # MutationType + sample cols
+act = genoray.fit_signatures(cat, ref)           # activities + cosine_similarity
+
+# convenience: mutation_matrix -> fit_signatures in one call
+act = svar.assign_signatures("SBS96")                       # default COSMIC ref
+act = svar.assign_signatures("SBS96", reference=ref, min_activity=0.01)
+act = svar.assign_signatures("SBS96", reference="my_sigs.txt")  # TSV path
+```
+
+Signatures:
+- `cosmic_signatures(kind, *, version="3.4", genome="GRCh38") -> pl.DataFrame`
+  — fetches/caches the COSMIC reference set for `kind ∈ {"SBS96","DBS78","ID83"}`.
+  Returns a `MutationType` column (canonical codebook order) + one column per
+  signature. `genome` is ignored for `ID83`.
+- `fit_signatures(catalogue, reference, *, max_delta=0.01, min_activity=0.005) -> pl.DataFrame`
+  — sparse forward-selection refit (NNLS + cosine-guided add + min-activity
+  prune). Aligns rows by joining on `MutationType` (raises `ValueError` if the
+  catalogue has a type missing from the reference). Returns one row per sample:
+  `Sample`, one Float column per signature (counts; `0.0` if unselected), and
+  `cosine_similarity`.
+- `SparseVar.assign_signatures(kind, *, reference=None, count="allele", max_delta=0.01, min_activity=0.005) -> pl.DataFrame`
+  — `mutation_matrix(kind, count=...)` then `fit_signatures(...)`. `reference`
+  accepts a `pl.DataFrame`, a TSV path, or `None` (defaults to `cosmic_signatures(kind)`).
+
+Out of scope (v1): de novo extraction, opportunity normalization, bootstrap CIs,
+plotting.
 
 ## Common mistakes
 
