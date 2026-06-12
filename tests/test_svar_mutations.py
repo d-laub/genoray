@@ -248,6 +248,48 @@ def test_write_view_recomputes_mutcat_with_reference(annotated_svar, tmp_path):
     )
 
 
+def test_write_view_recompute_breaks_dbs_when_partner_dropped(annotated_svar, tmp_path):
+    """write_view with reference= RECOMPUTES mutcat; dropping the DBS 3' partner
+    reclassifies the surviving 5' SNV as SBS rather than leaving a stale DBS code.
+
+    Variant layout (0-based POS): s0 carries POS=1 (DBS 5') and POS=2 (DBS 3').
+    Region [1, 2) keeps POS=1 only — the partner at POS=2 is excluded.
+    After recompute, the isolated SNV must count as SBS96=1, DBS78=0.
+    A positional copy of the old mutcat would wrongly leave DBS78=1, SBS96=0.
+    """
+    svar = SparseVar(annotated_svar)
+    ref_fa = annotated_svar.parent / "ref.fa"
+    assert ref_fa.exists(), f"Reference FASTA not found at {ref_fa}"
+
+    out = tmp_path / "view_no_partner.svar"
+    # Region [1, 2) is 0-based half-open: covers POS=1 only, NOT POS=2.
+    svar.write_view(
+        regions=("chr1", 1, 2),
+        samples=["s0"],
+        output=out,
+        reference=ref_fa,
+    )
+
+    sv2 = SparseVar(out)
+    assert "mutcat" in sv2.available_fields, (
+        "write_view with reference= must produce a mutcat field on the view"
+    )
+
+    dbs = sv2.mutation_matrix("DBS78")
+    sbs = sv2.mutation_matrix("SBS96")
+
+    dbs_sum = dbs["s0"].sum()
+    sbs_sum = sbs["s0"].sum()
+
+    assert dbs_sum == 0, (
+        f"Expected DBS78 count=0 for s0 after partner dropped, got {dbs_sum}. "
+        "A stale positional copy would incorrectly leave DBS=1."
+    )
+    assert sbs_sum == 1, (
+        f"Expected SBS96 count=1 for s0 (isolated SNV reclassified), got {sbs_sum}."
+    )
+
+
 def test_write_view_drops_mutcat_by_default(annotated_svar, tmp_path):
     """write_view with fields=None must NOT carry the derived mutcat field.
 
