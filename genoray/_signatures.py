@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Literal
 
 import numpy as np
+import polars as pl
 from numpy.typing import NDArray
 from scipy.optimize import nnls
 
@@ -100,3 +101,82 @@ def _fit_one(
     for i, sig in enumerate(active):
         full[sig] = h_sub[i]
     return full, cos
+
+
+def fit_signatures(
+    catalogue: pl.DataFrame,
+    reference: pl.DataFrame,
+    *,
+    max_delta: float = 0.01,
+    min_activity: float = 0.005,
+) -> pl.DataFrame:
+    """Refit a mutation catalogue against reference signatures.
+
+    Parameters
+    ----------
+    catalogue
+        A ``mutation_matrix``-shaped frame: a ``MutationType`` column followed by
+        one numeric column per sample.
+    reference
+        A ``MutationType`` column followed by one column per reference signature.
+        Columns need not be pre-normalized; each is scaled to sum 1 so reported
+        activities are in mutation-count units.
+    max_delta
+        Minimum cosine-similarity improvement to keep adding a signature
+        (forward-selection stop criterion).
+    min_activity
+        Minimum fractional contribution; signatures below this are pruned.
+
+    Returns
+    -------
+    pl.DataFrame
+        One row per sample: a ``Sample`` column, one Float column per reference
+        signature (activities, 0.0 if unselected), and a ``cosine_similarity``
+        column for the final reconstruction.
+
+    Raises
+    ------
+    ValueError
+        If a ``MutationType`` present in the catalogue is missing from the
+        reference (rows cannot be aligned).
+    """
+    if "MutationType" not in catalogue.columns:
+        raise ValueError("catalogue must have a 'MutationType' column.")
+    if "MutationType" not in reference.columns:
+        raise ValueError("reference must have a 'MutationType' column.")
+
+    sample_cols = [c for c in catalogue.columns if c != "MutationType"]
+    sig_cols = [c for c in reference.columns if c != "MutationType"]
+
+    # Align reference rows to the catalogue's row order by joining on MutationType.
+    aligned = catalogue.select("MutationType").join(
+        reference, on="MutationType", how="left"
+    )
+    missing = aligned.filter(pl.col(sig_cols[0]).is_null())
+    if missing.height > 0:
+        bad = missing["MutationType"].to_list()
+        raise ValueError(
+            f"reference is missing MutationType rows present in the catalogue: {bad}"
+        )
+
+    W = aligned.select(sig_cols).to_numpy().astype(np.float64)  # (n_types, n_sigs)
+    col_sums = W.sum(axis=0)
+    col_sums[col_sums == 0.0] = 1.0  # avoid div-by-zero for empty signatures
+    W = W / col_sums  # normalize each signature column to sum 1
+
+    M = (
+        catalogue.select(sample_cols).to_numpy().astype(np.float64)
+    )  # (n_types, n_samples)
+
+    activities = np.zeros((len(sample_cols), len(sig_cols)), dtype=np.float64)
+    cosines = np.zeros(len(sample_cols), dtype=np.float64)
+    for j in range(len(sample_cols)):
+        h, cos = _fit_one(W, M[:, j], max_delta=max_delta, min_activity=min_activity)
+        activities[j] = h
+        cosines[j] = cos
+
+    out: dict[str, object] = {"Sample": sample_cols}
+    for i, sig in enumerate(sig_cols):
+        out[sig] = activities[:, i]
+    out["cosine_similarity"] = cosines
+    return pl.DataFrame(out)

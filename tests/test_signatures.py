@@ -1,7 +1,8 @@
 import numpy as np
+import polars as pl
 import pytest
 
-from genoray._signatures import _cosine, _fit_one, _nnls
+from genoray._signatures import _cosine, _fit_one, _nnls, fit_signatures
 
 
 def test_cosine_identical_is_one():
@@ -71,3 +72,60 @@ def test_fit_one_prunes_below_min_activity():
     h, cos = _fit_one(W, m, max_delta=0.001, min_activity=0.005)
     # signature 1 sliver is below min_activity -> pruned to 0
     assert h[1] == 0.0
+
+
+def _catalogue_and_reference():
+    types = ["A[C>A]A", "A[C>A]C", "A[C>A]G", "A[C>A]T"]
+    ref = pl.DataFrame(
+        {
+            "MutationType": types,
+            "SBS_X": [0.7, 0.1, 0.1, 0.1],
+            "SBS_Y": [0.1, 0.7, 0.1, 0.1],
+            "SBS_Z": [0.25, 0.25, 0.25, 0.25],
+        }
+    )
+    W = ref.select(["SBS_X", "SBS_Y", "SBS_Z"]).to_numpy()
+    # sample s0 = 30*X + 70*Y ; sample s1 = 100*Z
+    m0 = W @ np.array([30.0, 70.0, 0.0])
+    m1 = W @ np.array([0.0, 0.0, 50.0])
+    cat = pl.DataFrame(
+        {
+            "MutationType": types,
+            "s0": np.rint(m0).astype(np.int64),
+            "s1": np.rint(m1).astype(np.int64),
+        }
+    )
+    return cat, ref
+
+
+def test_fit_signatures_shape_and_columns():
+    cat, ref = _catalogue_and_reference()
+    act = fit_signatures(cat, ref)
+    assert act.columns == ["Sample", "SBS_X", "SBS_Y", "SBS_Z", "cosine_similarity"]
+    assert act["Sample"].to_list() == ["s0", "s1"]
+    assert act.height == 2
+
+
+def test_fit_signatures_recovers_activities():
+    cat, ref = _catalogue_and_reference()
+    act = fit_signatures(cat, ref)
+    row0 = act.filter(pl.col("Sample") == "s0")
+    assert row0["SBS_X"].item() == pytest.approx(30.0, rel=0.02)
+    assert row0["SBS_Y"].item() == pytest.approx(70.0, rel=0.02)
+    assert row0["SBS_Z"].item() == 0.0
+    assert row0["cosine_similarity"].item() == pytest.approx(1.0, abs=1e-3)
+
+
+def test_fit_signatures_aligns_rows_by_join_not_position():
+    cat, ref = _catalogue_and_reference()
+    ref_shuffled = ref.sort("MutationType", descending=True)  # reorder rows
+    act = fit_signatures(cat, ref_shuffled)
+    row0 = act.filter(pl.col("Sample") == "s0")
+    assert row0["SBS_X"].item() == pytest.approx(30.0, rel=0.02)
+
+
+def test_fit_signatures_missing_type_raises():
+    cat, ref = _catalogue_and_reference()
+    ref_missing = ref.head(3)  # drop a row present in the catalogue
+    with pytest.raises(ValueError, match="MutationType"):
+        fit_signatures(cat, ref_missing)
