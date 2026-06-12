@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import polars as pl
 import pysam
 import pytest
+from loguru import logger
 
 import genoray
 from genoray import SparseVar
@@ -206,6 +209,49 @@ def test_write_view_mutcat_explicit_without_reference_raises(annotated_svar, tmp
             fields=["mutcat"],
             # reference=None (default) — should raise
         )
+
+
+def test_mutcat_staleness_warning(tmp_path):
+    # --- build a tiny reference + single-SNV VCF ---
+
+    seq = "ACGTACGTACGTACGT"
+    fa = tmp_path / "ref.fa"
+    fa.write_text(">chr1\n" + seq + "\n")
+    pysam.faidx(str(fa))
+
+    vcf = tmp_path / "t.vcf"
+    h = pysam.VariantHeader()
+    h.add_line("##contig=<ID=chr1,length=16>")
+    h.add_line('##FORMAT=<ID=GT,Number=1,Type=String,Description="GT">')
+    h.add_sample("S1")
+    with pysam.VariantFile(str(vcf), "w", header=h) as vf:
+        r = h.new_record(contig="chr1", start=4, alleles=("A", "C"))  # 1-based POS=5
+        r.samples["S1"]["GT"] = (0, 1)
+        vf.write(r)
+    pysam.tabix_index(str(vcf), preset="vcf", force=True)
+
+    svp = tmp_path / "sv.svar"
+    genoray.SparseVar.from_vcf(
+        svp, genoray.VCF(str(vcf) + ".gz"), max_mem="1g", overwrite=True
+    )
+    sv = SparseVar(svp)
+    sv.annotate_mutations(Reference.from_path(fa), write_back=True)
+
+    # corrupt the persisted version to look stale
+    meta_path = svp / "metadata.json"
+    meta = json.loads(meta_path.read_text())
+    meta["mutcat_version"] = 0
+    meta_path.write_text(json.dumps(meta))
+
+    # capture loguru output
+    messages = []
+    sink_id = logger.add(lambda m: messages.append(str(m)), level="WARNING")
+    try:
+        SparseVar(svp, fields=["mutcat"])
+    finally:
+        logger.remove(sink_id)
+
+    assert any("older version" in m for m in messages), messages
 
 
 def test_write_view_recomputes_mutcat_with_reference(annotated_svar, tmp_path):
