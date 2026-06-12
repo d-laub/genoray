@@ -191,6 +191,63 @@ def test_public_reference_export():
     assert R is genoray.Reference
 
 
+def test_write_view_mutcat_explicit_without_reference_raises(annotated_svar, tmp_path):
+    """write_view with fields=["mutcat"] and no reference must raise ValueError."""
+    svar = SparseVar(annotated_svar)
+    assert "mutcat" in svar.available_fields, (
+        "fixture must have mutcat to test the error path"
+    )
+    out = tmp_path / "view.svar"
+    with pytest.raises(ValueError, match="mutcat"):
+        svar.write_view(
+            regions=("chr1", 0, 100),
+            samples=svar.available_samples,
+            output=out,
+            fields=["mutcat"],
+            # reference=None (default) — should raise
+        )
+
+
+def test_write_view_recomputes_mutcat_with_reference(annotated_svar, tmp_path):
+    """write_view with reference= recomputes mutcat on the subset view."""
+    svar = SparseVar(annotated_svar)
+    assert "mutcat" in svar.available_fields, (
+        "fixture must have mutcat so the source is annotated"
+    )
+    # The fixture writes ref.fa alongside the svar dir (same tmp_path).
+    ref_fa = annotated_svar.parent / "ref.fa"
+    assert ref_fa.exists(), f"Reference FASTA not found at {ref_fa}"
+
+    out = tmp_path / "view.svar"
+    # Keep all samples and all variants (chr1 POS 1,2,8 → region 0..100).
+    svar.write_view(
+        regions=("chr1", 0, 100),
+        samples=svar.available_samples,
+        output=out,
+        reference=ref_fa,  # triggers recomputation
+    )
+
+    sv2 = SparseVar(out)
+    # mutcat should be present on the output (recomputed, not stale)
+    assert "mutcat" in sv2.available_fields, (
+        "write_view with reference= must produce a mutcat field on the view"
+    )
+    # mutation_matrix must work and give sane counts
+    sbs = sv2.mutation_matrix("SBS96")
+    assert sbs.height == 96
+    assert set(sv2.available_samples).issubset(set(sbs.columns))
+    # The subset has the same variants as the source, so totals should be positive
+    total = sbs.select(sv2.available_samples).sum().sum_horizontal().item()
+    assert total > 0, "Recomputed mutation matrix should have non-zero counts"
+
+    # DBS: sample s0 carries the two adjacent SNVs -> one DBS event
+    dbs = sv2.mutation_matrix("DBS78")
+    assert dbs.height == 78
+    assert dbs["s0"].sum() == 1, (
+        f"Expected s0 to have 1 DBS event in the view, got {dbs['s0'].sum()}"
+    )
+
+
 def test_write_view_drops_mutcat_by_default(annotated_svar, tmp_path):
     """write_view with fields=None must NOT carry the derived mutcat field.
 

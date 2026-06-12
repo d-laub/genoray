@@ -315,8 +315,9 @@ Signature: `annotate_mutations(reference, *, write_back=True) -> None`
   (auto-wraps via `Reference.from_path`).
 - `write_back=True` — persists `mutcat.npy` and updates `metadata.json` so
   that subsequent `SparseVar(dir, fields=["mutcat"])` opens will see the field.
-  **Note:** `write_view` with the default `fields=None` does NOT carry `mutcat`
-  to the output (see below); call `annotate_mutations` on the view to regenerate.
+  **Note:** `write_view` **never** copies `mutcat` positionally to the output
+  (see below); pass `reference=` to `write_view` to recompute it on the subset,
+  or call `annotate_mutations` on the output view yourself.
 - `write_back=False` — the `mutcat` field lives only in memory
   (`svar.fields["mutcat"]`); reopening the file will NOT find it.
 - After the call, `svar.fields["mutcat"]` is populated regardless of
@@ -401,7 +402,7 @@ svar = genoray.SparseVar("out.svar", fields=["mutcat"])
 | Calling `mutation_matrix` without a `mutcat` field | Run `annotate_mutations` first, or open with `fields=["mutcat"]` |
 | Expecting `mutation_matrix` to auto-run annotation | It does not; call `annotate_mutations` separately |
 | Re-opening SparseVar and losing the `mutcat` field | Use `write_back=True` (default) in `annotate_mutations`; then open with `SparseVar(dir, fields=["mutcat"])` |
-| Calling `write_view` and expecting `mutcat` to be in the output | `write_view` excludes `mutcat` by default (`fields=None`) because subsetting can invalidate DBS adjacency codes; call `annotate_mutations` on the output view to regenerate it |
+| Calling `write_view` and expecting `mutcat` to be in the output | `write_view` **never** copies `mutcat` positionally (subsetting invalidates DBS adjacency codes). Pass `reference=` to `write_view` to recompute it on the subset, or call `annotate_mutations` on the output view yourself. Explicitly including `"mutcat"` in `fields=` without a `reference=` raises `ValueError`. |
 | Passing a FASTA path directly to `annotate_mutations` | Supported — it auto-wraps via `Reference.from_path` |
 
 ## When this skill needs updating

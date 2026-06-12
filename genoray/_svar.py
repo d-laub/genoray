@@ -1476,13 +1476,12 @@ class SparseVar(Generic[_SRT]):
         write_back
             If ``True`` (default), persist ``mutcat.npy`` and update
             ``metadata.json`` on disk so that subsequent ``SparseVar(...)``
-            opens and ``write_view`` calls with ``fields=["mutcat"]`` will see
-            the field.  If ``False``, the ``mutcat`` field lives only in memory
-            (``self.fields["mutcat"]``) and is NOT written to disk — reopening
-            the file or calling ``write_view`` with ``fields=["mutcat"]`` will
-            not find it.  Note: the ``metadata.json`` update is not safe
-            against concurrent writers; single-writer access is expected
-            (consistent with ``annotate_with_gtf``).
+            opens will see the field.  If ``False``, the ``mutcat`` field lives
+            only in memory (``self.fields["mutcat"]``) and is NOT written to
+            disk — reopening the file will not find it.  Note: the
+            ``metadata.json`` update is not safe against concurrent writers;
+            single-writer access is expected (consistent with
+            ``annotate_with_gtf``).
         """
         if not isinstance(reference, Reference):
             reference = Reference.from_path(reference)
@@ -1651,6 +1650,7 @@ class SparseVar(Generic[_SRT]):
         samples: str | Sequence[str] | Path,
         output: str | Path,
         fields: Sequence[str] | None = None,
+        reference: "Reference | str | Path | None" = None,
         merge_overlapping: bool = False,
         regions_overlap: Literal["pos", "record", "variant"] = "pos",
         overwrite: bool = False,
@@ -1672,12 +1672,21 @@ class SparseVar(Generic[_SRT]):
             Destination directory for the new SparseVar.
         fields
             Fields to carry over (``None`` = all available except ``"mutcat"``; ``[]`` = none).
-            The derived ``mutcat`` field is intentionally excluded from the default
-            carry-over because its mutation codes — especially DBS adjacency — are
-            only valid for the full variant set; subsetting may drop a DBS partner
-            and leave a stale 5' code. Re-run :meth:`annotate_mutations` on the
-            output view to regenerate it.  To opt in anyway (advanced use), pass
-            ``fields=["mutcat", ...]`` explicitly.
+            The derived ``mutcat`` field is **never** copied positionally by
+            ``write_view`` because its mutation codes — especially DBS adjacency —
+            are only valid for the full variant set; subsetting may drop a DBS
+            partner and leave a stale 5' code.  Pass ``reference=`` to recompute
+            ``mutcat`` on the subset instead (see below).  Explicitly including
+            ``"mutcat"`` in *fields* without also providing *reference* raises a
+            :class:`ValueError`.
+        reference
+            If provided (a :class:`~genoray._reference.Reference` instance, or a
+            path to a FASTA file), :meth:`annotate_mutations` is called on the
+            output view after all other data have been written, recomputing
+            ``mutcat`` codes for the subset.  This is the supported way to get a
+            valid ``mutcat`` field on a view.  When ``None`` (default), no
+            annotation is performed and the output will not have a ``mutcat``
+            field.
         merge_overlapping
             If ``True`` silently merge overlapping regions; if ``False``
             raise ``ValueError`` when overlaps are detected.
@@ -1700,17 +1709,27 @@ class SparseVar(Generic[_SRT]):
 
         output = Path(output)
 
+        # --- Early validation: mutcat cannot be positionally copied ---
+        if fields is not None and "mutcat" in fields:
+            if reference is None:
+                raise ValueError(
+                    "'mutcat' cannot be copied through write_view because its codes "
+                    "are dataset-specific (DBS adjacency is only valid for the full "
+                    "variant set; subsetting may leave stale codes). "
+                    "Pass reference= to recompute mutcat on the subset, or call "
+                    "annotate_mutations() on the output view yourself."
+                )
+
         # --- 1. Normalize inputs ---
         regions_df = _normalize_regions(regions, self._c_norm)
         caller_samples = _normalize_samples(samples, self.available_samples)
         fields_to_write = _validate_fields(fields, self.available_fields)
-        # When the caller passed fields=None ("carry all"), exclude the derived
-        # "mutcat" field: its codes encode cross-variant DBS adjacency that is
-        # only valid for the full variant set.  Subsetting can drop a DBS 3'
-        # partner, leaving an orphaned 5' code that mutation_matrix would
-        # miscount.  Re-run annotate_mutations on the output view to regenerate.
-        if fields is None:
-            fields_to_write = [f for f in fields_to_write if f != "mutcat"]
+        # Always exclude the derived "mutcat" field from positional copy:
+        # its codes encode cross-variant DBS adjacency that is only valid for
+        # the full variant set.  Subsetting can drop a DBS 3' partner, leaving
+        # an orphaned 5' code that mutation_matrix would miscount.
+        # Use reference= to recompute mutcat on the output view instead.
+        fields_to_write = [f for f in fields_to_write if f != "mutcat"]
 
         if not caller_samples:
             raise ValueError("write_view requires at least one sample")
@@ -1860,6 +1879,11 @@ class SparseVar(Generic[_SRT]):
                 fields={n: self.available_fields[n].name for n in fields_to_write},
             ).model_dump_json()
             f.write(json_str)
+
+        # --- 11. Optionally recompute mutcat on the output view ---
+        if reference is not None:
+            out_svar = SparseVar(output)
+            out_svar.annotate_mutations(reference, write_back=True)
 
 
 @nb.njit(nogil=True, cache=True)
