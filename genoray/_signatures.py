@@ -151,8 +151,10 @@ def fit_signatures(
     sig_cols = [c for c in reference.columns if c != "MutationType"]
 
     # Align reference rows to the catalogue's row order by joining on MutationType.
+    # maintain_order="left" is required: without it, Polars' hash-join is
+    # non-deterministic under concurrent workloads and can reorder left-frame rows.
     aligned = catalogue.select("MutationType").join(
-        reference, on="MutationType", how="left"
+        reference, on="MutationType", how="left", maintain_order="left"
     )
     missing = aligned.filter(pl.col(sig_cols[0]).is_null())
     if missing.height > 0:
