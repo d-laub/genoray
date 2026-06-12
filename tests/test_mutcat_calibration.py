@@ -287,11 +287,11 @@ def test_sigprofiler_calibration(tmp_path: Path) -> None:
     _write_plain_fasta(fa_path)
     ref = Reference.from_path(fa_path)
 
-    # VCF_LINES has 1-based POS; genoray classify_variants expects 0-based POS.
+    # VCF_LINES has 1-based POS; classify_variants converts internally.
     geno_index = pl.DataFrame(
         {
             "CHROM": [v[0] for v in VCF_LINES],
-            "POS": [v[1] - 1 for v in VCF_LINES],  # convert 1-based -> 0-based
+            "POS": [v[1] for v in VCF_LINES],  # 1-based; classify_variants converts
             "REF": [v[2] for v in VCF_LINES],
             "ALT": [[v[3]] for v in VCF_LINES],
         }

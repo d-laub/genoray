@@ -8,6 +8,7 @@ from typing import Any, Literal
 import numba as nb
 import numpy as np
 import polars as pl
+from loguru import logger
 from numpy.typing import NDArray
 
 from ._reference import Reference
@@ -477,8 +478,9 @@ def count_matrix(
 def classify_variants(index: pl.DataFrame, reference: Reference) -> np.ndarray:
     """Return an int16 array of intrinsic mutation codes, one per row of ``index``.
 
-    ``index`` must have columns CHROM, POS (0-based int), REF (str), ALT
-    (List[str]; first ALT used). Reference context is fetched per contig.
+    ``index`` must have columns CHROM, POS (1-based int, VCF convention), REF
+    (str), ALT (List[str]; first ALT used). POS is converted to a 0-based
+    reference coordinate internally. Reference context is fetched per contig.
     """
     chrom = index["CHROM"].to_numpy()
     pos = index["POS"].to_numpy().astype(np.int64)
@@ -487,6 +489,9 @@ def classify_variants(index: pl.DataFrame, reference: Reference) -> np.ndarray:
 
     out = np.full(index.height, SENTINELS["UNCLASSIFIED"], dtype=np.int16)
 
+    n_mismatch = 0
+    mismatch_examples: list[str] = []
+
     for i in range(index.height):
         r = ref[i]
         a = alt0[i]
@@ -494,7 +499,7 @@ def classify_variants(index: pl.DataFrame, reference: Reference) -> np.ndarray:
             continue
         rb, ab = r.encode(), a.encode()
         c = str(chrom[i])
-        p = int(pos[i])
+        p = int(pos[i]) - 1  # index POS is 1-based (VCF); reference.fetch is 0-based
 
         if len(rb) == 1 and len(ab) == 1:  # SNV
             five = reference.fetch(c, p - 1, p).tobytes()
@@ -508,6 +513,22 @@ def classify_variants(index: pl.DataFrame, reference: Reference) -> np.ndarray:
             def _fetch(s: int, e: int, _c: str = _c) -> bytes:
                 return reference.fetch(_c, s, e).tobytes()
 
-            out[i] = classify_id83(p, rb, ab, _fetch)
+            code = classify_id83(p, rb, ab, _fetch)
+            if code == _REF_MISMATCH:
+                n_mismatch += 1
+                if len(mismatch_examples) < 5:
+                    mismatch_examples.append(f"{c}:{int(pos[i])}")
+                out[i] = SENTINELS["UNCLASSIFIED"]
+            else:
+                out[i] = code
         # else: MNV>2bp or symbolic -> stays UNCLASSIFIED
+
+    if n_mismatch:
+        examples = ", ".join(mismatch_examples)
+        logger.warning(
+            f"{n_mismatch}/{index.height} deletions have REF disagreeing with the "
+            f"reference genome at their position (e.g. {examples}) — wrong reference "
+            "build? These were marked UNCLASSIFIED."
+        )
+
     return out

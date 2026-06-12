@@ -33,13 +33,15 @@ def _build_tiny_svar(path):
     from seqpro.rag import Ragged
 
     path.mkdir(parents=True)
-    # 3 variants on chr1 at POS 1,2,8 (0-based); all SNVs
+    # 3 variants on chr1 at 1-based POS 2,3,9 (VCF convention); all SNVs
+    # Reference chr1: A C G T A C G T A C (0-based 0..9)
+    # POS=2 -> 0-based 1 -> REF=C; POS=3 -> 0-based 2 -> REF=G; POS=9 -> 0-based 8 -> REF=A
     # Note: _load_index adds 'index' as a row-index column; the on-disk file
     # must NOT include it.
     index = pl.DataFrame(
         {
             "CHROM": ["chr1", "chr1", "chr1"],
-            "POS": np.array([1, 2, 8], dtype=np.int32),
+            "POS": np.array([2, 3, 9], dtype=np.int32),
             "REF": ["C", "G", "A"],
             "ALT": [["A"], ["T"], ["C"]],
             "ILEN": pl.Series([[0], [0], [0]], dtype=pl.List(pl.Int32)),
@@ -118,7 +120,7 @@ def annotated_svar_ploidy2(tmp_path):
 def _build_ploidy2_svar(path):
     """Write a minimal SVAR with 2 samples, ploidy 2.
 
-    One variant: chr1 POS=7 (0-based), A>C (isolated SNV -> SBS).
+    One variant: chr1 POS=8 (1-based), T>C (isolated SNV -> SBS).
     Sample 0 is HOMOZYGOUS: hap0=[0], hap1=[0].
     Sample 1 is REF: hap0=[], hap1=[].
     offsets length = n_samples*ploidy + 1 = 2*2 + 1 = 5.
@@ -129,13 +131,13 @@ def _build_ploidy2_svar(path):
 
     path.mkdir(parents=True)
     # Reference chr1: A C G T A C G T A C (0-based indices)
-    # POS=7 -> ref base T, but we use an A context:
-    # Let's place the SNV at POS=7 (T>C) — flanks at 6=G and 8=A.
+    # 1-based POS=8 -> 0-based index 7 -> ref base T
+    # Flanks: 0-based 6=G (5') and 8=A (3').
     # Pyrimidine ref T -> label: G[T>C]A
     index = pl.DataFrame(
         {
             "CHROM": ["chr1"],
-            "POS": np.array([7], dtype=np.int32),
+            "POS": np.array([8], dtype=np.int32),
             "REF": ["T"],
             "ALT": [["C"]],
             "ILEN": pl.Series([[0]], dtype=pl.List(pl.Int32)),
@@ -298,8 +300,8 @@ def test_write_view_recompute_breaks_dbs_when_partner_dropped(annotated_svar, tm
     """write_view with reference= RECOMPUTES mutcat; dropping the DBS 3' partner
     reclassifies the surviving 5' SNV as SBS rather than leaving a stale DBS code.
 
-    Variant layout (0-based POS): s0 carries POS=1 (DBS 5') and POS=2 (DBS 3').
-    Region [1, 2) keeps POS=1 only — the partner at POS=2 is excluded.
+    Variant layout (1-based POS): s0 carries POS=2 (DBS 5') and POS=3 (DBS 3').
+    Region [1, 2) keeps POS=2 only — the partner at POS=3 is excluded.
     After recompute, the isolated SNV must count as SBS96=1, DBS78=0.
     A positional copy of the old mutcat would wrongly leave DBS78=1, SBS96=0.
     """
@@ -387,3 +389,66 @@ def test_assign_signatures_with_explicit_reference(annotated_svar):
     assert set(act["Sample"].to_list()).issubset(set(svar.available_samples))
     # activities are nonnegative
     assert (act.select(["SBS_A", "SBS_B"]).to_numpy() >= 0).all()
+
+
+def test_issue59_deletion_no_longer_crashes(tmp_path):
+    from genoray._mutcat import ID83_OFFSET, N_CODES
+
+    seq = "ACGTTGCAACGTTGCAAGGCCTTAGCATCGTACGATCGTTAGCCATGACTGACATGCATGC"
+    fa = tmp_path / "ref.fa"
+    fa.write_text(">chr1\n" + seq + "\n")
+    pysam.faidx(str(fa))
+
+    anchor0 = 19
+    REF, ALT = seq[anchor0 : anchor0 + 6], seq[anchor0]  # "CCTTAG" -> "C", 5bp del
+
+    vcf = tmp_path / "t.vcf"
+    h = pysam.VariantHeader()
+    h.add_line("##contig=<ID=chr1,length=60>")
+    h.add_line('##FORMAT=<ID=GT,Number=1,Type=String,Description="GT">')
+    h.add_sample("S1")
+    with pysam.VariantFile(str(vcf), "w", header=h) as vf:
+        r = h.new_record(contig="chr1", start=anchor0, alleles=(REF, ALT))
+        r.samples["S1"]["GT"] = (0, 1)
+        vf.write(r)
+    pysam.tabix_index(str(vcf), preset="vcf", force=True)
+
+    svp = tmp_path / "sv.svar"
+    genoray.SparseVar.from_vcf(
+        svp, genoray.VCF(str(vcf) + ".gz"), max_mem="1g", overwrite=True
+    )
+    sv = SparseVar(svp)
+    assert sv.index["POS"].to_list() == [20]  # 1-based preserved
+
+    sv.annotate_mutations(Reference.from_path(fa), write_back=False)  # must NOT raise
+    codes = sv.fields["mutcat"].data
+    # the deletion entry must be a valid ID-83 code, not UNCLASSIFIED/mismatch
+    id83_codes = [c for c in codes if ID83_OFFSET <= c < N_CODES]
+    assert len(id83_codes) == 1
+
+
+def test_classify_variants_snv_context_uses_pos_minus_one(tmp_path):
+    import polars as pl
+
+    from genoray._mutcat import classify_sbs96, classify_variants
+
+    # Reference where the base at 0-based index differs left vs right of the variant,
+    # so a +1 shift would pick a different trinucleotide context.
+    seq = "AACGTTGCA"
+    fa = tmp_path / "ref.fa"
+    fa.write_text(">chr1\n" + seq + "\n")
+    pysam.faidx(str(fa))
+    ref = Reference.from_path(fa)
+
+    # Variant at 1-based POS=4 => 0-based index 3, REF = seq[3] = "G".
+    p0 = 3
+    assert seq[p0] == "G"
+    index = pl.DataFrame(
+        {"CHROM": ["chr1"], "POS": [p0 + 1], "REF": ["G"], "ALT": [["A"]]}
+    )
+    codes = classify_variants(index, ref)
+
+    five = seq[p0 - 1].encode()
+    three = seq[p0 + 1].encode()
+    expected = classify_sbs96(five, b"G", b"A", three)
+    assert int(codes[0]) == expected

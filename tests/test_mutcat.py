@@ -152,7 +152,7 @@ def test_classify_variants_mixed(tmp_path):
     index = pl.DataFrame(
         {
             "CHROM": ["chr1", "chr1"],
-            "POS": [1, 2],  # 0-based
+            "POS": [2, 3],  # 1-based (VCF convention); classify_variants converts
             "REF": ["C", "G"],
             "ALT": [["A"], ["GT"]],  # SNV ; insertion
         }
