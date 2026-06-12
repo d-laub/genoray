@@ -33,6 +33,8 @@ dependencies = [
     "joblib>=1.4.2,<2",
     "joblib-progress>=1.0.6,<2",
     "filelock>3,<4",
+    "scipy>=1.10",
+    "pooch>=1.7",
 ]
 
 [project.scripts]
