@@ -1,3 +1,32 @@
+## 2.11.0 (2026-06-12)
+
+### Feat
+
+- **signatures**: export fit_signatures and cosmic_signatures
+- **svar**: add SparseVar.assign_signatures convenience
+- **signatures**: add pooch-backed cosmic_signatures loader
+- **signatures**: add fit_signatures DataFrame orchestration + row alignment
+- **signatures**: add single-sample forward-selection refit
+- **signatures**: add cosine + NNLS primitives
+- **svar**: recompute mutcat on write_view via opt-in reference; never copy stale codes
+- **svar**: export Reference and document mutation catalogues in SKILL.md
+- **svar**: add mutation_matrix with per-allele/per-sample counting
+- **svar**: add annotate_mutations writing per-entry mutcat field
+- **mutcat**: add per-entry codes with DBS adjacency override
+- **mutcat**: add per-variant classification dispatcher
+- **mutcat**: add ID-83 indel classifier
+- **mutcat**: add DBS-78 doublet classifier
+- **mutcat**: add SBS-96 single-variant classifier
+- **mutcat**: add SBS-96/DBS-78/ID-83 codebooks and code space
+- **reference**: vendor pysam-backed Reference reader
+
+### Fix
+
+- **signatures**: maintain row order in cosmic_signatures join; add DBS78/ID83 loader tests
+- **signatures**: add maintain_order="left" to fit_signatures join
+- **signatures**: guard cosmic_signatures against codebook null rows; drop dead constant
+- **svar**: exclude derived mutcat field from default write_view carry-over
+
 ## 2.10.0 (2026-06-11)
 
 ### Feat
