@@ -33,6 +33,7 @@ from tqdm.auto import tqdm
 from ._mutcat import MUTCAT_VERSION, build_entry_codes, classify_variants, count_matrix
 from ._pgen import PGEN
 from ._reference import Reference
+from ._signatures import _load_signature_file, cosmic_signatures, fit_signatures
 from ._types import DOSAGE_TYPE, DTYPE, POS_MAX, POS_TYPE, V_IDX_TYPE
 from ._utils import ContigNormalizer, format_memory, parse_memory
 from ._var_ranges import var_ranges
@@ -1604,6 +1605,50 @@ class SparseVar(Generic[_SRT]):
             self.available_samples,
             kind,
             per_sample=(count == "sample"),
+        )
+
+    def assign_signatures(
+        self,
+        kind: Literal["SBS96", "DBS78", "ID83"],
+        *,
+        reference: "pl.DataFrame | str | Path | None" = None,
+        count: Literal["allele", "sample"] = "allele",
+        max_delta: float = 0.01,
+        min_activity: float = 0.005,
+    ) -> "pl.DataFrame":
+        """Refit this object's mutation catalogue against COSMIC signatures.
+
+        Builds the ``kind`` catalogue via :meth:`mutation_matrix` and decomposes
+        it into per-sample activities via :func:`genoray.fit_signatures`.
+
+        Parameters
+        ----------
+        kind
+            One of ``"SBS96"``, ``"DBS78"``, ``"ID83"``.
+        reference
+            Reference signatures as a Polars ``DataFrame`` (``MutationType`` +
+            signature columns), a path to a COSMIC-style TSV, or ``None`` to fetch
+            the default COSMIC set via :func:`genoray.cosmic_signatures`.
+        count
+            Counting unit passed to :meth:`mutation_matrix`.
+        max_delta, min_activity
+            Forwarded to :func:`genoray.fit_signatures`.
+
+        Returns
+        -------
+        pl.DataFrame
+            One row per sample: ``Sample``, one column per signature, and
+            ``cosine_similarity``.
+        """
+        catalogue = self.mutation_matrix(kind, count=count)
+        if reference is None:
+            ref = cosmic_signatures(kind)
+        elif isinstance(reference, pl.DataFrame):
+            ref = reference
+        else:
+            ref = _load_signature_file(reference)
+        return fit_signatures(
+            catalogue, ref, max_delta=max_delta, min_activity=min_activity
         )
 
     def cache_afs(self):

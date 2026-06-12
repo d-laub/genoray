@@ -315,3 +315,29 @@ def test_write_view_drops_mutcat_by_default(annotated_svar, tmp_path):
         "write_view with default fields=None should NOT carry mutcat; "
         "re-run annotate_mutations on the view instead"
     )
+
+
+def _toy_sbs_reference():
+    # cover all 96 SBS rows with two signatures so any catalogue aligns
+    from genoray._mutcat import labels
+
+    rows = labels("SBS96")
+    n = len(rows)
+    return pl.DataFrame(
+        {
+            "MutationType": rows,
+            "SBS_A": np.linspace(1, 2, n) / np.linspace(1, 2, n).sum(),
+            "SBS_B": np.linspace(2, 1, n) / np.linspace(2, 1, n).sum(),
+        }
+    )
+
+
+def test_assign_signatures_with_explicit_reference(annotated_svar):
+    svar = SparseVar(annotated_svar, fields=["mutcat"])
+    ref = _toy_sbs_reference()
+    act = svar.assign_signatures("SBS96", reference=ref)
+    assert act.columns[0] == "Sample"
+    assert "cosine_similarity" in act.columns
+    assert set(act["Sample"].to_list()).issubset(set(svar.available_samples))
+    # activities are nonnegative
+    assert (act.select(["SBS_A", "SBS_B"]).to_numpy() >= 0).all()
