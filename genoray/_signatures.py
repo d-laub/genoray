@@ -270,7 +270,9 @@ def cosmic_signatures(
 
     # Reindex to genoray's canonical row order so it aligns with mutation_matrix.
     order = labels(kind)
-    df = pl.DataFrame({"MutationType": order}).join(df, on="MutationType", how="left")
+    df = pl.DataFrame({"MutationType": order}).join(
+        df, on="MutationType", how="left", maintain_order="left"
+    )
 
     sig_cols = [c for c in df.columns if c != "MutationType"]
     null_types = df.filter(pl.col(sig_cols[0]).is_null())["MutationType"].to_list()

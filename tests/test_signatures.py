@@ -165,6 +165,20 @@ def test_cosmic_signatures_sbs96_row_order():
     assert any(c.startswith("SBS") for c in df.columns[1:])
 
 
+@pytest.mark.network
+@pytest.mark.parametrize("kind", ["DBS78", "ID83"])
+def test_cosmic_signatures_row_order_other_kinds(kind):
+    from genoray._mutcat import labels
+
+    df = cosmic_signatures(kind)
+    assert df.columns[0] == "MutationType"
+    assert df["MutationType"].to_list() == labels(kind)
+    assert len(df.columns) > 1
+    # loader guarantees no codebook nulls
+    first_sig = df.columns[1]
+    assert df[first_sig].null_count() == 0
+
+
 def test_cosmic_signatures_unknown_kind_raises():
     with pytest.raises(ValueError, match="Unknown kind"):
         cosmic_signatures("SBS9999")  # type: ignore[arg-type]
