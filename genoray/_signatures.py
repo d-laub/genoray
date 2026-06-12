@@ -190,8 +190,6 @@ def fit_signatures(
 
 # COSMIC reference signatures (v3.4). The filename convention is
 # COSMIC_v{ver}_{SBS,DBS,ID}_{genome}.txt with a `Type` header column.
-_COSMIC_BASE = "https://cancer.sanger.ac.uk/signatures/documents"
-
 # Map (kind, version, genome) -> (url, known_hash). known_hash is None until
 # pinned; pooch will warn but still download when None.
 _COSMIC_REGISTRY: dict[tuple[str, str, str], tuple[str, str | None]] = {
@@ -271,4 +269,13 @@ def cosmic_signatures(
     # Reindex to genoray's canonical row order so it aligns with mutation_matrix.
     order = labels(kind)
     df = pl.DataFrame({"MutationType": order}).join(df, on="MutationType", how="left")
+
+    sig_cols = [c for c in df.columns if c != "MutationType"]
+    null_types = df.filter(pl.col(sig_cols[0]).is_null())["MutationType"].to_list()
+    if null_types:
+        raise ValueError(
+            f"COSMIC {kind} file is missing {len(null_types)} expected MutationType "
+            f"rows (codebook/COSMIC mismatch): {null_types[:5]}"
+        )
+
     return df

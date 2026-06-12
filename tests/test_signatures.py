@@ -163,3 +163,13 @@ def test_cosmic_signatures_sbs96_row_order():
     assert df["MutationType"].to_list() == labels("SBS96")  # canonical 96 rows
     # signature columns are the COSMIC SBS set
     assert any(c.startswith("SBS") for c in df.columns[1:])
+
+
+def test_cosmic_signatures_unknown_kind_raises():
+    with pytest.raises(ValueError, match="Unknown kind"):
+        cosmic_signatures("SBS9999")  # type: ignore[arg-type]
+
+
+def test_cosmic_signatures_unregistered_combo_raises():
+    with pytest.raises(ValueError, match="No COSMIC URL registered"):
+        cosmic_signatures("SBS96", version="9.9", genome="GRCh38")
