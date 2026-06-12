@@ -137,6 +137,11 @@ SENTINELS: dict[str, int] = {
     "MISSING": -3,
 }
 
+# Internal boundary signal (NOT a public sentinel): a deletion whose deleted unit
+# is absent in the reference at scan_start, i.e. REF disagrees with the reference
+# genome. classify_variants maps this to UNCLASSIFIED and aggregates a warning.
+_REF_MISMATCH = -99
+
 # index -> label, for building DataFrames
 SBS96_INDEX = {lbl: SBS96_OFFSET + i for i, lbl in enumerate(SBS96)}
 DBS78_INDEX = {lbl: DBS78_OFFSET + i for i, lbl in enumerate(DBS78)}
@@ -270,6 +275,8 @@ def classify_id83(
         # fold purine to pyrimidine for the 1bp channel
         if base in ("A", "G"):
             base = chr(_comp(ord(base)))
+        if is_del and n_rep == 0:
+            return _REF_MISMATCH
         rep = _repeat_bucket(n_rep - 1 if is_del else n_rep)
         return ID83_INDEX[f"1:{kind}:{base}:{rep}"]
 
@@ -280,6 +287,8 @@ def classify_id83(
         if mh > 0 and n_rep <= 1:
             mh_cap = {2: 1, 3: 2, 4: 3}.get(ilen, 5)
             return ID83_INDEX[f"{size}:Del:M:{min(mh, mh_cap)}"]
+    if is_del and n_rep == 0:
+        return _REF_MISMATCH
     rep = _repeat_bucket(n_rep - 1 if is_del else n_rep)
     return ID83_INDEX[f"{size}:{kind}:R:{rep}"]
 

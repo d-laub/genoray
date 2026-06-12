@@ -12,6 +12,7 @@ from genoray._mutcat import (
     SBS96,
     SENTINELS,
     SBS96_INDEX,
+    _REF_MISMATCH,
     build_entry_codes,
     classify_dbs78,
     classify_id83,
@@ -274,3 +275,50 @@ def test_build_entry_codes_no_pair_across_tracks():
     )
     # Neither entry should be promoted to a DBS or marked DBS_PARTNER
     assert codes.tolist() == [10, 11]
+
+
+def test_id83_2bp_deletion_ref_absent_returns_mismatch():
+    # REF="CGG" -> ALT="C": deleted unit "GG". Downstream reference is "AAAA..."
+    # so the deleted unit is NOT present at scan_start -> REF/reference mismatch.
+    downstream = b"A" * 20
+
+    def fetch(s: int, e: int) -> bytes:
+        return downstream[: e - s]
+
+    assert classify_id83(pos=0, ref=b"CGG", alt=b"C", fetch=fetch) == _REF_MISMATCH
+
+
+def test_id83_1bp_deletion_ref_absent_returns_mismatch():
+    # REF="CG" -> ALT="C": deleted unit "G". Downstream reference is "AAAA..."
+    downstream = b"A" * 20
+
+    def fetch(s: int, e: int) -> bytes:
+        return downstream[: e - s]
+
+    assert classify_id83(pos=0, ref=b"CG", alt=b"C", fetch=fetch) == _REF_MISMATCH
+
+
+def test_id83_2bp_deletion_ref_present_classifies():
+    # n_rep=2 means the MH guard (n_rep <= 1) doesn't fire, so this falls through
+    # to the repeat branch -> 2:Del:R:1, confirming the guard doesn't reject a
+    # legitimately repeated deleted unit.
+    downstream = b"GG" * 2 + b"A" * 16
+
+    def fetch(s: int, e: int) -> bytes:
+        return downstream[: e - s]
+
+    code = classify_id83(pos=0, ref=b"CGG", alt=b"C", fetch=fetch)
+    assert code != _REF_MISMATCH
+    assert code == ID83_INDEX["2:Del:R:1"]
+
+
+def test_id83_insertion_no_repeat_not_mismatch():
+    # An insertion with no downstream repeat must NOT trigger the deletion-only
+    # _REF_MISMATCH guard (guards are gated on is_del).
+    downstream = b"A" * 20
+
+    def fetch(s: int, e: int) -> bytes:
+        return downstream[: e - s]
+
+    code = classify_id83(pos=0, ref=b"C", alt=b"CG", fetch=fetch)
+    assert code != _REF_MISMATCH
