@@ -13,6 +13,7 @@ from genoray._mutcat import (
     SENTINELS,
     SBS96_INDEX,
     _REF_MISMATCH,
+    _dbs78_codes,
     _sbs96_codes,
     build_entry_codes,
     classify_dbs78,
@@ -358,3 +359,24 @@ def test_sbs96_codes_match_scalar_on_random_snvs():
             five, bytes(ref_b[i : i + 1]), bytes(alt_b[i : i + 1]), three
         )
         assert got[i] == exp, (i, five, ref_b[i], alt_b[i], three)
+
+
+def test_dbs78_codes_match_scalar():
+    bases = b"ACGT"
+    ref0, ref1, alt0, alt1, exp = [], [], [], [], []
+    for r0 in bases:
+        for r1 in bases:
+            for a0 in bases:
+                for a1 in bases:
+                    ref0.append(r0)
+                    ref1.append(r1)
+                    alt0.append(a0)
+                    alt1.append(a1)
+                    exp.append(classify_dbs78(bytes([r0, r1]), bytes([a0, a1])))
+    got = _dbs78_codes(
+        np.array(ref0, np.uint8),
+        np.array(ref1, np.uint8),
+        np.array(alt0, np.uint8),
+        np.array(alt1, np.uint8),
+    )
+    assert list(got) == exp

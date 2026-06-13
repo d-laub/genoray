@@ -344,6 +344,24 @@ def _sbs96_codes(
     return np.where(valid, code, _UNCL)
 
 
+def _dbs78_codes(
+    ref_b0: NDArray[np.uint8],
+    ref_b1: NDArray[np.uint8],
+    alt_b0: NDArray[np.uint8],
+    alt_b1: NDArray[np.uint8],
+) -> NDArray[np.int16]:
+    """DBS-78 codes for native 2bp doublets (context-free table lookup)."""
+    r0 = _BASE2IDX[ref_b0]
+    r1 = _BASE2IDX[ref_b1]
+    a0 = _BASE2IDX[alt_b0]
+    a1 = _BASE2IDX[alt_b1]
+    valid = (r0 >= 0) & (r1 >= 0) & (a0 >= 0) & (a1 >= 0)
+    code = _DBS_TABLE[
+        np.clip(r0, 0, 3), np.clip(r1, 0, 3), np.clip(a0, 0, 3), np.clip(a1, 0, 3)
+    ]
+    return np.where(valid, code, _UNCL)
+
+
 def _build_dbs_table() -> np.ndarray:
     """tbl[r0, r1, a0, a1] -> DBS-78 code or UNCLASSIFIED for doublets not in
     the (folded) catalogue. Bases encoded A=0,C=1,G=2,T=3."""
