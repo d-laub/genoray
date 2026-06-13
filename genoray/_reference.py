@@ -59,6 +59,14 @@ class Reference:
         assert self._cur_seq is not None
         return self._cur_seq
 
+    def contig_array(self, contig: str) -> NDArray[np.uint8]:
+        """Return the full contig sequence as a cached uint8 array.
+
+        Accepts ``chr``-prefixed or unprefixed names. One contig is held in
+        memory at a time (shared with :meth:`fetch`).
+        """
+        return self._load_contig(contig)
+
     def fetch(self, contig: str, start: int, end: int) -> NDArray[np.uint8]:
         """Return reference bytes for 0-based half-open ``[start, end)``.
 

@@ -465,6 +465,7 @@ class SparseVarMetadata(BaseModel):
     contigs: list[str]
     fields: dict[str, str] = {}  # field_name -> numpy dtype name (e.g. "float32")
     mutcat_version: int | None = None  # set when annotate_mutations has run
+    mutcat_contigs: list[str] | None = None  # normalized contigs annotated; None = all
 
 
 _SRT = TypeVar("_SRT")
@@ -1472,6 +1473,7 @@ class SparseVar(Generic[_SRT]):
         self,
         reference: "Reference | str | Path",
         *,
+        contigs: "list[str] | None" = None,
         write_back: bool = True,
     ) -> None:
         """Classify every variant into SBS-96 / DBS-78 / ID-83 channels and store
@@ -1485,6 +1487,15 @@ class SparseVar(Generic[_SRT]):
         reference
             Reference genome.  A :class:`~genoray._reference.Reference` instance,
             or a path to a FASTA file (with a ``.fai`` index alongside it).
+        contigs
+            If given, only variants on these contigs are classified; entries on
+            all other contigs are marked ``NOT_ANNOTATED`` and their contigs are
+            never fetched from the reference.  Names are matched via the
+            :class:`~genoray._utils.ContigNormalizer` (so ``chr1``/``1`` both
+            work).  Requested contigs absent from the ``.svar`` index are skipped
+            with a warning.  A listed contig present in the index but absent from
+            the reference still raises (use the allowlist to exclude it instead).
+            ``None`` (default) classifies all contigs.
         write_back
             If ``True`` (default), persist ``mutcat.npy`` and update
             ``metadata.json`` on disk so that subsequent ``SparseVar(...)``
@@ -1498,8 +1509,25 @@ class SparseVar(Generic[_SRT]):
         if not isinstance(reference, Reference):
             reference = Reference.from_path(reference)
 
-        # 1. intrinsic per-variant codes
-        var_code = classify_variants(self.index, reference)
+        # 0. resolve contig scope
+        index_chroms = self.index["CHROM"].to_list()
+        if contigs is None:
+            scoped_contigs: "list[str] | None" = None
+            in_scope = np.ones(self.index.height, dtype=np.bool_)
+        else:
+            normalized = self._c_norm.norm(list(contigs))
+            unmatched = [c for c, nm in zip(contigs, normalized) if nm is None]
+            if unmatched:
+                logger.warning(
+                    f"annotate_mutations: {len(unmatched)} requested contig(s) not "
+                    f"found in the .svar index; they will be skipped: {unmatched}"
+                )
+            scope_set = {nm for nm in normalized if nm is not None}
+            scoped_contigs = sorted(scope_set)
+            in_scope = np.array([c in scope_set for c in index_chroms], dtype=np.bool_)
+
+        # 1. intrinsic per-variant codes (scoped)
+        var_code = classify_variants(self.index, reference, contigs=scoped_contigs)
 
         # 2. per-variant arrays needed by the adjacency kernel
         pos = self.index["POS"].to_numpy().astype(np.int64)
@@ -1512,6 +1540,8 @@ class SparseVar(Generic[_SRT]):
             ],
             dtype=np.bool_,
         )
+        # gate adjacency: out-of-scope variants must not be collapsed into DBS
+        is_snv &= in_scope
         # contig id per variant — equality semantics only (same contig ↔ same id)
         contig_map = {c: i for i, c in enumerate(self.contigs)}
         contig_codes = np.array(
@@ -1556,6 +1586,7 @@ class SparseVar(Generic[_SRT]):
                 meta = SparseVarMetadata.model_validate_json(f.read())
             meta.fields["mutcat"] = "int16"
             meta.mutcat_version = MUTCAT_VERSION
+            meta.mutcat_contigs = scoped_contigs
             with open(self.path / "metadata.json", "w") as f:
                 f.write(meta.model_dump_json())
 

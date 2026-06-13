@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import numba as nb
 import numpy as np
 import polars as pl
 
@@ -12,13 +13,21 @@ from genoray._mutcat import (
     SBS96,
     SENTINELS,
     SBS96_INDEX,
+    _ID1_CODE,
+    _IDM_CODE,
+    _IDR_CODE,
     _REF_MISMATCH,
+    _dbs78_codes,
+    _id83_codes_for_contig,
+    _sbs96_codes,
+    _classify_variants_scalar,
     build_entry_codes,
     classify_dbs78,
     classify_id83,
     classify_sbs96,
     classify_variants,
     code_ranges,
+    count_matrix,
 )
 from genoray._reference import Reference
 
@@ -322,3 +331,286 @@ def test_id83_insertion_no_repeat_not_mismatch():
 
     code = classify_id83(pos=0, ref=b"C", alt=b"CG", fetch=fetch)
     assert code != _REF_MISMATCH
+
+
+def test_sbs96_arithmetic_matches_codebook():
+    # The vectorized substitution LUT + arithmetic must reproduce SBS96_INDEX
+    # for every one of the 96 labels (pyrimidine-folded form, no boundary issues).
+    from genoray._mutcat import _BASE2IDX, _SUB_LUT, _BASES, _SBS_SUBS
+
+    for sub_idx, sub in enumerate(_SBS_SUBS):
+        r_char, a_char = sub[0], sub[2]
+        r, a = _BASE2IDX[ord(r_char)], _BASE2IDX[ord(a_char)]
+        assert _SUB_LUT[r, a] == sub_idx
+        for five_idx, five in enumerate(_BASES):
+            for three_idx, three in enumerate(_BASES):
+                label = f"{five}[{sub}]{three}"
+                code = sub_idx * 16 + five_idx * 4 + three_idx
+                assert code == SBS96_INDEX[label]
+
+
+def test_sbs96_codes_match_scalar_on_random_snvs():
+    rng = np.random.default_rng(0)
+    bases = np.frombuffer(b"ACGT", np.uint8)
+    n = 500
+    seq = np.frombuffer(bytes(bases[rng.integers(0, 4, 200)]), np.uint8)
+    # interior positions only so flanks exist
+    p0 = rng.integers(1, len(seq) - 1, n).astype(np.int64)
+    ref_b = seq[p0].copy()  # use the actual reference base as REF
+    alt_b = bases[rng.integers(0, 4, n)].copy()
+    got = _sbs96_codes(seq, p0, ref_b, alt_b)
+    for i in range(n):
+        five = bytes(seq[p0[i] - 1 : p0[i]])
+        three = bytes(seq[p0[i] + 1 : p0[i] + 2])
+        exp = classify_sbs96(
+            five, bytes(ref_b[i : i + 1]), bytes(alt_b[i : i + 1]), three
+        )
+        assert got[i] == exp, (i, five, ref_b[i], alt_b[i], three)
+
+
+def test_dbs78_codes_match_scalar():
+    bases = b"ACGT"
+    ref0, ref1, alt0, alt1, exp = [], [], [], [], []
+    for r0 in bases:
+        for r1 in bases:
+            for a0 in bases:
+                for a1 in bases:
+                    ref0.append(r0)
+                    ref1.append(r1)
+                    alt0.append(a0)
+                    alt1.append(a1)
+                    exp.append(classify_dbs78(bytes([r0, r1]), bytes([a0, a1])))
+    got = _dbs78_codes(
+        np.array(ref0, np.uint8),
+        np.array(ref1, np.uint8),
+        np.array(alt0, np.uint8),
+        np.array(alt1, np.uint8),
+    )
+    assert list(got) == exp
+
+
+def test_id83_luts_match_index():
+    for ki, k in enumerate(("Del", "Ins")):
+        for bi, b in enumerate(("C", "T")):
+            for r in range(6):
+                assert _ID1_CODE[ki, bi, r] == ID83_INDEX[f"1:{k}:{b}:{r}"]
+        for si, s in enumerate(("2", "3", "4", "5")):
+            for r in range(6):
+                assert _IDR_CODE[ki, si, r] == ID83_INDEX[f"{s}:{k}:R:{r}"]
+    for si, s in enumerate(("2", "3", "4", "5")):
+        cap = {"2": 1, "3": 2, "4": 3, "5": 5}[s]
+        for m in range(1, cap + 1):
+            assert _IDM_CODE[si, m] == ID83_INDEX[f"{s}:Del:M:{m}"]
+
+
+def test_id83_kernel_matches_scalar_random():
+    # Build a random contig and a set of indels; compare to classify_id83.
+    rng = np.random.default_rng(7)
+    bases = b"ACGT"
+    seq = np.frombuffer(
+        bytes(np.frombuffer(bases, np.uint8)[rng.integers(0, 4, 400)]), np.uint8
+    )
+
+    def fetch(s, e, _seq=seq):
+        out = np.full(e - s, ord("N"), np.uint8)
+        a, b = max(s, 0), min(e, len(_seq))
+        if b > a:
+            out[a - s : b - s] = _seq[a:b]
+        return bytes(out)
+
+    refs, alts, p0s = [], [], []
+    for _ in range(300):
+        p = int(rng.integers(2, len(seq) - 10))
+        anchor = bytes(seq[p : p + 1])
+        size = int(rng.integers(1, 5))
+        unit = bytes(np.frombuffer(bases, np.uint8)[rng.integers(0, 4, size)])
+        if rng.random() < 0.5:  # deletion
+            refs.append(anchor + unit)
+            alts.append(anchor)
+        else:  # insertion
+            refs.append(anchor)
+            alts.append(anchor + unit)
+        p0s.append(p)
+
+    # flat buffers for the kernel
+    ref_data = np.frombuffer(b"".join(refs), np.uint8)
+    alt_data = np.frombuffer(b"".join(alts), np.uint8)
+    ref_off = np.concatenate(([0], np.cumsum([len(r) for r in refs]))).astype(np.int64)
+    alt_off = np.concatenate(([0], np.cumsum([len(a) for a in alts]))).astype(np.int64)
+    p0 = np.array(p0s, np.int64)
+
+    got = _id83_codes_for_contig(
+        seq,
+        p0,
+        ref_data,
+        ref_off[:-1],
+        (ref_off[1:] - ref_off[:-1]),
+        alt_data,
+        alt_off[:-1],
+        (alt_off[1:] - alt_off[:-1]),
+    )
+    for i in range(len(refs)):
+        exp = classify_id83(int(p0[i]), refs[i], alts[i], fetch)
+        assert got[i] == exp, (i, refs[i], alts[i], int(p0[i]), got[i], exp)
+
+
+def _random_index_and_ref(tmp_path, rng):
+    import pysam
+
+    seq = "".join(rng.choice(list("ACGT"), size=300))
+    fa = tmp_path / "ref.fa"
+    fa.write_text(f">chr1\n{seq}\n")
+    pysam.faidx(str(fa))
+    ref = Reference.from_path(fa)
+
+    chrom, pos, refs, alts = [], [], [], []
+    for _ in range(400):
+        p = int(rng.integers(2, len(seq) - 8))  # 0-based interior
+        kind = rng.integers(0, 4)
+        anchor = seq[p]
+        if kind == 0:  # SNV
+            alt = rng.choice([b for b in "ACGT" if b != anchor])
+            refs.append(anchor)
+            alts.append(alt)
+        elif kind == 1:  # native doublet
+            refs.append(seq[p : p + 2])
+            alts.append("".join(rng.choice(list("ACGT"), 2)))
+        elif kind == 2:  # deletion
+            size = int(rng.integers(1, 4))
+            refs.append(seq[p : p + 1 + size])
+            alts.append(anchor)
+        else:  # insertion
+            size = int(rng.integers(1, 4))
+            refs.append(anchor)
+            alts.append(anchor + "".join(rng.choice(list("ACGT"), size)))
+        chrom.append("chr1")
+        pos.append(p + 1)  # store 1-based
+
+    index = pl.DataFrame(
+        {"CHROM": chrom, "POS": pos, "REF": refs, "ALT": [[a] for a in alts]}
+    )
+    return index, ref
+
+
+def test_classify_variants_matches_scalar(tmp_path):
+    rng = np.random.default_rng(123)
+    index, ref = _random_index_and_ref(tmp_path, rng)
+    got = classify_variants(index, ref)
+    exp = _classify_variants_scalar(index, ref)
+    assert list(got) == list(exp)
+
+
+def test_classify_variants_contig_boundary(tmp_path):
+    import pysam
+
+    fa = tmp_path / "ref.fa"
+    fa.write_text(">chr1\nACGT\n")
+    pysam.faidx(str(fa))
+    ref = Reference.from_path(fa)
+    # SNV at first and last base: no 5'/3' flank -> UNCLASSIFIED, matching scalar
+    index = pl.DataFrame(
+        {
+            "CHROM": ["chr1", "chr1"],
+            "POS": [1, 4],
+            "REF": ["A", "T"],
+            "ALT": [["C"], ["G"]],
+        }
+    )
+    got = classify_variants(index, ref)
+    exp = _classify_variants_scalar(index, ref)
+    assert list(got) == list(exp) == [SENTINELS["UNCLASSIFIED"]] * 2
+
+
+def test_entry_codes_thread_invariant():
+    rng = np.random.default_rng(5)
+    n_var = 200
+    var_code = rng.integers(0, 96, n_var).astype(np.int16)
+    var_pos = np.sort(rng.integers(0, 10_000, n_var)).astype(np.int64)
+    var_contig = np.zeros(n_var, np.int32)
+    var_is_snv = np.ones(n_var, np.bool_)
+    var_ref_b = np.frombuffer(b"ACGT", np.uint8)[rng.integers(0, 4, n_var)].copy()
+    var_alt_b = np.frombuffer(b"ACGT", np.uint8)[rng.integers(0, 4, n_var)].copy()
+    # 8 tracks over the variant indices
+    data = np.tile(np.arange(n_var, dtype=np.int32), 8)
+    offsets = (np.arange(9) * n_var).astype(np.int64)
+
+    args = (
+        data,
+        offsets,
+        var_code,
+        var_pos,
+        var_contig,
+        var_is_snv,
+        var_ref_b,
+        var_alt_b,
+    )
+    prev = nb.get_num_threads()
+    try:
+        nb.set_num_threads(1)
+        a = build_entry_codes(*args)
+        nb.set_num_threads(max(2, prev))
+        b = build_entry_codes(*args)
+    finally:
+        nb.set_num_threads(prev)
+    assert np.array_equal(a, b)
+
+
+def test_count_matrix_thread_invariant():
+    rng = np.random.default_rng(9)
+    n_samples, ploidy = 6, 2
+    per_track = 50
+    n_slots = n_samples * ploidy
+    entry_codes = rng.integers(0, 96, n_slots * per_track).astype(np.int16)
+    offsets = (np.arange(n_slots + 1) * per_track).astype(np.int64)
+    names = [f"s{i}" for i in range(n_samples)]
+
+    prev = nb.get_num_threads()
+    try:
+        nb.set_num_threads(1)
+        a = count_matrix(entry_codes, offsets, ploidy, n_samples, names, "SBS96", False)
+        nb.set_num_threads(max(2, prev))
+        b = count_matrix(entry_codes, offsets, ploidy, n_samples, names, "SBS96", False)
+    finally:
+        nb.set_num_threads(prev)
+    assert a.equals(b)
+
+
+def test_not_annotated_sentinel_and_version():
+    from genoray._mutcat import SENTINELS, MUTCAT_VERSION
+
+    # distinct from the existing sentinels and from MISSING (-3)
+    assert SENTINELS["NOT_ANNOTATED"] == -4
+    assert len(set(SENTINELS.values())) == len(SENTINELS)
+    # on-disk semantics changed -> version bumped
+    assert MUTCAT_VERSION == 3
+
+
+def test_classify_variants_contig_scope(tmp_path):
+    import pysam
+    import polars as pl
+    from genoray._reference import Reference
+    from genoray._mutcat import classify_variants, SENTINELS
+
+    # two contigs; chr2 is a valid SNV that WOULD classify if in scope
+    fa = tmp_path / "ref.fa"
+    fa.write_text(">chr1\nACGTACGTAC\n>chr2\nACGTACGTAC\n")
+    pysam.faidx(str(fa))
+    ref = Reference.from_path(fa)
+
+    index = pl.DataFrame(
+        {
+            "CHROM": ["chr1", "chr2"],
+            "POS": np.array([2, 2], dtype=np.int32),  # 1-based; 0-based idx 1 -> REF=C
+            "REF": ["C", "C"],
+            "ALT": [["A"], ["A"]],
+        }
+    )
+
+    # scope to chr1 only: chr2 must be NOT_ANNOTATED, chr1 must be classified
+    out = classify_variants(index, ref, contigs=["chr1"])
+    assert out[0] >= 0  # chr1 classified to a real SBS code
+    assert out[1] == SENTINELS["NOT_ANNOTATED"]
+
+    # contigs=None -> both classified (unchanged behavior)
+    out_all = classify_variants(index, ref, contigs=None)
+    assert out_all[0] >= 0 and out_all[1] >= 0

@@ -35,7 +35,7 @@ Prefer reading these over guessing:
 - `genoray/_pgen.py` — `PGEN` class: constructor, `read`, `chunk`, `read_ranges`, `chunk_ranges`, mode constants near the top of the class
 - `genoray/_svar.py` — `SparseVar`: `__init__`, `from_vcf`, `from_pgen`, `read_ranges`, `with_fields`, `annotate_mutations`, `mutation_matrix`, `assign_signatures`
 - `genoray/_signatures.py` — `cosmic_signatures`, `fit_signatures`
-- `genoray/_reference.py` — `Reference`: `from_path`, `fetch`
+- `genoray/_reference.py` — `Reference`: `from_path`, `fetch`, `contig_array`
 - `genoray/exprs.py` — the *complete* set of pre-built filter expressions (currently 7: `is_snp`, `is_indel`, `is_biallelic`, `is_symbolic`, `is_breakend`, `is_imprecise`, `ILEN`)
 
 When a signature, kwarg, or shape is unclear, **read the docstring in the
@@ -288,6 +288,7 @@ Key properties:
 
 - `from_path(fasta, contigs=None)` — `fasta` is a `str | Path`; auto-calls `pysam.faidx` if the `.fai` index is missing. `contigs` filters which contigs the caller cares about (defaults to all in the FASTA).
 - `fetch(contig, start, end)` — 0-based half-open `[start, end)`. Positions outside the contig are N-padded. Returns `NDArray[np.uint8]`.
+- `contig_array(contig)` — the full contig sequence as a cached `NDArray[np.uint8]`. Shares the one-contig-in-memory cache with `fetch`. Accepts `chr`-prefixed or unprefixed names.
 - Contig-name agnostic: `"chr1"` and `"1"` both resolve correctly (`ContigNormalizer` under the hood).
 - One contig is cached in memory at a time; sequential per-contig access is efficient.
 
@@ -312,10 +313,19 @@ svar.annotate_mutations(ref, write_back=False) # in-memory only; not persisted
 svar.annotate_mutations("hg38.fa")             # path accepted directly
 ```
 
-Signature: `annotate_mutations(reference, *, write_back=True) -> None`
+Signature: `annotate_mutations(reference, *, contigs=None, write_back=True) -> None`
 
 - `reference` — a `genoray.Reference` instance **or** a path to a FASTA file
   (auto-wraps via `Reference.from_path`).
+- `contigs=None` — if given (a list of contig names), only variants on those
+  contigs are classified; entries on all other contigs are marked
+  `NOT_ANNOTATED` (sentinel `-4`) and their contigs are never fetched from the
+  reference. Names match via the `ContigNormalizer` (`chr1`/`1` both work).
+  Requested contigs absent from the `.svar` index are skipped with a warning; a
+  listed contig present in the index but absent from the reference raises (omit
+  it from the list to exclude it cleanly). `None` (default) classifies all
+  contigs. When `write_back=True`, the normalized scope is recorded in
+  `metadata.json` as `mutcat_contigs` (`None` = all).
 - `write_back=True` — persists `mutcat.npy` and updates `metadata.json` so
   that subsequent `SparseVar(dir, fields=["mutcat"])` opens will see the field.
   **Note:** `write_view` **never** copies `mutcat` positionally to the output
@@ -336,6 +346,7 @@ What it classifies:
 | Native 2 bp MNV in the VCF | DBS-78 |
 | MNV > 2 bp, symbolic, non-ACGT | UNCLASSIFIED |
 | Insertion / deletion | ID-83 (size, repeat-context bucketing) |
+| Variant on a contig outside `contigs=` | `NOT_ANNOTATED` (excluded from all matrices) |
 
 ### `SparseVar.mutation_matrix`
 
@@ -372,6 +383,7 @@ Signature: `mutation_matrix(kind, *, count="allele") -> pl.DataFrame`
 | `-1` | `DBS_PARTNER` — 3' half of an adjacent SNV pair; never counted |
 | `-2` | `UNCLASSIFIED` — symbolic / complex / MNV > 2 bp / non-ACGT |
 | `-3` | `MISSING` — reserved sentinel (defined in the code space but not emitted by `annotate_mutations` v1; SparseVar stores only ALT-carrying entries, so no-call slots do not appear in the ragged field) |
+| `-4` | `NOT_ANNOTATED` — entry on a contig outside the `contigs=` annotation scope; never counted |
 
 To read a previously annotated file:
 

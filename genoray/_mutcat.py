@@ -8,6 +8,7 @@ from typing import Any, Literal
 import numba as nb
 import numpy as np
 import polars as pl
+import pyarrow as pa
 from loguru import logger
 from numpy.typing import NDArray
 
@@ -136,6 +137,7 @@ SENTINELS: dict[str, int] = {
     "DBS_PARTNER": -1,  # 3' half of an adjacency doublet; never counted
     "UNCLASSIFIED": -2,  # symbolic/complex/MNV>2bp/non-ACGT
     "MISSING": -3,
+    "NOT_ANNOTATED": -4,  # entry on a contig excluded from the annotation scope
 }
 
 # Internal boundary signal (NOT a public sentinel): a deletion whose deleted unit
@@ -148,7 +150,7 @@ SBS96_INDEX = {lbl: SBS96_OFFSET + i for i, lbl in enumerate(SBS96)}
 DBS78_INDEX = {lbl: DBS78_OFFSET + i for i, lbl in enumerate(DBS78)}
 ID83_INDEX = {lbl: ID83_OFFSET + i for i, lbl in enumerate(ID83)}
 
-MUTCAT_VERSION = 2
+MUTCAT_VERSION = 3
 
 _LABELS: dict[str, list[str]] = {"SBS96": SBS96, "DBS78": DBS78, "ID83": ID83}
 
@@ -307,6 +309,210 @@ def _microhomology_len(indel: bytes, downstream: bytes, ilen: int) -> int:
 _BASE2IDX = np.full(256, -1, dtype=np.int64)
 _BASE2IDX[[ord("A"), ord("C"), ord("G"), ord("T")]] = [0, 1, 2, 3]
 
+# (ref_idx, alt_idx) -> SBS substitution index 0..5, for pyrimidine-folded refs.
+# _SBS_SUBS order: C>A, C>G, C>T, T>A, T>C, T>G  (encoding A=0,C=1,G=2,T=3)
+_SUB_LUT = np.full((4, 4), -1, dtype=np.int64)
+for _si, _sub in enumerate(_SBS_SUBS):
+    _SUB_LUT[_BASE2IDX[ord(_sub[0])], _BASE2IDX[ord(_sub[2])]] = _si
+
+_UNCL = np.int16(SENTINELS["UNCLASSIFIED"])
+
+
+def _sbs96_codes(
+    seq: NDArray[np.uint8],
+    p0: NDArray[np.int64],
+    ref_b: NDArray[np.uint8],
+    alt_b: NDArray[np.uint8],
+) -> NDArray[np.int16]:
+    """SBS-96 codes for SNVs on one contig. ``p0`` is the 0-based REF position."""
+    n = len(seq)
+    r = _BASE2IDX[ref_b]
+    a = _BASE2IDX[alt_b]
+    fpos = p0 - 1
+    tpos = p0 + 1
+    in_f = (fpos >= 0) & (fpos < n)
+    in_t = (tpos >= 0) & (tpos < n)
+    f = _BASE2IDX[seq[np.clip(fpos, 0, n - 1)]]
+    t = _BASE2IDX[seq[np.clip(tpos, 0, n - 1)]]
+    valid = (r >= 0) & (a >= 0) & (f >= 0) & (t >= 0) & (r != a) & in_f & in_t
+    purine = (r == 0) | (r == 2)  # A or G
+    rr = np.where(purine, 3 - r, r)
+    aa = np.where(purine, 3 - a, a)
+    # flanks swap and complement when folding: new 5' = comp(old 3'), new 3' = comp(old 5')
+    ff = np.where(purine, 3 - t, f)
+    tt = np.where(purine, 3 - f, t)
+    sub = _SUB_LUT[np.clip(rr, 0, 3), np.clip(aa, 0, 3)]
+    code = (sub * 16 + ff * 4 + tt).astype(np.int16)
+    return np.where(valid, code, _UNCL)
+
+
+def _dbs78_codes(
+    ref_b0: NDArray[np.uint8],
+    ref_b1: NDArray[np.uint8],
+    alt_b0: NDArray[np.uint8],
+    alt_b1: NDArray[np.uint8],
+) -> NDArray[np.int16]:
+    """DBS-78 codes for native 2bp doublets (context-free table lookup)."""
+    r0 = _BASE2IDX[ref_b0]
+    r1 = _BASE2IDX[ref_b1]
+    a0 = _BASE2IDX[alt_b0]
+    a1 = _BASE2IDX[alt_b1]
+    valid = (r0 >= 0) & (r1 >= 0) & (a0 >= 0) & (a1 >= 0)
+    code = _DBS_TABLE[
+        np.clip(r0, 0, 3), np.clip(r1, 0, 3), np.clip(a0, 0, 3), np.clip(a1, 0, 3)
+    ]
+    return np.where(valid, code, _UNCL)
+
+
+def _build_id83_luts() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    u = SENTINELS["UNCLASSIFIED"]
+    id1 = np.full((2, 2, 6), u, dtype=np.int16)  # [kind(Del,Ins), base(C,T), rep]
+    idr = np.full((2, 4, 6), u, dtype=np.int16)  # [kind, size_bucket(2..5), rep]
+    idm = np.full((4, 6), u, dtype=np.int16)  # [size_bucket(2..5), mh]
+    for ki, k in enumerate(("Del", "Ins")):
+        for bi, b in enumerate(("C", "T")):
+            for r in range(6):
+                id1[ki, bi, r] = ID83_INDEX[f"1:{k}:{b}:{r}"]
+        for si, s in enumerate(("2", "3", "4", "5")):
+            for r in range(6):
+                idr[ki, si, r] = ID83_INDEX[f"{s}:{k}:R:{r}"]
+    for si, (s, cap) in enumerate((("2", 1), ("3", 2), ("4", 3), ("5", 5))):
+        for m in range(1, cap + 1):
+            idm[si, m] = ID83_INDEX[f"{s}:Del:M:{m}"]
+    return id1, idr, idm
+
+
+_ID1_CODE, _IDR_CODE, _IDM_CODE = _build_id83_luts()
+_MH_CAP = np.array([1, 2, 3, 5], dtype=np.int64)  # by size bucket 2,3,4,5
+
+
+@nb.njit(parallel=True, nogil=True, cache=True)
+def _id83_kernel(
+    seq: NDArray[np.uint8],
+    p0: NDArray[np.int64],
+    ref_data: NDArray[np.uint8],
+    ref_s: NDArray[np.int64],
+    ref_len: NDArray[np.int64],
+    alt_data: NDArray[np.uint8],
+    alt_s: NDArray[np.int64],
+    alt_len: NDArray[np.int64],
+    base2idx: NDArray[np.int64],
+    id1: NDArray[np.int16],
+    idr: NDArray[np.int16],
+    idm: NDArray[np.int16],
+    mh_cap: NDArray[np.int64],
+    uncl: np.int16,
+    ref_mismatch: np.int16,
+    out: NDArray[np.int16],
+) -> None:
+    n = len(seq)
+    for k in nb.prange(len(p0)):  # type: ignore[misc]
+        rs, asz = ref_s[k], alt_s[k]
+        rl, al = ref_len[k], alt_len[k]
+        if rl == 0 or al == 0 or ref_data[rs] != alt_data[asz]:
+            out[k] = uncl
+            continue
+        is_del = rl > al
+        if is_del:
+            buf, us, ilen = ref_data, rs + 1, rl - 1
+        else:
+            buf, us, ilen = alt_data, asz + 1, al - 1
+        ok = True
+        for i in range(ilen):
+            if base2idx[buf[us + i]] < 0:
+                ok = False
+                break
+        if not ok:
+            out[k] = uncl
+            continue
+        # count tandem repeats of the unit downstream from p0+1
+        scan = p0[k] + 1
+        n_rep = 0
+        i = 0
+        while scan + i + ilen <= n:
+            match = True
+            for j in range(ilen):
+                if seq[scan + i + j] != buf[us + j]:
+                    match = False
+                    break
+            if not match:
+                break
+            n_rep += 1
+            i += ilen
+        if ilen == 1:
+            bi = base2idx[buf[us]]
+            if bi == 0 or bi == 2:  # A or G -> fold to pyrimidine partner
+                bi = 3 - bi
+            base_idx = 0 if bi == 1 else 1  # C->0, T->1
+            if is_del and n_rep == 0:
+                out[k] = ref_mismatch
+                continue
+            rep = n_rep - 1 if is_del else n_rep
+            if rep > 5:
+                rep = 5
+            out[k] = id1[0 if is_del else 1, base_idx, rep]
+            continue
+        sb = ilen if ilen < 5 else 5
+        si = sb - 2  # 0..3
+        if is_del:
+            mh = 0
+            for kk in range(1, ilen):
+                eq = True
+                for j in range(kk):
+                    if scan + j >= n or seq[scan + j] != buf[us + j]:
+                        eq = False
+                        break
+                if eq:
+                    mh = kk
+            if mh > 0 and n_rep <= 1:
+                cap = mh_cap[si]
+                m = mh if mh < cap else cap
+                out[k] = idm[si, m]
+                continue
+            if n_rep == 0:
+                out[k] = ref_mismatch
+                continue
+            rep = n_rep - 1
+        else:
+            rep = n_rep
+        if rep > 5:
+            rep = 5
+        out[k] = idr[0 if is_del else 1, si, rep]
+
+
+def _id83_codes_for_contig(
+    seq: NDArray[np.uint8],
+    p0: NDArray[np.int64],
+    ref_data: NDArray[np.uint8],
+    ref_s: NDArray[np.int64],
+    ref_len: NDArray[np.int64],
+    alt_data: NDArray[np.uint8],
+    alt_s: NDArray[np.int64],
+    alt_len: NDArray[np.int64],
+) -> NDArray[np.int16]:
+    """ID-83 codes for indels on one contig. May return ``_REF_MISMATCH``
+    entries, which the caller maps to UNCLASSIFIED with a warning."""
+    out = np.empty(len(p0), dtype=np.int16)
+    _id83_kernel(
+        np.ascontiguousarray(seq),
+        np.ascontiguousarray(p0),
+        np.ascontiguousarray(ref_data),
+        np.ascontiguousarray(ref_s),
+        np.ascontiguousarray(ref_len),
+        np.ascontiguousarray(alt_data),
+        np.ascontiguousarray(alt_s),
+        np.ascontiguousarray(alt_len),
+        _BASE2IDX,
+        _ID1_CODE,
+        _IDR_CODE,
+        _IDM_CODE,
+        _MH_CAP,
+        np.int16(SENTINELS["UNCLASSIFIED"]),
+        np.int16(_REF_MISMATCH),
+        out,
+    )
+    return out
+
 
 def _build_dbs_table() -> np.ndarray:
     """tbl[r0, r1, a0, a1] -> DBS-78 code or UNCLASSIFIED for doublets not in
@@ -327,7 +533,7 @@ _DBS_TABLE = _build_dbs_table()
 _DBS_PARTNER = SENTINELS["DBS_PARTNER"]
 
 
-@nb.njit(nogil=True, cache=True)
+@nb.njit(parallel=True, nogil=True, cache=True)
 def _entry_codes_kernel(
     data: NDArray[np.int32],
     offsets: NDArray[np.int64],
@@ -341,7 +547,7 @@ def _entry_codes_kernel(
     out: NDArray[np.int16],
     dbs_partner: np.int16,
 ):
-    for slot in range(len(offsets) - 1):
+    for slot in nb.prange(len(offsets) - 1):  # type: ignore[misc]
         o_s, o_e = offsets[slot], offsets[slot + 1]
         j = o_s
         while j < o_e:
@@ -419,7 +625,7 @@ def build_entry_codes(
     return out
 
 
-@nb.njit(nogil=True, cache=True)
+@nb.njit(parallel=True, nogil=True, cache=True)
 def _count_kernel(
     data_codes: NDArray[np.int16],
     offsets: NDArray[np.int64],
@@ -431,21 +637,20 @@ def _count_kernel(
 ) -> None:
     """out[sample, code] accumulator over genotype entries.
 
-    ``data_codes`` is the per-entry int16 code array (aligned to genos.data).
+    Parallelized over samples: each thread owns a disjoint row of ``out``.
     When ``per_sample`` is True, a code is counted at most once per sample.
     """
-    for slot in range(len(offsets) - 1):
-        sample = slot // ploidy
-        o_s, o_e = offsets[slot], offsets[slot + 1]
-        for j in range(o_s, o_e):
-            code = data_codes[j]
-            if code < 0 or code >= n_codes:
-                continue
-            if per_sample:
-                if out[sample, code] == 0:
+    for sample in nb.prange(n_samples):  # type: ignore[misc]
+        for slot in range(sample * ploidy, (sample + 1) * ploidy):
+            o_s, o_e = offsets[slot], offsets[slot + 1]
+            for j in range(o_s, o_e):
+                code = data_codes[j]
+                if code < 0 or code >= n_codes:
+                    continue
+                if per_sample:
                     out[sample, code] = 1
-            else:
-                out[sample, code] += 1
+                else:
+                    out[sample, code] += 1
 
 
 def count_matrix(
@@ -475,7 +680,7 @@ def count_matrix(
     return pl.DataFrame(out)
 
 
-def classify_variants(index: pl.DataFrame, reference: Reference) -> np.ndarray:
+def _classify_variants_scalar(index: pl.DataFrame, reference: Reference) -> np.ndarray:
     """Return an int16 array of intrinsic mutation codes, one per row of ``index``.
 
     ``index`` must have columns CHROM, POS (1-based int, VCF convention), REF
@@ -527,6 +732,123 @@ def classify_variants(index: pl.DataFrame, reference: Reference) -> np.ndarray:
         examples = ", ".join(mismatch_examples)
         logger.warning(
             f"{n_mismatch}/{index.height} deletions have REF disagreeing with the "
+            f"reference genome at their position (e.g. {examples}) — wrong reference "
+            "build? These were marked UNCLASSIFIED."
+        )
+
+    return out
+
+
+def _utf8_flat(
+    s: "pl.Series",
+) -> tuple[NDArray[np.uint8], NDArray[np.int64], NDArray[np.bool_]]:
+    """Zero-copy flat byte buffer + int64 offsets + not-null mask for a Utf8 series."""
+    arr = s.rechunk().to_arrow()
+    if isinstance(arr, pa.ChunkedArray):
+        arr = arr.combine_chunks()
+    assert arr.offset == 0
+    bufs = arr.buffers()
+    offsets = np.frombuffer(bufs[1], dtype=np.int64)[: len(s) + 1]
+    data = (
+        np.frombuffer(bufs[2], dtype=np.uint8)
+        if bufs[2] is not None
+        else np.empty(0, dtype=np.uint8)
+    )
+    not_null = s.is_not_null().to_numpy()
+    return data, offsets, not_null
+
+
+def classify_variants(
+    index: pl.DataFrame,
+    reference: Reference,
+    contigs: list[str] | None = None,
+) -> np.ndarray:
+    """Return an int16 array of intrinsic mutation codes, one per row of ``index``.
+
+    Vectorized: SNV->SBS-96 and native 2bp doublet->DBS-78 via numpy; indels->ID-83
+    via a parallel numba kernel. ``index`` must have columns CHROM, POS (1-based),
+    REF (str), ALT (List[str]; first used). POS is converted to 0-based internally.
+
+    ``contigs`` restricts annotation to the listed contigs (names must match the
+    index ``CHROM`` naming scheme exactly; the caller normalizes them). Rows on
+    contigs outside the allowlist are set to ``NOT_ANNOTATED`` and their contigs
+    are never fetched. ``None`` (default) annotates all contigs.
+    """
+    n = index.height
+    chrom = index["CHROM"].to_numpy()
+    if contigs is None:
+        scope: set[str] | None = None
+        out = np.full(n, SENTINELS["UNCLASSIFIED"], dtype=np.int16)
+    else:
+        scope = set(map(str, contigs))
+        in_scope = np.array([str(c) in scope for c in chrom], dtype=np.bool_)
+        out = np.where(
+            in_scope, SENTINELS["UNCLASSIFIED"], SENTINELS["NOT_ANNOTATED"]
+        ).astype(np.int16)
+    if n == 0:
+        return out
+    pos0 = index["POS"].to_numpy().astype(np.int64) - 1  # 1-based -> 0-based
+    ref_data, ref_off, ref_nn = _utf8_flat(index["REF"])
+    alt_data, alt_off, alt_nn = _utf8_flat(index["ALT"].list.first())
+
+    rlen = (ref_off[1:] - ref_off[:-1]).astype(np.int64)
+    alen = (alt_off[1:] - alt_off[:-1]).astype(np.int64)
+    valid_row = ref_nn & alt_nn
+    snv_mask = valid_row & (rlen == 1) & (alen == 1)
+    dbs_mask = valid_row & (rlen == 2) & (alen == 2)
+    indel_mask = valid_row & (rlen != alen)
+    n_indel = int(indel_mask.sum())
+
+    n_mismatch = 0
+    mismatch_examples: list[str] = []
+
+    uniq, inv = np.unique(chrom, return_inverse=True)
+    for gi, c in enumerate(uniq):
+        if scope is not None and str(c) not in scope:
+            continue
+        rows = np.nonzero(inv == gi)[0]
+        seq = reference.contig_array(str(c))
+
+        s_rows = rows[snv_mask[rows]]
+        if len(s_rows):
+            out[s_rows] = _sbs96_codes(
+                seq, pos0[s_rows], ref_data[ref_off[s_rows]], alt_data[alt_off[s_rows]]
+            )
+
+        d_rows = rows[dbs_mask[rows]]
+        if len(d_rows):
+            sr, sa = ref_off[d_rows], alt_off[d_rows]
+            out[d_rows] = _dbs78_codes(
+                ref_data[sr], ref_data[sr + 1], alt_data[sa], alt_data[sa + 1]
+            )
+
+        i_rows = rows[indel_mask[rows]]
+        if len(i_rows):
+            codes = _id83_codes_for_contig(
+                seq,
+                pos0[i_rows],
+                ref_data,
+                ref_off[i_rows],
+                rlen[i_rows],
+                alt_data,
+                alt_off[i_rows],
+                alen[i_rows],
+            )
+            mm = codes == _REF_MISMATCH
+            if mm.any():
+                mm_rows = i_rows[mm]
+                n_mismatch += int(mm.sum())
+                for ri in mm_rows[:5]:
+                    if len(mismatch_examples) < 5:
+                        mismatch_examples.append(f"{chrom[ri]}:{int(pos0[ri]) + 1}")
+                codes = codes.copy()
+                codes[mm] = SENTINELS["UNCLASSIFIED"]
+            out[i_rows] = codes
+
+    if n_mismatch:
+        examples = ", ".join(mismatch_examples)
+        logger.warning(
+            f"{n_mismatch}/{n_indel} deletions have REF disagreeing with the "
             f"reference genome at their position (e.g. {examples}) — wrong reference "
             "build? These were marked UNCLASSIFIED."
         )
