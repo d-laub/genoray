@@ -781,6 +781,7 @@ def classify_variants(index: pl.DataFrame, reference: Reference) -> np.ndarray:
     snv_mask = valid_row & (rlen == 1) & (alen == 1)
     dbs_mask = valid_row & (rlen == 2) & (alen == 2)
     indel_mask = valid_row & (rlen != alen)
+    n_indel = int(indel_mask.sum())
 
     n_mismatch = 0
     mismatch_examples: list[str] = []
@@ -829,7 +830,7 @@ def classify_variants(index: pl.DataFrame, reference: Reference) -> np.ndarray:
     if n_mismatch:
         examples = ", ".join(mismatch_examples)
         logger.warning(
-            f"{n_mismatch}/{n} deletions have REF disagreeing with the "
+            f"{n_mismatch}/{n_indel} deletions have REF disagreeing with the "
             f"reference genome at their position (e.g. {examples}) — wrong reference "
             "build? These were marked UNCLASSIFIED."
         )
