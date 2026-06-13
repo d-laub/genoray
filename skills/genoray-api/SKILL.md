@@ -313,10 +313,19 @@ svar.annotate_mutations(ref, write_back=False) # in-memory only; not persisted
 svar.annotate_mutations("hg38.fa")             # path accepted directly
 ```
 
-Signature: `annotate_mutations(reference, *, write_back=True) -> None`
+Signature: `annotate_mutations(reference, *, contigs=None, write_back=True) -> None`
 
 - `reference` — a `genoray.Reference` instance **or** a path to a FASTA file
   (auto-wraps via `Reference.from_path`).
+- `contigs=None` — if given (a list of contig names), only variants on those
+  contigs are classified; entries on all other contigs are marked
+  `NOT_ANNOTATED` (sentinel `-4`) and their contigs are never fetched from the
+  reference. Names match via the `ContigNormalizer` (`chr1`/`1` both work).
+  Requested contigs absent from the `.svar` index are skipped with a warning; a
+  listed contig present in the index but absent from the reference raises (omit
+  it from the list to exclude it cleanly). `None` (default) classifies all
+  contigs. When `write_back=True`, the normalized scope is recorded in
+  `metadata.json` as `mutcat_contigs` (`None` = all).
 - `write_back=True` — persists `mutcat.npy` and updates `metadata.json` so
   that subsequent `SparseVar(dir, fields=["mutcat"])` opens will see the field.
   **Note:** `write_view` **never** copies `mutcat` positionally to the output
@@ -337,6 +346,7 @@ What it classifies:
 | Native 2 bp MNV in the VCF | DBS-78 |
 | MNV > 2 bp, symbolic, non-ACGT | UNCLASSIFIED |
 | Insertion / deletion | ID-83 (size, repeat-context bucketing) |
+| Variant on a contig outside `contigs=` | `NOT_ANNOTATED` (excluded from all matrices) |
 
 ### `SparseVar.mutation_matrix`
 
@@ -373,6 +383,7 @@ Signature: `mutation_matrix(kind, *, count="allele") -> pl.DataFrame`
 | `-1` | `DBS_PARTNER` — 3' half of an adjacent SNV pair; never counted |
 | `-2` | `UNCLASSIFIED` — symbolic / complex / MNV > 2 bp / non-ACGT |
 | `-3` | `MISSING` — reserved sentinel (defined in the code space but not emitted by `annotate_mutations` v1; SparseVar stores only ALT-carrying entries, so no-call slots do not appear in the ragged field) |
+| `-4` | `NOT_ANNOTATED` — entry on a contig outside the `contigs=` annotation scope; never counted |
 
 To read a previously annotated file:
 
