@@ -307,6 +307,42 @@ def _microhomology_len(indel: bytes, downstream: bytes, ilen: int) -> int:
 _BASE2IDX = np.full(256, -1, dtype=np.int64)
 _BASE2IDX[[ord("A"), ord("C"), ord("G"), ord("T")]] = [0, 1, 2, 3]
 
+# (ref_idx, alt_idx) -> SBS substitution index 0..5, for pyrimidine-folded refs.
+# _SBS_SUBS order: C>A, C>G, C>T, T>A, T>C, T>G  (encoding A=0,C=1,G=2,T=3)
+_SUB_LUT = np.full((4, 4), -1, dtype=np.int64)
+for _si, _sub in enumerate(_SBS_SUBS):
+    _SUB_LUT[_BASE2IDX[ord(_sub[0])], _BASE2IDX[ord(_sub[2])]] = _si
+
+_UNCL = np.int16(SENTINELS["UNCLASSIFIED"])
+
+
+def _sbs96_codes(
+    seq: NDArray[np.uint8],
+    p0: NDArray[np.int64],
+    ref_b: NDArray[np.uint8],
+    alt_b: NDArray[np.uint8],
+) -> NDArray[np.int16]:
+    """SBS-96 codes for SNVs on one contig. ``p0`` is the 0-based REF position."""
+    n = len(seq)
+    r = _BASE2IDX[ref_b]
+    a = _BASE2IDX[alt_b]
+    fpos = p0 - 1
+    tpos = p0 + 1
+    in_f = (fpos >= 0) & (fpos < n)
+    in_t = (tpos >= 0) & (tpos < n)
+    f = _BASE2IDX[seq[np.clip(fpos, 0, n - 1)]]
+    t = _BASE2IDX[seq[np.clip(tpos, 0, n - 1)]]
+    valid = (r >= 0) & (a >= 0) & (f >= 0) & (t >= 0) & (r != a) & in_f & in_t
+    purine = (r == 0) | (r == 2)  # A or G
+    rr = np.where(purine, 3 - r, r)
+    aa = np.where(purine, 3 - a, a)
+    # flanks swap and complement when folding: new 5' = comp(old 3'), new 3' = comp(old 5')
+    ff = np.where(purine, 3 - t, f)
+    tt = np.where(purine, 3 - f, t)
+    sub = _SUB_LUT[np.clip(rr, 0, 3), np.clip(aa, 0, 3)]
+    code = (sub * 16 + ff * 4 + tt).astype(np.int16)
+    return np.where(valid, code, _UNCL)
+
 
 def _build_dbs_table() -> np.ndarray:
     """tbl[r0, r1, a0, a1] -> DBS-78 code or UNCLASSIFIED for doublets not in

@@ -322,3 +322,41 @@ def test_id83_insertion_no_repeat_not_mismatch():
 
     code = classify_id83(pos=0, ref=b"C", alt=b"CG", fetch=fetch)
     assert code != _REF_MISMATCH
+
+
+from genoray._mutcat import _sbs96_codes  # noqa: E402
+
+
+def test_sbs96_arithmetic_matches_codebook():
+    # The vectorized substitution LUT + arithmetic must reproduce SBS96_INDEX
+    # for every one of the 96 labels (pyrimidine-folded form, no boundary issues).
+    from genoray._mutcat import _BASE2IDX, _SUB_LUT, _BASES, _SBS_SUBS
+
+    for sub_idx, sub in enumerate(_SBS_SUBS):
+        r_char, a_char = sub[0], sub[2]
+        r, a = _BASE2IDX[ord(r_char)], _BASE2IDX[ord(a_char)]
+        assert _SUB_LUT[r, a] == sub_idx
+        for five_idx, five in enumerate(_BASES):
+            for three_idx, three in enumerate(_BASES):
+                label = f"{five}[{sub}]{three}"
+                code = sub_idx * 16 + five_idx * 4 + three_idx
+                assert code == SBS96_INDEX[label]
+
+
+def test_sbs96_codes_match_scalar_on_random_snvs():
+    rng = np.random.default_rng(0)
+    bases = np.frombuffer(b"ACGT", np.uint8)
+    n = 500
+    seq = np.frombuffer(bytes(bases[rng.integers(0, 4, 200)]), np.uint8)
+    # interior positions only so flanks exist
+    p0 = rng.integers(1, len(seq) - 1, n).astype(np.int64)
+    ref_b = seq[p0].copy()  # ref must equal reference base is NOT required by classify,
+    alt_b = bases[rng.integers(0, 4, n)].copy()
+    got = _sbs96_codes(seq, p0, ref_b, alt_b)
+    for i in range(n):
+        five = bytes(seq[p0[i] - 1 : p0[i]])
+        three = bytes(seq[p0[i] + 1 : p0[i] + 2])
+        exp = classify_sbs96(
+            five, bytes(ref_b[i : i + 1]), bytes(alt_b[i : i + 1]), three
+        )
+        assert got[i] == exp, (i, five, ref_b[i], alt_b[i], three)
