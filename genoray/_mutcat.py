@@ -624,7 +624,7 @@ def build_entry_codes(
     return out
 
 
-@nb.njit(nogil=True, cache=True)
+@nb.njit(parallel=True, nogil=True, cache=True)
 def _count_kernel(
     data_codes: NDArray[np.int16],
     offsets: NDArray[np.int64],
@@ -636,21 +636,20 @@ def _count_kernel(
 ) -> None:
     """out[sample, code] accumulator over genotype entries.
 
-    ``data_codes`` is the per-entry int16 code array (aligned to genos.data).
+    Parallelized over samples: each thread owns a disjoint row of ``out``.
     When ``per_sample`` is True, a code is counted at most once per sample.
     """
-    for slot in range(len(offsets) - 1):
-        sample = slot // ploidy
-        o_s, o_e = offsets[slot], offsets[slot + 1]
-        for j in range(o_s, o_e):
-            code = data_codes[j]
-            if code < 0 or code >= n_codes:
-                continue
-            if per_sample:
-                if out[sample, code] == 0:
+    for sample in nb.prange(n_samples):  # type: ignore[misc]
+        for slot in range(sample * ploidy, (sample + 1) * ploidy):
+            o_s, o_e = offsets[slot], offsets[slot + 1]
+            for j in range(o_s, o_e):
+                code = data_codes[j]
+                if code < 0 or code >= n_codes:
+                    continue
+                if per_sample:
                     out[sample, code] = 1
-            else:
-                out[sample, code] += 1
+                else:
+                    out[sample, code] += 1
 
 
 def count_matrix(

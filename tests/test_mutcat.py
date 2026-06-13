@@ -27,6 +27,7 @@ from genoray._mutcat import (
     classify_sbs96,
     classify_variants,
     code_ranges,
+    count_matrix,
 )
 from genoray._reference import Reference
 
@@ -552,3 +553,23 @@ def test_entry_codes_thread_invariant():
     finally:
         nb.set_num_threads(prev)
     assert np.array_equal(a, b)
+
+
+def test_count_matrix_thread_invariant():
+    rng = np.random.default_rng(9)
+    n_samples, ploidy = 6, 2
+    per_track = 50
+    n_slots = n_samples * ploidy
+    entry_codes = rng.integers(0, 96, n_slots * per_track).astype(np.int16)
+    offsets = (np.arange(n_slots + 1) * per_track).astype(np.int64)
+    names = [f"s{i}" for i in range(n_samples)]
+
+    prev = nb.get_num_threads()
+    try:
+        nb.set_num_threads(1)
+        a = count_matrix(entry_codes, offsets, ploidy, n_samples, names, "SBS96", False)
+        nb.set_num_threads(max(2, prev))
+        b = count_matrix(entry_codes, offsets, ploidy, n_samples, names, "SBS96", False)
+    finally:
+        nb.set_num_threads(prev)
+    assert a.equals(b)
