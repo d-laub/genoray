@@ -583,3 +583,34 @@ def test_not_annotated_sentinel_and_version():
     assert len(set(SENTINELS.values())) == len(SENTINELS)
     # on-disk semantics changed -> version bumped
     assert MUTCAT_VERSION == 3
+
+
+def test_classify_variants_contig_scope(tmp_path):
+    import pysam
+    import polars as pl
+    from genoray._reference import Reference
+    from genoray._mutcat import classify_variants, SENTINELS
+
+    # two contigs; chr2 is a valid SNV that WOULD classify if in scope
+    fa = tmp_path / "ref.fa"
+    fa.write_text(">chr1\nACGTACGTAC\n>chr2\nACGTACGTAC\n")
+    pysam.faidx(str(fa))
+    ref = Reference.from_path(fa)
+
+    index = pl.DataFrame(
+        {
+            "CHROM": ["chr1", "chr2"],
+            "POS": np.array([2, 2], dtype=np.int32),  # 1-based; 0-based idx 1 -> REF=C
+            "REF": ["C", "C"],
+            "ALT": [["A"], ["A"]],
+        }
+    )
+
+    # scope to chr1 only: chr2 must be NOT_ANNOTATED, chr1 must be classified
+    out = classify_variants(index, ref, contigs=["chr1"])
+    assert out[0] >= 0  # chr1 classified to a real SBS code
+    assert out[1] == SENTINELS["NOT_ANNOTATED"]
+
+    # contigs=None -> both classified (unchanged behavior)
+    out_all = classify_variants(index, ref, contigs=None)
+    assert out_all[0] >= 0 and out_all[1] >= 0

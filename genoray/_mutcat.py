@@ -758,19 +758,35 @@ def _utf8_flat(
     return data, offsets, not_null
 
 
-def classify_variants(index: pl.DataFrame, reference: Reference) -> np.ndarray:
+def classify_variants(
+    index: pl.DataFrame,
+    reference: Reference,
+    contigs: list[str] | None = None,
+) -> np.ndarray:
     """Return an int16 array of intrinsic mutation codes, one per row of ``index``.
 
     Vectorized: SNV->SBS-96 and native 2bp doublet->DBS-78 via numpy; indels->ID-83
     via a parallel numba kernel. ``index`` must have columns CHROM, POS (1-based),
     REF (str), ALT (List[str]; first used). POS is converted to 0-based internally.
+
+    ``contigs`` restricts annotation to the listed contigs (names must match the
+    index ``CHROM`` naming scheme exactly; the caller normalizes them). Rows on
+    contigs outside the allowlist are set to ``NOT_ANNOTATED`` and their contigs
+    are never fetched. ``None`` (default) annotates all contigs.
     """
     n = index.height
-    out = np.full(n, SENTINELS["UNCLASSIFIED"], dtype=np.int16)
+    chrom = index["CHROM"].to_numpy()
+    if contigs is None:
+        scope: set[str] | None = None
+        out = np.full(n, SENTINELS["UNCLASSIFIED"], dtype=np.int16)
+    else:
+        scope = set(map(str, contigs))
+        in_scope = np.array([str(c) in scope for c in chrom], dtype=np.bool_)
+        out = np.where(
+            in_scope, SENTINELS["UNCLASSIFIED"], SENTINELS["NOT_ANNOTATED"]
+        ).astype(np.int16)
     if n == 0:
         return out
-
-    chrom = index["CHROM"].to_numpy()
     pos0 = index["POS"].to_numpy().astype(np.int64) - 1  # 1-based -> 0-based
     ref_data, ref_off, ref_nn = _utf8_flat(index["REF"])
     alt_data, alt_off, alt_nn = _utf8_flat(index["ALT"].list.first())
@@ -788,6 +804,8 @@ def classify_variants(index: pl.DataFrame, reference: Reference) -> np.ndarray:
 
     uniq, inv = np.unique(chrom, return_inverse=True)
     for gi, c in enumerate(uniq):
+        if scope is not None and str(c) not in scope:
+            continue
         rows = np.nonzero(inv == gi)[0]
         seq = reference.contig_array(str(c))
 
