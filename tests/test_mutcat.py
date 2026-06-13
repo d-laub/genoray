@@ -13,6 +13,7 @@ from genoray._mutcat import (
     SENTINELS,
     SBS96_INDEX,
     _REF_MISMATCH,
+    _sbs96_codes,
     build_entry_codes,
     classify_dbs78,
     classify_id83,
@@ -324,9 +325,6 @@ def test_id83_insertion_no_repeat_not_mismatch():
     assert code != _REF_MISMATCH
 
 
-from genoray._mutcat import _sbs96_codes  # noqa: E402
-
-
 def test_sbs96_arithmetic_matches_codebook():
     # The vectorized substitution LUT + arithmetic must reproduce SBS96_INDEX
     # for every one of the 96 labels (pyrimidine-folded form, no boundary issues).
@@ -350,7 +348,7 @@ def test_sbs96_codes_match_scalar_on_random_snvs():
     seq = np.frombuffer(bytes(bases[rng.integers(0, 4, 200)]), np.uint8)
     # interior positions only so flanks exist
     p0 = rng.integers(1, len(seq) - 1, n).astype(np.int64)
-    ref_b = seq[p0].copy()  # ref must equal reference base is NOT required by classify,
+    ref_b = seq[p0].copy()  # use the actual reference base as REF
     alt_b = bases[rng.integers(0, 4, n)].copy()
     got = _sbs96_codes(seq, p0, ref_b, alt_b)
     for i in range(n):
