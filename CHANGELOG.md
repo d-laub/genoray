@@ -1,3 +1,11 @@
+## 2.11.1 (2026-06-13)
+
+### Fix
+
+- **svar**: convert 1-based POS to 0-based in classify_variants (#59)
+- **mutcat**: guard deletion repeat bucket against REF/reference mismatch
+- **svar**: bump MUTCAT_VERSION and warn on stale persisted mutcat
+
 ## 2.11.0 (2026-06-12)
 
 ### Feat
