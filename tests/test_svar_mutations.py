@@ -427,6 +427,34 @@ def test_issue59_deletion_no_longer_crashes(tmp_path):
     assert len(id83_codes) == 1
 
 
+def test_mutation_matrix_thread_invariant(tmp_path):
+    import numba as nb
+
+    # Inline the same construction used by the annotated_svar fixture.
+    fa = tmp_path / "ref.fa"
+    fa.write_text(">chr1\nACGTACGTAC\n")
+    pysam.faidx(str(fa))
+    svar_dir = tmp_path / "tiny.svar"
+    _build_tiny_svar(svar_dir)
+    ref = Reference.from_path(fa)
+
+    prev = nb.get_num_threads()
+    try:
+        nb.set_num_threads(1)
+        svar = SparseVar(svar_dir)
+        svar.annotate_mutations(ref, write_back=True)
+        a = SparseVar(svar_dir, fields=["mutcat"]).mutation_matrix("SBS96")
+
+        nb.set_num_threads(max(2, prev))
+        svar2 = SparseVar(svar_dir)
+        svar2.annotate_mutations(ref, write_back=True)
+        b = SparseVar(svar_dir, fields=["mutcat"]).mutation_matrix("SBS96")
+    finally:
+        nb.set_num_threads(prev)
+
+    assert a.equals(b), "mutation_matrix('SBS96') differs between 1 and >=2 threads"
+
+
 def test_classify_variants_snv_context_uses_pos_minus_one(tmp_path):
     import polars as pl
 
