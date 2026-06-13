@@ -35,7 +35,7 @@ Prefer reading these over guessing:
 - `genoray/_pgen.py` — `PGEN` class: constructor, `read`, `chunk`, `read_ranges`, `chunk_ranges`, mode constants near the top of the class
 - `genoray/_svar.py` — `SparseVar`: `__init__`, `from_vcf`, `from_pgen`, `read_ranges`, `with_fields`, `annotate_mutations`, `mutation_matrix`, `assign_signatures`
 - `genoray/_signatures.py` — `cosmic_signatures`, `fit_signatures`
-- `genoray/_reference.py` — `Reference`: `from_path`, `fetch`
+- `genoray/_reference.py` — `Reference`: `from_path`, `fetch`, `contig_array`
 - `genoray/exprs.py` — the *complete* set of pre-built filter expressions (currently 7: `is_snp`, `is_indel`, `is_biallelic`, `is_symbolic`, `is_breakend`, `is_imprecise`, `ILEN`)
 
 When a signature, kwarg, or shape is unclear, **read the docstring in the
@@ -288,6 +288,7 @@ Key properties:
 
 - `from_path(fasta, contigs=None)` — `fasta` is a `str | Path`; auto-calls `pysam.faidx` if the `.fai` index is missing. `contigs` filters which contigs the caller cares about (defaults to all in the FASTA).
 - `fetch(contig, start, end)` — 0-based half-open `[start, end)`. Positions outside the contig are N-padded. Returns `NDArray[np.uint8]`.
+- `contig_array(contig)` — the full contig sequence as a cached `NDArray[np.uint8]`. Shares the one-contig-in-memory cache with `fetch`. Accepts `chr`-prefixed or unprefixed names.
 - Contig-name agnostic: `"chr1"` and `"1"` both resolve correctly (`ContigNormalizer` under the hood).
 - One contig is cached in memory at a time; sequential per-contig access is efficient.
 
