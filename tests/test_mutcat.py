@@ -19,6 +19,7 @@ from genoray._mutcat import (
     _dbs78_codes,
     _id83_codes_for_contig,
     _sbs96_codes,
+    _classify_variants_scalar,
     build_entry_codes,
     classify_dbs78,
     classify_id83,
@@ -449,3 +450,70 @@ def test_id83_kernel_matches_scalar_random():
     for i in range(len(refs)):
         exp = classify_id83(int(p0[i]), refs[i], alts[i], fetch)
         assert got[i] == exp, (i, refs[i], alts[i], int(p0[i]), got[i], exp)
+
+
+def _random_index_and_ref(tmp_path, rng):
+    import pysam
+
+    seq = "".join(rng.choice(list("ACGT"), size=300))
+    fa = tmp_path / "ref.fa"
+    fa.write_text(f">chr1\n{seq}\n")
+    pysam.faidx(str(fa))
+    ref = Reference.from_path(fa)
+
+    chrom, pos, refs, alts = [], [], [], []
+    for _ in range(400):
+        p = int(rng.integers(2, len(seq) - 8))  # 0-based interior
+        kind = rng.integers(0, 4)
+        anchor = seq[p]
+        if kind == 0:  # SNV
+            alt = rng.choice([b for b in "ACGT" if b != anchor])
+            refs.append(anchor)
+            alts.append(alt)
+        elif kind == 1:  # native doublet
+            refs.append(seq[p : p + 2])
+            alts.append("".join(rng.choice(list("ACGT"), 2)))
+        elif kind == 2:  # deletion
+            size = int(rng.integers(1, 4))
+            refs.append(seq[p : p + 1 + size])
+            alts.append(anchor)
+        else:  # insertion
+            size = int(rng.integers(1, 4))
+            refs.append(anchor)
+            alts.append(anchor + "".join(rng.choice(list("ACGT"), size)))
+        chrom.append("chr1")
+        pos.append(p + 1)  # store 1-based
+
+    index = pl.DataFrame(
+        {"CHROM": chrom, "POS": pos, "REF": refs, "ALT": [[a] for a in alts]}
+    )
+    return index, ref
+
+
+def test_classify_variants_matches_scalar(tmp_path):
+    rng = np.random.default_rng(123)
+    index, ref = _random_index_and_ref(tmp_path, rng)
+    got = classify_variants(index, ref)
+    exp = _classify_variants_scalar(index, ref)
+    assert list(got) == list(exp)
+
+
+def test_classify_variants_contig_boundary(tmp_path):
+    import pysam
+
+    fa = tmp_path / "ref.fa"
+    fa.write_text(">chr1\nACGT\n")
+    pysam.faidx(str(fa))
+    ref = Reference.from_path(fa)
+    # SNV at first and last base: no 5'/3' flank -> UNCLASSIFIED, matching scalar
+    index = pl.DataFrame(
+        {
+            "CHROM": ["chr1", "chr1"],
+            "POS": [1, 4],
+            "REF": ["A", "T"],
+            "ALT": [["C"], ["G"]],
+        }
+    )
+    got = classify_variants(index, ref)
+    exp = _classify_variants_scalar(index, ref)
+    assert list(got) == list(exp) == [SENTINELS["UNCLASSIFIED"]] * 2

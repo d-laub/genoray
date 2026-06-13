@@ -8,6 +8,7 @@ from typing import Any, Literal
 import numba as nb
 import numpy as np
 import polars as pl
+import pyarrow as pa
 from loguru import logger
 from numpy.typing import NDArray
 
@@ -679,7 +680,7 @@ def count_matrix(
     return pl.DataFrame(out)
 
 
-def classify_variants(index: pl.DataFrame, reference: Reference) -> np.ndarray:
+def _classify_variants_scalar(index: pl.DataFrame, reference: Reference) -> np.ndarray:
     """Return an int16 array of intrinsic mutation codes, one per row of ``index``.
 
     ``index`` must have columns CHROM, POS (1-based int, VCF convention), REF
@@ -731,6 +732,104 @@ def classify_variants(index: pl.DataFrame, reference: Reference) -> np.ndarray:
         examples = ", ".join(mismatch_examples)
         logger.warning(
             f"{n_mismatch}/{index.height} deletions have REF disagreeing with the "
+            f"reference genome at their position (e.g. {examples}) — wrong reference "
+            "build? These were marked UNCLASSIFIED."
+        )
+
+    return out
+
+
+def _utf8_flat(
+    s: "pl.Series",
+) -> tuple[NDArray[np.uint8], NDArray[np.int64], NDArray[np.bool_]]:
+    """Zero-copy flat byte buffer + int64 offsets + not-null mask for a Utf8 series."""
+    arr = s.rechunk().to_arrow()
+    if isinstance(arr, pa.ChunkedArray):
+        arr = arr.combine_chunks()
+    assert arr.offset == 0
+    bufs = arr.buffers()
+    offsets = np.frombuffer(bufs[1], dtype=np.int64)[: len(s) + 1]
+    data = (
+        np.frombuffer(bufs[2], dtype=np.uint8)
+        if bufs[2] is not None
+        else np.empty(0, dtype=np.uint8)
+    )
+    not_null = s.is_not_null().to_numpy()
+    return data, offsets, not_null
+
+
+def classify_variants(index: pl.DataFrame, reference: Reference) -> np.ndarray:
+    """Return an int16 array of intrinsic mutation codes, one per row of ``index``.
+
+    Vectorized: SNV->SBS-96 and native 2bp doublet->DBS-78 via numpy; indels->ID-83
+    via a parallel numba kernel. ``index`` must have columns CHROM, POS (1-based),
+    REF (str), ALT (List[str]; first used). POS is converted to 0-based internally.
+    """
+    n = index.height
+    out = np.full(n, SENTINELS["UNCLASSIFIED"], dtype=np.int16)
+    if n == 0:
+        return out
+
+    chrom = index["CHROM"].to_numpy()
+    pos0 = index["POS"].to_numpy().astype(np.int64) - 1  # 1-based -> 0-based
+    ref_data, ref_off, ref_nn = _utf8_flat(index["REF"])
+    alt_data, alt_off, alt_nn = _utf8_flat(index["ALT"].list.first())
+
+    rlen = (ref_off[1:] - ref_off[:-1]).astype(np.int64)
+    alen = (alt_off[1:] - alt_off[:-1]).astype(np.int64)
+    valid_row = ref_nn & alt_nn
+    snv_mask = valid_row & (rlen == 1) & (alen == 1)
+    dbs_mask = valid_row & (rlen == 2) & (alen == 2)
+    indel_mask = valid_row & (rlen != alen)
+
+    n_mismatch = 0
+    mismatch_examples: list[str] = []
+
+    uniq, inv = np.unique(chrom, return_inverse=True)
+    for gi, c in enumerate(uniq):
+        rows = np.nonzero(inv == gi)[0]
+        seq = reference.contig_array(str(c))
+
+        s_rows = rows[snv_mask[rows]]
+        if len(s_rows):
+            out[s_rows] = _sbs96_codes(
+                seq, pos0[s_rows], ref_data[ref_off[s_rows]], alt_data[alt_off[s_rows]]
+            )
+
+        d_rows = rows[dbs_mask[rows]]
+        if len(d_rows):
+            sr, sa = ref_off[d_rows], alt_off[d_rows]
+            out[d_rows] = _dbs78_codes(
+                ref_data[sr], ref_data[sr + 1], alt_data[sa], alt_data[sa + 1]
+            )
+
+        i_rows = rows[indel_mask[rows]]
+        if len(i_rows):
+            codes = _id83_codes_for_contig(
+                seq,
+                pos0[i_rows],
+                ref_data,
+                ref_off[i_rows],
+                rlen[i_rows],
+                alt_data,
+                alt_off[i_rows],
+                alen[i_rows],
+            )
+            mm = codes == _REF_MISMATCH
+            if mm.any():
+                mm_rows = i_rows[mm]
+                n_mismatch += int(mm.sum())
+                for ri in mm_rows[:5]:
+                    if len(mismatch_examples) < 5:
+                        mismatch_examples.append(f"{chrom[ri]}:{int(pos0[ri]) + 1}")
+                codes = codes.copy()
+                codes[mm] = SENTINELS["UNCLASSIFIED"]
+            out[i_rows] = codes
+
+    if n_mismatch:
+        examples = ", ".join(mismatch_examples)
+        logger.warning(
+            f"{n_mismatch}/{n} deletions have REF disagreeing with the "
             f"reference genome at their position (e.g. {examples}) — wrong reference "
             "build? These were marked UNCLASSIFIED."
         )
