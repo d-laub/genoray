@@ -42,6 +42,34 @@ def contig_no_match():
     return unnormed, source, desired
 
 
+def contig_mito_mt_to_chrm():
+    unnormed = "MT"
+    source = ContigNormalizer(["chr1", "chrM"])
+    desired = "chrM"
+    return unnormed, source, desired
+
+
+def contig_mito_chrmt_to_chrm():
+    unnormed = "chrMT"
+    source = ContigNormalizer(["chr1", "chrM"])
+    desired = "chrM"
+    return unnormed, source, desired
+
+
+def contig_mito_chrm_to_mt():
+    unnormed = "chrM"
+    source = ContigNormalizer(["1", "MT"])
+    desired = "MT"
+    return unnormed, source, desired
+
+
+def contig_mito_absent():
+    unnormed = "MT"
+    source = ContigNormalizer(["chr1", "chr2"])
+    desired = None
+    return unnormed, source, desired
+
+
 def contig_list():
     unnormed = ["chr1", "1", "chr3"]
     source = ContigNormalizer(["chr1", "chr2"])

@@ -15,10 +15,13 @@ from numpy.typing import ArrayLike, DTypeLike, NDArray
 
 DTYPE = TypeVar("DTYPE", bound=np.generic)
 
+_MITO_ALIASES = ("M", "MT", "chrM", "chrMT")
+
 
 class ContigNormalizer:
     """Normalizes contig name(s) to match alternative naming schemes. For example, "chr1" to "1" or "1" to "chr1".
-    Note: this does not handle the special case of equivalence between M and MT.
+    Mitochondrial aliases {M, MT, chrM, chrMT} are treated as mutually equivalent and
+    resolve to whichever spelling the reference actually contains.
     """
 
     contigs: list[str]
@@ -26,10 +29,13 @@ class ContigNormalizer:
 
     def __init__(self, contigs: Iterable[str]):
         self.contigs = list(contigs)
+        mito = next((c for c in self.contigs if c in _MITO_ALIASES), None)
+        mito_map = {a: mito for a in _MITO_ALIASES} if mito is not None else {}
         self.contig_map = (
             {f"{c[3:]}": c for c in contigs if c.startswith("chr")}
             | {f"chr{c}": c for c in contigs if not c.startswith("chr")}
             | {c: c for c in contigs}
+            | mito_map
         )
         self.remapper = {k: self.contigs.index(c) for k, c in self.contig_map.items()}
         keys = np.array(list(self.remapper.keys()))
