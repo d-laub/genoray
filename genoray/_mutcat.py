@@ -362,6 +362,156 @@ def _dbs78_codes(
     return np.where(valid, code, _UNCL)
 
 
+def _build_id83_luts() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    u = SENTINELS["UNCLASSIFIED"]
+    id1 = np.full((2, 2, 6), u, dtype=np.int16)  # [kind(Del,Ins), base(C,T), rep]
+    idr = np.full((2, 4, 6), u, dtype=np.int16)  # [kind, size_bucket(2..5), rep]
+    idm = np.full((4, 6), u, dtype=np.int16)  # [size_bucket(2..5), mh]
+    for ki, k in enumerate(("Del", "Ins")):
+        for bi, b in enumerate(("C", "T")):
+            for r in range(6):
+                id1[ki, bi, r] = ID83_INDEX[f"1:{k}:{b}:{r}"]
+        for si, s in enumerate(("2", "3", "4", "5")):
+            for r in range(6):
+                idr[ki, si, r] = ID83_INDEX[f"{s}:{k}:R:{r}"]
+    for si, (s, cap) in enumerate((("2", 1), ("3", 2), ("4", 3), ("5", 5))):
+        for m in range(1, cap + 1):
+            idm[si, m] = ID83_INDEX[f"{s}:Del:M:{m}"]
+    return id1, idr, idm
+
+
+_ID1_CODE, _IDR_CODE, _IDM_CODE = _build_id83_luts()
+_MH_CAP = np.array([1, 2, 3, 5], dtype=np.int64)  # by size bucket 2,3,4,5
+
+
+@nb.njit(parallel=True, nogil=True, cache=True)
+def _id83_kernel(
+    seq: NDArray[np.uint8],
+    p0: NDArray[np.int64],
+    ref_data: NDArray[np.uint8],
+    ref_s: NDArray[np.int64],
+    ref_len: NDArray[np.int64],
+    alt_data: NDArray[np.uint8],
+    alt_s: NDArray[np.int64],
+    alt_len: NDArray[np.int64],
+    base2idx: NDArray[np.int64],
+    id1: NDArray[np.int16],
+    idr: NDArray[np.int16],
+    idm: NDArray[np.int16],
+    mh_cap: NDArray[np.int64],
+    uncl: np.int16,
+    ref_mismatch: np.int16,
+    out: NDArray[np.int16],
+) -> None:
+    n = len(seq)
+    for k in nb.prange(len(p0)):  # type: ignore[misc]
+        rs, asz = ref_s[k], alt_s[k]
+        rl, al = ref_len[k], alt_len[k]
+        if rl == 0 or al == 0 or ref_data[rs] != alt_data[asz]:
+            out[k] = uncl
+            continue
+        is_del = rl > al
+        if is_del:
+            buf, us, ilen = ref_data, rs + 1, rl - 1
+        else:
+            buf, us, ilen = alt_data, asz + 1, al - 1
+        ok = True
+        for i in range(ilen):
+            if base2idx[buf[us + i]] < 0:
+                ok = False
+                break
+        if not ok:
+            out[k] = uncl
+            continue
+        # count tandem repeats of the unit downstream from p0+1
+        scan = p0[k] + 1
+        n_rep = 0
+        i = 0
+        while scan + i + ilen <= n:
+            match = True
+            for j in range(ilen):
+                if seq[scan + i + j] != buf[us + j]:
+                    match = False
+                    break
+            if not match:
+                break
+            n_rep += 1
+            i += ilen
+        if ilen == 1:
+            bi = base2idx[buf[us]]
+            if bi == 0 or bi == 2:  # A or G -> fold to pyrimidine partner
+                bi = 3 - bi
+            base_idx = 0 if bi == 1 else 1  # C->0, T->1
+            if is_del and n_rep == 0:
+                out[k] = ref_mismatch
+                continue
+            rep = n_rep - 1 if is_del else n_rep
+            if rep > 5:
+                rep = 5
+            out[k] = id1[0 if is_del else 1, base_idx, rep]
+            continue
+        sb = ilen if ilen < 5 else 5
+        si = sb - 2  # 0..3
+        if is_del:
+            mh = 0
+            for kk in range(1, ilen):
+                eq = True
+                for j in range(kk):
+                    if scan + j >= n or seq[scan + j] != buf[us + j]:
+                        eq = False
+                        break
+                if eq:
+                    mh = kk
+            if mh > 0 and n_rep <= 1:
+                cap = mh_cap[si]
+                m = mh if mh < cap else cap
+                out[k] = idm[si, m]
+                continue
+            if n_rep == 0:
+                out[k] = ref_mismatch
+                continue
+            rep = n_rep - 1
+        else:
+            rep = n_rep
+        if rep > 5:
+            rep = 5
+        out[k] = idr[0 if is_del else 1, si, rep]
+
+
+def _id83_codes_for_contig(
+    seq: NDArray[np.uint8],
+    p0: NDArray[np.int64],
+    ref_data: NDArray[np.uint8],
+    ref_s: NDArray[np.int64],
+    ref_len: NDArray[np.int64],
+    alt_data: NDArray[np.uint8],
+    alt_s: NDArray[np.int64],
+    alt_len: NDArray[np.int64],
+) -> NDArray[np.int16]:
+    """ID-83 codes for indels on one contig. May return ``_REF_MISMATCH``
+    entries, which the caller maps to UNCLASSIFIED with a warning."""
+    out = np.empty(len(p0), dtype=np.int16)
+    _id83_kernel(
+        np.ascontiguousarray(seq),
+        np.ascontiguousarray(p0),
+        np.ascontiguousarray(ref_data),
+        np.ascontiguousarray(ref_s),
+        np.ascontiguousarray(ref_len),
+        np.ascontiguousarray(alt_data),
+        np.ascontiguousarray(alt_s),
+        np.ascontiguousarray(alt_len),
+        _BASE2IDX,
+        _ID1_CODE,
+        _IDR_CODE,
+        _IDM_CODE,
+        _MH_CAP,
+        np.int16(SENTINELS["UNCLASSIFIED"]),
+        np.int16(_REF_MISMATCH),
+        out,
+    )
+    return out
+
+
 def _build_dbs_table() -> np.ndarray:
     """tbl[r0, r1, a0, a1] -> DBS-78 code or UNCLASSIFIED for doublets not in
     the (folded) catalogue. Bases encoded A=0,C=1,G=2,T=3."""

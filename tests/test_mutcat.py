@@ -12,8 +12,12 @@ from genoray._mutcat import (
     SBS96,
     SENTINELS,
     SBS96_INDEX,
+    _ID1_CODE,
+    _IDM_CODE,
+    _IDR_CODE,
     _REF_MISMATCH,
     _dbs78_codes,
+    _id83_codes_for_contig,
     _sbs96_codes,
     build_entry_codes,
     classify_dbs78,
@@ -380,3 +384,68 @@ def test_dbs78_codes_match_scalar():
         np.array(alt1, np.uint8),
     )
     assert list(got) == exp
+
+
+def test_id83_luts_match_index():
+    for ki, k in enumerate(("Del", "Ins")):
+        for bi, b in enumerate(("C", "T")):
+            for r in range(6):
+                assert _ID1_CODE[ki, bi, r] == ID83_INDEX[f"1:{k}:{b}:{r}"]
+        for si, s in enumerate(("2", "3", "4", "5")):
+            for r in range(6):
+                assert _IDR_CODE[ki, si, r] == ID83_INDEX[f"{s}:{k}:R:{r}"]
+    for si, s in enumerate(("2", "3", "4", "5")):
+        cap = {"2": 1, "3": 2, "4": 3, "5": 5}[s]
+        for m in range(1, cap + 1):
+            assert _IDM_CODE[si, m] == ID83_INDEX[f"{s}:Del:M:{m}"]
+
+
+def test_id83_kernel_matches_scalar_random():
+    # Build a random contig and a set of indels; compare to classify_id83.
+    rng = np.random.default_rng(7)
+    bases = b"ACGT"
+    seq = np.frombuffer(
+        bytes(np.frombuffer(bases, np.uint8)[rng.integers(0, 4, 400)]), np.uint8
+    )
+
+    def fetch(s, e, _seq=seq):
+        out = np.full(e - s, ord("N"), np.uint8)
+        a, b = max(s, 0), min(e, len(_seq))
+        if b > a:
+            out[a - s : b - s] = _seq[a:b]
+        return bytes(out)
+
+    refs, alts, p0s = [], [], []
+    for _ in range(300):
+        p = int(rng.integers(2, len(seq) - 10))
+        anchor = bytes(seq[p : p + 1])
+        size = int(rng.integers(1, 5))
+        unit = bytes(np.frombuffer(bases, np.uint8)[rng.integers(0, 4, size)])
+        if rng.random() < 0.5:  # deletion
+            refs.append(anchor + unit)
+            alts.append(anchor)
+        else:  # insertion
+            refs.append(anchor)
+            alts.append(anchor + unit)
+        p0s.append(p)
+
+    # flat buffers for the kernel
+    ref_data = np.frombuffer(b"".join(refs), np.uint8)
+    alt_data = np.frombuffer(b"".join(alts), np.uint8)
+    ref_off = np.concatenate(([0], np.cumsum([len(r) for r in refs]))).astype(np.int64)
+    alt_off = np.concatenate(([0], np.cumsum([len(a) for a in alts]))).astype(np.int64)
+    p0 = np.array(p0s, np.int64)
+
+    got = _id83_codes_for_contig(
+        seq,
+        p0,
+        ref_data,
+        ref_off[:-1],
+        (ref_off[1:] - ref_off[:-1]),
+        alt_data,
+        alt_off[:-1],
+        (alt_off[1:] - alt_off[:-1]),
+    )
+    for i in range(len(refs)):
+        exp = classify_id83(int(p0[i]), refs[i], alts[i], fetch)
+        assert got[i] == exp, (i, refs[i], alts[i], int(p0[i]), got[i], exp)
