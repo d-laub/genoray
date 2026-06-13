@@ -465,6 +465,7 @@ class SparseVarMetadata(BaseModel):
     contigs: list[str]
     fields: dict[str, str] = {}  # field_name -> numpy dtype name (e.g. "float32")
     mutcat_version: int | None = None  # set when annotate_mutations has run
+    mutcat_contigs: list[str] | None = None  # normalized contigs annotated; None = all
 
 
 _SRT = TypeVar("_SRT")

@@ -480,3 +480,17 @@ def test_classify_variants_snv_context_uses_pos_minus_one(tmp_path):
     three = seq[p0 + 1].encode()
     expected = classify_sbs96(five, b"G", b"A", three)
     assert int(codes[0]) == expected
+
+
+def test_metadata_has_mutcat_contigs_default():
+    from genoray._svar import SparseVarMetadata
+
+    m = SparseVarMetadata(samples=["s0"], ploidy=1, contigs=["chr1"])
+    assert m.mutcat_contigs is None
+    # round-trips through JSON
+    m2 = SparseVarMetadata.model_validate_json(
+        SparseVarMetadata(
+            samples=["s0"], ploidy=1, contigs=["chr1"], mutcat_contigs=["chr1"]
+        ).model_dump_json()
+    )
+    assert m2.mutcat_contigs == ["chr1"]
