@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import numba as nb
 import numpy as np
 import polars as pl
 
@@ -517,3 +518,37 @@ def test_classify_variants_contig_boundary(tmp_path):
     got = classify_variants(index, ref)
     exp = _classify_variants_scalar(index, ref)
     assert list(got) == list(exp) == [SENTINELS["UNCLASSIFIED"]] * 2
+
+
+def test_entry_codes_thread_invariant():
+    rng = np.random.default_rng(5)
+    n_var = 200
+    var_code = rng.integers(0, 96, n_var).astype(np.int16)
+    var_pos = np.sort(rng.integers(0, 10_000, n_var)).astype(np.int64)
+    var_contig = np.zeros(n_var, np.int32)
+    var_is_snv = np.ones(n_var, np.bool_)
+    var_ref_b = np.frombuffer(b"ACGT", np.uint8)[rng.integers(0, 4, n_var)].copy()
+    var_alt_b = np.frombuffer(b"ACGT", np.uint8)[rng.integers(0, 4, n_var)].copy()
+    # 8 tracks over the variant indices
+    data = np.tile(np.arange(n_var, dtype=np.int32), 8)
+    offsets = (np.arange(9) * n_var).astype(np.int64)
+
+    args = (
+        data,
+        offsets,
+        var_code,
+        var_pos,
+        var_contig,
+        var_is_snv,
+        var_ref_b,
+        var_alt_b,
+    )
+    prev = nb.get_num_threads()
+    try:
+        nb.set_num_threads(1)
+        a = build_entry_codes(*args)
+        nb.set_num_threads(max(2, prev))
+        b = build_entry_codes(*args)
+    finally:
+        nb.set_num_threads(prev)
+    assert np.array_equal(a, b)

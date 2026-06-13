@@ -532,7 +532,7 @@ _DBS_TABLE = _build_dbs_table()
 _DBS_PARTNER = SENTINELS["DBS_PARTNER"]
 
 
-@nb.njit(nogil=True, cache=True)
+@nb.njit(parallel=True, nogil=True, cache=True)
 def _entry_codes_kernel(
     data: NDArray[np.int32],
     offsets: NDArray[np.int64],
@@ -546,7 +546,7 @@ def _entry_codes_kernel(
     out: NDArray[np.int16],
     dbs_partner: np.int16,
 ):
-    for slot in range(len(offsets) - 1):
+    for slot in nb.prange(len(offsets) - 1):  # type: ignore[misc]
         o_s, o_e = offsets[slot], offsets[slot + 1]
         j = o_s
         while j < o_e:
