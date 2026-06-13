@@ -1,3 +1,31 @@
+## 2.12.0 (2026-06-13)
+
+### Feat
+
+- **svar**: contig scope + NOT_ANNOTATED + mutcat_contigs in annotate_mutations (#62)
+- **svar**: add mutcat_contigs to SparseVarMetadata
+- **mutcat**: contig allowlist in classify_variants -> NOT_ANNOTATED
+- **mutcat**: add NOT_ANNOTATED sentinel and bump MUTCAT_VERSION to 3
+- **mutcat**: parallel numba ID-83 indel kernel + derived LUTs
+- **mutcat**: vectorized DBS-78 batch classifier
+- **mutcat**: vectorized SBS-96 batch classifier
+- **reference**: expose cached contig_array for vectorized lookups
+
+### Fix
+
+- **mutcat**: report deletion REF-mismatch count against indel total, not all rows
+- **utils**: treat mitochondrial aliases M/MT/chrM/chrMT as equivalent (#61)
+
+### Refactor
+
+- **mutcat**: tidy SBS-96 test imports and comment
+
+### Perf
+
+- **mutcat**: parallelize count kernel over samples
+- **mutcat**: parallelize entry-code kernel over tracks
+- **mutcat**: vectorize classify_variants (SNV/DBS numpy, indel kernel)
+
 ## 2.11.1 (2026-06-13)
 
 ### Fix
