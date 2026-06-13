@@ -574,6 +574,17 @@ class SparseVar(Generic[_SRT]):
             name: _open_fmt(name, self.available_fields[name], path, shape, "r")
             for name in (fields or [])
         }
+        if (
+            "mutcat" in (fields or [])
+            # None: svar predates mutcat versioning; no warning (treat as pre-v1).
+            and metadata.mutcat_version is not None
+            and metadata.mutcat_version < MUTCAT_VERSION
+        ):
+            logger.warning(
+                "mutcat field was computed with an older version "
+                f"(v{metadata.mutcat_version} < v{MUTCAT_VERSION}); "
+                "recompute via annotate_mutations()."
+            )
         logger.info("Loading genoray index")
         self.index = self._load_index(attrs)
         self._is_biallelic = (self.index["ALT"].list.len() == 1).all()
