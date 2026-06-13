@@ -573,3 +573,13 @@ def test_count_matrix_thread_invariant():
     finally:
         nb.set_num_threads(prev)
     assert a.equals(b)
+
+
+def test_not_annotated_sentinel_and_version():
+    from genoray._mutcat import SENTINELS, MUTCAT_VERSION
+
+    # distinct from the existing sentinels and from MISSING (-3)
+    assert SENTINELS["NOT_ANNOTATED"] == -4
+    assert len(set(SENTINELS.values())) == len(SENTINELS)
+    # on-disk semantics changed -> version bumped
+    assert MUTCAT_VERSION == 3

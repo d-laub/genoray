@@ -137,6 +137,7 @@ SENTINELS: dict[str, int] = {
     "DBS_PARTNER": -1,  # 3' half of an adjacency doublet; never counted
     "UNCLASSIFIED": -2,  # symbolic/complex/MNV>2bp/non-ACGT
     "MISSING": -3,
+    "NOT_ANNOTATED": -4,  # entry on a contig excluded from the annotation scope
 }
 
 # Internal boundary signal (NOT a public sentinel): a deletion whose deleted unit
@@ -149,7 +150,7 @@ SBS96_INDEX = {lbl: SBS96_OFFSET + i for i, lbl in enumerate(SBS96)}
 DBS78_INDEX = {lbl: DBS78_OFFSET + i for i, lbl in enumerate(DBS78)}
 ID83_INDEX = {lbl: ID83_OFFSET + i for i, lbl in enumerate(ID83)}
 
-MUTCAT_VERSION = 2
+MUTCAT_VERSION = 3
 
 _LABELS: dict[str, list[str]] = {"SBS96": SBS96, "DBS78": DBS78, "ID83": ID83}
 
