@@ -494,3 +494,171 @@ def test_metadata_has_mutcat_contigs_default():
         ).model_dump_json()
     )
     assert m2.mutcat_contigs == ["chr1"]
+
+
+# ---------------------------------------------------------------------------
+# contig-scope tests (Task 4)
+# ---------------------------------------------------------------------------
+
+
+def _build_two_contig_svar(path):
+    """chr1 has the 3-SNV tiny layout; chr2 carries one adjacent SNV pair.
+
+    Variants (1-based POS): chr1@2, chr1@3, chr1@9, chr2@2, chr2@3.
+    chr2@2 and chr2@3 are adjacent SNVs on sample 0's single haplotype.
+    """
+    from genoray._svar import SparseVarMetadata, _write_genos
+    from seqpro.rag import Ragged
+
+    path.mkdir(parents=True)
+    index = pl.DataFrame(
+        {
+            "CHROM": ["chr1", "chr1", "chr1", "chr2", "chr2"],
+            "POS": np.array([2, 3, 9, 2, 3], dtype=np.int32),
+            "REF": ["C", "G", "A", "C", "G"],
+            "ALT": [["A"], ["T"], ["C"], ["A"], ["T"]],
+            "ILEN": pl.Series([[0]] * 5, dtype=pl.List(pl.Int32)),
+        }
+    )
+    index.write_ipc(path / "index.arrow")
+    # sample 0 carries chr1@2, chr1@3 (var 0,1) and chr2@2, chr2@3 (var 3,4);
+    # sample 1 carries chr1@9 (var 2). ploidy 1 -> 2 tracks.
+    data = np.array([0, 1, 3, 4, 2], dtype=np.int32)
+    offsets = np.array([0, 4, 5], dtype=np.int64)  # n_samples*ploidy + 1 = 3
+    genos = Ragged.from_offsets(data, (2, 1, None), offsets)
+    _write_genos(path, genos)
+    with open(path / "metadata.json", "w") as f:
+        f.write(
+            SparseVarMetadata(
+                version=1, samples=["s0", "s1"], ploidy=1, contigs=["chr1", "chr2"]
+            ).model_dump_json()
+        )
+
+
+def _two_contig_ref(tmp_path):
+    fa = tmp_path / "ref.fa"
+    fa.write_text(">chr1\nACGTACGTAC\n>chr2\nACGTACGTAC\n")
+    pysam.faidx(str(fa))
+    return Reference.from_path(fa)
+
+
+def test_annotate_scope_marks_excluded_not_annotated(tmp_path):
+    from genoray._mutcat import SENTINELS
+
+    d = tmp_path / "two.svar"
+    _build_two_contig_svar(d)
+    svar = SparseVar(d)
+    svar.annotate_mutations(
+        _two_contig_ref(tmp_path), contigs=["chr1"], write_back=True
+    )
+
+    mut = svar.fields["mutcat"]
+    # data order matches genos: [chr1@2, chr1@3, chr2@2, chr2@3, chr1@9]
+    flat = mut.data
+    assert flat[2] == SENTINELS["NOT_ANNOTATED"]
+    assert flat[3] == SENTINELS["NOT_ANNOTATED"]
+    # chr1 entries are NOT NOT_ANNOTATED (classified or DBS)
+    assert flat[0] != SENTINELS["NOT_ANNOTATED"]
+
+
+def test_annotate_scope_excludes_from_matrix(tmp_path):
+    """A scoped run's SBS96 matrix equals an all-contig run on a chr1-only svar."""
+    d = tmp_path / "two.svar"
+    _build_two_contig_svar(d)
+    svar = SparseVar(d)
+    svar.annotate_mutations(
+        _two_contig_ref(tmp_path), contigs=["chr1"], write_back=False
+    )
+    sbs = svar.mutation_matrix("SBS96", count="allele")
+    # chr2's SNVs contribute nothing; totals come only from chr1 isolated SNV(s)
+    assert sbs.height == 96
+    # chr1@9 (sample 1) is an isolated SNV -> exactly one SBS event total
+    total = sum(sbs[c].sum() for c in ["s0", "s1"])
+    assert total == 1  # chr1@2,@3 collapse to DBS (not SBS); chr2 excluded
+
+
+def test_annotate_scope_normalizes_contig_names(tmp_path):
+    """Allowlist given without 'chr' prefix still matches a chr-prefixed index."""
+    from genoray._mutcat import SENTINELS
+
+    d = tmp_path / "two.svar"
+    _build_two_contig_svar(d)
+    svar = SparseVar(d)
+    # index uses 'chr1'/'chr2'; pass '1' -> should match chr1
+    svar.annotate_mutations(_two_contig_ref(tmp_path), contigs=["1"], write_back=False)
+    flat = svar.fields["mutcat"].data
+    assert flat[2] == SENTINELS["NOT_ANNOTATED"]  # chr2 excluded
+    assert flat[0] != SENTINELS["NOT_ANNOTATED"]  # chr1 annotated
+
+
+def test_annotate_scope_warns_on_unmatched_contig(tmp_path):
+    # loguru bypasses stdlib logging so caplog doesn't work; use a loguru sink instead.
+    d = tmp_path / "two.svar"
+    _build_two_contig_svar(d)
+    svar = SparseVar(d)
+    messages = []
+    sink_id = logger.add(lambda m: messages.append(str(m)), level="WARNING")
+    try:
+        svar.annotate_mutations(
+            _two_contig_ref(tmp_path), contigs=["chr1", "chrZ"], write_back=False
+        )
+    finally:
+        logger.remove(sink_id)
+    assert any("chrZ" in m for m in messages), messages
+
+
+def test_annotate_scope_adjacent_oos_snvs_not_dbs(tmp_path):
+    """chr2's adjacent SNV pair, when out of scope, is NOT collapsed to DBS."""
+    from genoray._mutcat import SENTINELS
+
+    d = tmp_path / "two.svar"
+    _build_two_contig_svar(d)
+    svar = SparseVar(d)
+    svar.annotate_mutations(
+        _two_contig_ref(tmp_path), contigs=["chr1"], write_back=False
+    )
+    flat = svar.fields["mutcat"].data
+    # both chr2 entries are NOT_ANNOTATED; neither is a DBS code or DBS_PARTNER
+    assert flat[2] == SENTINELS["NOT_ANNOTATED"]
+    assert flat[3] == SENTINELS["NOT_ANNOTATED"]
+    assert flat[3] != SENTINELS["DBS_PARTNER"]
+
+
+def test_annotate_scope_persists_mutcat_contigs(tmp_path):
+    from genoray._svar import SparseVarMetadata
+
+    d = tmp_path / "two.svar"
+    _build_two_contig_svar(d)
+    svar = SparseVar(d)
+    svar.annotate_mutations(
+        _two_contig_ref(tmp_path), contigs=["chr1"], write_back=True
+    )
+    with open(d / "metadata.json", "rb") as f:
+        meta = SparseVarMetadata.model_validate_json(f.read())
+    assert meta.mutcat_contigs == ["chr1"]
+    assert meta.mutcat_version == 3
+
+
+def test_annotate_no_scope_persists_none(tmp_path):
+    from genoray._svar import SparseVarMetadata
+
+    d = tmp_path / "two.svar"
+    _build_two_contig_svar(d)
+    svar = SparseVar(d)
+    svar.annotate_mutations(_two_contig_ref(tmp_path), write_back=True)
+    with open(d / "metadata.json", "rb") as f:
+        meta = SparseVarMetadata.model_validate_json(f.read())
+    assert meta.mutcat_contigs is None
+
+
+def test_annotate_inscope_contig_absent_from_reference_raises(tmp_path):
+    """Listing a contig present in the index but absent from the reference raises."""
+    d = tmp_path / "two.svar"
+    _build_two_contig_svar(d)
+    svar = SparseVar(d)
+    # reference has only chr1; chr2 is in scope but unfetchable
+    fa = tmp_path / "ref1.fa"
+    fa.write_text(">chr1\nACGTACGTAC\n")
+    pysam.faidx(str(fa))
+    with pytest.raises(Exception):
+        svar.annotate_mutations(Reference.from_path(fa), contigs=["chr1", "chr2"])
