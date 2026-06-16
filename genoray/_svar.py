@@ -1457,7 +1457,11 @@ class SparseVar(Generic[_SRT]):
                 self.index = (
                     self.index.lazy()
                     .with_row_index("varID")
-                    .join(annot.lazy(), on="varID", how="left")
+                    # maintain_order="left" is required: index rows are
+                    # positionally aligned with the sparse genotype storage, so
+                    # the join must not reorder them. The default ('none') lets
+                    # polars' hash join reorder output on larger data.
+                    .join(annot.lazy(), on="varID", how="left", maintain_order="left")
                     .drop("varID")
                     .collect()
                 )
@@ -3034,6 +3038,8 @@ def _get_strand_and_codon_pos(
         )
         .group_by("var_id", maintain_order=True)
         .agg(pl.col("gene_id", "strand", "codon_pos").first())
+        # Match the column name used by _empty_annot() and the write-back join.
+        .rename({"var_id": "varID"})
     )
 
     return annot
