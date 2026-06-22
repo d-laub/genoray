@@ -820,7 +820,7 @@ class SparseVar(Generic[_SRT]):
             name: Ragged.from_offsets(field.data, shape, flat_offsets)
             for name, field in self.fields.items()
         }
-        return ak.zip({"genos": genos_result, **field_results})  # type: ignore[return-value]
+        return Ragged.from_fields({"genos": genos_result, **field_results})  # type: ignore[return-value]
 
     def read_ranges_with_length(
         self,
@@ -875,7 +875,7 @@ class SparseVar(Generic[_SRT]):
             name: Ragged.from_offsets(field.data, shape, flat_offsets)
             for name, field in self.fields.items()
         }
-        return ak.zip({"genos": genos_result, **field_results})  # type: ignore[return-value]
+        return Ragged.from_fields({"genos": genos_result, **field_results})  # type: ignore[return-value]
 
     @overload
     def with_fields(self, fields: Sequence[str]) -> SparseVar[Ragged[np.void]]: ...
