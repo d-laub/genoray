@@ -251,7 +251,7 @@ def _resolve_kept_rows(
     # --- overlap detection / optional merge ---
     # sp.bed.to_pyr requires chromStart/chromEnd column names.
     pyr_input = regions.rename({"start": "chromStart", "end": "chromEnd"})
-    pyr = sp.bed.to_pyr(pyr_input)
+    pyr = sp.bed.to_pyr(pyr_input)  # type: ignore[bad-argument-type]
     mod = type(pyr).__module__.split(".")[0]
     if mod == "pyranges":
         merged = pyr.merge()
