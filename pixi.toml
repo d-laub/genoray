@@ -11,6 +11,8 @@ py311 = ["py311"]
 py312 = ["py312"]
 py313 = ["py313"]
 sbox = ["sbox", "py310"]
+# isolated env for linting: no editable genoray build (and thus no Rust compile)
+lint = { features = ["lint"], no-default-feature = true }
 
 [dependencies]
 uv = "*"
@@ -29,6 +31,19 @@ typing-extensions = "<4.15"
 rust = ">=1.93.1,<1.94"
 maturin = ">=1.12.0,<2"
 pip = ">=26.0.1,<27"
+# Build toolchain for the Rust extension: cxx-compiler builds vendored htslib (via
+# hts-sys), clangdev provides libclang for rust-htslib's mandatory bindgen step.
+cxx-compiler = "*"
+# Pin libclang: newer majors (e.g. 22) make bindgen 0.69 emit struct layouts that
+# rust-htslib 1.0 doesn't match (nested anon fields). 18 generates compatible bindings.
+clangdev = "18.*"
+# The conda compiler uses the conda sysroot, so source-built pypi deps (e.g. pgenlib)
+# need dev headers from conda rather than the system: zlib provides zlib.h.
+zlib = "*"
+
+[activation.env]
+# rust-htslib's bindgen step needs to locate libclang (provided by clangdev).
+LIBCLANG_PATH = "$CONDA_PREFIX/lib"
 
 [pypi-dependencies]
 genoray = { path = ".", editable = true, extras = ["cli"] }
@@ -40,6 +55,22 @@ gen = "sh tests/data/gen_from_vcf.sh"
 test = { cmd = "pytest tests", depends-on = "gen" }
 prek-install = "prek install -t pre-commit -t pre-push"
 bump-dry = "cz bump --dry-run"
+
+[feature.lint.dependencies]
+prek = "*"
+# Toolchain so the cargo fmt/check/clippy hooks can run here without building the
+# editable genoray wheel: rust + python (pyo3 build script) + the htslib build deps.
+rust = ">=1.93.1,<1.94"
+python = "*"
+cxx-compiler = "*"
+clangdev = "18.*"
+
+[feature.lint.activation.env]
+# lint is no-default-feature, so it doesn't inherit the top-level LIBCLANG_PATH.
+LIBCLANG_PATH = "$CONDA_PREFIX/lib"
+
+[feature.lint.tasks]
+lint = "prek run --all-files --show-diff-on-failure"
 
 [feature.doc.dependencies]
 sphinx = "*"

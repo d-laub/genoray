@@ -4,14 +4,14 @@ use crossbeam_channel::Sender;
 // Public API
 pub struct LongAlleleTable {
     tx_long: Sender<Vec<u8>>, //channel to the writer thread
-    alt_offsets: Vec<u32>, // TODO - should this be u32 or u64
-    buffer: Vec<u8>, // staging area
+    alt_offsets: Vec<u32>,    // TODO - should this be u32 or u64
+    buffer: Vec<u8>,          // staging area
     global_offset: usize,     // The exact byte position
     row_index: u32, // Tracks the number of long alleles and 31-bit integer returned to the variant key
 }
 
 impl LongAlleleTable {
-    // because we need to map the file, it must be pre-allocated to the exact 
+    // because we need to map the file, it must be pre-allocated to the exact
     // byte size calculated during your 1st Pass.
     pub fn new(tx_long: Sender<Vec<u8>>) -> Self {
         // 128 MB RAM Limit to prevent OOM crashes -> can be changed or made run time
@@ -60,20 +60,24 @@ impl LongAlleleTable {
         current_index & 0x7FFFFFFF
     }
 
-    // Double-Buffer Swap 
+    // Double-Buffer Swap
     #[cold]
     fn flush_buffer(&mut self) {
-        if self.buffer.is_empty() { return; }
+        if self.buffer.is_empty() {
+            return;
+        }
 
         // empty 128MB vector.
         let fresh_buffer = Vec::with_capacity(128 * 1024 * 1024);
-        
+
         // swap full buffer with new
         let full_buffer = std::mem::replace(&mut self.buffer, fresh_buffer);
 
         // send the full buffer to the background writer thread.
-        self.tx_long.send(full_buffer).expect("Long Allele Writer Thread panicked");
-        
+        self.tx_long
+            .send(full_buffer)
+            .expect("Long Allele Writer Thread panicked");
+
         // update the global byte tracker so offsets remain accurate.
         self.global_offset += 128 * 1024 * 1024;
     }
@@ -114,7 +118,7 @@ impl LongAlleleTable {
 //     /// Performs the 2-way fill -> inserts the data and returns the 32-bit packed pointer (31 bit index + 1 bit flag for non reversible key)
 //     // pub fn push_variant(&mut self, ilen: i32, alt_allele: &[u8]) -> u32 {
 //     //     // get the current row index
-//     //     let row_index = self.ilens.len() as u32; 
+//     //     let row_index = self.ilens.len() as u32;
 //     //     // 0 <-> chr1:100 ( alt allele > 13 )
 //     //     // 1 <-> chr22:5 ( alt allele > 13 )
 //     //     assert!(
@@ -146,7 +150,7 @@ impl LongAlleleTable {
 //     /// Performs the 2-way fill -> inserts the data and returns the 32-bit packed pointer (31 bit index + 1 bit flag for non reversible key)
 //     pub fn push_variant(&mut self, ilen: i32, alt_allele: &[u8]) -> u32 {
 //         // get the current row index
-//         let row_index = self.ilens.len() as u32; 
+//         let row_index = self.ilens.len() as u32;
 //         // 0 <-> chr1:100 ( alt allele > 13 )
 //         // 1 <-> chr22:5 ( alt allele > 13 )
 //         assert!(

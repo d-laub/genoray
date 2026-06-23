@@ -1,41 +1,13 @@
 use crate::nrvk::LongAlleleTable;
-use ndarray::{Array, Array1, Array3, ArrayView3, Ix1, Ix3, s};
+use crate::types::{DenseChunk, MIN_I31, SparseChunk, VALID_RANGE_SPAN};
 use num_traits::PrimInt;
-use std::sync::Arc;
-use crate::types::{DenseChunk, SparseChunk};
-use packed_seq::{PackedSeqVec, Seq};
-
-// fn hasher()
 
 //map (s,p) -> flattened index
 #[inline]
+#[allow(dead_code)]
 fn sp_index(s: usize, p: usize, ploidy: usize) -> usize {
     s * ploidy + p
 }
-
-// inline bit packing helper
-#[inline(always)]
-fn encode_base(base: u8) -> u32 {
-    match base {
-        b'A' | b'a' => 0b00,
-        b'C' | b'c' => 0b01,
-        b'G' | b'g' => 0b10,
-        b'T' | b't' => 0b11,
-        _ => 0,
-    }
-}
-
-// bit-trick to convert ASCII DNA to 2-bit values without branching
-// faster as no branching so highly unrollable and max ILP
-// 'A' (65) 0100 0001 -> shift right -> 0010 0000 and 3 (011) -> 00
-// 'C' (67) -> 0100 0011 -> 01
-// 'T' (84) -> 0101 0100 -> shift right -> 0010 1010 and 3 (011) -> 10
-// 'G' (71) -> 0100 0111 -> shift right -> 0010 0011 and 3 (011) -> 11
-#[inline(always)]
-fn ascii_to_2bit(base: u8) -> u32 {
-    ((base >> 1) & 3) as u32
-}
-// instead of doing this do by taking a slice of alt
 
 /// SIMD Within A Register (SWAR) string encoder.
 /// Packs up to 13 DNA bases into a single u32.
@@ -45,7 +17,7 @@ fn encode_alt_inline(alt_allele: &[u8], len: u32) -> u32 {
 
     // fixed 16-byte memory block initialized to zero
     let mut padded = [0u8; 16];
-    
+
     padded[..len as usize].copy_from_slice(alt_allele);
 
     // read the DNA at once into two 64-bit CPU registers
@@ -61,162 +33,82 @@ fn encode_alt_inline(alt_allele: &[u8], len: u32) -> u32 {
     // compressing the bits down into 32-bit space.
     // The shifts align the target 2 bits from each byte into a contiguous block.
     let mut payload = 0u32;
-    
-    // left-aligned packing starting exactly at Bit 26
-    // Because the 2-bit chunk occupies bits 25 and 26 -> shift by 25.
-    payload |= ((bits1 >> 0)  & 3) as u32 << 25; // shift to make major, 
-    // then get last 2 bits, then upshift to correct position in payload
-    payload |= ((bits1 >> 8)  & 3) as u32 << 23; 
-    payload |= ((bits1 >> 16) & 3) as u32 << 21; 
-    payload |= ((bits1 >> 24) & 3) as u32 << 19; 
-    payload |= ((bits1 >> 32) & 3) as u32 << 17; 
-    payload |= ((bits1 >> 40) & 3) as u32 << 15; 
-    payload |= ((bits1 >> 48) & 3) as u32 << 13; 
-    payload |= ((bits1 >> 56) & 3) as u32 << 11; 
+
+    // left-aligned packing starting exactly at bit 26
+    payload |= ((bits1 & 3) as u32) << 25;
+    payload |= (((bits1 >> 8) & 3) as u32) << 23;
+    payload |= (((bits1 >> 16) & 3) as u32) << 21;
+    payload |= (((bits1 >> 24) & 3) as u32) << 19;
+    payload |= (((bits1 >> 32) & 3) as u32) << 17;
+    payload |= (((bits1 >> 40) & 3) as u32) << 15;
+    payload |= (((bits1 >> 48) & 3) as u32) << 13;
+    payload |= (((bits1 >> 56) & 3) as u32) << 11;
 
     // block 2
-    payload |= ((bits2 >> 0)  & 3) as u32 << 9;  
-    payload |= ((bits2 >> 8)  & 3) as u32 << 7;  
-    payload |= ((bits2 >> 16) & 3) as u32 << 5;  
-    payload |= ((bits2 >> 24) & 3) as u32 << 3;  
-    payload |= ((bits2 >> 32) & 3) as u32 << 1;  
+    payload |= ((bits2 & 3) as u32) << 9;
+    payload |= (((bits2 >> 8) & 3) as u32) << 7;
+    payload |= (((bits2 >> 16) & 3) as u32) << 5;
+    payload |= (((bits2 >> 24) & 3) as u32) << 3;
+    payload |= (((bits2 >> 32) & 3) as u32) << 1;
 
     // tag the length into the top 5 bits and return
-    payload | (len << 27) // this will also keep the lsb 0 which is demarking no lookup
-}
+    // (this also keeps the LSB 0, demarking "no lookup")
+    payload | (len << 27)
 }
 
-// SIMD version of generate variant key for better parallel encoding
+// Packs (ilen, alt) into a single 32-bit variant key, spilling to the long-allele
+// table when the allele cannot be represented inline.
 #[inline(always)]
-pub fn pack_variant(
-    ilen: i32, alt_allele: &[u8], bank: &mut LongAlleleTable
-) -> u32 {
+pub fn pack_variant(ilen: i32, alt_allele: &[u8], bank: &mut LongAlleleTable) -> u32 {
     // this evaluates (MIN_I31 <= ilen <= 13)
     if (ilen.wrapping_sub(MIN_I31) as u32) <= VALID_RANGE_SPAN {
-        // Reversible Packing
+        // Reversible packing
         if ilen >= 0 {
-            // Positive length (0 to 13) -> Inline Encoding
-            return encode_alt_inline(alt_allele, ilen as u32);
+            // Positive length (0 to 13) -> inline encoding
+            encode_alt_inline(alt_allele, ilen as u32)
         } else {
-            // Valid negative length -> Direct Integer Packing
-            // Mask out the lsb to ensure it doesn't trigger the lookup flag
-            // return (ilen as u32) & 0xFFFFFFFE; -> can also use this
-            // shift left by 1 -> LSB = 0 and MSB 31 bits are signed ilen i31
-            return (ilen as u32) << 1;
+            // Valid negative length -> direct integer packing.
+            // Shift left by 1 -> LSB = 0 and the upper 31 bits are the signed i31 ilen.
+            (ilen as u32) << 1
         }
-        
     } else {
-        // Long Allele Table
-        // either an insertion (> 13) or a deletion (< MIN_I31)
+        // Long allele table: either an insertion (> 13) or a deletion (< MIN_I31).
         let row_index = bank.push_long_allele(alt_allele);
-        return (row_index << 1) | 1; // Return the pointer with the lsb (lookup bit) flagged to 1
+        // Return the pointer with the LSB (lookup bit) flagged to 1.
+        (row_index << 1) | 1
     }
 }
 
-
-
-// encoding the ilen, and alt allele (with rk or nrk) into a single key
-#[inline(always)]
-fn encode_variant_key(
-    ref_len: usize,
-    alt_len: usize,
-    alt_allele: &[u8],
-    long_allele_bank: &mut NonReversibleLongAllele,
-) -> u32 {
-    // will have to check based on the size so that cn decide if to use the ptr or not
-    // lookup flag ->
-    // 		true -> when ilen is > 13 or if ilen if < minimum value of i31
-    //		false -> o.w. it is an actual vk not a pointer
-    /* if lookup flag {
-            1. yes -> 31 bits for an unsigned address
-            2. no ->
-                a. if ilen >= 0 then ilen = i5 and alt = 26 bits of 2 bit each nucleotide
-                b. if ilen < 0 then ilen = i31
-        }
-    */
-    // AC 
-    // 0010 00000000000 >> 5 | ilen | flag
-
-
-    let ilen: i32 = (alt_len as i32) - (ref_len as i32);
-    let min_i31: i32 = -(1 << 30); //constant
-    let mut seq_bits: u32 = 0; //vk
-
-    if (ilen >= 0 && ilen <= 13) || (ilen < 0 && ilen >= min_i31) {
-        // Path A: Reversible Packing (when +ve ilen but <= 13 alt len, or when -ve but in range of i31)
-        if ilen >= 0 {
-            //then it can fit in the 31 bits with last bit being 0
-            let key = ((ilen as u32) & 0x1F) << 27; //write decimal instead of hex
-            for (i, &b) in alt_allele.iter().enumerate() {
-                // prevent shifting out of bounds if a rogue string gets through
-                if i >= 13 {
-                    break; //panic 
-                }
-                // u8s to bits -> vectorized 
-                // calculate exactly how far left to push this specific base -> left aligned
-                // Base 0 shifts by 25. Base 1 shifts by 23. Base 2 shifts by 21...
-                let shift_amount = 25 - (i * 2);
-
-                // encoding the base and dropping it to the assigned slot
-                // eg: Alt: ACGT ilen = 4 -> seq_bits = 00100 00011011 000000000000000000 0
-                seq_bits |= encode_base(b) << shift_amount;
-            }
-            seq_bits |= key;
-        } else {
-            // shift left by 1 -> LSB = 0 and MSB 31 bits are signed ilen i31
-            seq_bits = (ilen as u32) << 1;
-        }
-    } else {
-        // Path B: Ptr Fallback for large variants (> 13 alt len or more than i31 deletions)
-        // 31 bits for an usigned add + 1 bit for flag True
-        // modifies the data of long allele bank and returns the pointer to that with lsb 1 as lookup flag
-        row_index = long_allele_bank.push_variant(ilen, alt_allele); // should not couple in table 
-        // tagging the lsb to 1
-        return (row_index << 1) | 1;
-    }
-    seq_bits
-}
-
-// The core Dense-to-Sparse Matrix Transposer.
-// Flips Row-Major VCF data into Column-Major (Sample-Major) Sparse Tensors.
+// The core dense-to-sparse matrix transposer.
+// Flips row-major VCF data into column-major (sample-major) sparse tensors.
 pub fn dense2sparse_vk<I: PrimInt>(
     chunk: &DenseChunk<I>,
     bank: &mut LongAlleleTable,
 ) -> SparseChunk {
-    
-    // TODO
-
-    // 1. Iterate Sample-Major (for s in 0..samples { for p in 0..ploidy { for v in 0..variants } })
-    // 2. Check if chunk.genos[[v, s, p]] is true
-    // 3. If true, extract pos, ref, alt using the v index
-    // 4. Do SIMD encoding or push to long_allele_bank depending upon the len
-    // 5. Push to call_positions and call_keys
-    // 6. Track the number of calls for this specific sample and push to sample_lengths
-    
-    // Return formatted SparseChunk ready for the Writer Thread
-
     let shape = chunk.genos.shape();
     let v_variants = shape[0];
     let num_samples = shape[1];
     let ploidy = shape[2];
     let columns = num_samples * ploidy;
 
-    // pre-allocate assuming roughly 5% sparsity to prevent heap allocations
+    // pre-allocate assuming roughly 5% sparsity to prevent heap reallocations
     let estimated_nnz = (v_variants * columns) / 20;
     let mut call_positions = Vec::with_capacity(estimated_nnz);
     let mut call_keys = Vec::with_capacity(estimated_nnz);
     let mut sample_lengths = Vec::with_capacity(columns);
 
     // Get a flat slice to completely bypass ndarray bounds-checking overhead
-    let genos_slice = chunk.genos.as_slice().expect("Genos array must be contiguous");
+    let genos_slice = chunk
+        .genos
+        .as_slice()
+        .expect("Genos array must be contiguous");
 
-    // Outer loops are Sample/Ploidy, Inner loop is Variants.
+    // Outer loops are sample/ploidy, inner loop is variants.
     for s in 0..num_samples {
         for p in 0..ploidy {
-            
             let mut current_sample_calls = 0u32;
-            
-            // Fixed stride for perfect CPU cache prefetching
+
+            // Fixed stride for CPU cache prefetching
             let base_idx = (s * ploidy) + p;
             let stride = columns;
 
@@ -224,22 +116,19 @@ pub fn dense2sparse_vk<I: PrimInt>(
                 let flat_idx = (v * stride) + base_idx;
 
                 if unsafe { *genos_slice.get_unchecked(flat_idx) } {
-                    
                     let pos = chunk.pos[v];
                     let ilen = chunk.ilens[v];
-                    
-                    let start_idx = chunk.alt_offsets[v] as usize;
-                    let end_idx = chunk.alt_offsets[v + 1] as usize;
-                    
-                    let alt_allele = unsafe { 
-                        chunk.alt.get_unchecked(start_idx..end_idx) 
-                    };
+
+                    let start_idx = chunk.alt_offsets[v].to_usize().unwrap();
+                    let end_idx = chunk.alt_offsets[v + 1].to_usize().unwrap();
+
+                    let alt_allele = unsafe { chunk.alt.get_unchecked(start_idx..end_idx) };
 
                     let packed_key = pack_variant(ilen, alt_allele, bank);
 
                     call_positions.push(pos);
                     call_keys.push(packed_key);
-                    
+
                     current_sample_calls += 1;
                 }
             }
@@ -251,102 +140,6 @@ pub fn dense2sparse_vk<I: PrimInt>(
         chunk_id: chunk.chunk_id,
         call_positions, // Vec<u32>
         call_keys,      // Vec<u32>
-        sample_lengths, // Vec<u32> -> sum of all variants across samples
+        sample_lengths, // Vec<u32>
     }
 }
-
-// pub fn dense2sparse_vk<I: PrimInt, H: Fn(u64) -> u64>(
-//     pos: &[u32],
-//     refe: &[u8],
-//     ref_offsets: &[I],
-//     alt: &[u8],
-//     alt_offsets: &[I],
-//     start: usize,
-//     end: usize,
-//     genos: &Array<bool, Ix3>, // Varients, Samples, ploidy (V, S, P)
-//     long_allele_bank: &mut NonReversibleLongAllele,
-// ) -> (Vec<u32>, Vec<u32>, Vec<u64>) {
-//     /*
-//     Convert dense genotypes to sparse variant-key genotypes
-
-//     Args:
-//         pos: (total_variants)
-//         ref: (total_ref_length)
-//         ref_offsets: (total_variants + 1)
-//         alt: (total_alt_length)
-//         alt_offsets: (total_variants + 1)
-//         start_idx
-//         end_idx: end_idx - start_idx == n_variants
-//         genos: (variants, samples, ploidy)
-//         long_allele_bank: ref to SoA for the nr alleles
-
-//     Returns:
-//         positions: (n_calls)
-//         ilen_alt: (n_calls)
-//         offsets: (samples * ploidy + 1)
-//     */
-
-//     let genos = genos.slice(s![start..end, .., ..]);
-
-//     let shape = genos.shape();
-//     let samples = shape[1];
-//     let ploidy = shape[2];
-//     let n_hap = samples * ploidy;
-
-//     //step 1 - counting mutations per hap
-//     let mut counts = vec![0u64; n_hap];
-
-//     for ((_v, s, p), &has_mut) in genos.indexed_iter() {
-//         if has_mut {
-//             counts[s * ploidy + p] += 1;
-//         }
-//     }
-
-//     //step 2 - prefix sum for offsets
-//     let mut offsets = vec![0u64; n_hap + 1];
-//     for i in 0..n_hap {
-//         offsets[i + 1] = offsets[i] + counts[i];
-//     }
-
-//     let n_calls = offsets[n_hap] as usize;
-
-//     //step 3
-//     let mut out_pos = vec![0u32; n_calls];
-//     let mut ilen_alt = vec![0u32; n_calls];
-
-//     let mut write_heads = offsets.clone();
-
-//     for ((v, s, p), &has_mutation) in genos.indexed_iter() {
-//         if has_mutation {
-//             let global_idx = start + v;
-//             let hap_idx = s * ploidy + p;
-//             let write_idx = write_heads[hap_idx] as usize;
-
-//             // get start end end indices from the offsets arrays
-
-//             let ref_start = ref_offsets[global_idx] as usize;
-//             let ref_end = ref_offsets[global_idx + 1] as usize;
-
-//             let alt_start = alt_offsets[global_idx] as usize;
-//             let alt_end = alt_offsets[global_idx + 1] as usize;
-
-//             // don't require ref slice for now -> can be added later
-//             let alt_slice = &alt[alt_start..alt_end];
-
-//             let ref_len = ref_end - ref_start;
-//             let alt_len = alt_slice.len();
-
-//             // generate the lower 32 bits -> ilen (5 bits signed) + alt encoded (26 bits) + flag for ptr lookup (1 bit)
-
-//             let ilen_alt_flag = encode_variant_key(ref_len, alt_len, alt_slice, long_allele_bank);
-
-//             // scatter the data to correct positions
-//             out_pos[write_idx] = pos[global_idx];
-//             ilen_alt[write_idx] = ilen_alt_flag; // ilen (5 bits signed) + alt encoded (26 bits) + flag for ptr lookup (1 bit)
-
-//             // moving the write head forward for next mut for this haplotype to be right next
-//             write_heads[hap_idx] += 1;
-//         }
-//     }
-//     (out_pos, ilen_alt, offsets)
-// }
