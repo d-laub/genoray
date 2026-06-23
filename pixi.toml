@@ -11,6 +11,8 @@ py311 = ["py311"]
 py312 = ["py312"]
 py313 = ["py313"]
 sbox = ["sbox", "py310"]
+# isolated env for linting: no editable genoray build (and thus no Rust compile)
+lint = { features = ["lint"], no-default-feature = true }
 
 [dependencies]
 uv = "*"
@@ -39,8 +41,13 @@ seaborn = "*"
 gen = "sh tests/data/gen_from_vcf.sh"
 test = { cmd = "pytest tests", depends-on = "gen" }
 prek-install = "prek install -t pre-commit -t pre-push"
-lint = "prek run --all-files --show-diff-on-failure"
 bump-dry = "cz bump --dry-run"
+
+[feature.lint.dependencies]
+prek = "*"
+
+[feature.lint.tasks]
+lint = "prek run --all-files --show-diff-on-failure"
 
 [feature.doc.dependencies]
 sphinx = "*"
