@@ -84,7 +84,6 @@ fn encode_alt_inline(alt_allele: &[u8], len: u32) -> u32 {
     // tag the length into the top 5 bits and return
     payload | (len << 27) // this will also keep the lsb 0 which is demarking no lookup
 }
-}
 
 // SIMD version of generate variant key for better parallel encoding
 #[inline(always)]
