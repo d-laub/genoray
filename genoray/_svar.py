@@ -251,7 +251,7 @@ def _resolve_kept_rows(
     # --- overlap detection / optional merge ---
     # sp.bed.to_pyr requires chromStart/chromEnd column names.
     pyr_input = regions.rename({"start": "chromStart", "end": "chromEnd"})
-    pyr = sp.bed.to_pyr(pyr_input)
+    pyr = sp.bed.to_pyr(pyr_input)  # type: ignore[bad-argument-type]
     mod = type(pyr).__module__.split(".")[0]
     if mod == "pyranges":
         merged = pyr.merge()
@@ -820,7 +820,7 @@ class SparseVar(Generic[_SRT]):
             name: Ragged.from_offsets(field.data, shape, flat_offsets)
             for name, field in self.fields.items()
         }
-        return ak.zip({"genos": genos_result, **field_results})  # type: ignore[return-value]
+        return Ragged.from_fields({"genos": genos_result, **field_results})  # type: ignore[return-value]
 
     def read_ranges_with_length(
         self,
@@ -875,7 +875,7 @@ class SparseVar(Generic[_SRT]):
             name: Ragged.from_offsets(field.data, shape, flat_offsets)
             for name, field in self.fields.items()
         }
-        return ak.zip({"genos": genos_result, **field_results})  # type: ignore[return-value]
+        return Ragged.from_fields({"genos": genos_result, **field_results})  # type: ignore[return-value]
 
     @overload
     def with_fields(self, fields: Sequence[str]) -> SparseVar[Ragged[np.void]]: ...
