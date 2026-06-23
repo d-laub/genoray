@@ -1,3 +1,10 @@
+## 2.12.3 (2026-06-23)
+
+### Fix
+
+- adapt genoray to rust-backed seqpro Ragged
+- **svar**: preserve index order and fix varID column in annotate_with_gtf
+
 ## 2.12.2 (2026-06-14)
 
 ### Fix
