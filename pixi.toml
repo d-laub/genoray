@@ -55,6 +55,16 @@ bump-dry = "cz bump --dry-run"
 
 [feature.lint.dependencies]
 prek = "*"
+# Toolchain so the cargo fmt/check/clippy hooks can run here without building the
+# editable genoray wheel: rust + python (pyo3 build script) + the htslib build deps.
+rust = ">=1.93.1,<1.94"
+python = "*"
+cxx-compiler = "*"
+clangdev = "18.*"
+
+[feature.lint.activation.env]
+# lint is no-default-feature, so it doesn't inherit the top-level LIBCLANG_PATH.
+LIBCLANG_PATH = "$CONDA_PREFIX/lib"
 
 [feature.lint.tasks]
 lint = "prek run --all-files --show-diff-on-failure"
