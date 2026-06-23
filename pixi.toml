@@ -31,6 +31,16 @@ typing-extensions = "<4.15"
 rust = ">=1.93.1,<1.94"
 maturin = ">=1.12.0,<2"
 pip = ">=26.0.1,<27"
+# Build toolchain for the Rust extension: cxx-compiler builds vendored htslib (via
+# hts-sys), clangdev provides libclang for rust-htslib's mandatory bindgen step.
+cxx-compiler = "*"
+# Pin libclang: newer majors (e.g. 22) make bindgen 0.69 emit struct layouts that
+# rust-htslib 1.0 doesn't match (nested anon fields). 18 generates compatible bindings.
+clangdev = "18.*"
+
+[activation.env]
+# rust-htslib's bindgen step needs to locate libclang (provided by clangdev).
+LIBCLANG_PATH = "$CONDA_PREFIX/lib"
 
 [pypi-dependencies]
 genoray = { path = ".", editable = true, extras = ["cli"] }
