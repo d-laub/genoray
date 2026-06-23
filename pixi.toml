@@ -37,6 +37,9 @@ cxx-compiler = "*"
 # Pin libclang: newer majors (e.g. 22) make bindgen 0.69 emit struct layouts that
 # rust-htslib 1.0 doesn't match (nested anon fields). 18 generates compatible bindings.
 clangdev = "18.*"
+# The conda compiler uses the conda sysroot, so source-built pypi deps (e.g. pgenlib)
+# need dev headers from conda rather than the system: zlib provides zlib.h.
+zlib = "*"
 
 [activation.env]
 # rust-htslib's bindgen step needs to locate libclang (provided by clangdev).

@@ -28,6 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     name: "Run test across all Python versions"
     strategy:
+      fail-fast: false
       matrix:
         environment: [py310, py311, py312, py313]
     steps:
