@@ -492,3 +492,38 @@ def test_pgen_nbytes_zero_after_free():
     assert pgen._index is None
     assert pgen._sei is None
     assert pgen.nbytes == 0
+
+
+def test_filtered_var_idxs_consistent_with_index():
+    """Regression for #69: filtered PGEN var_idxs must index its own _index.
+
+    `is_snp` drops the interior GAT>A indels (physical rows 0 and 3), so for a
+    filtered reader physical != positional. var_idxs() must return positional
+    indices into the (filtered) _index, and reads must still return the correct
+    (physical) genotypes.
+    """
+    from genoray import exprs
+
+    g_filt = PGEN(ddir / "biallelic.pgen", filter=exprs.is_snp)
+    g_full = PGEN(ddir / "biallelic.pgen")
+
+    # Filter drops physical rows 0 and 3 -> 4 rows remain.
+    assert g_filt._index.height == 4
+
+    # chr2 query: positional [2, 3] (NOT physical [4, 5]).
+    vi, offsets = g_filt.var_idxs("chr2", 0, POS_MAX)
+    assert int(vi.max()) < g_filt._index.height  # #69: in-bounds
+    assert np.array_equal(vi, np.array([2, 3], dtype=vi.dtype))
+    assert np.array_equal(offsets, np.array([0, 2], dtype=offsets.dtype))
+
+    # _index[var_idxs] selects the kept chr2 SNPs (POS 81262, 81265).
+    assert g_filt._index[vi]["POS"].to_list() == [81262, 81265]
+
+    # Read correctness: a filtered chr1 read returns exactly the same genotypes
+    # as the corresponding (physical) variants from an unfiltered read. chr1's
+    # SNPs are physical rows [1, 2] -> within the full chr1 read those are the
+    # 2nd and 3rd variants on the variant axis.
+    filt = g_filt.read("chr1", 0, POS_MAX, mode=Genos)  # (s, p, 2)
+    full = g_full.read("chr1", 0, POS_MAX, mode=Genos)  # (s, p, 3)
+    assert filt.shape[-1] == 2
+    assert np.array_equal(filt, full[..., [1, 2]])
