@@ -122,9 +122,10 @@ def var_indices(
 
     var_table = (
         var_table.lazy()
+        .with_row_index("__pos")
         .filter(pl.col("CHROM") == c)
         .select(
-            pl.col("index").cast(np_to_pl_dtype(idx_dtype)),
+            pl.col("__pos").cast(np_to_pl_dtype(idx_dtype)).alias("index"),
             chrom=pl.col("CHROM").cast(pl.Utf8),
             start=pl.col("POS") - 1,
             end=pl.col("POS")

@@ -432,7 +432,10 @@ class PGEN:
 
         Returns
         -------
-            Shape: (tot_variants). Variant indices for the given ranges.
+            Shape: (tot_variants). Variant indices for the given ranges, as
+            0-based **positions into this reader's (filtered) ``_index``** — i.e.
+            ``reader._index[var_idxs]`` is always valid. With no filter these
+            equal the physical PVAR row order.
 
             Shape: (ranges+1). Offsets to get variant indices for each range.
         """
@@ -440,6 +443,22 @@ class PGEN:
             self._init_index()
             assert self._c_norm is not None and self._index is not None
         return var_indices(V_IDX_TYPE, self._c_norm, self._index, contig, starts, ends)
+
+    def _var_idxs_phys(
+        self,
+        contig: str,
+        starts: ArrayLike = 0,
+        ends: ArrayLike = POS_MAX,
+    ) -> tuple[NDArray[V_IDX_TYPE], NDArray[OFFSET_TYPE]]:
+        """Internal: like :meth:`var_idxs`, but maps the positional indices to
+        physical (file-global) PVAR row ids for pgenlib random access. The
+        ``_index["index"]`` column holds physical ids; ``var_idxs`` returns
+        positions into ``_index`` (issue #69), so reads remap here.
+        """
+        pos, offsets = self.var_idxs(contig, starts, ends)
+        assert self._index is not None
+        phys = self._index["index"].to_numpy()[pos].astype(V_IDX_TYPE)
+        return phys, offsets
 
     def read(
         self,
@@ -476,7 +495,7 @@ class PGEN:
         if c is None:
             return mode.empty(self.n_samples, self.ploidy, 0)
 
-        var_idxs, _ = self.var_idxs(c, start, end)
+        var_idxs, _ = self._var_idxs_phys(c, start, end)
         n_variants = len(var_idxs)
 
         if n_variants == 0:
@@ -543,7 +562,7 @@ class PGEN:
             yield mode.empty(self.n_samples, self.ploidy, 0)
             return
 
-        var_idxs, _ = self.var_idxs(c, start, end)
+        var_idxs, _ = self._var_idxs_phys(c, start, end)
         n_variants = len(var_idxs)
         if n_variants == 0:
             yield mode.empty(self.n_samples, self.ploidy, 0)
@@ -630,7 +649,7 @@ class PGEN:
                 n_ranges + 1, OFFSET_TYPE
             )
 
-        var_idxs, offsets = self.var_idxs(c, starts, ends)
+        var_idxs, offsets = self._var_idxs_phys(c, starts, ends)
         n_variants = len(var_idxs)
         if n_variants == 0:
             return mode.empty(self.n_samples, self.ploidy, 0), np.zeros(
@@ -715,7 +734,7 @@ class PGEN:
 
         ends = np.atleast_1d(np.asarray(ends, POS_TYPE))
 
-        var_idxs, offsets = self.var_idxs(c, starts, ends)
+        var_idxs, offsets = self._var_idxs_phys(c, starts, ends)
         vars_per_range = np.diff(offsets)
         tot_variants = len(var_idxs)
         if tot_variants == 0:
@@ -850,7 +869,7 @@ class PGEN:
 
         ends = np.atleast_1d(np.asarray(ends, POS_TYPE))
 
-        var_idxs, offsets = self.var_idxs(c, starts, ends)
+        var_idxs, offsets = self._var_idxs_phys(c, starts, ends)
         tot_variants = len(var_idxs)
         if tot_variants == 0:
             for e in ends:
