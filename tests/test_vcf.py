@@ -7,7 +7,7 @@ import pytest
 from numpy.typing import ArrayLike, NDArray
 from pytest_cases import fixture, parametrize_with_cases
 
-from genoray._vcf import VCF
+from genoray._vcf import POS_MAX, VCF
 from tests import _oracle
 from tests.data.fixtures import FIXTURES
 
@@ -346,3 +346,40 @@ def test_filter_setter_enforces_pair_invariant():
     # A bare (non-tuple) value is rejected.
     with pytest.raises(TypeError):
         vcf.filter = record_fn
+
+
+def test_filtered_var_idxs_consistent_with_index():
+    """Regression guard for #69 on the VCF backend.
+
+    VCF._var_idxs is private and never gathers _index, but it shares
+    var_indices() with PGEN, so it must also return positional indices. Filtered
+    reads must return the same genotypes as the matching unfiltered variants.
+    """
+    from genoray import exprs
+
+    # is_snp as a (cyvcf2 record callable, pl.Expr) pair (VCF requires both).
+    def record_is_snp(rec):
+        return len(rec.REF) == 1 and all(len(a) == 1 for a in rec.ALT)
+
+    v_filt = VCF(
+        ddir / "biallelic.vcf.gz",
+        filter=record_is_snp,
+        pl_filter=exprs.is_snp,
+    )
+    v_filt._write_gvi_index()
+    v_filt._load_index()
+    v_full = VCF(ddir / "biallelic.vcf.gz")
+
+    assert v_filt._index.height == 4
+
+    # _var_idxs is positional and in-bounds (pre-#69 it returned physical [4,5]).
+    vi, _ = v_filt._var_idxs("chr2", 0, POS_MAX)
+    assert int(vi.max()) < v_filt._index.height
+    assert np.array_equal(vi, np.array([2, 3], dtype=vi.dtype))
+    assert v_filt._index[vi]["POS"].to_list() == [81262, 81265]
+
+    # Filtered chr1 read == the SNP variants (physical [1, 2]) of the full read.
+    filt = v_filt.read("chr1", 0, POS_MAX, mode=VCF.Genos16)
+    full = v_full.read("chr1", 0, POS_MAX, mode=VCF.Genos16)
+    assert filt.shape[-1] == 2
+    assert np.array_equal(filt, full[..., [1, 2]])
