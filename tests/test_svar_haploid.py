@@ -220,3 +220,33 @@ def test_cli_write_haploid_subprocess(tmp_path: Path):
     )
     assert r.returncode == 0, r.stderr
     assert SparseVar(out).ploidy == 1
+
+
+def test_haploid_write_view_roundtrip(tmp_path: Path):
+    hap = tmp_path / "hap.svar"
+    SparseVar.from_vcf(hap, VCF(VCF_PATH), max_mem="1g", overwrite=True, haploid=True)
+    sv = SparseVar(hap)
+
+    out = tmp_path / "view.svar"
+    # all variants (one row per contig), all samples
+    import polars as pl
+
+    bounds = (
+        sv.index.group_by("CHROM", maintain_order=True)
+        .agg(
+            start=pl.lit(0, dtype=pl.Int32),
+            end=(pl.col("POS").max() + 1).cast(pl.Int32),
+        )
+        .rename({"CHROM": "chrom"})
+        .select("chrom", "start", "end")
+    )
+    sv.write_view(
+        regions=bounds, samples=list(sv.available_samples), output=out, overwrite=True
+    )
+
+    view = SparseVar(out)
+    assert view.ploidy == 1
+    assert view.genos.shape[1] == 1
+    # read paths return a ploidy-1 axis end to end
+    rag = view.read_ranges(view.contigs[0])
+    assert rag.shape[2] == 1
