@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -186,3 +187,36 @@ def test_from_pgen_haploid_metadata_and_or(tmp_path: Path):
     assert sv_hap.genos.shape[1] == 1
     assert sv_hap.n_variants == sv_dip.n_variants
     assert _haploid_call_sets(sv_hap) == _diploid_union_call_sets(sv_dip)
+
+
+def test_cli_write_haploid_vcf(tmp_path: Path):
+    from genoray._cli.__main__ import write as cli_write
+
+    out = tmp_path / "cli.svar"
+    cli_write(VCF_PATH, out, max_mem="1g", overwrite=True, haploid=True)
+    sv = SparseVar(out)
+    assert sv.ploidy == 1
+    assert sv.genos.shape[1] == 1
+
+
+def test_cli_write_haploid_subprocess(tmp_path: Path):
+    out = tmp_path / "cli_sub.svar"
+    r = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "genoray._cli",
+            "write",
+            str(VCF_PATH),
+            str(out),
+            "--max-mem",
+            "1g",
+            "--overwrite",
+            "--haploid",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert r.returncode == 0, r.stderr
+    assert SparseVar(out).ploidy == 1
