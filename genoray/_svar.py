@@ -929,6 +929,7 @@ class SparseVar(Generic[_SRT]):
         samples: "str | Sequence[str] | PathLike | None" = None,
         merge_overlapping: bool = False,
         regions_overlap: Literal["pos", "record", "variant"] = "pos",
+        haploid: bool = False,
     ):
         """Create a Sparse Variant (.svar) from a VCF/BCF.
 
@@ -963,6 +964,11 @@ class SparseVar(Generic[_SRT]):
         regions_overlap
             ``"pos"`` (default), ``"record"``, or ``"variant"`` — same semantics
             as ``write_view``.
+        haploid
+            If ``True``, OR-collapse the ploidy axis into a single haploid call
+            per sample (a variant present on any haplotype becomes one call) and
+            record ``ploidy=1`` in the output metadata. Intended for unphased
+            somatic data. Default ``False``.
         """
         out = Path(out)
 
@@ -1036,12 +1042,14 @@ class SparseVar(Generic[_SRT]):
             in_block = kept_rows[(kept_rows >= start) & (kept_rows < start + n)]
             keep_local_by_contig[c] = (in_block - start).astype(np.int64)
 
+        out_ploidy = 1 if haploid else vcf.ploidy
+
         with open(out / "metadata.json", "w") as f:
             json_str = SparseVarMetadata(
                 version=CURRENT_VERSION,
                 contigs=contigs,
                 samples=caller_samples,
-                ploidy=vcf.ploidy,
+                ploidy=out_ploidy,
                 fields={"dosages": np.dtype(DOSAGE_TYPE).name} if with_dosages else {},
             ).model_dump_json()
             f.write(json_str)
@@ -1062,7 +1070,7 @@ class SparseVar(Generic[_SRT]):
         with TemporaryDirectory() as chunk_dir:
             chunk_dir = Path(chunk_dir)
 
-            shape = (n_out, vcf.ploidy)
+            shape = (n_out, out_ploidy)
             tasks = []
             for chunk_idx, c in enumerate(contigs):
                 task = joblib.delayed(_process_contig_vcf)(
@@ -1076,6 +1084,7 @@ class SparseVar(Generic[_SRT]):
                     pl_filter=vcf._pl_filter,
                     caller_samples=None if samples is None else caller_samples,
                     keep_local=keep_local_by_contig.get(c),
+                    haploid=haploid,
                 )
                 tasks.append(task)
 
@@ -1096,7 +1105,7 @@ class SparseVar(Generic[_SRT]):
                     out,
                     n_total=len(kept_rows),
                     n_out=n_out,
-                    ploidy=vcf.ploidy,
+                    ploidy=out_ploidy,
                     with_dosages=with_dosages,
                 )
                 _write_index_from_working(
@@ -1122,6 +1131,7 @@ class SparseVar(Generic[_SRT]):
         samples: "str | Sequence[str] | PathLike | None" = None,
         merge_overlapping: bool = False,
         regions_overlap: Literal["pos", "record", "variant"] = "pos",
+        haploid: bool = False,
     ):
         """Create a Sparse Variant (.svar) from a PGEN.
 
@@ -1156,6 +1166,11 @@ class SparseVar(Generic[_SRT]):
         regions_overlap
             ``"pos"`` (default), ``"record"``, or ``"variant"`` — same semantics
             as ``write_view``.
+        haploid
+            If ``True``, OR-collapse the ploidy axis into a single haploid call
+            per sample (a variant present on any haplotype becomes one call) and
+            record ``ploidy=1`` in the output metadata. Intended for unphased
+            somatic data. Default ``False``.
         """
         out = Path(out)
 
@@ -1227,12 +1242,14 @@ class SparseVar(Generic[_SRT]):
             if m.any():
                 keep_by_contig[c] = np.ascontiguousarray(kept_phys[m], dtype=np.uint32)
 
+        out_ploidy = 1 if haploid else pgen.ploidy
+
         with open(out / "metadata.json", "w") as f:
             json_str = SparseVarMetadata(
                 version=CURRENT_VERSION,
                 contigs=contigs,
                 samples=caller_samples,
-                ploidy=pgen.ploidy,
+                ploidy=out_ploidy,
                 fields={"dosages": np.dtype(DOSAGE_TYPE).name} if with_dosages else {},
             ).model_dump_json()
             f.write(json_str)
@@ -1255,7 +1272,7 @@ class SparseVar(Generic[_SRT]):
             pgen.GenosDosages if with_dosages else pgen.Genos  # type: ignore
         )
 
-        shape = (n_out, pgen.ploidy)
+        shape = (n_out, out_ploidy)
         with TemporaryDirectory() as contig_dir:
             contig_dir = Path(contig_dir)
 
@@ -1276,6 +1293,7 @@ class SparseVar(Generic[_SRT]):
                     chunk_dir=contig_dir,
                     chunk_idx=len(tasks),
                     sample_subset=sample_subset,
+                    haploid=haploid,
                 )
                 tasks.append(task)
 
@@ -1303,7 +1321,7 @@ class SparseVar(Generic[_SRT]):
                     out,
                     n_total=len(kept_rows),
                     n_out=n_out,
-                    ploidy=pgen.ploidy,
+                    ploidy=out_ploidy,
                     with_dosages=with_dosages,
                 )
                 _write_index_from_working(
@@ -2258,6 +2276,7 @@ def _process_contig_vcf(
     pl_filter: pl.Expr | None = None,
     caller_samples: list[str] | None = None,
     keep_local: np.ndarray | None = None,
+    haploid: bool = False,
 ) -> tuple[int, int]:
     vcf = VCF(
         path,
@@ -2304,6 +2323,13 @@ def _process_contig_vcf(
         else:
             contig_local_pos += n_in
 
+        if haploid:
+            # OR across haplotypes -> single haploid slot. Uses `== 1`, the same
+            # predicate dense2sparse keys on, so the haploid call set equals the
+            # union of the per-haplotype call sets. Dosages keep their (s, v)
+            # shape and broadcast against the collapsed genos in dense2sparse.
+            genos = (genos == 1).any(axis=-2, keepdims=True).astype(np.int8)
+
         n_vars = genos.shape[-1]
         if n_vars == 0:
             continue
@@ -2335,6 +2361,7 @@ def _process_contig_pgen(
     chunk_dir: Path,
     chunk_idx: int,
     sample_subset: np.ndarray | None = None,
+    haploid: bool = False,
 ) -> tuple[int, int]:
     geno_reader = PgenReader(bytes(Path(geno_path)), n_samples)
     dose_reader = (
@@ -2391,6 +2418,12 @@ def _process_contig_pgen(
         # Restore caller-order from sorted pgenlib order
         if unsorter is not None:
             genos = genos[unsorter]
+
+        if haploid:
+            # OR across haplotypes -> single haploid slot. `ploidy` above is the
+            # native read ploidy (needed to reshape pgenlib output); the collapse
+            # changes only the STORED ploidy. Dosages keep (s, v) and broadcast.
+            genos = (genos == 1).any(axis=-2, keepdims=True).astype(np.int8)
 
         dosages = None
         if dose_reader is not None:

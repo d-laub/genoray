@@ -53,6 +53,7 @@ def write(
     threads: int | None = None,
     no_symbolic: Annotated[bool, Parameter(name="--no-symbolic", negative="")] = False,
     no_breakend: Annotated[bool, Parameter(name="--no-breakend", negative="")] = False,
+    haploid: Annotated[bool, Parameter(name="--haploid", negative="")] = False,
 ) -> None:
     """
     Convert a VCF or PGEN file to a SVAR file.
@@ -85,6 +86,10 @@ def write(
         single-breakend notation (``G[chr2:321[``, ``]chr2:321]G``, ``.TGCA``,
         ``TGCA.``). A distinct ALT class from symbolic alleles; combine with
         ``--no-symbolic`` to drop everything haplotype consumers cannot expand.
+    haploid
+        If set, OR-collapse the ploidy axis into a single haploid call per
+        sample (a variant present on any haplotype becomes one call) and record
+        ``ploidy=1`` in the output metadata. Intended for unphased somatic data.
     """
     from genoray import PGEN, VCF, SparseVar, exprs
     from genoray._utils import variant_file_type
@@ -143,7 +148,13 @@ def write(
             pl_filter=pl_filter,
         )
         SparseVar.from_vcf(
-            out, vcf, max_mem, overwrite, with_dosages=with_dosages, n_jobs=threads
+            out,
+            vcf,
+            max_mem,
+            overwrite,
+            with_dosages=with_dosages,
+            n_jobs=threads,
+            haploid=haploid,
         )
     elif file_type == "pgen":
         pgen = PGEN(
@@ -152,7 +163,13 @@ def write(
             filter=pl_filter,
         )
         SparseVar.from_pgen(
-            out, pgen, max_mem, overwrite, with_dosages=with_dosages, n_jobs=threads
+            out,
+            pgen,
+            max_mem,
+            overwrite,
+            with_dosages=with_dosages,
+            n_jobs=threads,
+            haploid=haploid,
         )
     else:
         raise ValueError(f"Unsupported file type: {source}")

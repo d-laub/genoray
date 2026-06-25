@@ -15,6 +15,33 @@ SparseVar.from_pgen("out.svar", "file.pgen", max_mem="4g")
 svar = SparseVar("out.svar")
 ```
 
+## Haploid (ploidy=1) write option
+
+For unphased somatic cohorts where phasing information is unavailable or irrelevant,
+`from_vcf` and `from_pgen` accept `haploid=True` to OR-collapse both haplotypes into a
+single haploid call per sample. A variant is recorded for a sample if it is present on
+*either* haplotype. The resulting SVAR stores `ploidy=1` in its metadata, and all
+downstream read operations (including `write_view` and `annotate_mutations`) work
+transparently at ploidy=1.
+
+```python
+from genoray import SparseVar, VCF
+
+# Collapse diploid genotypes to haploid (ploidy=1 in output)
+SparseVar.from_vcf("out.svar", VCF("file.vcf.gz"), max_mem="4g", haploid=True)
+
+svar = SparseVar("out.svar")
+assert svar.ploidy == 1
+# shape: (ranges, samples, ploidy=1, ~variants)
+rag = svar.read_ranges("chr1", starts=[0], ends=[1_000_000])
+```
+
+The equivalent CLI command:
+
+```bash
+genoray write file.vcf.gz out.svar --max-mem 4g --haploid
+```
+
 ## Reading SVAR
 
 ```python
