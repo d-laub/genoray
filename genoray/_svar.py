@@ -929,6 +929,7 @@ class SparseVar(Generic[_SRT]):
         samples: "str | Sequence[str] | PathLike | None" = None,
         merge_overlapping: bool = False,
         regions_overlap: Literal["pos", "record", "variant"] = "pos",
+        haploid: bool = False,
     ):
         """Create a Sparse Variant (.svar) from a VCF/BCF.
 
@@ -963,6 +964,11 @@ class SparseVar(Generic[_SRT]):
         regions_overlap
             ``"pos"`` (default), ``"record"``, or ``"variant"`` — same semantics
             as ``write_view``.
+        haploid
+            If ``True``, OR-collapse the ploidy axis into a single haploid call
+            per sample (a variant present on any haplotype becomes one call) and
+            record ``ploidy=1`` in the output metadata. Intended for unphased
+            somatic data. Default ``False``.
         """
         out = Path(out)
 
@@ -1036,12 +1042,14 @@ class SparseVar(Generic[_SRT]):
             in_block = kept_rows[(kept_rows >= start) & (kept_rows < start + n)]
             keep_local_by_contig[c] = (in_block - start).astype(np.int64)
 
+        out_ploidy = 1 if haploid else vcf.ploidy
+
         with open(out / "metadata.json", "w") as f:
             json_str = SparseVarMetadata(
                 version=CURRENT_VERSION,
                 contigs=contigs,
                 samples=caller_samples,
-                ploidy=vcf.ploidy,
+                ploidy=out_ploidy,
                 fields={"dosages": np.dtype(DOSAGE_TYPE).name} if with_dosages else {},
             ).model_dump_json()
             f.write(json_str)
@@ -1062,7 +1070,7 @@ class SparseVar(Generic[_SRT]):
         with TemporaryDirectory() as chunk_dir:
             chunk_dir = Path(chunk_dir)
 
-            shape = (n_out, vcf.ploidy)
+            shape = (n_out, out_ploidy)
             tasks = []
             for chunk_idx, c in enumerate(contigs):
                 task = joblib.delayed(_process_contig_vcf)(
@@ -1076,6 +1084,7 @@ class SparseVar(Generic[_SRT]):
                     pl_filter=vcf._pl_filter,
                     caller_samples=None if samples is None else caller_samples,
                     keep_local=keep_local_by_contig.get(c),
+                    haploid=haploid,
                 )
                 tasks.append(task)
 
@@ -1096,7 +1105,7 @@ class SparseVar(Generic[_SRT]):
                     out,
                     n_total=len(kept_rows),
                     n_out=n_out,
-                    ploidy=vcf.ploidy,
+                    ploidy=out_ploidy,
                     with_dosages=with_dosages,
                 )
                 _write_index_from_working(
@@ -2258,6 +2267,7 @@ def _process_contig_vcf(
     pl_filter: pl.Expr | None = None,
     caller_samples: list[str] | None = None,
     keep_local: np.ndarray | None = None,
+    haploid: bool = False,
 ) -> tuple[int, int]:
     vcf = VCF(
         path,
@@ -2303,6 +2313,13 @@ def _process_contig_vcf(
                 dosages = dosages[..., sel]
         else:
             contig_local_pos += n_in
+
+        if haploid:
+            # OR across haplotypes -> single haploid slot. Uses `== 1`, the same
+            # predicate dense2sparse keys on, so the haploid call set equals the
+            # union of the per-haplotype call sets. Dosages keep their (s, v)
+            # shape and broadcast against the collapsed genos in dense2sparse.
+            genos = (genos == 1).any(axis=-2, keepdims=True).astype(np.int8)
 
         n_vars = genos.shape[-1]
         if n_vars == 0:
