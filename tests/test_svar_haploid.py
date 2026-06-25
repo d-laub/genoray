@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import shutil
+import subprocess
 from pathlib import Path
 
 import numpy as np
+import pytest
 from seqpro.rag import Ragged
 
-from genoray import VCF, SparseVar
+from genoray import PGEN, VCF, SparseVar
 
 ddir = Path(__file__).parent / "data"
 VCF_PATH = (
@@ -140,3 +143,46 @@ def test_from_vcf_haploid_sample_subset_af(tmp_path: Path):
     assert afs.size == sv.n_variants
     assert np.all(afs > 0.0)
     assert np.all(afs <= 1.0)
+
+
+VCF_FOR_PGEN = str(ddir / "biallelic.vcf")
+
+
+def _vcf_to_pgen(tmp_path: Path) -> Path:
+    if shutil.which("plink2") is None:
+        pytest.skip("plink2 not available")
+    prefix = tmp_path / "conv"
+    subprocess.run(
+        [
+            "plink2",
+            "--vcf",
+            VCF_FOR_PGEN,
+            "--make-pgen",
+            "--out",
+            str(prefix),
+            "--allow-extra-chr",
+            "--vcf-half-call",
+            "haploid",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return prefix.with_suffix(".pgen")
+
+
+def test_from_pgen_haploid_metadata_and_or(tmp_path: Path):
+    pgen_path = _vcf_to_pgen(tmp_path)
+    dip = tmp_path / "dip.svar"
+    hap = tmp_path / "hap.svar"
+    SparseVar.from_pgen(dip, PGEN(pgen_path), max_mem="1g", overwrite=True)
+    SparseVar.from_pgen(
+        hap, PGEN(pgen_path), max_mem="1g", overwrite=True, haploid=True
+    )
+
+    sv_dip = SparseVar(dip)
+    sv_hap = SparseVar(hap)
+
+    assert sv_hap.ploidy == 1
+    assert sv_hap.genos.shape[1] == 1
+    assert sv_hap.n_variants == sv_dip.n_variants
+    assert _haploid_call_sets(sv_hap) == _diploid_union_call_sets(sv_dip)
