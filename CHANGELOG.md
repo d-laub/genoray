@@ -1,3 +1,15 @@
+## 2.13.0 (2026-06-25)
+
+### Feat
+
+- add --haploid flag to genoray write CLI
+- add haploid OR-collapse option to SparseVar.from_pgen
+- add haploid OR-collapse option to SparseVar.from_vcf
+
+### Fix
+
+- filtered PGEN var_idxs returns positional indices into _index (#69)
+
 ## 2.12.3 (2026-06-23)
 
 ### Fix
