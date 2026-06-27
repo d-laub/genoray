@@ -14,6 +14,7 @@ import numpy as np
 import polars as pl
 import pooch
 from numpy.typing import NDArray
+from joblib import Parallel, delayed
 from scipy.optimize import nnls
 
 from ._mutcat import labels
@@ -111,6 +112,8 @@ def fit_signatures(
     *,
     max_delta: float = 0.01,
     min_activity: float = 0.005,
+    n_jobs: int = 1,
+    backend: str = "loky",
 ) -> pl.DataFrame:
     """Refit a mutation catalogue against reference signatures.
 
@@ -128,6 +131,14 @@ def fit_signatures(
         (forward-selection stop criterion).
     min_activity
         Minimum fractional contribution; signatures below this are pruned.
+    n_jobs
+        Number of parallel workers for the per-sample refit (passed to
+        ``joblib.Parallel``). ``1`` (default) runs serially; ``-1`` uses all
+        cores. Results are identical regardless of ``n_jobs``.
+    backend
+        ``joblib`` backend (default ``"loky"``, process-based). Samples are
+        refit independently, so a process backend avoids GIL contention from
+        the forward-selection orchestration.
 
     Returns
     -------
@@ -174,8 +185,11 @@ def fit_signatures(
 
     activities = np.zeros((len(sample_cols), len(sig_cols)), dtype=np.float64)
     cosines = np.zeros(len(sample_cols), dtype=np.float64)
-    for j in range(len(sample_cols)):
-        h, cos = _fit_one(W, M[:, j], max_delta=max_delta, min_activity=min_activity)
+    results = Parallel(n_jobs=n_jobs, backend=backend)(
+        delayed(_fit_one)(W, M[:, j], max_delta=max_delta, min_activity=min_activity)
+        for j in range(len(sample_cols))
+    )
+    for j, (h, cos) in enumerate(results):
         activities[j] = h
         cosines[j] = cos
 

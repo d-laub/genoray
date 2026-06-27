@@ -1679,6 +1679,8 @@ class SparseVar(Generic[_SRT]):
         count: Literal["allele", "sample"] = "allele",
         max_delta: float = 0.01,
         min_activity: float = 0.005,
+        n_jobs: int = 1,
+        backend: str = "loky",
     ) -> "pl.DataFrame":
         """Refit this object's mutation catalogue against COSMIC signatures.
 
@@ -1697,6 +1699,10 @@ class SparseVar(Generic[_SRT]):
             Counting unit passed to :meth:`mutation_matrix`.
         max_delta, min_activity
             Forwarded to :func:`genoray.fit_signatures`.
+        n_jobs, backend
+            Forwarded to :func:`genoray.fit_signatures` to control per-sample
+            parallelism (``1`` (default) runs serially; ``-1`` uses all cores;
+            process-based ``"loky"`` backend).
 
         Returns
         -------
@@ -1712,7 +1718,12 @@ class SparseVar(Generic[_SRT]):
         else:
             ref = _load_signature_file(reference)
         return fit_signatures(
-            catalogue, ref, max_delta=max_delta, min_activity=min_activity
+            catalogue,
+            ref,
+            max_delta=max_delta,
+            min_activity=min_activity,
+            n_jobs=n_jobs,
+            backend=backend,
         )
 
     def cache_afs(self):

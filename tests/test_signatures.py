@@ -189,6 +189,26 @@ def test_cosmic_signatures_unregistered_combo_raises():
         cosmic_signatures("SBS96", version="9.9", genome="GRCh38")
 
 
+def test_fit_signatures_parallel_matches_serial():
+    cat, ref = _catalogue_and_reference()
+    serial = fit_signatures(cat, ref, n_jobs=1)
+    parallel = fit_signatures(cat, ref, n_jobs=-1)
+    assert serial.columns == parallel.columns
+    for col in serial.columns:
+        if col == "Sample":
+            assert serial[col].to_list() == parallel[col].to_list()
+        else:
+            assert serial[col].to_numpy() == pytest.approx(
+                parallel[col].to_numpy(), rel=1e-9, abs=1e-12
+            )
+
+
+def test_fit_signatures_accepts_backend_kwarg():
+    cat, ref = _catalogue_and_reference()
+    act = fit_signatures(cat, ref, n_jobs=2, backend="loky")
+    assert act["Sample"].to_list() == ["s0", "s1"]
+
+
 def test_public_exports():
     import genoray
 

@@ -391,6 +391,18 @@ def test_assign_signatures_with_explicit_reference(annotated_svar):
     assert (act.select(["SBS_A", "SBS_B"]).to_numpy() >= 0).all()
 
 
+def test_assign_signatures_forwards_n_jobs(annotated_svar):
+    svar = SparseVar(annotated_svar, fields=["mutcat"])
+    ref = _toy_sbs_reference()
+    serial = svar.assign_signatures("SBS96", reference=ref, n_jobs=1)
+    parallel = svar.assign_signatures("SBS96", reference=ref, n_jobs=2, backend="loky")
+    assert serial.columns == parallel.columns
+    for col in ("SBS_A", "SBS_B", "cosine_similarity"):
+        assert serial[col].to_numpy() == pytest.approx(
+            parallel[col].to_numpy(), rel=1e-9, abs=1e-12
+        )
+
+
 def test_issue59_deletion_no_longer_crashes(tmp_path):
     from genoray._mutcat import ID83_OFFSET, N_CODES
 
