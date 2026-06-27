@@ -135,10 +135,33 @@ def test_validate_fields_empty_list_returns_empty():
 
 
 # ---------------------------------------------------------------------------
-# Task 4: _resolve_kept_var_idxs
+# Task 2: __init__ does not materialize the full index
 # ---------------------------------------------------------------------------
 
 ddir = Path(__file__).parent / "data"
+
+
+def _index_raises(self):
+    raise AssertionError("full index was materialized")
+
+
+def test_construction_does_not_materialize_index(monkeypatch):
+    import numpy as np
+
+    # Make any access to the full .index blow up.
+    monkeypatch.setattr(SparseVar, "index", property(_index_raises))
+
+    sv = SparseVar(ddir / "biallelic.vcf.svar")
+
+    # These must all work WITHOUT touching the full index.
+    assert isinstance(sv._is_biallelic, (bool, np.bool_))
+    assert sv.n_variants > 0
+    assert isinstance(sv._c_max_idxs, dict) and sv._c_max_idxs
+
+
+# ---------------------------------------------------------------------------
+# Task 4: _resolve_kept_var_idxs
+# ---------------------------------------------------------------------------
 
 
 @pytest.fixture

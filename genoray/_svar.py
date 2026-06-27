@@ -512,7 +512,7 @@ class SparseVar(Generic[_SRT]):
     @property
     def n_variants(self) -> int:
         """Number of variants in the dataset."""
-        return self.index.height
+        return int(self._contig_stats["n"].sum())
 
     @property
     def nbytes(self) -> int:
@@ -526,6 +526,34 @@ class SparseVar(Generic[_SRT]):
     def index(self) -> pl.DataFrame:
         """The full variant index, materialized on first access."""
         return self._index_lazy.collect()
+
+    @cached_property
+    def _contig_stats(self) -> pl.DataFrame:
+        """Per-contig variant count and max POS, in first-appearance order.
+
+        Computed by a single streaming reduction over the numeric index
+        columns — never materializes the full string-bearing index.
+        """
+        return (
+            self._index_lazy.group_by("CHROM", maintain_order=True)
+            .agg(n=pl.len(), pos_max=pl.col("POS").max())
+            .collect()
+        )
+
+    @cached_property
+    def _c_max_idxs(self) -> dict[str, int]:
+        stats = self._contig_stats
+        out = {c: int(v) - 1 for c, v in zip(stats["CHROM"], stats["n"].cum_sum())}
+        out |= {c: 0 for c in self.contigs if c not in out}
+        return out
+
+    @cached_property
+    def _is_biallelic(self) -> bool:
+        return bool(
+            self._index_lazy.select((pl.col("ALT").list.len() == 1).all())
+            .collect()
+            .item()
+        )
 
     @overload
     def __init__(
@@ -593,17 +621,6 @@ class SparseVar(Generic[_SRT]):
                 "recompute via annotate_mutations()."
             )
         self._index_lazy = self._scan_index(attrs)
-        self._is_biallelic = (self.index["ALT"].list.len() == 1).all()
-        vars_per_contig = self.index.group_by("CHROM", maintain_order=True).agg(
-            n_variants=pl.len()
-        )
-        self._c_max_idxs = {
-            c: v - 1
-            for c, v in zip(
-                vars_per_contig["CHROM"], vars_per_contig["n_variants"].cum_sum()
-            )
-        }
-        self._c_max_idxs |= {c: 0 for c in self.contigs if c not in self._c_max_idxs}
 
     def var_ranges(
         self,
