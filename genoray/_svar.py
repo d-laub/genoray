@@ -8,6 +8,7 @@ from collections.abc import Callable, Iterable, Sequence
 from os import PathLike
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from functools import cached_property
 from typing import Any, Generic, Literal, TypeVar, cast, overload
 
 import awkward as ak
@@ -521,6 +522,11 @@ class SparseVar(Generic[_SRT]):
         """
         return int(self.index.estimated_size())
 
+    @cached_property
+    def index(self) -> pl.DataFrame:
+        """The full variant index, materialized on first access."""
+        return self._index_lazy.collect()
+
     @overload
     def __init__(
         self: SparseVar[Ragged[V_IDX_TYPE]],
@@ -586,8 +592,7 @@ class SparseVar(Generic[_SRT]):
                 f"(v{metadata.mutcat_version} < v{MUTCAT_VERSION}); "
                 "recompute via annotate_mutations()."
             )
-        logger.info("Loading genoray index")
-        self.index = self._load_index(attrs)
+        self._index_lazy = self._scan_index(attrs)
         self._is_biallelic = (self.index["ALT"].list.len() == 1).all()
         vars_per_contig = self.index.group_by("CHROM", maintain_order=True).agg(
             n_variants=pl.len()
@@ -1338,9 +1343,12 @@ class SparseVar(Generic[_SRT]):
         """Path to the index file."""
         return root / "index.arrow"
 
-    def _load_index(self, attrs: IntoExpr | None = None) -> pl.DataFrame:
-        """Load the .gvi index."""
+    def _scan_index(self, attrs: IntoExpr | None = None) -> pl.LazyFrame:
+        """Lazily scan the .gvi index (no collect).
 
+        Returns a LazyFrame with columns ``index, CHROM, POS, REF, ALT, *attrs, ILEN``.
+        ``index`` is the physical row index added by ``scan_ipc``.
+        """
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             index = pl.scan_ipc(self._index_path(self.path), row_index_name="index")
@@ -1371,9 +1379,7 @@ class SparseVar(Generic[_SRT]):
         elif "ILEN" not in schema:
             attrs.append(ILEN.alias("ILEN"))
 
-        index = index.select("index", "CHROM", "POS", "REF", *attrs).collect()
-
-        return index
+        return index.select("index", "CHROM", "POS", "REF", *attrs)
 
     def annotate_with_gtf(
         self,

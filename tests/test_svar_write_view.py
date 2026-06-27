@@ -639,3 +639,22 @@ def test_write_view_raises_when_all_variants_drop(tmp_path: Path, svar_wv: Spars
             samples=one,
             output=out,
         )
+
+
+def test_index_lazy_and_cached_property(svar_wv):
+    import polars as pl
+
+    # Lazy handle exists and is a LazyFrame
+    assert isinstance(svar_wv._index_lazy, pl.LazyFrame)
+
+    # .index is a DataFrame equal to collecting the lazy handle
+    eager = svar_wv.index
+    assert isinstance(eager, pl.DataFrame)
+    assert eager.equals(svar_wv._index_lazy.collect())
+
+    # Required columns present (unchanged public shape)
+    for col in ("index", "CHROM", "POS", "REF", "ALT", "ILEN"):
+        assert col in eager.columns
+
+    # Cached: second access returns the same object
+    assert svar_wv.index is eager
