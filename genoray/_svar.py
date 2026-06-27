@@ -536,7 +536,7 @@ class SparseVar(Generic[_SRT]):
         """Per-contig variant count and max POS, in first-appearance order.
 
         Computed by a single streaming reduction over the numeric index
-        columns — never materializes the full string-bearing index.
+        columns — never materializes the full per-row index.
         """
         return (
             self._index_lazy.group_by("CHROM", maintain_order=True)
@@ -2068,6 +2068,9 @@ class SparseVar(Generic[_SRT]):
             )  # row order must match the ascending kept_var_idxs / written genos
             .drop("index")  # physical row index is not part of the output schema
         )
+        # sink_ipc forces the streaming engine, so the inner join filters the
+        # scan down to output size before the sort — peak RAM scales with the
+        # selected subset, not the full input index.
         out_index.sink_ipc(SparseVar._index_path(output))
 
         # --- 10. Write metadata.json ---
