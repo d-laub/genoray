@@ -427,15 +427,18 @@ Signatures:
   — fetches/caches the COSMIC reference set for `kind ∈ {"SBS96","DBS78","ID83"}`.
   Returns a `MutationType` column (canonical codebook order) + one column per
   signature. `genome` is ignored for `ID83`.
-- `fit_signatures(catalogue, reference, *, max_delta=0.01, min_activity=0.005) -> pl.DataFrame`
+- `fit_signatures(catalogue, reference, *, max_delta=0.01, min_activity=0.005, n_jobs=-1, backend="loky") -> pl.DataFrame`
   — sparse forward-selection refit (NNLS + cosine-guided add + min-activity
   prune). Aligns rows by joining on `MutationType` (raises `ValueError` if the
   catalogue has a type missing from the reference). Returns one row per sample:
   `Sample`, one Float column per signature (counts; `0.0` if unselected), and
-  `cosine_similarity`.
-- `SparseVar.assign_signatures(kind, *, reference=None, count="allele", max_delta=0.01, min_activity=0.005) -> pl.DataFrame`
+  `cosine_similarity`. Refits per sample in parallel (joblib). `n_jobs=-1` uses
+  all cores; `n_jobs=1` is serial. Results are identical regardless of
+  `n_jobs`/`backend`.
+- `SparseVar.assign_signatures(kind, *, reference=None, count="allele", max_delta=0.01, min_activity=0.005, n_jobs=-1, backend="loky") -> pl.DataFrame`
   — `mutation_matrix(kind, count=...)` then `fit_signatures(...)`. `reference`
   accepts a `pl.DataFrame`, a TSV path, or `None` (defaults to `cosmic_signatures(kind)`).
+  Forwards `n_jobs`/`backend` to `fit_signatures` for per-sample parallelism.
 
 Out of scope (v1): de novo extraction, opportunity normalization, bootstrap CIs,
 plotting.
