@@ -8,6 +8,7 @@ from collections.abc import Callable, Iterable, Sequence
 from os import PathLike
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from functools import cached_property
 from typing import Any, Generic, Literal, TypeVar, cast, overload
 
 import awkward as ak
@@ -319,9 +320,13 @@ def _resolve_kept_var_idxs(
     mode: Literal["pos", "record", "variant"],
     merge_overlapping: bool,
 ) -> "NDArray[V_IDX_TYPE]":
-    """Backward-compatible wrapper used by ``write_view``; resolves against
-    ``sv.index`` (which carries CHROM/POS/ILEN/index)."""
-    return _resolve_kept_rows(sv.index, sv._c_norm, regions, mode, merge_overlapping)
+    """Resolve kept row positions using only the numeric index columns.
+
+    Collects ``index/CHROM/POS/ILEN`` from the lazy index (bounded RAM) instead
+    of materializing the full string-bearing index.
+    """
+    idx_numeric = sv._index_lazy.select("index", "CHROM", "POS", "ILEN").collect()
+    return _resolve_kept_rows(idx_numeric, sv._c_norm, regions, mode, merge_overlapping)
 
 
 @overload
@@ -511,7 +516,7 @@ class SparseVar(Generic[_SRT]):
     @property
     def n_variants(self) -> int:
         """Number of variants in the dataset."""
-        return self.index.height
+        return int(self._contig_stats["n"].sum())
 
     @property
     def nbytes(self) -> int:
@@ -520,6 +525,39 @@ class SparseVar(Generic[_SRT]):
         and `fields` are memory-mapped and excluded.
         """
         return int(self.index.estimated_size())
+
+    @cached_property
+    def index(self) -> pl.DataFrame:
+        """The full variant index, materialized on first access."""
+        return self._index_lazy.collect()
+
+    @cached_property
+    def _contig_stats(self) -> pl.DataFrame:
+        """Per-contig variant count and max POS, in first-appearance order.
+
+        Computed by a single streaming reduction over the numeric index
+        columns — never materializes the full per-row index.
+        """
+        return (
+            self._index_lazy.group_by("CHROM", maintain_order=True)
+            .agg(n=pl.len(), pos_max=pl.col("POS").max())
+            .collect()
+        )
+
+    @cached_property
+    def _c_max_idxs(self) -> dict[str, int]:
+        stats = self._contig_stats
+        out = {c: int(v) - 1 for c, v in zip(stats["CHROM"], stats["n"].cum_sum())}
+        out |= {c: 0 for c in self.contigs if c not in out}
+        return out
+
+    @cached_property
+    def _is_biallelic(self) -> bool:
+        return bool(
+            self._index_lazy.select((pl.col("ALT").list.len() == 1).all())
+            .collect()
+            .item()
+        )
 
     @overload
     def __init__(
@@ -586,19 +624,7 @@ class SparseVar(Generic[_SRT]):
                 f"(v{metadata.mutcat_version} < v{MUTCAT_VERSION}); "
                 "recompute via annotate_mutations()."
             )
-        logger.info("Loading genoray index")
-        self.index = self._load_index(attrs)
-        self._is_biallelic = (self.index["ALT"].list.len() == 1).all()
-        vars_per_contig = self.index.group_by("CHROM", maintain_order=True).agg(
-            n_variants=pl.len()
-        )
-        self._c_max_idxs = {
-            c: v - 1
-            for c, v in zip(
-                vars_per_contig["CHROM"], vars_per_contig["n_variants"].cum_sum()
-            )
-        }
-        self._c_max_idxs |= {c: 0 for c in self.contigs if c not in self._c_max_idxs}
+        self._index_lazy = self._scan_index(attrs)
 
     def var_ranges(
         self,
@@ -626,6 +652,40 @@ class SparseVar(Generic[_SRT]):
             and the second column is the end index of the variant.
         """
         return var_ranges(self._c_norm, self.index, contig, starts, ends)
+
+    def _covers_all_variants(
+        self, regions: "pl.DataFrame", mode: "Literal['pos', 'record', 'variant']"
+    ) -> bool:
+        """True iff *regions* select every variant (one region per present contig,
+        each spanning [0, pos_max]).  Lets write_view skip POS materialization.
+
+        Only applies to ``pos``/``record`` modes (``variant`` mode is ILEN-aware
+        and resolved through ``var_ranges``).
+        """
+        if mode == "variant":
+            return False
+
+        stats = self._contig_stats  # CHROM, n, pos_max
+        present = set(stats["CHROM"])
+
+        per_contig = regions.group_by("chrom").agg(
+            start=pl.col("start").min(),
+            end=pl.col("end").max(),
+            k=pl.len(),
+        )
+        if set(per_contig["chrom"]) != present:
+            return False
+
+        pos_max = dict(zip(stats["CHROM"], stats["pos_max"]))
+        end_offset = 0 if mode == "pos" else 1
+        for c, s, e, k in zip(
+            per_contig["chrom"], per_contig["start"], per_contig["end"], per_contig["k"]
+        ):
+            # POS is 1-based; 0-based p in [0, pos_max-1]. Full coverage needs a
+            # single region with start <= 0 and (end + end_offset) >= pos_max.
+            if k != 1 or s > 0 or (e + end_offset) < pos_max[c]:
+                return False
+        return True
 
     def _find_starts_ends(
         self,
@@ -1338,9 +1398,12 @@ class SparseVar(Generic[_SRT]):
         """Path to the index file."""
         return root / "index.arrow"
 
-    def _load_index(self, attrs: IntoExpr | None = None) -> pl.DataFrame:
-        """Load the .gvi index."""
+    def _scan_index(self, attrs: IntoExpr | None = None) -> pl.LazyFrame:
+        """Lazily scan the .gvi index (no collect).
 
+        Returns a LazyFrame with columns ``index, CHROM, POS, REF, ALT, *attrs, ILEN``.
+        ``index`` is the physical row index added by ``scan_ipc``.
+        """
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             index = pl.scan_ipc(self._index_path(self.path), row_index_name="index")
@@ -1371,9 +1434,7 @@ class SparseVar(Generic[_SRT]):
         elif "ILEN" not in schema:
             attrs.append(ILEN.alias("ILEN"))
 
-        index = index.select("index", "CHROM", "POS", "REF", *attrs).collect()
-
-        return index
+        return index.select("index", "CHROM", "POS", "REF", *attrs)
 
     def annotate_with_gtf(
         self,
@@ -1855,9 +1916,13 @@ class SparseVar(Generic[_SRT]):
             raise ValueError("write_view requires at least one sample")
 
         # --- 2. Resolve kept variant indices ---
-        kept_var_idxs = _resolve_kept_var_idxs(
-            self, regions_df, regions_overlap, merge_overlapping
-        )
+        if self._covers_all_variants(regions_df, regions_overlap):
+            # Fast path: every variant is selected; skip POS/ILEN materialization.
+            kept_var_idxs = np.arange(self.n_variants, dtype=V_IDX_TYPE)
+        else:
+            kept_var_idxs = _resolve_kept_var_idxs(
+                self, regions_df, regions_overlap, merge_overlapping
+            )
         if len(kept_var_idxs) == 0:
             raise ValueError("no variants selected by `regions`")
 
@@ -1974,20 +2039,39 @@ class SparseVar(Generic[_SRT]):
             out_field_mm.flush()
             del src_field_rag
 
-        # --- 9. Build new index ---
-        new_index = self.index[kept_var_idxs.tolist()]
-        # Drop existing AF and row-index columns if present
-        cols_to_drop = [c for c in ("AF", "index") if c in new_index.columns]
-        if cols_to_drop:
-            new_index = new_index.drop(cols_to_drop)
-
-        # Compute AFs over the written genos
+        # --- 9. Build new index (streaming: never materialize the full index) ---
+        # Compute AFs over the written genos.
         n_alleles = n_out * ploidy
         afs = np.zeros(len(kept_var_idxs), dtype=np.float32)
         _nb_af_helper(afs, out_var_idxs_mm, new_offsets.ravel(), n_alleles)
 
-        new_index = new_index.with_columns(AF=pl.Series(afs))
-        new_index.write_ipc(SparseVar._index_path(output))
+        # Small, output-sized frame keyed by the kept physical row index.
+        # The row-index column produced by scan_ipc is UInt32 (see _scan_index);
+        # match that dtype so the join keys align.
+        idx_dtype = self._index_lazy.collect_schema()["index"]
+        af_frame = pl.DataFrame(
+            {
+                "index": pl.Series(kept_var_idxs).cast(idx_dtype),
+                "AF": pl.Series(afs),
+            }
+        )
+
+        base = self._index_lazy
+        drop_existing_af = ["AF"] if "AF" in base.collect_schema().names() else []
+        out_index = (
+            base.drop(drop_existing_af)
+            .join(
+                af_frame.lazy(), on="index", how="inner"
+            )  # filter to kept + attach AF
+            .sort(
+                "index"
+            )  # row order must match the ascending kept_var_idxs / written genos
+            .drop("index")  # physical row index is not part of the output schema
+        )
+        # sink_ipc forces the streaming engine, so the inner join filters the
+        # scan down to output size before the sort — peak RAM scales with the
+        # selected subset, not the full input index.
+        out_index.sink_ipc(SparseVar._index_path(output))
 
         # --- 10. Write metadata.json ---
         with open(output / "metadata.json", "w") as f:

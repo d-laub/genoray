@@ -135,10 +135,33 @@ def test_validate_fields_empty_list_returns_empty():
 
 
 # ---------------------------------------------------------------------------
-# Task 4: _resolve_kept_var_idxs
+# Task 2: __init__ does not materialize the full index
 # ---------------------------------------------------------------------------
 
 ddir = Path(__file__).parent / "data"
+
+
+def _index_raises(self):
+    raise AssertionError("full index was materialized")
+
+
+def test_construction_does_not_materialize_index(monkeypatch):
+    import numpy as np
+
+    # Make any access to the full .index blow up.
+    monkeypatch.setattr(SparseVar, "index", property(_index_raises))
+
+    sv = SparseVar(ddir / "biallelic.vcf.svar")
+
+    # These must all work WITHOUT touching the full index.
+    assert isinstance(sv._is_biallelic, (bool, np.bool_))
+    assert sv.n_variants > 0
+    assert isinstance(sv._c_max_idxs, dict) and sv._c_max_idxs
+
+
+# ---------------------------------------------------------------------------
+# Task 4: _resolve_kept_var_idxs
+# ---------------------------------------------------------------------------
 
 
 @pytest.fixture
@@ -639,3 +662,135 @@ def test_write_view_raises_when_all_variants_drop(tmp_path: Path, svar_wv: Spars
             samples=one,
             output=out,
         )
+
+
+def test_index_lazy_and_cached_property(svar_wv):
+    import polars as pl
+
+    # Lazy handle exists and is a LazyFrame
+    assert isinstance(svar_wv._index_lazy, pl.LazyFrame)
+
+    # .index is a DataFrame equal to collecting the lazy handle
+    eager = svar_wv.index
+    assert isinstance(eager, pl.DataFrame)
+    assert eager.equals(svar_wv._index_lazy.collect())
+
+    # Required columns present (unchanged public shape)
+    for col in ("index", "CHROM", "POS", "REF", "ALT", "ILEN"):
+        assert col in eager.columns
+
+    # Cached: second access returns the same object
+    assert svar_wv.index is eager
+
+
+def test_write_view_output_index_order_and_af(tmp_path: Path, svar: SparseVar):
+    import numpy as np
+    import polars as pl
+
+    out = tmp_path / "view.svar"
+    contig = svar.contigs[0]
+    samples = svar.available_samples[:2]
+    svar.write_view(regions=(contig, 0, 1_000_000), samples=samples, output=out)
+
+    sv2 = SparseVar(out, attrs="AF")  # need attrs="AF" to expose AF column
+    out_idx = sv2.index
+
+    # 1. Output index POS is ascending (positional alignment with written genos).
+    pos = out_idx["POS"].to_numpy()
+    assert np.all(np.diff(pos) >= 0)
+
+    # 2. AF is present, finite, and in [0, 1].
+    af = out_idx["AF"].to_numpy()
+    assert np.isfinite(af).all()
+    assert (af >= 0).all() and (af <= 1).all()
+
+    # 3. No leftover row-index column persisted to disk.
+    # (sv2.index always has "index" added synthetically by scan_ipc; check the raw file.)
+    raw_schema = pl.read_ipc_schema(SparseVar._index_path(out))
+    assert "index" not in raw_schema
+
+    # 4. Output POS set matches the source POS on this contig (all MAC>0 kept here).
+    src_pos = set(svar.index.filter(pl.col("CHROM") == contig)["POS"].to_list())
+    # MAC=0 variants may be dropped; output must be a subset of source POS.
+    assert set(pos.tolist()).issubset(src_pos)
+
+
+# ---------------------------------------------------------------------------
+# Task 4: _covers_all_variants short-circuit + write_view never materializes
+# ---------------------------------------------------------------------------
+
+
+def test_covers_all_variants_short_circuit(svar_wv):
+    import numpy as np
+
+    # Build per-contig [0, pos_max+1) bounds == the CLI "all variants" default.
+    stats = svar_wv._contig_stats
+    regions = pl.DataFrame(
+        {
+            "chrom": stats["CHROM"],
+            "start": pl.Series([0] * stats.height, dtype=pl.Int32),
+            "end": (stats["pos_max"] + 1).cast(pl.Int32),
+        }
+    ).select("chrom", "start", "end")
+
+    assert svar_wv._covers_all_variants(regions, "pos") is True
+
+    from genoray._svar import _resolve_kept_var_idxs
+
+    kept = _resolve_kept_var_idxs(svar_wv, regions, mode="pos", merge_overlapping=False)
+    # Short-circuit returns every variant, in ascending order.
+    assert len(kept) == svar_wv.n_variants
+    assert np.array_equal(kept, np.arange(svar_wv.n_variants, dtype=kept.dtype))
+
+
+def test_write_view_never_materializes_full_index(monkeypatch, tmp_path: Path):
+    # .index access => failure, for BOTH the all-variants and specific-region paths.
+    monkeypatch.setattr(SparseVar, "index", property(_index_raises))
+    sv = SparseVar(ddir / "biallelic.vcf.svar")
+    contig = sv.contigs[0]
+    samples = sv.available_samples[:1]
+
+    # all-variants (short-circuit) path
+    out_all = tmp_path / "all.svar"
+    stats = sv._contig_stats
+    regions_all = pl.DataFrame(
+        {
+            "chrom": stats["CHROM"],
+            "start": pl.Series([0] * stats.height, dtype=pl.Int32),
+            "end": (stats["pos_max"] + 1).cast(pl.Int32),
+        }
+    ).select("chrom", "start", "end")
+    sv.write_view(regions=regions_all, samples=samples, output=out_all)
+    assert (out_all / "index.arrow").exists()
+    assert (out_all / "metadata.json").exists()
+
+    # specific-region (numeric-collect) path
+    out_one = tmp_path / "one.svar"
+    sv.write_view(regions=(contig, 0, 1_000_000), samples=samples, output=out_one)
+    assert (out_one / "index.arrow").exists()
+
+
+# ---------------------------------------------------------------------------
+# Task 5: CLI view default bounds do not materialize the full index
+# ---------------------------------------------------------------------------
+
+
+def test_cli_view_default_does_not_materialize_index(monkeypatch, tmp_path: Path):
+    from genoray._cli.__main__ import view
+
+    monkeypatch.setattr(SparseVar, "index", property(_index_raises))
+
+    src = ddir / "biallelic.vcf.svar"
+    out = tmp_path / "cli.svar"
+    sv = SparseVar(src)
+    sample = sv.available_samples[0]
+
+    # Default regions (all variants) + a sample subset — the issue #73 shape.
+    view(
+        source=src,
+        out=out,
+        samples=sample,
+        overwrite=True,
+    )
+    assert (out / "index.arrow").exists()
+    assert (out / "metadata.json").exists()
