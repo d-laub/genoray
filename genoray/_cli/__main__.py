@@ -263,17 +263,14 @@ def view(
     elif regions_file is not None:
         regions_arg = regions_file
     else:
-        # "all variants" — one row per contig spanning [0, max_pos+1)
-        # Synthesize one row per contig covering [0, max(POS)+1)
-        bounds = (
-            sv.index.group_by("CHROM", maintain_order=True)
-            .agg(
-                start=pl.lit(0, dtype=pl.Int32),
-                end=(pl.col("POS").max() + 1).cast(pl.Int32),
-            )
-            .rename({"CHROM": "chrom"})
+        # "all variants" — one row per contig spanning [0, max_pos+1).
+        # Use the lazy per-contig stats so we never materialize the full index.
+        stats = sv._contig_stats  # columns: CHROM, n, pos_max
+        regions_arg = stats.select(
+            chrom=pl.col("CHROM"),
+            start=pl.lit(0, dtype=pl.Int32),
+            end=(pl.col("pos_max") + 1).cast(pl.Int32),
         )
-        regions_arg = bounds.select("chrom", "start", "end")
 
     # Resolve samples arg
     if samples is not None:

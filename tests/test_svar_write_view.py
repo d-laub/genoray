@@ -768,3 +768,29 @@ def test_write_view_never_materializes_full_index(monkeypatch, tmp_path: Path):
     out_one = tmp_path / "one.svar"
     sv.write_view(regions=(contig, 0, 1_000_000), samples=samples, output=out_one)
     assert (out_one / "index.arrow").exists()
+
+
+# ---------------------------------------------------------------------------
+# Task 5: CLI view default bounds do not materialize the full index
+# ---------------------------------------------------------------------------
+
+
+def test_cli_view_default_does_not_materialize_index(monkeypatch, tmp_path: Path):
+    from genoray._cli.__main__ import view
+
+    monkeypatch.setattr(SparseVar, "index", property(_index_raises))
+
+    src = ddir / "biallelic.vcf.svar"
+    out = tmp_path / "cli.svar"
+    sv = SparseVar(src)
+    sample = sv.available_samples[0]
+
+    # Default regions (all variants) + a sample subset — the issue #73 shape.
+    view(
+        source=src,
+        out=out,
+        samples=sample,
+        overwrite=True,
+    )
+    assert (out / "index.arrow").exists()
+    assert (out / "metadata.json").exists()
