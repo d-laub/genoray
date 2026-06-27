@@ -112,7 +112,7 @@ def fit_signatures(
     *,
     max_delta: float = 0.01,
     min_activity: float = 0.005,
-    n_jobs: int = -1,
+    n_jobs: int = 1,
     backend: str = "loky",
 ) -> pl.DataFrame:
     """Refit a mutation catalogue against reference signatures.
@@ -133,8 +133,8 @@ def fit_signatures(
         Minimum fractional contribution; signatures below this are pruned.
     n_jobs
         Number of parallel workers for the per-sample refit (passed to
-        ``joblib.Parallel``). ``-1`` (default) uses all cores; ``1`` runs
-        serially. Results are identical regardless of ``n_jobs``.
+        ``joblib.Parallel``). ``1`` (default) runs serially; ``-1`` uses all
+        cores. Results are identical regardless of ``n_jobs``.
     backend
         ``joblib`` backend (default ``"loky"``, process-based). Samples are
         refit independently, so a process backend avoids GIL contention from

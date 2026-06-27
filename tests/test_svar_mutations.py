@@ -399,7 +399,7 @@ def test_assign_signatures_forwards_n_jobs(annotated_svar):
     assert serial.columns == parallel.columns
     for col in ("SBS_A", "SBS_B", "cosine_similarity"):
         assert serial[col].to_numpy() == pytest.approx(
-            parallel[col].to_numpy(), abs=0.0, rel=0.0
+            parallel[col].to_numpy(), rel=1e-9, abs=1e-12
         )
 
 

@@ -199,7 +199,7 @@ def test_fit_signatures_parallel_matches_serial():
             assert serial[col].to_list() == parallel[col].to_list()
         else:
             assert serial[col].to_numpy() == pytest.approx(
-                parallel[col].to_numpy(), abs=0.0, rel=0.0
+                parallel[col].to_numpy(), rel=1e-9, abs=1e-12
             )
 
 

@@ -1679,7 +1679,7 @@ class SparseVar(Generic[_SRT]):
         count: Literal["allele", "sample"] = "allele",
         max_delta: float = 0.01,
         min_activity: float = 0.005,
-        n_jobs: int = -1,
+        n_jobs: int = 1,
         backend: str = "loky",
     ) -> "pl.DataFrame":
         """Refit this object's mutation catalogue against COSMIC signatures.
@@ -1701,8 +1701,8 @@ class SparseVar(Generic[_SRT]):
             Forwarded to :func:`genoray.fit_signatures`.
         n_jobs, backend
             Forwarded to :func:`genoray.fit_signatures` to control per-sample
-            parallelism (default ``-1`` = all cores, process-based ``"loky"``
-            backend).
+            parallelism (``1`` (default) runs serially; ``-1`` uses all cores;
+            process-based ``"loky"`` backend).
 
         Returns
         -------
