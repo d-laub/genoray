@@ -1,3 +1,22 @@
+## 2.14.0 (2026-06-27)
+
+### Feat
+
+- stream write_view region resolution + whole-contig short-circuit
+- stream write_view output index via scan_ipc join+sink_ipc (no full-index collect)
+- forward n_jobs/backend through SparseVar.assign_signatures
+- parallelize fit_signatures over samples with joblib
+
+### Fix
+
+- compute genoray view default bounds lazily (no full-index materialization)
+
+### Refactor
+
+- derive _is_biallelic/_c_max_idxs/n_variants lazily so __init__ never materializes the full index
+- lazy SparseVar index scan with collect-on-demand .index property
+- default fit_signatures/assign_signatures to serial (n_jobs=1); relax parallel-equivalence tests to tolerance
+
 ## 2.13.0 (2026-06-25)
 
 ### Feat
