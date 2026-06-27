@@ -320,9 +320,13 @@ def _resolve_kept_var_idxs(
     mode: Literal["pos", "record", "variant"],
     merge_overlapping: bool,
 ) -> "NDArray[V_IDX_TYPE]":
-    """Backward-compatible wrapper used by ``write_view``; resolves against
-    ``sv.index`` (which carries CHROM/POS/ILEN/index)."""
-    return _resolve_kept_rows(sv.index, sv._c_norm, regions, mode, merge_overlapping)
+    """Resolve kept row positions using only the numeric index columns.
+
+    Collects ``index/CHROM/POS/ILEN`` from the lazy index (bounded RAM) instead
+    of materializing the full string-bearing index.
+    """
+    idx_numeric = sv._index_lazy.select("index", "CHROM", "POS", "ILEN").collect()
+    return _resolve_kept_rows(idx_numeric, sv._c_norm, regions, mode, merge_overlapping)
 
 
 @overload
@@ -648,6 +652,40 @@ class SparseVar(Generic[_SRT]):
             and the second column is the end index of the variant.
         """
         return var_ranges(self._c_norm, self.index, contig, starts, ends)
+
+    def _covers_all_variants(
+        self, regions: "pl.DataFrame", mode: "Literal['pos', 'record', 'variant']"
+    ) -> bool:
+        """True iff *regions* select every variant (one region per present contig,
+        each spanning [0, pos_max]).  Lets write_view skip POS materialization.
+
+        Only applies to ``pos``/``record`` modes (``variant`` mode is ILEN-aware
+        and resolved through ``var_ranges``).
+        """
+        if mode == "variant":
+            return False
+
+        stats = self._contig_stats  # CHROM, n, pos_max
+        present = set(stats["CHROM"])
+
+        per_contig = regions.group_by("chrom").agg(
+            start=pl.col("start").min(),
+            end=pl.col("end").max(),
+            k=pl.len(),
+        )
+        if set(per_contig["chrom"]) != present:
+            return False
+
+        pos_max = dict(zip(stats["CHROM"], stats["pos_max"]))
+        end_offset = 0 if mode == "pos" else 1
+        for c, s, e, k in zip(
+            per_contig["chrom"], per_contig["start"], per_contig["end"], per_contig["k"]
+        ):
+            # POS is 1-based; 0-based p in [0, pos_max-1]. Full coverage needs a
+            # single region with start <= 0 and (end + end_offset) >= pos_max.
+            if k != 1 or s > 0 or (e + end_offset) < pos_max[c]:
+                return False
+        return True
 
     def _find_starts_ends(
         self,
@@ -1878,9 +1916,13 @@ class SparseVar(Generic[_SRT]):
             raise ValueError("write_view requires at least one sample")
 
         # --- 2. Resolve kept variant indices ---
-        kept_var_idxs = _resolve_kept_var_idxs(
-            self, regions_df, regions_overlap, merge_overlapping
-        )
+        if self._covers_all_variants(regions_df, regions_overlap):
+            # Fast path: every variant is selected; skip POS/ILEN materialization.
+            kept_var_idxs = np.arange(self.n_variants, dtype=V_IDX_TYPE)
+        else:
+            kept_var_idxs = _resolve_kept_var_idxs(
+                self, regions_df, regions_overlap, merge_overlapping
+            )
         if len(kept_var_idxs) == 0:
             raise ValueError("no variants selected by `regions`")
 

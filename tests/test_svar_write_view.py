@@ -713,3 +713,58 @@ def test_write_view_output_index_order_and_af(tmp_path: Path, svar: SparseVar):
     src_pos = set(svar.index.filter(pl.col("CHROM") == contig)["POS"].to_list())
     # MAC=0 variants may be dropped; output must be a subset of source POS.
     assert set(pos.tolist()).issubset(src_pos)
+
+
+# ---------------------------------------------------------------------------
+# Task 4: _covers_all_variants short-circuit + write_view never materializes
+# ---------------------------------------------------------------------------
+
+
+def test_covers_all_variants_short_circuit(svar_wv):
+    import numpy as np
+
+    # Build per-contig [0, pos_max+1) bounds == the CLI "all variants" default.
+    stats = svar_wv._contig_stats
+    regions = pl.DataFrame(
+        {
+            "chrom": stats["CHROM"],
+            "start": pl.Series([0] * stats.height, dtype=pl.Int32),
+            "end": (stats["pos_max"] + 1).cast(pl.Int32),
+        }
+    ).select("chrom", "start", "end")
+
+    assert svar_wv._covers_all_variants(regions, "pos") is True
+
+    from genoray._svar import _resolve_kept_var_idxs
+
+    kept = _resolve_kept_var_idxs(svar_wv, regions, mode="pos", merge_overlapping=False)
+    # Short-circuit returns every variant, in ascending order.
+    assert len(kept) == svar_wv.n_variants
+    assert np.array_equal(kept, np.arange(svar_wv.n_variants, dtype=kept.dtype))
+
+
+def test_write_view_never_materializes_full_index(monkeypatch, tmp_path: Path):
+    # .index access => failure, for BOTH the all-variants and specific-region paths.
+    monkeypatch.setattr(SparseVar, "index", property(_index_raises))
+    sv = SparseVar(ddir / "biallelic.vcf.svar")
+    contig = sv.contigs[0]
+    samples = sv.available_samples[:1]
+
+    # all-variants (short-circuit) path
+    out_all = tmp_path / "all.svar"
+    stats = sv._contig_stats
+    regions_all = pl.DataFrame(
+        {
+            "chrom": stats["CHROM"],
+            "start": pl.Series([0] * stats.height, dtype=pl.Int32),
+            "end": (stats["pos_max"] + 1).cast(pl.Int32),
+        }
+    ).select("chrom", "start", "end")
+    sv.write_view(regions=regions_all, samples=samples, output=out_all)
+    assert (out_all / "index.arrow").exists()
+    assert (out_all / "metadata.json").exists()
+
+    # specific-region (numeric-collect) path
+    out_one = tmp_path / "one.svar"
+    sv.write_view(regions=(contig, 0, 1_000_000), samples=samples, output=out_one)
+    assert (out_one / "index.arrow").exists()
