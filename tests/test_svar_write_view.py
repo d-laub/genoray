@@ -681,3 +681,35 @@ def test_index_lazy_and_cached_property(svar_wv):
 
     # Cached: second access returns the same object
     assert svar_wv.index is eager
+
+
+def test_write_view_output_index_order_and_af(tmp_path: Path, svar: SparseVar):
+    import numpy as np
+    import polars as pl
+
+    out = tmp_path / "view.svar"
+    contig = svar.contigs[0]
+    samples = svar.available_samples[:2]
+    svar.write_view(regions=(contig, 0, 1_000_000), samples=samples, output=out)
+
+    sv2 = SparseVar(out, attrs="AF")  # need attrs="AF" to expose AF column
+    out_idx = sv2.index
+
+    # 1. Output index POS is ascending (positional alignment with written genos).
+    pos = out_idx["POS"].to_numpy()
+    assert np.all(np.diff(pos) >= 0)
+
+    # 2. AF is present, finite, and in [0, 1].
+    af = out_idx["AF"].to_numpy()
+    assert np.isfinite(af).all()
+    assert (af >= 0).all() and (af <= 1).all()
+
+    # 3. No leftover row-index column persisted to disk.
+    # (sv2.index always has "index" added synthetically by scan_ipc; check the raw file.)
+    raw_schema = pl.read_ipc_schema(SparseVar._index_path(out))
+    assert "index" not in raw_schema
+
+    # 4. Output POS set matches the source POS on this contig (all MAC>0 kept here).
+    src_pos = set(svar.index.filter(pl.col("CHROM") == contig)["POS"].to_list())
+    # MAC=0 variants may be dropped; output must be a subset of source POS.
+    assert set(pos.tolist()).issubset(src_pos)

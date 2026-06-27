@@ -1997,20 +1997,36 @@ class SparseVar(Generic[_SRT]):
             out_field_mm.flush()
             del src_field_rag
 
-        # --- 9. Build new index ---
-        new_index = self.index[kept_var_idxs.tolist()]
-        # Drop existing AF and row-index columns if present
-        cols_to_drop = [c for c in ("AF", "index") if c in new_index.columns]
-        if cols_to_drop:
-            new_index = new_index.drop(cols_to_drop)
-
-        # Compute AFs over the written genos
+        # --- 9. Build new index (streaming: never materialize the full index) ---
+        # Compute AFs over the written genos.
         n_alleles = n_out * ploidy
         afs = np.zeros(len(kept_var_idxs), dtype=np.float32)
         _nb_af_helper(afs, out_var_idxs_mm, new_offsets.ravel(), n_alleles)
 
-        new_index = new_index.with_columns(AF=pl.Series(afs))
-        new_index.write_ipc(SparseVar._index_path(output))
+        # Small, output-sized frame keyed by the kept physical row index.
+        # The row-index column produced by scan_ipc is UInt32 (see _scan_index);
+        # match that dtype so the join keys align.
+        idx_dtype = self._index_lazy.collect_schema()["index"]
+        af_frame = pl.DataFrame(
+            {
+                "index": pl.Series(kept_var_idxs).cast(idx_dtype),
+                "AF": pl.Series(afs),
+            }
+        )
+
+        base = self._index_lazy
+        drop_existing_af = ["AF"] if "AF" in base.collect_schema().names() else []
+        out_index = (
+            base.drop(drop_existing_af)
+            .join(
+                af_frame.lazy(), on="index", how="inner"
+            )  # filter to kept + attach AF
+            .sort(
+                "index"
+            )  # row order must match the ascending kept_var_idxs / written genos
+            .drop("index")  # physical row index is not part of the output schema
+        )
+        out_index.sink_ipc(SparseVar._index_path(output))
 
         # --- 10. Write metadata.json ---
         with open(output / "metadata.json", "w") as f:
