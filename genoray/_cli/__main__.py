@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Annotated, Any, Callable, Literal
 
 import polars as pl
-from cyclopts import App, Parameter
+from cyclopts import App, Parameter, validators
 
 app = App(
     help_on_error=True,
@@ -177,16 +177,29 @@ def write(
 
 @app.command
 def view(
-    source: Path,
+    source: Annotated[
+        Path,
+        Parameter(
+            validator=validators.Path(exists=True, dir_okay=True, file_okay=False)
+        ),
+    ],
     out: Path,
     *,
     regions: Annotated[str | None, Parameter(name=["--regions", "-r"])] = None,
     regions_file: Annotated[
-        Path | None, Parameter(name=["--regions-file", "-R"])
+        Path | None,
+        Parameter(
+            name=["--regions-file", "-R"],
+            validator=validators.Path(exists=True, dir_okay=False, file_okay=True),
+        ),
     ] = None,
     samples: Annotated[str | None, Parameter(name=["--samples", "-s"])] = None,
     samples_file: Annotated[
-        Path | None, Parameter(name=["--samples-file", "-S"])
+        Path | None,
+        Parameter(
+            name=["--samples-file", "-S"],
+            validator=validators.Path(exists=True, dir_okay=False, file_okay=True),
+        ),
     ] = None,
     fields: Annotated[list[str] | None, Parameter(name=["--fields", "-f"])] = None,
     merge_overlapping: bool = False,

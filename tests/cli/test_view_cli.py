@@ -125,3 +125,40 @@ def test_view_samples_only_uses_all_variants(tmp_path: Path, tiny_svar: Path):
     # All variants kept since all samples kept.
     assert sub.n_variants == src.n_variants
     assert sorted(sub.available_samples) == sorted(src.available_samples)
+
+
+def test_view_missing_source_errors(tmp_path: Path):
+    out = tmp_path / "view.svar"
+    r = _run(["view", str(tmp_path / "nope.svar"), str(out), "-s", "A"])
+    combined = r.stderr + r.stdout
+    assert r.returncode != 0
+    # The validator fires at parse time (before the function body runs), so
+    # cyclopts emits a structured "Invalid value" error — NOT a Python traceback.
+    # This assertion is the true gate: it fails when the validators.Path(...)
+    # annotation on `source` is absent (runtime SparseVar.__init__ raises a
+    # FileNotFoundError with a traceback instead).
+    assert "Invalid value" in combined, (
+        "Expected a cyclopts parse-time validation error ('Invalid value …'), "
+        "got a runtime error instead — the source validator may be missing.\n"
+        f"stderr: {r.stderr}\nstdout: {r.stdout}"
+    )
+    assert "Traceback" not in combined, (
+        "Got a Python traceback — error is being raised at runtime, not at "
+        "parse time. The source validator may be missing.\n"
+        f"stderr: {r.stderr}\nstdout: {r.stdout}"
+    )
+    assert "does not exist" in combined.lower()
+
+
+def test_view_missing_samples_file_errors(tmp_path: Path, tiny_svar: Path):
+    out = tmp_path / "view.svar"
+    r = _run(["view", str(tiny_svar), str(out), "-S", str(tmp_path / "nope.txt")])
+    assert r.returncode != 0
+    assert "does not exist" in (r.stderr + r.stdout).lower()
+
+
+def test_view_missing_regions_file_errors(tmp_path: Path, tiny_svar: Path):
+    out = tmp_path / "view.svar"
+    r = _run(["view", str(tiny_svar), str(out), "-R", str(tmp_path / "nope.bed")])
+    assert r.returncode != 0
+    assert "does not exist" in (r.stderr + r.stdout).lower()

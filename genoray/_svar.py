@@ -1867,7 +1867,8 @@ class SparseVar(Generic[_SRT]):
             ``mutcat`` codes for the subset.  This is the supported way to get a
             valid ``mutcat`` field on a view.  When ``None`` (default), no
             annotation is performed and the output will not have a ``mutcat``
-            field.
+            field.  When provided, the FASTA is validated up front (before any
+            output is written) so a bad path fails fast.
         merge_overlapping
             If ``True`` silently merge overlapping regions; if ``False``
             raise ``ValueError`` when overlaps are detected.
@@ -1890,7 +1891,9 @@ class SparseVar(Generic[_SRT]):
 
         output = Path(output)
 
-        # --- Early validation: mutcat cannot be positionally copied ---
+        # --- Band A: cheap raises (fail fast; nothing on disk is touched) ---
+
+        # mutcat cannot be positionally copied through a view.
         if fields is not None and "mutcat" in fields:
             if reference is None:
                 raise ValueError(
@@ -1901,7 +1904,20 @@ class SparseVar(Generic[_SRT]):
                     "annotate_mutations() on the output view yourself."
                 )
 
-        # --- 1. Normalize inputs ---
+        # Output existence: raise (but do NOT delete) before any heavy work.
+        if output.exists() and not overwrite:
+            raise FileExistsError(
+                f"Output path {output} already exists. Use overwrite=True to overwrite."
+            )
+
+        # Writing a view in place would rmtree the source under overwrite=True.
+        if output.resolve() == self.path.resolve():
+            raise ValueError(
+                "output resolves to the same path as the source dataset; "
+                "write_view cannot write a view in place"
+            )
+
+        # Normalize inputs (cheap; missing samples/fields raise here).
         regions_df = _normalize_regions(regions, self._c_norm)
         caller_samples = _normalize_samples(samples, self.available_samples)
         fields_to_write = _validate_fields(fields, self.available_fields)
@@ -1915,7 +1931,20 @@ class SparseVar(Generic[_SRT]):
         if not caller_samples:
             raise ValueError("write_view requires at least one sample")
 
-        # --- 2. Resolve kept variant indices ---
+        # Validate the reference up front (existence + .fai build) and reuse the
+        # built instance for the final annotate_mutations, so a bad FASTA path
+        # fails now instead of after the whole output is written.
+        ref_obj: "Reference | None" = None
+        if reference is not None:
+            ref_obj = (
+                reference
+                if isinstance(reference, Reference)
+                else Reference.from_path(reference)
+            )
+
+        # --- Band B: heavier checks (still nothing on disk is touched) ---
+
+        # Resolve kept variant indices.
         if self._covers_all_variants(regions_df, regions_overlap):
             # Fast path: every variant is selected; skip POS/ILEN materialization.
             kept_var_idxs = np.arange(self.n_variants, dtype=V_IDX_TYPE)
@@ -1925,15 +1954,6 @@ class SparseVar(Generic[_SRT]):
             )
         if len(kept_var_idxs) == 0:
             raise ValueError("no variants selected by `regions`")
-
-        # --- 3. Output directory (after all validation, so no partial dir on error) ---
-        if output.exists():
-            if not overwrite:
-                raise FileExistsError(
-                    f"Output path {output} already exists. Use overwrite=True to overwrite."
-                )
-            shutil.rmtree(output)
-        output.mkdir(parents=True)
 
         # --- 4. Setup ---
         n_out = len(caller_samples)
@@ -1966,6 +1986,11 @@ class SparseVar(Generic[_SRT]):
                 "all variants in the selected regions have MAC=0 in the "
                 "chosen sample subset; nothing to write"
             )
+
+        # --- Band C: commit. All validation passed; now (re)create the output. ---
+        if output.exists():
+            shutil.rmtree(output)
+        output.mkdir(parents=True)
 
         # --- 5. Pass 1: count kept entries per output slot ---
         out_lengths = np.zeros(n_out * ploidy, dtype=np.int64)
@@ -2085,9 +2110,9 @@ class SparseVar(Generic[_SRT]):
             f.write(json_str)
 
         # --- 11. Optionally recompute mutcat on the output view ---
-        if reference is not None:
+        if ref_obj is not None:
             out_svar = SparseVar(output)
-            out_svar.annotate_mutations(reference, write_back=True)
+            out_svar.annotate_mutations(ref_obj, write_back=True)
 
 
 @nb.njit(nogil=True, cache=True)
