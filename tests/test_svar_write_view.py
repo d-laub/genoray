@@ -858,3 +858,21 @@ def test_write_view_all_mac0_preserves_existing_output(
         )
     # The doomed run must not have deleted the pre-existing output.
     assert marker.exists()
+
+
+def test_write_view_self_overwrite_guard(tmp_path: Path):
+    import shutil
+
+    # Copy the fixture so the destructive RED behavior can only touch the copy.
+    src = tmp_path / "src.svar"
+    shutil.copytree(ddir / "biallelic.vcf.svar", src)
+    sv = SparseVar(src)
+    with pytest.raises(ValueError, match="same path|output.*source|in place"):
+        sv.write_view(
+            regions=(sv.contigs[0], 0, 1_000_000),
+            samples=sv.available_samples[:2],
+            output=src,
+            overwrite=True,
+        )
+    # Source dataset is intact.
+    assert (src / "metadata.json").exists()

@@ -1909,6 +1909,13 @@ class SparseVar(Generic[_SRT]):
                 f"Output path {output} already exists. Use overwrite=True to overwrite."
             )
 
+        # Writing a view in place would rmtree the source under overwrite=True.
+        if output.resolve() == self.path.resolve():
+            raise ValueError(
+                "output resolves to the same path as the source dataset; "
+                "write_view cannot write a view in place"
+            )
+
         # Normalize inputs (cheap; missing samples/fields raise here).
         regions_df = _normalize_regions(regions, self._c_norm)
         caller_samples = _normalize_samples(samples, self.available_samples)
