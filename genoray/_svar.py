@@ -1867,7 +1867,8 @@ class SparseVar(Generic[_SRT]):
             ``mutcat`` codes for the subset.  This is the supported way to get a
             valid ``mutcat`` field on a view.  When ``None`` (default), no
             annotation is performed and the output will not have a ``mutcat``
-            field.
+            field.  When provided, the FASTA is validated up front (before any
+            output is written) so a bad path fails fast.
         merge_overlapping
             If ``True`` silently merge overlapping regions; if ``False``
             raise ``ValueError`` when overlaps are detected.
