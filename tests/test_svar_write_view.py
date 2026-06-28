@@ -794,3 +794,67 @@ def test_cli_view_default_does_not_materialize_index(monkeypatch, tmp_path: Path
     )
     assert (out / "index.arrow").exists()
     assert (out / "metadata.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# Fail-fast: write_view band reorder
+# ---------------------------------------------------------------------------
+
+
+def _resolve_raises(*args, **kwargs):
+    raise AssertionError("region resolution was reached before output check")
+
+
+def test_write_view_bad_reference_fails_before_write(tmp_path: Path, svar: SparseVar):
+    out = tmp_path / "view.svar"
+    contig = svar.contigs[0]
+    samples = svar.available_samples[:2]
+    with pytest.raises(FileNotFoundError):
+        svar.write_view(
+            regions=(contig, 0, 1_000_000),
+            samples=samples,
+            output=out,
+            reference=str(tmp_path / "does_not_exist.fa"),
+        )
+    # Reference is validated up front, so no output dir is created.
+    assert not out.exists()
+
+
+def test_write_view_output_exists_checked_before_resolution(
+    monkeypatch, tmp_path: Path, svar: SparseVar
+):
+    out = tmp_path / "view.svar"
+    out.mkdir()
+    # If region resolution runs before the output-exists check, this raises
+    # AssertionError instead of FileExistsError.
+    monkeypatch.setattr("genoray._svar._resolve_kept_var_idxs", _resolve_raises)
+    contig = svar.contigs[0]
+    with pytest.raises(FileExistsError):
+        svar.write_view(
+            # narrow region so _covers_all_variants is False and the
+            # _resolve_kept_var_idxs path would be taken
+            regions=(contig, 0, 10_000),
+            samples=svar.available_samples[:2],
+            output=out,
+            overwrite=False,
+        )
+
+
+def test_write_view_all_mac0_preserves_existing_output(
+    tmp_path: Path, svar_wv: SparseVar
+):
+    out = tmp_path / "existing.svar"
+    out.mkdir()
+    marker = out / "DO_NOT_DELETE.txt"
+    marker.write_text("keep me")
+    samples_all = list(svar_wv.available_samples)
+    # Same all-MAC=0 scenario as test_write_view_raises_when_all_variants_drop.
+    with pytest.raises(ValueError, match="MAC=0"):
+        svar_wv.write_view(
+            regions=(svar_wv.contigs[0], 81264, 81265),
+            samples=[samples_all[1]],
+            output=out,
+            overwrite=True,
+        )
+    # The doomed run must not have deleted the pre-existing output.
+    assert marker.exists()
