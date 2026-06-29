@@ -297,6 +297,23 @@ Key properties:
 
 ## Mutation catalogues (SBS-96 / DBS-78 / ID-83)
 
+### `write_view` progress bar
+
+`SparseVar.write_view(..., progress=False)` accepts an opt-in `progress` keyword.
+When `True`, a phase-level `rich` progress bar is shown while the view is written
+(one tick per major step: counting, genotypes, each carried field, the index
+build, and mutation annotation when `reference=` is given). It defaults to
+`False` — no bar and no overhead — so library and pipeline callers are
+unaffected. The `genoray view` CLI exposes the same option as `--progress`
+(also default off):
+
+```bash
+genoray view in.svar out.svar -r chr1:1-1000 -s A,B --progress
+```
+
+The bar is cosmetic: output bytes, schema, and dtypes are identical whether or
+not it is enabled.
+
 ### Overview
 
 `SparseVar` supports COSMIC-style mutation catalogues. The workflow is:

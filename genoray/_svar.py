@@ -1836,6 +1836,7 @@ class SparseVar(Generic[_SRT]):
         regions_overlap: Literal["pos", "record", "variant"] = "pos",
         overwrite: bool = False,
         threads: int | None = None,
+        progress: bool = False,
     ) -> None:
         """Write a subset of this SparseVar to a new directory.
 
@@ -1879,6 +1880,11 @@ class SparseVar(Generic[_SRT]):
             Whether to overwrite *output* if it already exists.
         threads
             Number of Numba threads to use.  ``None`` uses all available CPUs.
+        progress
+            If ``True``, display a phase-level :mod:`rich` progress bar while the
+            view is written (one tick per major step: counting, genotypes, each
+            field, index build, and mutation annotation when *reference* is
+            given).  Defaults to ``False`` (no bar, no overhead).
 
         Notes
         -----
@@ -1887,6 +1893,8 @@ class SparseVar(Generic[_SRT]):
         :class:`ValueError` is raised — the same code path that fires when
         ``regions`` itself selects no variants.
         """
+        from contextlib import nullcontext
+
         from ._utils import _resolve_threads, numba_threads
 
         output = Path(output)
@@ -1988,131 +1996,165 @@ class SparseVar(Generic[_SRT]):
             )
 
         # --- Band C: commit. All validation passed; now (re)create the output. ---
-        if output.exists():
-            shutil.rmtree(output)
-        output.mkdir(parents=True)
-
-        # --- 5. Pass 1: count kept entries per output slot ---
-        out_lengths = np.zeros(n_out * ploidy, dtype=np.int64)
-        with numba_threads(threads_resolved):
-            _nb_count_kept(
-                self.genos.data,
-                self.genos.offsets,
-                src_sample_idxs,
-                ploidy,
-                kept_var_idxs,
-                out_lengths,
-            )
-
-        new_offsets = lengths_to_offsets(out_lengths.reshape(n_out, ploidy))
-
-        # --- 6. Write offsets.npy ---
-        offsets_mm = np.memmap(
-            output / "offsets.npy",
-            dtype=np.int64,
-            mode="w+",
-            shape=new_offsets.shape,
+        # Phase-level progress bar (opt-in): one tick per major write step,
+        # plus one per field, plus the optional mutcat annotation. Built only
+        # when progress=True so the default path constructs no Progress object.
+        pbar = (
+            Progress(*Progress.get_default_columns(), MofNCompleteColumn())
+            if progress
+            else None
         )
-        offsets_mm[:] = new_offsets
-        offsets_mm.flush()
+        n_steps = 3 + len(fields_to_write) + (1 if ref_obj is not None else 0)
 
-        # Allocate output variant_idxs memmap
-        n_entries = int(new_offsets[-1])
-        out_var_idxs_mm = np.memmap(
-            output / "variant_idxs.npy",
-            dtype=V_IDX_TYPE,
-            mode="w+",
-            shape=(n_entries,),
-        )
-
-        # --- 7. Pass 2 (genos): write remapped variant indices ---
-        with numba_threads(threads_resolved):
-            _nb_write_var_idxs(
-                self.genos.data,
-                self.genos.offsets,
-                src_sample_idxs,
-                ploidy,
-                kept_var_idxs,
-                new_offsets.ravel(),
-                out_var_idxs_mm,
+        with pbar or nullcontext():
+            task = (
+                pbar.add_task("counting entries", total=n_steps)
+                if pbar is not None
+                else None
             )
-        out_var_idxs_mm.flush()
 
-        # --- 8. Pass 2 (fields): write each field ---
-        for name in fields_to_write:
-            dtype = self.available_fields[name]
-            src_field_rag = _open_fmt(
-                name, dtype, self.path, (self.n_samples, ploidy, None), "r"
+            def _step(desc: str) -> None:
+                """Mark the current phase complete and label the next one."""
+                if pbar is not None:
+                    assert task is not None
+                    pbar.advance(task)
+                    pbar.update(task, description=desc)
+
+            if output.exists():
+                shutil.rmtree(output)
+            output.mkdir(parents=True)
+
+            # --- 5. Pass 1: count kept entries per output slot ---
+            out_lengths = np.zeros(n_out * ploidy, dtype=np.int64)
+            with numba_threads(threads_resolved):
+                _nb_count_kept(
+                    self.genos.data,
+                    self.genos.offsets,
+                    src_sample_idxs,
+                    ploidy,
+                    kept_var_idxs,
+                    out_lengths,
+                )
+
+            new_offsets = lengths_to_offsets(out_lengths.reshape(n_out, ploidy))
+
+            # --- 6. Write offsets.npy ---
+            offsets_mm = np.memmap(
+                output / "offsets.npy",
+                dtype=np.int64,
+                mode="w+",
+                shape=new_offsets.shape,
             )
-            out_field_mm = np.memmap(
-                output / f"{name}.npy",
-                dtype=dtype,
+            offsets_mm[:] = new_offsets
+            offsets_mm.flush()
+
+            # Allocate output variant_idxs memmap
+            n_entries = int(new_offsets[-1])
+            out_var_idxs_mm = np.memmap(
+                output / "variant_idxs.npy",
+                dtype=V_IDX_TYPE,
                 mode="w+",
                 shape=(n_entries,),
             )
+            _step("writing genotypes")
+
+            # --- 7. Pass 2 (genos): write remapped variant indices ---
             with numba_threads(threads_resolved):
-                _nb_write_field(
-                    src_field_rag.data,
+                _nb_write_var_idxs(
                     self.genos.data,
                     self.genos.offsets,
                     src_sample_idxs,
                     ploidy,
                     kept_var_idxs,
                     new_offsets.ravel(),
-                    out_field_mm,
+                    out_var_idxs_mm,
                 )
-            out_field_mm.flush()
-            del src_field_rag
+            out_var_idxs_mm.flush()
 
-        # --- 9. Build new index (streaming: never materialize the full index) ---
-        # Compute AFs over the written genos.
-        n_alleles = n_out * ploidy
-        afs = np.zeros(len(kept_var_idxs), dtype=np.float32)
-        _nb_af_helper(afs, out_var_idxs_mm, new_offsets.ravel(), n_alleles)
+            # --- 8. Pass 2 (fields): write each field ---
+            for name in fields_to_write:
+                _step(f"field: {name}")
+                dtype = self.available_fields[name]
+                src_field_rag = _open_fmt(
+                    name, dtype, self.path, (self.n_samples, ploidy, None), "r"
+                )
+                out_field_mm = np.memmap(
+                    output / f"{name}.npy",
+                    dtype=dtype,
+                    mode="w+",
+                    shape=(n_entries,),
+                )
+                with numba_threads(threads_resolved):
+                    _nb_write_field(
+                        src_field_rag.data,
+                        self.genos.data,
+                        self.genos.offsets,
+                        src_sample_idxs,
+                        ploidy,
+                        kept_var_idxs,
+                        new_offsets.ravel(),
+                        out_field_mm,
+                    )
+                out_field_mm.flush()
+                del src_field_rag
 
-        # Small, output-sized frame keyed by the kept physical row index.
-        # The row-index column produced by scan_ipc is UInt32 (see _scan_index);
-        # match that dtype so the join keys align.
-        idx_dtype = self._index_lazy.collect_schema()["index"]
-        af_frame = pl.DataFrame(
-            {
-                "index": pl.Series(kept_var_idxs).cast(idx_dtype),
-                "AF": pl.Series(afs),
-            }
-        )
+            _step("building index")
 
-        base = self._index_lazy
-        drop_existing_af = ["AF"] if "AF" in base.collect_schema().names() else []
-        out_index = (
-            base.drop(drop_existing_af)
-            .join(
-                af_frame.lazy(), on="index", how="inner"
-            )  # filter to kept + attach AF
-            .sort(
-                "index"
-            )  # row order must match the ascending kept_var_idxs / written genos
-            .drop("index")  # physical row index is not part of the output schema
-        )
-        # sink_ipc forces the streaming engine, so the inner join filters the
-        # scan down to output size before the sort — peak RAM scales with the
-        # selected subset, not the full input index.
-        out_index.sink_ipc(SparseVar._index_path(output))
+            # --- 9. Build new index (streaming: never materialize the full index) ---
+            # Compute AFs over the written genos.
+            n_alleles = n_out * ploidy
+            afs = np.zeros(len(kept_var_idxs), dtype=np.float32)
+            _nb_af_helper(afs, out_var_idxs_mm, new_offsets.ravel(), n_alleles)
 
-        # --- 10. Write metadata.json ---
-        with open(output / "metadata.json", "w") as f:
-            json_str = SparseVarMetadata(
-                version=CURRENT_VERSION,
-                samples=caller_samples,
-                ploidy=ploidy,
-                contigs=self.contigs,
-                fields={n: self.available_fields[n].name for n in fields_to_write},
-            ).model_dump_json()
-            f.write(json_str)
+            # Small, output-sized frame keyed by the kept physical row index.
+            # The row-index column produced by scan_ipc is UInt32 (see _scan_index);
+            # match that dtype so the join keys align.
+            idx_dtype = self._index_lazy.collect_schema()["index"]
+            af_frame = pl.DataFrame(
+                {
+                    "index": pl.Series(kept_var_idxs).cast(idx_dtype),
+                    "AF": pl.Series(afs),
+                }
+            )
 
-        # --- 11. Optionally recompute mutcat on the output view ---
-        if ref_obj is not None:
-            out_svar = SparseVar(output)
-            out_svar.annotate_mutations(ref_obj, write_back=True)
+            base = self._index_lazy
+            drop_existing_af = ["AF"] if "AF" in base.collect_schema().names() else []
+            out_index = (
+                base.drop(drop_existing_af)
+                .join(
+                    af_frame.lazy(), on="index", how="inner"
+                )  # filter to kept + attach AF
+                .sort(
+                    "index"
+                )  # row order must match the ascending kept_var_idxs / written genos
+                .drop("index")  # physical row index is not part of the output schema
+            )
+            # sink_ipc forces the streaming engine, so the inner join filters the
+            # scan down to output size before the sort — peak RAM scales with the
+            # selected subset, not the full input index.
+            out_index.sink_ipc(SparseVar._index_path(output))
+
+            # --- 10. Write metadata.json ---
+            with open(output / "metadata.json", "w") as f:
+                json_str = SparseVarMetadata(
+                    version=CURRENT_VERSION,
+                    samples=caller_samples,
+                    ploidy=ploidy,
+                    contigs=self.contigs,
+                    fields={n: self.available_fields[n].name for n in fields_to_write},
+                ).model_dump_json()
+                f.write(json_str)
+
+            # --- 11. Optionally recompute mutcat on the output view ---
+            if ref_obj is not None:
+                _step("annotating mutations")
+                out_svar = SparseVar(output)
+                out_svar.annotate_mutations(ref_obj, write_back=True)
+
+            # Final advance so the bar reads N/N on completion.
+            if pbar is not None:
+                assert task is not None
+                pbar.advance(task)
 
 
 @nb.njit(nogil=True, cache=True)

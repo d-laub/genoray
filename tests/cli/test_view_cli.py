@@ -162,3 +162,24 @@ def test_view_missing_regions_file_errors(tmp_path: Path, tiny_svar: Path):
     r = _run(["view", str(tiny_svar), str(out), "-R", str(tmp_path / "nope.bed")])
     assert r.returncode != 0
     assert "does not exist" in (r.stderr + r.stdout).lower()
+
+
+def _dir_digest(root: Path) -> dict[str, bytes]:
+    return {
+        p.relative_to(root).as_posix(): p.read_bytes()
+        for p in sorted(root.rglob("*"))
+        if p.is_file()
+    }
+
+
+def test_view_progress_flag_byte_identical(tmp_path: Path, tiny_svar: Path):
+    out_a = tmp_path / "a.svar"
+    out_b = tmp_path / "b.svar"
+    base = ["view", str(tiny_svar)]
+    region = ["-r", "chr1:1-100", "-s", "A"]
+    r1 = _run([*base, str(out_a), *region])
+    r2 = _run([*base, str(out_b), *region, "--progress"])
+    assert r1.returncode == 0, r1.stderr
+    assert r2.returncode == 0, r2.stderr
+    # --progress must not change the written output.
+    assert _dir_digest(out_a) == _dir_digest(out_b)

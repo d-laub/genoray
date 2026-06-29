@@ -206,6 +206,7 @@ def view(
     regions_overlap: Literal["pos", "record", "variant"] = "pos",
     overwrite: bool = False,
     threads: Annotated[int | None, Parameter(name=["--threads", "-@"])] = None,
+    progress: bool = False,
 ) -> None:
     """Write a subset of an SVAR to a new SVAR directory.
 
@@ -244,6 +245,8 @@ def view(
         Overwrite the output directory if it already exists.
     threads
         Number of threads. Defaults to all available CPUs.
+    progress
+        If set, show a phase-level progress bar while writing the view.
     """
     import polars as pl
 
@@ -302,6 +305,7 @@ def view(
         regions_overlap=regions_overlap,
         overwrite=overwrite,
         threads=threads,
+        progress=progress,
     )
 
 
