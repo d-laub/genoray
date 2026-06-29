@@ -876,3 +876,39 @@ def test_write_view_self_overwrite_guard(tmp_path: Path):
         )
     # Source dataset is intact.
     assert (src / "metadata.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# Opt-in progress bar (phase-level)
+# ---------------------------------------------------------------------------
+
+
+def _dir_digest(root: Path) -> dict[str, bytes]:
+    """Map every file under `root` to its raw bytes, for byte-identical compares."""
+    return {
+        p.relative_to(root).as_posix(): p.read_bytes()
+        for p in sorted(root.rglob("*"))
+        if p.is_file()
+    }
+
+
+def test_write_view_progress_defaults_false():
+    import inspect
+
+    sig = inspect.signature(SparseVar.write_view)
+    assert sig.parameters["progress"].default is False
+
+
+def test_write_view_progress_byte_identical(tmp_path: Path, svar: SparseVar):
+    contig = svar.contigs[0]
+    samples = svar.available_samples[:2]
+    a = tmp_path / "a.svar"
+    b = tmp_path / "b.svar"
+    svar.write_view(
+        regions=(contig, 0, 1_000_000), samples=samples, output=a, progress=False
+    )
+    svar.write_view(
+        regions=(contig, 0, 1_000_000), samples=samples, output=b, progress=True
+    )
+    # The bar must not perturb the written output in any way.
+    assert _dir_digest(a) == _dir_digest(b)
