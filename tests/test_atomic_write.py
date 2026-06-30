@@ -8,7 +8,7 @@ import polars as pl
 import pytest
 
 import genoray._utils as U
-from genoray import SparseVar, VCF
+from genoray import PGEN, SparseVar, VCF
 from genoray._utils import atomic_write_dir, atomic_write_path
 
 _DDIR = Path(__file__).parent / "data"
@@ -183,3 +183,28 @@ def test_from_vcf_atomic_preserves_existing_on_failure(tmp_path: Path, monkeypat
 
     assert _dir_digest(out) == before  # old output intact
     assert [p.name for p in tmp_path.iterdir() if p.name != "x.svar"] == []
+
+
+def test_from_pgen_atomic_no_leftover(tmp_path: Path):
+    out = tmp_path / "p.svar"
+    SparseVar.from_pgen(out, PGEN(_DDIR / "biallelic.pgen"), max_mem="1g")
+    assert (out / "metadata.json").exists()
+    SparseVar(out)
+    assert [p.name for p in tmp_path.iterdir() if p.name != "p.svar"] == []
+
+
+def test_from_pgen_atomic_preserves_existing_on_failure(tmp_path: Path, monkeypatch):
+    import genoray._svar as S
+
+    out = tmp_path / "p.svar"
+    SparseVar.from_pgen(out, PGEN(_DDIR / "biallelic.pgen"), max_mem="1g")
+    before = _dir_digest(out)
+
+    monkeypatch.setattr(S, "_concat_data", _corrupt_outdir_then_boom)
+    with pytest.raises(RuntimeError, match="write boom"):
+        SparseVar.from_pgen(
+            out, PGEN(_DDIR / "biallelic.pgen"), max_mem="1g", overwrite=True
+        )
+
+    assert _dir_digest(out) == before
+    assert [p.name for p in tmp_path.iterdir() if p.name != "p.svar"] == []
