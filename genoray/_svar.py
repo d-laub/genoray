@@ -36,7 +36,7 @@ from ._pgen import PGEN
 from ._reference import Reference
 from ._signatures import _load_signature_file, cosmic_signatures, fit_signatures
 from ._types import DOSAGE_TYPE, DTYPE, POS_MAX, POS_TYPE, V_IDX_TYPE
-from ._utils import ContigNormalizer, format_memory, parse_memory
+from ._utils import ContigNormalizer, atomic_write_dir, format_memory, parse_memory
 from ._var_ranges import var_ranges
 from ._vcf import VCF
 from .exprs import ILEN
@@ -1039,7 +1039,7 @@ class SparseVar(Generic[_SRT]):
             raise FileExistsError(
                 f"Output path {out} already exists. Use overwrite=True to overwrite."
             )
-        out.mkdir(parents=True, exist_ok=True)
+        out.parent.mkdir(parents=True, exist_ok=True)
 
         if not vcf._index_path().exists():
             logger.info("Genoray VCF index not found, creating index.")
@@ -1104,78 +1104,87 @@ class SparseVar(Generic[_SRT]):
 
         out_ploidy = 1 if haploid else vcf.ploidy
 
-        with open(out / "metadata.json", "w") as f:
-            json_str = SparseVarMetadata(
-                version=CURRENT_VERSION,
-                contigs=contigs,
-                samples=caller_samples,
-                ploidy=out_ploidy,
-                fields={"dosages": np.dtype(DOSAGE_TYPE).name} if with_dosages else {},
-            ).model_dump_json()
-            f.write(json_str)
-
-        subsetting_samples = samples is not None
-        # When NOT subsetting samples, write the (region-restricted) index up front.
-        if not subsetting_samples:
-            _write_index_from_working(
-                working_df, kept_rows, cls._index_path(out), alt_is_utf8, ilen_added
-            )
-
-        max_mem = parse_memory(max_mem)
-        n_out = len(caller_samples)
-        effective_n_jobs = joblib.cpu_count() if n_jobs == -1 else n_jobs
-        effective_n_jobs = min(effective_n_jobs, len(contigs))
-        job_mem = max_mem // effective_n_jobs
-
-        with TemporaryDirectory() as chunk_dir:
-            chunk_dir = Path(chunk_dir)
-
-            shape = (n_out, out_ploidy)
-            tasks = []
-            for chunk_idx, c in enumerate(contigs):
-                task = joblib.delayed(_process_contig_vcf)(
-                    vcf.path,
-                    dosage_field=vcf.dosage_field if with_dosages else None,
-                    max_mem=job_mem,
-                    contig=c,
-                    chunk_dir=chunk_dir,
-                    chunk_idx=chunk_idx,
-                    cyvcf2_filter=vcf._filter,
-                    pl_filter=vcf._pl_filter,
-                    caller_samples=None if samples is None else caller_samples,
-                    keep_local=keep_local_by_contig.get(c),
-                    haploid=haploid,
-                )
-                tasks.append(task)
-
-            with (
-                joblib_progress(
-                    description=f"Processing contigs using {effective_n_jobs} jobs",
-                    total=len(tasks),
-                ),
-                joblib.Parallel(n_jobs=effective_n_jobs) as parallel,
-            ):
-                results: list[tuple[int, int]] = list(parallel(tasks))  # type: ignore
-
-            logger.info("Concatenating intermediate chunks")
-            _concat_data(out, chunk_dir, shape, results, with_dosages=with_dosages)
-
-            if subsetting_samples:
-                survivors, af = _subset_var_idxs_and_recompute_af(
-                    out,
-                    n_total=len(kept_rows),
-                    n_out=n_out,
+        with atomic_write_dir(out) as staging:
+            with open(staging / "metadata.json", "w") as f:
+                json_str = SparseVarMetadata(
+                    version=CURRENT_VERSION,
+                    contigs=contigs,
+                    samples=caller_samples,
                     ploidy=out_ploidy,
-                    with_dosages=with_dosages,
-                )
+                    fields={"dosages": np.dtype(DOSAGE_TYPE).name}
+                    if with_dosages
+                    else {},
+                ).model_dump_json()
+                f.write(json_str)
+
+            subsetting_samples = samples is not None
+            # When NOT subsetting samples, write the (region-restricted) index up front.
+            if not subsetting_samples:
                 _write_index_from_working(
                     working_df,
-                    kept_rows[survivors],
-                    cls._index_path(out),
+                    kept_rows,
+                    cls._index_path(staging),
                     alt_is_utf8,
                     ilen_added,
-                    af=af,
                 )
+
+            max_mem = parse_memory(max_mem)
+            n_out = len(caller_samples)
+            effective_n_jobs = joblib.cpu_count() if n_jobs == -1 else n_jobs
+            effective_n_jobs = min(effective_n_jobs, len(contigs))
+            job_mem = max_mem // effective_n_jobs
+
+            with TemporaryDirectory(dir=out.parent) as chunk_dir:
+                chunk_dir = Path(chunk_dir)
+
+                shape = (n_out, out_ploidy)
+                tasks = []
+                for chunk_idx, c in enumerate(contigs):
+                    task = joblib.delayed(_process_contig_vcf)(
+                        vcf.path,
+                        dosage_field=vcf.dosage_field if with_dosages else None,
+                        max_mem=job_mem,
+                        contig=c,
+                        chunk_dir=chunk_dir,
+                        chunk_idx=chunk_idx,
+                        cyvcf2_filter=vcf._filter,
+                        pl_filter=vcf._pl_filter,
+                        caller_samples=None if samples is None else caller_samples,
+                        keep_local=keep_local_by_contig.get(c),
+                        haploid=haploid,
+                    )
+                    tasks.append(task)
+
+                with (
+                    joblib_progress(
+                        description=f"Processing contigs using {effective_n_jobs} jobs",
+                        total=len(tasks),
+                    ),
+                    joblib.Parallel(n_jobs=effective_n_jobs) as parallel,
+                ):
+                    results: list[tuple[int, int]] = list(parallel(tasks))  # type: ignore
+
+                logger.info("Concatenating intermediate chunks")
+                _concat_data(
+                    staging, chunk_dir, shape, results, with_dosages=with_dosages
+                )
+
+                if subsetting_samples:
+                    survivors, af = _subset_var_idxs_and_recompute_af(
+                        staging,
+                        n_total=len(kept_rows),
+                        n_out=n_out,
+                        ploidy=out_ploidy,
+                        with_dosages=with_dosages,
+                    )
+                    _write_index_from_working(
+                        working_df,
+                        kept_rows[survivors],
+                        cls._index_path(staging),
+                        alt_is_utf8,
+                        ilen_added,
+                        af=af,
+                    )
 
     @classmethod
     def from_pgen(
