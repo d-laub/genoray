@@ -16,16 +16,9 @@ VCF_PATH = (
     ddir / "biallelic.vcf.gz"
 )  # 2 samples (sample1, sample2), contigs chr1/chr2/chr3
 
-_SENTINEL = np.iinfo(np.int64).max
-
 
 def _rag_to_set(r: Ragged) -> set[int]:
-    """Safely convert a 1-D Ragged entry to a set of ints, returning empty set on sentinels."""
-    offsets = r._layout.offsets
-    # offsets is a list of arrays; the last level is starts/stops as [[start],[stop]]
-    arr = offsets[-1] if isinstance(offsets, (list, tuple)) else offsets
-    if arr.flat[0] == _SENTINEL:
-        return set()
+    """Convert a 1-D Ragged entry to a set of ints (empty row -> empty set)."""
     return set(r.to_numpy().flatten().tolist())
 
 
@@ -77,12 +70,7 @@ def _dose_pairs(sv: SparseVar) -> dict[int, set[tuple[int, float]]]:
         rag = sv.read_ranges(c)  # record array: .genos, .dosages
         for i in range(sv.n_samples):
             for p in range(sv.ploidy):
-                g_entry = rag.genos[0, i, p]
-                offsets = g_entry._layout.offsets
-                arr = offsets[-1] if isinstance(offsets, (list, tuple)) else offsets
-                if arr.flat[0] == _SENTINEL:
-                    continue
-                vi = g_entry.to_numpy().flatten()
+                vi = rag.genos[0, i, p].to_numpy().flatten()
                 ds = rag.dosages[0, i, p].to_numpy().flatten()
                 for v, d in zip(vi.tolist(), ds.tolist()):
                     out[i].add((int(v), round(float(d), 4)))
