@@ -60,12 +60,31 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
 - [~] **M1. VCF → SVAR2 conversion.** Streaming, chunked, multi-threaded
   conversion producing the `var_key` representation. Builds on the existing
   conversion pipeline on this branch. See [`architecture.md`](architecture.md#conversion-pipeline).
+  *Implemented and tested for the `var_key` happy path:* a per-contig pipeline
+  (reader → encode → writers → Phase-2 merge) fanned out across contigs by rayon
+  with bounded-channel backpressure; a PEXT (BMI2) / portable-SWAR inline encoder
+  proven byte-identical by proptest; a bit-packed dense read buffer (`BitGrid3`); a
+  streaming long-allele LUT; and a memory-bounded parallel tile merge. Covered by 30
+  in-source unit/proptests + 5 e2e tests. An optional per-contig monitoring sampler
+  (`GENORAY_SAMPLE_INTERVAL`) reports channel fill and per-thread CPU%. *Remaining:*
+  variant normalization (M2, currently a precondition — see below) and the dense
+  routing of M4; the on-disk filenames are still provisional (see M3).
 - [ ] **M2. Variant normalization during conversion.** Left-alignment, atomization,
   and biallelic splitting (split multi-allelic sites) applied inline as variants stream
   through. See [`data-model.md`](data-model.md#variant-normalization).
-- [ ] **M3. Per-contig split + sidecar positions.** Partition the SVAR2 directory by
+  *Not started — currently an input precondition.* The reader asserts normalized input
+  and panics on multi-allelic or complex records; the inline encoder bakes in the
+  atomized invariant `ref_len = 1` (it stores `ILEN = alt_len − 1` and decodes
+  `alt_len = ILEN + 1`). M2 is what will let conversion accept un-normalized VCFs
+  directly.
+- [~] **M3. Per-contig split + sidecar positions.** Partition the SVAR2 directory by
   contig; keep positions as sidecar arrays. See
   [`architecture.md`](architecture.md#on-disk-layout).
+  *Core done:* output is partitioned per contig (`{out}/{contig}/var_key/`) and the
+  merge emits sorted position + offset sidecars. *Provisional / remaining:* the current
+  scratch filenames are `final_positions.bin` / `final_keys.bin` (raw little-endian via
+  bytemuck) and `final_offsets.npy`, which differ from the `.npy` names in the layout
+  spec; `meta.json` and the per-contig `max_del.npy` are not yet written.
 - [ ] **M4. Dense representation + cost-model routing.** Implement the 1-bit dense
   genotype matrix and the deterministic per-variant dense/sparse decision. See
   [`data-model.md`](data-model.md#dense-vs-sparse-cost-model).

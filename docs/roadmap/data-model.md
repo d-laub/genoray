@@ -35,8 +35,14 @@ A SNP changes one base and `ILEN = 0`. With position and reference known, only t
 base is needed:
 
 ```
-2-bit ALT:  A=00  C=01  G=10  T=11
+2-bit ALT:  A=00  C=01  T=10  G=11
 ```
+
+This mapping is `(base_ascii >> 1) & 0b11`, a branchless ASCII→2-bit trick (no
+lookup, no match) that the encoder relies on; the decoder's inverse table is
+`[A, C, T, G]`. Note `T` and `G` are swapped relative to the obvious alphabetical
+assignment — the bit values are an implementation detail of the encode/decode layer
+and carry no meaning outside it.
 
 ### Indel flavor — 32 bits
 
@@ -84,8 +90,9 @@ The LUT is a struct-of-arrays holding the alleles that don't fit inline:
 
 - `ILEN` — `i32` per row.
 - `ALT` — 2-bit packed DNA, concatenated.
-- `offsets` — `u32` array indexing into the packed ALT (row `i` spans
-  `offsets[i] .. offsets[i+1]`).
+- `offsets` — `u64` array indexing into the packed ALT (row `i` spans
+  `offsets[i] .. offsets[i+1]`). `u64` matches the byte-offset type used by the
+  reader's `seek`, avoiding a cast on the read path.
 
 On disk this is `long_alleles.bin` (+ its offsets). A 31-bit key references a row by
 index. Because long alleles are rare in short-read data, we do **not** do a full pass
@@ -243,7 +250,15 @@ SVAR2 is a **compute-oriented, derived format — not an archival format.**
   share a single per-call stream? Options: a uniform 32-bit width (simplest, treats
   every call as the indel flavor), a tagged/variable width, or separate streams. The
   cost model is written in terms of bytes-per-variant-info `s` to stay agnostic, but
-  the wire format must pick one.
+  the wire format must pick one. *Current implementation (M1):* **uniform 32-bit** —
+  every `var_key` call is the 32-bit indel flavor, with SNPs encoded as `ILEN = 0` and
+  the ALT base in bits `[26:25]` (a SNP fast path skips the block load but produces the
+  same bits). Revisit if the 2-bit SNP packing proves worth the added complexity.
+- **`var_key` sidecar wire format.** The merge currently writes positions and keys as
+  raw little-endian `.bin` (`final_positions.bin` / `final_keys.bin`, via `bytemuck`)
+  and offsets as `final_offsets.npy`, whereas the layout spec above names them `.npy`.
+  Settle on one (raw `.bin` is mmap-friendly and avoids the npy header; `.npy` is
+  self-describing) and align the names before the decode path (M6) is built.
 - **Cost-model constants.** Pointer width (32 vs 64 bit) and the exact `s` per
   representation need measurement; the current inequalities are placeholders.
 - **`s` for `var_key`.** When variant info is inlined per call, what exactly counts

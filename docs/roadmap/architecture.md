@@ -126,7 +126,13 @@ union / merge** of multiple sorted streams.
 
 - **Routing granularity.** Is representation chosen strictly per variant, or can a
   contig be forced into a single representation for simplicity in early milestones?
-- **Merge stage memory.** Bounds and chunking strategy for the Phase-2 K-way merge at
-  scale (many samples × many chunks).
+- **Merge stage memory.** Bounds and chunking strategy for the Phase-2 merge at
+  scale (many samples × many chunks). *Current implementation:* a parallel **tile-based
+  interleaving** merge replaces the sequential K-way merge — an in-memory metadata pass
+  derives per-column offsets from the RAM ledger, then rayon workers each own a column
+  tile, gather it from every chunk via stateless positional reads (`pread`), and
+  `pwrite` the assembled buffer into a disjoint byte range of the output. Peak RAM is
+  bounded per tile by `TILE_RAM_BUDGET_BYTES` (currently 256 MB), so process peak ≈
+  budget × rayon threads. Open: how to tune the budget vs. thread count at cohort scale.
 - **PGEN path (M7).** Whether the htslib reader stage is cleanly swappable for a
   `pgenlib` FFI source behind the same chunk contract.
