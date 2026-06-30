@@ -100,9 +100,7 @@ def _raise_boom(*args, **kwargs):
 
 
 def _corrupt_then_boom(self, path, *args, **kwargs):
-    from pathlib import Path as _P
-
-    _P(path).write_bytes(b"CORRUPT")
+    Path(path).write_bytes(b"CORRUPT")
     raise RuntimeError("write boom")
 
 
