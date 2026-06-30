@@ -2886,8 +2886,11 @@ def _find_starts_ends(
             # add o_s to make indices relative to whole array
             out_offsets[..., s, p] = np.searchsorted(sp_genos, var_ranges).T + o_s
 
-    no_vars = var_ranges[:, 0] == var_ranges[:, 1]
-    out_offsets[:, no_vars] = np.iinfo(OFFSET_TYPE).max
+    # Ranges with no overlapping variants already get start == stop from
+    # searchsorted above (an in-bounds, zero-length range). Do NOT overwrite
+    # them with a sentinel: an out-of-range value (e.g. INT64_MAX) is poison for
+    # downstream byte-offset math (seqpro Ragged.to_packed multiplies the offset
+    # by the element size and overflows int64), even though the row is empty.
 
     unsorter = np.argsort(sorter)
     out_offsets[:] = out_offsets[:, unsorter]
@@ -3057,7 +3060,11 @@ def _find_starts_ends_with_length(
                 start_idx: np.intp = start_idxs[r]
 
                 if var_ranges[r, 0] == var_ranges[r, 1]:
-                    out[:, r, s, p] = np.iinfo(OFFSET_TYPE).max
+                    # No overlapping variants: emit an in-bounds, zero-length
+                    # range (start == stop) rather than an INT64_MAX sentinel,
+                    # which would overflow downstream byte-offset math even
+                    # though the row is empty.
+                    out[:, r, s, p] = start_idx + o_s
                     continue
 
                 # add o_s to make indices relative to whole array

@@ -112,8 +112,11 @@ def case_no_vars():
     # (r 2)
     var_ranges = np.full((1, 2), np.iinfo(V_IDX_TYPE).max, V_IDX_TYPE)
     shape = (1, N_SAMPLES, PLOIDY, None)
-    # (2 r s p)
-    offsets = np.full((2, N_SAMPLES, PLOIDY, 1), np.iinfo(OFFSET_TYPE).max, OFFSET_TYPE)
+    # No overlapping variants -> an in-bounds, zero-length range (start == stop)
+    # at each haplotype's end offset. NOT an INT64_MAX sentinel: that overflows
+    # downstream byte-offset math (seqpro Ragged.to_packed) even on empty rows.
+    ends = OFFSETS[1:].reshape(N_SAMPLES, PLOIDY, 1)  # (s p 1)
+    offsets = np.stack([ends, ends])  # (2 s p 1), start == stop
     desired = Ragged[V_IDX_TYPE].from_offsets(DATA, shape, offsets.reshape(2, -1))
     return cse, var_ranges, desired
 
@@ -168,6 +171,33 @@ def test_read_ranges_sample_subset(
     np.testing.assert_equal(actual.offsets, desired.offsets)
 
 
+@pytest.mark.parametrize("with_length", [False, True])
+def test_no_var_range_offsets_pack(svar: SparseVar, with_length: bool):
+    """A range overlapping no variants must yield in-bounds, zero-length offsets
+    that survive seqpro's byte-level ``to_packed`` (regression: an INT64_MAX
+    sentinel overflowed the int64 byte offset in ``Ragged.to_packed``, crashing
+    ``genvarloader.write`` on contigs with empty windows)."""
+    contig, start, end = "chr1", int(1e8), int(2e8)  # past every variant
+    samples = svar.available_samples
+    if with_length:
+        out = svar._find_starts_ends_with_length(contig, [start], [end], samples)
+    else:
+        out = svar._find_starts_ends(contig, [start], [end], samples)
+
+    n = svar.genos.data.size
+    assert (out[0] == out[1]).all(), "no-variant range must be empty (start == stop)"
+    assert out.min() >= 0 and out.max() <= n, "offsets must stay in bounds"
+
+    # Mirror genvarloader._dataset._write._write_from_svar: build the ragged
+    # genotypes from the raw offsets and pack -> must not raise.
+    shape = (1, len(samples), svar.ploidy, None)
+    rag = Ragged[V_IDX_TYPE].from_offsets(
+        svar.genos.data, shape, out.reshape(2, -1).astype(OFFSET_TYPE)
+    )
+    packed = rag.to_packed()
+    assert packed.data.size == 0
+
+
 def test_read_ranges_sample_reorder(svar: SparseVar):
     cse = "chr1", 81261, 81265
     actual = svar.read_ranges(*cse, samples=["sample2", "sample1"])
@@ -197,12 +227,14 @@ def length_ext():
 
 
 def length_none():
-    # missing contig -> sentinel offsets (INT64_MAX) per haplotype
+    # present contig but no variants in range -> in-bounds, zero-length range
+    # at each haplotype's end offset (NOT an INT64_MAX sentinel, which would
+    # overflow downstream byte-offset math even though the row is empty).
     cse = "chr3", 0, 1
     shape = (1, N_SAMPLES, PLOIDY, None)
-    sentinel = np.iinfo(OFFSET_TYPE).max
-    # (s p)
-    offsets = np.full((2, N_SAMPLES * PLOIDY), sentinel, OFFSET_TYPE)
+    # (2 s*p)
+    ends = OFFSETS[1:]  # per-haplotype end offsets
+    offsets = np.stack([ends, ends])  # start == stop
     desired = Ragged[V_IDX_TYPE].from_offsets(DATA, shape, offsets)
     return cse, desired
 
