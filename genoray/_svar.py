@@ -2024,7 +2024,7 @@ class SparseVar(Generic[_SRT]):
         )
         n_steps = 3 + len(fields_to_write) + (1 if ref_obj is not None else 0)
 
-        with pbar or nullcontext():
+        with atomic_write_dir(output) as staging, pbar or nullcontext():
             task = (
                 pbar.add_task("counting entries", total=n_steps)
                 if pbar is not None
@@ -2038,9 +2038,7 @@ class SparseVar(Generic[_SRT]):
                     pbar.advance(task)
                     pbar.update(task, description=desc)
 
-            if output.exists():
-                shutil.rmtree(output)
-            output.mkdir(parents=True)
+            # (no rmtree/mkdir: atomic_write_dir already created `staging`)
 
             # --- 5. Pass 1: count kept entries per output slot ---
             out_lengths = np.zeros(n_out * ploidy, dtype=np.int64)
@@ -2058,7 +2056,7 @@ class SparseVar(Generic[_SRT]):
 
             # --- 6. Write offsets.npy ---
             offsets_mm = np.memmap(
-                output / "offsets.npy",
+                staging / "offsets.npy",
                 dtype=np.int64,
                 mode="w+",
                 shape=new_offsets.shape,
@@ -2069,7 +2067,7 @@ class SparseVar(Generic[_SRT]):
             # Allocate output variant_idxs memmap
             n_entries = int(new_offsets[-1])
             out_var_idxs_mm = np.memmap(
-                output / "variant_idxs.npy",
+                staging / "variant_idxs.npy",
                 dtype=V_IDX_TYPE,
                 mode="w+",
                 shape=(n_entries,),
@@ -2097,7 +2095,7 @@ class SparseVar(Generic[_SRT]):
                     name, dtype, self.path, (self.n_samples, ploidy, None), "r"
                 )
                 out_field_mm = np.memmap(
-                    output / f"{name}.npy",
+                    staging / f"{name}.npy",
                     dtype=dtype,
                     mode="w+",
                     shape=(n_entries,),
@@ -2150,10 +2148,10 @@ class SparseVar(Generic[_SRT]):
             # sink_ipc forces the streaming engine, so the inner join filters the
             # scan down to output size before the sort — peak RAM scales with the
             # selected subset, not the full input index.
-            out_index.sink_ipc(SparseVar._index_path(output))
+            out_index.sink_ipc(SparseVar._index_path(staging))
 
             # --- 10. Write metadata.json ---
-            with open(output / "metadata.json", "w") as f:
+            with open(staging / "metadata.json", "w") as f:
                 json_str = SparseVarMetadata(
                     version=CURRENT_VERSION,
                     samples=caller_samples,
@@ -2166,7 +2164,7 @@ class SparseVar(Generic[_SRT]):
             # --- 11. Optionally recompute mutcat on the output view ---
             if ref_obj is not None:
                 _step("annotating mutations")
-                out_svar = SparseVar(output)
+                out_svar = SparseVar(staging)
                 out_svar.annotate_mutations(ref_obj, write_back=True)
 
             # Final advance so the bar reads N/N on completion.

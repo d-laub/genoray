@@ -208,3 +208,31 @@ def test_from_pgen_atomic_preserves_existing_on_failure(tmp_path: Path, monkeypa
 
     assert _dir_digest(out) == before
     assert [p.name for p in tmp_path.iterdir() if p.name != "p.svar"] == []
+
+
+def test_write_view_atomic_no_leftover(tmp_path: Path):
+    src = SparseVar(_DDIR / "biallelic.vcf.svar")
+    out = tmp_path / "v.svar"
+    region = (src.contigs[0], 0, 1_000_000)
+    src.write_view(region, src.available_samples, out)
+    SparseVar(out)
+    assert [p.name for p in tmp_path.iterdir() if p.name != "v.svar"] == []
+
+
+def test_write_view_atomic_preserves_existing_on_failure(tmp_path: Path, monkeypatch):
+    import genoray._svar as S
+
+    src = SparseVar(_DDIR / "biallelic.vcf.svar")
+    out = tmp_path / "v.svar"
+    region = (src.contigs[0], 0, 1_000_000)
+    src.write_view(region, src.available_samples, out)
+    before = _dir_digest(out)
+
+    # lengths_to_offsets is called inside Band C, after staging is created but
+    # before the output is finalized — a clean seam to simulate a mid-write crash.
+    monkeypatch.setattr(S, "lengths_to_offsets", _raise_boom)
+    with pytest.raises(RuntimeError, match="write boom"):
+        src.write_view(region, src.available_samples, out, overwrite=True)
+
+    assert _dir_digest(out) == before
+    assert [p.name for p in tmp_path.iterdir() if p.name != "v.svar"] == []
