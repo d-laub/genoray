@@ -314,6 +314,16 @@ genoray view in.svar out.svar -r chr1:1-1000 -s A,B --progress
 The bar is cosmetic: output bytes, schema, and dtypes are identical whether or
 not it is enabled.
 
+### Atomic crash-safe writes
+
+Writes are crash-safe and atomic. `from_vcf`, `from_pgen`, and `write_view` build
+the `.svar` directory in a hidden sibling staging directory (`.<name>.tmp…` next
+to the output) and atomically rename it into place only after the write fully
+succeeds; `.gvi` index files are written the same way. A crash mid-write never
+leaves a partial or corrupt output, and overwriting an existing output preserves
+it until the replacement is complete. Output bytes are unchanged — this is a
+durability guarantee only.
+
 ### Overview
 
 `SparseVar` supports COSMIC-style mutation catalogues. The workflow is:
