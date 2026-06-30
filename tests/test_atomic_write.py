@@ -106,6 +106,11 @@ def _corrupt_then_boom(self, path, *args, **kwargs):
     raise RuntimeError("write boom")
 
 
+def _corrupt_outdir_then_boom(outdir, *args, **kwargs):
+    (outdir / "metadata.json").write_bytes(b"CORRUPT")
+    raise RuntimeError("write boom")
+
+
 def test_vcf_gvi_write_atomic_no_leftover(tmp_path: Path):
     for ext in (".vcf.gz", ".vcf.gz.csi"):
         shutil.copy(_DDIR / f"biallelic{ext}", tmp_path / f"biallelic{ext}")
@@ -170,7 +175,7 @@ def test_from_vcf_atomic_preserves_existing_on_failure(tmp_path: Path, monkeypat
     SparseVar.from_vcf(out, VCF(_DDIR / "biallelic.vcf.gz"), max_mem="1g")
     before = _dir_digest(out)
 
-    monkeypatch.setattr(S, "_concat_data", _raise_boom)
+    monkeypatch.setattr(S, "_concat_data", _corrupt_outdir_then_boom)
     with pytest.raises(RuntimeError, match="write boom"):
         SparseVar.from_vcf(
             out, VCF(_DDIR / "biallelic.vcf.gz"), max_mem="1g", overwrite=True
