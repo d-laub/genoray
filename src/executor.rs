@@ -1,4 +1,4 @@
-use crate::nrvk::LongAlleleTable;
+use crate::nrvk::LongAlleleTableWriter;
 use crate::rvk::dense2sparse_vk;
 use crate::types::{DenseChunk, SparseChunk};
 use crossbeam_channel::{Receiver, Sender};
@@ -6,10 +6,10 @@ use crossbeam_channel::{Receiver, Sender};
 // pulls raw chunks, does the math, manages the Bank,
 // and streams the payloads to the Writer.
 pub fn run_compute_engine(
-    rx_dense: Receiver<DenseChunk<u32>>,
+    rx_dense: Receiver<DenseChunk>,
     tx_sparse: Sender<SparseChunk>,
-    mut bank: LongAlleleTable,
-) -> (Vec<Vec<u32>>, Vec<u32>) {
+    mut bank: LongAlleleTableWriter,
+) -> (Vec<Vec<u32>>, Vec<u64>) {
     // The ram ledge -> Stores the lengths array for every single chunk.
     let mut ram_ledger: Vec<Vec<u32>> = Vec::with_capacity(10_000);
 
@@ -36,7 +36,7 @@ pub fn run_compute_engine(
 
     // Force the bank to write any remaining bytes in its 128MB buffer to disk,
     // and extract the offsets tensor.
-    let long_allele_offsets = bank.finalize();
+    let long_allele_offsets: Vec<u64> = bank.finalize();
 
     // Return the Phase 2 metadata to the orchestrator
     (ram_ledger, long_allele_offsets)
