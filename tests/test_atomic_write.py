@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 
+import polars as pl
 import pytest
 
 import genoray._utils as U
+from genoray import VCF
 from genoray._utils import atomic_write_dir, atomic_write_path
+
+_DDIR = Path(__file__).parent / "data"
 
 
 def test_atomic_write_path_replaces_and_is_sibling(tmp_path: Path):
@@ -88,3 +93,47 @@ def test_atomic_write_dir_rollback_on_swap_failure(tmp_path: Path, monkeypatch):
     assert (dest / "old.bin").read_bytes() == b"OLD"  # rolled back
     assert not (dest / "new.bin").exists()
     assert [p.name for p in tmp_path.iterdir()] == ["out.svar"]
+
+
+def _raise_boom(*args, **kwargs):
+    raise RuntimeError("write boom")
+
+
+def test_vcf_gvi_write_atomic_no_leftover(tmp_path: Path):
+    for ext in (".vcf.gz", ".vcf.gz.csi"):
+        shutil.copy(_DDIR / f"biallelic{ext}", tmp_path / f"biallelic{ext}")
+    vcf = VCF(tmp_path / "biallelic.vcf.gz")
+    vcf._write_gvi_index(overwrite=True)
+    gvi = vcf._index_path()
+    assert gvi.exists()
+    pl.read_ipc(gvi)  # loads cleanly
+    assert [p.name for p in tmp_path.iterdir() if ".tmp" in p.name] == []
+
+
+def test_vcf_gvi_write_preserves_on_failure(tmp_path: Path, monkeypatch):
+    for ext in (".vcf.gz", ".vcf.gz.csi"):
+        shutil.copy(_DDIR / f"biallelic{ext}", tmp_path / f"biallelic{ext}")
+    vcf = VCF(tmp_path / "biallelic.vcf.gz")
+    vcf._write_gvi_index(overwrite=True)
+    gvi = vcf._index_path()
+    good = gvi.read_bytes()
+    monkeypatch.setattr(pl.DataFrame, "write_ipc", _raise_boom)
+    with pytest.raises(RuntimeError, match="write boom"):
+        vcf._write_gvi_index(overwrite=True)
+    assert gvi.read_bytes() == good  # prior index intact
+    assert [p.name for p in tmp_path.iterdir() if ".tmp" in p.name] == []
+
+
+def test_pgen_write_index_preserves_on_failure(tmp_path: Path, monkeypatch):
+    from genoray._pgen import _write_index
+
+    for ext in (".pgen", ".pvar", ".psam"):
+        shutil.copy(_DDIR / f"biallelic{ext}", tmp_path / f"biallelic{ext}")
+    idx = tmp_path / "biallelic.pvar.gvi"
+    _write_index(idx)
+    good = idx.read_bytes()
+    monkeypatch.setattr(pl.LazyFrame, "sink_ipc", _raise_boom)
+    with pytest.raises(RuntimeError, match="write boom"):
+        _write_index(idx)
+    assert idx.read_bytes() == good
+    assert [p.name for p in tmp_path.iterdir() if ".tmp" in p.name] == []

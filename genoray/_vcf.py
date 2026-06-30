@@ -23,7 +23,13 @@ from tqdm.auto import tqdm
 from typing_extensions import Self, assert_never
 
 from ._types import POS_MAX, POS_TYPE
-from ._utils import ContigNormalizer, format_memory, hap_ilens, parse_memory
+from ._utils import (
+    ContigNormalizer,
+    atomic_write_path,
+    format_memory,
+    hap_ilens,
+    parse_memory,
+)
 from ._var_ranges import var_counts, var_indices
 from .exprs import ILEN, symbolic_ilen
 
@@ -1212,9 +1218,10 @@ class VCF:
         if drop_cols:
             index = index.drop(drop_cols)
 
-        index.with_columns(pl.col("ALT").list.join(",")).collect().write_ipc(
-            self._index_path(), compression="zstd"
-        )
+        with atomic_write_path(self._index_path()) as _tmp:
+            index.with_columns(pl.col("ALT").list.join(",")).collect().write_ipc(
+                _tmp, compression="zstd"
+            )
 
     def _load_index(self) -> Self:
         """Load the index from disk, applying the filter expression if provided. You must

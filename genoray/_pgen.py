@@ -20,7 +20,13 @@ from typing_extensions import Self, assert_never, override
 from zstandard import ZstdDecompressor
 
 from ._types import POS_MAX, POS_TYPE
-from ._utils import ContigNormalizer, format_memory, hap_ilens, parse_memory
+from ._utils import (
+    ContigNormalizer,
+    atomic_write_path,
+    format_memory,
+    hap_ilens,
+    parse_memory,
+)
 from ._var_ranges import var_counts, var_indices
 from .exprs import ILEN, is_biallelic, symbolic_ilen
 
@@ -1253,11 +1259,12 @@ def _load_index(
 def _write_index(index_path: Path):
     """Write PVAR index."""
 
-    (
-        _scan_pvar(index_path.with_suffix(""))
-        .rename({"#CHROM": "CHROM"})
-        .sink_ipc(index_path)
-    )
+    with atomic_write_path(index_path) as _tmp:
+        (
+            _scan_pvar(index_path.with_suffix(""))
+            .rename({"#CHROM": "CHROM"})
+            .sink_ipc(_tmp)
+        )
 
 
 def _scan_pvar(pvar: Path):
