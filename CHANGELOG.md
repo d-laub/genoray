@@ -1,3 +1,21 @@
+## 2.15.0 (2026-06-30)
+
+### Feat
+
+- add --progress flag to genoray view CLI
+- opt-in phase-level progress bar in write_view
+- validate view source/regions-file/samples-file at parse time
+- guard write_view against writing a view in place
+
+### Fix
+
+- **deps**: require seqpro>=0.21.1 for empty-row to_numpy; drop sentinel-based empty checks
+- **svar**: emit in-bounds empty range for no-variant queries
+
+### Perf
+
+- fail fast in write_view; never delete output on a doomed run
+
 ## 2.14.0 (2026-06-27)
 
 ### Feat
