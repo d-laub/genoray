@@ -99,6 +99,13 @@ def _raise_boom(*args, **kwargs):
     raise RuntimeError("write boom")
 
 
+def _corrupt_then_boom(self, path, *args, **kwargs):
+    from pathlib import Path as _P
+
+    _P(path).write_bytes(b"CORRUPT")
+    raise RuntimeError("write boom")
+
+
 def test_vcf_gvi_write_atomic_no_leftover(tmp_path: Path):
     for ext in (".vcf.gz", ".vcf.gz.csi"):
         shutil.copy(_DDIR / f"biallelic{ext}", tmp_path / f"biallelic{ext}")
@@ -117,7 +124,7 @@ def test_vcf_gvi_write_preserves_on_failure(tmp_path: Path, monkeypatch):
     vcf._write_gvi_index(overwrite=True)
     gvi = vcf._index_path()
     good = gvi.read_bytes()
-    monkeypatch.setattr(pl.DataFrame, "write_ipc", _raise_boom)
+    monkeypatch.setattr(pl.DataFrame, "write_ipc", _corrupt_then_boom)
     with pytest.raises(RuntimeError, match="write boom"):
         vcf._write_gvi_index(overwrite=True)
     assert gvi.read_bytes() == good  # prior index intact
@@ -132,7 +139,7 @@ def test_pgen_write_index_preserves_on_failure(tmp_path: Path, monkeypatch):
     idx = tmp_path / "biallelic.pvar.gvi"
     _write_index(idx)
     good = idx.read_bytes()
-    monkeypatch.setattr(pl.LazyFrame, "sink_ipc", _raise_boom)
+    monkeypatch.setattr(pl.LazyFrame, "sink_ipc", _corrupt_then_boom)
     with pytest.raises(RuntimeError, match="write boom"):
         _write_index(idx)
     assert idx.read_bytes() == good
