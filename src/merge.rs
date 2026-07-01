@@ -1,9 +1,11 @@
+use crate::layout;
 use bytemuck;
 use ndarray::Array1;
 use ndarray_npy::write_npy;
 use rayon::prelude::*;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
+use std::path::Path;
 
 // Target peak RAM per tile (per worker). Two u32 buffers per tile, so a 256 MB
 // budget caps a tile at ~32M items. Workers run in parallel via rayon — peak
@@ -26,6 +28,7 @@ pub fn merge_mini_sc<K: bytemuck::Pod>(
     output_dir: &str,
     ram_ledger: Vec<Vec<u32>>,
 ) {
+    let output_dir_path = Path::new(output_dir);
     let total_columns = num_samples * ploidy;
     let key_size = std::mem::size_of::<K>();
     let pos_size = std::mem::size_of::<u32>(); // positions are always u32
@@ -49,7 +52,7 @@ pub fn merge_mini_sc<K: bytemuck::Pod>(
 
     // save the global offsets array immediately
     let offsets_array = Array1::from_vec(final_offsets.clone());
-    write_npy(format!("{}/final_offsets.npy", output_dir), &offsets_array)
+    write_npy(layout::final_offsets(output_dir_path), &offsets_array)
         .expect("Failed to write final offsets");
 
     let total_items: u64 = final_offsets[total_columns];
@@ -61,13 +64,13 @@ pub fn merge_mini_sc<K: bytemuck::Pod>(
     // Pre-create the monolithic outputs at full size so worker pwrites land in
     // disjoint byte ranges. set_len doesn't allocate disk space (sparse file)
     // until each tile actually writes.
-    let final_pos_file = File::create(format!("{}/final_positions.bin", output_dir))
+    let final_pos_file = File::create(layout::final_positions(output_dir_path))
         .expect("Failed to create final_positions.bin");
     final_pos_file
         .set_len(pos_total_bytes)
         .expect("Failed to size final_positions.bin");
-    let final_key_file = File::create(format!("{}/final_keys.bin", output_dir))
-        .expect("Failed to create final_keys.bin");
+    let final_key_file =
+        File::create(layout::final_keys(output_dir_path)).expect("Failed to create final_keys.bin");
     final_key_file
         .set_len(key_total_bytes)
         .expect("Failed to size final_keys.bin");
@@ -76,9 +79,9 @@ pub fn merge_mini_sc<K: bytemuck::Pod>(
     // safe to call concurrently from multiple rayon workers.
     let chunk_files: Vec<(File, File)> = (0..num_chunks)
         .map(|c| {
-            let pf = File::open(format!("{}/chunk_{}_pos.bin", output_dir, c))
+            let pf = File::open(layout::chunk_pos(output_dir_path, c))
                 .unwrap_or_else(|e| panic!("Failed to open chunk_{}_pos.bin: {}", c, e));
-            let kf = File::open(format!("{}/chunk_{}_key.bin", output_dir, c))
+            let kf = File::open(layout::chunk_key(output_dir_path, c))
                 .unwrap_or_else(|e| panic!("Failed to open chunk_{}_key.bin: {}", c, e));
             (pf, kf)
         })
@@ -213,8 +216,8 @@ pub fn merge_mini_sc<K: bytemuck::Pod>(
 
     println!("Phase C -> Cleaning up temporary chunk files");
     for c in 0..num_chunks {
-        let _ = std::fs::remove_file(format!("{}/chunk_{}_pos.bin", output_dir, c));
-        let _ = std::fs::remove_file(format!("{}/chunk_{}_key.bin", output_dir, c));
+        let _ = std::fs::remove_file(layout::chunk_pos(output_dir_path, c));
+        let _ = std::fs::remove_file(layout::chunk_key(output_dir_path, c));
     }
 
     println!("Merge Complete.");

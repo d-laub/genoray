@@ -1,7 +1,7 @@
+use crate::layout::ContigPaths;
 use crossbeam_channel::Sender;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
 
 // strictly bounded memory bank for long alleles (non-blocking, double-buffered memory)
 // Public API
@@ -105,14 +105,12 @@ impl LongAlleleReader {
     // TODO: Decide which will call this (or create this instance)
     pub fn new(output_dir: &str, chrom: &str) -> Self {
         // Layout matches the writer: {output_dir}/{chrom}/var_key/indel/{long_alleles.bin, long_allele_offsets.npy}
-        let chrom_dir = format!("{}/{}/var_key/indel", output_dir, chrom);
+        let paths = ContigPaths::new(output_dir, chrom);
 
-        let file_path = Path::new(&chrom_dir).join("long_alleles.bin");
-        let file = File::open(file_path).expect("Failed to open long_alleles.bin");
+        let file = File::open(paths.long_alleles_bin()).expect("Failed to open long_alleles.bin");
 
-        let offsets_path = Path::new(&chrom_dir).join("long_allele_offsets.npy");
         let offsets_array: ndarray::Array1<u64> =
-            ndarray_npy::read_npy(offsets_path).expect("Failed to load offsets npy");
+            ndarray_npy::read_npy(paths.long_allele_offsets()).expect("Failed to load offsets npy");
 
         Self {
             file,

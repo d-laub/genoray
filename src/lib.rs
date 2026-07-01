@@ -4,13 +4,13 @@ use pyo3::prelude::*;
 use rayon::prelude::*;
 use std::fs::{self, OpenOptions};
 use std::io::{BufWriter, Write};
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 pub mod budget;
 pub mod executor;
+pub mod layout;
 pub mod merge;
 pub mod monitor;
 pub mod nrvk;
@@ -63,9 +63,9 @@ pub fn process_chromosome(
     long_allele_capacity: usize,
 ) {
     // Directory Formatting: svar2/{contig}/var_key/{snp,indel}
-    let var_key_dir = format!("{}/{}/var_key", base_out_dir, chrom);
-    let snp_dir = format!("{}/snp", var_key_dir);
-    let indel_dir = format!("{}/indel", var_key_dir);
+    let paths = crate::layout::ContigPaths::new(base_out_dir, chrom);
+    let snp_dir = paths.var_key_snp_dir().to_str().unwrap().to_string();
+    let indel_dir = paths.var_key_indel_dir().to_str().unwrap().to_string();
     fs::create_dir_all(&snp_dir).expect("Failed to create snp output directory");
     fs::create_dir_all(&indel_dir).expect("Failed to create indel output directory");
 
@@ -137,11 +137,10 @@ pub fn process_chromosome(
     let long_allele_writer_thread = thread::Builder::new()
         .name(format!("lw-{}", chrom))
         .spawn({
-            let out_dir = indel_dir.clone();
+            let file_path = paths.long_alleles_bin();
             let chrom_label = chrom.to_string();
 
             move || {
-                let file_path = Path::new(&out_dir).join("long_alleles.bin");
                 let file = OpenOptions::new()
                     .create(true)
                     .write(true)
@@ -185,11 +184,8 @@ pub fn process_chromosome(
 
     // Long-allele offsets belong to the indel stream.
     let offsets_array = ndarray::Array1::from_vec(long_allele_offsets);
-    ndarray_npy::write_npy(
-        format!("{}/long_allele_offsets.npy", indel_dir),
-        &offsets_array,
-    )
-    .expect("Failed to write long allele offsets");
+    ndarray_npy::write_npy(paths.long_allele_offsets(), &offsets_array)
+        .expect("Failed to write long allele offsets");
 
     let num_chunks = snp_ledger.len(); // == indel_ledger.len() (one row per chunk)
 
