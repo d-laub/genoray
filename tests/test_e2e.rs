@@ -10,7 +10,7 @@
 // downstream data.
 
 use genoray_core::process_chromosome;
-use genoray_core::rvk::decode_alt_inline;
+use genoray_core::rvk::{decode_alt_inline, unpack_snp_keys};
 use genoray_core::vcf_reader::VcfChunkReader;
 
 use rust_htslib::bcf::record::GenotypeAllele;
@@ -173,42 +173,43 @@ fn test_e2e_normalized_bcf_pipeline() {
         4096, // long_allele_capacity
     );
 
-    let chrom_dir = out_dir.join("chr1/var_key");
-    let final_pos = read_u32_bin(&chrom_dir.join("final_positions.bin"));
-    let final_key = read_u32_bin(&chrom_dir.join("final_keys.bin"));
-    let final_off = read_offsets_npy(&chrom_dir.join("final_offsets.npy"));
+    let snp_dir = out_dir.join("chr1/var_key/snp");
+    let indel_dir = out_dir.join("chr1/var_key/indel");
 
-    // 4 haps + 1 sentinel
-    assert_eq!(final_off.len(), 5);
-    assert_eq!(final_off, vec![0u64, 2, 4, 5, 6]);
+    // ---- SNP stream ----
+    let snp_pos = read_u32_bin(&snp_dir.join("final_positions.bin"));
+    let snp_off = read_offsets_npy(&snp_dir.join("final_offsets.npy"));
+    let snp_key_packed = std::fs::read(snp_dir.join("final_keys.bin")).unwrap();
 
-    // hap 0: SNP@100, DEL@300
-    assert_eq!(&final_pos[0..2], &[100, 300]);
-    // hap 1: INS@200, DEL@300
-    assert_eq!(&final_pos[2..4], &[200, 300]);
-    // hap 2: SNP@100
-    assert_eq!(&final_pos[4..5], &[100]);
-    // hap 3: SNP@100
-    assert_eq!(&final_pos[5..6], &[100]);
+    // 4 haps + sentinel; SNP calls per hap: [1, 0, 1, 1]
+    assert_eq!(snp_off, vec![0u64, 1, 1, 2, 3]);
+    assert_eq!(snp_pos, vec![100, 100, 100]);
+    // 'C' → code 1; three carriers → codes [1, 1, 1]
+    let snp_codes = unpack_snp_keys(&snp_key_packed, snp_pos.len());
+    assert_eq!(snp_codes, vec![1u8, 1, 1]);
 
-    // Decode the keys to confirm payload semantics.
-    // hap 0 calls: [SNP A→C, DEL AT→A]
-    match decode_key(final_key[0]) {
-        DecodedKey::Inline { alt } => assert_eq!(alt, b"C".to_vec()),
-        other => panic!("expected inline SNP, got {:?}", other),
-    }
-    match decode_key(final_key[1]) {
+    // ---- Indel stream ----
+    let indel_pos = read_u32_bin(&indel_dir.join("final_positions.bin"));
+    let indel_key = read_u32_bin(&indel_dir.join("final_keys.bin"));
+    let indel_off = read_offsets_npy(&indel_dir.join("final_offsets.npy"));
+
+    // indel calls per hap: [1, 2, 0, 0]
+    assert_eq!(indel_off, vec![0u64, 1, 3, 3, 3]);
+    assert_eq!(indel_pos, vec![300, 200, 300]);
+
+    // hap0: DEL@300
+    match decode_key(indel_key[0]) {
         DecodedKey::PureDel { ilen } => assert_eq!(ilen, -1),
         other => panic!("expected PureDel ilen=-1, got {:?}", other),
     }
-    // hap 1 calls: [INS A→AT, DEL AT→A]
-    match decode_key(final_key[2]) {
+    // hap1: INS@200 then DEL@300
+    match decode_key(indel_key[1]) {
         DecodedKey::Inline { alt } => assert_eq!(alt, b"AT".to_vec()),
-        other => panic!("expected inline INS, got {:?}", other),
+        other => panic!("expected inline INS AT, got {:?}", other),
     }
-    match decode_key(final_key[3]) {
+    match decode_key(indel_key[2]) {
         DecodedKey::PureDel { ilen } => assert_eq!(ilen, -1),
-        other => panic!("expected PureDel, got {:?}", other),
+        other => panic!("expected PureDel ilen=-1, got {:?}", other),
     }
 }
 
@@ -262,17 +263,22 @@ fn test_e2e_mutation_conservation() {
         4096,
     );
 
-    let chrom_dir = out_dir.join("chr1/var_key");
-    let final_pos = read_u32_bin(&chrom_dir.join("final_positions.bin"));
-    let final_off = read_offsets_npy(&chrom_dir.join("final_offsets.npy"));
+    let snp_dir = out_dir.join("chr1/var_key/snp");
+    let indel_dir = out_dir.join("chr1/var_key/indel");
 
+    let snp_pos = read_u32_bin(&snp_dir.join("final_positions.bin"));
+    let snp_off = read_offsets_npy(&snp_dir.join("final_offsets.npy"));
+    let indel_pos = read_u32_bin(&indel_dir.join("final_positions.bin"));
+
+    // Every SNP call is conserved; the indel stream is empty.
     assert_eq!(
-        final_pos.len(),
+        snp_pos.len(),
         expected_calls,
         "mutation conservation across pipeline"
     );
-    assert_eq!(*final_off.last().unwrap() as usize, expected_calls);
-    assert_eq!(final_off.len(), samples.len() * 2 + 1);
+    assert_eq!(*snp_off.last().unwrap() as usize, expected_calls);
+    assert_eq!(snp_off.len(), samples.len() * 2 + 1);
+    assert_eq!(indel_pos.len(), 0);
 }
 
 // ─────────────────────────────────────────────────────────────────────────
