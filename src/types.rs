@@ -80,18 +80,33 @@ pub struct DenseChunk {
     pub num_variants: usize,
 }
 
-// The transposed, sparse packet produced by the Compute Thread and consumed by the Writer Thread
+// One position-sorted sub-stream of calls, generic over the key element type
+// (`u8` for the 2-bit SNP stream, `u32` for the 32-bit indel stream).
+pub struct SparseSubChunk<K> {
+    // Per-call data, sample-major (sample, ploid, ~variant).
+    pub call_positions: Vec<u32>,
+    pub call_keys: Vec<K>,
+    // Calls per (sample, ploid) in THIS sub-stream. Length == samples * ploidy.
+    pub sample_lengths: Vec<u32>,
+}
+
+impl<K> SparseSubChunk<K> {
+    pub(crate) fn with_capacity(nnz: usize, columns: usize) -> Self {
+        Self {
+            call_positions: Vec::with_capacity(nnz),
+            call_keys: Vec::with_capacity(nnz),
+            sample_lengths: Vec::with_capacity(columns),
+        }
+    }
+}
+
+// The transposed, sparse packet produced by the Compute Thread and consumed by
+// the Writer Thread — split into a 2-bit SNP sub-stream and a 32-bit indel
+// sub-stream (see data-model.md#on-disk-layout).
 pub struct SparseChunk {
     pub chunk_id: usize,
-
-    // The packed data ordered by Sample
-    pub call_positions: Vec<u32>,
-    pub call_keys: Vec<u32>, // alt packed keys - variant keys
-
-    // for the K-Way Merge
-    // Tracks exactly how many mutations each sample had in this specific chunk.
-    // Length must be exactly (Samples * Ploidy).
-    pub sample_lengths: Vec<u32>, // Replaced offsets with lengths
+    pub snp: SparseSubChunk<u8>,
+    pub indel: SparseSubChunk<u32>,
 }
 
 #[cfg(test)]

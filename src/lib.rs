@@ -214,9 +214,12 @@ pub fn process_chromosome(
     htslib_threads: usize,
     long_allele_capacity: usize,
 ) {
-    // Directory Formatting: svar2/{contig}/var_key
-    let chrom_out_dir = format!("{}/{}/var_key", base_out_dir, chrom);
-    fs::create_dir_all(&chrom_out_dir).expect("Failed to create chromosome output directory");
+    // Directory Formatting: svar2/{contig}/var_key/{snp,indel}
+    let var_key_dir = format!("{}/{}/var_key", base_out_dir, chrom);
+    let snp_dir = format!("{}/snp", var_key_dir);
+    let indel_dir = format!("{}/indel", var_key_dir);
+    fs::create_dir_all(&snp_dir).expect("Failed to create snp output directory");
+    fs::create_dir_all(&indel_dir).expect("Failed to create indel output directory");
 
     // Channel capacities tuned for cohort-scale workloads.
     // - tx_dense=6: smooths HTSlib BGZF block-boundary jitter so the executor
@@ -276,8 +279,9 @@ pub fn process_chromosome(
     let chunk_writer_thread = thread::Builder::new()
         .name(format!("cw-{}", chrom))
         .spawn({
-            let out_dir = chrom_out_dir.clone();
-            move || writer::run_io_writer(rx_sparse, &out_dir)
+            let snp = snp_dir.clone();
+            let indel = indel_dir.clone();
+            move || writer::run_io_writer(rx_sparse, &snp, &indel)
         })
         .expect("spawn chunk writer");
 
@@ -285,7 +289,7 @@ pub fn process_chromosome(
     let long_allele_writer_thread = thread::Builder::new()
         .name(format!("lw-{}", chrom))
         .spawn({
-            let out_dir = chrom_out_dir.clone();
+            let out_dir = indel_dir.clone();
             let chrom_label = chrom.to_string();
 
             move || {
@@ -322,7 +326,7 @@ pub fn process_chromosome(
     stop_sampler.store(true, Ordering::Relaxed);
     sampler_thread.join().unwrap();
 
-    let (ram_ledger, long_allele_offsets) = executor_thread.join().unwrap();
+    let (snp_ledger, indel_ledger, long_allele_offsets) = executor_thread.join().unwrap();
     chunk_writer_thread.join().unwrap();
     long_allele_writer_thread.join().unwrap();
 
@@ -331,23 +335,22 @@ pub fn process_chromosome(
         chrom
     );
 
-    // Save the Long Allele offsets to disk (per-chrom dir, alongside long_alleles.bin)
+    // Long-allele offsets belong to the indel stream.
     let offsets_array = ndarray::Array1::from_vec(long_allele_offsets);
     ndarray_npy::write_npy(
-        format!("{}/long_allele_offsets.npy", chrom_out_dir),
+        format!("{}/long_allele_offsets.npy", indel_dir),
         &offsets_array,
     )
     .expect("Failed to write long allele offsets");
 
-    // trigger the K-Way Tile Merge — final_*.bin / final_offsets.npy land in chrom_out_dir
-    let num_chunks = ram_ledger.len();
-    merge::merge_mini_sc::<u32>(
-        num_chunks,
-        samples.len(),
-        ploidy,
-        &chrom_out_dir,
-        ram_ledger,
-    );
+    let num_chunks = snp_ledger.len(); // == indel_ledger.len() (one row per chunk)
+
+    // SNP stream: merge u8 keys, then bit-pack the merged stream to 2 bits/call.
+    merge::merge_mini_sc::<u8>(num_chunks, samples.len(), ploidy, &snp_dir, snp_ledger);
+    rvk::pack_snp_key_file(&snp_dir);
+
+    // Indel stream: merge 32-bit keys.
+    merge::merge_mini_sc::<u32>(num_chunks, samples.len(), ploidy, &indel_dir, indel_ledger);
 
     println!("[{}] Pipeline Execution Finished Successfully.", chrom);
 }

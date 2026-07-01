@@ -104,8 +104,8 @@ pub struct LongAlleleReader {
 impl LongAlleleReader {
     // TODO: Decide which will call this (or create this instance)
     pub fn new(output_dir: &str, chrom: &str) -> Self {
-        // Layout matches the writer: {output_dir}/{chrom}/var_key/{long_alleles.bin, long_allele_offsets.npy}
-        let chrom_dir = format!("{}/{}/var_key", output_dir, chrom);
+        // Layout matches the writer: {output_dir}/{chrom}/var_key/indel/{long_alleles.bin, long_allele_offsets.npy}
+        let chrom_dir = format!("{}/{}/var_key/indel", output_dir, chrom);
 
         let file_path = Path::new(&chrom_dir).join("long_alleles.bin");
         let file = File::open(file_path).expect("Failed to open long_alleles.bin");

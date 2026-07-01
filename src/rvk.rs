@@ -1,5 +1,7 @@
 use crate::nrvk::LongAlleleTableWriter;
-use crate::types::{DenseChunk, MAX_INLINE_ALT_LEN, MIN_I31, SparseChunk};
+use crate::types::{DenseChunk, MAX_INLINE_ALT_LEN, MIN_I31, SparseChunk, SparseSubChunk};
+use std::fs::File;
+use std::io::{BufReader, BufWriter, Read, Write};
 
 // Reversed byte loading
 //
@@ -135,6 +137,45 @@ pub fn unpack_snp_keys(packed: &[u8], n: usize) -> Vec<u8> {
     (0..n)
         .map(|i| (packed[i >> 2] >> ((i & 3) * 2)) & 3)
         .collect()
+}
+
+// Post-merge pass for the SNP stream: read the merged `final_keys.bin` (one
+// u8 code per call) and rewrite it 2-bit packed (4 calls/byte). Streams in
+// 4-MiB blocks (a multiple of 4, so no pack straddles a block boundary except
+// the genuine EOF tail). Offsets are call-indexed and need no change.
+pub fn pack_snp_key_file(dir: &str) {
+    let src = format!("{}/final_keys.bin", dir);
+    let tmp = format!("{}/final_keys.packed.tmp", dir);
+
+    let mut reader = BufReader::new(File::open(&src).expect("open snp final_keys.bin"));
+    let mut writer = BufWriter::new(File::create(&tmp).expect("create packed tmp"));
+
+    const BLOCK: usize = 4 * 1024 * 1024; // multiple of 4
+    let mut buf = vec![0u8; BLOCK];
+    loop {
+        // Fill `buf` fully unless we hit EOF (so intermediate blocks stay a
+        // multiple of 4 and pack cleanly byte-aligned).
+        let mut filled = 0usize;
+        while filled < BLOCK {
+            match reader.read(&mut buf[filled..]).expect("read snp keys") {
+                0 => break,
+                n => filled += n,
+            }
+        }
+        if filled == 0 {
+            break;
+        }
+        let packed = pack_snp_keys(&buf[..filled]);
+        writer.write_all(&packed).expect("write packed snp keys");
+        if filled < BLOCK {
+            break; // EOF tail handled
+        }
+    }
+    writer.flush().expect("flush packed snp keys");
+    drop(writer);
+    drop(reader);
+
+    std::fs::rename(&tmp, &src).expect("replace snp final_keys.bin with packed");
 }
 
 // Packs up to 13 DNA bases into a single u32 with the inline-encoding layout:
@@ -305,49 +346,34 @@ pub fn classify_variant(ilen: i32, alt_allele: &[u8], bank: &mut LongAlleleTable
 // The core Dense-to-Sparse Matrix Transposer.
 // Flips Row-Major VCF data into Column-Major (Sample-Major) Sparse Tensors.
 pub fn dense2sparse_vk(chunk: &DenseChunk, bank: &mut LongAlleleTableWriter) -> SparseChunk {
-    // TODO
-
-    // 1. Iterate Sample-Major (for s in 0..samples { for p in 0..ploidy { for v in 0..variants } })
-    // 2. Check if chunk.genos[[v, s, p]] is true
-    // 3. If true, extract pos, ref, alt using the v index
-    // 4. Do SIMD encoding or push to long_allele_bank depending upon the len
-    // 5. Push to call_positions and call_keys
-    // 6. Track the number of calls for this specific sample and push to sample_lengths
-
-    // Return formatted SparseChunk ready for the Writer Thread
-
     let (v_variants, num_samples, ploidy) = chunk.genos.shape;
     let columns = num_samples * ploidy;
 
-    // pre-allocate assuming roughly 5% sparsity to prevent heap allocations
-    let estimated_nnz = (v_variants * columns) / 20;
-    let mut call_positions = Vec::with_capacity(estimated_nnz);
-    let mut call_keys = Vec::with_capacity(estimated_nnz);
-    let mut sample_lengths = Vec::with_capacity(columns);
-
-    // Pre-pack each variant's (ilen, alt) into its 32-bit key exactly once.
-    // Without this, a common variant carried by N haplotypes pays the SWAR/PEXT
-    // encode N times, and — critically — pushes its long allele into the bank
-    // N times as well, bloating long_alleles.bin with duplicate rows.
-    let mut packed_keys: Vec<u32> = Vec::with_capacity(v_variants);
+    // Pre-classify each variant exactly once into its stream + key. This also
+    // ensures a long insertion is pushed to the bank a single time, not once
+    // per carrying haplotype.
+    let mut var_keys: Vec<VarKey> = Vec::with_capacity(v_variants);
     for v in 0..v_variants {
         let ilen = unsafe { *chunk.ilens.get_unchecked(v) };
         let start_idx = unsafe { *chunk.alt_offsets.get_unchecked(v) } as usize;
         let end_idx = unsafe { *chunk.alt_offsets.get_unchecked(v + 1) } as usize;
         let alt_allele = unsafe { chunk.alt.get_unchecked(start_idx..end_idx) };
-        packed_keys.push(pack_variant(ilen, alt_allele, bank));
+        var_keys.push(classify_variant(ilen, alt_allele, bank));
     }
 
-    // Raw u64 word slice for the bit-packed dense grid. Same flat-index math
-    // as the previous Vec<bool> layout — we just shift to find the word/bit.
+    // Rough pre-allocation (~5% sparsity), split across the two streams.
+    let estimated_nnz = (v_variants * columns) / 20;
+    let mut snp = SparseSubChunk::<u8>::with_capacity(estimated_nnz, columns);
+    let mut indel = SparseSubChunk::<u32>::with_capacity(estimated_nnz, columns);
+
     let words: &[u64] = &chunk.genos.words;
 
-    // Outer loops are Sample/Ploidy, Inner loop is Variants.
+    // Sample-major transpose; route each set call to its stream.
     for s in 0..num_samples {
         for p in 0..ploidy {
-            let mut current_sample_calls = 0u32;
+            let mut snp_calls = 0u32;
+            let mut indel_calls = 0u32;
 
-            // Fixed stride for perfect CPU cache prefetching
             let base_idx = (s * ploidy) + p;
             let stride = columns;
 
@@ -357,23 +383,29 @@ pub fn dense2sparse_vk(chunk: &DenseChunk, bank: &mut LongAlleleTableWriter) -> 
 
                 if (word >> (flat_idx & 63)) & 1 != 0 {
                     let pos = unsafe { *chunk.pos.get_unchecked(v) };
-                    let packed_key = unsafe { *packed_keys.get_unchecked(v) };
-
-                    call_positions.push(pos);
-                    call_keys.push(packed_key);
-
-                    current_sample_calls += 1;
+                    match unsafe { *var_keys.get_unchecked(v) } {
+                        VarKey::Snp(code) => {
+                            snp.call_positions.push(pos);
+                            snp.call_keys.push(code);
+                            snp_calls += 1;
+                        }
+                        VarKey::Indel(key) => {
+                            indel.call_positions.push(pos);
+                            indel.call_keys.push(key);
+                            indel_calls += 1;
+                        }
+                    }
                 }
             }
-            sample_lengths.push(current_sample_calls);
+            snp.sample_lengths.push(snp_calls);
+            indel.sample_lengths.push(indel_calls);
         }
     }
 
     SparseChunk {
         chunk_id: chunk.chunk_id,
-        call_positions, // Vec<u32>
-        call_keys,      // Vec<u32>
-        sample_lengths, // Vec<u32> -> sum of all variants across samples
+        snp,
+        indel,
     }
 }
 
@@ -795,9 +827,11 @@ mod tests {
         let chunk = build_test_chunk(0, 2, 2, &[], &[], &[]);
         let mut bank = make_bank();
         let sparse = dense2sparse_vk(&chunk, &mut bank);
-        assert_eq!(sparse.call_positions.len(), 0);
-        assert_eq!(sparse.call_keys.len(), 0);
-        assert_eq!(sparse.sample_lengths, vec![0u32; 4]);
+        assert_eq!(sparse.snp.call_positions.len(), 0);
+        assert_eq!(sparse.snp.call_keys.len(), 0);
+        assert_eq!(sparse.snp.sample_lengths, vec![0u32; 4]);
+        assert_eq!(sparse.indel.call_positions.len(), 0);
+        assert_eq!(sparse.indel.sample_lengths, vec![0u32; 4]);
     }
 
     #[test]
@@ -815,11 +849,40 @@ mod tests {
         let mut bank = make_bank();
         let sparse = dense2sparse_vk(&chunk, &mut bank);
 
-        assert_eq!(sparse.call_positions.len(), 12);
-        assert_eq!(sparse.sample_lengths, vec![3, 3, 3, 3]);
+        assert_eq!(sparse.snp.call_positions.len(), 12);
+        assert_eq!(sparse.snp.sample_lengths, vec![3, 3, 3, 3]);
         // First hap's slice is positions [100, 110, 120]
-        assert_eq!(&sparse.call_positions[0..3], &[100, 110, 120]);
-        assert_eq!(&sparse.call_positions[3..6], &[100, 110, 120]);
+        assert_eq!(&sparse.snp.call_positions[0..3], &[100, 110, 120]);
+        assert_eq!(&sparse.snp.call_positions[3..6], &[100, 110, 120]);
+        assert_eq!(sparse.indel.call_positions.len(), 0);
+    }
+
+    // A mixed chunk: variant 0 is a SNP (A→C), variant 1 is an INS (A→AT),
+    // variant 2 is a pure DEL (AT→A). One diploid sample carrying all three on
+    // both haplotypes. The SNP must land in `snp`, the INS/DEL in `indel`.
+    #[test]
+    #[allow(clippy::identity_op)] // 1 /*S*/ documents the shape factor, not dead code
+    fn test_dense2sparse_splits_snp_and_indel() {
+        let refs: Vec<&[u8]> = vec![b"A", b"A", b"AT"];
+        let alts: Vec<&[u8]> = vec![b"C", b"AT", b"A"];
+        let bit_pattern = vec![true; 3 /*V*/ * 1 /*S*/ * 2 /*P*/];
+        let chunk = build_test_chunk(3, 1, 2, &refs, &alts, &bit_pattern);
+
+        let mut bank = make_bank();
+        let sparse = dense2sparse_vk(&chunk, &mut bank);
+
+        // Two haplotypes, each: 1 SNP call + 2 indel calls.
+        assert_eq!(sparse.snp.sample_lengths, vec![1, 1]);
+        assert_eq!(sparse.indel.sample_lengths, vec![2, 2]);
+
+        // SNP stream: position 100 (variant 0), code for 'C' == 1.
+        assert_eq!(sparse.snp.call_positions, vec![100, 100]);
+        assert_eq!(sparse.snp.call_keys, vec![1u8, 1u8]);
+
+        // Indel stream: positions 110 (INS) then 120 (DEL) per hap, keys decode back.
+        assert_eq!(sparse.indel.call_positions, vec![110, 120, 110, 120]);
+        assert_eq!(decode_alt_inline(sparse.indel.call_keys[0]), b"AT".to_vec());
+        assert_eq!((sparse.indel.call_keys[1] as i32) >> 1, -1); // DEL ilen = -1
     }
 
     proptest! {
@@ -847,11 +910,12 @@ mod tests {
             let mut bank = make_bank();
             let sparse = dense2sparse_vk(&chunk, &mut bank);
 
-            let total_calls: u32 = sparse.sample_lengths.iter().sum();
+            let total_calls: u32 = sparse.snp.sample_lengths.iter().sum();
             prop_assert_eq!(total_calls as usize, true_count, "lost or doubled mutations");
-            prop_assert_eq!(sparse.call_positions.len(), true_count);
-            prop_assert_eq!(sparse.call_keys.len(), true_count);
-            prop_assert_eq!(sparse.sample_lengths.len(), n_samples * ploidy);
+            prop_assert_eq!(sparse.snp.call_positions.len(), true_count);
+            prop_assert_eq!(sparse.snp.call_keys.len(), true_count);
+            prop_assert_eq!(sparse.snp.sample_lengths.len(), n_samples * ploidy);
+            prop_assert_eq!(sparse.indel.call_positions.len(), 0);
         }
 
         // Per-sample correctness: for each (s,p) hap, the slice of call_positions
@@ -878,7 +942,7 @@ mod tests {
             for s in 0..n_samples {
                 for p in 0..ploidy {
                     let hap_idx = s * ploidy + p;
-                    let calls = sparse.sample_lengths[hap_idx] as usize;
+                    let calls = sparse.snp.sample_lengths[hap_idx] as usize;
 
                     // Compute expected positions from the bit pattern + chunk.pos
                     let expected: Vec<u32> = (0..n_variants).filter_map(|v| {
@@ -886,12 +950,12 @@ mod tests {
                         if bit_pattern[flat_idx] { Some(chunk.pos[v]) } else { None }
                     }).collect();
 
-                    let actual: Vec<u32> = sparse.call_positions[cursor..cursor + calls].to_vec();
+                    let actual: Vec<u32> = sparse.snp.call_positions[cursor..cursor + calls].to_vec();
                     prop_assert_eq!(&actual, &expected, "hap {} positions mismatch", hap_idx);
                     cursor += calls;
                 }
             }
-            prop_assert_eq!(cursor, sparse.call_positions.len());
+            prop_assert_eq!(cursor, sparse.snp.call_positions.len());
         }
     }
 }
