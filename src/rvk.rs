@@ -111,6 +111,32 @@ fn encode_snp(alt_base: u8) -> u32 {
     ((alt_base as u32 >> 1) & 3) << 25
 }
 
+// Bare 2-bit ALT code for the SNP stream: A=00 C=01 T=10 G=11.
+// Same branchless mapping as `encode_snp`, without the shift into bits[26:25].
+#[inline(always)]
+pub fn encode_snp_2bit(base: u8) -> u8 {
+    (base >> 1) & 3
+}
+
+// Pack 2-bit SNP codes 4-per-byte, little-pair-first: code `i` occupies bits
+// [(i&3)*2 + 1 : (i&3)*2] of byte `i >> 2`. The final byte is zero-padded when
+// `codes.len()` is not a multiple of 4. Offsets index CALLS, not bytes, so a
+// reader recovers code `i` as `(packed[i >> 2] >> ((i & 3) * 2)) & 3`.
+pub fn pack_snp_keys(codes: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; codes.len().div_ceil(4)];
+    for (i, &c) in codes.iter().enumerate() {
+        out[i >> 2] |= (c & 3) << ((i & 3) * 2);
+    }
+    out
+}
+
+// Inverse of `pack_snp_keys`. Returns the first `n` codes.
+pub fn unpack_snp_keys(packed: &[u8], n: usize) -> Vec<u8> {
+    (0..n)
+        .map(|i| (packed[i >> 2] >> ((i & 3) * 2)) & 3)
+        .collect()
+}
+
 // Packs up to 13 DNA bases into a single u32 with the inline-encoding layout:
 // [ ilen:5 | base[0..alt_len] × 2bit | _ | flag=0 ].
 //
@@ -552,6 +578,36 @@ mod tests {
                 "SNP fast path diverged from general path for base {}",
                 b as char
             );
+        }
+    }
+
+    #[test]
+    fn test_encode_snp_2bit_mapping() {
+        // A=00 C=01 T=10 G=11 via (base >> 1) & 3
+        assert_eq!(encode_snp_2bit(b'A'), 0);
+        assert_eq!(encode_snp_2bit(b'C'), 1);
+        assert_eq!(encode_snp_2bit(b'T'), 2);
+        assert_eq!(encode_snp_2bit(b'G'), 3);
+    }
+
+    #[test]
+    fn test_pack_snp_keys_exact_layout() {
+        // codes [1, 2, 3, 0, 1] → byte0 = 1 | (2<<2) | (3<<4) | (0<<6) = 0b00_11_10_01 = 0x39
+        //                        → byte1 = 1 (only low pair) = 0x01
+        let packed = pack_snp_keys(&[1, 2, 3, 0, 1]);
+        assert_eq!(packed, vec![0x39, 0x01]);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2000))]
+
+        // pack → unpack roundtrips for any length and any codes in 0..=3.
+        #[test]
+        fn test_pack_unpack_snp_roundtrip(codes in proptest::collection::vec(0u8..=3, 0..100)) {
+            let packed = pack_snp_keys(&codes);
+            prop_assert_eq!(packed.len(), codes.len().div_ceil(4));
+            let unpacked = unpack_snp_keys(&packed, codes.len());
+            prop_assert_eq!(unpacked, codes);
         }
     }
 
