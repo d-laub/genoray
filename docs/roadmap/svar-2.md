@@ -68,10 +68,10 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
   in-source unit/proptests + 5 e2e tests. An optional per-contig monitoring sampler
   (`GENORAY_SAMPLE_INTERVAL`) reports channel fill and per-thread CPU%. *Remaining:*
   variant normalization (M2, currently a precondition — see below) and the dense
-  routing of M4; the on-disk filenames are still provisional (see M3). The current
-  encoder writes a single **uniform 32-bit** `var_key` stream; the data model now
-  specifies splitting it into 2-bit `snp/` and 32-bit `indel/` sub-streams (see
-  [`data-model.md`](data-model.md#on-disk-layout)), which remains to be implemented.
+  routing of M4; the on-disk filenames are still provisional (see M3). The
+  `var_key` stream is now split into 2-bit `snp/` and 32-bit `indel/`
+  sub-streams per [`data-model.md`](data-model.md#on-disk-layout); the SNP stream
+  is 2-bit-packed post-merge and carries no LUT.
 - [ ] **M2. Variant normalization during conversion.** Left-alignment, atomization,
   and biallelic splitting (split multi-allelic sites) applied inline as variants stream
   through. See [`data-model.md`](data-model.md#variant-normalization).
@@ -85,9 +85,11 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
   [`architecture.md`](architecture.md#on-disk-layout).
   *Core done:* output is partitioned per contig (`{out}/{contig}/var_key/`) and the
   merge emits sorted position + offset sidecars. *Provisional / remaining:* the current
-  scratch filenames are `final_positions.bin` / `final_keys.bin` (raw little-endian via
-  bytemuck) and `final_offsets.npy`, which differ from the `.npy` names in the layout
-  spec; `meta.json` and the per-contig `max_del.npy` are not yet written.
+  scratch filenames live under `{out}/{contig}/var_key/{snp,indel}/` as
+  `final_positions.bin` / `final_keys.bin` (raw little-endian via bytemuck) and
+  `final_offsets.npy`, plus `long_alleles.bin` + `long_allele_offsets.npy` under
+  `indel/`, which differ from the `.npy` names in the layout spec; `meta.json` and
+  the per-contig `max_del.npy` are not yet written.
 - [ ] **M4. Dense representation + cost-model routing.** Implement the 1-bit dense
   genotype matrix and the deterministic per-variant dense/sparse decision. See
   [`data-model.md`](data-model.md#dense-vs-sparse-cost-model).
