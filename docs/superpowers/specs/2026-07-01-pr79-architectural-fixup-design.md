@@ -182,6 +182,30 @@ Unit-tested across the low-end (below `MIN_THREADS_PER_CHROM`), high-end
 Linux-`/proc`-specific observability; isolating it documents that and shrinks
 `lib.rs`. Public surface: `spawn_sampler(...)` unchanged.
 
+**Platform note:** the per-thread CPU sampling reads `/proc/self/task/<tid>/stat`
+and hardcodes `CLK_TCK = 100` — both Linux-only. On macOS there is no `/proc`, so
+`find_thread_tid_by_name` returns `None` and the sampler prints channel fill
+levels with `0%` CPU (it never panics — the degrade path already exists). Make
+this explicit in `monitor.rs`: a module-level doc comment stating the CPU
+figures are Linux-only, and the CPU columns emit `n/a` instead of a misleading
+`0%` when no TID resolves (cheap honesty; still no `cfg` gate needed since the
+code compiles and runs on both).
+
+## Platform support
+
+Linux and macOS are both supported; Windows is explicitly out of scope.
+
+- **`pread`/`pwrite`** (`merge.rs`, and the new `LongAlleleReader` path) use
+  `std::os::unix::fs::FileExt` (`read_exact_at` / `write_all_at`), which is
+  implemented for all Unix targets including macOS — no `cfg` needed. `merge.rs`
+  already depends on this today.
+- **`/proc` monitoring** is the only Linux-specific surface; it degrades to
+  no-CPU-numbers on macOS as described above rather than failing.
+- No other module uses platform-specific APIs. The default (`extension-module`)
+  and `--no-default-features` test builds should be exercised on at least one
+  Unix target in CI; macOS-specific CI is not required by this PR but nothing
+  here blocks it.
+
 ## Bounded error-handling pass (Tier 3, cuttable)
 
 Introduce `ConversionError` (via `thiserror`):
