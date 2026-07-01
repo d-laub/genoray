@@ -341,7 +341,7 @@ pub fn process_chromosome(
 
     // trigger the K-Way Tile Merge — final_*.bin / final_offsets.npy land in chrom_out_dir
     let num_chunks = ram_ledger.len();
-    merge::merge_mini_sc(
+    merge::merge_mini_sc::<u32>(
         num_chunks,
         samples.len(),
         ploidy,
