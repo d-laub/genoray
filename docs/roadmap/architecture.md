@@ -62,10 +62,12 @@ fixed-width bits**. Only a thin encode/decode layer knows the bit layout in
 Contract for the encoder:
 
 - **Input:** `(ILEN, ALT bytes)` plus a handle to the LUT for spill.
-- **Output:** a fixed-width key (e.g. `u32`) — inline value or LUT pointer, with the
-  flag bit set per the layout.
-- **Constraint:** as long as the key width is unchanged, the encoding internals can be
-  swapped freely; orchestration code does not branch on the layout.
+- **Output:** a **stream tag** (`snp` or `indel`) plus a fixed-width key for that
+  stream — a bare 2-bit code for the SNP stream, or a `u32` (inline value or LUT
+  pointer, flag bit set per the layout) for the indel stream.
+- **Constraint:** as long as each stream's key width is unchanged, the encoding
+  internals can be swapped freely; orchestration routes by the tag and does not branch
+  on the layout within a stream.
 
 A matching decoder reverses it: `key (+ LUT) → (ILEN, ALT)`. Keep these two functions
 (and their width constant) as the *only* place that knows the layout. The cost model
@@ -82,7 +84,10 @@ the reader/writer:
 
 - One directory per contig; positions are sidecar arrays sorted within a contig.
 - Each contig has up to three representation subdirs (`var_key`, `pointer`, `dense`);
-  a variant lives in exactly one.
+  a variant lives in exactly one. Each representation further splits into a `snp/`
+  (2-bit, no LUT) and an `indel/` (32-bit, LUT) sub-stream, so a variant's full
+  placement is `{representation}/{snp|indel}` (see
+  [`data-model.md`](data-model.md#on-disk-layout)).
 - `meta.json` holds version (for `SparseVar2` negotiation), samples, contigs, and
   ploidy. The per-`(contig, sample, ploid)` maximum deletion length for overlap queries
   is stored separately in a per-contig `max_del.npy` (it is structured and potentially
@@ -103,16 +108,19 @@ deletions span reference bases.
 - **Overlap handling:** use the max-deletion-length bound to set the lower search
   bound, then linear-scan to the upper bound, per the algorithm in
   [`data-model.md`](data-model.md#overlap-queries-and-deletions).
-- **Across representations:** a query may touch variants in `var_key`, `pointer`, and
-  `dense` subdirs for the same contig; results from each must be combined in
-  position-sorted order (next section).
+- **Across representations and sub-streams:** a query may touch variants in `var_key`,
+  `pointer`, and `dense` subdirs for the same contig, and within each the `snp/` and
+  `indel/` sub-streams; results from all of them must be combined in position-sorted
+  order (next section). SNP sub-streams never span, so only the `indel/` sub-streams use
+  the `max_del` leftward bound.
 
 ## Python decode path
 
 Query results (roadmap M6) decode into user-facing structs/classes (exact API TBD).
 Because a single contig's variants are spread across up to three representations — each
-an independent, position-sorted source — assembling a result requires a **fast sorted
-union / merge** of multiple sorted streams.
+split into an independent, position-sorted `snp/` and `indel/` sub-stream (up to six
+sources) — assembling a result requires a **fast sorted union / merge** of multiple
+sorted streams.
 
 - This is the union-shaped dual of fast sorted-array **intersection**; the techniques
   in [Doug Turnbull's "Faster intersect"](https://softwaredoug.com/blog/2024/05/05/faster-intersect)

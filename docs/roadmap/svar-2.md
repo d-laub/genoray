@@ -38,9 +38,9 @@ by the cost model (see [`data-model.md`](data-model.md#dense-vs-sparse-cost-mode
 
 | Representation | Code name | What it stores | Best when |
 | --- | --- | --- | --- |
-| **Inline variant key** | `var_key` | Per-call inline key (2-bit SNP ALT, or 32-bit indel key); long alleles spill to a LUT | Low allele frequency (most variants) |
-| **Pointer** | `pointer` | Sparse `u32`/`u64` pointers into a shared variant table (this is SVAR 1.0) | Variant info is large (many INFO/FORMAT fields) |
-| **Dense** | `dense` | 1-bit `(sample, ploid, variant)` matrix + variant table | High allele frequency |
+| **Inline variant key** | `var_key` | Per-call inline key in a 2-bit SNP stream or a 32-bit indel stream; long indel alleles spill to a LUT (SNPs never do) | Low allele frequency (most variants) |
+| **Pointer** | `pointer` | Sparse `u32`/`u64` pointers into a shared variant table, split into 2-bit SNP and 32-bit indel tables (this is SVAR 1.0) | Variant info is large (many INFO/FORMAT fields) |
+| **Dense** | `dense` | 1-bit `(sample, ploid, variant)` matrix + variant table, each split into 2-bit SNP and 32-bit indel sub-streams | High allele frequency |
 
 There are two axes here, which is the source of the "4-way" / "3-way" naming:
 
@@ -68,7 +68,10 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
   in-source unit/proptests + 5 e2e tests. An optional per-contig monitoring sampler
   (`GENORAY_SAMPLE_INTERVAL`) reports channel fill and per-thread CPU%. *Remaining:*
   variant normalization (M2, currently a precondition — see below) and the dense
-  routing of M4; the on-disk filenames are still provisional (see M3).
+  routing of M4; the on-disk filenames are still provisional (see M3). The current
+  encoder writes a single **uniform 32-bit** `var_key` stream; the data model now
+  specifies splitting it into 2-bit `snp/` and 32-bit `indel/` sub-streams (see
+  [`data-model.md`](data-model.md#on-disk-layout)), which remains to be implemented.
 - [ ] **M2. Variant normalization during conversion.** Left-alignment, atomization,
   and biallelic splitting (split multi-allelic sites) applied inline as variants stream
   through. See [`data-model.md`](data-model.md#variant-normalization).
