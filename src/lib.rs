@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+pub mod budget;
 pub mod executor;
 pub mod merge;
 pub mod nrvk;
@@ -389,50 +390,12 @@ fn run_conversion_pipeline(
             }
         };
 
-        // 4 fixed OS threads per chrom: reader + executor + chunk_writer + long_allele_writer.
-        // Mostly I/O-bound (blocked on channels) but they still count against the scheduler.
-        const PIPELINE_THREADS_PER_CHROM: usize = 4;
-        // Floor for HTSlib decode threads — below this the executor channel starves
-        // (decompression is the measured bottleneck, not the encode/transpose).
-        const MIN_HTSLIB_THREADS: usize = 2;
-        // Ceiling for HTSlib decode threads — diminishing returns past 4 due to BGZF
-        // block-level parallelism limits. More threads = contention, not throughput.
-        const MAX_HTSLIB_THREADS: usize = 4;
-        // Min viable allocation for one chrom end-to-end. Below this we accept thrashing.
-        const MIN_THREADS_PER_CHROM: usize = PIPELINE_THREADS_PER_CHROM + MIN_HTSLIB_THREADS;
+        let plan = crate::budget::plan_thread_budget(available_cores, chroms.len());
+        let concurrent_chroms = plan.concurrent_chroms;
+        let htslib_threads = plan.htslib_threads;
 
-        // Reserve 1 core for the OS + Python main thread so the box doesn't freeze.
-        let usable_cores = std::cmp::max(1, available_cores.saturating_sub(1));
-        let n_chroms = std::cmp::max(1, chroms.len());
-
-        let (concurrent_chroms, htslib_threads) = if usable_cores < MIN_THREADS_PER_CHROM {
-            // Low-end machine: can't satisfy the minimum. Run one chrom and pour every
-            // remaining core into HTSlib decompression. Pipeline threads will thrash with
-            // decode threads — fine, they spend most of their time blocked on channel recv().
-            let htslib = std::cmp::max(1, usable_cores.saturating_sub(PIPELINE_THREADS_PER_CHROM));
-            let htslib = std::cmp::min(htslib, MAX_HTSLIB_THREADS);
-            (1usize, htslib)
-        } else {
-            // High-end path: decide concurrency FIRST, capped by chromosome count,
-            // then redistribute every remaining core into HTSlib up to MAX_HTSLIB_THREADS.
-
-            // Pass 1: how many chroms can we fan out to in principle?
-            let max_concurrent_by_cores = usable_cores / MIN_THREADS_PER_CHROM;
-            // Cap by actual chromosome count — no point reserving budget for chroms that don't exist.
-            let concurrent = std::cmp::max(1, std::cmp::min(max_concurrent_by_cores, n_chroms));
-
-            // Pass 2: divvy up the actual core budget across the actual concurrent count.
-            let cores_per_chrom = usable_cores / concurrent;
-            let htslib_unclamped = cores_per_chrom.saturating_sub(PIPELINE_THREADS_PER_CHROM);
-            // Clamp into [MIN_HTSLIB_THREADS, MAX_HTSLIB_THREADS]. Surplus cores past
-            // MAX_HTSLIB_THREADS are intentionally left idle — adding them hurts due to
-            // BGZF contention. Better to leave OS scheduler some slack than oversubscribe.
-            let htslib = htslib_unclamped.clamp(MIN_HTSLIB_THREADS, MAX_HTSLIB_THREADS);
-
-            (concurrent, htslib)
-        };
-
-        let total_active = concurrent_chroms * (PIPELINE_THREADS_PER_CHROM + htslib_threads);
+        let total_active =
+            concurrent_chroms * (crate::budget::PIPELINE_THREADS_PER_CHROM + htslib_threads);
         println!("Using: {} cores.", available_cores);
         println!(
             "Pipeline Config: {} concurrent chromosomes | {} HTSlib decompression threads each \
