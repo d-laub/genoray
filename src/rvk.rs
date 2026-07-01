@@ -212,6 +212,35 @@ pub fn pack_variant(ilen: i32, alt_allele: &[u8], bank: &mut LongAlleleTableWrit
     (ilen as u32) << 1
 }
 
+// The two inline flavors, tagged for stream routing (the encoding-seam output;
+// see architecture.md#the-encoding-agnostic-seam).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VarKey {
+    /// SNP: a bare 2-bit ALT code (0..=3) for the SNP stream.
+    Snp(u8),
+    /// Indel: the 32-bit key (inline value or LUT pointer) for the indel stream.
+    Indel(u32),
+}
+
+// Classify one atomized variant into its stream + key.
+//
+// Under the atomization precondition, `ilen == 0` ⟺ SNP (ref_len == 1 &&
+// alt_len == 1); `ilen != 0` ⟺ indel (INS ilen > 0, pure DEL ilen < 0). SNPs
+// never spill; indels spill long insertions to the bank via `pack_variant`.
+#[inline(always)]
+pub fn classify_variant(ilen: i32, alt_allele: &[u8], bank: &mut LongAlleleTableWriter) -> VarKey {
+    if ilen == 0 {
+        debug_assert_eq!(
+            alt_allele.len(),
+            1,
+            "ilen == 0 must be an atomized SNP (alt_len == 1)"
+        );
+        VarKey::Snp(encode_snp_2bit(alt_allele[0]))
+    } else {
+        VarKey::Indel(pack_variant(ilen, alt_allele, bank))
+    }
+}
+
 // // encoding the ilen, and alt allele (with rk or nrk) into a single key
 // #[inline(always)]
 // fn encode_variant_key(
@@ -669,6 +698,32 @@ mod tests {
         assert_eq!(((key as i32) >> 1), -3);
         // (-3i32 << 1) = -6 → as u32 = 0xFFFFFFFA
         assert_eq!(key, 0xFFFFFFFAu32);
+    }
+
+    #[test]
+    fn test_classify_variant_routes_by_ilen() {
+        let mut bank = make_bank();
+
+        // SNP: ilen == 0 → Snp(2-bit code). ref=A alt=C → code 1.
+        match classify_variant(0, b"C", &mut bank) {
+            VarKey::Snp(code) => assert_eq!(code, 1),
+            other => panic!("expected Snp, got {:?}", other),
+        }
+
+        // INS: ilen > 0 → Indel(inline key), decodes back to the ALT.
+        match classify_variant(2, b"ACG", &mut bank) {
+            VarKey::Indel(key) => {
+                assert_eq!(key & 1, 0, "inline INS clears lookup flag");
+                assert_eq!(decode_alt_inline(key), b"ACG".to_vec());
+            }
+            other => panic!("expected Indel, got {:?}", other),
+        }
+
+        // Pure DEL: ilen < 0 → Indel(signed key).
+        match classify_variant(-3, b"A", &mut bank) {
+            VarKey::Indel(key) => assert_eq!((key as i32) >> 1, -3),
+            other => panic!("expected Indel, got {:?}", other),
+        }
     }
 
     #[test]
