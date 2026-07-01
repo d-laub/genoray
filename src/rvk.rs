@@ -282,67 +282,6 @@ pub fn classify_variant(ilen: i32, alt_allele: &[u8], bank: &mut LongAlleleTable
     }
 }
 
-// // encoding the ilen, and alt allele (with rk or nrk) into a single key
-// #[inline(always)]
-// fn encode_variant_key(
-//     ref_len: usize,
-//     alt_len: usize,
-//     alt_allele: &[u8],
-//     long_allele_bank: &mut NonReversibleLongAllele,
-// ) -> u32 {
-//     // will have to check based on the size so that cn decide if to use the ptr or not
-//     // lookup flag ->
-//     // 		true -> when ilen is > 13 or if ilen if < minimum value of i31
-//     //		false -> o.w. it is an actual vk not a pointer
-//     /* if lookup flag {
-//             1. yes -> 31 bits for an unsigned address
-//             2. no ->
-//                 a. if ilen >= 0 then ilen = i5 and alt = 26 bits of 2 bit each nucleotide
-//                 b. if ilen < 0 then ilen = i31
-//         }
-//     */
-//     // AC
-//     // 0010 00000000000 >> 5 | ilen | flag
-
-//     let ilen: i32 = (alt_len as i32) - (ref_len as i32);
-//     let min_i31: i32 = -(1 << 30); //constant
-//     let mut seq_bits: u32 = 0; //vk
-
-//     if (ilen >= 0 && ilen <= 13) || (ilen < 0 && ilen >= min_i31) {
-//         // Path A: Reversible Packing (when +ve ilen but <= 13 alt len, or when -ve but in range of i31)
-//         if ilen >= 0 {
-//             //then it can fit in the 31 bits with last bit being 0
-//             let key = ((ilen as u32) & 0x1F) << 27; //write decimal instead of hex
-//             for (i, &b) in alt_allele.iter().enumerate() {
-//                 // prevent shifting out of bounds if a rogue string gets through
-//                 if i >= 13 {
-//                     break; //panic
-//                 }
-//                 // u8s to bits -> vectorized
-//                 // calculate exactly how far left to push this specific base -> left aligned
-//                 // Base 0 shifts by 25. Base 1 shifts by 23. Base 2 shifts by 21...
-//                 let shift_amount = 25 - (i * 2);
-
-//                 // encoding the base and dropping it to the assigned slot
-//                 // eg: Alt: ACGT ilen = 4 -> seq_bits = 00100 00011011 000000000000000000 0
-//                 seq_bits |= encode_base(b) << shift_amount;
-//             }
-//             seq_bits |= key;
-//         } else {
-//             // shift left by 1 -> LSB = 0 and MSB 31 bits are signed ilen i31
-//             seq_bits = (ilen as u32) << 1;
-//         }
-//     } else {
-//         // Path B: Ptr Fallback for large variants (> 13 alt len or more than i31 deletions)
-//         // 31 bits for an usigned add + 1 bit for flag True
-//         // modifies the data of long allele bank and returns the pointer to that with lsb 1 as lookup flag
-//         row_index = long_allele_bank.push_variant(ilen, alt_allele); // should not couple in table
-//         // tagging the lsb to 1
-//         return (row_index << 1) | 1;
-//     }
-//     seq_bits
-// }
-
 // The core Dense-to-Sparse Matrix Transposer.
 // Flips Row-Major VCF data into Column-Major (Sample-Major) Sparse Tensors.
 pub fn dense2sparse_vk(chunk: &DenseChunk, bank: &mut LongAlleleTableWriter) -> SparseChunk {
@@ -409,101 +348,6 @@ pub fn dense2sparse_vk(chunk: &DenseChunk, bank: &mut LongAlleleTableWriter) -> 
     }
 }
 
-// pub fn dense2sparse_vk<I: PrimInt, H: Fn(u64) -> u64>(
-//     pos: &[u32],
-//     refe: &[u8],
-//     ref_offsets: &[I],
-//     alt: &[u8],
-//     alt_offsets: &[I],
-//     start: usize,
-//     end: usize,
-//     genos: &Array<bool, Ix3>, // Varients, Samples, ploidy (V, S, P)
-//     long_allele_bank: &mut NonReversibleLongAllele,
-// ) -> (Vec<u32>, Vec<u32>, Vec<u64>) {
-//     /*
-//     Convert dense genotypes to sparse variant-key genotypes
-
-//     Args:
-//         pos: (total_variants)
-//         ref: (total_ref_length)
-//         ref_offsets: (total_variants + 1)
-//         alt: (total_alt_length)
-//         alt_offsets: (total_variants + 1)
-//         start_idx
-//         end_idx: end_idx - start_idx == n_variants
-//         genos: (variants, samples, ploidy)
-//         long_allele_bank: ref to SoA for the nr alleles
-
-//     Returns:
-//         positions: (n_calls)
-//         ilen_alt: (n_calls)
-//         offsets: (samples * ploidy + 1)
-//     */
-//     let genos = genos.slice(s![start..end, .., ..]);
-
-//     let shape = genos.shape();
-//     let samples = shape[1];
-//     let ploidy = shape[2];
-//     let n_hap = samples * ploidy;
-
-//     //step 1 - counting mutations per hap
-//     let mut counts = vec![0u64; n_hap];
-
-//     for ((_v, s, p), &has_mut) in genos.indexed_iter() {
-//         if has_mut {
-//             counts[s * ploidy + p] += 1;
-//         }
-//     }
-
-//     //step 2 - prefix sum for offsets
-//     let mut offsets = vec![0u64; n_hap + 1];
-//     for i in 0..n_hap {
-//         offsets[i + 1] = offsets[i] + counts[i];
-//     }
-
-//     let n_calls = offsets[n_hap] as usize;
-
-//     //step 3
-//     let mut out_pos = vec![0u32; n_calls];
-//     let mut ilen_alt = vec![0u32; n_calls];
-
-//     let mut write_heads = offsets.clone();
-
-//     for ((v, s, p), &has_mutation) in genos.indexed_iter() {
-//         if has_mutation {
-//             let global_idx = start + v;
-//             let hap_idx = s * ploidy + p;
-//             let write_idx = write_heads[hap_idx] as usize;
-
-//             // get start end end indices from the offsets arrays
-
-//             let ref_start = ref_offsets[global_idx] as usize;
-//             let ref_end = ref_offsets[global_idx + 1] as usize;
-
-//             let alt_start = alt_offsets[global_idx] as usize;
-//             let alt_end = alt_offsets[global_idx + 1] as usize;
-
-//             // don't require ref slice for now -> can be added later
-//             let alt_slice = &alt[alt_start..alt_end];
-
-//             let ref_len = ref_end - ref_start;
-//             let alt_len = alt_slice.len();
-
-//             // generate the lower 32 bits -> ilen (5 bits signed) + alt encoded (26 bits) + flag for ptr lookup (1 bit)
-
-//             let ilen_alt_flag = encode_variant_key(ref_len, alt_len, alt_slice, long_allele_bank);
-
-//             // scatter the data to correct positions
-//             out_pos[write_idx] = pos[global_idx];
-//             ilen_alt[write_idx] = ilen_alt_flag; // ilen (5 bits signed) + alt encoded (26 bits) + flag for ptr lookup (1 bit)
-
-//             // moving the write head forward for next mut for this haplotype to be right next
-//             write_heads[hap_idx] += 1;
-//         }
-//     }
-//     (out_pos, ilen_alt, offsets)
-// }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -554,7 +398,6 @@ mod tests {
             alt: alt_buf,
             alt_offsets,
             genos,
-            num_variants: n_variants,
         }
     }
 

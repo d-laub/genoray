@@ -77,7 +77,6 @@ pub struct DenseChunk {
 
     // Dense Genotype Tensor - Shape (Variants, Samples, Ploidy), bit-packed
     pub genos: BitGrid3, // (V, S, P)
-    pub num_variants: usize,
 }
 
 // One position-sorted sub-stream of calls, generic over the key element type
@@ -234,22 +233,3 @@ mod tests {
         }
     }
 }
-
-// mod nrvk;
-// mod rvk;
-
-// use nrvk::NonReversibleLongAllele;
-// use rvk::dense2sparse_vk;
-
-// fn main() {
-//     /* things main has to do:
-//         `Stream everything` -> 1st pass for long alleles -> allocation on disk
-//         then streaming the conversion and encode (FS with directories in 1st pass) + file lock (create dir + lock it)
-//         read chunk of genotype -> put inside the DS
-//         || capability -> across contig
-//         1. create the genos array based on reading files (vcf, plink)
-//         2. additional data - metadata and all
-//         3. create contig based long allele memory
-//         4. writing them on files (for each contig a different directory)
-//     */
-// }

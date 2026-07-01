@@ -354,6 +354,6 @@ fn test_reader_accepts_pure_del() {
     let chunk = reader
         .read_next_chunk(100, 0)
         .expect("chunk should succeed");
-    assert_eq!(chunk.num_variants, 1);
+    assert_eq!(chunk.ilens.len(), 1);
     assert_eq!(chunk.ilens, vec![-2]);
 }
