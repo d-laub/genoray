@@ -1,6 +1,10 @@
+use crate::cost_model::{Class, Representation, choose_representation};
+use crate::dense::{DenseClass, DenseMap};
 use crate::nrvk::LongAlleleTableWriter;
 use crate::streams::StreamTag;
-use crate::types::{DenseChunk, MAX_INLINE_ALT_LEN, MIN_I31, SparseChunk, SparseSubStream};
+use crate::types::{
+    DenseChunk, DenseSubChunk, MAX_INLINE_ALT_LEN, MIN_I31, SparseChunk, SparseSubStream,
+};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 
@@ -289,16 +293,54 @@ pub fn dense2sparse_vk(chunk: &DenseChunk, bank: &mut LongAlleleTableWriter) -> 
     let (v_variants, num_samples, ploidy) = chunk.genos.shape;
     let columns = num_samples * ploidy;
 
-    // Pre-classify each variant exactly once into its stream + key. This also
-    // ensures a long insertion is pushed to the bank a single time, not once
-    // per carrying haplotype.
-    let mut var_keys: Vec<VarKey> = Vec::with_capacity(v_variants);
+    // Per-variant routing record built in one pre-pass.
+    enum Route {
+        VarKey(VarKey),
+        // dense variant: which class + its column index within that class's table
+        Dense { class: DenseClass, col: u32 },
+    }
+
+    // Dense per-class tables accumulate positions + keys as we discover dense
+    // variants; geno_bits is sized after the pre-pass (n_dense known). This
+    // also ensures a long insertion is pushed to the bank a single time, not
+    // once per carrying haplotype.
+    let mut dense = DenseMap::from_fn(|c| DenseSubChunk::empty(c.key_bytes()));
+    let mut routes: Vec<Route> = Vec::with_capacity(v_variants);
+
     for v in 0..v_variants {
         let ilen = unsafe { *chunk.ilens.get_unchecked(v) };
         let start_idx = unsafe { *chunk.alt_offsets.get_unchecked(v) } as usize;
         let end_idx = unsafe { *chunk.alt_offsets.get_unchecked(v + 1) } as usize;
         let alt_allele = unsafe { chunk.alt.get_unchecked(start_idx..end_idx) };
-        var_keys.push(classify_variant(ilen, alt_allele, bank));
+
+        let vk = classify_variant(ilen, alt_allele, bank);
+        let (class, dclass) = match vk {
+            VarKey::Snp(_) => (Class::Snp, DenseClass::Snp),
+            VarKey::Indel(_) => (Class::Indel, DenseClass::Indel),
+        };
+        let x = chunk.genos.popcount_plane(v);
+
+        match choose_representation(class, num_samples, ploidy, x) {
+            Representation::VarKey => routes.push(Route::VarKey(vk)),
+            Representation::Dense => {
+                let sub = dense.get_mut(dclass);
+                let col = sub.n_dense_variants as u32;
+                let pos = unsafe { *chunk.pos.get_unchecked(v) };
+                sub.positions.push(pos);
+                match vk {
+                    VarKey::Snp(code) => sub.keys.push(code),
+                    VarKey::Indel(key) => sub.keys.extend_from_slice(&key.to_le_bytes()),
+                }
+                sub.n_dense_variants += 1;
+                routes.push(Route::Dense { class: dclass, col });
+            }
+        }
+    }
+
+    // Size each dense class's hap-major geno block now that n_dense is known.
+    for (_c, sub) in dense.iter_mut() {
+        let bits = columns * sub.n_dense_variants;
+        sub.geno_bits = vec![0u8; bits.div_ceil(8)];
     }
 
     let estimated_nnz = (v_variants * columns) / 20;
@@ -309,30 +351,39 @@ pub fn dense2sparse_vk(chunk: &DenseChunk, bank: &mut LongAlleleTableWriter) -> 
 
     let words: &[u64] = &chunk.genos.words;
 
-    // Sample-major transpose; route each set call to its stream.
+    // Sample-major transpose; route each set call to its stream or dense bit.
     for s in 0..num_samples {
         for p in 0..ploidy {
             // per-tag running counts for this column
             let mut counts = crate::streams::StreamMap::from_fn(|_| 0u32);
             let base_idx = (s * ploidy) + p;
+            let hap = base_idx; // hap index in sample-major order
             let stride = columns;
 
             for v in 0..v_variants {
                 let flat_idx = (v * stride) + base_idx;
                 let word = unsafe { *words.get_unchecked(flat_idx >> 6) };
-
-                if (word >> (flat_idx & 63)) & 1 != 0 {
-                    let pos = unsafe { *chunk.pos.get_unchecked(v) };
-                    let (tag, key_le): (StreamTag, [u8; 4]) =
-                        match unsafe { *var_keys.get_unchecked(v) } {
-                            VarKey::Snp(code) => (StreamTag::VarKeySnp, [code, 0, 0, 0]),
+                if (word >> (flat_idx & 63)) & 1 == 0 {
+                    continue;
+                }
+                match unsafe { routes.get_unchecked(v) } {
+                    Route::VarKey(vk) => {
+                        let pos = unsafe { *chunk.pos.get_unchecked(v) };
+                        let (tag, key_le): (StreamTag, [u8; 4]) = match vk {
+                            VarKey::Snp(code) => (StreamTag::VarKeySnp, [*code, 0, 0, 0]),
                             VarKey::Indel(key) => (StreamTag::VarKeyIndel, key.to_le_bytes()),
                         };
-                    let spec = &crate::streams::REGISTRY[tag.index()];
-                    streams
-                        .get_mut(tag)
-                        .push_call(pos, &key_le[..spec.key_bytes]);
-                    *counts.get_mut(tag) += 1;
+                        let spec = &crate::streams::REGISTRY[tag.index()];
+                        streams
+                            .get_mut(tag)
+                            .push_call(pos, &key_le[..spec.key_bytes]);
+                        *counts.get_mut(tag) += 1;
+                    }
+                    Route::Dense { class, col } => {
+                        let sub = dense.get_mut(*class);
+                        let bit = hap * sub.n_dense_variants + (*col as usize);
+                        crate::bits::set_bit(&mut sub.geno_bits, bit);
+                    }
                 }
             }
             for (tag, c) in counts.into_iter_tagged() {
@@ -344,9 +395,7 @@ pub fn dense2sparse_vk(chunk: &DenseChunk, bank: &mut LongAlleleTableWriter) -> 
     SparseChunk {
         chunk_id: chunk.chunk_id,
         streams,
-        dense: crate::dense::DenseMap::from_fn(|c| {
-            crate::types::DenseSubChunk::empty(c.key_bytes())
-        }),
+        dense,
     }
 }
 
@@ -683,14 +732,22 @@ mod tests {
 
     #[test]
     fn test_dense2sparse_all_true_sample_major_layout() {
-        // 3 variants x 2 samples x 2 ploidy, every bit set.
-        // Each (s,p) hap should see all 3 variant positions in v-order.
-        let refs: Vec<&[u8]> = vec![b"A", b"A", b"A"];
-        let alts: Vec<&[u8]> = vec![b"C", b"G", b"T"];
-        let n_variants = 3;
+        // 6 variants x 2 samples x 2 ploidy (np=4). Each variant has exactly
+        // ONE carrier (x=1), well under the dense crossover (34*1=34 <=
+        // 34+np=38), so every variant stays var_key. hap0 carries the
+        // even-indexed variants, hap1 the odd-indexed ones — exercising
+        // multiple var_key calls per hap, across multiple haps, in v-order.
+        let refs: Vec<&[u8]> = vec![b"A"; 6];
+        let alts: Vec<&[u8]> = vec![b"C", b"G", b"T", b"C", b"G", b"T"];
+        let n_variants = 6;
         let n_samples = 2;
         let ploidy = 2;
-        let bit_pattern = vec![true; n_variants * n_samples * ploidy];
+        let columns = n_samples * ploidy;
+        let mut bit_pattern = vec![false; n_variants * columns];
+        for v in 0..n_variants {
+            let hap = if v % 2 == 0 { 0 } else { 1 };
+            bit_pattern[v * columns + hap] = true;
+        }
 
         let chunk = build_test_chunk(n_variants, n_samples, ploidy, &refs, &alts, &bit_pattern);
         let mut bank = make_bank();
@@ -698,23 +755,35 @@ mod tests {
         let snp = sparse.streams.get(StreamTag::VarKeySnp);
         let indel = sparse.streams.get(StreamTag::VarKeyIndel);
 
-        assert_eq!(snp.call_positions.len(), 12);
-        assert_eq!(snp.sample_lengths, vec![3, 3, 3, 3]);
-        // First hap's slice is positions [100, 110, 120]
-        assert_eq!(&snp.call_positions[0..3], &[100, 110, 120]);
-        assert_eq!(&snp.call_positions[3..6], &[100, 110, 120]);
+        assert_eq!(snp.call_positions.len(), 6);
+        assert_eq!(snp.sample_lengths, vec![3, 3, 0, 0]);
+        // hap0's slice is v-ordered [v0, v2, v4] = [100, 120, 140]
+        assert_eq!(&snp.call_positions[0..3], &[100, 120, 140]);
+        // hap1's slice is v-ordered [v1, v3, v5] = [110, 130, 150]
+        assert_eq!(&snp.call_positions[3..6], &[110, 130, 150]);
         assert_eq!(indel.call_positions.len(), 0);
+        // No variant meets the dense crossover with a single carrier.
+        assert_eq!(sparse.dense.get(DenseClass::Snp).n_dense_variants, 0);
     }
 
     // A mixed chunk: variant 0 is a SNP (A→C), variant 1 is an INS (A→AT),
-    // variant 2 is a pure DEL (AT→A). One diploid sample carrying all three on
-    // both haplotypes. The SNP must land in `snp`, the INS/DEL in `indel`.
+    // variant 2 is a pure DEL (AT→A). Each variant has a SINGLE carrier
+    // (x=1), which always stays var_key regardless of cohort size
+    // (var_key_bits = key_bits+32 <= dense_bits = key_bits+32+np for np>=0).
+    // hap0 carries the SNP + INS, hap1 carries the DEL, so a hap sees both
+    // streams and calls stay v-ordered. The SNP must land in `snp`, the
+    // INS/DEL in `indel`.
     #[test]
-    #[allow(clippy::identity_op)] // 1 /*S*/ documents the shape factor, not dead code
     fn test_dense2sparse_splits_snp_and_indel() {
         let refs: Vec<&[u8]> = vec![b"A", b"A", b"AT"];
         let alts: Vec<&[u8]> = vec![b"C", b"AT", b"A"];
-        let bit_pattern = vec![true; 3 /*V*/ * 1 /*S*/ * 2 /*P*/];
+        // (variant, hap): v0(SNP)->hap0, v1(INS)->hap0, v2(DEL)->hap1
+        #[rustfmt::skip]
+        let bit_pattern = vec![
+            true, false, // v0: hap0 carries
+            true, false, // v1: hap0 carries
+            false, true, // v2: hap1 carries
+        ];
         let chunk = build_test_chunk(3, 1, 2, &refs, &alts, &bit_pattern);
 
         let mut bank = make_bank();
@@ -722,28 +791,86 @@ mod tests {
         let snp = sparse.streams.get(StreamTag::VarKeySnp);
         let indel = sparse.streams.get(StreamTag::VarKeyIndel);
 
-        // Two haplotypes, each: 1 SNP call + 2 indel calls.
-        assert_eq!(snp.sample_lengths, vec![1, 1]);
-        assert_eq!(indel.sample_lengths, vec![2, 2]);
+        // hap0: 1 SNP call + 1 indel call (INS); hap1: 1 indel call (DEL).
+        assert_eq!(snp.sample_lengths, vec![1, 0]);
+        assert_eq!(indel.sample_lengths, vec![1, 1]);
 
         // SNP stream: position 100 (variant 0), code for 'C' == 1.
-        assert_eq!(snp.call_positions, vec![100, 100]);
-        assert_eq!(snp.call_keys, vec![1u8, 1u8]);
+        assert_eq!(snp.call_positions, vec![100]);
+        assert_eq!(snp.call_keys, vec![1u8]);
 
-        // Indel stream: positions 110 (INS) then 120 (DEL) per hap, keys decode back.
-        assert_eq!(indel.call_positions, vec![110, 120, 110, 120]);
+        // Indel stream: hap0's INS@110 then hap1's DEL@120, keys decode back.
+        assert_eq!(indel.call_positions, vec![110, 120]);
         let decode_key =
             |i: usize| u32::from_le_bytes(indel.call_keys[i * 4..i * 4 + 4].try_into().unwrap());
         assert_eq!(decode_alt_inline(decode_key(0)), b"AT".to_vec());
         assert_eq!((decode_key(1) as i32) >> 1, -1); // DEL ilen = -1
+
+        // Every variant has a single carrier → all stayed var_key.
+        assert_eq!(sparse.dense.get(DenseClass::Snp).n_dense_variants, 0);
+        assert_eq!(sparse.dense.get(DenseClass::Indel).n_dense_variants, 0);
+    }
+
+    // A SNP carried by every hap in a small cohort routes to DENSE, leaving the
+    // var_key snp stream empty; its bit lands in the dense geno block.
+    #[test]
+    fn test_common_snp_routes_to_dense() {
+        // n=2 diploid, np=4. One SNP A→C, all 4 haps carry it.
+        // dense = 32+2+4 = 38 bits; var_key = 4*(32+2)=136 → dense wins.
+        let refs: Vec<&[u8]> = vec![b"A"];
+        let alts: Vec<&[u8]> = vec![b"C"];
+        let bits = vec![true; 2 * 2]; // n_variants=1 * n_samples=2 * ploidy=2
+        let chunk = build_test_chunk(1, 2, 2, &refs, &alts, &bits);
+
+        let mut bank = make_bank();
+        let sparse = dense2sparse_vk(&chunk, &mut bank);
+
+        // var_key snp stream is empty (variant went dense)
+        let snp = sparse.streams.get(StreamTag::VarKeySnp);
+        assert_eq!(snp.call_positions.len(), 0);
+
+        // dense snp table has 1 variant, all 4 haps' bits set
+        let d = sparse.dense.get(DenseClass::Snp);
+        assert_eq!(d.n_dense_variants, 1);
+        assert_eq!(d.positions, vec![100]);
+        assert_eq!(d.keys, vec![1u8]); // 'C' code == 1
+        // np=4 haps, v_dense=1 → 4 bits, one per hap at flat idx h*1+0
+        for h in 0..4 {
+            assert!(crate::bits::get_bit(&d.geno_bits, h), "hap {} bit", h);
+        }
+    }
+
+    // A rare SNP (single carrier) stays var_key; dense table empty.
+    #[test]
+    fn test_rare_snp_stays_var_key() {
+        // n=100 diploid np=200. One SNP, single carrier → var_key wins
+        // (34 < dense 32+2+200=234).
+        let n = 100;
+        let refs: Vec<&[u8]> = vec![b"A"];
+        let alts: Vec<&[u8]> = vec![b"C"];
+        let mut bits = vec![false; n * 2]; // n_variants=1 * n_samples=n * ploidy=2
+        bits[0] = true; // one hap carries it
+        let chunk = build_test_chunk(1, n, 2, &refs, &alts, &bits);
+
+        let mut bank = make_bank();
+        let sparse = dense2sparse_vk(&chunk, &mut bank);
+        assert_eq!(
+            sparse
+                .streams
+                .get(StreamTag::VarKeySnp)
+                .call_positions
+                .len(),
+            1
+        );
+        assert_eq!(sparse.dense.get(DenseClass::Snp).n_dense_variants, 0);
     }
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(1500))]
 
         // Mutation conservation: every true bit in the dense grid produces exactly
-        // one sparse call. Total calls (sum of sample_lengths) == popcount(genos).
-        // Catches lost mutations and double-counting.
+        // one sparse call, either var_key or dense. Total calls == popcount(genos).
+        // Catches lost mutations and double-counting, across ALL buckets.
         #[test]
         fn test_dense2sparse_mutation_conservation(
             n_variants in 1usize..30,
@@ -755,7 +882,9 @@ mod tests {
             let bit_pattern = random_bits(total_bits, seed);
             let true_count = bit_pattern.iter().filter(|&&b| b).count();
 
-            // SNPs only — keeps everything in the inline lane.
+            // SNPs only — keeps everything in the inline lane. Some may still
+            // route to dense under the cost model, so conservation must be
+            // checked across both var_key and dense buckets.
             let refs: Vec<&[u8]> = vec![&b"A"[..]; n_variants];
             let alts: Vec<&[u8]> = vec![&b"C"[..]; n_variants];
             let chunk = build_test_chunk(n_variants, n_samples, ploidy, &refs, &alts, &bit_pattern);
@@ -765,17 +894,24 @@ mod tests {
             let snp = sparse.streams.get(StreamTag::VarKeySnp);
             let indel = sparse.streams.get(StreamTag::VarKeyIndel);
 
-            let total_calls: u32 = snp.sample_lengths.iter().sum();
-            prop_assert_eq!(total_calls as usize, true_count, "lost or doubled mutations");
-            prop_assert_eq!(snp.call_positions.len(), true_count);
-            prop_assert_eq!(snp.call_keys.len(), true_count);
+            let vk_calls: usize = snp.sample_lengths.iter().map(|&c| c as usize).sum::<usize>()
+                + indel.sample_lengths.iter().map(|&c| c as usize).sum::<usize>();
+            let dense_calls: usize = sparse
+                .dense
+                .iter()
+                .map(|(_c, sub)| sub.geno_bits.iter().map(|b| b.count_ones() as usize).sum::<usize>())
+                .sum();
+
+            prop_assert_eq!(vk_calls + dense_calls, true_count, "lost or double-counted a call");
             prop_assert_eq!(snp.sample_lengths.len(), n_samples * ploidy);
-            prop_assert_eq!(indel.call_positions.len(), 0);
+            prop_assert_eq!(indel.sample_lengths.len(), n_samples * ploidy);
         }
 
         // Per-sample correctness: for each (s,p) hap, the slice of call_positions
-        // identified by sample_lengths must exactly match the variants where that
-        // hap's bit is set, in v-order.
+        // identified by sample_lengths must exactly match the variants where
+        // that hap's bit is set AND the variant stayed var_key, in v-order.
+        // (Variants routed to dense are excluded from the var_key stream —
+        // this replicates the routing decision from the bit pattern itself.)
         #[test]
         fn test_dense2sparse_per_sample_calls(
             n_variants in 1usize..15,
@@ -794,16 +930,27 @@ mod tests {
             let sparse = dense2sparse_vk(&chunk, &mut bank);
             let snp = sparse.streams.get(StreamTag::VarKeySnp);
 
+            let np = n_samples * ploidy;
+            // Replicate the routing decision per variant: SNP stays var_key
+            // iff 34*x <= 34+np (see cost_model::choose_representation).
+            let stays_var_key: Vec<bool> = (0..n_variants)
+                .map(|v| {
+                    let x: usize = (0..np).filter(|&c| bit_pattern[v * np + c]).count();
+                    34 * x <= 34 + np
+                })
+                .collect();
+
             let mut cursor = 0usize;
             for s in 0..n_samples {
                 for p in 0..ploidy {
                     let hap_idx = s * ploidy + p;
                     let calls = snp.sample_lengths[hap_idx] as usize;
 
-                    // Compute expected positions from the bit pattern + chunk.pos
+                    // Compute expected positions from the bit pattern + chunk.pos,
+                    // filtered to variants that stayed var_key.
                     let expected: Vec<u32> = (0..n_variants).filter_map(|v| {
                         let flat_idx = v * n_samples * ploidy + s * ploidy + p;
-                        if bit_pattern[flat_idx] { Some(chunk.pos[v]) } else { None }
+                        if bit_pattern[flat_idx] && stays_var_key[v] { Some(chunk.pos[v]) } else { None }
                     }).collect();
 
                     let actual: Vec<u32> = snp.call_positions[cursor..cursor + calls].to_vec();
@@ -812,6 +959,36 @@ mod tests {
                 }
             }
             prop_assert_eq!(cursor, snp.call_positions.len());
+        }
+
+        // Conservation across routing: every set genotype bit is stored exactly
+        // once — either as a var_key call or a dense set bit.
+        #[test]
+        fn test_routing_conserves_all_calls(
+            n_variants in 1usize..20,
+            n_samples in 1usize..6,
+            ploidy in 1usize..3,
+            seed in any::<u64>(),
+        ) {
+            let bits = random_bits(n_variants * n_samples * ploidy, seed);
+            let true_count = bits.iter().filter(|&&b| b).count();
+            let refs: Vec<&[u8]> = vec![&b"A"[..]; n_variants];
+            let alts: Vec<&[u8]> = vec![&b"C"[..]; n_variants]; // all SNPs
+            let chunk = build_test_chunk(n_variants, n_samples, ploidy, &refs, &alts, &bits);
+
+            let mut bank = make_bank();
+            let sparse = dense2sparse_vk(&chunk, &mut bank);
+
+            let vk_calls: usize = sparse.streams.get(StreamTag::VarKeySnp)
+                .sample_lengths.iter().map(|&c| c as usize).sum::<usize>()
+                + sparse.streams.get(StreamTag::VarKeyIndel)
+                .sample_lengths.iter().map(|&c| c as usize).sum::<usize>();
+
+            let mut dense_calls = 0usize;
+            for (_c, sub) in sparse.dense.iter() {
+                dense_calls += sub.geno_bits.iter().map(|b| b.count_ones() as usize).sum::<usize>();
+            }
+            prop_assert_eq!(vk_calls + dense_calls, true_count, "lost or double-counted a call");
         }
     }
 }

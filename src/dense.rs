@@ -78,6 +78,9 @@ impl<T> DenseMap<T> {
     pub fn iter(&self) -> impl Iterator<Item = (DenseClass, &T)> {
         DenseClass::ALL.into_iter().zip(self.slots.iter())
     }
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (DenseClass, &mut T)> {
+        DenseClass::ALL.into_iter().zip(self.slots.iter_mut())
+    }
     pub fn into_iter_tagged(self) -> impl Iterator<Item = (DenseClass, T)> {
         DenseClass::ALL.into_iter().zip(self.slots)
     }
