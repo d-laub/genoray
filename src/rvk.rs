@@ -3,17 +3,17 @@ use crate::dense::{DenseClass, DenseMap};
 use crate::layout;
 use crate::nrvk::LongAlleleTableWriter;
 use crate::streams::StreamTag;
-use crate::types::{
-    DenseChunk, DenseSubChunk, MAX_INLINE_ALT_LEN, MIN_I31, SparseChunk, SparseSubStream,
-};
+use crate::types::{DenseChunk, DenseSubChunk, MAX_INLINE_ALT_LEN, SparseChunk, SparseSubStream};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
-// SNP 2-bit key primitives now live in `svar2-codec`. Re-exported so existing
-// `crate::rvk::<name>` call sites (query.rs, dense_merge.rs, tests) resolve.
+// SNP 2-bit key primitives and the indel key codec (encode/decode) now live in
+// `svar2-codec`. Re-exported so existing `crate::rvk::<name>` call sites
+// (query.rs, max_del.rs, tests) resolve.
 pub use svar2_codec::{
-    decode_snp_2bit, encode_snp_2bit, pack_snp_keys, unpack_snp_key_at, unpack_snp_keys,
+    DecodedKey, decode_alt_inline, decode_key, decode_snp_2bit, deletion_len, encode_snp_2bit,
+    pack_snp_keys, unpack_snp_key_at, unpack_snp_keys,
 };
 
 // Post-merge pass for the SNP stream: read the merged `alleles.bin` (one
@@ -55,53 +55,6 @@ pub fn pack_snp_key_file(dir: &Path) {
     std::fs::rename(&tmp, &src).expect("replace snp alleles.bin with packed");
 }
 
-#[inline(always)]
-pub fn decode_alt_inline(payload: u32) -> Vec<u8> {
-    // Top 5 bits hold ilen; alt_len = ilen + 1 (atomized invariant).
-    let ilen = (payload >> 27) as usize;
-    let alt_len = ilen + 1;
-    let mut decoded = Vec::with_capacity(alt_len);
-
-    const BASES: [u8; 4] = [b'A', b'C', b'T', b'G'];
-
-    for i in 0..alt_len {
-        let shift = 25 - (i * 2);
-        let bit_val = ((payload >> shift) & 3) as usize;
-        decoded.push(BASES[bit_val]);
-    }
-
-    decoded
-}
-
-/// Discriminated form of a 32-bit indel key. Mirrors the `pack_variant` layout:
-/// bit 0 = lookup flag, bit 31 (of a non-lookup key) = pure-DEL flag.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DecodedKey {
-    /// Inline INS/SNP; `alt` is the decoded ALT bases (`alt.len() == ilen + 1`).
-    Inline { alt: Vec<u8> },
-    /// Pure deletion of `-ilen` reference bases (`ilen < 0`). The ALT (anchor)
-    /// base is not stored in the key; recover it from the reference downstream.
-    PureDel { ilen: i32 },
-    /// Long insertion spilled to the long-allele bank at row `row`.
-    Lookup { row: u32 },
-}
-
-/// Decode a packed 32-bit indel key into its discriminated form. Single entry
-/// point for the query path — no caller re-derives the bit layout.
-pub fn decode_key(key: u32) -> DecodedKey {
-    if key & 1 == 1 {
-        DecodedKey::Lookup { row: key >> 1 }
-    } else if (key as i32) < 0 {
-        DecodedKey::PureDel {
-            ilen: (key as i32) >> 1,
-        }
-    } else {
-        DecodedKey::Inline {
-            alt: decode_alt_inline(key),
-        }
-    }
-}
-
 // Pack a single variant into its 32-bit key.
 //
 // Layout (LSB → MSB):
@@ -118,49 +71,13 @@ pub fn decode_key(key: u32) -> DecodedKey {
 #[inline(always)]
 pub fn pack_variant(ilen: i32, alt_allele: &[u8], bank: &mut LongAlleleTableWriter) -> u32 {
     if ilen >= 0 {
-        // INS or SNP. Atomized inputs satisfy alt_len = ilen + 1.
         if alt_allele.len() <= MAX_INLINE_ALT_LEN {
             return svar2_codec::encode_alt_inline(alt_allele, ilen as u32);
         }
-        // Long INS overflow: spill alt bytes; ilen is recoverable as
-        // alt_bytes.len() - 1 since atomized inputs always have ref_len = 1.
         let row_index = bank.push_long_allele(alt_allele);
-        return (row_index << 1) | 1;
+        return svar2_codec::encode_lookup(row_index);
     }
-
-    // Pure DEL. ilen is signed-i31; top bit is set → distinguishes from inline INS/SNP.
-    debug_assert!(
-        ilen >= MIN_I31,
-        "pure DEL ilen below MIN_I31 would alias the inline-positive lane",
-    );
-    (ilen as u32) << 1
-}
-
-/// Reference-base deletion length encoded in a 32-bit indel `var_key`/`dense` key.
-///
-/// Inverse of the DEL lane of [`pack_variant`]: a pure DEL clears the lookup flag
-/// (`bit 0 == 0`) and sets the top bit (`bit 31 == 1`), storing its signed `ilen`
-/// in `bits[31:1]`; the deletion length is `-ilen`. Inline INS/SNP keys clear the
-/// top bit, and long-INS lookup keys set `bit 0`, so both yield `0`. This is the
-/// single decode site for the deletion length — the bit layout stays co-located
-/// with the encoder (respecting the encoding-agnostic seam).
-#[inline]
-pub fn deletion_len(key: u32) -> u32 {
-    // Long-INS lookup keys set the LSB; they are never deletions. Checked first
-    // because such a key can also have its top bit set (a large row index).
-    if key & 1 == 1 {
-        return 0;
-    }
-    // Inline lane. Pure DEL sets the top bit; INS/SNP clear it.
-    if key & (1 << 31) == 0 {
-        return 0;
-    }
-    let ilen = (key as i32) >> 1; // arithmetic shift recovers the signed i31
-    debug_assert!(
-        ilen < 0,
-        "top-bit-set inline key must be a negative-ilen DEL"
-    );
-    ilen.unsigned_abs()
+    svar2_codec::encode_pure_del(ilen)
 }
 
 // The two inline flavors, tagged for stream routing (the encoding-seam output;
@@ -307,7 +224,7 @@ pub fn dense2sparse_vk(chunk: &DenseChunk, bank: &mut LongAlleleTableWriter) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::BitGrid3;
+    use crate::types::{BitGrid3, MIN_I31};
     use crossbeam_channel::bounded;
     use proptest::prelude::*;
 
@@ -456,13 +373,8 @@ mod tests {
         assert_eq!(deletion_len(large), (1u32 << 30));
     }
 
-    #[test]
-    fn test_deletion_len_lookup_key_is_zero() {
-        // A long-INS lookup key sets the LSB. Even with the top bit set
-        // (a large row index), the LSB check must win → not a deletion.
-        assert_eq!(deletion_len(0x0000_0003), 0); // LSB set
-        assert_eq!(deletion_len(0xFFFF_FFFF), 0); // LSB set AND top bit set
-    }
+    // Note: test_deletion_len_lookup_key_is_zero moved to svar2-codec — it is a
+    // pure-decode edge case (raw keys, no bank), now codec-native.
 
     #[test]
     fn test_classify_variant_routes_by_ilen() {

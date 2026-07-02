@@ -193,6 +193,91 @@ pub fn encode_alt_inline(alt_allele: &[u8], ilen: u32) -> u32 {
     payload | (ilen << 27) // LSB stays 0 → no lookup flag
 }
 
+/// Decode the inline INS/SNP lane's ALT bases. Top 5 bits hold `ilen`;
+/// `alt_len = ilen + 1` (atomized invariant). Bases read MSB-first from `[26:25]`.
+#[inline(always)]
+pub fn decode_alt_inline(payload: u32) -> Vec<u8> {
+    let ilen = (payload >> 27) as usize;
+    let alt_len = ilen + 1;
+    let mut decoded = Vec::with_capacity(alt_len);
+    for i in 0..alt_len {
+        let shift = 25 - (i * 2);
+        let bit_val = ((payload >> shift) & 3) as usize;
+        decoded.push(BASES[bit_val]);
+    }
+    decoded
+}
+
+/// Discriminated form of a 32-bit indel key. Mirrors the encode lanes:
+/// bit 0 = lookup flag, bit 31 (of a non-lookup key) = pure-DEL flag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecodedKey {
+    /// Inline INS/SNP; `alt` is the decoded ALT bases (`alt.len() == ilen + 1`).
+    Inline { alt: Vec<u8> },
+    /// Pure deletion of `-ilen` reference bases (`ilen < 0`). The anchor base is
+    /// recovered from the reference downstream, not stored in the key.
+    PureDel { ilen: i32 },
+    /// Long insertion spilled to the long-allele bank at row `row`.
+    Lookup { row: u32 },
+}
+
+/// Decode a packed 32-bit indel key into its discriminated form. Single decode
+/// entry point — no caller re-derives the bit layout.
+pub fn decode_key(key: u32) -> DecodedKey {
+    if key & 1 == 1 {
+        DecodedKey::Lookup { row: key >> 1 }
+    } else if (key as i32) < 0 {
+        DecodedKey::PureDel {
+            ilen: (key as i32) >> 1,
+        }
+    } else {
+        DecodedKey::Inline {
+            alt: decode_alt_inline(key),
+        }
+    }
+}
+
+/// Reference-base deletion length encoded in a 32-bit indel key. Inverse of the
+/// DEL lane of [`encode_pure_del`]: a pure DEL clears the lookup flag (bit 0) and
+/// sets bit 31, storing signed `ilen` in `[31:1]`; the length is `-ilen`. Inline
+/// INS/SNP keys (bit 31 clear) and lookup keys (bit 0 set) both yield `0`.
+#[inline]
+pub fn deletion_len(key: u32) -> u32 {
+    if key & 1 == 1 {
+        return 0;
+    }
+    if key & (1 << 31) == 0 {
+        return 0;
+    }
+    let ilen = (key as i32) >> 1;
+    debug_assert!(
+        ilen < 0,
+        "top-bit-set inline key must be a negative-ilen DEL"
+    );
+    ilen.unsigned_abs()
+}
+
+/// Encode a pure deletion of `-ilen` reference bases into the DEL lane
+/// (`bit 0 = 0`, `bit 31 = 1`, signed `ilen` in `[31:1]`). `ilen` must be `< 0`
+/// and `>= MIN_I31`.
+#[inline]
+pub fn encode_pure_del(ilen: i32) -> u32 {
+    debug_assert!(ilen < 0, "encode_pure_del expects a negative ilen");
+    debug_assert!(
+        ilen >= MIN_I31,
+        "pure DEL ilen below MIN_I31 aliases the inline lane"
+    );
+    (ilen as u32) << 1
+}
+
+/// Encode a long-allele-bank row index into the lookup lane (`(row << 1) | 1`).
+/// `row` must fit in 31 bits.
+#[inline]
+pub fn encode_lookup(row: u32) -> u32 {
+    debug_assert!(row < (1 << 31), "bank row index must fit in 31 bits");
+    (row << 1) | 1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,6 +413,51 @@ mod tests {
             let pext_out = unsafe { pext_reduce(b1, b2, n) };
             let swar_out = swar_reduce_portable(b1, b2, n);
             prop_assert_eq!(pext_out, swar_out);
+        }
+    }
+
+    #[test]
+    fn deletion_len_snp_ins_lookup_are_zero() {
+        // inline SNP (ilen 0), inline INS, and a lookup key all decode to 0.
+        assert_eq!(deletion_len(encode_alt_inline(b"A", 0)), 0);
+        assert_eq!(deletion_len(encode_alt_inline(b"ACG", 2)), 0);
+        assert_eq!(deletion_len(encode_lookup(5)), 0);
+    }
+
+    #[test]
+    fn pure_del_round_trips() {
+        for d in [1i32, 3, 100, 1 << 20] {
+            let key = encode_pure_del(-d);
+            assert_eq!(deletion_len(key), d as u32);
+            assert_eq!(decode_key(key), DecodedKey::PureDel { ilen: -d });
+        }
+    }
+
+    #[test]
+    fn lookup_round_trips() {
+        assert_eq!(
+            decode_key(encode_lookup(42)),
+            DecodedKey::Lookup { row: 42 }
+        );
+    }
+
+    // A long-INS lookup key sets the LSB. Even with the top bit set (a large
+    // row index), the LSB check must win → not a deletion. Moved from
+    // `genoray::rvk` — pure-decode edge case, codec-native now.
+    #[test]
+    fn test_deletion_len_lookup_key_is_zero() {
+        assert_eq!(deletion_len(0x0000_0003), 0); // LSB set
+        assert_eq!(deletion_len(0xFFFF_FFFF), 0); // LSB set AND top bit set
+    }
+
+    proptest! {
+        #[test]
+        fn inline_ins_snp_round_trips(
+            bases in proptest::collection::vec(
+                prop::sample::select(vec![b'A', b'C', b'G', b'T']), 1..=13usize)) {
+            let ilen = (bases.len() - 1) as u32;
+            let key = encode_alt_inline(&bases, ilen);
+            prop_assert_eq!(decode_key(key), DecodedKey::Inline { alt: bases.clone() });
         }
     }
 }
