@@ -64,6 +64,11 @@ pub fn build_bcf_with_index(
         .expect("build BCF index");
 }
 
+// Not every integration-test binary that pulls in this shared `mod common;` calls
+// every helper (e.g. test_atomize_e2e.rs never reads on-disk binary output). Each
+// test file is its own compilation unit, so clippy's dead-code pass is per-binary;
+// allow(dead_code) keeps `cargo clippy --tests -D warnings` clean across all of them.
+#[allow(dead_code)]
 pub fn read_u32_bin(path: &Path) -> Vec<u32> {
     // Alignment-agnostic decode: std::fs::read can hand back a Vec<u8> whose
     // pointer isn't 4-byte aligned (especially when empty), which would trip
@@ -75,6 +80,7 @@ pub fn read_u32_bin(path: &Path) -> Vec<u32> {
         .collect()
 }
 
+#[allow(dead_code)]
 pub fn read_offsets_npy(path: &Path) -> Vec<u64> {
     let arr: ndarray::Array1<u64> = ndarray_npy::read_npy(path).expect("read offsets npy");
     arr.to_vec()
