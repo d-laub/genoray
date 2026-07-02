@@ -92,7 +92,15 @@ impl VcfChunkReader {
         // soft-masked (lowercase) reference bases compare equal to uppercase VCF alleles.
         let fasta = rust_htslib::faidx::Reader::from_path(fasta_path)
             .expect("Failed to open reference FASTA (is there a .fai?)");
-        let contig_len = fasta.fetch_seq_len(chrom) as usize;
+        // htslib's faidx_seq_len returns -1 for an unknown contig, which fetch_seq_len
+        // (via rust-htslib) surfaces as u64::MAX rather than 0 — check for it explicitly
+        // so a missing contig fails fast with a clear message instead of the generic
+        // "Failed to fetch contig" panic below.
+        let contig_len_raw = fasta.fetch_seq_len(chrom);
+        if contig_len_raw == u64::MAX {
+            panic!("Contig '{chrom}' not found in reference FASTA");
+        }
+        let contig_len = contig_len_raw as usize;
         let mut ref_seq = if contig_len == 0 {
             Vec::new()
         } else {
@@ -187,8 +195,10 @@ impl VcfChunkReader {
     //
     // Memory note: the heap holds every atom with pos >= frontier - L_MAX until a later
     // record advances the frontier past that window (or EOF). For coordinate-sorted input
-    // this is bounded by the atoms within an `L_MAX`-wide window of the frontier; shifts
-    // are capped at `L_MAX` so the window — and thus memory — stays bounded.
+    // this is bounded by the atoms within an `L_MAX`-wide window of the frontier, plus
+    // atoms sharing a single start position — a run of many records all starting at the
+    // same pos never advances the frontier, so the heap can still grow unboundedly in
+    // that (pre-existing) pathological case.
     fn next_atom(&mut self) -> Option<PendingAtom> {
         loop {
             if let Some(Reverse(top)) = self.heap.peek() {
