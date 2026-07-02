@@ -185,10 +185,17 @@ pub fn process_chromosome(
     sampler_res.map_err(|_| ConversionError::WorkerPanicked {
         thread: format!("samp-{}", chrom),
     })?;
-    let (ledgers, long_allele_offsets) =
-        executor_res.map_err(|_| ConversionError::WorkerPanicked {
-            thread: format!("exec-{}", chrom),
-        })?;
+    let phase1 = executor_res.map_err(|_| ConversionError::WorkerPanicked {
+        thread: format!("exec-{}", chrom),
+    })?;
+    // dense_ledgers isn't consumed until Task 11 (dense merge wiring); bind
+    // with a leading underscore for now to keep clippy's unused-var lint
+    // green, then rename to `dense_ledgers` when it's wired up.
+    let crate::executor::Phase1Output {
+        var_key_ledgers: ledgers,
+        dense_ledgers: _dense_ledgers,
+        long_allele_offsets,
+    } = phase1;
     chunk_writer_res.map_err(|_| ConversionError::WorkerPanicked {
         thread: format!("cw-{}", chrom),
     })?;
