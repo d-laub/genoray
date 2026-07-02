@@ -22,6 +22,11 @@ pub fn merge_dense_class(
     output_dir: &str,
     dense_ledger: Vec<u32>,
 ) {
+    debug_assert_eq!(
+        dense_ledger.len(),
+        num_chunks,
+        "dense_ledger must have exactly one row per chunk"
+    );
     let dir = Path::new(output_dir);
     let np = num_samples * ploidy;
     let v_total: usize = dense_ledger.iter().map(|&c| c as usize).sum();
