@@ -322,10 +322,10 @@ already does an analogous length-aware scan
 (`_find_starts_ends_with_length` in `python/genoray/_svar.py`); SVAR 2.0 generalizes it
 across the three representations.
 
-### Implementation status (M5, part 1 — search core)
+### Implementation status (M5 — search core + disk query)
 
-The **format-independent search core** for this algorithm ships in `src/search.rs`; the
-disk-integrated `(range, sample)` query is still pending. What is implemented:
+Both the **format-independent search core** (`src/search.rs`) and the **disk-integrated
+`(range, sample)` query** (`src/query.rs`) are implemented. The search core:
 
 - `SearchTree` — the left-tree static B-tree above, over a sorted-ascending `u32`
   position array (`B = 16` keys/node; `u32::MAX` is the padding sentinel, so stored
@@ -344,10 +344,16 @@ disk-integrated `(range, sample)` query is still pending. What is implemented:
   returned as `s_idx == e_idx` — correctly empty on a no-overlap query, unlike SVAR
   1.0's `var_ranges` end-sentinel.
 
-The core depends only on in-memory slices — no on-disk types. **Remaining for full
-M5:** producing/consuming `max_del.npy`, the sorted union across the `snp/`+`indel/`
-sub-streams (and representations), and the genotype gather that turns an index range
-into user-facing calls.
+The core depends only on in-memory slices — no on-disk types. The **disk query**
+(`src/query.rs`) closes the loop: `ContigReader` mmaps a finished contig's `var_key` and
+`dense` sidecars plus the shared LUT, and `overlap_sample` produces/consumes `max_del.npy`
+(per-column `var_key/indel`, scalar `dense/indel`), runs `overlap_range` per
+`(sample, ploid)`, genotype-filters the dense classes, decodes each hit through `rvk`, and
+k-way-merges the four sub-streams into one position-sorted result per haplotype (proptested
+end-to-end in `tests/test_query.rs`). **Remaining beyond M5** (now M6): the batched
+multi-region/multi-sample consumer interface, the `svar2-codec` seam extraction, and
+uniform-key re-expansion — `overlap_sample` is a single-sample Rust core, not yet a Python
+API.
 
 ## Format constraints and non-goals
 

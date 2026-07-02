@@ -100,9 +100,11 @@ model.
 ## Query path
 
 `(range, sample)` queries (roadmap M5) resolve overlaps, not point hits, because
-deletions span reference bases. The **format-independent overlap core** is implemented
-(`src/search.rs`, M5 part 1); wiring it to the on-disk sidecars, the sub-stream union,
-and the genotype gather is the remaining M5 work.
+deletions span reference bases. Both the **format-independent overlap core**
+(`src/search.rs`) and its **disk integration** (`src/query.rs`: `ContigReader` +
+`overlap_sample`, which mmaps the sidecars, consumes `max_del.npy`, genotype-filters the
+dense classes, and unions the sub-streams) are implemented (M5). Generalizing this
+single-sample core into the batched two-channel consumer interface is M6.
 
 - **Index structure:** binary search over the sorted position sidecar, starting from
   the [left-tree static search tree](https://curiouscoding.nl/posts/static-search-tree/#left-tree)

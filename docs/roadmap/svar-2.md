@@ -57,7 +57,7 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
 
 ### MVP — VCF → SVAR2
 
-- [~] **M1. VCF → SVAR2 conversion.** Streaming, chunked, multi-threaded
+- [x] **M1. VCF → SVAR2 conversion.** Streaming, chunked, multi-threaded
   conversion producing the `var_key` representation. Builds on the existing
   conversion pipeline on this branch. See [`architecture.md`](architecture.md#conversion-pipeline).
   *Implemented and tested for the `var_key` happy path:* a per-contig pipeline
@@ -66,13 +66,14 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
   proven byte-identical by proptest; a bit-packed dense read buffer (`BitGrid3`); a
   streaming long-allele LUT; and a memory-bounded parallel tile merge. Covered by 30
   in-source unit/proptests + 5 e2e tests. An optional per-contig monitoring sampler
-  (`GENORAY_SAMPLE_INTERVAL`) reports channel fill and per-thread CPU%. *Remaining:*
-  variant normalization (M2, currently a precondition — see below); the on-disk
-  filenames were finalized in M3. The
-  `var_key` stream is now split into 2-bit `snp/` and 32-bit `indel/`
+  (`GENORAY_SAMPLE_INTERVAL`) reports channel fill and per-thread CPU%. Exposed to
+  Python as `run_conversion_pipeline` (PyO3). *Done — its former preconditions all
+  landed:* variant normalization (M2) and left-alignment (M2b) are integrated into
+  the reader, and the on-disk filenames were finalized in M3. The
+  `var_key` stream is split into 2-bit `snp/` and 32-bit `indel/`
   sub-streams per [`data-model.md`](data-model.md#on-disk-layout); the SNP stream
   is 2-bit-packed post-merge and carries no LUT.
-- [~] **M2. Variant normalization during conversion.** Atomization and biallelic
+- [x] **M2. Variant normalization during conversion.** Atomization and biallelic
   splitting (split multi-allelic sites) applied inline as variants stream through. See
   [`data-model.md`](data-model.md#variant-normalization). *Shipped:* the reader accepts
   un-normalized VCFs — a pure `normalize.rs` decomposes each record into atomic
@@ -126,7 +127,7 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
   filenames with `var_key`'s spec base names (`positions.bin` / `alleles.bin` /
   `genotypes.bin`; see the dense-representation section of
   [`data-model.md`](data-model.md#dense-representation-dense)) landed in M3.
-- [~] **M5. `(range, sample)` queries.** Fast overlap queries via binary search,
+- [x] **M5. `(range, sample)` queries.** Fast overlap queries via binary search,
   starting from the [left-tree static search tree](https://curiouscoding.nl/posts/static-search-tree/#left-tree).
   Must handle deletions spanning the query start (see
   [`data-model.md`](data-model.md#overlap-queries-and-deletions)).
@@ -149,13 +150,22 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
   orchestrator after each contig's merge; gated by unit tests, a brute-force per-column
   oracle proptest, and an e2e round-trip that feeds the produced `max_del` into
   `overlap_range`.
-  *Remaining:* disk integration — the `max_del.npy` **consumer**, the sorted sub-stream
-  union across `snp/`+`indel/`, per-`(contig, sample, ploid)` wiring, and the genotype
-  gather that turns an index range into user-facing calls (the `(range, sample)` query
-  proper).
-- [ ] **M6. Query decode core.** The shared spine both consumers build on. Finish M5's
-  disk integration (consume `max_del.npy`, read the sidecars, resolve per-`(contig,
-  sample, ploid)` index ranges via `overlap_range`); extract the key ↔ `(ILEN, ALT)`
+  *Shipped — disk-integrated `(range, sample)` query (PR #86):* `src/query.rs` wires the
+  `search.rs` core to the on-disk sidecars. `ContigReader::open` mmaps a finished contig's
+  `var_key/{snp,indel}` and `dense/{snp,indel}` sidecars, CSR offsets, and the shared LUT
+  (tolerating missing sub-streams as empty); `overlap_sample` resolves per-`(sample, ploid)`
+  index ranges via `overlap_range`, consumes `max_del.npy` (per-column for `var_key/indel`,
+  scalar `dense/max_del.npy` for `dense/indel`) for the leftward bound, genotype-filters the
+  two dense classes, decodes each hit through `rvk` (LUT-resolved for long alleles), and
+  k-way-merges the four sub-streams into one position-sorted `QueryResult` per haplotype.
+  Gated by in-source unit tests plus a disk-integration e2e (`tests/test_query.rs`, 6 tests
+  incl. proptests) that builds finished contigs through the real conversion pipeline. The
+  batched multi-region/multi-sample **consumer interface**, the `svar2-codec` extraction,
+  and uniform-key re-expansion are M6, not M5 — `overlap_sample` is a single-sample Rust
+  core, not yet exposed to Python.
+- [ ] **M6. Query decode core.** The shared spine both consumers build on. Generalize
+  M5's single-sample `overlap_sample` (`src/query.rs`) into the batched multi-region ×
+  multi-sample consumer spine; extract the key ↔ `(ILEN, ALT)`
   decode seam out of `rvk.rs` into a new dependency-light **`svar2-codec`** workspace
   crate (published to crates.io) so genoray and gvl share one decoder; re-expand SNPs to
   the uniform 32-bit key at query time; and implement the fast sorted **union** across
