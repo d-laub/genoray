@@ -11,6 +11,7 @@ pub mod error;
 pub mod executor;
 pub mod layout;
 pub mod merge;
+pub mod meta;
 pub mod monitor;
 pub mod normalize;
 pub mod nrvk;
