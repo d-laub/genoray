@@ -13,10 +13,6 @@
 //! `child(k, j) = k*(B+1) + j + 1`. `u32::MAX` is reserved as the padding sentinel,
 //! so stored positions must be `< u32::MAX` (genomic positions always are).
 
-// Scaffold-only: these primitives have no callers yet — `SearchTree`/`overlap_range`
-// land in a follow-up task and will use them. Remove once wired up.
-#![allow(dead_code)]
-
 /// Keys per node — a 64-byte cache line of `u32`.
 const B: usize = 16;
 
@@ -119,6 +115,21 @@ impl SearchTree {
         }
         res as usize
     }
+
+    /// First index `i` with `sorted[i] > x`, or `len()` if every element is `<= x`.
+    pub fn upper_bound(&self, x: u32) -> usize {
+        let mut k = 0;
+        let mut res = self.n as u32;
+        while k < self.nblocks {
+            let block = &self.keys[k * B..k * B + B];
+            let j = block_upper(block, x);
+            if j < B {
+                res = self.idx[k * B + j];
+            }
+            k = child(k, j);
+        }
+        res as usize
+    }
 }
 
 #[cfg(test)]
@@ -199,5 +210,42 @@ mod tests {
         assert_eq!(t.lower_bound(8), 3);
         assert_eq!(t.lower_bound(9), 5);
         assert_eq!(t.lower_bound(10), 6);
+    }
+
+    /// Independent reference: first index with `sorted[i] > x`.
+    fn ub_ref(sorted: &[u32], x: u32) -> usize {
+        sorted.partition_point(|&v| v <= x)
+    }
+
+    #[test]
+    fn upper_bound_empty_and_single() {
+        let t = SearchTree::new(&[]);
+        assert_eq!(t.upper_bound(0), 0);
+
+        let t = SearchTree::new(&[42u32]);
+        assert_eq!(t.upper_bound(41), 0);
+        assert_eq!(t.upper_bound(42), 1); // strictly greater → past this element
+        assert_eq!(t.upper_bound(43), 1);
+    }
+
+    #[test]
+    fn upper_bound_with_duplicates() {
+        let a = [5u32, 5, 5, 8, 8, 9];
+        let t = SearchTree::new(&a);
+        assert_eq!(t.upper_bound(5), 3); // past the last 5
+        assert_eq!(t.upper_bound(7), 3);
+        assert_eq!(t.upper_bound(8), 5);
+        assert_eq!(t.upper_bound(9), 6);
+    }
+
+    #[test]
+    fn upper_bound_matches_partition_point_across_block_boundaries() {
+        for &n in &[1usize, 15, 16, 17, 31, 32, 33, 271, 272, 273, 1000] {
+            let a: Vec<u32> = (0..n as u32).map(|v| v * 2).collect();
+            let t = SearchTree::new(&a);
+            for k in 0..=(n as u32 * 2 + 1) {
+                assert_eq!(t.upper_bound(k), ub_ref(&a, k), "n={n} x={k}");
+            }
+        }
     }
 }
