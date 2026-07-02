@@ -344,6 +344,9 @@ pub fn dense2sparse_vk(chunk: &DenseChunk, bank: &mut LongAlleleTableWriter) -> 
     SparseChunk {
         chunk_id: chunk.chunk_id,
         streams,
+        dense: crate::dense::DenseMap::from_fn(|c| {
+            crate::types::DenseSubChunk::empty(c.key_bytes())
+        }),
     }
 }
 

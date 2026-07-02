@@ -5,6 +5,7 @@ use rayon::prelude::*;
 pub mod bits;
 pub mod budget;
 pub mod cost_model;
+pub mod dense;
 pub mod error;
 pub mod executor;
 pub mod layout;

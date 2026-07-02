@@ -142,12 +142,38 @@ impl SparseSubStream {
     }
 }
 
+// Per-class dense payload for one chunk: the hap-major 1-bit genotype block
+// plus the per-variant table (positions + keys). Built by `dense2sparse_vk`,
+// consumed by the writer, transposed/concatenated by dense_merge.
+pub struct DenseSubChunk {
+    pub key_bytes: usize,
+    pub n_dense_variants: usize,
+    pub positions: Vec<u32>, // len == n_dense_variants
+    pub keys: Vec<u8>,       // key_bytes * n_dense_variants
+    // Hap-major bit block, shape (S, P, n_dense_variants), variant fastest.
+    // Bit (hap h, dense col d) at flat index h*n_dense_variants + d.
+    pub geno_bits: Vec<u8>,
+}
+
+impl DenseSubChunk {
+    pub fn empty(key_bytes: usize) -> Self {
+        Self {
+            key_bytes,
+            n_dense_variants: 0,
+            positions: Vec::new(),
+            keys: Vec::new(),
+            geno_bits: Vec::new(),
+        }
+    }
+}
+
 // The transposed, sparse packet produced by the Compute Thread and consumed by
 // the Writer Thread — one `SparseSubStream` per active `StreamTag` (see
 // data-model.md#on-disk-layout).
 pub struct SparseChunk {
     pub chunk_id: usize,
     pub streams: StreamMap<SparseSubStream>,
+    pub dense: crate::dense::DenseMap<DenseSubChunk>,
 }
 
 #[cfg(test)]
