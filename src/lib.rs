@@ -10,6 +10,7 @@ pub mod dense_merge;
 pub mod error;
 pub mod executor;
 pub mod layout;
+pub mod max_del;
 pub mod merge;
 pub mod meta;
 pub mod monitor;

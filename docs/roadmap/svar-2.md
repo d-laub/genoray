@@ -138,10 +138,21 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
   saturating subtraction against a `max_region_length` bound — collapsing the two
   `searchsorted` calls onto one tree instead of building a second. Gated by proptests
   vs `slice::partition_point` (bounds) and a brute-force O(n) oracle (overlap). Depends
-  only on in-memory slices — no on-disk types. *Remaining:* disk integration — the
-  `max_del.npy` producer/consumer, the sorted sub-stream union across `snp/`+`indel/`,
-  per-`(contig, sample, ploid)` wiring, and the genotype gather that turns an index
-  range into user-facing calls (the `(range, sample)` query proper).
+  only on in-memory slices — no on-disk types.
+  *Shipped — `max_del` producer post-pass (M5 part 2a):* a standalone `src/max_del.rs`
+  post-pass over a finished contig's indel key streams emits `max_del.npy`
+  (per-`(sample, ploid)`, `(n_samples, ploidy)` `u32`) and `dense/max_del.npy` (`(1,)`
+  `u32`), decoding each pure-DEL key's reference-base deletion length via
+  `rvk::deletion_len` (the single decode site for the 32-bit key layout) — no LUT,
+  reference genome, or merge-path coupling. All-zero artifacts are always written for a
+  no-deletion contig so the consumer never special-cases a missing file. Wired into the
+  orchestrator after each contig's merge; gated by unit tests, a brute-force per-column
+  oracle proptest, and an e2e round-trip that feeds the produced `max_del` into
+  `overlap_range`.
+  *Remaining:* disk integration — the `max_del.npy` **consumer**, the sorted sub-stream
+  union across `snp/`+`indel/`, per-`(contig, sample, ploid)` wiring, and the genotype
+  gather that turns an index range into user-facing calls (the `(range, sample)` query
+  proper).
 - [ ] **M6. Python decode.** Decode query results into user-facing structs/classes
   (to be spec'd). Requires fast sorted **unions** to merge data from multiple
   position-sorted sources. See [`architecture.md`](architecture.md#python-decode-path).
