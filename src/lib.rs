@@ -16,6 +16,7 @@ pub mod monitor;
 pub mod normalize;
 pub mod nrvk;
 pub mod orchestrator;
+pub mod query;
 pub mod rvk;
 pub mod search;
 pub mod streams;
