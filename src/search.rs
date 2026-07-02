@@ -135,6 +135,7 @@ impl SearchTree {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn block_lower_finds_first_ge() {
@@ -245,6 +246,26 @@ mod tests {
             let t = SearchTree::new(&a);
             for k in 0..=(n as u32 * 2 + 1) {
                 assert_eq!(t.upper_bound(k), ub_ref(&a, k), "n={n} x={k}");
+            }
+        }
+    }
+
+    proptest! {
+        // lower_bound/upper_bound match slice::partition_point for random sorted
+        // arrays and random queries. Sizes range across the tree's block/level
+        // boundaries; the query range extends just past the max value so past-end
+        // results are exercised.
+        #[test]
+        fn prop_bounds_match_partition_point(
+            mut vals in proptest::collection::vec(0u32..2000, 0..600),
+            queries in proptest::collection::vec(0u32..2100, 1..40),
+        ) {
+            vals.sort_unstable();
+            let t = SearchTree::new(&vals);
+            prop_assert_eq!(t.len(), vals.len());
+            for &q in &queries {
+                prop_assert_eq!(t.lower_bound(q), vals.partition_point(|&v| v < q), "lb q={}", q);
+                prop_assert_eq!(t.upper_bound(q), vals.partition_point(|&v| v <= q), "ub q={}", q);
             }
         }
     }
