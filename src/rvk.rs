@@ -255,18 +255,6 @@ pub fn decode_key(key: u32) -> DecodedKey {
     }
 }
 
-/// Deletion length (in reference bases) encoded by an indel `key`, or `0` for an
-/// insertion / SNP / lookup key. Used to reconstruct exclusive variant ends
-/// (`v_end = pos + 1 + deletion_len(key)`) for `overlap_range`.
-pub fn deletion_len(key: u32) -> u32 {
-    if key & 1 == 0 && (key as i32) < 0 {
-        // Pure DEL: ilen = (key as i32) >> 1 (negative); length = -ilen.
-        (-((key as i32) >> 1)) as u32
-    } else {
-        0
-    }
-}
-
 /// Recover the ALT base for a 2-bit SNP code (`A=00 C=01 T=10 G=11`). Inverse of
 /// [`encode_snp_2bit`].
 #[inline]
@@ -314,6 +302,33 @@ pub fn pack_variant(ilen: i32, alt_allele: &[u8], bank: &mut LongAlleleTableWrit
         "pure DEL ilen below MIN_I31 would alias the inline-positive lane",
     );
     (ilen as u32) << 1
+}
+
+/// Reference-base deletion length encoded in a 32-bit indel `var_key`/`dense` key.
+///
+/// Inverse of the DEL lane of [`pack_variant`]: a pure DEL clears the lookup flag
+/// (`bit 0 == 0`) and sets the top bit (`bit 31 == 1`), storing its signed `ilen`
+/// in `bits[31:1]`; the deletion length is `-ilen`. Inline INS/SNP keys clear the
+/// top bit, and long-INS lookup keys set `bit 0`, so both yield `0`. This is the
+/// single decode site for the deletion length — the bit layout stays co-located
+/// with the encoder (respecting the encoding-agnostic seam).
+#[inline]
+pub fn deletion_len(key: u32) -> u32 {
+    // Long-INS lookup keys set the LSB; they are never deletions. Checked first
+    // because such a key can also have its top bit set (a large row index).
+    if key & 1 == 1 {
+        return 0;
+    }
+    // Inline lane. Pure DEL sets the top bit; INS/SNP clear it.
+    if key & (1 << 31) == 0 {
+        return 0;
+    }
+    let ilen = (key as i32) >> 1; // arithmetic shift recovers the signed i31
+    debug_assert!(
+        ilen < 0,
+        "top-bit-set inline key must be a negative-ilen DEL"
+    );
+    ilen.unsigned_abs()
 }
 
 // The two inline flavors, tagged for stream routing (the encoding-seam output;
@@ -733,6 +748,35 @@ mod tests {
         assert_eq!(((key as i32) >> 1), -3);
         // (-3i32 << 1) = -6 → as u32 = 0xFFFFFFFA
         assert_eq!(key, 0xFFFFFFFAu32);
+    }
+
+    #[test]
+    fn test_deletion_len_snp_and_ins_are_zero() {
+        let mut bank = make_bank();
+        // SNP (ilen 0) and INS (ilen > 0) carry no deletion.
+        let snp = pack_variant(0, b"C", &mut bank);
+        let ins = pack_variant(2, b"ACG", &mut bank);
+        assert_eq!(deletion_len(snp), 0);
+        assert_eq!(deletion_len(ins), 0);
+    }
+
+    #[test]
+    fn test_deletion_len_small_and_large_del() {
+        let mut bank = make_bank();
+        // ref=ACGT alt=A → ilen=-3, deletion of 3 reference bases.
+        let small = pack_variant(-3, b"A", &mut bank);
+        assert_eq!(deletion_len(small), 3);
+        // Largest atomizable deletion: ilen == MIN_I31 → d == 1 << 30.
+        let large = pack_variant(crate::types::MIN_I31, b"A", &mut bank);
+        assert_eq!(deletion_len(large), (1u32 << 30));
+    }
+
+    #[test]
+    fn test_deletion_len_lookup_key_is_zero() {
+        // A long-INS lookup key sets the LSB. Even with the top bit set
+        // (a large row index), the LSB check must win → not a deletion.
+        assert_eq!(deletion_len(0x0000_0003), 0); // LSB set
+        assert_eq!(deletion_len(0xFFFF_FFFF), 0); // LSB set AND top bit set
     }
 
     #[test]

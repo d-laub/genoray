@@ -43,6 +43,7 @@ parallel memory architecture.
 #[allow(clippy::too_many_arguments)]
 pub fn process_chromosome(
     vcf_path: &str,
+    fasta_path: &str,
     chrom: &str,
     base_out_dir: &str,
     samples: &[&str],
@@ -118,6 +119,7 @@ pub fn process_chromosome(
         .name(format!("read-{}", chrom))
         .spawn({
             let vcf = vcf_path.to_string();
+            let fasta = fasta_path.to_string();
             let chr = chrom.to_string();
             // Convert references into owned Strings that can safely live forever in the thread
             let s_owned: Vec<String> = samples.iter().map(|&s| s.to_string()).collect();
@@ -125,7 +127,8 @@ pub fn process_chromosome(
             move || {
                 // passing the thread budget down to HTSLib
                 let s_refs: Vec<&str> = s_owned.iter().map(|s| s.as_str()).collect();
-                let mut reader = VcfChunkReader::new(&vcf, &chr, &s_refs, htslib_threads, ploidy);
+                let mut reader =
+                    VcfChunkReader::new(&vcf, &fasta, &chr, &s_refs, htslib_threads, ploidy);
                 let mut chunk_id = 0;
                 while let Some(dense_chunk) = reader.read_next_chunk(chunk_size, chunk_id) {
                     tx_dense.send(dense_chunk).unwrap();
@@ -250,6 +253,11 @@ pub fn process_chromosome(
             ledger,
         );
     }
+
+    // M5 post-pass: emit max-deletion-length artifacts for the overlap query.
+    // A pure scan of the finished indel key streams — decoupled from the merge.
+    let contig_dir = std::path::Path::new(base_out_dir).join(chrom);
+    crate::max_del::write_max_del(&contig_dir, samples.len(), ploidy)?;
 
     println!("[{}] Pipeline Execution Finished Successfully.", chrom);
 

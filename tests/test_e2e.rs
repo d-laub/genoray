@@ -7,9 +7,12 @@
 
 mod common;
 
-use common::{SynthRecord, build_bcf_with_index, read_offsets_npy, read_u32_bin};
+use common::{
+    SynthRecord, build_bcf_with_index, build_fasta_with_index, read_offsets_npy, read_u32_bin,
+};
 use genoray_core::process_chromosome;
 use genoray_core::rvk::decode_alt_inline;
+use genoray_core::search::{SearchTree, overlap_range};
 use genoray_core::vcf_reader::VcfChunkReader;
 
 use tempfile::tempdir;
@@ -79,12 +82,14 @@ fn test_e2e_normalized_bcf_pipeline() {
     ];
 
     build_bcf_with_index(&bcf_path, "chr1", 10_000, &samples, &records);
+    build_fasta_with_index(&bcf_path.with_extension("fa"), "chr1", 10_000, &records);
 
     let out_dir = tmp.path().join("out");
     std::fs::create_dir_all(&out_dir).unwrap();
 
     process_chromosome(
         bcf_path.to_str().unwrap(),
+        bcf_path.with_extension("fa").to_str().unwrap(),
         "chr1",
         out_dir.to_str().unwrap(),
         &samples,
@@ -139,6 +144,86 @@ fn test_e2e_normalized_bcf_pipeline() {
     assert!(!genoray_core::bits::get_bit(&dindel_geno, 3));
 }
 
+// M5 max_del post-pass, end-to-end. Two deletions with known lengths:
+//   pos=100  ATTT → A  (d=3)  gt=[1,0,0,0]  x=1 → rare → var_key/indel (hap 0)
+//   pos=200  ATT  → A  (d=2)  gt=[1,1,1,0]  x=3 → common → dense/indel (shared)
+// Asserts the produced artifacts, then feeds max_del into overlap_range to prove
+// a deletion that starts left of the query but spans into it is recoverable.
+#[test]
+fn test_e2e_max_del_postpass() {
+    let tmp = tempdir().unwrap();
+    let bcf_path = tmp.path().join("maxdel.bcf");
+    let samples = vec!["S0", "S1"]; // np = 4
+
+    let records = vec![
+        SynthRecord {
+            pos: 100,
+            ref_allele: b"ATTT",
+            alts: vec![&b"A"[..]],
+            gt: vec![1, 0, 0, 0], // hap 0 only → var_key/indel
+        },
+        SynthRecord {
+            pos: 200,
+            ref_allele: b"ATT",
+            alts: vec![&b"A"[..]],
+            gt: vec![1, 1, 1, 0], // haps 0,1,2 → dense/indel
+        },
+    ];
+    build_bcf_with_index(&bcf_path, "chr1", 10_000, &samples, &records);
+    build_fasta_with_index(&bcf_path.with_extension("fa"), "chr1", 10_000, &records);
+
+    let out_dir = tmp.path().join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    process_chromosome(
+        bcf_path.to_str().unwrap(),
+        bcf_path.with_extension("fa").to_str().unwrap(),
+        "chr1",
+        out_dir.to_str().unwrap(),
+        &samples,
+        100,
+        2,
+        1,
+        4096,
+    )
+    .expect("conversion");
+
+    let contig_dir = out_dir.join("chr1");
+
+    // var_key max_del: shape (2, 2); only col 0 (S0_p0) carries the d=3 deletion.
+    let m: ndarray::Array2<u32> = ndarray_npy::read_npy(contig_dir.join("max_del.npy")).unwrap();
+    assert_eq!(m.shape(), &[2, 2]);
+    assert_eq!(m[[0, 0]], 3);
+    assert_eq!(m[[0, 1]], 0);
+    assert_eq!(m[[1, 0]], 0);
+    assert_eq!(m[[1, 1]], 0);
+
+    // dense max_del: shape (1,); single max over the shared indel table = 2.
+    let dm: ndarray::Array1<u32> =
+        ndarray_npy::read_npy(contig_dir.join("dense/max_del.npy")).unwrap();
+    assert_eq!(dm, ndarray::Array1::from_vec(vec![2u32]));
+
+    // Close the producer -> consumer loop: the var_key/indel deletion for hap 0
+    // starts at pos 100 and spans 3 bases (v_end = 100 + 1 + 3 = 104). A query
+    // strictly right of the start but inside the deletion must still find it,
+    // using the produced max_del as max_region_length.
+    let vk_indel = contig_dir.join("var_key/indel");
+    let off = read_offsets_npy(&vk_indel.join("offsets.npy"));
+    let pos = read_u32_bin(&vk_indel.join("positions.bin"));
+    // hap 0 owns exactly the [off[0], off[1]) slice = one call at pos 100.
+    let col0 = &pos[off[0] as usize..off[1] as usize];
+    assert_eq!(col0, &[100u32]);
+
+    let v_starts: Vec<u32> = col0.to_vec();
+    let v_ends: Vec<u32> = vec![100 + 1 + 3]; // start + 1 + d, d = max_del[0,0]
+    let tree = SearchTree::new(&v_starts);
+    let max_region_length = m[[0, 0]];
+    // query [102, 103): starts right of variant start 100 but inside the deletion.
+    assert_eq!(
+        overlap_range(&tree, &v_ends, max_region_length, 102, 103),
+        (0, 1)
+    );
+}
+
 // Dense round-trip: a SNP carried by most of a small cohort must be routed to
 // dense/snp and its genotype bits reconstructable from genotypes.bin.
 #[test]
@@ -156,11 +241,13 @@ fn test_e2e_dense_snp_roundtrip() {
         gt: vec![1, 1, 1, 1, 1, 0], // S0(1,1) S1(1,1) S2(1,0)
     }];
     build_bcf_with_index(&bcf_path, "chr1", 10_000, &samples, &records);
+    build_fasta_with_index(&bcf_path.with_extension("fa"), "chr1", 10_000, &records);
 
     let out_dir = tmp.path().join("out");
     std::fs::create_dir_all(&out_dir).unwrap();
     process_chromosome(
         bcf_path.to_str().unwrap(),
+        bcf_path.with_extension("fa").to_str().unwrap(),
         "chr1",
         out_dir.to_str().unwrap(),
         &samples,
@@ -223,12 +310,14 @@ fn test_e2e_mutation_conservation() {
         .sum();
 
     build_bcf_with_index(&bcf_path, "chr1", 10_000, &samples, &records);
+    build_fasta_with_index(&bcf_path.with_extension("fa"), "chr1", 10_000, &records);
 
     let out_dir = tmp.path().join("out");
     std::fs::create_dir_all(&out_dir).unwrap();
 
     process_chromosome(
         bcf_path.to_str().unwrap(),
+        bcf_path.with_extension("fa").to_str().unwrap(),
         "chr1",
         out_dir.to_str().unwrap(),
         &samples,
@@ -282,8 +371,16 @@ fn test_reader_accepts_pure_del() {
         gt: vec![1, 1],
     }];
     build_bcf_with_index(&bcf_path, "chr1", 10_000, &samples, &records);
+    build_fasta_with_index(&bcf_path.with_extension("fa"), "chr1", 10_000, &records);
 
-    let mut reader = VcfChunkReader::new(bcf_path.to_str().unwrap(), "chr1", &samples, 1, 2);
+    let mut reader = VcfChunkReader::new(
+        bcf_path.to_str().unwrap(),
+        bcf_path.with_extension("fa").to_str().unwrap(),
+        "chr1",
+        &samples,
+        1,
+        2,
+    );
     let chunk = reader
         .read_next_chunk(100, 0)
         .expect("chunk should succeed");
@@ -308,12 +405,14 @@ fn test_missing_chrom_returns_err() {
         gt: vec![1, 0],
     }];
     build_bcf_with_index(&bcf_path, "chr1", 10_000, &samples, &records);
+    build_fasta_with_index(&bcf_path.with_extension("fa"), "chr1", 10_000, &records);
 
     let out_dir = tmp.path().join("out");
     std::fs::create_dir_all(&out_dir).unwrap();
 
     let res = genoray_core::orchestrator::process_chromosome(
         bcf_path.to_str().unwrap(),
+        bcf_path.with_extension("fa").to_str().unwrap(),
         "chrZ",
         out_dir.to_str().unwrap(),
         &["s0"],

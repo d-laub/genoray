@@ -78,14 +78,19 @@ pub fn genotypes(dir: &Path) -> PathBuf {
     dir.join("genotypes.bin")
 }
 
-/// Per-contig `max_del.npy` (var_key/indel per-`(sample, ploid)` max deletion
-/// length; `u32`, shape `(n_samples, ploidy)`). See the M5 `max_del` contract.
+/// Contig-dir-relative path helpers for the standalone `max_del` post-pass. These
+/// take the contig directory (`{out}/{contig}`) directly, unlike the `ContigPaths`
+/// methods which build from `base_out_dir` + `chrom`. Keeping them here preserves
+/// layout.rs as the single source of on-disk paths.
+pub fn var_key_indel_dir(contig_dir: &Path) -> PathBuf {
+    contig_dir.join("var_key").join("indel")
+}
+pub fn dense_indel_dir(contig_dir: &Path) -> PathBuf {
+    contig_dir.join("dense").join("indel")
+}
 pub fn max_del(contig_dir: &Path) -> PathBuf {
     contig_dir.join("max_del.npy")
 }
-
-/// Per-contig `dense/max_del.npy` (single scalar max deletion length over the
-/// shared dense/indel table; `u32`, shape `(1,)`).
 pub fn dense_max_del(contig_dir: &Path) -> PathBuf {
     contig_dir.join("dense").join("max_del.npy")
 }
@@ -119,6 +124,15 @@ mod tests {
         let p = ContigPaths::new("/out", "chr1");
         assert_eq!(p.dense_snp_dir(), Path::new("/out/chr1/dense/snp"));
         assert_eq!(p.dense_indel_dir(), Path::new("/out/chr1/dense/indel"));
+    }
+
+    #[test]
+    fn test_max_del_postpass_paths() {
+        let c = Path::new("/out/chr1");
+        assert_eq!(var_key_indel_dir(c), Path::new("/out/chr1/var_key/indel"));
+        assert_eq!(dense_indel_dir(c), Path::new("/out/chr1/dense/indel"));
+        assert_eq!(max_del(c), Path::new("/out/chr1/max_del.npy"));
+        assert_eq!(dense_max_del(c), Path::new("/out/chr1/dense/max_del.npy"));
     }
 
     #[test]

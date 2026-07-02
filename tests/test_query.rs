@@ -1,12 +1,14 @@
 //! Disk-integration tests for the `(range, sample)` query. Builds finished SVAR2
-//! contigs via the real conversion pipeline and a hand-written `max_del.npy`
-//! fixture (until the max_del post-pass producer lands).
+//! contigs via the real conversion pipeline, then overwrites `max_del.npy` with a
+//! deliberately conservative fixture: an over-estimate is provably overshoot-safe
+//! (see `search.rs`), so the consumer's answers are identical to the tight bound
+//! the wired-in producer writes, while the fixture keeps the test independent of it.
 
 mod common;
 
 use proptest::prelude::*;
 
-use common::{SynthRecord, build_bcf_with_index};
+use common::{SynthRecord, build_bcf_with_index, build_fasta_with_index};
 use genoray_core::process_chromosome;
 use genoray_core::query::ContigReader;
 use genoray_core::query::overlap_sample;
@@ -25,7 +27,7 @@ fn del_len_of(rec: &SynthRecord) -> u32 {
 /// over-estimate vs. the var_key-only contract, but `overlap_range`'s overshoot
 /// is proven safe — see `search.rs` `overlap_max_region_length_overshoot_is_safe`),
 /// and the global max for `dense/max_del`. This exercises per-column indexing in
-/// the consumer while remaining independent of the not-yet-landed producer.
+/// the consumer while remaining independent of the producer's tight per-column bound.
 fn write_max_del_fixture(
     contig_dir: &Path,
     n_samples: usize,
@@ -56,9 +58,15 @@ fn write_max_del_fixture(
 /// `max_del` fixture. `out` must already exist.
 fn build_contig(out: &Path, chrom: &str, samples: &[&str], ploidy: usize, records: &[SynthRecord]) {
     let bcf = out.join("in.bcf");
+    let fasta = out.join("in.fa");
     build_bcf_with_index(&bcf, chrom, 1_000_000, samples, records);
+    // M2b: the reader validates REF and left-aligns against a reference FASTA.
+    // Stamp each record's REF into an 'N'-filler contig; 'N' never satisfies the
+    // left-align repeat condition, so positions stay put and the oracle holds.
+    build_fasta_with_index(&fasta, chrom, 1_000_000, records);
     process_chromosome(
         bcf.to_str().unwrap(),
+        fasta.to_str().unwrap(),
         chrom,
         out.to_str().unwrap(),
         samples,
@@ -264,7 +272,7 @@ fn test_routing_invariant_dense_vs_var_key() {
         let samples = ["S0", "S1", "S2", "S3", "S4", "S5"];
         let records = vec![SynthRecord {
             pos: 500,
-            ref_allele: b"ATATA", // 4-base deletion
+            ref_allele: b"ATATC", // 4-base deletion
             alts: vec![&b"A"[..]],
             gt: vec![1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         }];
@@ -286,7 +294,7 @@ fn test_routing_invariant_dense_vs_var_key() {
         let samples = ["S0", "S1", "S2", "S3", "S4", "S5"];
         let records = vec![SynthRecord {
             pos: 500,
-            ref_allele: b"ATATA",
+            ref_allele: b"ATATC",
             alts: vec![&b"A"[..]],
             gt: vec![1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0],
         }];
@@ -365,7 +373,8 @@ fn arb_records(n_haps: usize) -> impl Strategy<Value = Vec<OwnedRecord>> {
             0usize..4,                                           // SNP alt base index
             proptest::collection::vec(0usize..4, 1..16),         // INS/DEL tail (>= 1 base)
             proptest::collection::vec(0i32..2, n_haps..=n_haps), // genotypes
-            1u32..40u32,                                         // position gap
+            17u32..40u32, // position gap: >= 17 keeps an 'N' between records' REF
+                          // stamps (max REF span is 16), so no overlap and M2b never left-shifts
         ),
         1..8, // 1..7 records; empty contigs are covered by the degenerate tests
     )
@@ -376,6 +385,14 @@ fn arb_records(n_haps: usize) -> impl Strategy<Value = Vec<OwnedRecord>> {
         for (kind, anchor, snp_alt, tail, gt, gap) in specs {
             pos += gap as i64;
             let b0 = BASES[anchor];
+            // M2b left-aligns any indel whose anchor base repeats at the allele's
+            // end (roll condition: anchor == tail's last base). Force them distinct
+            // so generated records are already left-canonical and the converter
+            // leaves positions put — keeping the brute-force oracle valid.
+            let mut tail = tail;
+            if tail.last() == Some(&anchor) {
+                *tail.last_mut().unwrap() = (anchor + 1) % 4;
+            }
             let (ref_allele, alt) = match kind {
                 0 => {
                     let alt_idx = if snp_alt == anchor {
