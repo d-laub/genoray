@@ -68,7 +68,7 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
   in-source unit/proptests + 5 e2e tests. An optional per-contig monitoring sampler
   (`GENORAY_SAMPLE_INTERVAL`) reports channel fill and per-thread CPU%. *Remaining:*
   variant normalization (M2, currently a precondition — see below); the on-disk
-  filenames are still provisional (see M3). The
+  filenames were finalized in M3. The
   `var_key` stream is now split into 2-bit `snp/` and 32-bit `indel/`
   sub-streams per [`data-model.md`](data-model.md#on-disk-layout); the SNP stream
   is 2-bit-packed post-merge and carries no LUT.
