@@ -234,6 +234,47 @@ mod tests {
         assert_eq!(g.popcount_plane(2), 0);
     }
 
+    #[test]
+    fn test_popcount_plane_word_aligned_boundaries() {
+        // Exercise popcount_plane's `take == 64` branch (the dominant
+        // real-world case: plane = S*P is usually >= 64 bits, and this
+        // hand-written special case exists solely to avoid `1u64 << 64` UB)
+        // together with the boundary shapes around it: sub-word (63),
+        // exactly one word (64), one word + 1 bit (65, straddles a word
+        // boundary), and exactly two words (128, two consecutive take==64
+        // iterations).
+        for &plane in &[63usize, 64, 65, 128] {
+            let variants = 4;
+            // shape (variants, plane, 1) so S*P == plane exactly, one plane
+            // per variant.
+            let mut g = BitGrid3::zeros(variants, plane, 1);
+
+            // Deterministic, non-trivial pattern: bit `i` of variant `vi` is
+            // set iff `(i * (vi + 1)) % 5 < 2`. Not all-zero/all-one, and it
+            // hits bit 0, the last bit of the plane, and (for plane >= 64)
+            // bits on both sides of every word boundary.
+            for vi in 0..variants {
+                for i in 0..plane {
+                    let set = (i * (vi + 1)) % 5 < 2;
+                    g.or_bit(vi * plane + i, set);
+                }
+            }
+
+            for vi in 0..variants {
+                // Ground truth: an independent naive per-bit count via
+                // get_bit, not the masked-word logic under test.
+                let expected = (0..plane).filter(|&i| g.get_bit(vi * plane + i)).count();
+                assert_eq!(
+                    g.popcount_plane(vi),
+                    expected,
+                    "plane={} bits, variant={}",
+                    plane,
+                    vi
+                );
+            }
+        }
+    }
+
     proptest! {
         // popcount_plane equals a naive per-bit count for arbitrary shapes/patterns.
         #[test]
