@@ -7,7 +7,9 @@
 
 mod common;
 
-use common::{SynthRecord, build_bcf_with_index, read_offsets_npy, read_u32_bin};
+use common::{
+    SynthRecord, build_bcf_with_index, build_fasta_with_index, read_offsets_npy, read_u32_bin,
+};
 use genoray_core::process_chromosome;
 use genoray_core::rvk::decode_alt_inline;
 use genoray_core::vcf_reader::VcfChunkReader;
@@ -79,12 +81,14 @@ fn test_e2e_normalized_bcf_pipeline() {
     ];
 
     build_bcf_with_index(&bcf_path, "chr1", 10_000, &samples, &records);
+    build_fasta_with_index(&bcf_path.with_extension("fa"), "chr1", 10_000, &records);
 
     let out_dir = tmp.path().join("out");
     std::fs::create_dir_all(&out_dir).unwrap();
 
     process_chromosome(
         bcf_path.to_str().unwrap(),
+        bcf_path.with_extension("fa").to_str().unwrap(),
         "chr1",
         out_dir.to_str().unwrap(),
         &samples,
@@ -156,11 +160,13 @@ fn test_e2e_dense_snp_roundtrip() {
         gt: vec![1, 1, 1, 1, 1, 0], // S0(1,1) S1(1,1) S2(1,0)
     }];
     build_bcf_with_index(&bcf_path, "chr1", 10_000, &samples, &records);
+    build_fasta_with_index(&bcf_path.with_extension("fa"), "chr1", 10_000, &records);
 
     let out_dir = tmp.path().join("out");
     std::fs::create_dir_all(&out_dir).unwrap();
     process_chromosome(
         bcf_path.to_str().unwrap(),
+        bcf_path.with_extension("fa").to_str().unwrap(),
         "chr1",
         out_dir.to_str().unwrap(),
         &samples,
@@ -223,12 +229,14 @@ fn test_e2e_mutation_conservation() {
         .sum();
 
     build_bcf_with_index(&bcf_path, "chr1", 10_000, &samples, &records);
+    build_fasta_with_index(&bcf_path.with_extension("fa"), "chr1", 10_000, &records);
 
     let out_dir = tmp.path().join("out");
     std::fs::create_dir_all(&out_dir).unwrap();
 
     process_chromosome(
         bcf_path.to_str().unwrap(),
+        bcf_path.with_extension("fa").to_str().unwrap(),
         "chr1",
         out_dir.to_str().unwrap(),
         &samples,
@@ -282,8 +290,16 @@ fn test_reader_accepts_pure_del() {
         gt: vec![1, 1],
     }];
     build_bcf_with_index(&bcf_path, "chr1", 10_000, &samples, &records);
+    build_fasta_with_index(&bcf_path.with_extension("fa"), "chr1", 10_000, &records);
 
-    let mut reader = VcfChunkReader::new(bcf_path.to_str().unwrap(), "chr1", &samples, 1, 2);
+    let mut reader = VcfChunkReader::new(
+        bcf_path.to_str().unwrap(),
+        bcf_path.with_extension("fa").to_str().unwrap(),
+        "chr1",
+        &samples,
+        1,
+        2,
+    );
     let chunk = reader
         .read_next_chunk(100, 0)
         .expect("chunk should succeed");
@@ -308,12 +324,14 @@ fn test_missing_chrom_returns_err() {
         gt: vec![1, 0],
     }];
     build_bcf_with_index(&bcf_path, "chr1", 10_000, &samples, &records);
+    build_fasta_with_index(&bcf_path.with_extension("fa"), "chr1", 10_000, &records);
 
     let out_dir = tmp.path().join("out");
     std::fs::create_dir_all(&out_dir).unwrap();
 
     let res = genoray_core::orchestrator::process_chromosome(
         bcf_path.to_str().unwrap(),
+        bcf_path.with_extension("fa").to_str().unwrap(),
         "chrZ",
         out_dir.to_str().unwrap(),
         &["s0"],

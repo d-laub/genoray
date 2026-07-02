@@ -39,6 +39,10 @@ pub struct VcfChunkReader {
     num_samples: usize,
     ploidy: usize,
     sample_indices: Vec<usize>,
+    // full 0-based contig sequence, uppercased. Cached now so `new`'s signature and
+    // loading are stable; consumed by `validate_ref`/`left_align` starting M2b Task 4.
+    #[allow(dead_code)]
+    ref_seq: Vec<u8>,
 
     // Reorder state, persisted across read_next_chunk calls.
     record: Record,
@@ -52,6 +56,7 @@ impl VcfChunkReader {
     // opens the file, applies the sample filter at the C-level, and jumps to the chromosome.
     pub fn new(
         vcf_path: &str,
+        fasta_path: &str,
         chrom: &str,
         samples: &[&str],
         htslib_threads: usize,
@@ -83,6 +88,21 @@ impl VcfChunkReader {
             })
             .collect();
 
+        // Cache the full contig once per worker (simplest; one contig per worker at a
+        // time). fetch_seq's `end` is inclusive, so [0, contig_len-1]. Uppercase so
+        // soft-masked (lowercase) reference bases compare equal to uppercase VCF alleles.
+        let fasta = rust_htslib::faidx::Reader::from_path(fasta_path)
+            .expect("Failed to open reference FASTA (is there a .fai?)");
+        let contig_len = fasta.fetch_seq_len(chrom) as usize;
+        let mut ref_seq = if contig_len == 0 {
+            Vec::new()
+        } else {
+            fasta
+                .fetch_seq(chrom, 0, contig_len - 1)
+                .expect("Failed to fetch contig from reference FASTA")
+        };
+        ref_seq.make_ascii_uppercase();
+
         let record = reader.empty_record();
 
         Self {
@@ -90,6 +110,7 @@ impl VcfChunkReader {
             num_samples: samples.len(),
             ploidy,
             sample_indices,
+            ref_seq,
             record,
             heap: BinaryHeap::new(),
             frontier: 0,
@@ -151,19 +172,20 @@ impl VcfChunkReader {
     }
 
     // Yield the next atom in global position order, reading and decomposing more
-    // records as needed. An atom is safe to emit once its position is strictly below
-    // the read frontier (no future atom can precede the frontier, since there is no
-    // left-alignment) or once the input is exhausted.
+    // records as needed. Left-alignment (M2b) can move an atom up to `L_MAX` bases below
+    // its record's start, so a future record at start `frontier` may still produce an atom
+    // as low as `frontier - L_MAX`. An atom is therefore safe to emit only once its
+    // position is strictly below `frontier - L_MAX` (saturating), or the input is
+    // exhausted — this preserves the position-sorted invariant the Phase-2 merge relies on.
     //
-    // Memory note: the heap holds every atom whose pos == frontier until a record with a
-    // strictly greater start pos advances the frontier (or EOF). For coordinate-sorted
-    // input this is bounded by the atoms at a single position; a pathological run of many
-    // records sharing one start pos would grow it. M2b (left-alignment) weakens the
-    // `pos >= record_start` premise and must revisit this bound.
+    // Memory note: the heap holds every atom with pos >= frontier - L_MAX until a later
+    // record advances the frontier past that window (or EOF). For coordinate-sorted input
+    // this is bounded by the atoms within an `L_MAX`-wide window of the frontier; shifts
+    // are capped at `L_MAX` so the window — and thus memory — stays bounded.
     fn next_atom(&mut self) -> Option<PendingAtom> {
         loop {
             if let Some(Reverse(top)) = self.heap.peek() {
-                if self.eof || top.pos < self.frontier {
+                if self.eof || top.pos < self.frontier.saturating_sub(crate::normalize::L_MAX) {
                     return Some(self.heap.pop().unwrap().0);
                 }
             } else if self.eof {

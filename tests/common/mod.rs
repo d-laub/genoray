@@ -64,6 +64,33 @@ pub fn build_bcf_with_index(
         .expect("build BCF index");
 }
 
+/// Build a FASTA (+ `.fai`) whose single contig is `chrom_len` bases of 'N' filler with
+/// each record's REF allele stamped at its 0-based `pos`, so it agrees with the records
+/// pushed into the companion BCF. 'N' filler never satisfies the left-align repeat
+/// condition, so records that should not move don't. Overlapping records must agree on
+/// their shared bases (real VCFs are reference-consistent).
+#[allow(dead_code)]
+pub fn build_fasta_with_index(
+    fasta_path: &Path,
+    chrom: &str,
+    chrom_len: usize,
+    records: &[SynthRecord],
+) {
+    use std::io::Write;
+    let mut seq = vec![b'N'; chrom_len];
+    for rec in records {
+        let start = rec.pos as usize;
+        seq[start..start + rec.ref_allele.len()].copy_from_slice(rec.ref_allele);
+    }
+    {
+        let mut f = std::fs::File::create(fasta_path).expect("create fasta");
+        writeln!(f, ">{}", chrom).expect("write header");
+        f.write_all(&seq).expect("write seq");
+        writeln!(f).expect("write newline");
+    }
+    rust_htslib::faidx::build(fasta_path).expect("build .fai");
+}
+
 // Not every integration-test binary that pulls in this shared `mod common;` calls
 // every helper (e.g. test_atomize_e2e.rs never reads on-disk binary output). Each
 // test file is its own compilation unit, so clippy's dead-code pass is per-binary;
