@@ -68,7 +68,7 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
   in-source unit/proptests + 5 e2e tests. An optional per-contig monitoring sampler
   (`GENORAY_SAMPLE_INTERVAL`) reports channel fill and per-thread CPU%. *Remaining:*
   variant normalization (M2, currently a precondition — see below); the on-disk
-  filenames are still provisional (see M3). The
+  filenames were finalized in M3. The
   `var_key` stream is now split into 2-bit `snp/` and 32-bit `indel/`
   sub-streams per [`data-model.md`](data-model.md#on-disk-layout); the SNP stream
   is 2-bit-packed post-merge and carries no LUT.
@@ -87,16 +87,19 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
   needs a reference genome (FASTA/faidx) and a new required conversion argument, and it
   widens the reorder-buffer bound (leftward shifts). See
   [`data-model.md`](data-model.md#variant-normalization).
-- [~] **M3. Per-contig split + sidecar positions.** Partition the SVAR2 directory by
-  contig; keep positions as sidecar arrays. See
-  [`architecture.md`](architecture.md#on-disk-layout).
-  *Core done:* output is partitioned per contig (`{out}/{contig}/var_key/`) and the
-  merge emits sorted position + offset sidecars. *Provisional / remaining:* the current
-  scratch filenames live under `{out}/{contig}/var_key/{snp,indel}/` as
-  `final_positions.bin` / `final_keys.bin` (raw little-endian via bytemuck) and
-  `final_offsets.npy`, plus `long_alleles.bin` + `long_allele_offsets.npy` under
-  `indel/`, which differ from the `.npy` names in the layout spec; `meta.json` and
-  the per-contig `max_del.npy` are not yet written.
+- [x] **M3. Per-contig split + sidecar positions + format finalization.** Partition the
+  SVAR2 directory by contig; keep positions as sidecar arrays; finalize the on-disk
+  format. See [`architecture.md`](architecture.md#on-disk-layout).
+  *Done:* output is partitioned per contig
+  (`{out}/{contig}/{var_key,dense}/{snp,indel}/`) and the merge emits sorted position +
+  offset sidecars. The final per-stream files use their spec base names —
+  `positions.bin` / `alleles.bin` / `genotypes.bin` (raw little-endian, mmap-friendly)
+  and `offsets.npy` (one-shot) — plus the shared `long_alleles.bin` +
+  `long_allele_offsets.npy` under `indel/`. A top-level `meta.json`
+  (`format_version` / `samples` / `contigs` / `ploidy`) is written once after all
+  contigs succeed. Array dtypes are a `format_version` convention documented in
+  [`data-model.md`](data-model.md#on-disk-layout). *(The per-contig `max_del.npy` is
+  produced and consumed by the overlap search, so it lands with M5, not here.)*
 - [x] **M4. Dense representation + cost-model routing.** Implement the 1-bit dense
   genotype matrix and the deterministic per-variant dense/sparse decision. See
   [`data-model.md`](data-model.md#dense-vs-sparse-cost-model).
@@ -113,11 +116,11 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
   shared per-contig LUT (see [`data-model.md`](data-model.md#long-allele-lookup-table-lut)).
   Covered by unit/proptests in `cost_model.rs`, `dense.rs`, `dense_merge.rs`, `bits.rs`,
   and `rvk.rs`, plus an e2e dense round-trip test. *Out of scope (deferred to later
-  milestones):* `max_del.npy` / overlap queries (M5), `meta.json` (M3), and the
-  `pointer` representation (M11) are not implemented here; the dense final filenames
-  are provisional and mirror `var_key`'s (see the dense-representation section of
-  [`data-model.md`](data-model.md#dense-representation-dense)), to be unified as part
-  of M3.
+  milestones):* `max_del.npy` / overlap queries (M5) and the `pointer` representation
+  (M11) are not implemented here. `meta.json` and the unification of the dense final
+  filenames with `var_key`'s spec base names (`positions.bin` / `alleles.bin` /
+  `genotypes.bin`; see the dense-representation section of
+  [`data-model.md`](data-model.md#dense-representation-dense)) landed in M3.
 - [ ] **M5. `(range, sample)` queries.** Fast overlap queries via binary search,
   starting from the [left-tree static search tree](https://curiouscoding.nl/posts/static-search-tree/#left-tree).
   Must handle deletions spanning the query start (see

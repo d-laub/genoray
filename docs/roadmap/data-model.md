@@ -138,12 +138,12 @@ switch to a **dense 1-bit genotype matrix**, chosen **strictly per variant** (se
   by class is free (same total bits) and shrinks the SNP variant table's `alleles`
   column 4 B → 0.25 B per variant — a large win whenever annotations are sparse and
   `alleles` dominates the row.
-- **Provisional filenames.** Like `var_key` (see [Open questions](#open-questions)),
-  the current scratch implementation writes raw `.bin` final files —
-  `final_positions.bin` / `final_keys.bin` / `final_genotypes.bin` under
-  `{contig}/dense/{snp,indel}/` — mirroring the `var_key` naming rather than the
-  `.npy` names in the layout tree below. These will be unified with the `var_key`
-  wire format before the decode path (M6), as part of M3.
+- **On-disk filenames.** The dense final files share `var_key`'s wire-format
+  convention (see [Open questions](#open-questions) → resolved): `positions.bin` /
+  `alleles.bin` / `genotypes.bin` under `{contig}/dense/{snp,indel}/`, all raw
+  little-endian `.bin`. The dense representation has no ragged `offsets` sidecar —
+  every hap contributes the same per-variant count, so the matrix shape is derived
+  from `len(positions)` and `(n_samples, ploidy)` from `meta.json`.
 
 ## Dense vs. sparse cost model
 
@@ -211,15 +211,15 @@ svar2/
     │   └── long_allele_offsets.npy # row offsets into the packed ALT bytes above
     ├── dense/
     │   ├── snp/
-    │   │   ├── positions.npy       # sidecar SNP-variant positions (sorted)
-    │   │   ├── alleles.npy         # 2-bit packed keys, one per SNP variant (no LUT)
+    │   │   ├── positions.bin       # sidecar SNP-variant positions (sorted), u32 LE
+    │   │   ├── alleles.bin         # 2-bit packed keys, one per SNP variant (no LUT), u8
     │   │   ├── {field}.npy         # per-variant INFO/FORMAT fields
-    │   │   └── genotypes.npy       # 1-bit (sample, ploid, snp_variant) matrix, C-order
+    │   │   └── genotypes.bin       # 1-bit (sample, ploid, snp_variant) matrix, C-order, u8
     │   └── indel/
-    │       ├── positions.npy
-    │       ├── alleles.npy         # 32-bit keys, one per indel variant (points into shared LUT)
+    │       ├── positions.bin       # u32 LE
+    │       ├── alleles.bin         # 32-bit keys, one per indel variant (points into shared LUT), u32 LE
     │       ├── {field}.npy
-    │       └── genotypes.npy       # 1-bit (sample, ploid, indel_variant) matrix, C-order
+    │       └── genotypes.bin       # 1-bit (sample, ploid, indel_variant) matrix, C-order, u8
     ├── pointer/                    # = SVAR 1.0 representation (longer-term, M11)
     │   ├── snp/
     │   │   ├── positions.npy
@@ -235,14 +235,14 @@ svar2/
     │       └── offsets.npy
     └── var_key/
         ├── snp/
-        │   ├── positions.npy       # per-call SNP positions (sorted within each hap)
-        │   ├── alleles.npy         # 2-bit packed ALT, 4 calls/byte (uint8), no LUT
-        │   ├── offsets.npy         # per (sample, ploid) ragged offsets into snp calls
+        │   ├── positions.bin       # per-call SNP positions (sorted within each hap), u32 LE
+        │   ├── alleles.bin         # 2-bit packed ALT, 4 calls/byte (uint8), no LUT
+        │   ├── offsets.npy         # per (sample, ploid) ragged offsets into snp calls, u64
         │   └── {field}.npy         # per-call INFO/FORMAT for SNP calls
         └── indel/
-            ├── positions.npy       # per-call indel positions (sorted within each hap)
-            ├── alleles.npy         # 32-bit keys, one per call (ragged, points into shared LUT)
-            ├── offsets.npy         # per (sample, ploid) ragged offsets into alleles
+            ├── positions.bin       # per-call indel positions (sorted within each hap), u32 LE
+            ├── alleles.bin         # 32-bit keys, one per call (ragged, points into shared LUT), u32 LE
+            ├── offsets.npy         # per (sample, ploid) ragged offsets into alleles, u64
             └── {field}.npy
 ```
 
@@ -251,6 +251,17 @@ contig list, and ploidy. The per-stream maximum deletion length needed for overl
 queries lives in a separate `max_del.npy` per contig (see below) rather than in
 `meta.json`, because it is a structured, potentially large array (e.g. 1M diploid
 samples × 20 contigs).
+
+**Array dtypes are a `format_version` convention, not duplicated in `meta.json`.**
+For `format_version = 1`: `positions.bin` is `u32` little-endian; `alleles.bin` is
+`u8` (2-bit-packed SNP codes, 4/byte) in `snp/` and `u32` little-endian (inline value
+or shared-LUT pointer) in `indel/`; `genotypes.bin` is `u8` (raw 1-bit hap-major
+matrix, LSB-first); `offsets.npy` and `long_allele_offsets.npy` are `u64`;
+`long_alleles.bin` is `u8`. The bulk parallel-`pwrite`n arrays (`positions` /
+`alleles` / `genotypes`) are raw `.bin` — mmap-friendly, no npy-header offset to align
+every `pwrite` past — and Python reads them with `np.memmap(path, dtype=…, mode='r')`,
+deriving shape from `len(positions)` and `meta.json`. The small one-shot index/metadata
+sidecars (`offsets`, `long_allele_offsets`) stay self-describing `.npy`.
 
 A contig query reads both sub-streams of each representation it touches and merges the
 results in position order. `max_del.npy` describes the **indel sub-streams only**; SNP
@@ -334,11 +345,15 @@ SVAR2 is a **compute-oriented, derived format — not an archival format.**
   SNPs encoded as `ILEN = 0` and the ALT base in bits `[26:25]`; the split supersedes
   it. The encoder's SNP fast path (`encode_snp`) still applies — it now emits the bare
   2-bit code into the SNP stream instead of shifting it to bits `[26:25]`.
-- **`var_key` sidecar wire format.** The merge currently writes positions and keys as
-  raw little-endian `.bin` (`final_positions.bin` / `final_keys.bin`, via `bytemuck`)
-  and offsets as `final_offsets.npy`, whereas the layout spec above names them `.npy`.
-  Settle on one (raw `.bin` is mmap-friendly and avoids the npy header; `.npy` is
-  self-describing) and align the names before the decode path (M6) is built.
+- **`var_key` sidecar wire format.** *Resolved (M3): raw `.bin` for pwritten data
+  arrays, `.npy` for one-shot sidecars.* The bulk arrays the tile merge writes via
+  concurrent positional `pwrite` (`positions.bin`, `alleles.bin`, and dense
+  `genotypes.bin`) are raw little-endian `.bin`: they carry no logical shape in the
+  file (2-bit-packed SNP / 1-bit-packed genotype bytes), and wrapping them in `.npy`
+  would force a hand-rolled 64-byte-aligned header that every `pwrite` must offset past
+  — real fragility for no gain. The small one-shot index/metadata sidecars
+  (`offsets.npy`, `long_allele_offsets.npy`) stay self-describing `.npy`. Array dtypes
+  are keyed to `format_version` (see [On-disk layout](#on-disk-layout)).
 - **Cost-model constants (pointer representation only).** `var_key` vs. `dense` are
   implemented and measured in exact integer bits (see
   [cost model](#dense-vs-sparse-cost-model)); the remaining open constant is the
