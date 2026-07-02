@@ -251,6 +251,11 @@ pub fn process_chromosome(
         );
     }
 
+    // M5 post-pass: emit max-deletion-length artifacts for the overlap query.
+    // A pure scan of the finished indel key streams — decoupled from the merge.
+    let contig_dir = std::path::Path::new(base_out_dir).join(chrom);
+    crate::max_del::write_max_del(&contig_dir, samples.len(), ploidy)?;
+
     println!("[{}] Pipeline Execution Finished Successfully.", chrom);
 
     Ok(())

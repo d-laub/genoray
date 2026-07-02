@@ -21,3 +21,6 @@ memray_flamegraphs/
 # Added by cargo
 
 /target
+
+# Claude Code worktrees
+.claude/worktrees/

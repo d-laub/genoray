@@ -18,4 +18,10 @@ pub enum ConversionError {
         #[source]
         source: ndarray_npy::WriteNpyError,
     },
+    #[error("failed to read npy at {path}: {source}")]
+    ReadNpy {
+        path: String,
+        #[source]
+        source: ndarray_npy::ReadNpyError,
+    },
 }
