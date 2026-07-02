@@ -1,3 +1,5 @@
+use crate::streams::StreamMap;
+
 // Minimum signed ilen representable inline as a pure DEL (i31 signed two's complement).
 // Real data won't approach this — atomized DELs span at most chromosome length (~250 Mbp).
 pub const MIN_I31: i32 = -(1 << 30);
@@ -79,33 +81,41 @@ pub struct DenseChunk {
     pub genos: BitGrid3, // (V, S, P)
 }
 
-// One position-sorted sub-stream of calls, generic over the key element type
-// (`u8` for the 2-bit SNP stream, `u32` for the 32-bit indel stream).
-pub struct SparseSubChunk<K> {
+// One position-sorted sub-stream of calls with byte-erased keys (`key_bytes`
+// wide, little-endian). Type erasure lets streams of differing widths live in
+// a single `StreamMap`.
+pub struct SparseSubStream {
     // Per-call data, sample-major (sample, ploid, ~variant).
     pub call_positions: Vec<u32>,
-    pub call_keys: Vec<K>,
+    pub call_keys: Vec<u8>, // key_bytes per call
     // Calls per (sample, ploid) in THIS sub-stream. Length == samples * ploidy.
     pub sample_lengths: Vec<u32>,
+    pub key_bytes: usize,
 }
 
-impl<K> SparseSubChunk<K> {
-    pub(crate) fn with_capacity(nnz: usize, columns: usize) -> Self {
+impl SparseSubStream {
+    pub fn with_capacity(key_bytes: usize, nnz: usize, columns: usize) -> Self {
         Self {
             call_positions: Vec::with_capacity(nnz),
-            call_keys: Vec::with_capacity(nnz),
+            call_keys: Vec::with_capacity(nnz * key_bytes),
             sample_lengths: Vec::with_capacity(columns),
+            key_bytes,
         }
+    }
+    #[inline(always)]
+    pub fn push_call(&mut self, pos: u32, key_le: &[u8]) {
+        debug_assert_eq!(key_le.len(), self.key_bytes);
+        self.call_positions.push(pos);
+        self.call_keys.extend_from_slice(key_le);
     }
 }
 
 // The transposed, sparse packet produced by the Compute Thread and consumed by
-// the Writer Thread — split into a 2-bit SNP sub-stream and a 32-bit indel
-// sub-stream (see data-model.md#on-disk-layout).
+// the Writer Thread — one `SparseSubStream` per active `StreamTag` (see
+// data-model.md#on-disk-layout).
 pub struct SparseChunk {
     pub chunk_id: usize,
-    pub snp: SparseSubChunk<u8>,
-    pub indel: SparseSubChunk<u32>,
+    pub streams: StreamMap<SparseSubStream>,
 }
 
 #[cfg(test)]

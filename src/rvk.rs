@@ -1,5 +1,6 @@
 use crate::nrvk::LongAlleleTableWriter;
-use crate::types::{DenseChunk, MAX_INLINE_ALT_LEN, MIN_I31, SparseChunk, SparseSubChunk};
+use crate::streams::StreamTag;
+use crate::types::{DenseChunk, MAX_INLINE_ALT_LEN, MIN_I31, SparseChunk, SparseSubStream};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 
@@ -300,19 +301,19 @@ pub fn dense2sparse_vk(chunk: &DenseChunk, bank: &mut LongAlleleTableWriter) -> 
         var_keys.push(classify_variant(ilen, alt_allele, bank));
     }
 
-    // Rough pre-allocation (~5% sparsity), split across the two streams.
     let estimated_nnz = (v_variants * columns) / 20;
-    let mut snp = SparseSubChunk::<u8>::with_capacity(estimated_nnz, columns);
-    let mut indel = SparseSubChunk::<u32>::with_capacity(estimated_nnz, columns);
+    let mut streams = crate::streams::StreamMap::from_fn(|tag| {
+        let spec = &crate::streams::REGISTRY[tag.index()];
+        SparseSubStream::with_capacity(spec.key_bytes, estimated_nnz, columns)
+    });
 
     let words: &[u64] = &chunk.genos.words;
 
     // Sample-major transpose; route each set call to its stream.
     for s in 0..num_samples {
         for p in 0..ploidy {
-            let mut snp_calls = 0u32;
-            let mut indel_calls = 0u32;
-
+            // per-tag running counts for this column
+            let mut counts = crate::streams::StreamMap::from_fn(|_| 0u32);
             let base_idx = (s * ploidy) + p;
             let stride = columns;
 
@@ -322,29 +323,27 @@ pub fn dense2sparse_vk(chunk: &DenseChunk, bank: &mut LongAlleleTableWriter) -> 
 
                 if (word >> (flat_idx & 63)) & 1 != 0 {
                     let pos = unsafe { *chunk.pos.get_unchecked(v) };
-                    match unsafe { *var_keys.get_unchecked(v) } {
-                        VarKey::Snp(code) => {
-                            snp.call_positions.push(pos);
-                            snp.call_keys.push(code);
-                            snp_calls += 1;
-                        }
-                        VarKey::Indel(key) => {
-                            indel.call_positions.push(pos);
-                            indel.call_keys.push(key);
-                            indel_calls += 1;
-                        }
-                    }
+                    let (tag, key_le): (StreamTag, [u8; 4]) =
+                        match unsafe { *var_keys.get_unchecked(v) } {
+                            VarKey::Snp(code) => (StreamTag::VarKeySnp, [code, 0, 0, 0]),
+                            VarKey::Indel(key) => (StreamTag::VarKeyIndel, key.to_le_bytes()),
+                        };
+                    let spec = &crate::streams::REGISTRY[tag.index()];
+                    streams
+                        .get_mut(tag)
+                        .push_call(pos, &key_le[..spec.key_bytes]);
+                    *counts.get_mut(tag) += 1;
                 }
             }
-            snp.sample_lengths.push(snp_calls);
-            indel.sample_lengths.push(indel_calls);
+            for (tag, c) in counts.into_iter_tagged() {
+                streams.get_mut(tag).sample_lengths.push(c);
+            }
         }
     }
 
     SparseChunk {
         chunk_id: chunk.chunk_id,
-        snp,
-        indel,
+        streams,
     }
 }
 
@@ -670,11 +669,13 @@ mod tests {
         let chunk = build_test_chunk(0, 2, 2, &[], &[], &[]);
         let mut bank = make_bank();
         let sparse = dense2sparse_vk(&chunk, &mut bank);
-        assert_eq!(sparse.snp.call_positions.len(), 0);
-        assert_eq!(sparse.snp.call_keys.len(), 0);
-        assert_eq!(sparse.snp.sample_lengths, vec![0u32; 4]);
-        assert_eq!(sparse.indel.call_positions.len(), 0);
-        assert_eq!(sparse.indel.sample_lengths, vec![0u32; 4]);
+        let snp = sparse.streams.get(StreamTag::VarKeySnp);
+        let indel = sparse.streams.get(StreamTag::VarKeyIndel);
+        assert_eq!(snp.call_positions.len(), 0);
+        assert_eq!(snp.call_keys.len(), 0);
+        assert_eq!(snp.sample_lengths, vec![0u32; 4]);
+        assert_eq!(indel.call_positions.len(), 0);
+        assert_eq!(indel.sample_lengths, vec![0u32; 4]);
     }
 
     #[test]
@@ -691,13 +692,15 @@ mod tests {
         let chunk = build_test_chunk(n_variants, n_samples, ploidy, &refs, &alts, &bit_pattern);
         let mut bank = make_bank();
         let sparse = dense2sparse_vk(&chunk, &mut bank);
+        let snp = sparse.streams.get(StreamTag::VarKeySnp);
+        let indel = sparse.streams.get(StreamTag::VarKeyIndel);
 
-        assert_eq!(sparse.snp.call_positions.len(), 12);
-        assert_eq!(sparse.snp.sample_lengths, vec![3, 3, 3, 3]);
+        assert_eq!(snp.call_positions.len(), 12);
+        assert_eq!(snp.sample_lengths, vec![3, 3, 3, 3]);
         // First hap's slice is positions [100, 110, 120]
-        assert_eq!(&sparse.snp.call_positions[0..3], &[100, 110, 120]);
-        assert_eq!(&sparse.snp.call_positions[3..6], &[100, 110, 120]);
-        assert_eq!(sparse.indel.call_positions.len(), 0);
+        assert_eq!(&snp.call_positions[0..3], &[100, 110, 120]);
+        assert_eq!(&snp.call_positions[3..6], &[100, 110, 120]);
+        assert_eq!(indel.call_positions.len(), 0);
     }
 
     // A mixed chunk: variant 0 is a SNP (A→C), variant 1 is an INS (A→AT),
@@ -713,19 +716,23 @@ mod tests {
 
         let mut bank = make_bank();
         let sparse = dense2sparse_vk(&chunk, &mut bank);
+        let snp = sparse.streams.get(StreamTag::VarKeySnp);
+        let indel = sparse.streams.get(StreamTag::VarKeyIndel);
 
         // Two haplotypes, each: 1 SNP call + 2 indel calls.
-        assert_eq!(sparse.snp.sample_lengths, vec![1, 1]);
-        assert_eq!(sparse.indel.sample_lengths, vec![2, 2]);
+        assert_eq!(snp.sample_lengths, vec![1, 1]);
+        assert_eq!(indel.sample_lengths, vec![2, 2]);
 
         // SNP stream: position 100 (variant 0), code for 'C' == 1.
-        assert_eq!(sparse.snp.call_positions, vec![100, 100]);
-        assert_eq!(sparse.snp.call_keys, vec![1u8, 1u8]);
+        assert_eq!(snp.call_positions, vec![100, 100]);
+        assert_eq!(snp.call_keys, vec![1u8, 1u8]);
 
         // Indel stream: positions 110 (INS) then 120 (DEL) per hap, keys decode back.
-        assert_eq!(sparse.indel.call_positions, vec![110, 120, 110, 120]);
-        assert_eq!(decode_alt_inline(sparse.indel.call_keys[0]), b"AT".to_vec());
-        assert_eq!((sparse.indel.call_keys[1] as i32) >> 1, -1); // DEL ilen = -1
+        assert_eq!(indel.call_positions, vec![110, 120, 110, 120]);
+        let decode_key =
+            |i: usize| u32::from_le_bytes(indel.call_keys[i * 4..i * 4 + 4].try_into().unwrap());
+        assert_eq!(decode_alt_inline(decode_key(0)), b"AT".to_vec());
+        assert_eq!((decode_key(1) as i32) >> 1, -1); // DEL ilen = -1
     }
 
     proptest! {
@@ -752,13 +759,15 @@ mod tests {
 
             let mut bank = make_bank();
             let sparse = dense2sparse_vk(&chunk, &mut bank);
+            let snp = sparse.streams.get(StreamTag::VarKeySnp);
+            let indel = sparse.streams.get(StreamTag::VarKeyIndel);
 
-            let total_calls: u32 = sparse.snp.sample_lengths.iter().sum();
+            let total_calls: u32 = snp.sample_lengths.iter().sum();
             prop_assert_eq!(total_calls as usize, true_count, "lost or doubled mutations");
-            prop_assert_eq!(sparse.snp.call_positions.len(), true_count);
-            prop_assert_eq!(sparse.snp.call_keys.len(), true_count);
-            prop_assert_eq!(sparse.snp.sample_lengths.len(), n_samples * ploidy);
-            prop_assert_eq!(sparse.indel.call_positions.len(), 0);
+            prop_assert_eq!(snp.call_positions.len(), true_count);
+            prop_assert_eq!(snp.call_keys.len(), true_count);
+            prop_assert_eq!(snp.sample_lengths.len(), n_samples * ploidy);
+            prop_assert_eq!(indel.call_positions.len(), 0);
         }
 
         // Per-sample correctness: for each (s,p) hap, the slice of call_positions
@@ -780,12 +789,13 @@ mod tests {
 
             let mut bank = make_bank();
             let sparse = dense2sparse_vk(&chunk, &mut bank);
+            let snp = sparse.streams.get(StreamTag::VarKeySnp);
 
             let mut cursor = 0usize;
             for s in 0..n_samples {
                 for p in 0..ploidy {
                     let hap_idx = s * ploidy + p;
-                    let calls = sparse.snp.sample_lengths[hap_idx] as usize;
+                    let calls = snp.sample_lengths[hap_idx] as usize;
 
                     // Compute expected positions from the bit pattern + chunk.pos
                     let expected: Vec<u32> = (0..n_variants).filter_map(|v| {
@@ -793,12 +803,12 @@ mod tests {
                         if bit_pattern[flat_idx] { Some(chunk.pos[v]) } else { None }
                     }).collect();
 
-                    let actual: Vec<u32> = sparse.snp.call_positions[cursor..cursor + calls].to_vec();
+                    let actual: Vec<u32> = snp.call_positions[cursor..cursor + calls].to_vec();
                     prop_assert_eq!(&actual, &expected, "hap {} positions mismatch", hap_idx);
                     cursor += calls;
                 }
             }
-            prop_assert_eq!(cursor, sparse.snp.call_positions.len());
+            prop_assert_eq!(cursor, snp.call_positions.len());
         }
     }
 }

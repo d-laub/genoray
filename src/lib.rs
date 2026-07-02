@@ -65,10 +65,18 @@ pub fn process_chromosome(
 ) {
     // Directory Formatting: svar2/{contig}/var_key/{snp,indel}
     let paths = crate::layout::ContigPaths::new(base_out_dir, chrom);
-    let snp_dir = paths.var_key_snp_dir().to_str().unwrap().to_string();
-    let indel_dir = paths.var_key_indel_dir().to_str().unwrap().to_string();
-    fs::create_dir_all(&snp_dir).expect("Failed to create snp output directory");
-    fs::create_dir_all(&indel_dir).expect("Failed to create indel output directory");
+
+    // Stream dirs keyed by tag, created up front. Adding a new stream means
+    // extending `streams::REGISTRY` only — nothing here needs to change.
+    let stream_dirs: crate::streams::StreamMap<std::path::PathBuf> =
+        crate::streams::StreamMap::from_fn(|tag| {
+            let spec = &crate::streams::REGISTRY[tag.index()];
+            let dir = std::path::Path::new(base_out_dir)
+                .join(chrom)
+                .join(spec.subdir);
+            fs::create_dir_all(&dir).expect("create stream output dir");
+            dir
+        });
 
     // Channel capacities tuned for cohort-scale workloads.
     // - tx_dense=6: smooths HTSlib BGZF block-boundary jitter so the executor
@@ -125,13 +133,13 @@ pub fn process_chromosome(
         .expect("spawn executor");
 
     // Step 3a -> The chunk writer
+    // StreamMap isn't Clone, so build a separate owned copy (PathBuf IS Clone)
+    // for the writer thread to move into its closure; `stream_dirs` itself is
+    // kept for the post-Phase-1 merge loop below.
+    let dirs_for_writer = crate::streams::StreamMap::from_fn(|tag| stream_dirs.get(tag).clone());
     let chunk_writer_thread = thread::Builder::new()
         .name(format!("cw-{}", chrom))
-        .spawn({
-            let snp = snp_dir.clone();
-            let indel = indel_dir.clone();
-            move || writer::run_io_writer(rx_sparse, &snp, &indel)
-        })
+        .spawn(move || writer::run_io_writer(rx_sparse, dirs_for_writer))
         .expect("spawn chunk writer");
 
     // Step 3b -> The long allele chunk writer
@@ -174,7 +182,7 @@ pub fn process_chromosome(
     stop_sampler.store(true, Ordering::Relaxed);
     sampler_thread.join().unwrap();
 
-    let (snp_ledger, indel_ledger, long_allele_offsets) = executor_thread.join().unwrap();
+    let (ledgers, long_allele_offsets) = executor_thread.join().unwrap();
     chunk_writer_thread.join().unwrap();
     long_allele_writer_thread.join().unwrap();
 
@@ -188,21 +196,24 @@ pub fn process_chromosome(
     ndarray_npy::write_npy(paths.long_allele_offsets(), &offsets_array)
         .expect("Failed to write long allele offsets");
 
-    let num_chunks = snp_ledger.len(); // == indel_ledger.len() (one row per chunk)
-
-    // SNP stream: merge u8 keys, then bit-pack the merged stream to 2 bits/call.
-    merge::merge_mini_sc(1, num_chunks, samples.len(), ploidy, &snp_dir, snp_ledger);
-    rvk::pack_snp_key_file(&snp_dir);
-
-    // Indel stream: merge 32-bit keys.
-    merge::merge_mini_sc(
-        4,
-        num_chunks,
-        samples.len(),
-        ploidy,
-        &indel_dir,
-        indel_ledger,
-    );
+    // num_chunks is identical across streams — one ledger row per chunk.
+    let num_chunks = ledgers.get(crate::streams::StreamTag::VarKeyIndel).len();
+    let mut ledgers = ledgers; // make mutable to move rows out
+    for spec in &crate::streams::REGISTRY {
+        let dir = stream_dirs.get(spec.tag).clone();
+        let ledger = std::mem::take(ledgers.get_mut(spec.tag));
+        merge::merge_mini_sc(
+            spec.key_bytes,
+            num_chunks,
+            samples.len(),
+            ploidy,
+            dir.to_str().unwrap(),
+            ledger,
+        );
+        if let Some(hook) = spec.post_merge {
+            hook(&dir);
+        }
+    }
 
     println!("[{}] Pipeline Execution Finished Successfully.", chrom);
 }
