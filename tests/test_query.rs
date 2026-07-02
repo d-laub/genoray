@@ -4,6 +4,8 @@
 
 mod common;
 
+use proptest::prelude::*;
+
 use common::{SynthRecord, build_bcf_with_index};
 use genoray_core::process_chromosome;
 use genoray_core::query::ContigReader;
@@ -246,4 +248,153 @@ fn test_overlap_sample_var_key_snp_nonzero_csr_offset() {
     // local-`i` regression breaks: it would decode col 0's code and return `C`.
     assert_eq!(r.per_hap[1].positions, vec![200]);
     assert_eq!(r.per_hap[1].alts, vec![b"G".to_vec()]);
+}
+
+/// Owned analogue of `SynthRecord` (proptest needs values that outlive the
+/// borrow). One atomized bi-allelic variant.
+#[derive(Clone, Debug)]
+struct OwnedRecord {
+    pos: i64,
+    ref_allele: Vec<u8>,
+    alt: Vec<u8>,
+    gt: Vec<i32>, // len == n_haps
+}
+
+/// Random atomized contig: strictly increasing positions, each variant a SNP,
+/// INS (alt = anchor + tail), or DEL (ref = anchor + tail), with random per-hap
+/// genotypes. INS tails reach 15 bases so some insertions spill to the LUT.
+fn arb_records(n_haps: usize) -> impl Strategy<Value = Vec<OwnedRecord>> {
+    proptest::collection::vec(
+        (
+            0u8..3u8,                                            // kind: 0 SNP, 1 INS, 2 DEL
+            0usize..4,                                           // anchor base index
+            0usize..4,                                           // SNP alt base index
+            proptest::collection::vec(0usize..4, 1..16),         // INS/DEL tail (>= 1 base)
+            proptest::collection::vec(0i32..2, n_haps..=n_haps), // genotypes
+            1u32..40u32,                                         // position gap
+        ),
+        1..8, // 1..7 records; empty contigs are covered by the degenerate tests
+    )
+    .prop_map(move |specs| {
+        const BASES: [u8; 4] = [b'A', b'C', b'T', b'G'];
+        let mut pos: i64 = 100;
+        let mut out = Vec::new();
+        for (kind, anchor, snp_alt, tail, gt, gap) in specs {
+            pos += gap as i64;
+            let b0 = BASES[anchor];
+            let (ref_allele, alt) = match kind {
+                0 => {
+                    let alt_idx = if snp_alt == anchor {
+                        (anchor + 1) % 4
+                    } else {
+                        snp_alt
+                    };
+                    (vec![b0], vec![BASES[alt_idx]])
+                }
+                1 => {
+                    let mut a = vec![b0];
+                    a.extend(tail.iter().map(|&x| BASES[x]));
+                    (vec![b0], a)
+                }
+                _ => {
+                    let mut r = vec![b0];
+                    r.extend(tail.iter().map(|&x| BASES[x]));
+                    (r, vec![b0])
+                }
+            };
+            out.push(OwnedRecord {
+                pos,
+                ref_allele,
+                alt,
+                gt,
+            });
+        }
+        out
+    })
+}
+
+/// Brute-force reference: for `sample`, per hap, the carried variants overlapping
+/// `[q_start, q_end)` in position order. `alt` matches the query contract — the
+/// ALT bases for SNP/INS, empty for a pure DEL.
+#[allow(clippy::type_complexity)]
+fn oracle(
+    records: &[OwnedRecord],
+    sample: usize,
+    ploidy: usize,
+    q_start: u32,
+    q_end: u32,
+) -> Vec<(Vec<u32>, Vec<i32>, Vec<Vec<u8>>)> {
+    let mut per_hap: Vec<(Vec<u32>, Vec<i32>, Vec<Vec<u8>>)> =
+        vec![(Vec::new(), Vec::new(), Vec::new()); ploidy];
+    for rec in records {
+        let pos = rec.pos as u32;
+        let ilen = rec.alt.len() as i32 - rec.ref_allele.len() as i32;
+        let del = if ilen < 0 { (-ilen) as u32 } else { 0 };
+        let v_end = pos + 1 + del;
+        if !(pos < q_end && q_start < v_end) {
+            continue;
+        }
+        let alt = if ilen < 0 {
+            Vec::new()
+        } else {
+            rec.alt.clone()
+        };
+        #[allow(clippy::needless_range_loop)]
+        for p in 0..ploidy {
+            let hap = sample * ploidy + p;
+            if rec.gt[hap] == 1 {
+                per_hap[p].0.push(pos);
+                per_hap[p].1.push(ilen);
+                per_hap[p].2.push(alt.clone());
+            }
+        }
+    }
+    per_hap // records are position-sorted, so each hap's lists already are too
+}
+
+proptest! {
+    // Heavy: each case runs the full converter (BCF write + index + pipeline), so
+    // the case count is deliberately low. Not a silent cap — 24 random contigs,
+    // each queried for every sample, is the primary correctness gate for the
+    // dense/var_key union.
+    #![proptest_config(ProptestConfig::with_cases(24))]
+
+    #[test]
+    fn prop_overlap_sample_matches_oracle(
+        records in arb_records(6), // 3 samples, diploid -> 6 haps
+        q_start in 0u32..1200,
+        q_len in 1u32..300,
+    ) {
+        let n_samples = 3;
+        let ploidy = 2;
+        let sample_names = ["S0", "S1", "S2"];
+
+        let synth: Vec<SynthRecord> = records
+            .iter()
+            .map(|r| SynthRecord {
+                pos: r.pos,
+                ref_allele: &r.ref_allele,
+                alts: vec![&r.alt[..]],
+                gt: r.gt.clone(),
+            })
+            .collect();
+
+        let tmp = tempdir().unwrap();
+        let out = tmp.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        build_contig(&out, "chr1", &sample_names, ploidy, &synth);
+        let reader = ContigReader::open(out.to_str().unwrap(), "chr1", n_samples, ploidy).unwrap();
+
+        let q_end = q_start + q_len;
+        for s in 0..n_samples {
+            let got = overlap_sample(&reader, s, q_start, q_end);
+            let want = oracle(&records, s, ploidy, q_start, q_end);
+            #[allow(clippy::needless_range_loop)]
+            for p in 0..ploidy {
+                prop_assert_eq!(&got.per_hap[p].positions, &want[p].0, "s={} p={} positions", s, p);
+                prop_assert_eq!(&got.per_hap[p].ilens, &want[p].1, "s={} p={} ilens", s, p);
+                prop_assert_eq!(&got.per_hap[p].alts, &want[p].2, "s={} p={} alts", s, p);
+            }
+        }
+    }
 }
