@@ -10,6 +10,12 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
+// SNP 2-bit key primitives now live in `svar2-codec`. Re-exported so existing
+// `crate::rvk::<name>` call sites (query.rs, dense_merge.rs, tests) resolve.
+pub use svar2_codec::{
+    decode_snp_2bit, encode_snp_2bit, pack_snp_keys, unpack_snp_key_at, unpack_snp_keys,
+};
+
 // Reversed byte loading
 //
 // Places base[0] in the HIGH byte of block1, base[7] in the LOW byte.
@@ -120,32 +126,6 @@ fn encode_snp(alt_base: u8) -> u32 {
     ((alt_base as u32 >> 1) & 3) << 25
 }
 
-// Bare 2-bit ALT code for the SNP stream: A=00 C=01 T=10 G=11.
-// Same branchless mapping as `encode_snp`, without the shift into bits[26:25].
-#[inline(always)]
-pub fn encode_snp_2bit(base: u8) -> u8 {
-    (base >> 1) & 3
-}
-
-// Pack 2-bit SNP codes 4-per-byte, little-pair-first: code `i` occupies bits
-// [(i&3)*2 + 1 : (i&3)*2] of byte `i >> 2`. The final byte is zero-padded when
-// `codes.len()` is not a multiple of 4. Offsets index CALLS, not bytes, so a
-// reader recovers code `i` as `(packed[i >> 2] >> ((i & 3) * 2)) & 3`.
-pub fn pack_snp_keys(codes: &[u8]) -> Vec<u8> {
-    let mut out = vec![0u8; codes.len().div_ceil(4)];
-    for (i, &c) in codes.iter().enumerate() {
-        out[i >> 2] |= (c & 3) << ((i & 3) * 2);
-    }
-    out
-}
-
-// Inverse of `pack_snp_keys`. Returns the first `n` codes.
-pub fn unpack_snp_keys(packed: &[u8], n: usize) -> Vec<u8> {
-    (0..n)
-        .map(|i| (packed[i >> 2] >> ((i & 3) * 2)) & 3)
-        .collect()
-}
-
 // Post-merge pass for the SNP stream: read the merged `alleles.bin` (one
 // u8 code per call) and rewrite it 2-bit packed (4 calls/byte). Streams in
 // 4-MiB blocks (a multiple of 4, so no pack straddles a block boundary except
@@ -253,21 +233,6 @@ pub fn decode_key(key: u32) -> DecodedKey {
             alt: decode_alt_inline(key),
         }
     }
-}
-
-/// Recover the ALT base for a 2-bit SNP code (`A=00 C=01 T=10 G=11`). Inverse of
-/// [`encode_snp_2bit`].
-#[inline]
-pub fn decode_snp_2bit(code: u8) -> u8 {
-    const BASES: [u8; 4] = [b'A', b'C', b'T', b'G'];
-    BASES[(code & 3) as usize]
-}
-
-/// Read the 2-bit SNP code at call index `i` from a 2-bit-packed key buffer
-/// (4 codes/byte; see [`pack_snp_keys`]) without materializing the whole array.
-#[inline]
-pub fn unpack_snp_key_at(packed: &[u8], i: usize) -> u8 {
-    (packed[i >> 2] >> ((i & 3) * 2)) & 3
 }
 
 // Pack a single variant into its 32-bit key.
@@ -610,15 +575,6 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_snp_2bit_mapping() {
-        // A=00 C=01 T=10 G=11 via (base >> 1) & 3
-        assert_eq!(encode_snp_2bit(b'A'), 0);
-        assert_eq!(encode_snp_2bit(b'C'), 1);
-        assert_eq!(encode_snp_2bit(b'T'), 2);
-        assert_eq!(encode_snp_2bit(b'G'), 3);
-    }
-
-    #[test]
     fn test_decode_key_roundtrips_pack_variant() {
         let mut bank = make_bank();
         // SNP A->C: ilen 0, alt "C" inline.
@@ -649,45 +605,6 @@ mod tests {
         let mut bank = make_bank();
         let big = pack_variant(MIN_I31, b"A", &mut bank);
         assert_eq!(deletion_len(big), (-(MIN_I31 as i64)) as u32);
-    }
-
-    #[test]
-    fn test_decode_snp_2bit_inverts_encode() {
-        for &b in b"ACTG" {
-            assert_eq!(decode_snp_2bit(encode_snp_2bit(b)), b);
-        }
-    }
-
-    #[test]
-    fn test_unpack_snp_key_at_matches_unpack_all() {
-        let codes = [1u8, 2, 3, 0, 2, 1, 3];
-        let packed = pack_snp_keys(&codes);
-        let all = unpack_snp_keys(&packed, codes.len());
-        for i in 0..codes.len() {
-            assert_eq!(unpack_snp_key_at(&packed, i), all[i], "code {}", i);
-            assert_eq!(unpack_snp_key_at(&packed, i), codes[i]);
-        }
-    }
-
-    #[test]
-    fn test_pack_snp_keys_exact_layout() {
-        // codes [1, 2, 3, 0, 1] → byte0 = 1 | (2<<2) | (3<<4) | (0<<6) = 0b00_11_10_01 = 0x39
-        //                        → byte1 = 1 (only low pair) = 0x01
-        let packed = pack_snp_keys(&[1, 2, 3, 0, 1]);
-        assert_eq!(packed, vec![0x39, 0x01]);
-    }
-
-    proptest! {
-        #![proptest_config(ProptestConfig::with_cases(2000))]
-
-        // pack → unpack roundtrips for any length and any codes in 0..=3.
-        #[test]
-        fn test_pack_unpack_snp_roundtrip(codes in proptest::collection::vec(0u8..=3, 0..100)) {
-            let packed = pack_snp_keys(&codes);
-            prop_assert_eq!(packed.len(), codes.len().div_ceil(4));
-            let unpacked = unpack_snp_keys(&packed, codes.len());
-            prop_assert_eq!(unpacked, codes);
-        }
     }
 
     // PEXT path (when BMI2 present) must produce byte-identical output to SWAR.
