@@ -28,11 +28,19 @@ impl ContigPaths {
     pub fn var_key_indel_dir(&self) -> PathBuf {
         self.var_key_dir().join("indel")
     }
+    /// Shared per-contig indel long-allele LUT dir. Both var_key/indel and
+    /// dense/indel reference this single table (spilled keys are
+    /// representation-portable).
+    pub fn shared_indel_dir(&self) -> PathBuf {
+        Path::new(&self.base_out_dir)
+            .join(&self.chrom)
+            .join("indel")
+    }
     pub fn long_alleles_bin(&self) -> PathBuf {
-        self.var_key_indel_dir().join("long_alleles.bin")
+        self.shared_indel_dir().join("long_alleles.bin")
     }
     pub fn long_allele_offsets(&self) -> PathBuf {
-        self.var_key_indel_dir().join("long_allele_offsets.npy")
+        self.shared_indel_dir().join("long_allele_offsets.npy")
     }
 }
 
@@ -64,15 +72,15 @@ mod tests {
     }
 
     #[test]
-    fn test_long_allele_paths_live_under_indel() {
+    fn test_long_allele_paths_live_under_shared_indel() {
         let p = ContigPaths::new("/out", "chr1");
         assert_eq!(
             p.long_alleles_bin(),
-            Path::new("/out/chr1/var_key/indel/long_alleles.bin")
+            Path::new("/out/chr1/indel/long_alleles.bin")
         );
         assert_eq!(
             p.long_allele_offsets(),
-            Path::new("/out/chr1/var_key/indel/long_allele_offsets.npy")
+            Path::new("/out/chr1/indel/long_allele_offsets.npy")
         );
     }
 

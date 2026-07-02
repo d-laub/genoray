@@ -70,6 +70,11 @@ pub fn process_chromosome(
             source: e,
         })?;
     }
+    // Shared per-contig indel LUT dir (long alleles for var_key + dense indels).
+    fs::create_dir_all(paths.shared_indel_dir()).map_err(|e| ConversionError::Io {
+        context: format!("create_dir_all {:?}", paths.shared_indel_dir()),
+        source: e,
+    })?;
 
     // Channel capacities tuned for cohort-scale workloads.
     // - tx_dense=6: smooths HTSlib BGZF block-boundary jitter so the executor
