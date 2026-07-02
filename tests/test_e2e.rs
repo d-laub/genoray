@@ -4,119 +4,17 @@
 // pushes it through the full process_chromosome → merge pipeline, and
 // validates the final sample-major sparse outputs against hand-computed
 // ground truth.
-//
-// Also covers the negative side of the atomization contract: multi-allelic
-// records and complex variants must panic at the reader, not silently corrupt
-// downstream data.
 
+mod common;
+
+use common::{
+    DecodedKey, SynthRecord, build_bcf_with_index, decode_key, read_offsets_npy, read_u32_bin,
+};
 use genoray_core::process_chromosome;
-use genoray_core::rvk::{decode_alt_inline, unpack_snp_keys};
+use genoray_core::rvk::unpack_snp_keys;
 use genoray_core::vcf_reader::VcfChunkReader;
 
-use rust_htslib::bcf::record::GenotypeAllele;
-use rust_htslib::bcf::{Format, Header, Writer};
-
-use std::path::Path;
 use tempfile::tempdir;
-
-// One synthetic VCF record: position, ref allele, list of alt alleles, and a
-// flat genotype vector laid out as [s0_p0, s0_p1, s1_p0, s1_p1, ...] holding
-// allele indices (0 = ref, 1 = first alt, …).
-struct SynthRecord<'a> {
-    pos: i64,
-    ref_allele: &'a [u8],
-    alts: Vec<&'a [u8]>,
-    gt: Vec<i32>,
-}
-
-fn build_bcf_with_index(
-    bcf_path: &Path,
-    chrom: &str,
-    chrom_len: u64,
-    samples: &[&str],
-    records: &[SynthRecord],
-) {
-    let mut header = Header::new();
-    let contig = format!("##contig=<ID={},length={}>", chrom, chrom_len);
-    header.push_record(contig.as_bytes());
-    header.push_record(b"##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">");
-    for s in samples {
-        header.push_sample(s.as_bytes());
-    }
-
-    {
-        let mut writer =
-            Writer::from_path(bcf_path, &header, false, Format::Bcf).expect("open BCF writer");
-
-        for rec in records {
-            let mut record = writer.empty_record();
-            record.set_rid(Some(0));
-            record.set_pos(rec.pos);
-
-            // set_alleles wants &[&[u8]] starting with ref then alts
-            let mut alleles: Vec<&[u8]> = Vec::with_capacity(1 + rec.alts.len());
-            alleles.push(rec.ref_allele);
-            for a in &rec.alts {
-                alleles.push(a);
-            }
-            record.set_alleles(&alleles).expect("set alleles");
-
-            let gt_alleles: Vec<GenotypeAllele> =
-                rec.gt.iter().map(|&i| GenotypeAllele::Phased(i)).collect();
-            record.push_genotypes(&gt_alleles).expect("push genotypes");
-
-            writer.write(&record).expect("write record");
-        }
-        // writer drops here, finalizing the BCF file
-    }
-
-    // Build CSI index alongside the BCF so IndexedReader can fetch by chrom.
-    // BCF only supports CSI (TBI is text-VCF-only). min_shift=14 is the htslib
-    // standard for genomic data; n_threads=0 means synchronous build.
-    rust_htslib::bcf::index::build(bcf_path, None, 0, rust_htslib::bcf::index::Type::Csi(14))
-        .expect("build BCF index");
-}
-
-fn read_u32_bin(path: &Path) -> Vec<u32> {
-    // Alignment-agnostic decode: std::fs::read can hand back a Vec<u8> whose
-    // pointer isn't 4-byte aligned (especially when empty), which would trip
-    // bytemuck::cast_slice's TargetAlignmentGreater check.
-    let bytes = std::fs::read(path).expect("read u32 bin");
-    bytes
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
-}
-
-fn read_offsets_npy(path: &Path) -> Vec<u64> {
-    let arr: ndarray::Array1<u64> = ndarray_npy::read_npy(path).expect("read offsets npy");
-    arr.to_vec()
-}
-
-// Decode a single packed key. Discriminator:
-//   bit 0 = 1                 → lookup (long allele bank row index)
-//   bit 0 = 0 AND bit 31 = 1  → pure DEL (signed ilen in upper 31 bits)
-//   bit 0 = 0 AND bit 31 = 0  → inline ALT (top 5 bits hold the length field)
-#[derive(Debug, PartialEq)]
-enum DecodedKey {
-    Inline { alt: Vec<u8> },
-    PureDel { ilen: i32 },
-    Lookup { row: u32 },
-}
-
-fn decode_key(key: u32) -> DecodedKey {
-    if key & 1 == 1 {
-        DecodedKey::Lookup { row: key >> 1 }
-    } else if (key as i32) < 0 {
-        DecodedKey::PureDel {
-            ilen: (key as i32) >> 1,
-        }
-    } else {
-        DecodedKey::Inline {
-            alt: decode_alt_inline(key),
-        }
-    }
-}
 
 // Positive E2E: 3 records spanning SNP / INS / pure DEL across 2 samples diploid.
 //   pos=100  A  → C    (SNP)        gt = [1, 0, 1, 1]   → haps 0, 2, 3 carry it
@@ -283,61 +181,7 @@ fn test_e2e_mutation_conservation() {
     assert_eq!(indel_pos.len(), 0);
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// Negative tests — the reader must panic on inputs that violate the
-// `bcftools norm -m -any --atomize` contract. We invoke VcfChunkReader
-// directly so the panic surfaces in the test thread (process_chromosome
-// would route it through JoinHandle::unwrap, masking the message).
-// ─────────────────────────────────────────────────────────────────────────
-
-#[test]
-#[should_panic(expected = "must be normalized")]
-fn test_reader_panics_on_multi_allelic() {
-    let tmp = tempdir().unwrap();
-    let bcf_path = tmp.path().join("multi.bcf");
-
-    let samples = vec!["S0"];
-    let records = vec![
-        // 3-allele record: REF + 2 ALTs → forbidden by `bcftools norm -m -any`
-        SynthRecord {
-            pos: 100,
-            ref_allele: b"A",
-            alts: vec![&b"C"[..], &b"G"[..]],
-            gt: vec![1, 2],
-        },
-    ];
-    build_bcf_with_index(&bcf_path, "chr1", 10_000, &samples, &records);
-
-    let mut reader = VcfChunkReader::new(bcf_path.to_str().unwrap(), "chr1", &samples, 1, 2);
-    let _ = reader.read_next_chunk(100, 0); // panics here
-}
-
-#[test]
-#[should_panic(expected = "must be atomized")]
-fn test_reader_panics_on_complex_variant() {
-    let tmp = tempdir().unwrap();
-    let bcf_path = tmp.path().join("complex.bcf");
-
-    let samples = vec!["S0"];
-    let records = vec![
-        // Complex variant: ref=ATG (3bp), alt=CG (2bp).
-        // alt_len=2 > 1 AND alt_len=2 < ref_len=3 → forbidden by `bcftools norm --atomize`
-        SynthRecord {
-            pos: 100,
-            ref_allele: b"ATG",
-            alts: vec![&b"CG"[..]],
-            gt: vec![1, 1],
-        },
-    ];
-    build_bcf_with_index(&bcf_path, "chr1", 10_000, &samples, &records);
-
-    let mut reader = VcfChunkReader::new(bcf_path.to_str().unwrap(), "chr1", &samples, 1, 2);
-    let _ = reader.read_next_chunk(100, 0); // panics here
-}
-
-// Sanity: a clean, properly atomized DEL (alt_len=1) does NOT trip the panic.
-// Acts as a regression guard: we don't want the atomization assert to false-
-// positive on legitimate pure deletions.
+// Sanity: a clean, properly atomized DEL (alt_len=1) passes the reader.
 #[test]
 fn test_reader_accepts_pure_del() {
     let tmp = tempdir().unwrap();
