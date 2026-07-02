@@ -1,5 +1,6 @@
 use crate::cost_model::{Class, Representation, choose_representation};
 use crate::dense::{DenseClass, DenseMap};
+use crate::layout;
 use crate::nrvk::LongAlleleTableWriter;
 use crate::streams::StreamTag;
 use crate::types::{
@@ -7,6 +8,7 @@ use crate::types::{
 };
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
+use std::path::Path;
 
 // Reversed byte loading
 //
@@ -148,9 +150,9 @@ pub fn unpack_snp_keys(packed: &[u8], n: usize) -> Vec<u8> {
 // u8 code per call) and rewrite it 2-bit packed (4 calls/byte). Streams in
 // 4-MiB blocks (a multiple of 4, so no pack straddles a block boundary except
 // the genuine EOF tail). Offsets are call-indexed and need no change.
-pub fn pack_snp_key_file(dir: &str) {
-    let src = format!("{}/alleles.bin", dir);
-    let tmp = format!("{}/alleles.packed.tmp", dir);
+pub fn pack_snp_key_file(dir: &Path) {
+    let src = layout::alleles(dir);
+    let tmp = dir.join("alleles.packed.tmp");
 
     let mut reader = BufReader::new(File::open(&src).expect("open snp alleles.bin"));
     let mut writer = BufWriter::new(File::create(&tmp).expect("create packed tmp"));

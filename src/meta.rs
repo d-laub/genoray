@@ -25,9 +25,10 @@ pub fn write_meta(
         "contigs": contigs,
         "ploidy": ploidy,
     });
-    // Serializing a serde_json::Value cannot fail (no custom Serialize), so the
-    // only real error is the filesystem write.
-    let bytes = serde_json::to_vec_pretty(&meta).expect("serialize meta.json value");
+    // Serializing a plain serde_json::Value effectively cannot fail (no custom
+    // Serialize), but propagate rather than panic to keep the io::Result contract
+    // uniform; the real error is almost always the filesystem write below.
+    let bytes = serde_json::to_vec_pretty(&meta).map_err(std::io::Error::other)?;
     std::fs::write(output_dir.join("meta.json"), bytes)
 }
 

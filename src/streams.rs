@@ -37,7 +37,7 @@ pub const REGISTRY: [StreamSpec; StreamTag::COUNT] = [
         tag: StreamTag::VarKeySnp,
         subdir: "var_key/snp",
         key_bytes: 1,
-        post_merge: Some(pack_snp_key_file_path),
+        post_merge: Some(pack_snp_key_file),
     },
     StreamSpec {
         tag: StreamTag::VarKeyIndel,
@@ -46,11 +46,6 @@ pub const REGISTRY: [StreamSpec; StreamTag::COUNT] = [
         post_merge: None,
     },
 ];
-
-// pack_snp_key_file currently takes &str; adapt to the fn(&Path) hook shape.
-fn pack_snp_key_file_path(dir: &Path) {
-    pack_snp_key_file(dir.to_str().expect("stream dir is valid UTF-8"));
-}
 
 /// Fixed-size map keyed by `StreamTag`, backed by an array (O(1), no hashing).
 pub struct StreamMap<T> {
