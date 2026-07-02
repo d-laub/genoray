@@ -39,9 +39,8 @@ pub struct VcfChunkReader {
     num_samples: usize,
     ploidy: usize,
     sample_indices: Vec<usize>,
-    // full 0-based contig sequence, uppercased. Cached now so `new`'s signature and
-    // loading are stable; consumed by `validate_ref`/`left_align` starting M2b Task 4.
-    #[allow(dead_code)]
+    // full 0-based contig sequence, uppercased. Consumed by `validate_ref`/`left_align`
+    // in `decompose_current_record`.
     ref_seq: Vec<u8>,
 
     // Reorder state, persisted across read_next_chunk calls.
@@ -152,12 +151,20 @@ impl VcfChunkReader {
         }
         let gt = Rc::new(gt);
 
+        // Fail fast if the record's REF disagrees with the reference FASTA — left-alignment
+        // rolls against the reference, so a mismatch would silently corrupt positions.
+        crate::normalize::validate_ref(pos, &ref_allele, &self.ref_seq)
+            .expect("REF disagrees with reference FASTA");
+
         let alt_refs: Vec<&[u8]> = alts_owned.iter().map(|a| a.as_slice()).collect();
         let mut atoms = Vec::new();
         atomize_record(pos, &ref_allele, &alt_refs, &mut atoms)
             .expect("symbolic/breakend ALT is out of scope for SVAR2 (short-read only)");
 
         for atom in atoms {
+            // Left-align each anchored indel to its leftmost equivalent position (SNPs and
+            // substituted-anchor insertions are returned unchanged).
+            let atom = crate::normalize::left_align(atom, &self.ref_seq, crate::normalize::L_MAX);
             let seq = self.next_seq;
             self.next_seq += 1;
             self.heap.push(Reverse(PendingAtom {
