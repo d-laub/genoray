@@ -15,11 +15,11 @@ const TILE_RAM_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 /// Performs the Tile-Based Interleaving Merge.
 ///
 /// Phase A: in-memory metadata pass — derives global per-column offsets and per-chunk
-///          local offsets from the RAM Ledger, writes `final_offsets.npy`.
+///          local offsets from the RAM Ledger, writes `offsets.npy`.
 /// Phase B: parallel tile gather — each rayon worker owns one tile, reads the slice
 ///          of every chunk via positional reads, scatters into per-column slots,
 ///          then `pwrite`s the assembled tile to its pre-computed byte range in
-///          `final_positions.bin` / `final_keys.bin`.
+///          `positions.bin` / `alleles.bin`.
 /// Phase C: cleanup of per-chunk temp files.
 pub fn merge_mini_sc(
     key_bytes: usize,
@@ -52,7 +52,7 @@ pub fn merge_mini_sc(
 
     // save the global offsets array immediately
     let offsets_array = Array1::from_vec(final_offsets.clone());
-    write_npy(layout::final_offsets(output_dir_path), &offsets_array)
+    write_npy(layout::offsets(output_dir_path), &offsets_array)
         .expect("Failed to write final offsets");
 
     let total_items: u64 = final_offsets[total_columns];
@@ -64,16 +64,16 @@ pub fn merge_mini_sc(
     // Pre-create the monolithic outputs at full size so worker pwrites land in
     // disjoint byte ranges. set_len doesn't allocate disk space (sparse file)
     // until each tile actually writes.
-    let final_pos_file = File::create(layout::final_positions(output_dir_path))
-        .expect("Failed to create final_positions.bin");
+    let final_pos_file =
+        File::create(layout::positions(output_dir_path)).expect("Failed to create positions.bin");
     final_pos_file
         .set_len(pos_total_bytes)
-        .expect("Failed to size final_positions.bin");
+        .expect("Failed to size positions.bin");
     let final_key_file =
-        File::create(layout::final_keys(output_dir_path)).expect("Failed to create final_keys.bin");
+        File::create(layout::alleles(output_dir_path)).expect("Failed to create alleles.bin");
     final_key_file
         .set_len(key_total_bytes)
-        .expect("Failed to size final_keys.bin");
+        .expect("Failed to size alleles.bin");
 
     // Open every chunk's pos/key file exactly once; pread() is stateless and
     // safe to call concurrently from multiple rayon workers.
@@ -206,10 +206,10 @@ pub fn merge_mini_sc(
         let tile_pos_bytes: &[u8] = bytemuck::cast_slice(&tile_pos_buffer);
         final_pos_ref
             .write_all_at(tile_pos_bytes, tile_pos_byte_offset)
-            .expect("Failed to pwrite tile to final_positions.bin");
+            .expect("Failed to pwrite tile to positions.bin");
         final_key_ref
             .write_all_at(&tile_key_buffer, tile_key_byte_offset)
-            .expect("Failed to pwrite tile to final_keys.bin");
+            .expect("Failed to pwrite tile to alleles.bin");
     });
 
     // Drop file handles to flush metadata before cleanup
@@ -277,9 +277,9 @@ mod tests {
 
         merge_mini_sc(4, 1, 2, 2, dir.to_str().unwrap(), ram_ledger);
 
-        let final_pos = read_u32_bin(&dir.join("final_positions.bin"));
-        let final_key = read_u32_bin(&dir.join("final_keys.bin"));
-        let final_off = read_offsets_npy(&dir.join("final_offsets.npy"));
+        let final_pos = read_u32_bin(&dir.join("positions.bin"));
+        let final_key = read_u32_bin(&dir.join("alleles.bin"));
+        let final_off = read_offsets_npy(&dir.join("offsets.npy"));
 
         assert_eq!(final_pos, pos);
         assert_eq!(final_key, key);
@@ -306,9 +306,9 @@ mod tests {
 
         merge_mini_sc(4, 2, 2, 1, dir.to_str().unwrap(), ram_ledger);
 
-        let final_pos = read_u32_bin(&dir.join("final_positions.bin"));
-        let final_key = read_u32_bin(&dir.join("final_keys.bin"));
-        let final_off = read_offsets_npy(&dir.join("final_offsets.npy"));
+        let final_pos = read_u32_bin(&dir.join("positions.bin"));
+        let final_key = read_u32_bin(&dir.join("alleles.bin"));
+        let final_off = read_offsets_npy(&dir.join("offsets.npy"));
 
         assert_eq!(final_pos, vec![100, 200, 400, 300, 500, 600]);
         assert_eq!(final_key, vec![1, 2, 4, 3, 5, 6]);
@@ -326,8 +326,8 @@ mod tests {
 
         merge_mini_sc(4, 1, 2, 2, dir.to_str().unwrap(), ram_ledger);
 
-        let final_pos = read_u32_bin(&dir.join("final_positions.bin"));
-        let final_off = read_offsets_npy(&dir.join("final_offsets.npy"));
+        let final_pos = read_u32_bin(&dir.join("positions.bin"));
+        let final_off = read_offsets_npy(&dir.join("offsets.npy"));
 
         assert_eq!(final_pos.len(), 0);
         assert_eq!(final_off, vec![0u64; 5]);
@@ -346,8 +346,8 @@ mod tests {
 
         merge_mini_sc(4, 2, 2, 1, dir.to_str().unwrap(), ram_ledger);
 
-        let final_pos = read_u32_bin(&dir.join("final_positions.bin"));
-        let final_off = read_offsets_npy(&dir.join("final_offsets.npy"));
+        let final_pos = read_u32_bin(&dir.join("positions.bin"));
+        let final_off = read_offsets_npy(&dir.join("offsets.npy"));
 
         assert_eq!(final_pos, vec![10, 20, 30, 40, 50]);
         assert_eq!(final_off, vec![0u64, 3, 5]);
@@ -383,9 +383,9 @@ mod tests {
 
         merge_mini_sc(1, 2, 2, 1, dir.to_str().unwrap(), ram_ledger);
 
-        let final_pos = read_u32_bin(&dir.join("final_positions.bin"));
-        let final_key = read_u8_bin(&dir.join("final_keys.bin"));
-        let final_off = read_offsets_npy(&dir.join("final_offsets.npy"));
+        let final_pos = read_u32_bin(&dir.join("positions.bin"));
+        let final_key = read_u8_bin(&dir.join("alleles.bin"));
+        let final_off = read_offsets_npy(&dir.join("offsets.npy"));
 
         assert_eq!(final_pos, vec![100, 200, 400, 300, 500, 600]);
         assert_eq!(final_key, vec![1, 2, 4, 3, 5, 6]);
@@ -449,9 +449,9 @@ mod tests {
 
             merge_mini_sc(4, num_chunks, num_samples, ploidy, dir.to_str().unwrap(), ram_ledger.clone());
 
-            let final_pos = read_u32_bin(&dir.join("final_positions.bin"));
-            let final_key = read_u32_bin(&dir.join("final_keys.bin"));
-            let final_off = read_offsets_npy(&dir.join("final_positions.bin").with_file_name("final_offsets.npy"));
+            let final_pos = read_u32_bin(&dir.join("positions.bin"));
+            let final_key = read_u32_bin(&dir.join("alleles.bin"));
+            let final_off = read_offsets_npy(&dir.join("positions.bin").with_file_name("offsets.npy"));
 
             // Build expected: walk columns, then chunks within each column.
             let mut expected_pos: Vec<u32> = Vec::new();

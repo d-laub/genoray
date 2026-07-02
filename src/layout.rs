@@ -1,6 +1,6 @@
 //! Single source of truth for the SVAR2 on-disk directory + file layout. Every
-//! path the pipeline reads or writes is constructed here so the (still
-//! provisional) filenames can be changed in exactly one place before M6 decode.
+//! path the pipeline reads or writes is constructed here, so the finalized
+//! on-disk file names are defined in exactly one place.
 
 use std::path::{Path, PathBuf};
 
@@ -62,20 +62,20 @@ pub fn chunk_pos(dir: &Path, chunk_id: usize) -> PathBuf {
 pub fn chunk_key(dir: &Path, chunk_id: usize) -> PathBuf {
     dir.join(format!("chunk_{}_key.bin", chunk_id))
 }
-pub fn final_positions(dir: &Path) -> PathBuf {
-    dir.join("final_positions.bin")
+pub fn positions(dir: &Path) -> PathBuf {
+    dir.join("positions.bin")
 }
-pub fn final_keys(dir: &Path) -> PathBuf {
-    dir.join("final_keys.bin")
+pub fn alleles(dir: &Path) -> PathBuf {
+    dir.join("alleles.bin")
 }
-pub fn final_offsets(dir: &Path) -> PathBuf {
-    dir.join("final_offsets.npy")
+pub fn offsets(dir: &Path) -> PathBuf {
+    dir.join("offsets.npy")
 }
 pub fn chunk_geno(dir: &Path, chunk_id: usize) -> PathBuf {
     dir.join(format!("chunk_{}_geno.bin", chunk_id))
 }
-pub fn final_genotypes(dir: &Path) -> PathBuf {
-    dir.join("final_genotypes.bin")
+pub fn genotypes(dir: &Path) -> PathBuf {
+    dir.join("genotypes.bin")
 }
 
 #[cfg(test)]
@@ -117,8 +117,8 @@ mod tests {
             Path::new("/out/chr1/dense/snp/chunk_2_geno.bin")
         );
         assert_eq!(
-            final_genotypes(dir),
-            Path::new("/out/chr1/dense/snp/final_genotypes.bin")
+            genotypes(dir),
+            Path::new("/out/chr1/dense/snp/genotypes.bin")
         );
     }
 
@@ -134,16 +134,10 @@ mod tests {
             Path::new("/out/chr1/var_key/snp/chunk_3_key.bin")
         );
         assert_eq!(
-            final_positions(dir),
-            Path::new("/out/chr1/var_key/snp/final_positions.bin")
+            positions(dir),
+            Path::new("/out/chr1/var_key/snp/positions.bin")
         );
-        assert_eq!(
-            final_keys(dir),
-            Path::new("/out/chr1/var_key/snp/final_keys.bin")
-        );
-        assert_eq!(
-            final_offsets(dir),
-            Path::new("/out/chr1/var_key/snp/final_offsets.npy")
-        );
+        assert_eq!(alleles(dir), Path::new("/out/chr1/var_key/snp/alleles.bin"));
+        assert_eq!(offsets(dir), Path::new("/out/chr1/var_key/snp/offsets.npy"));
     }
 }

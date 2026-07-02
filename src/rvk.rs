@@ -144,15 +144,15 @@ pub fn unpack_snp_keys(packed: &[u8], n: usize) -> Vec<u8> {
         .collect()
 }
 
-// Post-merge pass for the SNP stream: read the merged `final_keys.bin` (one
+// Post-merge pass for the SNP stream: read the merged `alleles.bin` (one
 // u8 code per call) and rewrite it 2-bit packed (4 calls/byte). Streams in
 // 4-MiB blocks (a multiple of 4, so no pack straddles a block boundary except
 // the genuine EOF tail). Offsets are call-indexed and need no change.
 pub fn pack_snp_key_file(dir: &str) {
-    let src = format!("{}/final_keys.bin", dir);
-    let tmp = format!("{}/final_keys.packed.tmp", dir);
+    let src = format!("{}/alleles.bin", dir);
+    let tmp = format!("{}/alleles.packed.tmp", dir);
 
-    let mut reader = BufReader::new(File::open(&src).expect("open snp final_keys.bin"));
+    let mut reader = BufReader::new(File::open(&src).expect("open snp alleles.bin"));
     let mut writer = BufWriter::new(File::create(&tmp).expect("create packed tmp"));
 
     const BLOCK: usize = 4 * 1024 * 1024; // multiple of 4
@@ -180,7 +180,7 @@ pub fn pack_snp_key_file(dir: &str) {
     drop(writer);
     drop(reader);
 
-    std::fs::rename(&tmp, &src).expect("replace snp final_keys.bin with packed");
+    std::fs::rename(&tmp, &src).expect("replace snp alleles.bin with packed");
 }
 
 // Packs up to 13 DNA bases into a single u32 with the inline-encoding layout:

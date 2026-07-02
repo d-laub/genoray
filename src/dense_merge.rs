@@ -41,13 +41,13 @@ pub fn merge_dense_class(
         positions.extend_from_slice(&fs::read(layout::chunk_pos(dir, c)).expect("read dense pos"));
         keys.extend_from_slice(&fs::read(layout::chunk_key(dir, c)).expect("read dense key"));
     }
-    write_all(&layout::final_positions(dir), &positions);
+    write_all(&layout::positions(dir), &positions);
     let final_key_bytes = if pack_snp {
         pack_snp_keys(&keys) // keys are one raw 2-bit code per variant
     } else {
         keys
     };
-    write_all(&layout::final_keys(dir), &final_key_bytes);
+    write_all(&layout::alleles(dir), &final_key_bytes);
 
     // ---- genotypes: per-hap bit concatenation across chunks ----
     // output bit (hap h, global col g) at flat index h * v_total + g.
@@ -73,7 +73,7 @@ pub fn merge_dense_class(
             copy_bits(&mut out, dst_bit, &block, src_bit, v_c);
         }
     }
-    write_all(&layout::final_genotypes(dir), &out);
+    write_all(&layout::genotypes(dir), &out);
 
     // ---- cleanup per-chunk temp files ----
     for c in 0..num_chunks {
@@ -147,12 +147,12 @@ mod tests {
         );
 
         // positions concat in chunk order
-        assert_eq!(read_u32(&layout::final_positions(dir)), vec![100, 200, 300]);
+        assert_eq!(read_u32(&layout::positions(dir)), vec![100, 200, 300]);
         // keys concat (pack_snp=false → raw)
-        assert_eq!(fs::read(layout::final_keys(dir)).unwrap(), vec![1u8, 2, 3]);
+        assert_eq!(fs::read(layout::alleles(dir)).unwrap(), vec![1u8, 2, 3]);
 
         // genotypes: hap0 row = [1,0,1], hap1 row = [0,1,0], flat h*v_total+g.
-        let geno = fs::read(layout::final_genotypes(dir)).unwrap();
+        let geno = fs::read(layout::genotypes(dir)).unwrap();
         let expect_bits = [
             (0usize, true),
             (1, false),
@@ -173,8 +173,8 @@ mod tests {
         let tmp = tempdir().unwrap();
         let dir = tmp.path();
         merge_dense_class(1, 2, 2, 1, true, dir.to_str().unwrap(), vec![0]);
-        assert_eq!(fs::read(layout::final_positions(dir)).unwrap().len(), 0);
-        assert_eq!(fs::read(layout::final_genotypes(dir)).unwrap().len(), 0);
+        assert_eq!(fs::read(layout::positions(dir)).unwrap().len(), 0);
+        assert_eq!(fs::read(layout::genotypes(dir)).unwrap().len(), 0);
     }
 
     #[test]
@@ -192,9 +192,6 @@ mod tests {
         );
         merge_dense_class(1, 1, 1, 1, true, dir.to_str().unwrap(), vec![5]);
         // pack_snp_keys([1,2,3,0,1]) == [0x39, 0x01] (see rvk.rs test)
-        assert_eq!(
-            fs::read(layout::final_keys(dir)).unwrap(),
-            vec![0x39u8, 0x01]
-        );
+        assert_eq!(fs::read(layout::alleles(dir)).unwrap(), vec![0x39u8, 0x01]);
     }
 }
