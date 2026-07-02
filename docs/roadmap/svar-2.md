@@ -153,9 +153,33 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
   union across `snp/`+`indel/`, per-`(contig, sample, ploid)` wiring, and the genotype
   gather that turns an index range into user-facing calls (the `(range, sample)` query
   proper).
-- [ ] **M6. Python decode.** Decode query results into user-facing structs/classes
-  (to be spec'd). Requires fast sorted **unions** to merge data from multiple
-  position-sorted sources. See [`architecture.md`](architecture.md#python-decode-path).
+- [ ] **M6. Query decode core.** The shared spine both consumers build on. Finish M5's
+  disk integration (consume `max_del.npy`, read the sidecars, resolve per-`(contig,
+  sample, ploid)` index ranges via `overlap_range`); extract the key ↔ `(ILEN, ALT)`
+  decode seam out of `rvk.rs` into a new dependency-light **`svar2-codec`** workspace
+  crate (published to crates.io) so genoray and gvl share one decoder; re-expand SNPs to
+  the uniform 32-bit key at query time; and implement the fast sorted **union** across
+  the `{var_key, dense} × {snp, indel}` sub-streams. See
+  [`architecture.md`](architecture.md#python-decode-path) and the design spec
+  [`../superpowers/specs/2026-07-02-svar2-m6-consumer-interfaces-design.md`](../superpowers/specs/2026-07-02-svar2-m6-consumer-interfaces-design.md).
+- [ ] **M6b. gvl Rust variant interface.** *(built first among M6 consumers)* The primary
+  consumer. genoray returns a **two-channel** query result — `var_key` gathered per-hap
+  inline (no dedup, no barrier) + a shared decode-once `dense` table with per-hap presence
+  bitmasks — and gvl's Rust core consumes it via a **two-source splice** (`var_key ⋈
+  dense` in position order), calling `svar2-codec` inline to decode keys straight into the
+  reconstructed haplotype / re-aligned track with no intermediate allele buffer. Track
+  re-align needs only `ilen`/`deletion_len`, no alleles. **Cross-repo (genoray +
+  GenVarLoader) and release-gated:** the gvl PR is only mergeable after `svar2-codec` is
+  on crates.io and `svar-2` is on PyPI; sequence managed manually. genoray-side work is
+  independently mergeable.
+- [ ] **M6c. Python decode → `seqpro.rag.Ragged` + region variant counts.** The analysis
+  consumer. Materialize decoded query results into a `seqpro` `Ragged` record
+  (`from_fields`: `pos` / `ilen` numeric + `allele` opaque-string, shared variant-axis
+  offsets, shape `(ranges, samples, ploidy, None)` — byte-identical to gvl's
+  `RaggedVariants`), and provide a **decode-free** variants-per-`(sample, ploid)` count
+  (offset diffs + dense-mask popcount) as the simplified replacement for SVAR 1.0's
+  `SparseVar.var_ranges` (variant indices no longer fit the data model — there is no
+  unified variant table).
 
 ### Beyond MVP
 
