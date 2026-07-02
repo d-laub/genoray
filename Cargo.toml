@@ -5,17 +5,29 @@ edition = "2024"
 
 [lib]
 name = "genoray_core"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+bytemuck = "1.25.0"
+crossbeam-channel = "0.5.15"
 memmap2 = "0.9.10"
 ndarray = "0.17.2"
 ndarray-npy = "0.10.0"
-num-traits = "0.2.19"
-pyo3 = { version = "0.29", features = ["extension-module"] }
-crossbeam-channel = "0.5.15"
-bytemuck = "1.25"
+# extension-module is gated behind the (default) `extension-module` feature below so
+# that `cargo test --no-default-features` can link libpython and run the Rust test
+# suites. maturin builds with default features, so the wheel still gets it.
+pyo3 = { version = "0.29" }
+rayon = "1.11.0"
 # default-features = false drops bzip2/lzma/curl (and their system libs); htslib is
 # vendored by hts-sys and built with the conda C/C++ compilers. hts-sys forces
 # bindgen, so the build needs libclang (provided via pixi: clang/clangdev).
 rust-htslib = { version = "1.0", default-features = false }
+thiserror = "2"
+
+[dev-dependencies]
+proptest = "1.11.0"
+tempfile = "3.10"
+
+[features]
+default = ["extension-module"]
+extension-module = ["pyo3/extension-module"]

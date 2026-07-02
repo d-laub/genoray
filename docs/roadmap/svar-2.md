@@ -38,9 +38,9 @@ by the cost model (see [`data-model.md`](data-model.md#dense-vs-sparse-cost-mode
 
 | Representation | Code name | What it stores | Best when |
 | --- | --- | --- | --- |
-| **Inline variant key** | `var_key` | Per-call inline key (2-bit SNP ALT, or 32-bit indel key); long alleles spill to a LUT | Low allele frequency (most variants) |
-| **Pointer** | `pointer` | Sparse `u32`/`u64` pointers into a shared variant table (this is SVAR 1.0) | Variant info is large (many INFO/FORMAT fields) |
-| **Dense** | `dense` | 1-bit `(sample, ploid, variant)` matrix + variant table | High allele frequency |
+| **Inline variant key** | `var_key` | Per-call inline key in a 2-bit SNP stream or a 32-bit indel stream; long indel alleles spill to a LUT (SNPs never do) | Low allele frequency (most variants) |
+| **Pointer** | `pointer` | Sparse `u32`/`u64` pointers into a shared variant table, split into 2-bit SNP and 32-bit indel tables (this is SVAR 1.0) | Variant info is large (many INFO/FORMAT fields) |
+| **Dense** | `dense` | 1-bit `(sample, ploid, variant)` matrix + variant table, each split into 2-bit SNP and 32-bit indel sub-streams | High allele frequency |
 
 There are two axes here, which is the source of the "4-way" / "3-way" naming:
 
@@ -60,12 +60,36 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
 - [~] **M1. VCF → SVAR2 conversion.** Streaming, chunked, multi-threaded
   conversion producing the `var_key` representation. Builds on the existing
   conversion pipeline on this branch. See [`architecture.md`](architecture.md#conversion-pipeline).
+  *Implemented and tested for the `var_key` happy path:* a per-contig pipeline
+  (reader → encode → writers → Phase-2 merge) fanned out across contigs by rayon
+  with bounded-channel backpressure; a PEXT (BMI2) / portable-SWAR inline encoder
+  proven byte-identical by proptest; a bit-packed dense read buffer (`BitGrid3`); a
+  streaming long-allele LUT; and a memory-bounded parallel tile merge. Covered by 30
+  in-source unit/proptests + 5 e2e tests. An optional per-contig monitoring sampler
+  (`GENORAY_SAMPLE_INTERVAL`) reports channel fill and per-thread CPU%. *Remaining:*
+  variant normalization (M2, currently a precondition — see below) and the dense
+  routing of M4; the on-disk filenames are still provisional (see M3). The
+  `var_key` stream is now split into 2-bit `snp/` and 32-bit `indel/`
+  sub-streams per [`data-model.md`](data-model.md#on-disk-layout); the SNP stream
+  is 2-bit-packed post-merge and carries no LUT.
 - [ ] **M2. Variant normalization during conversion.** Left-alignment, atomization,
   and biallelic splitting (split multi-allelic sites) applied inline as variants stream
   through. See [`data-model.md`](data-model.md#variant-normalization).
-- [ ] **M3. Per-contig split + sidecar positions.** Partition the SVAR2 directory by
+  *Not started — currently an input precondition.* The reader asserts normalized input
+  and panics on multi-allelic or complex records; the inline encoder bakes in the
+  atomized invariant `ref_len = 1` (it stores `ILEN = alt_len − 1` and decodes
+  `alt_len = ILEN + 1`). M2 is what will let conversion accept un-normalized VCFs
+  directly.
+- [~] **M3. Per-contig split + sidecar positions.** Partition the SVAR2 directory by
   contig; keep positions as sidecar arrays. See
   [`architecture.md`](architecture.md#on-disk-layout).
+  *Core done:* output is partitioned per contig (`{out}/{contig}/var_key/`) and the
+  merge emits sorted position + offset sidecars. *Provisional / remaining:* the current
+  scratch filenames live under `{out}/{contig}/var_key/{snp,indel}/` as
+  `final_positions.bin` / `final_keys.bin` (raw little-endian via bytemuck) and
+  `final_offsets.npy`, plus `long_alleles.bin` + `long_allele_offsets.npy` under
+  `indel/`, which differ from the `.npy` names in the layout spec; `meta.json` and
+  the per-contig `max_del.npy` are not yet written.
 - [ ] **M4. Dense representation + cost-model routing.** Implement the 1-bit dense
   genotype matrix and the deterministic per-variant dense/sparse decision. See
   [`data-model.md`](data-model.md#dense-vs-sparse-cost-model).

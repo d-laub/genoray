@@ -1,24 +1,27 @@
+use crate::layout::ContigPaths;
 use crossbeam_channel::Sender;
+use std::fs::File;
+use std::os::unix::fs::FileExt;
 
 // strictly bounded memory bank for long alleles (non-blocking, double-buffered memory)
 // Public API
-pub struct LongAlleleTable {
+pub struct LongAlleleTableWriter {
     tx_long: Sender<Vec<u8>>, //channel to the writer thread
-    alt_offsets: Vec<u32>,    // TODO - should this be u32 or u64
+    alt_offsets: Vec<u64>,    // using 64 bits as same is used in seek - no extra casting
     buffer: Vec<u8>,          // staging area
     global_offset: usize,     // The exact byte position
     row_index: u32, // Tracks the number of long alleles and 31-bit integer returned to the variant key
 }
 
-impl LongAlleleTable {
+impl LongAlleleTableWriter {
     // because we need to map the file, it must be pre-allocated to the exact
     // byte size calculated during your 1st Pass.
-    pub fn new(tx_long: Sender<Vec<u8>>) -> Self {
+    pub fn new(tx_long: Sender<Vec<u8>>, buffer_capacity: usize) -> Self {
         // 128 MB RAM Limit to prevent OOM crashes -> can be changed or made run time
-        let buffer_capacity = 128 * 1024 * 1024;
+        // let buffer_capacity = 128 * 1024 * 1024; -> now parameter
 
         let mut initial_offsets = Vec::with_capacity(1_000_000); //hardcoded capacity for now, can optimize
-        initial_offsets.push(0); // The first allele starts at byte 0
+        initial_offsets.push(0u64); // The first allele starts at byte 0
 
         Self {
             buffer: Vec::with_capacity(buffer_capacity),
@@ -33,25 +36,24 @@ impl LongAlleleTable {
     // to be stored in Variant Key array.
     #[inline(always)]
     pub fn push_long_allele(&mut self, alt_bytes: &[u8]) -> u32 {
+        // enforcing the 31-bit capacity constraint
+        assert!(
+            self.row_index <= 0x7FFFFFFF,
+            "Exceeded 31-bit (4,294,967,295) index capacity! Cannot proceed with this many long alleles!"
+        );
+
         // checking Capacity Bounds
-        // If this string pushes us over 128MB, trigger the synchronous hardware flush
+        // If this string pushes us over buffer cap, trigger the synchronous hardware flush
         if self.buffer.len() + alt_bytes.len() > self.buffer.capacity() {
             self.flush_buffer();
         }
 
-        // enforcing the 31-bit capacity constraint
-        assert!(
-            self.row_index <= 0x7FFFFFFF,
-            "Exceeded 31-bit index capacity! Cannot proceed with this many long alleles!"
-        );
-
         // store the current index to return later
         let current_index = self.row_index;
-
         self.buffer.extend_from_slice(alt_bytes); //pushing to ram
 
         // calculate where this string logically lives
-        let next_byte_offset = (self.global_offset + self.buffer.len()) as u32;
+        let next_byte_offset = (self.global_offset + self.buffer.len()) as u64;
         self.alt_offsets.push(next_byte_offset);
 
         self.row_index += 1;
@@ -67,23 +69,23 @@ impl LongAlleleTable {
             return;
         }
 
-        // empty 128MB vector.
-        let fresh_buffer = Vec::with_capacity(128 * 1024 * 1024);
+        // empty vector
+        let fresh_buffer = Vec::with_capacity(self.buffer.capacity());
 
         // swap full buffer with new
         let full_buffer = std::mem::replace(&mut self.buffer, fresh_buffer);
+
+        // update the global byte tracker so offsets remain accurate.
+        self.global_offset += full_buffer.len();
 
         // send the full buffer to the background writer thread.
         self.tx_long
             .send(full_buffer)
             .expect("Long Allele Writer Thread panicked");
-
-        // update the global byte tracker so offsets remain accurate.
-        self.global_offset += 128 * 1024 * 1024;
     }
 
     // called by the Executor at the very end to flush any remaining bytes
-    pub fn finalize(mut self) -> Vec<u32> {
+    pub fn finalize(mut self) -> Vec<u64> {
         if !self.buffer.is_empty() {
             // send the final partial buffer
             let final_buffer = std::mem::take(&mut self.buffer);
@@ -93,82 +95,79 @@ impl LongAlleleTable {
     }
 }
 
-// // Contains the NonReversibleLongAllele struct, MmapMut initialization, and long allele read/write methods.
-// pub struct NonReversibleLongAllele {
-//     pub ilens: Vec<i32>,
-//     pub alt_offsets: Vec<u32>,
-//     pub alt_allele: MmapMut, //data of all alts -> mem mapped disk file
-//     pub curr_allele_idx: usize, // idx of where we are writing in the mem mapped file
-// }
-// //2 pass -> then allocate first (on disk -> mem maps) -> memmap
+// Immutable state - Exists after conversion (phase 1)
+pub struct LongAlleleReader {
+    file: File,
+    offsets: Vec<u64>,
+}
 
-// impl NonReversibleLongAllele {
-//     // Initialize the SoA with pre-allocated memory to prevent slow reallocations
-//     pub fn new(capacity: usize) -> Self {
-//         let mut offsets = Vec::with_capacity(capacity + 1);
-//         offsets.push(0); // first offset is always 0
+impl LongAlleleReader {
+    // TODO: Decide which will call this (or create this instance)
+    pub fn new(output_dir: &str, chrom: &str) -> Self {
+        // Layout matches the writer: {output_dir}/{chrom}/var_key/indel/{long_alleles.bin, long_allele_offsets.npy}
+        let paths = ContigPaths::new(output_dir, chrom);
 
-//         Self {
-//             ilens: Vec::with_capacity(capacity),
-//             alt_offsets: offsets,
-//             alt_allele: Vec::with_capacity(capacity * 4),
-//         }
-//     }
+        let file = File::open(paths.long_alleles_bin()).expect("Failed to open long_alleles.bin");
 
-//     /// Performs the 2-way fill -> inserts the data and returns the 32-bit packed pointer (31 bit index + 1 bit flag for non reversible key)
-//     // pub fn push_variant(&mut self, ilen: i32, alt_allele: &[u8]) -> u32 {
-//     //     // get the current row index
-//     //     let row_index = self.ilens.len() as u32;
-//     //     // 0 <-> chr1:100 ( alt allele > 13 )
-//     //     // 1 <-> chr22:5 ( alt allele > 13 )
-//     //     assert!(
-//     //         row_index <= 0x7FFFFFFF,
-//     //         "Exceeded 31-bit index capacity! Cannot proceed with these many long alleles!"
-//     //     );
+        let offsets_array: ndarray::Array1<u64> =
+            ndarray_npy::read_npy(paths.long_allele_offsets()).expect("Failed to load offsets npy");
 
-//     //     // push alt to the alt allele vec
-//     //     self.alt_allele.extend_from_slice(alt_allele);
+        Self {
+            file,
+            offsets: offsets_array.into_raw_vec_and_offset().0,
+        }
+    }
 
-//     //     // push the new end boundary to the offsets array
-//     //     self.alt_offsets.push(self.alt_allele.len() as u32);
+    // Fetches the exact DNA string from the disk using the 31-bit row index.
+    pub fn get_allele(&self, row_index: u32) -> Vec<u8> {
+        let idx = row_index as usize;
+        let start_byte = self.offsets[idx];
+        let end_byte = self.offsets[idx + 1];
+        let len = (end_byte - start_byte) as usize;
+        let mut buf = vec![0u8; len];
+        self.file
+            .read_exact_at(&mut buf, start_byte)
+            .expect("pread long allele");
+        buf
+    }
+}
 
-//     //     // add the ilen as well
-//     //     self.ilens.push(ilen);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossbeam_channel::bounded;
 
-//     //     // packing the 31-bit index with the 1-bit lookup flag (non reversible flag)
-//     //     (row_index << 1) | 1 // coupled here -> eg: unaware of vk
-//     // }
+    #[test]
+    fn test_global_u64_offsets() {
+        let (tx, _rx) = bounded(10);
+        let mut bank = LongAlleleTableWriter::new(tx, 1024);
 
-//     // extracts the data using a 31-bit index pointer
-//     pub fn get_variant(&self, row_index: usize) -> (i32, &[u8]) {
-//         let start = self.alt_offsets[row_index] as usize;
-//         let end = self.alt_offsets[row_index + 1] as usize;
+        // Push 10 bytes, then 5 bytes
+        bank.push_long_allele(b"0123456789");
+        bank.push_long_allele(b"ABCDE");
 
-//         (self.ilens[row_index], &self.alt_allele[start..end])
-//     }
+        let offsets = bank.finalize();
 
-//     /// Performs the 2-way fill -> inserts the data and returns the 32-bit packed pointer (31 bit index + 1 bit flag for non reversible key)
-//     pub fn push_variant(&mut self, ilen: i32, alt_allele: &[u8]) -> u32 {
-//         // get the current row index
-//         let row_index = self.ilens.len() as u32;
-//         // 0 <-> chr1:100 ( alt allele > 13 )
-//         // 1 <-> chr22:5 ( alt allele > 13 )
-//         assert!(
-//             row_index <= 0x7FFFFFFF,
-//             "Exceeded 31-bit index capacity! Cannot proceed with these many long alleles!"
-//         );
+        // First allele starts at 0, second at 10, EOF at 15.
+        // MUST perfectly match OS SeekFrom requirements.
+        assert_eq!(offsets, vec![0u64, 10u64, 15u64]);
+    }
 
-//         // push alt to the alt allele vec
-//         self.alt_allele.extend_from_slice(alt_allele);
+    #[test]
+    fn test_reader_get_allele_shared_borrow() {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("chr1").join("var_key").join("indel");
+        std::fs::create_dir_all(&dir).unwrap();
+        // bytes: "AAAA" then "CC" → offsets [0, 4, 6]
+        let mut f = std::fs::File::create(dir.join("long_alleles.bin")).unwrap();
+        f.write_all(b"AAAACC").unwrap();
+        let offsets = ndarray::Array1::from_vec(vec![0u64, 4, 6]);
+        ndarray_npy::write_npy(dir.join("long_allele_offsets.npy"), &offsets).unwrap();
 
-//         // push the new end boundary to the offsets array
-//         self.alt_offsets.push(self.alt_allele.len() as u32);
-
-//         // add the ilen as well
-//         self.ilens.push(ilen);
-
-//         // packing the 31-bit index with the 1-bit lookup flag (non reversible flag)
-//         (row_index << 1) | 1 // coupled here -> eg: unaware of vk
-//     }
-
-// }
+        let reader = LongAlleleReader::new(tmp.path().to_str().unwrap(), "chr1");
+        // &self: two immutable calls, no &mut needed
+        assert_eq!(reader.get_allele(0), b"AAAA".to_vec());
+        assert_eq!(reader.get_allele(1), b"CC".to_vec());
+    }
+}
