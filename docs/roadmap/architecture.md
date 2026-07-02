@@ -100,13 +100,17 @@ model.
 ## Query path
 
 `(range, sample)` queries (roadmap M5) resolve overlaps, not point hits, because
-deletions span reference bases.
+deletions span reference bases. The **format-independent overlap core** is implemented
+(`src/search.rs`, M5 part 1); wiring it to the on-disk sidecars, the sub-stream union,
+and the genotype gather is the remaining M5 work.
 
 - **Index structure:** binary search over the sorted position sidecar, starting from
   the [left-tree static search tree](https://curiouscoding.nl/posts/static-search-tree/#left-tree)
-  for cache-friendly lookups.
-- **Overlap handling:** use the max-deletion-length bound to set the lower search
-  bound, then linear-scan to the upper bound, per the algorithm in
+  for cache-friendly lookups — realized as `SearchTree` (`lower_bound`/`upper_bound`)
+  in `src/search.rs`.
+- **Overlap handling:** `overlap_range` uses the max-deletion-length bound to set the
+  lower search bound — by shifting the query with a saturating subtraction (one tree,
+  not two) — then linear-scans to the upper bound, per the algorithm in
   [`data-model.md`](data-model.md#overlap-queries-and-deletions).
 - **Across representations and sub-streams:** a query may touch variants in `var_key`,
   `pointer`, and `dense` subdirs for the same contig, and within each the `snp/` and

@@ -121,10 +121,22 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
   filenames with `var_key`'s spec base names (`positions.bin` / `alleles.bin` /
   `genotypes.bin`; see the dense-representation section of
   [`data-model.md`](data-model.md#dense-representation-dense)) landed in M3.
-- [ ] **M5. `(range, sample)` queries.** Fast overlap queries via binary search,
+- [~] **M5. `(range, sample)` queries.** Fast overlap queries via binary search,
   starting from the [left-tree static search tree](https://curiouscoding.nl/posts/static-search-tree/#left-tree).
   Must handle deletions spanning the query start (see
   [`data-model.md`](data-model.md#overlap-queries-and-deletions)).
+  *Shipped — search core (PR #83):* a self-contained `src/search.rs` with a static
+  `(B+1)`-ary B-tree (`B=16`, left-tree layout) over sorted `u32` starts
+  (`lower_bound`/`upper_bound`), plus `overlap_range`, a format-independent resolver
+  returning the `[s_idx, e_idx)` variant range overlapping `[q_start, q_end)`.
+  Deletions spanning the query start are handled by shifting the query with a
+  saturating subtraction against a `max_region_length` bound — collapsing the two
+  `searchsorted` calls onto one tree instead of building a second. Gated by proptests
+  vs `slice::partition_point` (bounds) and a brute-force O(n) oracle (overlap). Depends
+  only on in-memory slices — no on-disk types. *Remaining:* disk integration — the
+  `max_del.npy` producer/consumer, the sorted sub-stream union across `snp/`+`indel/`,
+  per-`(contig, sample, ploid)` wiring, and the genotype gather that turns an index
+  range into user-facing calls (the `(range, sample)` query proper).
 - [ ] **M6. Python decode.** Decode query results into user-facing structs/classes
   (to be spec'd). Requires fast sorted **unions** to merge data from multiple
   position-sorted sources. See [`architecture.md`](architecture.md#python-decode-path).

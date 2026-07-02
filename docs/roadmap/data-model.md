@@ -318,6 +318,33 @@ already does an analogous length-aware scan
 (`_find_starts_ends_with_length` in `python/genoray/_svar.py`); SVAR 2.0 generalizes it
 across the three representations.
 
+### Implementation status (M5, part 1 — search core)
+
+The **format-independent search core** for this algorithm ships in `src/search.rs`; the
+disk-integrated `(range, sample)` query is still pending. What is implemented:
+
+- `SearchTree` — the left-tree static B-tree above, over a sorted-ascending `u32`
+  position array (`B = 16` keys/node; `u32::MAX` is the padding sentinel, so stored
+  positions must be `< u32::MAX`). Built once, queried many times; exposes
+  `lower_bound`/`upper_bound`.
+- `overlap_range(tree, v_ends, max_region_length, q_start, q_end) -> (s_idx, e_idx)` —
+  the resolver, over 0-based half-open ends (`v_end = v_start + 1` for a SNP,
+  `v_start + 1 + d` for a `d`-base deletion). It realizes step 1 as **one tree, not
+  two**: `UB = lower_bound(q_end)`, and `LB = lower_bound(q_start.saturating_sub(
+  max_region_length))` — the max-deletion bound is applied by shifting the *query* down
+  with a saturating subtraction rather than building a second tree over
+  `v_starts + max_region_length`. The concrete lower bound is therefore
+  `v_start >= q_start − max_region_length` (saturating at 0), which is conservative
+  (never misses a spanning deletion); step 2's forward/backward scan over `v_ends` then
+  tightens it to the exact first/last truly-overlapping index. An empty result is
+  returned as `s_idx == e_idx` — correctly empty on a no-overlap query, unlike SVAR
+  1.0's `var_ranges` end-sentinel.
+
+The core depends only on in-memory slices — no on-disk types. **Remaining for full
+M5:** producing/consuming `max_del.npy`, the sorted union across the `snp/`+`indel/`
+sub-streams (and representations), and the genotype gather that turns an index range
+into user-facing calls.
+
 ## Format constraints and non-goals
 
 SVAR2 is a **compute-oriented, derived format — not an archival format.**
