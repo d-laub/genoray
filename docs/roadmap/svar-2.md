@@ -163,13 +163,17 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
   batched multi-region/multi-sample **consumer interface**, the `svar2-codec` extraction,
   and uniform-key re-expansion are M6, not M5 — `overlap_sample` is a single-sample Rust
   core, not yet exposed to Python.
-- [ ] **M6. Query decode core.** The shared spine both consumers build on. Generalize
-  M5's single-sample `overlap_sample` (`src/query.rs`) into the batched multi-region ×
-  multi-sample consumer spine; extract the key ↔ `(ILEN, ALT)`
-  decode seam out of `rvk.rs` into a new dependency-light **`svar2-codec`** workspace
-  crate (published to crates.io) so genoray and gvl share one decoder; re-expand SNPs to
-  the uniform 32-bit key at query time; and implement the fast sorted **union** across
-  the `{var_key, dense} × {snp, indel}` sub-streams. See
+- [ ] **M6. Query decode core.** The shared spine both consumers build on. M5's
+  `(range, sample)` query landed (`overlap_sample` in `src/query.rs`); M6 generalizes it
+  into the batched multi-region × multi-sample consumer spine, re-expands SNPs to the
+  uniform 32-bit key at query time, and implements the fast sorted **union** across the
+  `{var_key, dense} × {snp, indel}` sub-streams. *Done:* the key ↔ `(ILEN, ALT)` decode
+  seam has already been extracted out of `rvk.rs` into the dependency-light,
+  crates.io publish-ready **`svar2-codec`** workspace crate, so genoray and gvl share one
+  decoder — see
+  [`../superpowers/plans/2026-07-02-svar2-codec-crate.md`](../superpowers/plans/2026-07-02-svar2-codec-crate.md).
+  What remains is the batched consumer spine above, then the two-channel/materialized
+  consumer interfaces, M6b/M6c. See
   [`architecture.md`](architecture.md#python-decode-path) and the design spec
   [`../superpowers/specs/2026-07-02-svar2-m6-consumer-interfaces-design.md`](../superpowers/specs/2026-07-02-svar2-m6-consumer-interfaces-design.md).
 - [ ] **M6b. gvl Rust variant interface.** *(built first among M6 consumers)* The primary

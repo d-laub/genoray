@@ -74,6 +74,11 @@ A matching decoder reverses it: `key (+ LUT) → (ILEN, ALT)`. Keep these two fu
 and on-disk layout reference the encoding solely through `s` (bytes per variant info),
 not through any specific field positions.
 
+In code, this encode/decode layer is realized as the standalone **`svar2-codec`** crate
+(crates.io publish-ready, std-only) — the single place that knows the bit layout is a
+linkable unit shared by the converter and by downstream Rust consumers (e.g. gvl), not
+duplicated code.
+
 > If you find orchestration code branching on SNP-vs-indel bit positions, that's a
 > leak of the seam — push it back into the encode/decode layer.
 

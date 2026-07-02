@@ -31,7 +31,8 @@ per-call stream** — a 2-bit SNP stream and a 32-bit indel stream (see
 1` (equivalently `ILEN == 0` after atomization); everything else is an indel. The
 orchestration code treats each stream's key as opaque fixed-width bits (see
 [`architecture.md`](architecture.md#the-encoding-agnostic-seam)); only the
-encode/decode layer knows the layouts below.
+encode/decode layer knows the layouts below. That encode/decode layer lives in the
+**`svar2-codec`** crate — the co-located single source of truth for both halves.
 
 ### SNP flavor — 2 bits
 
@@ -351,9 +352,10 @@ The core depends only on in-memory slices — no on-disk types. The **disk query
 `(sample, ploid)`, genotype-filters the dense classes, decodes each hit through `rvk`, and
 k-way-merges the four sub-streams into one position-sorted result per haplotype (proptested
 end-to-end in `tests/test_query.rs`). **Remaining beyond M5** (now M6): the batched
-multi-region/multi-sample consumer interface, the `svar2-codec` seam extraction, and
-uniform-key re-expansion — `overlap_sample` is a single-sample Rust core, not yet a Python
-API.
+multi-region/multi-sample consumer interface and uniform-key re-expansion —
+`overlap_sample` is a single-sample Rust core, not yet a Python API. The `svar2-codec`
+seam extraction listed here previously has since shipped as its own crate (see
+[`svar-2.md`](svar-2.md), M6).
 
 ## Format constraints and non-goals
 
