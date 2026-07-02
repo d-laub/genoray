@@ -2,7 +2,7 @@
 // reader emits correctly split, atomized, and globally position-sorted DenseChunks.
 mod common;
 
-use common::{SynthRecord, build_bcf_with_index};
+use common::{SynthRecord, build_bcf_with_index, build_fasta_with_index};
 use genoray_core::vcf_reader::VcfChunkReader;
 use std::path::Path;
 use tempfile::tempdir;
@@ -16,7 +16,17 @@ fn drain_reader(
     ploidy: usize,
     chunk_size: usize,
 ) -> Vec<(u32, i32, Vec<bool>)> {
-    let mut reader = VcfChunkReader::new(bcf_path.to_str().unwrap(), chrom, samples, 1, ploidy);
+    // Each test builds `bcf_path.with_extension("fa")` from its records *before* calling
+    // drain_reader (see the per-test edit below); here we just point the reader at it.
+    let fasta_path = bcf_path.with_extension("fa");
+    let mut reader = VcfChunkReader::new(
+        bcf_path.to_str().unwrap(),
+        fasta_path.to_str().unwrap(),
+        chrom,
+        samples,
+        1,
+        ploidy,
+    );
     let columns = samples.len() * ploidy;
     let mut out = Vec::new();
     let mut chunk_id = 0;
@@ -47,6 +57,7 @@ fn multiallelic_site_splits_and_remaps_genotypes() {
         gt: vec![1, 2],
     }];
     build_bcf_with_index(&bcf, "chr1", 10_000, &samples, &records);
+    build_fasta_with_index(&bcf.with_extension("fa"), "chr1", 10_000, &records);
 
     let atoms = drain_reader(&bcf, "chr1", &samples, 2, 100);
     // Two SNP atoms at pos 100: ALT C carried on hap0 only, ALT G on hap1 only.
@@ -70,6 +81,7 @@ fn mnp_atomizes_to_snps_shared_presence() {
         gt: vec![1, 1],
     }];
     build_bcf_with_index(&bcf, "chr1", 10_000, &samples, &records);
+    build_fasta_with_index(&bcf.with_extension("fa"), "chr1", 10_000, &records);
 
     let atoms = drain_reader(&bcf, "chr1", &samples, 2, 100);
     // Two SNP atoms (A>G@100, C>T@101), both carried on both haps.
@@ -97,12 +109,13 @@ fn atoms_are_globally_position_sorted_across_records() {
         },
         SynthRecord {
             pos: 102,
-            ref_allele: b"A",
+            ref_allele: b"G",
             alts: vec![&b"T"[..]],
             gt: vec![1, 0],
         },
     ];
     build_bcf_with_index(&bcf, "chr1", 10_000, &samples, &records);
+    build_fasta_with_index(&bcf.with_extension("fa"), "chr1", 10_000, &records);
 
     // chunk_size = 1 → every atom lands in its own chunk; emission order must still
     // be globally sorted.
@@ -131,6 +144,7 @@ fn complex_deletion_with_substituted_anchor() {
         gt: vec![1, 1],
     }];
     build_bcf_with_index(&bcf, "chr1", 10_000, &samples, &records);
+    build_fasta_with_index(&bcf.with_extension("fa"), "chr1", 10_000, &records);
 
     let atoms = drain_reader(&bcf, "chr1", &samples, 2, 100);
     assert_eq!(atoms.len(), 2);

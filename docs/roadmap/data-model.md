@@ -276,14 +276,18 @@ always normalized:
   anchored INS / anchored DEL), mirroring bcftools `_atomize_allele`.
 - **Biallelic split (M2)** — split multi-allelic sites into separate biallelic records,
   remapping genotypes by original ALT index.
-- **Left-alignment (M2b, deferred)** — shift indels to their leftmost equivalent
-  position. Deferred because it is the only step requiring a reference genome.
+- **Left-alignment (M2b)** — shift each anchored indel to its leftmost reference-equivalent
+  position (classic VCF repeat roll, matching `bcftools norm -a -m- -f`), capped at a
+  bounded window `L_MAX` (default 1000 bases; indels inside a longer repeat are left
+  partially aligned, as bcftools does at its `--buffer-size` limit). Requires a reference
+  FASTA (faidx), threaded as a required conversion argument. Deletion length is invariant,
+  so overlap/`max_del` semantics are unaffected.
 
 This keeps `ILEN`/ALT semantics simple and makes the inline encoding well-defined.
-Because atomization spreads atom positions rightward (and, once M2b lands,
-left-alignment shifts them leftward), the reader emits atoms through a position-keyed
-reorder buffer so each per-`(sample, ploid)` stream stays position-sorted for the
-interleaving merge.
+Because atomization spreads atom positions rightward (and left-alignment shifts them
+leftward by up to `L_MAX`), the reader emits atoms through a position-keyed reorder buffer
+whose emit bound is relaxed by `L_MAX`, so each per-`(sample, ploid)` stream stays
+position-sorted for the interleaving merge.
 
 ## Overlap queries and deletions
 

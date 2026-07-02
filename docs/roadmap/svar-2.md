@@ -82,11 +82,16 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
   each haplotype's integer allele index to the atom's source ALT index. The former
   "input must be normalized" asserts are gone; symbolic/breakend ALTs are rejected and
   `*`/`.` alleles are skipped.
-- [ ] **M2b. Left-alignment during conversion.** Shift indels to their leftmost
+- [x] **M2b. Left-alignment during conversion.** Shift indels to their leftmost
   equivalent position. Deferred from M2 because it is the only normalization step that
   needs a reference genome (FASTA/faidx) and a new required conversion argument, and it
   widens the reorder-buffer bound (leftward shifts). See
   [`data-model.md`](data-model.md#variant-normalization).
+  *Done:* `normalize::left_align` rolls anchored indels leftward (repeat-slide, capped at
+  `L_MAX`), validated against `bcftools norm -a -m- -f`; `validate_ref` fails fast on
+  REF/FASTA disagreement; the reference FASTA threads through `process_chromosome` and the
+  PyO3 entry point as a required argument; and `vcf_reader::next_atom`'s emit bound is
+  widened by `L_MAX` to keep emission position-sorted.
 - [x] **M3. Per-contig split + sidecar positions + format finalization.** Partition the
   SVAR2 directory by contig; keep positions as sidecar arrays; finalize the on-disk
   format. See [`architecture.md`](architecture.md#on-disk-layout).

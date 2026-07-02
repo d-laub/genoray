@@ -29,10 +29,11 @@ pub use orchestrator::process_chromosome;
 //The Python Wrapper and resource allocator
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (vcf_path, chroms, output_dir, samples, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608))]
+#[pyo3(signature = (vcf_path, reference_path, chroms, output_dir, samples, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608))]
 fn run_conversion_pipeline(
     py: Python,
     vcf_path: String,
+    reference_path: String,
     chroms: Vec<String>, // now taking a vector
     output_dir: String,
     samples: Vec<String>,
@@ -95,6 +96,7 @@ fn run_conversion_pipeline(
                     println!("==> Processing {}", chrom);
                     orchestrator::process_chromosome(
                         &vcf_path,
+                        &reference_path,
                         chrom,
                         &output_dir,
                         &sample_refs,
