@@ -6,7 +6,31 @@
 pub enum NormalizeError {
     #[error("symbolic/breakend ALT '{alt}' at pos {pos} is out of scope (short-read only)")]
     SymbolicAllele { pos: u32, alt: String },
+    #[error("REF '{expected}' at pos {pos} disagrees with reference FASTA ('{found}')")]
+    RefMismatch {
+        pos: u32,
+        expected: String,
+        found: String,
+    },
+    #[error(
+        "REF at pos {pos} needs reference bases up to {needed_end} but contig is only \
+         {contig_len} long"
+    )]
+    RefOutOfContig {
+        pos: u32,
+        needed_end: usize,
+        contig_len: usize,
+    },
 }
+
+/// Maximum leftward shift (in reference bases) applied during left-alignment, and the
+/// matching width by which the reorder buffer's emit bound is relaxed (see
+/// `crate::vcf_reader::VcfChunkReader::next_atom`). Left-alignment never moves an atom
+/// more than `L_MAX` bases; an indel inside a repeat longer than `L_MAX` is left
+/// *partially* aligned — the same truncation `bcftools` applies at its `--buffer-size`
+/// limit. Conservative default pending measurement on representative short-read VCFs (the
+/// M2b spec's open question); real short-read indel/STR shifts are far below this.
+pub const L_MAX: u32 = 1000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Atom {
@@ -41,6 +65,31 @@ pub fn atomize_record(
             });
         }
         atomize_biallelic(pos, ref_allele, alt, src, out);
+    }
+    Ok(())
+}
+
+/// Fail-fast check that a record's REF allele matches the reference FASTA. Left-alignment
+/// rolls an indel against the reference, so a REF that disagrees with the FASTA would
+/// silently corrupt positions; reject it instead (a mismatch is an error, never silently
+/// "corrected"). Comparison is ASCII-case-insensitive so soft-masked (lowercase)
+/// reference bases match uppercase VCF alleles. `ref_seq` is the full 0-based contig.
+pub fn validate_ref(pos: u32, ref_allele: &[u8], ref_seq: &[u8]) -> Result<(), NormalizeError> {
+    let start = pos as usize;
+    let needed_end = start + ref_allele.len();
+    if needed_end > ref_seq.len() {
+        return Err(NormalizeError::RefOutOfContig {
+            pos,
+            needed_end,
+            contig_len: ref_seq.len(),
+        });
+    }
+    if !ref_seq[start..needed_end].eq_ignore_ascii_case(ref_allele) {
+        return Err(NormalizeError::RefMismatch {
+            pos,
+            expected: String::from_utf8_lossy(ref_allele).into_owned(),
+            found: String::from_utf8_lossy(&ref_seq[start..needed_end]).into_owned(),
+        });
     }
     Ok(())
 }
@@ -241,6 +290,43 @@ mod tests {
         assert!(matches!(
             atomize_record(100, b"A", &[b"A[chr2:321[".as_slice()], &mut out),
             Err(NormalizeError::SymbolicAllele { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_ref_accepts_matching_ref() {
+        // ref_seq (0-based): A C G T A C
+        let ref_seq = b"ACGTAC";
+        assert_eq!(validate_ref(2, b"GT", ref_seq), Ok(()));
+        assert_eq!(validate_ref(0, b"A", ref_seq), Ok(()));
+    }
+
+    #[test]
+    fn validate_ref_is_case_insensitive() {
+        // Soft-masked (lowercase) reference bases must still match uppercase VCF REF.
+        let ref_seq = b"acgtac";
+        assert_eq!(validate_ref(2, b"GT", ref_seq), Ok(()));
+    }
+
+    #[test]
+    fn validate_ref_rejects_mismatch() {
+        let ref_seq = b"ACGTAC";
+        assert!(matches!(
+            validate_ref(2, b"AA", ref_seq),
+            Err(NormalizeError::RefMismatch { pos: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn validate_ref_rejects_out_of_contig() {
+        let ref_seq = b"ACGT";
+        assert!(matches!(
+            validate_ref(3, b"TAC", ref_seq),
+            Err(NormalizeError::RefOutOfContig {
+                pos: 3,
+                needed_end: 6,
+                contig_len: 4
+            })
         ));
     }
 
