@@ -218,4 +218,58 @@ mod tests {
         assert_eq!(read_max_del(c), Array2::<u32>::zeros((2, 2)));
         assert_eq!(read_dense_max_del(c), Array1::from_vec(vec![5u32]));
     }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        // Random per-column deletion lengths → the produced (n_samples, ploidy)
+        // max_del must equal the brute-force per-column maximum. `0` marks a
+        // non-deletion call (SNP/INS). This is the primary correctness gate for
+        // the scan + column slicing + reshape.
+        #[test]
+        fn prop_var_key_max_del_matches_oracle(
+            n_samples in 1usize..4,
+            ploidy in 1usize..3,
+            // per-column deletion lengths, flattened; sized/chunked below.
+            col_lens in proptest::collection::vec(0usize..6, 0..12),
+            del_seeds in proptest::collection::vec(0u32..1000, 0..64),
+        ) {
+            let total_columns = n_samples * ploidy;
+
+            // Deterministic per-column call counts (0..=5) derived from col_lens.
+            let counts: Vec<usize> =
+                (0..total_columns).map(|c| col_lens.get(c).copied().unwrap_or(0)).collect();
+
+            // Assign deletion lengths to calls from del_seeds (cycled), building
+            // both the key stream and the per-column oracle max in lockstep.
+            let mut keys: Vec<u32> = Vec::new();
+            let mut offsets: Vec<u64> = vec![0u64; total_columns + 1];
+            let mut oracle = vec![0u32; total_columns];
+            let mut seed_i = 0usize;
+            for c in 0..total_columns {
+                let mut col_max = 0u32;
+                for _ in 0..counts[c] {
+                    let d = del_seeds.get(seed_i % del_seeds.len().max(1)).copied().unwrap_or(0);
+                    seed_i += 1;
+                    keys.push(del_key(d));
+                    col_max = col_max.max(d);
+                }
+                offsets[c + 1] = offsets[c] + counts[c] as u64;
+                oracle[c] = col_max;
+            }
+
+            let tmp = tempdir().unwrap();
+            let cdir = tmp.path();
+            write_var_key_indel(cdir, &offsets, &keys);
+            write_max_del(cdir, n_samples, ploidy).unwrap();
+
+            let m = read_max_del(cdir);
+            prop_assert_eq!(m.shape(), &[n_samples, ploidy]);
+            for (c, &want) in oracle.iter().enumerate() {
+                let s = c / ploidy;
+                let p = c % ploidy;
+                prop_assert_eq!(m[[s, p]], want, "col {}", c);
+            }
+        }
+    }
 }
