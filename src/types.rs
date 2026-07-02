@@ -1,12 +1,9 @@
 use crate::streams::StreamMap;
 
-// Minimum signed ilen representable inline as a pure DEL (i31 signed two's complement).
-// Real data won't approach this — atomized DELs span at most chromosome length (~250 Mbp).
-pub const MIN_I31: i32 = -(1 << 30);
-
-// Maximum ALT byte length that fits in the inline encoding (26 bits ÷ 2 bits/base = 13).
-// Beyond this, a pure-INS variant spills to the long-allele bank.
-pub const MAX_INLINE_ALT_LEN: usize = 13;
+// Key-layout constants now live in the `svar2-codec` crate (single source of
+// layout truth). Re-exported so existing `crate::types::{MIN_I31,
+// MAX_INLINE_ALT_LEN}` call sites keep resolving.
+pub use svar2_codec::{MAX_INLINE_ALT_LEN, MIN_I31};
 
 // 3-D bit grid laid out row-major (V, S, P), packed 64 bits per u64 word.
 // Equivalent to an Array3<bool> with default C-order layout: bit (v, s, p)

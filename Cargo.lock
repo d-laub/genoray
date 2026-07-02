@@ -374,6 +374,7 @@ dependencies = [
  "rayon",
  "rust-htslib",
  "serde_json",
+ "svar2-codec",
  "tempfile",
  "thiserror 2.0.18",
 ]
