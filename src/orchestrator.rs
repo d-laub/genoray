@@ -76,6 +76,22 @@ pub fn process_chromosome(
         source: e,
     })?;
 
+    // Dense per-class dirs, built up front the same way as `stream_dirs`.
+    let dense_dirs: crate::dense::DenseMap<std::path::PathBuf> =
+        crate::dense::DenseMap::from_fn(|c| {
+            let spec = &crate::dense::DENSE_REGISTRY[c.index()];
+            std::path::Path::new(base_out_dir)
+                .join(chrom)
+                .join(spec.subdir)
+        });
+    for spec in &crate::dense::DENSE_REGISTRY {
+        let dir = dense_dirs.get(spec.class);
+        fs::create_dir_all(dir).map_err(|e| ConversionError::Io {
+            context: format!("create_dir_all {:?}", dir),
+            source: e,
+        })?;
+    }
+
     // Channel capacities tuned for cohort-scale workloads.
     // - tx_dense=6: smooths HTSlib BGZF block-boundary jitter so the executor
     //   never starves on `rx_dense.recv()`. Each DenseChunk is ~chunk_size × S × P / 8 bytes.
@@ -135,9 +151,10 @@ pub fn process_chromosome(
     // for the writer thread to move into its closure; `stream_dirs` itself is
     // kept for the post-Phase-1 merge loop below.
     let dirs_for_writer = StreamMap::from_fn(|tag| stream_dirs.get(tag).clone());
+    let dense_dirs_for_writer = crate::dense::DenseMap::from_fn(|c| dense_dirs.get(c).clone());
     let chunk_writer_thread = thread::Builder::new()
         .name(format!("cw-{}", chrom))
-        .spawn(move || writer::run_io_writer(rx_sparse, dirs_for_writer))
+        .spawn(move || writer::run_io_writer(rx_sparse, dirs_for_writer, dense_dirs_for_writer))
         .expect("spawn chunk writer");
 
     // Step 3b -> The long allele chunk writer
