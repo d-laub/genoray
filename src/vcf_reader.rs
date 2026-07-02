@@ -154,6 +154,12 @@ impl VcfChunkReader {
     // records as needed. An atom is safe to emit once its position is strictly below
     // the read frontier (no future atom can precede the frontier, since there is no
     // left-alignment) or once the input is exhausted.
+    //
+    // Memory note: the heap holds every atom whose pos == frontier until a record with a
+    // strictly greater start pos advances the frontier (or EOF). For coordinate-sorted
+    // input this is bounded by the atoms at a single position; a pathological run of many
+    // records sharing one start pos would grow it. M2b (left-alignment) weakens the
+    // `pos >= record_start` premise and must revisit this bound.
     fn next_atom(&mut self) -> Option<PendingAtom> {
         loop {
             if let Some(Reverse(top)) = self.heap.peek() {

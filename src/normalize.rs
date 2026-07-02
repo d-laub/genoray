@@ -55,6 +55,12 @@ fn is_symbolic(alt: &[u8]) -> bool {
 /// single left-anchored indel at the last aligned index. The one deviation is the
 /// substituted-deletion-anchor case (see below), forced by the pure-DEL encoding.
 fn atomize_biallelic(pos: u32, ref_allele: &[u8], alt: &[u8], src: u16, out: &mut Vec<Atom>) {
+    // Valid VCF guarantees non-empty REF/ALT; a `*`/`.`/symbolic ALT is filtered by the
+    // caller. Fail fast on the precondition — otherwise `k = n - 1` below underflows.
+    debug_assert!(
+        !ref_allele.is_empty() && !alt.is_empty(),
+        "atomize_biallelic requires non-empty REF and ALT"
+    );
     // 1. Trim shared suffix, keeping >= 1 base on each side.
     let mut rlen = ref_allele.len();
     let mut alen = alt.len();
