@@ -250,6 +250,100 @@ fn test_overlap_sample_var_key_snp_nonzero_csr_offset() {
     assert_eq!(r.per_hap[1].alts, vec![b"G".to_vec()]);
 }
 
+// A variant routed to dense vs. var_key must give identical query results for the
+// carrying sample — routing is an internal storage choice, invisible to queries.
+// A deletion carried by 1 sample (rare -> var_key/indel) vs. by many samples
+// (common -> dense/indel) must both come back with the same (pos, ilen, alt).
+#[test]
+fn test_routing_invariant_dense_vs_var_key() {
+    // Rare: 6 samples, only S0_p0 carries the DEL -> var_key/indel.
+    let rare = {
+        let tmp = tempdir().unwrap();
+        let out = tmp.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let samples = ["S0", "S1", "S2", "S3", "S4", "S5"];
+        let records = vec![SynthRecord {
+            pos: 500,
+            ref_allele: b"ATATA", // 4-base deletion
+            alts: vec![&b"A"[..]],
+            gt: vec![1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        }];
+        build_contig(&out, "chr1", &samples, 2, &records);
+        let reader = ContigReader::open(out.to_str().unwrap(), "chr1", 6, 2).unwrap();
+        let r = overlap_sample(&reader, 0, 0, 1000);
+        (
+            r.per_hap[0].positions.clone(),
+            r.per_hap[0].ilens.clone(),
+            r.per_hap[0].alts.clone(),
+        )
+    };
+
+    // Common: same DEL carried by nearly everyone -> dense/indel.
+    let common = {
+        let tmp = tempdir().unwrap();
+        let out = tmp.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let samples = ["S0", "S1", "S2", "S3", "S4", "S5"];
+        let records = vec![SynthRecord {
+            pos: 500,
+            ref_allele: b"ATATA",
+            alts: vec![&b"A"[..]],
+            gt: vec![1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0],
+        }];
+        build_contig(&out, "chr1", &samples, 2, &records);
+        let reader = ContigReader::open(out.to_str().unwrap(), "chr1", 6, 2).unwrap();
+        let r = overlap_sample(&reader, 0, 0, 1000);
+        (
+            r.per_hap[0].positions.clone(),
+            r.per_hap[0].ilens.clone(),
+            r.per_hap[0].alts.clone(),
+        )
+    };
+
+    assert_eq!(rare, common);
+    assert_eq!(rare.0, vec![500]);
+    assert_eq!(rare.1, vec![-4]); // 5-base ref, 1-base alt
+    assert_eq!(rare.2, vec![Vec::<u8>::new()]);
+}
+
+// A pure-SNP contig (all-zero max_del, possibly no dense/indel or var_key/indel
+// dir) queries correctly, and a query outside all variants is empty.
+#[test]
+fn test_pure_snp_contig_and_no_overlap() {
+    let tmp = tempdir().unwrap();
+    let out = tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+
+    let samples = ["S0"];
+    let records = vec![
+        SynthRecord {
+            pos: 100,
+            ref_allele: b"A",
+            alts: vec![&b"C"[..]],
+            gt: vec![1, 1],
+        },
+        SynthRecord {
+            pos: 200,
+            ref_allele: b"G",
+            alts: vec![&b"T"[..]],
+            gt: vec![1, 0],
+        },
+    ];
+    build_contig(&out, "chr1", &samples, 2, &records);
+    let reader = ContigReader::open(out.to_str().unwrap(), "chr1", 1, 2).unwrap();
+
+    let r = overlap_sample(&reader, 0, 0, 1000);
+    assert_eq!(r.per_hap[0].positions, vec![100, 200]);
+    assert_eq!(r.per_hap[0].ilens, vec![0, 0]);
+    assert_eq!(r.per_hap[1].positions, vec![100]); // hap 1 carries only the SNP@100
+
+    // Entirely-left and entirely-right queries are empty.
+    let left = overlap_sample(&reader, 0, 0, 50);
+    assert!(left.per_hap[0].positions.is_empty());
+    let right = overlap_sample(&reader, 0, 900, 1000);
+    assert!(right.per_hap[0].positions.is_empty());
+}
+
 /// Owned analogue of `SynthRecord` (proptest needs values that outlive the
 /// borrow). One atomized bi-allelic variant.
 #[derive(Clone, Debug)]
