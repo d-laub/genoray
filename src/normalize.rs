@@ -94,6 +94,54 @@ pub fn validate_ref(pos: u32, ref_allele: &[u8], ref_seq: &[u8]) -> Result<(), N
     Ok(())
 }
 
+/// Shift an anchored indel atom to its leftmost reference-equivalent position (classic VCF
+/// left-alignment / repeat roll), capped at `l_max` leftward bases. SNP atoms and
+/// substituted-anchor insertions never move. `ref_seq` is the full 0-based contig
+/// (uppercased); the caller must have run `validate_ref` on the source record first, so
+/// every reference read here is in-bounds. Only `pos` and the anchor base(s) in `alt`
+/// change — `ilen` (and thus deletion length) and `source_alt_index` are invariant.
+pub fn left_align(mut atom: Atom, ref_seq: &[u8], l_max: u32) -> Atom {
+    use std::cmp::Ordering;
+    match atom.ilen.cmp(&0) {
+        Ordering::Equal => atom, // SNP: never moves.
+        Ordering::Less => {
+            // Deletion: anchor at `pos`, `ndel` deleted bases at ref_seq[pos+1 ..= pos+ndel].
+            // Roll while the anchor base equals the last deleted base.
+            let ndel = (-atom.ilen) as usize;
+            let mut pos = atom.pos as usize;
+            let mut shifts = 0u32;
+            while pos > 0 && shifts < l_max && ref_seq[pos] == ref_seq[pos + ndel] {
+                pos -= 1;
+                shifts += 1;
+            }
+            atom.pos = pos as u32;
+            atom.alt = vec![ref_seq[pos]]; // pure DEL: alt is the (new) anchor base.
+            atom
+        }
+        Ordering::Greater => {
+            // Insertion: alt = [anchor] ++ inserted. Roll only a clean anchor; a
+            // substituted anchor is SNP+INS and stays put.
+            let mut pos = atom.pos as usize;
+            if ref_seq[pos] != atom.alt[0] {
+                return atom;
+            }
+            let mut inserted: Vec<u8> = atom.alt[1..].to_vec();
+            let mut shifts = 0u32;
+            while pos > 0 && shifts < l_max && ref_seq[pos] == *inserted.last().unwrap() {
+                inserted.rotate_right(1);
+                pos -= 1;
+                shifts += 1;
+            }
+            let mut alt = Vec::with_capacity(1 + inserted.len());
+            alt.push(ref_seq[pos]);
+            alt.extend_from_slice(&inserted);
+            atom.pos = pos as u32;
+            atom.alt = alt;
+            atom
+        }
+    }
+}
+
 #[inline]
 fn is_symbolic(alt: &[u8]) -> bool {
     alt.first() == Some(&b'<') || alt.contains(&b'[') || alt.contains(&b']')
@@ -328,6 +376,125 @@ mod tests {
                 contig_len: 4
             })
         ));
+    }
+
+    // Reference used across left_align tests (0-based indices):
+    //  0:C 1:A 2:A 3:A 4:A 5:T 6:C 7:A 8:G 9:A 10:G 11:T
+    const LA_REF: &[u8] = b"CAAAATCAGAGT";
+
+    #[test]
+    fn left_align_deletion_rolls_through_homopolymer() {
+        // AA>A anchored at pos 3 (delete one A) → bcftools: pos 0, REF "CA" ALT "C".
+        let a = atom(3, -1, b"A", 1);
+        assert_eq!(left_align(a, LA_REF, L_MAX), atom(0, -1, b"C", 1));
+    }
+
+    #[test]
+    fn left_align_deletion_stops_at_contig_start() {
+        // The homopolymer roll above lands exactly on pos 0 (contig start) and stops
+        // there without reading ref_seq[-1].
+        let a = atom(3, -1, b"A", 1);
+        assert_eq!(left_align(a, LA_REF, L_MAX).pos, 0);
+    }
+
+    #[test]
+    fn left_align_insertion_rolls_through_homopolymer() {
+        // A>AA anchored at pos 3 (insert one A) → bcftools: pos 0, REF "C" ALT "CA".
+        let a = atom(3, 1, b"AA", 1);
+        assert_eq!(left_align(a, LA_REF, L_MAX), atom(0, 1, b"CA", 1));
+    }
+
+    #[test]
+    fn left_align_dinucleotide_deletion_rolls_repeat() {
+        // GAG>G anchored at pos 8 (delete "AG" from the AGAG repeat) → bcftools:
+        // pos 6, REF "CAG" ALT "C".
+        let a = atom(8, -2, b"G", 1);
+        assert_eq!(left_align(a, LA_REF, L_MAX), atom(6, -2, b"C", 1));
+    }
+
+    #[test]
+    fn left_align_snp_never_moves() {
+        let a = atom(3, 0, b"T", 1);
+        assert_eq!(left_align(a, LA_REF, L_MAX), atom(3, 0, b"T", 1));
+    }
+
+    #[test]
+    fn left_align_substituted_anchor_insertion_stays_put() {
+        // alt[0]='G' but ref_seq[3]='A' → substituted anchor (SNP+INS), not a pure
+        // insertion. Must not roll.
+        let a = atom(3, 1, b"GT", 1);
+        assert_eq!(left_align(a, LA_REF, L_MAX), atom(3, 1, b"GT", 1));
+    }
+
+    #[test]
+    fn left_align_respects_l_max_partial_align() {
+        // Same homopolymer deletion, but l_max = 2 caps the roll: pos 3 → 1 (two shifts),
+        // not all the way to 0.
+        let a = atom(3, -1, b"A", 1);
+        let out = left_align(a, LA_REF, 2);
+        assert_eq!(out.pos, 1);
+        assert_eq!(out.alt, b"A".to_vec()); // ref_seq[1] == 'A'
+    }
+
+    // Apply a (clean) indel atom to a copy of the reference, returning the alt haplotype.
+    // DEL removes ref_seq[pos+1 ..= pos+ndel]; INS splices alt[1..] in after `pos`.
+    fn apply_edit(atom: &Atom, ref_seq: &[u8]) -> Vec<u8> {
+        let pos = atom.pos as usize;
+        let mut out = ref_seq[..=pos].to_vec();
+        if atom.ilen > 0 {
+            out.extend_from_slice(&atom.alt[1..]);
+            out.extend_from_slice(&ref_seq[pos + 1..]);
+        } else {
+            let ndel = (-atom.ilen) as usize;
+            out.extend_from_slice(&ref_seq[pos + 1 + ndel..]);
+        }
+        out
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2000))]
+
+        // Left-alignment preserves the alt haplotype (reference-equivalent) and produces a
+        // representation that cannot shift further left within L_MAX.
+        #[test]
+        fn left_align_is_reference_equivalent_and_leftmost(
+            reference in proptest::collection::vec(
+                prop_oneof![Just(b'A'), Just(b'C'), Just(b'G'), Just(b'T')], 2..40),
+            anchor in 0usize..38,
+            is_del in any::<bool>(),
+            unit in proptest::collection::vec(
+                prop_oneof![Just(b'A'), Just(b'C'), Just(b'G'), Just(b'T')], 1..4),
+        ) {
+            let n = reference.len();
+            let pos = anchor % (n - 1); // leave room for >= 1 base to the right
+
+            let atom = if is_del {
+                // Clean DEL: delete up to `unit.len()` bases starting at pos+1.
+                let ndel = unit.len().min(n - pos - 1);
+                if ndel == 0 { return Ok(()); }
+                Atom { pos: pos as u32, ilen: -(ndel as i32),
+                       alt: vec![reference[pos]], source_alt_index: 1 }
+            } else {
+                // Clean INS: anchor is the true reference base, insert `unit`.
+                let mut alt = vec![reference[pos]];
+                alt.extend_from_slice(&unit);
+                Atom { pos: pos as u32, ilen: unit.len() as i32,
+                       alt, source_alt_index: 1 }
+            };
+
+            let aligned = left_align(atom.clone(), &reference, L_MAX);
+
+            // 1. Reference-equivalent: same alt haplotype.
+            prop_assert_eq!(apply_edit(&atom, &reference), apply_edit(&aligned, &reference));
+
+            // 2. Length invariant.
+            prop_assert_eq!(aligned.ilen, atom.ilen);
+
+            // 3. Leftmost within L_MAX: applying left_align again is a fixpoint.
+            let again = left_align(aligned.clone(), &reference, L_MAX);
+            prop_assert_eq!(&again.pos, &aligned.pos);
+            prop_assert_eq!(&again.alt, &aligned.alt);
+        }
     }
 
     proptest! {
