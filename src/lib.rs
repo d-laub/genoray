@@ -17,6 +17,7 @@ pub mod normalize;
 pub mod nrvk;
 pub mod orchestrator;
 pub mod rvk;
+pub mod search;
 pub mod streams;
 pub mod types;
 pub mod vcf_reader;
