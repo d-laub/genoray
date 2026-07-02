@@ -171,7 +171,8 @@ fn test_e2e_normalized_bcf_pipeline() {
         2,    // ploidy
         1,    // htslib_threads
         4096, // long_allele_capacity
-    );
+    )
+    .expect("process_chromosome should succeed");
 
     let snp_dir = out_dir.join("chr1/var_key/snp");
     let indel_dir = out_dir.join("chr1/var_key/indel");
@@ -261,7 +262,8 @@ fn test_e2e_mutation_conservation() {
         2,
         1,
         4096,
-    );
+    )
+    .expect("process_chromosome should succeed");
 
     let snp_dir = out_dir.join("chr1/var_key/snp");
     let indel_dir = out_dir.join("chr1/var_key/indel");
@@ -356,4 +358,42 @@ fn test_reader_accepts_pure_del() {
         .expect("chunk should succeed");
     assert_eq!(chunk.ilens.len(), 1);
     assert_eq!(chunk.ilens, vec![-2]);
+}
+
+// Boundary error-handling: a chromosome absent from the VCF header must surface
+// as a typed `ConversionError::WorkerPanicked` (the reader thread panics on
+// `name2rid`, and `process_chromosome` converts the join panic into an Err)
+// rather than unwinding the calling thread.
+#[test]
+fn test_missing_chrom_returns_err() {
+    let tmp = tempdir().unwrap();
+    let bcf_path = tmp.path().join("missing_chrom.bcf");
+
+    let samples = vec!["s0"];
+    let records = vec![SynthRecord {
+        pos: 100,
+        ref_allele: b"A",
+        alts: vec![&b"C"[..]],
+        gt: vec![1, 0],
+    }];
+    build_bcf_with_index(&bcf_path, "chr1", 10_000, &samples, &records);
+
+    let out_dir = tmp.path().join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let res = genoray_core::orchestrator::process_chromosome(
+        bcf_path.to_str().unwrap(),
+        "chrZ",
+        out_dir.to_str().unwrap(),
+        &["s0"],
+        1000,
+        2,
+        1,
+        1 << 20,
+    );
+
+    assert!(matches!(
+        res,
+        Err(genoray_core::error::ConversionError::WorkerPanicked { .. })
+    ));
 }

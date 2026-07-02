@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
+use crate::error::ConversionError;
 use crate::nrvk::LongAlleleTableWriter;
 use crate::streams::{REGISTRY, StreamMap, StreamTag};
 use crate::vcf_reader::VcfChunkReader;
@@ -49,20 +50,26 @@ pub fn process_chromosome(
     ploidy: usize,
     htslib_threads: usize,
     long_allele_capacity: usize,
-) {
+) -> Result<(), ConversionError> {
     // Directory Formatting: svar2/{contig}/var_key/{snp,indel}
     let paths = crate::layout::ContigPaths::new(base_out_dir, chrom);
 
-    // Stream dirs keyed by tag, created up front. Adding a new stream means
+    // Stream dirs keyed by tag, built up front (no side effects — StreamMap::from_fn
+    // can't propagate a Result out of its closure). Adding a new stream means
     // extending `streams::REGISTRY` only — nothing here needs to change.
     let stream_dirs: StreamMap<std::path::PathBuf> = StreamMap::from_fn(|tag| {
         let spec = &REGISTRY[tag.index()];
-        let dir = std::path::Path::new(base_out_dir)
+        std::path::Path::new(base_out_dir)
             .join(chrom)
-            .join(spec.subdir);
-        fs::create_dir_all(&dir).expect("create stream output dir");
-        dir
+            .join(spec.subdir)
     });
+    // Actually create the directories in a separate loop, where `?` is available.
+    for (_, dir) in stream_dirs.iter() {
+        fs::create_dir_all(dir).map_err(|e| ConversionError::Io {
+            context: format!("create_dir_all {:?}", dir),
+            source: e,
+        })?;
+    }
 
     // Channel capacities tuned for cohort-scale workloads.
     // - tx_dense=6: smooths HTSlib BGZF block-boundary jitter so the executor
@@ -139,16 +146,37 @@ pub fn process_chromosome(
         .expect("spawn long allele writer");
 
     // Wait for the reader to finish (drops its tx_dense Sender).
-    reader_thread.join().unwrap();
+    reader_thread
+        .join()
+        .map_err(|_| ConversionError::WorkerPanicked {
+            thread: format!("read-{}", chrom),
+        })?;
 
     // Stop the sampler so its tx_* clones drop. Once these AND the reader's tx_dense
     // are gone, the executor's rx_dense.recv() returns Err and the executor unwinds.
     stop_sampler.store(true, Ordering::Relaxed);
-    sampler_thread.join().unwrap();
+    sampler_thread
+        .join()
+        .map_err(|_| ConversionError::WorkerPanicked {
+            thread: format!("samp-{}", chrom),
+        })?;
 
-    let (ledgers, long_allele_offsets) = executor_thread.join().unwrap();
-    chunk_writer_thread.join().unwrap();
-    long_allele_writer_thread.join().unwrap();
+    let (ledgers, long_allele_offsets) =
+        executor_thread
+            .join()
+            .map_err(|_| ConversionError::WorkerPanicked {
+                thread: format!("exec-{}", chrom),
+            })?;
+    chunk_writer_thread
+        .join()
+        .map_err(|_| ConversionError::WorkerPanicked {
+            thread: format!("cw-{}", chrom),
+        })?;
+    long_allele_writer_thread
+        .join()
+        .map_err(|_| ConversionError::WorkerPanicked {
+            thread: format!("lw-{}", chrom),
+        })?;
 
     println!(
         "[{}] Phase 1 Complete. Triggering Phase 2 In-Memory Merge...",
@@ -157,8 +185,12 @@ pub fn process_chromosome(
 
     // Long-allele offsets belong to the indel stream.
     let offsets_array = ndarray::Array1::from_vec(long_allele_offsets);
-    ndarray_npy::write_npy(paths.long_allele_offsets(), &offsets_array)
-        .expect("Failed to write long allele offsets");
+    ndarray_npy::write_npy(paths.long_allele_offsets(), &offsets_array).map_err(|source| {
+        ConversionError::Npy {
+            path: paths.long_allele_offsets().to_string_lossy().into_owned(),
+            source,
+        }
+    })?;
 
     // num_chunks is identical across streams — one ledger row per chunk.
     let num_chunks = ledgers.get(StreamTag::VarKeyIndel).len();
@@ -180,4 +212,6 @@ pub fn process_chromosome(
     }
 
     println!("[{}] Pipeline Execution Finished Successfully.", chrom);
+
+    Ok(())
 }

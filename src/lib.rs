@@ -3,6 +3,7 @@ use pyo3::prelude::*;
 use rayon::prelude::*;
 
 pub mod budget;
+pub mod error;
 pub mod executor;
 pub mod layout;
 pub mod merge;
@@ -34,7 +35,7 @@ fn run_conversion_pipeline(
 ) -> PyResult<()> {
     let sample_refs: Vec<&str> = samples.iter().map(|s| s.as_str()).collect();
 
-    py.detach(|| {
+    let results: Vec<Result<(), crate::error::ConversionError>> = py.detach(|| {
         // Step 1 -> HW discovery/override and budgeting
         let available_cores = match max_threads {
             Some(t) if t > 0 => {
@@ -79,24 +80,32 @@ fn run_conversion_pipeline(
             .unwrap();
 
         // Step 3 -> Dispatch
-        pool.install(|| {
-            chroms.par_iter().for_each(|chrom| {
-                println!("==> Processing {}", chrom);
-                orchestrator::process_chromosome(
-                    &vcf_path,
-                    chrom,
-                    &output_dir,
-                    &sample_refs,
-                    chunk_size,
-                    ploidy,
-                    htslib_threads,
-                    long_allele_capacity,
-                );
-            });
+        let results = pool.install(|| {
+            chroms
+                .par_iter()
+                .map(|chrom| {
+                    println!("==> Processing {}", chrom);
+                    orchestrator::process_chromosome(
+                        &vcf_path,
+                        chrom,
+                        &output_dir,
+                        &sample_refs,
+                        chunk_size,
+                        ploidy,
+                        htslib_threads,
+                        long_allele_capacity,
+                    )
+                })
+                .collect::<Vec<_>>()
         });
 
         println!("Cohort Processing Complete.");
+        results
     });
+
+    for r in results {
+        r.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+    }
 
     Ok(())
 }
