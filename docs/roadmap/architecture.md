@@ -132,8 +132,12 @@ sorted streams.
 
 ## Open questions
 
-- **Routing granularity.** Is representation chosen strictly per variant, or can a
-  contig be forced into a single representation for simplicity in early milestones?
+- **Routing granularity.** *Resolved: strictly per variant.* Each variant's
+  representation is decided **locally within the chunk that contains it**, from the
+  variant's plane popcount (`BitGrid3::popcount_plane`, i.e. its carrier count `x`)
+  fed into the [cost model](data-model.md#dense-vs-sparse-cost-model)
+  (`dense2sparse_vk` in `rvk.rs`). A variant is always fully contained in one chunk,
+  so no cross-chunk state is needed to make the routing decision.
 - **Merge stage memory.** Bounds and chunking strategy for the Phase-2 merge at
   scale (many samples × many chunks). *Current implementation:* a parallel **tile-based
   interleaving** merge replaces the sequential K-way merge — an in-memory metadata pass

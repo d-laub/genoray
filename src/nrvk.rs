@@ -104,7 +104,7 @@ pub struct LongAlleleReader {
 impl LongAlleleReader {
     // TODO: Decide which will call this (or create this instance)
     pub fn new(output_dir: &str, chrom: &str) -> Self {
-        // Layout matches the writer: {output_dir}/{chrom}/var_key/indel/{long_alleles.bin, long_allele_offsets.npy}
+        // Layout matches the writer: {output_dir}/{chrom}/indel/{long_alleles.bin, long_allele_offsets.npy}
         let paths = ContigPaths::new(output_dir, chrom);
 
         let file = File::open(paths.long_alleles_bin()).expect("Failed to open long_alleles.bin");
@@ -157,7 +157,7 @@ mod tests {
     fn test_reader_get_allele_shared_borrow() {
         use std::io::Write;
         let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("chr1").join("var_key").join("indel");
+        let dir = tmp.path().join("chr1").join("indel");
         std::fs::create_dir_all(&dir).unwrap();
         // bytes: "AAAA" then "CC" → offsets [0, 4, 6]
         let mut f = std::fs::File::create(dir.join("long_alleles.bin")).unwrap();

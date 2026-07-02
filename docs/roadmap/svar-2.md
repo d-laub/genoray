@@ -67,8 +67,8 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
   streaming long-allele LUT; and a memory-bounded parallel tile merge. Covered by 30
   in-source unit/proptests + 5 e2e tests. An optional per-contig monitoring sampler
   (`GENORAY_SAMPLE_INTERVAL`) reports channel fill and per-thread CPU%. *Remaining:*
-  variant normalization (M2, currently a precondition — see below) and the dense
-  routing of M4; the on-disk filenames are still provisional (see M3). The
+  variant normalization (M2, currently a precondition — see below); the on-disk
+  filenames are still provisional (see M3). The
   `var_key` stream is now split into 2-bit `snp/` and 32-bit `indel/`
   sub-streams per [`data-model.md`](data-model.md#on-disk-layout); the SNP stream
   is 2-bit-packed post-merge and carries no LUT.
@@ -97,9 +97,27 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
   `final_offsets.npy`, plus `long_alleles.bin` + `long_allele_offsets.npy` under
   `indel/`, which differ from the `.npy` names in the layout spec; `meta.json` and
   the per-contig `max_del.npy` are not yet written.
-- [ ] **M4. Dense representation + cost-model routing.** Implement the 1-bit dense
+- [x] **M4. Dense representation + cost-model routing.** Implement the 1-bit dense
   genotype matrix and the deterministic per-variant dense/sparse decision. See
   [`data-model.md`](data-model.md#dense-vs-sparse-cost-model).
+  *Implemented and tested:* an exact-integer-bit cost model (`cost_model.rs`) picks
+  `Dense` vs. `VarKey` per variant, strictly cheaper wins and ties break to
+  `VarKey` (see [`data-model.md`](data-model.md#dense-vs-sparse-cost-model)); routing
+  is wired directly into the dense→sparse transpose (`dense2sparse_vk` in `rvk.rs`),
+  decided per variant, locally within its chunk, from the variant's plane popcount
+  (`BitGrid3::popcount_plane`). Dense variants are written per class (2-bit SNP /
+  32-bit indel) as a per-chunk positions/keys/genotype-bits payload (`dense.rs`,
+  `writer.rs`) and consolidated by a rectangular dense merge (`dense_merge.rs`) that
+  bit-transposes the hap-major matrix across chunks and 2-bit-packs the SNP keys.
+  Indel long alleles — whether routed to `var_key` or `dense` — spill to the single
+  shared per-contig LUT (see [`data-model.md`](data-model.md#long-allele-lookup-table-lut)).
+  Covered by unit/proptests in `cost_model.rs`, `dense.rs`, `dense_merge.rs`, `bits.rs`,
+  and `rvk.rs`, plus an e2e dense round-trip test. *Out of scope (deferred to later
+  milestones):* `max_del.npy` / overlap queries (M5), `meta.json` (M3), and the
+  `pointer` representation (M11) are not implemented here; the dense final filenames
+  are provisional and mirror `var_key`'s (see the dense-representation section of
+  [`data-model.md`](data-model.md#dense-representation-dense)), to be unified as part
+  of M3.
 - [ ] **M5. `(range, sample)` queries.** Fast overlap queries via binary search,
   starting from the [left-tree static search tree](https://curiouscoding.nl/posts/static-search-tree/#left-tree).
   Must handle deletions spanning the query start (see

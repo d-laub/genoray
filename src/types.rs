@@ -61,6 +61,38 @@ impl BitGrid3 {
         let n_words = (new_v * ns * np).div_ceil(64);
         self.words.truncate(n_words);
     }
+
+    /// Number of set bits in variant `v`'s (S, P) plane — its allele count `x`.
+    /// The plane is the contiguous bit range `[v*S*P, (v+1)*S*P)`; counted
+    /// word-wise (masked head/tail) so it is O(plane_bits / 64), not per-bit.
+    pub fn popcount_plane(&self, v: usize) -> usize {
+        let (_, s, p) = self.shape;
+        let plane = s * p;
+        let start = v * plane;
+        let end = start + plane;
+        debug_assert!(end <= self.shape.0 * plane);
+
+        let mut count = 0u32;
+        let mut bit = start;
+        while bit < end {
+            let word_idx = bit >> 6;
+            let bit_in_word = bit & 63;
+            // bits available in this word from `bit_in_word` to end of word (64)
+            let word_end_bit = (word_idx + 1) << 6;
+            let span_end = end.min(word_end_bit);
+            let take = span_end - bit; // 1..=64 bits from this word
+            let word = self.words[word_idx];
+            // mask the [bit_in_word, bit_in_word+take) window
+            let mask = if take == 64 {
+                u64::MAX
+            } else {
+                ((1u64 << take) - 1) << bit_in_word
+            };
+            count += (word & mask).count_ones();
+            bit = span_end;
+        }
+        count as usize
+    }
 }
 
 // Defines DenseChunk and SparseChunk structs. All other files import from here.
@@ -110,12 +142,38 @@ impl SparseSubStream {
     }
 }
 
+// Per-class dense payload for one chunk: the hap-major 1-bit genotype block
+// plus the per-variant table (positions + keys). Built by `dense2sparse_vk`,
+// consumed by the writer, transposed/concatenated by dense_merge.
+pub struct DenseSubChunk {
+    pub key_bytes: usize,
+    pub n_dense_variants: usize,
+    pub positions: Vec<u32>, // len == n_dense_variants
+    pub keys: Vec<u8>,       // key_bytes * n_dense_variants
+    // Hap-major bit block, shape (S, P, n_dense_variants), variant fastest.
+    // Bit (hap h, dense col d) at flat index h*n_dense_variants + d.
+    pub geno_bits: Vec<u8>,
+}
+
+impl DenseSubChunk {
+    pub fn empty(key_bytes: usize) -> Self {
+        Self {
+            key_bytes,
+            n_dense_variants: 0,
+            positions: Vec::new(),
+            keys: Vec::new(),
+            geno_bits: Vec::new(),
+        }
+    }
+}
+
 // The transposed, sparse packet produced by the Compute Thread and consumed by
 // the Writer Thread — one `SparseSubStream` per active `StreamTag` (see
 // data-model.md#on-disk-layout).
 pub struct SparseChunk {
     pub chunk_id: usize,
     pub streams: StreamMap<SparseSubStream>,
+    pub dense: crate::dense::DenseMap<DenseSubChunk>,
 }
 
 #[cfg(test)]
@@ -183,6 +241,89 @@ mod tests {
     fn test_zeros_overflow_panics() {
         // V * S * P overflows usize on a 64-bit machine
         let _ = BitGrid3::zeros(usize::MAX, usize::MAX, 2);
+    }
+
+    #[test]
+    fn test_popcount_plane_counts_set_bits_in_variant() {
+        // shape (3, 2, 2): plane size = S*P = 4 bits per variant.
+        let mut g = BitGrid3::zeros(3, 2, 2);
+        // variant 0: set 2 bits (flat 0..4)
+        g.or_bit(0, true);
+        g.or_bit(3, true);
+        // variant 1: set 4 bits (flat 4..8)
+        for i in 4..8 {
+            g.or_bit(i, true);
+        }
+        // variant 2: set 0 bits (flat 8..12)
+        assert_eq!(g.popcount_plane(0), 2);
+        assert_eq!(g.popcount_plane(1), 4);
+        assert_eq!(g.popcount_plane(2), 0);
+    }
+
+    #[test]
+    fn test_popcount_plane_word_aligned_boundaries() {
+        // Exercise popcount_plane's `take == 64` branch (the dominant
+        // real-world case: plane = S*P is usually >= 64 bits, and this
+        // hand-written special case exists solely to avoid `1u64 << 64` UB)
+        // together with the boundary shapes around it: sub-word (63),
+        // exactly one word (64), one word + 1 bit (65, straddles a word
+        // boundary), and exactly two words (128, two consecutive take==64
+        // iterations).
+        for &plane in &[63usize, 64, 65, 128] {
+            let variants = 4;
+            // shape (variants, plane, 1) so S*P == plane exactly, one plane
+            // per variant.
+            let mut g = BitGrid3::zeros(variants, plane, 1);
+
+            // Deterministic, non-trivial pattern: bit `i` of variant `vi` is
+            // set iff `(i * (vi + 1)) % 5 < 2`. Not all-zero/all-one, and it
+            // hits bit 0, the last bit of the plane, and (for plane >= 64)
+            // bits on both sides of every word boundary.
+            for vi in 0..variants {
+                for i in 0..plane {
+                    let set = (i * (vi + 1)) % 5 < 2;
+                    g.or_bit(vi * plane + i, set);
+                }
+            }
+
+            for vi in 0..variants {
+                // Ground truth: an independent naive per-bit count via
+                // get_bit, not the masked-word logic under test.
+                let expected = (0..plane).filter(|&i| g.get_bit(vi * plane + i)).count();
+                assert_eq!(
+                    g.popcount_plane(vi),
+                    expected,
+                    "plane={} bits, variant={}",
+                    plane,
+                    vi
+                );
+            }
+        }
+    }
+
+    proptest! {
+        // popcount_plane equals a naive per-bit count for arbitrary shapes/patterns.
+        #[test]
+        fn test_popcount_plane_matches_naive(
+            v in 1usize..12,
+            s in 1usize..8,
+            p in 1usize..3,
+            seed in any::<u64>(),
+        ) {
+            let mut bg = BitGrid3::zeros(v, s, p);
+            let plane = s * p;
+            let mut expected = vec![0usize; v];
+            let mut state = seed | 1;
+            for idx in 0..(v * plane) {
+                state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+                let val = state & 1 != 0;
+                bg.or_bit(idx, val);
+                if val { expected[idx / plane] += 1; }
+            }
+            for vi in 0..v {
+                prop_assert_eq!(bg.popcount_plane(vi), expected[vi], "variant {}", vi);
+            }
+        }
     }
 
     proptest! {

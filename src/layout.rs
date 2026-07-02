@@ -28,11 +28,31 @@ impl ContigPaths {
     pub fn var_key_indel_dir(&self) -> PathBuf {
         self.var_key_dir().join("indel")
     }
+    pub fn dense_snp_dir(&self) -> PathBuf {
+        Path::new(&self.base_out_dir)
+            .join(&self.chrom)
+            .join("dense")
+            .join("snp")
+    }
+    pub fn dense_indel_dir(&self) -> PathBuf {
+        Path::new(&self.base_out_dir)
+            .join(&self.chrom)
+            .join("dense")
+            .join("indel")
+    }
+    /// Shared per-contig indel long-allele LUT dir. Both var_key/indel and
+    /// dense/indel reference this single table (spilled keys are
+    /// representation-portable).
+    pub fn shared_indel_dir(&self) -> PathBuf {
+        Path::new(&self.base_out_dir)
+            .join(&self.chrom)
+            .join("indel")
+    }
     pub fn long_alleles_bin(&self) -> PathBuf {
-        self.var_key_indel_dir().join("long_alleles.bin")
+        self.shared_indel_dir().join("long_alleles.bin")
     }
     pub fn long_allele_offsets(&self) -> PathBuf {
-        self.var_key_indel_dir().join("long_allele_offsets.npy")
+        self.shared_indel_dir().join("long_allele_offsets.npy")
     }
 }
 
@@ -51,6 +71,12 @@ pub fn final_keys(dir: &Path) -> PathBuf {
 pub fn final_offsets(dir: &Path) -> PathBuf {
     dir.join("final_offsets.npy")
 }
+pub fn chunk_geno(dir: &Path, chunk_id: usize) -> PathBuf {
+    dir.join(format!("chunk_{}_geno.bin", chunk_id))
+}
+pub fn final_genotypes(dir: &Path) -> PathBuf {
+    dir.join("final_genotypes.bin")
+}
 
 #[cfg(test)]
 mod tests {
@@ -64,15 +90,35 @@ mod tests {
     }
 
     #[test]
-    fn test_long_allele_paths_live_under_indel() {
+    fn test_long_allele_paths_live_under_shared_indel() {
         let p = ContigPaths::new("/out", "chr1");
         assert_eq!(
             p.long_alleles_bin(),
-            Path::new("/out/chr1/var_key/indel/long_alleles.bin")
+            Path::new("/out/chr1/indel/long_alleles.bin")
         );
         assert_eq!(
             p.long_allele_offsets(),
-            Path::new("/out/chr1/var_key/indel/long_allele_offsets.npy")
+            Path::new("/out/chr1/indel/long_allele_offsets.npy")
+        );
+    }
+
+    #[test]
+    fn test_dense_dirs() {
+        let p = ContigPaths::new("/out", "chr1");
+        assert_eq!(p.dense_snp_dir(), Path::new("/out/chr1/dense/snp"));
+        assert_eq!(p.dense_indel_dir(), Path::new("/out/chr1/dense/indel"));
+    }
+
+    #[test]
+    fn test_dense_chunk_and_final_names() {
+        let dir = Path::new("/out/chr1/dense/snp");
+        assert_eq!(
+            chunk_geno(dir, 2),
+            Path::new("/out/chr1/dense/snp/chunk_2_geno.bin")
+        );
+        assert_eq!(
+            final_genotypes(dir),
+            Path::new("/out/chr1/dense/snp/final_genotypes.bin")
         );
     }
 

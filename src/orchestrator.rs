@@ -70,6 +70,27 @@ pub fn process_chromosome(
             source: e,
         })?;
     }
+    // Shared per-contig indel LUT dir (long alleles for var_key + dense indels).
+    fs::create_dir_all(paths.shared_indel_dir()).map_err(|e| ConversionError::Io {
+        context: format!("create_dir_all {:?}", paths.shared_indel_dir()),
+        source: e,
+    })?;
+
+    // Dense per-class dirs, built up front the same way as `stream_dirs`.
+    let dense_dirs: crate::dense::DenseMap<std::path::PathBuf> =
+        crate::dense::DenseMap::from_fn(|c| {
+            let spec = &crate::dense::DENSE_REGISTRY[c.index()];
+            std::path::Path::new(base_out_dir)
+                .join(chrom)
+                .join(spec.subdir)
+        });
+    for spec in &crate::dense::DENSE_REGISTRY {
+        let dir = dense_dirs.get(spec.class);
+        fs::create_dir_all(dir).map_err(|e| ConversionError::Io {
+            context: format!("create_dir_all {:?}", dir),
+            source: e,
+        })?;
+    }
 
     // Channel capacities tuned for cohort-scale workloads.
     // - tx_dense=6: smooths HTSlib BGZF block-boundary jitter so the executor
@@ -130,9 +151,10 @@ pub fn process_chromosome(
     // for the writer thread to move into its closure; `stream_dirs` itself is
     // kept for the post-Phase-1 merge loop below.
     let dirs_for_writer = StreamMap::from_fn(|tag| stream_dirs.get(tag).clone());
+    let dense_dirs_for_writer = crate::dense::DenseMap::from_fn(|c| dense_dirs.get(c).clone());
     let chunk_writer_thread = thread::Builder::new()
         .name(format!("cw-{}", chrom))
-        .spawn(move || writer::run_io_writer(rx_sparse, dirs_for_writer))
+        .spawn(move || writer::run_io_writer(rx_sparse, dirs_for_writer, dense_dirs_for_writer))
         .expect("spawn chunk writer");
 
     // Step 3b -> The long allele chunk writer
@@ -163,10 +185,14 @@ pub fn process_chromosome(
     sampler_res.map_err(|_| ConversionError::WorkerPanicked {
         thread: format!("samp-{}", chrom),
     })?;
-    let (ledgers, long_allele_offsets) =
-        executor_res.map_err(|_| ConversionError::WorkerPanicked {
-            thread: format!("exec-{}", chrom),
-        })?;
+    let phase1 = executor_res.map_err(|_| ConversionError::WorkerPanicked {
+        thread: format!("exec-{}", chrom),
+    })?;
+    let crate::executor::Phase1Output {
+        var_key_ledgers: ledgers,
+        dense_ledgers,
+        long_allele_offsets,
+    } = phase1;
     chunk_writer_res.map_err(|_| ConversionError::WorkerPanicked {
         thread: format!("cw-{}", chrom),
     })?;
@@ -205,6 +231,24 @@ pub fn process_chromosome(
         if let Some(hook) = spec.post_merge {
             hook(&dir);
         }
+    }
+
+    // Dense merge: one rectangular merge per dense class (no-op-safe when empty).
+    let mut dense_ledgers = dense_ledgers; // make mutable to move rows out
+    for spec in &crate::dense::DENSE_REGISTRY {
+        let dir = std::path::Path::new(base_out_dir)
+            .join(chrom)
+            .join(spec.subdir);
+        let ledger = std::mem::take(dense_ledgers.get_mut(spec.class));
+        crate::dense_merge::merge_dense_class(
+            num_chunks,
+            samples.len(),
+            ploidy,
+            spec.key_bytes,
+            spec.pack_snp,
+            dir.to_str().unwrap(),
+            ledger,
+        );
     }
 
     println!("[{}] Pipeline Execution Finished Successfully.", chrom);

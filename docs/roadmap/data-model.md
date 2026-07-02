@@ -91,8 +91,9 @@ stays tiny.
 > [on-disk layout](#on-disk-layout)), so no per-call tag bit is needed and the SNP
 > stream stays a dense 2-bit bitstream. A query reads both streams and merges them (the
 > [sorted union](architecture.md#python-decode-path) the decode path already performs).
-> The cost model stays written in terms of *bytes per variant info* (`s`), which is now
-> **class-dependent** (`s ≈ 2 bits` for a SNP, `4 B` for an inline indel).
+> The cost model stays written in terms of *bits per variant info* (`s = POS_BITS +
+> key_bits`), which is **class-dependent**: `key_bits = 2` for a SNP, `32` for an
+> indel (see [cost model](#dense-vs-sparse-cost-model)).
 
 ## Long-allele lookup table (LUT)
 
@@ -105,7 +106,12 @@ spill. It is a struct-of-arrays holding the (indel) alleles that don't fit inlin
   `offsets[i] .. offsets[i+1]`). `u64` matches the byte-offset type used by the
   reader's `seek`, avoiding a cast on the read path.
 
-On disk this is `long_alleles.bin` (+ its offsets). A 31-bit key references a row by
+The LUT is a **single table shared per contig**, at `{contig}/indel/long_alleles.bin`
+(+ `{contig}/indel/long_allele_offsets.npy`) — it lives *outside* the
+`var_key`/`dense`/`pointer` representation subdirs and is referenced by **both**
+`var_key/indel` and `dense/indel` streams, since a spilled long allele is
+representation-portable (the same allele can be looked up regardless of which
+representation the carrying variant routed to). A 31-bit key references a row by
 index. Because long alleles are rare in short-read data, we do **not** do a full pass
 to pre-size the LUT — we stream and append, accepting that the LUT is small.
 
@@ -113,73 +119,96 @@ to pre-size the LUT — we stream and append, accepting that the LUT is small.
 
 When a variant's allele frequency is high enough (per the
 [cost model](#dense-vs-sparse-cost-model)), storing per-call data is wasteful and we
-switch to a **dense 1-bit genotype matrix**:
+switch to a **dense 1-bit genotype matrix**, chosen **strictly per variant** (see
+[routing granularity](architecture.md#open-questions)):
 
-- Shape `(sample, ploid, variant)`, **C-order** (variant is the fastest-varying axis).
-- One bit per `(sample, ploid, variant)`: present / absent.
+- `genotypes` is a **raw bit-packed matrix**, LSB-first, **hap-major**
+  `(sample, ploid, variant)` with variant as the fastest-varying axis — i.e. flat bit
+  index `h * V_dense + v` where `h` ranges over `sample * ploidy` haplotypes and `v`
+  over that class's dense variants. One bit per `(sample, ploid, variant)`: present /
+  absent.
+- The matrix carries **no shape sidecar** — its shape is derived from `len(positions)`
+  (the per-class dense variant count, `V_dense`) together with `(n_samples, ploidy)`
+  from `meta.json`.
 - The variant info is stored **once per variant** in a variant table alongside the
   matrix — not inline per call. That table is **split by class the same way the
   `var_key` streams are**: a 2-bit SNP variant table (no LUT) and a 32-bit indel
-  variant table (with LUT), each with its own matrix over its own variants. Splitting
-  the matrix's variant axis by class is free (same total bits) and shrinks the SNP
-  variant table's `alleles` column 4 B → 0.25 B per variant — a large win whenever
-  annotations are sparse and `alleles` dominates the row.
+  variant table (spills to the [shared per-contig LUT](#long-allele-lookup-table-lut)),
+  each with its own matrix over its own variants. Splitting the matrix's variant axis
+  by class is free (same total bits) and shrinks the SNP variant table's `alleles`
+  column 4 B → 0.25 B per variant — a large win whenever annotations are sparse and
+  `alleles` dominates the row.
+- **Provisional filenames.** Like `var_key` (see [Open questions](#open-questions)),
+  the current scratch implementation writes raw `.bin` final files —
+  `final_positions.bin` / `final_keys.bin` / `final_genotypes.bin` under
+  `{contig}/dense/{snp,indel}/` — mirroring the `var_key` naming rather than the
+  `.npy` names in the layout tree below. These will be unified with the `var_key`
+  wire format before the decode path (M6), as part of M3.
 
 ## Dense vs. sparse cost model
 
-For each variant we pick the representation with the smallest on-disk byte cost given
-its observed number of calls. Definitions:
+For each variant we pick the representation with the smallest on-disk **bit** cost
+given its observed number of carrier calls. The model is implemented in
+[`cost_model.rs`](../../src/cost_model.rs) as exact integer bit arithmetic — no
+floats, no fractional bytes — so the crossover is deterministic and reproducible.
+Definitions:
 
 $$
 \begin{aligned}
 n &\coloneqq \text{number of samples}, & n &\in \mathbb{Z}_{>0} \\
 p &\coloneqq \text{ploidy}, & p &\in \mathbb{Z}_{>0} \\
-x &\coloneqq \text{number of calls}, & x &\in [0,\, np] \\
-a &\coloneqq \tfrac{x}{np} \;\; \text{(allele frequency)} \\
-s &\coloneqq \text{bytes per variant info}, & s &\in \mathbb{Z}_{\ge 2}
+np &\coloneqq \text{number of haplotypes (columns)} \\
+x &\coloneqq \text{number of carrier calls}, & x &\in [0,\, np] \\
+s &\coloneqq \text{POS\_BITS} + \text{key\_bits(class)} \;\; \text{(bits per variant, class-dependent)}
 \end{aligned}
 $$
 
-Byte cost of each representation for one variant:
+`s` **includes** the per-call `u32` position (`POS_BITS = 32`) — packed-position
+bytes count toward the cost, both inline per call (`var_key`) and once per variant
+(`dense`). `key_bits(class)` is `2` for a SNP (2-bit ALT code) and `32` for an indel
+(inline value or LUT pointer). Concrete per-representation bit costs for one variant:
 
 $$
-\underbrace{s\,x}_{\text{VK (var\_key)}}
+\underbrace{x \cdot s}_{\text{var\_key}}
 \quad\lessgtr\quad
-\underbrace{s + 8x}_{\text{PT (pointer)}}
-\quad\lessgtr\quad
-\underbrace{s + \lceil np/8 \rceil}_{\text{DN (dense)}}
+\underbrace{s + np}_{\text{dense}}
 $$
 
-Interpretation by regime, as allele frequency `a` (hence `x`) grows:
+i.e. `var_key = x·(32 + key_bits)` (position + key inlined per call) and
+`dense = 32 + key_bits + np` (one position + key per variant, plus a 1-bit-per-hap
+mask). Route to `Dense` **iff strictly cheaper** (`dense_bits < var_key_bits`); an
+exact tie breaks to `VarKey`.
 
-- **VK** costs `s` bytes per call (variant info inlined `x` times) — cheapest at low `a`.
-- **PT** costs one `s`-byte table row plus a pointer per call — wins in the middle,
-  *and* when `s` is large (many INFO/FORMAT fields) so paying for the table row once
-  beats inlining it.
-- **DN** costs one `s`-byte table row plus a fixed `⌈np/8⌉`-byte bitmask independent of
-  `x` — cheapest at high `a`.
-
-> **This math is provisional and likely out of date.** For example, the `8x` term for
-> PT assumes a 64-bit pointer; it can be `4x` (32-bit) when the variant count is small
-> enough to index with `u32`. The LUT size is deliberately **ignored** here — pricing
-> it would require a full pass over all variants, and it is empirically negligible for
-> short-read data. Revisit the constants when we have measurements.
+> **Pointer (`PT`) representation not yet modeled here.** The `pointer`
+> representation (M11) is not part of the MVP cost-model routing above; when it's
+> added, its cost (`s` bytes table row + a pointer per call) needs to be folded into
+> the same comparison. The LUT size is deliberately **ignored** — pricing it would
+> require a full pass over all variants, and it is empirically negligible for
+> short-read data.
 
 ## On-disk layout
 
 SVAR2 is a directory. It is split by contig; each contig directory holds up to three
-representation subdirectories, populated according to the cost model. Variants in a
-contig are partitioned across `var_key` / `pointer` / `dense` — each variant lives in
-exactly one.
+representation subdirectories, populated according to the cost model, plus a single
+**shared `indel/` LUT directory** at the contig level. Variants in a contig are
+partitioned across `var_key` / `pointer` / `dense` — each variant lives in exactly
+one.
 
 Every representation splits its variant/allele storage into a **`snp/` sub-stream**
-(2-bit keys, no LUT) and an **`indel/` sub-stream** (32-bit keys, LUT):
+(2-bit keys, no LUT) and an **`indel/` sub-stream** (32-bit keys, spills to the
+shared LUT). The long-allele LUT itself is **not** duplicated per representation —
+there is exactly one `{contig}/indel/long_alleles.bin` (+
+`long_allele_offsets.npy`), referenced by both `var_key/indel` and `dense/indel`
+(and, eventually, `pointer/indel` — M11):
 
 ```
 svar2/
 ├── meta.json                       # version, samples, contigs, ploidy, ...
 └── {contig}/
     ├── max_del.npy                 # max deletion length per (sample, ploid); bounds overlap search (indel sub-streams only)
+    ├── indel/
+    │   ├── long_alleles.bin        # shared LUT for indel alleles that don't fit inline
+    │   └── long_allele_offsets.npy # row offsets into the packed ALT bytes above
     ├── dense/
     │   ├── snp/
     │   │   ├── positions.npy       # sidecar SNP-variant positions (sorted)
@@ -187,9 +216,8 @@ svar2/
     │   │   ├── {field}.npy         # per-variant INFO/FORMAT fields
     │   │   └── genotypes.npy       # 1-bit (sample, ploid, snp_variant) matrix, C-order
     │   └── indel/
-    │       ├── long_alleles.bin    # LUT for indel alleles that don't fit inline
     │       ├── positions.npy
-    │       ├── alleles.npy         # 32-bit keys, one per indel variant
+    │       ├── alleles.npy         # 32-bit keys, one per indel variant (points into shared LUT)
     │       ├── {field}.npy
     │       └── genotypes.npy       # 1-bit (sample, ploid, indel_variant) matrix, C-order
     ├── pointer/                    # = SVAR 1.0 representation (longer-term, M11)
@@ -200,9 +228,8 @@ svar2/
     │   │   ├── pointers.npy        # u32/u64 pointers into the SNP variant table
     │   │   └── offsets.npy         # per (sample, ploid) ragged offsets into pointers
     │   └── indel/
-    │       ├── long_alleles.bin
     │       ├── positions.npy
-    │       ├── alleles.npy         # 32-bit variant table
+    │       ├── alleles.npy         # 32-bit variant table (points into shared LUT)
     │       ├── {field}.npy
     │       ├── pointers.npy
     │       └── offsets.npy
@@ -213,9 +240,8 @@ svar2/
         │   ├── offsets.npy         # per (sample, ploid) ragged offsets into snp calls
         │   └── {field}.npy         # per-call INFO/FORMAT for SNP calls
         └── indel/
-            ├── long_alleles.bin
             ├── positions.npy       # per-call indel positions (sorted within each hap)
-            ├── alleles.npy         # 32-bit keys, one per call (ragged)
+            ├── alleles.npy         # 32-bit keys, one per call (ragged, points into shared LUT)
             ├── offsets.npy         # per (sample, ploid) ragged offsets into alleles
             └── {field}.npy
 ```
@@ -313,11 +339,14 @@ SVAR2 is a **compute-oriented, derived format — not an archival format.**
   and offsets as `final_offsets.npy`, whereas the layout spec above names them `.npy`.
   Settle on one (raw `.bin` is mmap-friendly and avoids the npy header; `.npy` is
   self-describing) and align the names before the decode path (M6) is built.
-- **Cost-model constants.** Pointer width (32 vs 64 bit) and the exact `s` per
-  representation need measurement; the current inequalities are placeholders.
-- **`s` for `var_key`.** When variant info is inlined per call, what exactly counts
-  toward `s` (key only, or key + decoded ALT bytes)? With the SNP/indel split, `s` is
-  now **class-dependent** — `≈2 bits` for a SNP call, `4 B` for an inline indel — so the
-  cost-model routing threshold differs by class (SNPs stay in `var_key` up to a higher
-  allele frequency before dense wins). Pin down the exact per-class `s` (including
-  whether packed-position bytes count) alongside the cost-model constants.
+- **Cost-model constants (pointer representation only).** `var_key` vs. `dense` are
+  implemented and measured in exact integer bits (see
+  [cost model](#dense-vs-sparse-cost-model)); the remaining open constant is the
+  pointer width (32 vs. 64 bit) for the not-yet-implemented `pointer` representation
+  (M11), which still needs to be folded into the same comparison.
+- **`s` for `var_key` / whether packed-position bytes count.** *Resolved:* yes —
+  `s = POS_BITS + key_bits(class)` includes the per-call `u32` position, so
+  positions count toward the cost on both sides of the comparison. `s` is
+  class-dependent (`key_bits = 2` for SNP, `32` for indel), so the routing threshold
+  differs by class (SNPs stay in `var_key` up to a higher allele frequency before
+  dense wins). See [`cost_model.rs`](../../src/cost_model.rs).
