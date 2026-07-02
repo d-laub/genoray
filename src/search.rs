@@ -132,6 +132,52 @@ impl SearchTree {
     }
 }
 
+/// Resolve the half-open variant index range `[s_idx, e_idx)` overlapping the query
+/// `[q_start, q_end)`.
+///
+/// * `tree` — a [`SearchTree`] over the ascending variant starts `v_starts`.
+/// * `v_ends` — parallel exclusive ends: `v_starts[i] + 1` for a SNP,
+///   `v_starts[i] + 1 + d` for a deletion of `d` bases. `v_ends.len() == tree.len()`.
+/// * `max_region_length` — an upper bound on any deletion length
+///   (`>= max_i (v_ends[i] - v_starts[i] - 1)`); pass `0` for a SNP-only stream.
+///
+/// Returns `(s_idx, e_idx)` with `s_idx == e_idx` when nothing overlaps. Only the
+/// endpoints are guaranteed to overlap: an interior index can be a deletion-spanned
+/// non-overlap (the resolver reports the min/max overlapping index, matching SVAR
+/// 1.0 `var_ranges`).
+pub fn overlap_range(
+    tree: &SearchTree,
+    v_ends: &[u32],
+    max_region_length: u32,
+    q_start: u32,
+    q_end: u32,
+) -> (usize, usize) {
+    debug_assert_eq!(v_ends.len(), tree.len());
+
+    // LB: leftmost variant whose start could still reach q_start given the max
+    // deletion span. first i with v_starts[i] + max_region_length >= q_start
+    //   <=> v_starts[i] >= q_start - max_region_length (saturating at 0).
+    let lb = tree.lower_bound(q_start.saturating_sub(max_region_length));
+    // UB: one past the last variant starting before q_end.
+    let ub = tree.lower_bound(q_end);
+
+    // Forward sub-scan for the first true overlap (q_start < v_end).
+    let Some(s_idx) = v_ends[lb..ub]
+        .iter()
+        .position(|&end| q_start < end)
+        .map(|p| lb + p)
+    else {
+        return (ub, ub); // no overlap
+    };
+    // Backward sub-scan for the last true overlap; e_idx is exclusive.
+    let e_idx = v_ends[s_idx..ub]
+        .iter()
+        .rposition(|&end| q_start < end)
+        .map(|p| s_idx + p + 1)
+        .unwrap_or(s_idx + 1);
+    (s_idx, e_idx)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,5 +314,100 @@ mod tests {
                 prop_assert_eq!(t.upper_bound(q), vals.partition_point(|&v| v <= q), "ub q={}", q);
             }
         }
+    }
+
+    /// Build exclusive ends: SNP (`d = 0`) spans one base; a deletion of `d` bases
+    /// spans `v_start + 1 + d`.
+    fn v_ends_from(v_starts: &[u32], dels: &[u32]) -> Vec<u32> {
+        v_starts
+            .iter()
+            .zip(dels)
+            .map(|(&s, &d)| s + 1 + d)
+            .collect()
+    }
+
+    #[test]
+    fn overlap_empty_array() {
+        let t = SearchTree::new(&[]);
+        let (s, e) = overlap_range(&t, &[], 0, 10, 20);
+        assert_eq!(s, e); // empty
+    }
+
+    #[test]
+    fn overlap_snp_only_reduces_to_half_open() {
+        // Pure-SNP stream: max_region_length == 0, v_end = v_start + 1.
+        let v_starts = [2u32, 4, 6, 8];
+        let v_ends = v_ends_from(&v_starts, &[0, 0, 0, 0]);
+        let t = SearchTree::new(&v_starts);
+        // query [4, 7): SNPs at 4 and 6 overlap (indices 1, 2).
+        assert_eq!(overlap_range(&t, &v_ends, 0, 4, 7), (1, 3));
+        // query [3, 4): nothing overlaps (SNP at 2 ends at 3, SNP at 4 starts at 4).
+        let (s, e) = overlap_range(&t, &v_ends, 0, 3, 4);
+        assert_eq!(s, e);
+    }
+
+    #[test]
+    fn overlap_query_entirely_left_and_right() {
+        let v_starts = [10u32, 20, 30];
+        let v_ends = v_ends_from(&v_starts, &[0, 0, 0]);
+        let t = SearchTree::new(&v_starts);
+        // entirely left of all variants
+        let (s, e) = overlap_range(&t, &v_ends, 0, 0, 5);
+        assert_eq!(s, e);
+        // entirely right of all variants
+        let (s, e) = overlap_range(&t, &v_ends, 0, 40, 50);
+        assert_eq!(s, e);
+    }
+
+    #[test]
+    fn overlap_adjacent_non_overlap_v_end_eq_q_start() {
+        // SNP at start 5 → v_end = 6. Query [6, 8): v_end == q_start ⟹ no overlap.
+        let v_starts = [5u32];
+        let v_ends = v_ends_from(&v_starts, &[0]);
+        let t = SearchTree::new(&v_starts);
+        let (s, e) = overlap_range(&t, &v_ends, 0, 6, 8);
+        assert_eq!(s, e);
+        // Query [5, 8): v_start=5 < 8 and q_start=5 < v_end=6 ⟹ overlaps.
+        assert_eq!(overlap_range(&t, &v_ends, 0, 5, 8), (0, 1));
+    }
+
+    #[test]
+    fn overlap_deletion_spans_query_start() {
+        // A deletion starting BEFORE the query that reaches INTO it must be found,
+        // even though its start is left of q_start. max_region_length must cover it.
+        // variant 0: start 2, deletion of 6 bases → v_end = 2 + 1 + 6 = 9.
+        // variant 1: SNP at start 10 → v_end 11.
+        let v_starts = [2u32, 10];
+        let dels = [6u32, 0];
+        let v_ends = v_ends_from(&v_starts, &dels);
+        let t = SearchTree::new(&v_starts);
+        let max_rl = 6; // = max deletion length
+        // query [5, 7): variant 0 (2..9) spans it though it starts at 2 < 5.
+        assert_eq!(overlap_range(&t, &v_ends, max_rl, 5, 7), (0, 1));
+    }
+
+    #[test]
+    fn overlap_interior_non_overlap_is_kept_in_range() {
+        // Endpoints overlap; an interior variant that does NOT overlap stays inside
+        // the returned [s_idx, e_idx) (the resolver reports min/max, not a filter).
+        // v0: start 0, del 8  → v_end 9   (spans query [3,4)? 3 < 9 and 0 < 4 → YES)
+        // v1: SNP start 1     → v_end 2   (1 < 4 but 3 < 2 false → NO overlap)
+        // v2: SNP start 3     → v_end 4   (3 < 4 and 3 < 4 → YES)
+        let v_starts = [0u32, 1, 3];
+        let dels = [8u32, 0, 0];
+        let v_ends = v_ends_from(&v_starts, &dels);
+        let t = SearchTree::new(&v_starts);
+        // s_idx = 0 (v0 overlaps), e_idx = 3 (v2 overlaps); v1 interior non-overlap.
+        assert_eq!(overlap_range(&t, &v_ends, 8, 3, 4), (0, 3));
+    }
+
+    #[test]
+    fn overlap_max_region_length_overshoot_is_safe() {
+        // Passing max_region_length LARGER than the true max deletion still yields
+        // the correct result — the forward sub-scan tightens the loose LB.
+        let v_starts = [2u32, 10];
+        let v_ends = v_ends_from(&v_starts, &[6, 0]);
+        let t = SearchTree::new(&v_starts);
+        assert_eq!(overlap_range(&t, &v_ends, 100, 5, 7), (0, 1)); // maxrl=100 ≫ 6
     }
 }
