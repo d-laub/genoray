@@ -2,7 +2,7 @@ use crate::layout;
 use crate::streams::StreamMap;
 use crate::types::SparseChunk;
 use crossbeam_channel::Receiver;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
@@ -23,6 +23,26 @@ pub fn run_io_writer(rx_sparse: Receiver<SparseChunk>, dirs: StreamMap<PathBuf>)
     }
 
     println!("Writer Thread: Channel closed. All chunks safely committed to SSD.");
+}
+
+pub fn run_long_allele_writer(rx_long: Receiver<Vec<u8>>, out_path: &Path, chrom_label: &str) {
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(out_path)
+        .unwrap();
+    let mut disk_writer = BufWriter::with_capacity(1024 * 1024, file);
+    while let Ok(buffer) = rx_long.recv() {
+        disk_writer
+            .write_all(&buffer)
+            .expect("Failed to write long alleles");
+    }
+    disk_writer.flush().unwrap();
+    println!(
+        "[{}] Long Allele Writer: All buffer data safely committed.",
+        chrom_label
+    );
 }
 
 fn write_bin(path: &Path, bytes: &[u8]) {
