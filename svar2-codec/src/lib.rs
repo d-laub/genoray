@@ -60,6 +60,139 @@ pub fn unpack_snp_key_at(packed: &[u8], i: usize) -> u8 {
     (packed[i >> 2] >> ((i & 3) * 2)) & 3
 }
 
+// Reversed byte loading
+//
+// Places base[0] in the HIGH byte of block1, base[7] in the LOW byte.
+// After SWAR or PEXT, base[0]'s 2-bit code naturally lands at bits [15:14]
+// of the extracted u32 — MSB-first, no reverse_bits needed.
+//
+// Block1: up to 8 bases, base[i] → padded[7 - i]
+// Block2: up to 5 more bases (13 - 8), base[8 + i] → padded[15 - i]
+#[inline(always)]
+fn load_padded_reversed(alt_allele: &[u8], n: usize) -> (u64, u64) {
+    debug_assert!(n <= 13);
+    let mut padded = [0u8; 16];
+
+    let n1 = n.min(8);
+    for i in 0..n1 {
+        padded[7 - i] = alt_allele[i]; // base[0] → slot 7 (high byte of block1)
+    }
+
+    let n2 = n.saturating_sub(8);
+    for i in 0..n2 {
+        padded[15 - i] = alt_allele[8 + i]; // base[8] → slot 15 (high byte of block2)
+    }
+
+    let block1 = u64::from_le_bytes(padded[0..8].try_into().unwrap());
+    let block2 = u64::from_le_bytes(padded[8..16].try_into().unwrap());
+    (block1, block2)
+}
+
+// PEXT reduce (BMI2). Replaces the 13-step OR+SHIFT loop with 2 PEXT ops.
+//
+// After (block >> 1) & 0x0303..03, each byte holds the 2-bit DNA code in its
+// low 2 bits. PEXT collapses those 8 codes into a contiguous 16-bit field;
+// because of the reversed load, base[0]'s code occupies bits [15:14].
+//
+// Layout target: top_shift = 25 (base[0] at payload bits [26:25]).
+//   part1 = extracted1 << (25 - 14)   → base[0] at [26:25]
+//   part2 = extracted2 >> (30 - 25)   → base[8] at [10:9]
+// LSB is left at 0 here — the tag bit is OR'd in by the caller.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "bmi2")]
+#[inline]
+unsafe fn pext_reduce(block1: u64, block2: u64, n_bases: usize) -> u32 {
+    use std::arch::x86_64::_pext_u64;
+    const SWAR_MASK: u64 = 0x0303030303030303;
+
+    let bits1 = (block1 >> 1) & SWAR_MASK;
+    let extracted1 = _pext_u64(bits1, SWAR_MASK) as u32;
+    let part1 = extracted1 << 11; // 25 - 14
+
+    if n_bases <= 8 {
+        return part1;
+    }
+
+    let bits2 = (block2 >> 1) & SWAR_MASK;
+    let extracted2 = _pext_u64(bits2, SWAR_MASK) as u32;
+    let part2 = extracted2 >> 5; // 30 - 25
+    part1 | part2
+}
+
+// Portable SWAR (SIMD within a register) fallback (no BMI2). Produces byte-identical output to PEXT.
+// Walks the bytes in MSB-first order so base[0] lands at the top_shift slot.
+#[inline(always)]
+fn swar_reduce_portable(block1: u64, block2: u64, n_bases: usize) -> u32 {
+    const SWAR_MASK: u64 = 0x0303030303030303;
+    let bits1 = (block1 >> 1) & SWAR_MASK;
+    let bits2 = (block2 >> 1) & SWAR_MASK;
+
+    let mut payload: u32 = 0;
+    let mut shift: i32 = 25;
+
+    let n1 = n_bases.min(8);
+    for i in 0..n1 {
+        let byte_shift = (7 - i) * 8; // high byte first → reversed-load order
+        payload |= (((bits1 >> byte_shift) & 3) as u32) << shift;
+        shift -= 2;
+    }
+
+    if n_bases > 8 {
+        let n2 = n_bases - 8;
+        for i in 0..n2 {
+            let byte_shift = (7 - i) * 8;
+            payload |= (((bits2 >> byte_shift) & 3) as u32) << shift;
+            shift -= 2;
+        }
+    }
+
+    payload
+}
+
+// Dispatch: PEXT if BMI2 is available at runtime, otherwise portable SWAR.
+#[inline(always)]
+fn encode_bases(alt_allele: &[u8], n_bases: usize) -> u32 {
+    let (block1, block2) = load_padded_reversed(alt_allele, n_bases);
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("bmi2") {
+            return unsafe { pext_reduce(block1, block2, n_bases) };
+        }
+    }
+    swar_reduce_portable(block1, block2, n_bases)
+}
+
+// SNP fast path (~95% of variants). Skip the 16-byte block load entirely:
+// 2 ops to extract the 2-bit code, 1 shift. Top 5 bits stay 0 (ilen=0 for SNP).
+#[inline(always)]
+fn encode_snp(alt_base: u8) -> u32 {
+    // (byte >> 1) & 3 → A=00, C=01, T=10, G=11.
+    ((alt_base as u32 >> 1) & 3) << 25
+}
+
+// Packs up to 13 DNA bases into a single u32 with the inline-encoding layout:
+// [ ilen:5 | base[0..alt_len] × 2bit | _ | flag=0 ].
+//
+// - `alt_allele` carries the bases to encode (length used directly as `alt_len`).
+// - `ilen` goes into the top 5 bits. For atomized INS/SNP, ilen = alt_len - 1.
+// - Decode reconstructs alt_len as ilen + 1.
+#[inline(always)]
+pub fn encode_alt_inline(alt_allele: &[u8], ilen: u32) -> u32 {
+    let alt_len = alt_allele.len();
+    if alt_len > 13 {
+        panic!("Inline ALT must be 13 bases or fewer");
+    }
+    debug_assert!(ilen <= 12, "inline ilen must be ≤ 12 (alt_len ≤ 13)");
+
+    // SNP fast path — dominates real-world VCF distributions. ilen=0 implicit.
+    if alt_len == 1 {
+        return encode_snp(alt_allele[0]);
+    }
+
+    let payload = encode_bases(alt_allele, alt_len);
+    payload | (ilen << 27) // LSB stays 0 → no lookup flag
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,6 +249,85 @@ mod tests {
         for i in 0..codes.len() {
             assert_eq!(unpack_snp_key_at(&packed, i), all[i], "code {}", i);
             assert_eq!(unpack_snp_key_at(&packed, i), codes[i]);
+        }
+    }
+
+    #[test]
+    fn test_alt_exact_binary_layout() {
+        // Layout: top 5 bits = ilen (= alt_len - 1 for atomized variants),
+        // base[i] at bits[26-2i:25-2i], LSB = 0 (no lookup flag).
+
+        // "ACGT" → alt_len=4, ilen=3 → top 5 = 3 << 27 = 0x18000000
+        // 'A' (00) << 25 = 0
+        // 'C' (01) << 23 = 0x00800000
+        // 'G' (11) << 21 = 0x00600000
+        // 'T' (10) << 19 = 0x00100000  → bases sum = 0x00F00000
+        // total = 0x18F00000
+        let seq = b"ACGT";
+        let payload = encode_alt_inline(seq, 3);
+        assert_eq!(
+            payload, 0x18F00000,
+            "ALT binary layout changed! This will break compatibility."
+        );
+
+        // "ACGTTGCAGCATT" → alt_len=13, ilen=12 → top 5 = 12 << 27 = 0x60000000
+        // bases (verified) = 0x00F5A694
+        let seq = b"ACGTTGCAGCATT";
+        let payload = encode_alt_inline(seq, 12);
+        assert_eq!(
+            payload, 0x60F5A694,
+            "ALT binary layout changed! This will break compatibility."
+        );
+
+        // "ACGTTGCAGC" → alt_len=10, ilen=9 → top 5 = 9 << 27 = 0x48000000
+        // bases (verified) = 0x00F5A680
+        let seq = b"ACGTTGCAGC";
+        let payload = encode_alt_inline(seq, 9);
+        assert_eq!(
+            payload, 0x48F5A680,
+            "ALT binary layout changed! This will break compatibility."
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Inline ALT must be 13 bases or fewer")]
+    fn test_alt_overflow_protection() {
+        // alt_allele.len() = 16 > 13 → panics regardless of `ilen` argument.
+        encode_alt_inline(b"ACGTACGTACGTACGT", 0);
+    }
+
+    // SNP fast path must produce the same output as the general SWAR/PEXT encode.
+    // Both yield the 2-bit base shifted to bits[26:25] with top 5 (ilen) = 0.
+    #[test]
+    fn test_snp_fast_path_matches_general_path() {
+        for &b in b"ACGT" {
+            let buf = [b];
+            let fast = encode_snp(b);
+            // General path bypassing the alt_len==1 short-circuit
+            let (b1, b2) = load_padded_reversed(&buf, 1);
+            let general = swar_reduce_portable(b1, b2, 1); // ilen=0 → no top-5 OR
+            assert_eq!(
+                fast, general,
+                "SNP fast path diverged from general path for base {}",
+                b as char
+            );
+        }
+    }
+
+    // PEXT path (when BMI2 present) must produce byte-identical output to SWAR.
+    #[cfg(target_arch = "x86_64")]
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(5000))]
+
+        #[test]
+        fn test_pext_swar_equivalence(dna in "[ACGT]{1,13}") {
+            if !is_x86_feature_detected!("bmi2") { return Ok(()); }
+            let bytes = dna.as_bytes();
+            let n = bytes.len();
+            let (b1, b2) = load_padded_reversed(bytes, n);
+            let pext_out = unsafe { pext_reduce(b1, b2, n) };
+            let swar_out = swar_reduce_portable(b1, b2, n);
+            prop_assert_eq!(pext_out, swar_out);
         }
     }
 }
