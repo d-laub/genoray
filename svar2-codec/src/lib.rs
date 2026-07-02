@@ -285,7 +285,7 @@ mod tests {
 
     #[test]
     fn snp_code_round_trip_all_bases() {
-        for &b in &[b'A', b'C', b'G', b'T'] {
+        for &b in b"ACGT" {
             let code = encode_snp_2bit(b);
             assert_eq!(decode_snp_2bit(code), b, "base {} round-trips", b as char);
         }
@@ -458,6 +458,31 @@ mod tests {
             let ilen = (bases.len() - 1) as u32;
             let key = encode_alt_inline(&bases, ilen);
             prop_assert_eq!(decode_key(key), DecodedKey::Inline { alt: bases.clone() });
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn key_round_trip_all_inline_lanes(kind in 0u8..3, ilen in 1i32..=1_000_000) {
+            match kind {
+                // SNP
+                0 => {
+                    let base = b'C';
+                    let key = encode_alt_inline(&[base], 0);
+                    prop_assert_eq!(decode_key(key), DecodedKey::Inline { alt: vec![base] });
+                }
+                // pure DEL
+                1 => {
+                    let key = encode_pure_del(-ilen);
+                    prop_assert_eq!(deletion_len(key), ilen as u32);
+                    prop_assert_eq!(decode_key(key), DecodedKey::PureDel { ilen: -ilen });
+                }
+                // lookup
+                _ => {
+                    let row = (ilen as u32) & ((1 << 31) - 1);
+                    prop_assert_eq!(decode_key(encode_lookup(row)), DecodedKey::Lookup { row });
+                }
+            }
         }
     }
 }
