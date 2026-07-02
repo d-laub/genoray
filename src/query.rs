@@ -14,7 +14,11 @@ use std::io::ErrorKind;
 use std::path::Path;
 
 use memmap2::Mmap;
+use ndarray::{Array1, Array2};
 
+use crate::bits;
+use crate::layout::{self, ContigPaths};
+use crate::nrvk::LongAlleleReader;
 use crate::search::{SearchTree, overlap_range};
 
 /// mmap a file into memory, returning `None` for a missing or zero-length file
@@ -138,6 +142,160 @@ fn kway_merge(runs: Vec<Vec<Call>>) -> Vec<Call> {
         heads[b] += 1;
     }
     out
+}
+
+/// A var_key sub-stream (snp or indel): mmap'd `positions.bin` + `alleles.bin`
+/// with the CSR `offsets.npy` giving per-`(sample, ploid)` column bounds.
+struct SubStreamView {
+    positions: Option<Mmap>, // raw u32 LE, one per call
+    keys: Option<Mmap>,      // packed 2-bit codes (snp) or u32 LE keys (indel)
+    offsets: Vec<u64>,       // CSR prefix-sum, len == columns + 1
+}
+
+impl SubStreamView {
+    fn positions(&self) -> &[u32] {
+        as_u32(&self.positions)
+    }
+    /// Half-open `[start, end)` call range for flat column `c`.
+    fn column(&self, c: usize) -> (usize, usize) {
+        (self.offsets[c] as usize, self.offsets[c + 1] as usize)
+    }
+}
+
+/// A dense class table (snp or indel): shared per-contig `positions.bin` +
+/// `alleles.bin` + hap-major `genotypes.bin` 1-bit matrix.
+struct DenseView {
+    positions: Option<Mmap>,
+    keys: Option<Mmap>,
+    genotypes: Option<Mmap>,
+    n_dense_variants: usize,
+}
+
+impl DenseView {
+    fn positions(&self) -> &[u32] {
+        as_u32(&self.positions)
+    }
+    /// Whether haplotype `hap` carries dense variant `col` (hap-major bit
+    /// `hap * n_dense_variants + col`).
+    fn carried(&self, hap: usize, col: usize) -> bool {
+        bits::get_bit(as_bytes(&self.genotypes), hap * self.n_dense_variants + col)
+    }
+}
+
+/// Load a CSR `offsets.npy` (len `columns + 1`); a missing file means an empty
+/// stream — return an all-zero prefix-sum so every column is empty.
+fn load_offsets(path: &Path, columns: usize) -> Vec<u64> {
+    if path.exists() {
+        let a: Array1<u64> = ndarray_npy::read_npy(path).expect("read offsets.npy");
+        a.to_vec()
+    } else {
+        vec![0u64; columns + 1]
+    }
+}
+
+/// Load `max_del.npy` (`u32`, shape `(n_samples, ploidy)`); a missing file
+/// (pure-SNP contig, or predating the post-pass) defaults to all-zero.
+fn load_max_del(path: &Path, n_samples: usize, ploidy: usize) -> Array2<u32> {
+    if path.exists() {
+        ndarray_npy::read_npy(path).expect("read max_del.npy")
+    } else {
+        Array2::zeros((n_samples, ploidy))
+    }
+}
+
+/// Load `dense/max_del.npy` (`u32`, shape `(1,)`); missing defaults to `0`.
+fn load_dense_max_del(path: &Path) -> u32 {
+    if path.exists() {
+        let a: Array1<u32> = ndarray_npy::read_npy(path).expect("read dense/max_del.npy");
+        a.into_iter().next().unwrap_or(0)
+    } else {
+        0
+    }
+}
+
+/// Open a dense class table, or `None` when the class has no variants (absent
+/// dir / empty `positions.bin`).
+fn open_dense(dir: &Path) -> std::io::Result<Option<DenseView>> {
+    let positions = mmap_file(&layout::positions(dir))?;
+    let n_dense_variants = as_u32(&positions).len();
+    if n_dense_variants == 0 {
+        return Ok(None);
+    }
+    Ok(Some(DenseView {
+        keys: mmap_file(&layout::alleles(dir))?,
+        genotypes: mmap_file(&layout::genotypes(dir))?,
+        positions,
+        n_dense_variants,
+    }))
+}
+
+/// Opens a finished SVAR2 contig directory and holds its sidecars mmap'd for the
+/// lifetime of queries against it.
+pub struct ContigReader {
+    ploidy: usize,
+    vk_snp: SubStreamView,
+    vk_indel: SubStreamView,
+    dense_snp: Option<DenseView>,
+    dense_indel: Option<DenseView>,
+    /// `(n_samples, ploidy)` per-column max deletion length for var_key/indel.
+    vk_indel_max_del: Array2<u32>,
+    /// Per-contig max deletion length over the shared dense/indel table.
+    dense_indel_max_del: u32,
+    /// Long-allele bank reader; present iff the shared indel LUT exists.
+    lut: Option<LongAlleleReader>,
+}
+
+impl ContigReader {
+    /// Open the contig `{base_out_dir}/{chrom}` for a cohort of `n_samples`
+    /// samples at `ploidy`. Missing sub-streams (pure-SNP contigs, absent dense
+    /// dirs) are tolerated as empty.
+    pub fn open(
+        base_out_dir: &str,
+        chrom: &str,
+        n_samples: usize,
+        ploidy: usize,
+    ) -> std::io::Result<Self> {
+        let paths = ContigPaths::new(base_out_dir, chrom);
+        let contig_dir = Path::new(base_out_dir).join(chrom);
+        let columns = n_samples * ploidy;
+
+        let vk_snp_dir = paths.var_key_snp_dir();
+        let vk_indel_dir = paths.var_key_indel_dir();
+
+        let vk_snp = SubStreamView {
+            positions: mmap_file(&layout::positions(&vk_snp_dir))?,
+            keys: mmap_file(&layout::alleles(&vk_snp_dir))?,
+            offsets: load_offsets(&layout::offsets(&vk_snp_dir), columns),
+        };
+        let vk_indel = SubStreamView {
+            positions: mmap_file(&layout::positions(&vk_indel_dir))?,
+            keys: mmap_file(&layout::alleles(&vk_indel_dir))?,
+            offsets: load_offsets(&layout::offsets(&vk_indel_dir), columns),
+        };
+
+        let dense_snp = open_dense(&paths.dense_snp_dir())?;
+        let dense_indel = open_dense(&paths.dense_indel_dir())?;
+
+        let vk_indel_max_del = load_max_del(&layout::max_del(&contig_dir), n_samples, ploidy);
+        let dense_indel_max_del = load_dense_max_del(&layout::dense_max_del(&contig_dir));
+
+        let lut = if paths.long_alleles_bin().exists() {
+            Some(LongAlleleReader::new(base_out_dir, chrom))
+        } else {
+            None
+        };
+
+        Ok(Self {
+            ploidy,
+            vk_snp,
+            vk_indel,
+            dense_snp,
+            dense_indel,
+            vk_indel_max_del,
+            dense_indel_max_del,
+            lut,
+        })
+    }
 }
 
 #[cfg(test)]
