@@ -113,6 +113,18 @@ fn run_conversion_pipeline(
         r.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
     }
 
+    // All contigs converted — write the top-level meta.json describing the cohort.
+    crate::meta::write_meta(
+        std::path::Path::new(&output_dir),
+        crate::meta::FORMAT_VERSION,
+        &samples,
+        &chroms,
+        ploidy,
+    )
+    .map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("failed to write meta.json: {e}"))
+    })?;
+
     Ok(())
 }
 
