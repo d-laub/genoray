@@ -153,6 +153,10 @@ pub fn overlap_range(
     q_end: u32,
 ) -> (usize, usize) {
     debug_assert_eq!(v_ends.len(), tree.len());
+    debug_assert!(
+        q_start <= q_end,
+        "overlap_range requires a half-open query: q_start <= q_end"
+    );
 
     // LB: leftmost variant whose start could still reach q_start given the max
     // deletion span. first i with v_starts[i] + max_region_length >= q_start
