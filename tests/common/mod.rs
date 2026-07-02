@@ -1,7 +1,5 @@
-// Shared BCF test harness: synthetic record builder, binary I/O helpers, and key decoders
+// Shared BCF test harness: synthetic record builder and binary I/O helpers
 // for E2E pipeline testing.
-
-use genoray_core::rvk::decode_alt_inline;
 
 use rust_htslib::bcf::record::GenotypeAllele;
 use rust_htslib::bcf::{Format, Header, Writer};
@@ -80,29 +78,4 @@ pub fn read_u32_bin(path: &Path) -> Vec<u32> {
 pub fn read_offsets_npy(path: &Path) -> Vec<u64> {
     let arr: ndarray::Array1<u64> = ndarray_npy::read_npy(path).expect("read offsets npy");
     arr.to_vec()
-}
-
-/// Decode a single packed key. Discriminator:
-///   bit 0 = 1                 → lookup (long allele bank row index)
-///   bit 0 = 0 AND bit 31 = 1  → pure DEL (signed ilen in upper 31 bits)
-///   bit 0 = 0 AND bit 31 = 0  → inline ALT (top 5 bits hold the length field)
-#[derive(Debug, PartialEq)]
-pub enum DecodedKey {
-    Inline { alt: Vec<u8> },
-    PureDel { ilen: i32 },
-    Lookup { row: u32 },
-}
-
-pub fn decode_key(key: u32) -> DecodedKey {
-    if key & 1 == 1 {
-        DecodedKey::Lookup { row: key >> 1 }
-    } else if (key as i32) < 0 {
-        DecodedKey::PureDel {
-            ilen: (key as i32) >> 1,
-        }
-    } else {
-        DecodedKey::Inline {
-            alt: decode_alt_inline(key),
-        }
-    }
 }

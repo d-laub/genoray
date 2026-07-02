@@ -7,14 +7,37 @@
 
 mod common;
 
-use common::{
-    DecodedKey, SynthRecord, build_bcf_with_index, decode_key, read_offsets_npy, read_u32_bin,
-};
+use common::{SynthRecord, build_bcf_with_index, read_offsets_npy, read_u32_bin};
 use genoray_core::process_chromosome;
-use genoray_core::rvk::unpack_snp_keys;
+use genoray_core::rvk::{decode_alt_inline, unpack_snp_keys};
 use genoray_core::vcf_reader::VcfChunkReader;
 
 use tempfile::tempdir;
+
+/// Decode a single packed key. Discriminator:
+///   bit 0 = 1                 → lookup (long allele bank row index)
+///   bit 0 = 0 AND bit 31 = 1  → pure DEL (signed ilen in upper 31 bits)
+///   bit 0 = 0 AND bit 31 = 0  → inline ALT (top 5 bits hold the length field)
+#[derive(Debug, PartialEq)]
+enum DecodedKey {
+    Inline { alt: Vec<u8> },
+    PureDel { ilen: i32 },
+    Lookup { row: u32 },
+}
+
+fn decode_key(key: u32) -> DecodedKey {
+    if key & 1 == 1 {
+        DecodedKey::Lookup { row: key >> 1 }
+    } else if (key as i32) < 0 {
+        DecodedKey::PureDel {
+            ilen: (key as i32) >> 1,
+        }
+    } else {
+        DecodedKey::Inline {
+            alt: decode_alt_inline(key),
+        }
+    }
+}
 
 // Positive E2E: 3 records spanning SNP / INS / pure DEL across 2 samples diploid.
 //   pos=100  A  → C    (SNP)        gt = [1, 0, 1, 1]   → haps 0, 2, 3 carry it
