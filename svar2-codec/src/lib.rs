@@ -292,8 +292,10 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2000))]
+
         #[test]
-        fn snp_pack_unpack_round_trips(codes in proptest::collection::vec(0u8..4, 0..64)) {
+        fn snp_pack_unpack_round_trips(codes in proptest::collection::vec(0u8..4, 0..100)) {
             let packed = pack_snp_keys(&codes);
             prop_assert_eq!(unpack_snp_keys(&packed, codes.len()), codes.clone());
             for (i, &c) in codes.iter().enumerate() {
