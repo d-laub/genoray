@@ -145,38 +145,34 @@ pub fn process_chromosome(
         })
         .expect("spawn long allele writer");
 
-    // Wait for the reader to finish (drops its tx_dense Sender).
-    reader_thread
-        .join()
-        .map_err(|_| ConversionError::WorkerPanicked {
-            thread: format!("read-{}", chrom),
-        })?;
-
-    // Stop the sampler so its tx_* clones drop. Once these AND the reader's tx_dense
-    // are gone, the executor's rx_dense.recv() returns Err and the executor unwinds.
+    // Shutdown must be leak-free even on the error path: a detached sampler keeps
+    // its tx_* channel clones alive, which would block the executor/writers on
+    // recv() forever. So finish the reader, tell the sampler to stop (dropping its
+    // clones so the executor can see channel-close and drain), join EVERY thread,
+    // and only then surface the first panic as a WorkerPanicked error.
+    let reader_res = reader_thread.join();
     stop_sampler.store(true, Ordering::Relaxed);
-    sampler_thread
-        .join()
-        .map_err(|_| ConversionError::WorkerPanicked {
-            thread: format!("samp-{}", chrom),
-        })?;
+    let sampler_res = sampler_thread.join();
+    let executor_res = executor_thread.join();
+    let chunk_writer_res = chunk_writer_thread.join();
+    let long_allele_writer_res = long_allele_writer_thread.join();
 
+    reader_res.map_err(|_| ConversionError::WorkerPanicked {
+        thread: format!("read-{}", chrom),
+    })?;
+    sampler_res.map_err(|_| ConversionError::WorkerPanicked {
+        thread: format!("samp-{}", chrom),
+    })?;
     let (ledgers, long_allele_offsets) =
-        executor_thread
-            .join()
-            .map_err(|_| ConversionError::WorkerPanicked {
-                thread: format!("exec-{}", chrom),
-            })?;
-    chunk_writer_thread
-        .join()
-        .map_err(|_| ConversionError::WorkerPanicked {
-            thread: format!("cw-{}", chrom),
+        executor_res.map_err(|_| ConversionError::WorkerPanicked {
+            thread: format!("exec-{}", chrom),
         })?;
-    long_allele_writer_thread
-        .join()
-        .map_err(|_| ConversionError::WorkerPanicked {
-            thread: format!("lw-{}", chrom),
-        })?;
+    chunk_writer_res.map_err(|_| ConversionError::WorkerPanicked {
+        thread: format!("cw-{}", chrom),
+    })?;
+    long_allele_writer_res.map_err(|_| ConversionError::WorkerPanicked {
+        thread: format!("lw-{}", chrom),
+    })?;
 
     println!(
         "[{}] Phase 1 Complete. Triggering Phase 2 In-Memory Merge...",
