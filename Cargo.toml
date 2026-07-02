@@ -32,3 +32,6 @@ tempfile = "3.10"
 [features]
 default = ["extension-module"]
 extension-module = ["pyo3/extension-module"]
+
+[workspace]
+members = ["svar2-codec"]
