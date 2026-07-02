@@ -190,11 +190,18 @@ pub fn process_chromosome(
     let num_chunks = snp_ledger.len(); // == indel_ledger.len() (one row per chunk)
 
     // SNP stream: merge u8 keys, then bit-pack the merged stream to 2 bits/call.
-    merge::merge_mini_sc::<u8>(num_chunks, samples.len(), ploidy, &snp_dir, snp_ledger);
+    merge::merge_mini_sc(1, num_chunks, samples.len(), ploidy, &snp_dir, snp_ledger);
     rvk::pack_snp_key_file(&snp_dir);
 
     // Indel stream: merge 32-bit keys.
-    merge::merge_mini_sc::<u32>(num_chunks, samples.len(), ploidy, &indel_dir, indel_ledger);
+    merge::merge_mini_sc(
+        4,
+        num_chunks,
+        samples.len(),
+        ploidy,
+        &indel_dir,
+        indel_ledger,
+    );
 
     println!("[{}] Pipeline Execution Finished Successfully.", chrom);
 }

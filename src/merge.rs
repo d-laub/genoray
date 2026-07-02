@@ -21,7 +21,8 @@ const TILE_RAM_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 ///          then `pwrite`s the assembled tile to its pre-computed byte range in
 ///          `final_positions.bin` / `final_keys.bin`.
 /// Phase C: cleanup of per-chunk temp files.
-pub fn merge_mini_sc<K: bytemuck::Pod>(
+pub fn merge_mini_sc(
+    key_bytes: usize,
     num_chunks: usize,
     num_samples: usize,
     ploidy: usize,
@@ -30,7 +31,6 @@ pub fn merge_mini_sc<K: bytemuck::Pod>(
 ) {
     let output_dir_path = Path::new(output_dir);
     let total_columns = num_samples * ploidy;
-    let key_size = std::mem::size_of::<K>();
     let pos_size = std::mem::size_of::<u32>(); // positions are always u32
 
     println!("Phase A -> Executing In-Memory Metadata Pass");
@@ -57,7 +57,7 @@ pub fn merge_mini_sc<K: bytemuck::Pod>(
 
     let total_items: u64 = final_offsets[total_columns];
     let pos_total_bytes: u64 = total_items * pos_size as u64;
-    let key_total_bytes: u64 = total_items * key_size as u64;
+    let key_total_bytes: u64 = total_items * key_bytes as u64;
 
     println!("Phase B -> Executing Parallel Tile-Based Interleaving Gather");
 
@@ -88,8 +88,8 @@ pub fn merge_mini_sc<K: bytemuck::Pod>(
         .collect();
 
     // Adaptive tile size: target TILE_RAM_BUDGET per tile.
-    // pos buffer (u32) + key buffer (K) → (pos_size + key_size) bytes per item.
-    let bytes_per_item = (pos_size + key_size) as u64;
+    // pos buffer (u32) + key buffer (key_bytes-wide) → (pos_size + key_bytes) bytes per item.
+    let bytes_per_item = (pos_size + key_bytes) as u64;
     let avg_calls_per_col =
         std::cmp::max(1u64, total_items / std::cmp::max(1, total_columns) as u64);
     let columns_per_tile = std::cmp::max(
@@ -129,7 +129,7 @@ pub fn merge_mini_sc<K: bytemuck::Pod>(
         }
 
         let mut tile_pos_buffer = vec![0u32; tile_total_items];
-        let mut tile_key_buffer = vec![K::zeroed(); tile_total_items];
+        let mut tile_key_buffer = vec![0u8; tile_total_items * key_bytes];
 
         // per-column write head (offset within this tile buffer)
         let mut tile_write_heads = vec![0usize; tile_n_cols];
@@ -153,9 +153,9 @@ pub fn merge_mini_sc<K: bytemuck::Pod>(
             // Stateless positional reads — multiple workers can read the same File
             // concurrently without locking or seek-state contention.
             let mut chunk_pos_bytes = vec![0u8; chunk_items_to_read * pos_size];
-            let mut chunk_key_bytes = vec![0u8; chunk_items_to_read * key_size];
+            let mut chunk_key_bytes = vec![0u8; chunk_items_to_read * key_bytes];
             let pos_byte_offset = (chunk_start_item * pos_size) as u64;
-            let key_byte_offset = (chunk_start_item * key_size) as u64;
+            let key_byte_offset = (chunk_start_item * key_bytes) as u64;
             chunk_files_ref[chunk_id]
                 .0
                 .read_exact_at(&mut chunk_pos_bytes, pos_byte_offset)
@@ -165,9 +165,8 @@ pub fn merge_mini_sc<K: bytemuck::Pod>(
                 .read_exact_at(&mut chunk_key_bytes, key_byte_offset)
                 .expect("Failed to pread chunk key");
 
-            // zero-copy cast back to typed slices
+            // zero-copy cast back to typed slice (positions only — keys stay raw bytes)
             let chunk_pos_u32: &[u32] = bytemuck::cast_slice(&chunk_pos_bytes);
-            let chunk_key_k: &[K] = bytemuck::cast_slice(&chunk_key_bytes);
 
             // stitch this chunk's block into the main Tile buffer
             let mut local_chunk_cursor = 0usize;
@@ -186,8 +185,13 @@ pub fn merge_mini_sc<K: bytemuck::Pod>(
                 tile_pos_buffer[dest_start..dest_end].copy_from_slice(
                     &chunk_pos_u32[local_chunk_cursor..local_chunk_cursor + calls],
                 );
-                tile_key_buffer[dest_start..dest_end]
-                    .copy_from_slice(&chunk_key_k[local_chunk_cursor..local_chunk_cursor + calls]);
+
+                let key_dest_start = dest_start * key_bytes;
+                let key_src_start = local_chunk_cursor * key_bytes;
+                tile_key_buffer[key_dest_start..key_dest_start + calls * key_bytes]
+                    .copy_from_slice(
+                        &chunk_key_bytes[key_src_start..key_src_start + calls * key_bytes],
+                    );
 
                 tile_write_heads[i] += calls;
                 local_chunk_cursor += calls;
@@ -198,14 +202,13 @@ pub fn merge_mini_sc<K: bytemuck::Pod>(
         // Tiles are disjoint by construction (final_offsets is monotonically increasing),
         // so concurrent write_all_at calls touch non-overlapping regions.
         let tile_pos_byte_offset = (tile_start_item * pos_size) as u64;
-        let tile_key_byte_offset = (tile_start_item * key_size) as u64;
+        let tile_key_byte_offset = (tile_start_item * key_bytes) as u64;
         let tile_pos_bytes: &[u8] = bytemuck::cast_slice(&tile_pos_buffer);
-        let tile_key_bytes: &[u8] = bytemuck::cast_slice(&tile_key_buffer);
         final_pos_ref
             .write_all_at(tile_pos_bytes, tile_pos_byte_offset)
             .expect("Failed to pwrite tile to final_positions.bin");
         final_key_ref
-            .write_all_at(tile_key_bytes, tile_key_byte_offset)
+            .write_all_at(&tile_key_buffer, tile_key_byte_offset)
             .expect("Failed to pwrite tile to final_keys.bin");
     });
 
@@ -272,7 +275,7 @@ mod tests {
         let key: Vec<u32> = vec![10, 20, 30, 40, 50, 60];
         write_chunk_files(dir, 0, &pos, &key);
 
-        merge_mini_sc::<u32>(1, 2, 2, dir.to_str().unwrap(), ram_ledger);
+        merge_mini_sc(4, 1, 2, 2, dir.to_str().unwrap(), ram_ledger);
 
         let final_pos = read_u32_bin(&dir.join("final_positions.bin"));
         let final_key = read_u32_bin(&dir.join("final_keys.bin"));
@@ -301,7 +304,7 @@ mod tests {
         write_chunk_files(dir, 0, &[100, 200, 300], &[1, 2, 3]);
         write_chunk_files(dir, 1, &[400, 500, 600], &[4, 5, 6]);
 
-        merge_mini_sc::<u32>(2, 2, 1, dir.to_str().unwrap(), ram_ledger);
+        merge_mini_sc(4, 2, 2, 1, dir.to_str().unwrap(), ram_ledger);
 
         let final_pos = read_u32_bin(&dir.join("final_positions.bin"));
         let final_key = read_u32_bin(&dir.join("final_keys.bin"));
@@ -321,7 +324,7 @@ mod tests {
         let ram_ledger = vec![vec![0u32; 4]];
         write_chunk_files(dir, 0, &[], &[]);
 
-        merge_mini_sc::<u32>(1, 2, 2, dir.to_str().unwrap(), ram_ledger);
+        merge_mini_sc(4, 1, 2, 2, dir.to_str().unwrap(), ram_ledger);
 
         let final_pos = read_u32_bin(&dir.join("final_positions.bin"));
         let final_off = read_offsets_npy(&dir.join("final_offsets.npy"));
@@ -341,7 +344,7 @@ mod tests {
         write_chunk_files(dir, 0, &[], &[]);
         write_chunk_files(dir, 1, &[10, 20, 30, 40, 50], &[1, 2, 3, 4, 5]);
 
-        merge_mini_sc::<u32>(2, 2, 1, dir.to_str().unwrap(), ram_ledger);
+        merge_mini_sc(4, 2, 2, 1, dir.to_str().unwrap(), ram_ledger);
 
         let final_pos = read_u32_bin(&dir.join("final_positions.bin"));
         let final_off = read_offsets_npy(&dir.join("final_offsets.npy"));
@@ -378,7 +381,7 @@ mod tests {
             kf.write_all(&[4u8, 5, 6]).unwrap();
         }
 
-        merge_mini_sc::<u8>(2, 2, 1, dir.to_str().unwrap(), ram_ledger);
+        merge_mini_sc(1, 2, 2, 1, dir.to_str().unwrap(), ram_ledger);
 
         let final_pos = read_u32_bin(&dir.join("final_positions.bin"));
         let final_key = read_u8_bin(&dir.join("final_keys.bin"));
@@ -444,7 +447,7 @@ mod tests {
                 write_chunk_files(dir, chunk_id, &pos_buf, &key_buf);
             }
 
-            merge_mini_sc::<u32>(num_chunks, num_samples, ploidy, dir.to_str().unwrap(), ram_ledger.clone());
+            merge_mini_sc(4, num_chunks, num_samples, ploidy, dir.to_str().unwrap(), ram_ledger.clone());
 
             let final_pos = read_u32_bin(&dir.join("final_positions.bin"));
             let final_key = read_u32_bin(&dir.join("final_keys.bin"));
