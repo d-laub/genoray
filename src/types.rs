@@ -61,6 +61,38 @@ impl BitGrid3 {
         let n_words = (new_v * ns * np).div_ceil(64);
         self.words.truncate(n_words);
     }
+
+    /// Number of set bits in variant `v`'s (S, P) plane — its allele count `x`.
+    /// The plane is the contiguous bit range `[v*S*P, (v+1)*S*P)`; counted
+    /// word-wise (masked head/tail) so it is O(plane_bits / 64), not per-bit.
+    pub fn popcount_plane(&self, v: usize) -> usize {
+        let (_, s, p) = self.shape;
+        let plane = s * p;
+        let start = v * plane;
+        let end = start + plane;
+        debug_assert!(end <= self.shape.0 * plane);
+
+        let mut count = 0u32;
+        let mut bit = start;
+        while bit < end {
+            let word_idx = bit >> 6;
+            let bit_in_word = bit & 63;
+            // bits available in this word from `bit_in_word` to end of word (64)
+            let word_end_bit = (word_idx + 1) << 6;
+            let span_end = end.min(word_end_bit);
+            let take = span_end - bit; // 1..=64 bits from this word
+            let word = self.words[word_idx];
+            // mask the [bit_in_word, bit_in_word+take) window
+            let mask = if take == 64 {
+                u64::MAX
+            } else {
+                ((1u64 << take) - 1) << bit_in_word
+            };
+            count += (word & mask).count_ones();
+            bit = span_end;
+        }
+        count as usize
+    }
 }
 
 // Defines DenseChunk and SparseChunk structs. All other files import from here.
@@ -183,6 +215,48 @@ mod tests {
     fn test_zeros_overflow_panics() {
         // V * S * P overflows usize on a 64-bit machine
         let _ = BitGrid3::zeros(usize::MAX, usize::MAX, 2);
+    }
+
+    #[test]
+    fn test_popcount_plane_counts_set_bits_in_variant() {
+        // shape (3, 2, 2): plane size = S*P = 4 bits per variant.
+        let mut g = BitGrid3::zeros(3, 2, 2);
+        // variant 0: set 2 bits (flat 0..4)
+        g.or_bit(0, true);
+        g.or_bit(3, true);
+        // variant 1: set 4 bits (flat 4..8)
+        for i in 4..8 {
+            g.or_bit(i, true);
+        }
+        // variant 2: set 0 bits (flat 8..12)
+        assert_eq!(g.popcount_plane(0), 2);
+        assert_eq!(g.popcount_plane(1), 4);
+        assert_eq!(g.popcount_plane(2), 0);
+    }
+
+    proptest! {
+        // popcount_plane equals a naive per-bit count for arbitrary shapes/patterns.
+        #[test]
+        fn test_popcount_plane_matches_naive(
+            v in 1usize..12,
+            s in 1usize..8,
+            p in 1usize..3,
+            seed in any::<u64>(),
+        ) {
+            let mut bg = BitGrid3::zeros(v, s, p);
+            let plane = s * p;
+            let mut expected = vec![0usize; v];
+            let mut state = seed | 1;
+            for idx in 0..(v * plane) {
+                state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+                let val = state & 1 != 0;
+                bg.or_bit(idx, val);
+                if val { expected[idx / plane] += 1; }
+            }
+            for vi in 0..v {
+                prop_assert_eq!(bg.popcount_plane(vi), expected[vi], "variant {}", vi);
+            }
+        }
     }
 
     proptest! {
