@@ -226,6 +226,50 @@ pub fn decode_alt_inline(payload: u32) -> Vec<u8> {
     decoded
 }
 
+/// Discriminated form of a 32-bit indel key. Mirrors the `pack_variant` layout:
+/// bit 0 = lookup flag, bit 31 (of a non-lookup key) = pure-DEL flag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecodedKey {
+    /// Inline INS/SNP; `alt` is the decoded ALT bases (`alt.len() == ilen + 1`).
+    Inline { alt: Vec<u8> },
+    /// Pure deletion of `-ilen` reference bases (`ilen < 0`). The ALT (anchor)
+    /// base is not stored in the key; recover it from the reference downstream.
+    PureDel { ilen: i32 },
+    /// Long insertion spilled to the long-allele bank at row `row`.
+    Lookup { row: u32 },
+}
+
+/// Decode a packed 32-bit indel key into its discriminated form. Single entry
+/// point for the query path — no caller re-derives the bit layout.
+pub fn decode_key(key: u32) -> DecodedKey {
+    if key & 1 == 1 {
+        DecodedKey::Lookup { row: key >> 1 }
+    } else if (key as i32) < 0 {
+        DecodedKey::PureDel {
+            ilen: (key as i32) >> 1,
+        }
+    } else {
+        DecodedKey::Inline {
+            alt: decode_alt_inline(key),
+        }
+    }
+}
+
+/// Recover the ALT base for a 2-bit SNP code (`A=00 C=01 T=10 G=11`). Inverse of
+/// [`encode_snp_2bit`].
+#[inline]
+pub fn decode_snp_2bit(code: u8) -> u8 {
+    const BASES: [u8; 4] = [b'A', b'C', b'T', b'G'];
+    BASES[(code & 3) as usize]
+}
+
+/// Read the 2-bit SNP code at call index `i` from a 2-bit-packed key buffer
+/// (4 codes/byte; see [`pack_snp_keys`]) without materializing the whole array.
+#[inline]
+pub fn unpack_snp_key_at(packed: &[u8], i: usize) -> u8 {
+    (packed[i >> 2] >> ((i & 3) * 2)) & 3
+}
+
 // Pack a single variant into its 32-bit key.
 //
 // Layout (LSB → MSB):
@@ -572,6 +616,57 @@ mod tests {
         assert_eq!(encode_snp_2bit(b'C'), 1);
         assert_eq!(encode_snp_2bit(b'T'), 2);
         assert_eq!(encode_snp_2bit(b'G'), 3);
+    }
+
+    #[test]
+    fn test_decode_key_roundtrips_pack_variant() {
+        let mut bank = make_bank();
+        // SNP A->C: ilen 0, alt "C" inline.
+        let snp = pack_variant(0, b"C", &mut bank);
+        assert_eq!(decode_key(snp), DecodedKey::Inline { alt: b"C".to_vec() });
+        assert_eq!(deletion_len(snp), 0);
+        // INS A->AT: ilen 1, alt "AT" inline.
+        let ins = pack_variant(1, b"AT", &mut bank);
+        assert_eq!(
+            decode_key(ins),
+            DecodedKey::Inline {
+                alt: b"AT".to_vec()
+            }
+        );
+        assert_eq!(deletion_len(ins), 0);
+        // Pure DEL of 2 bases: ilen -2, alt "A".
+        let del = pack_variant(-2, b"A", &mut bank);
+        assert_eq!(decode_key(del), DecodedKey::PureDel { ilen: -2 });
+        assert_eq!(deletion_len(del), 2);
+        // Long INS (> 13 bases) spills to the bank -> Lookup, deletion_len 0.
+        let long = pack_variant(19, b"ACGTACGTACGTACGTACGT", &mut bank);
+        assert!(matches!(decode_key(long), DecodedKey::Lookup { .. }));
+        assert_eq!(deletion_len(long), 0);
+    }
+
+    #[test]
+    fn test_deletion_len_near_min_i31() {
+        let mut bank = make_bank();
+        let big = pack_variant(MIN_I31, b"A", &mut bank);
+        assert_eq!(deletion_len(big), (-(MIN_I31 as i64)) as u32);
+    }
+
+    #[test]
+    fn test_decode_snp_2bit_inverts_encode() {
+        for &b in b"ACTG" {
+            assert_eq!(decode_snp_2bit(encode_snp_2bit(b)), b);
+        }
+    }
+
+    #[test]
+    fn test_unpack_snp_key_at_matches_unpack_all() {
+        let codes = [1u8, 2, 3, 0, 2, 1, 3];
+        let packed = pack_snp_keys(&codes);
+        let all = unpack_snp_keys(&packed, codes.len());
+        for i in 0..codes.len() {
+            assert_eq!(unpack_snp_key_at(&packed, i), all[i], "code {}", i);
+            assert_eq!(unpack_snp_key_at(&packed, i), codes[i]);
+        }
     }
 
     #[test]
