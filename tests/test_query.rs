@@ -160,3 +160,90 @@ fn test_overlap_sample_known_contig() {
     assert!(r3.per_hap[0].positions.is_empty());
     assert!(r3.per_hap[1].positions.is_empty());
 }
+
+// Regression guard for the var_key/snp decode path: `overlap_sample` must unpack
+// the 2-bit SNP code at the ABSOLUTE index `o0 + i` into the whole-stream packed
+// keys buffer, not the local (per-column) index `i`. A fixture where every
+// var_key/snp column happens to start at CSR offset 0 (as in
+// `test_overlap_sample_known_contig`) can't catch a regression to local `i` --
+// this test forces a nonzero offset for the second column.
+//
+// Two singleton-carrier (x=1) SNPs always route to var_key/snp regardless of
+// cohort size (see `cost_model::choose_representation`: var_key_bits = 34 <=
+// dense_bits = 34+np for every np >= 0). SNP_A@100 (ALT C, code 1) is carried
+// only by S0's hap p0 (flat col 0); SNP_B@200 (ALT G, code 3) only by S0's hap
+// p1 (flat col 1). The sample-major transpose fills var_key/snp column-by-
+// column, so col 0's CSR range is [0,1) and col 1's is [1,2): querying hap p1
+// unpacks the packed-key buffer at absolute index `o0+i = 1+0 = 1`. Under a
+// regression to local `i` it would instead read index 0 -- col 0's code (`C`)
+// -- and decode SNP_B's ALT as `C` instead of `G`.
+#[test]
+fn test_overlap_sample_var_key_snp_nonzero_csr_offset() {
+    let tmp = tempdir().unwrap();
+    let out = tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+
+    let samples = ["S0"];
+    let records = vec![
+        SynthRecord {
+            pos: 100,
+            ref_allele: b"A",
+            alts: vec![&b"C"[..]],
+            gt: vec![1, 0], // hap p0 only
+        },
+        SynthRecord {
+            pos: 200,
+            ref_allele: b"A",
+            alts: vec![&b"G"[..]],
+            gt: vec![0, 1], // hap p1 only
+        },
+    ];
+    build_contig(&out, "chr1", &samples, 2, &records);
+
+    // Confirm both SNPs actually routed to var_key/snp (not dense/snp): the
+    // var_key/snp positions sidecar must hold both calls, and dense/snp must be
+    // absent/empty.
+    let vk_snp_positions = out
+        .join("chr1")
+        .join("var_key")
+        .join("snp")
+        .join("positions.bin");
+    let vk_positions = common::read_u32_bin(&vk_snp_positions);
+    assert_eq!(
+        vk_positions,
+        vec![100, 200],
+        "expected both SNPs to route to var_key/snp"
+    );
+    let dense_snp_positions = out
+        .join("chr1")
+        .join("dense")
+        .join("snp")
+        .join("positions.bin");
+    assert!(
+        !dense_snp_positions.exists()
+            || std::fs::metadata(&dense_snp_positions).unwrap().len() == 0,
+        "expected dense/snp to be empty"
+    );
+
+    // Sanity-check the CSR offsets directly: col 0 -> [0,1), col 1 -> [1,2).
+    let offsets = common::read_offsets_npy(
+        &out.join("chr1")
+            .join("var_key")
+            .join("snp")
+            .join("offsets.npy"),
+    );
+    assert_eq!(offsets, vec![0, 1, 2]);
+
+    let reader = ContigReader::open(out.to_str().unwrap(), "chr1", 1, 2).unwrap();
+    let r = overlap_sample(&reader, 0, 0, 1000);
+    assert_eq!(r.per_hap.len(), 2);
+
+    // hap p0 (col 0, o0=0): SNP_A@100, ALT C.
+    assert_eq!(r.per_hap[0].positions, vec![100]);
+    assert_eq!(r.per_hap[0].alts, vec![b"C".to_vec()]);
+
+    // hap p1 (col 1, o0=1): SNP_B@200, ALT G. This is the assertion the
+    // local-`i` regression breaks: it would decode col 0's code and return `C`.
+    assert_eq!(r.per_hap[1].positions, vec![200]);
+    assert_eq!(r.per_hap[1].alts, vec![b"G".to_vec()]);
+}
