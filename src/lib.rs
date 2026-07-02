@@ -15,6 +15,7 @@ pub mod merge;
 pub mod monitor;
 pub mod nrvk;
 pub mod rvk;
+pub mod streams;
 pub mod types;
 pub mod vcf_reader;
 pub mod writer;
