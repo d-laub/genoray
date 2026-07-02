@@ -1,7 +1,7 @@
 use crate::layout::ContigPaths;
 use crossbeam_channel::Sender;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::os::unix::fs::FileExt;
 
 // strictly bounded memory bank for long alleles (non-blocking, double-buffered memory)
 // Public API
@@ -119,17 +119,16 @@ impl LongAlleleReader {
     }
 
     // Fetches the exact DNA string from the disk using the 31-bit row index.
-    pub fn get_allele(&mut self, row_index: u32) -> Vec<u8> {
+    pub fn get_allele(&self, row_index: u32) -> Vec<u8> {
         let idx = row_index as usize;
         let start_byte = self.offsets[idx];
         let end_byte = self.offsets[idx + 1];
         let len = (end_byte - start_byte) as usize;
-
-        let mut string_buffer = vec![0u8; len];
-        self.file.seek(SeekFrom::Start(start_byte)).unwrap();
-        self.file.read_exact(&mut string_buffer).unwrap();
-
-        string_buffer
+        let mut buf = vec![0u8; len];
+        self.file
+            .read_exact_at(&mut buf, start_byte)
+            .expect("pread long allele");
+        buf
     }
 }
 
@@ -152,5 +151,23 @@ mod tests {
         // First allele starts at 0, second at 10, EOF at 15.
         // MUST perfectly match OS SeekFrom requirements.
         assert_eq!(offsets, vec![0u64, 10u64, 15u64]);
+    }
+
+    #[test]
+    fn test_reader_get_allele_shared_borrow() {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("chr1").join("var_key").join("indel");
+        std::fs::create_dir_all(&dir).unwrap();
+        // bytes: "AAAA" then "CC" → offsets [0, 4, 6]
+        let mut f = std::fs::File::create(dir.join("long_alleles.bin")).unwrap();
+        f.write_all(b"AAAACC").unwrap();
+        let offsets = ndarray::Array1::from_vec(vec![0u64, 4, 6]);
+        ndarray_npy::write_npy(dir.join("long_allele_offsets.npy"), &offsets).unwrap();
+
+        let reader = LongAlleleReader::new(tmp.path().to_str().unwrap(), "chr1");
+        // &self: two immutable calls, no &mut needed
+        assert_eq!(reader.get_allele(0), b"AAAA".to_vec());
+        assert_eq!(reader.get_allele(1), b"CC".to_vec());
     }
 }
