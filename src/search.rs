@@ -410,4 +410,91 @@ mod tests {
         let t = SearchTree::new(&v_starts);
         assert_eq!(overlap_range(&t, &v_ends, 100, 5, 7), (0, 1)); // maxrl=100 ≫ 6
     }
+
+    /// Brute-force `O(n)` overlap: returns `(min_overlap_idx, max_overlap_idx + 1)`,
+    /// or an empty `(0, 0)` when nothing overlaps.
+    fn overlap_oracle(
+        v_starts: &[u32],
+        v_ends: &[u32],
+        q_start: u32,
+        q_end: u32,
+    ) -> (usize, usize) {
+        let mut lo: Option<usize> = None;
+        let mut hi = 0usize;
+        for i in 0..v_starts.len() {
+            if v_starts[i] < q_end && q_start < v_ends[i] {
+                lo.get_or_insert(i);
+                hi = i + 1;
+            }
+        }
+        match lo {
+            Some(s) => (s, hi),
+            None => (0, 0),
+        }
+    }
+
+    proptest! {
+        // The tree+scan resolver must agree with the brute-force oracle for random
+        // sorted starts, random deletion lengths (including the all-SNP case), and
+        // random non-empty queries. This is the primary correctness gate.
+        #[test]
+        fn prop_overlap_matches_oracle(
+            raw_starts in proptest::collection::vec(0u32..1000, 0..300),
+            del_seeds in proptest::collection::vec(0u32..30, 0..300),
+            q_start in 0u32..1000,
+            q_len in 1u32..60,
+        ) {
+            // sorted ascending starts
+            let mut v_starts = raw_starts;
+            v_starts.sort_unstable();
+            let n = v_starts.len();
+
+            // per-variant deletion lengths, sized to n (0 when del_seeds is short)
+            let dels: Vec<u32> = (0..n).map(|i| del_seeds.get(i).copied().unwrap_or(0)).collect();
+            let v_ends: Vec<u32> = v_starts.iter().zip(&dels).map(|(&s, &d)| s + 1 + d).collect();
+            let max_region_length = dels.iter().copied().max().unwrap_or(0);
+
+            let q_end = q_start + q_len;
+
+            let tree = SearchTree::new(&v_starts);
+            let (rs, re) = overlap_range(&tree, &v_ends, max_region_length, q_start, q_end);
+            let (os, oe) = overlap_oracle(&v_starts, &v_ends, q_start, q_end);
+
+            if os == oe {
+                // oracle empty → resolver must also be empty (s == e)
+                prop_assert_eq!(rs, re, "expected empty; got ({},{})", rs, re);
+            } else {
+                prop_assert_eq!((rs, re), (os, oe));
+            }
+        }
+
+        // Same, but with max_region_length deliberately OVERSHOT: a loose LB bound
+        // must still yield the exact oracle result (forward sub-scan tightens it).
+        #[test]
+        fn prop_overlap_matches_oracle_overshot_maxrl(
+            raw_starts in proptest::collection::vec(0u32..1000, 0..300),
+            del_seeds in proptest::collection::vec(0u32..30, 0..300),
+            q_start in 0u32..1000,
+            q_len in 1u32..60,
+        ) {
+            let mut v_starts = raw_starts;
+            v_starts.sort_unstable();
+            let n = v_starts.len();
+            let dels: Vec<u32> = (0..n).map(|i| del_seeds.get(i).copied().unwrap_or(0)).collect();
+            let v_ends: Vec<u32> = v_starts.iter().zip(&dels).map(|(&s, &d)| s + 1 + d).collect();
+            let true_max = dels.iter().copied().max().unwrap_or(0);
+            let max_region_length = true_max + 500; // overshoot
+
+            let q_end = q_start + q_len;
+            let tree = SearchTree::new(&v_starts);
+            let (rs, re) = overlap_range(&tree, &v_ends, max_region_length, q_start, q_end);
+            let (os, oe) = overlap_oracle(&v_starts, &v_ends, q_start, q_end);
+
+            if os == oe {
+                prop_assert_eq!(rs, re);
+            } else {
+                prop_assert_eq!((rs, re), (os, oe));
+            }
+        }
+    }
 }
