@@ -1,11 +1,51 @@
+use crate::normalize::atomize_record;
 use crate::types::{BitGrid3, DenseChunk};
-use rust_htslib::bcf::{IndexedReader, Read, record::GenotypeAllele};
+use rust_htslib::bcf::record::Record;
+use rust_htslib::bcf::{IndexedReader, Read};
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
+use std::rc::Rc;
+
+// A decomposed atom awaiting emission. Carries a shared handle to its source record's
+// per-column allele indices so genotype presence is computed at chunk-build time.
+struct PendingAtom {
+    pos: u32,
+    ilen: i32,
+    alt: Vec<u8>,
+    source_alt_index: u16,
+    gt: Rc<Vec<i32>>, // len = num_samples * ploidy; allele index per column (-1 = missing)
+    seq: u64,         // stable tiebreak for equal positions
+}
+
+impl PartialEq for PendingAtom {
+    fn eq(&self, other: &Self) -> bool {
+        self.pos == other.pos && self.seq == other.seq
+    }
+}
+impl Eq for PendingAtom {}
+impl PartialOrd for PendingAtom {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for PendingAtom {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.pos.cmp(&other.pos).then(self.seq.cmp(&other.seq))
+    }
+}
 
 pub struct VcfChunkReader {
     inner_reader: IndexedReader,
     num_samples: usize,
     ploidy: usize,
     sample_indices: Vec<usize>,
+
+    // Reorder state, persisted across read_next_chunk calls.
+    record: Record,
+    heap: BinaryHeap<Reverse<PendingAtom>>,
+    frontier: u32, // start pos of the most recently read record: all future atoms have pos >= this
+    eof: bool,
+    next_seq: u64,
 }
 
 impl VcfChunkReader {
@@ -20,25 +60,20 @@ impl VcfChunkReader {
         let mut reader = IndexedReader::from_path(vcf_path)
             .expect("Failed to open VCF/BCF index. Is there a .tbi or .csi file?");
 
-        // Tells C library to spawn exactly N background decompression threads.
         reader
             .set_threads(htslib_threads)
             .expect("Failed to allocate HTSlib background threads");
 
-        // Clone the header to extract Region IDs and Sample IDs
         let header = reader.header().clone();
 
-        // Resolve the string to a numeric Region ID (rid)
         let rid = header
             .name2rid(chrom.as_bytes())
             .expect("Chromosome not found in VCF header");
 
-        // Fetch the entire chromosome (start: 0, end: None)
         reader
             .fetch(rid, 0, None)
             .expect("Failed to fetch chromosome region");
 
-        // Map requested sample strings to their integer indices in the VCF
         let sample_indices: Vec<usize> = samples
             .iter()
             .map(|name| {
@@ -48,138 +83,142 @@ impl VcfChunkReader {
             })
             .collect();
 
+        let record = reader.empty_record();
+
         Self {
             inner_reader: reader,
             num_samples: samples.len(),
-            ploidy, //: 2, // hardcoded to diploid for this package -> can be changed later (can cause issues)
+            ploidy,
             sample_indices,
+            record,
+            heap: BinaryHeap::new(),
+            frontier: 0,
+            eof: false,
+            next_seq: 0,
         }
     }
 
-    // pulls the next `chunk_size` variants from the disk and builds the DenseChunk
-    // returns Option so that the thread knows exactly when EOF is reached
-    pub fn read_next_chunk(&mut self, chunk_size: usize, chunk_id: usize) -> Option<DenseChunk> {
-        // pre-allocate the arrays
-        let mut pos = Vec::with_capacity(chunk_size);
-        let mut ilens = Vec::with_capacity(chunk_size);
+    // Decompose `self.record` into atoms and push them onto the reorder heap, sharing
+    // one decoded genotype vector across all atoms of the record.
+    fn decompose_current_record(&mut self) {
+        let pos = self.record.pos() as u32;
 
-        let mut alt = Vec::with_capacity(chunk_size * 5); // flat array of all ALT characters
-        let mut alt_offsets = Vec::with_capacity(chunk_size + 1);
-        alt_offsets.push(0u32);
-
-        // Bit-packed dense grid: 1 bit per (variant, sample, ploidy) entry.
-        // 8x smaller than Vec<bool> for the same logical layout.
-        let mut genos = BitGrid3::zeros(chunk_size, self.num_samples, self.ploidy);
-
-        let mut current_v_idx = 0;
-        let mut current_alt_offset = 0u32;
-
-        let mut record = self.inner_reader.empty_record();
-
-        while current_v_idx < chunk_size {
-            // read the next row. If it fails, we've hit EOF for this chromosome.
-            match self.inner_reader.read(&mut record) {
-                Some(Ok(_)) => {}
-                Some(Err(e)) => panic!("VCF Read Error: {}", e), // fail on corruption
-                None => break, // End of file (or end of chromosome region)
-            }
-
-            // position
-            pos.push(record.pos() as u32);
-
-            // alleles ALT and ILEN
-            let alleles = record.alleles();
-
-            // Bi-allelic invariant: input must be normalized with `bcftools norm -m -any`.
-            // Multi-allelic records would silently lose ALT[2..], so we panic loudly.
-            assert!(
-                alleles.len() <= 2,
-                "VCF must be normalized with `bcftools norm -m -any`. \
-                 Multi-allelic record at pos {} has {} alleles.",
-                record.pos(),
-                alleles.len(),
-            );
-
-            let ref_len = alleles[0].len() as i32;
-            let mut alt_len = 0i32;
-
-            // handling ALT -> exactly one ALT after the bi-allelic check above
-            if alleles.len() > 1 {
-                let alt_allele = alleles[1];
-                alt_len = alt_allele.len() as i32;
-
-                // Atomized invariant: complex variants (alt_len > 1 AND alt_len < ref_len)
-                // can't be encoded inline by the 1-bit-tag scheme. `bcftools norm --atomize`
-                // splits these into SNPs/INS/pure-DEL primitives. Panic if we see one.
-                assert!(
-                    !(alt_len > 1 && alt_len < ref_len),
-                    "VCF must be atomized with `bcftools norm --atomize`. \
-                     Complex record at pos {} has REF_LEN={} ALT_LEN={} (cannot be encoded inline).",
-                    record.pos(),
-                    ref_len,
-                    alt_len,
-                );
-
-                alt.extend_from_slice(alt_allele);
-                current_alt_offset += alt_len as u32;
-            }
-            // if there is no ALT allele, the offset doesn't change
-            alt_offsets.push(current_alt_offset);
-            ilens.push(alt_len - ref_len); // storing ilen directly
-
-            // genotypes
-            let genotypes = record.genotypes().expect("Failed to read genotypes");
-
-            // Loop through your pre-mapped sample indices instead!
-            for (s_idx, &real_vcf_idx) in self.sample_indices.iter().enumerate() {
-                if s_idx >= self.num_samples {
-                    break;
-                }
-
-                // Fetch the genotype for this specific sample
-                let sample_gt = genotypes.get(real_vcf_idx);
-
-                let allele_1 = matches!(
-                    sample_gt[0],
-                    GenotypeAllele::Unphased(1) | GenotypeAllele::Phased(1)
-                );
-
-                let allele_2 = if sample_gt.len() > 1 {
-                    matches!(
-                        sample_gt[1],
-                        GenotypeAllele::Unphased(1) | GenotypeAllele::Phased(1)
-                    )
-                } else {
-                    false
-                };
-
-                // 1D to 3D Memory Mapping (matches BitGrid3 row-major C-order)
-                let base_idx =
-                    (current_v_idx * self.num_samples * self.ploidy) + (s_idx * self.ploidy);
-                genos.or_bit(base_idx, allele_1);
-                genos.or_bit(base_idx + 1, allele_2);
-
-                //this is for the ravel operation - need to check on this
-                // // The shape of our tensor block
-                // let shape = [chunk_size, self.num_samples, self.ploidy];
-
-                // // Raveling the 3D coordinates into a 1D memory pointer
-                // let base_idx = ravel!(shape, [current_v_idx, s_idx, 0]);
-
-                // genos_flat[base_idx] = allele_1;
-                // genos_flat[base_idx + 1] = allele_2;
-            }
-
-            current_v_idx += 1;
+        // Own the alleles so the record borrow is released before we mutate self.
+        let ref_allele: Vec<u8>;
+        let alts_owned: Vec<Vec<u8>>;
+        {
+            let alleles = self.record.alleles();
+            ref_allele = alleles[0].to_vec();
+            alts_owned = alleles[1..].iter().map(|a| a.to_vec()).collect();
         }
 
-        // if no read, return None to signal EOF
-        if current_v_idx == 0 {
+        // Decode per-column allele indices (-1 = missing).
+        let columns = self.num_samples * self.ploidy;
+        let mut gt = vec![-1i32; columns];
+        {
+            let genotypes = self.record.genotypes().expect("Failed to read genotypes");
+            for (s_idx, &vcf_idx) in self.sample_indices.iter().enumerate() {
+                let sample_gt = genotypes.get(vcf_idx);
+                for p in 0..self.ploidy {
+                    let idx = if p < sample_gt.len() {
+                        sample_gt[p].index().map(|v| v as i32).unwrap_or(-1)
+                    } else {
+                        -1
+                    };
+                    gt[s_idx * self.ploidy + p] = idx;
+                }
+            }
+        }
+        let gt = Rc::new(gt);
+
+        let alt_refs: Vec<&[u8]> = alts_owned.iter().map(|a| a.as_slice()).collect();
+        let mut atoms = Vec::new();
+        atomize_record(pos, &ref_allele, &alt_refs, &mut atoms)
+            .expect("symbolic/breakend ALT is out of scope for SVAR2 (short-read only)");
+
+        for atom in atoms {
+            let seq = self.next_seq;
+            self.next_seq += 1;
+            self.heap.push(Reverse(PendingAtom {
+                pos: atom.pos,
+                ilen: atom.ilen,
+                alt: atom.alt,
+                source_alt_index: atom.source_alt_index,
+                gt: Rc::clone(&gt),
+                seq,
+            }));
+        }
+    }
+
+    // Yield the next atom in global position order, reading and decomposing more
+    // records as needed. An atom is safe to emit once its position is strictly below
+    // the read frontier (no future atom can precede the frontier, since there is no
+    // left-alignment) or once the input is exhausted.
+    //
+    // Memory note: the heap holds every atom whose pos == frontier until a record with a
+    // strictly greater start pos advances the frontier (or EOF). For coordinate-sorted
+    // input this is bounded by the atoms at a single position; a pathological run of many
+    // records sharing one start pos would grow it. M2b (left-alignment) weakens the
+    // `pos >= record_start` premise and must revisit this bound.
+    fn next_atom(&mut self) -> Option<PendingAtom> {
+        loop {
+            if let Some(Reverse(top)) = self.heap.peek() {
+                if self.eof || top.pos < self.frontier {
+                    return Some(self.heap.pop().unwrap().0);
+                }
+            } else if self.eof {
+                return None;
+            }
+
+            match self.inner_reader.read(&mut self.record) {
+                Some(Ok(())) => {
+                    self.frontier = self.record.pos() as u32;
+                    self.decompose_current_record();
+                }
+                Some(Err(e)) => panic!("VCF Read Error: {}", e),
+                None => self.eof = true,
+            }
+        }
+    }
+
+    // Pull up to `chunk_size` atoms (already globally position-sorted) and pack them
+    // into a variant-major DenseChunk. Returns None once no atoms remain.
+    pub fn read_next_chunk(&mut self, chunk_size: usize, chunk_id: usize) -> Option<DenseChunk> {
+        let mut atoms: Vec<PendingAtom> = Vec::with_capacity(chunk_size);
+        while atoms.len() < chunk_size {
+            match self.next_atom() {
+                Some(a) => atoms.push(a),
+                None => break,
+            }
+        }
+        if atoms.is_empty() {
             return None;
         }
 
-        // shrink V dim if we hit EOF before filling the whole chunk size
-        genos.truncate_v(current_v_idx);
+        let v = atoms.len();
+        let columns = self.num_samples * self.ploidy;
+
+        let mut pos = Vec::with_capacity(v);
+        let mut ilens = Vec::with_capacity(v);
+        let mut alt = Vec::with_capacity(v * 2);
+        let mut alt_offsets = Vec::with_capacity(v + 1);
+        alt_offsets.push(0u32);
+        let mut genos = BitGrid3::zeros(v, self.num_samples, self.ploidy);
+
+        let mut off = 0u32;
+        for (vi, a) in atoms.iter().enumerate() {
+            pos.push(a.pos);
+            ilens.push(a.ilen);
+            alt.extend_from_slice(&a.alt);
+            off += a.alt.len() as u32;
+            alt_offsets.push(off);
+
+            let src = a.source_alt_index as i32;
+            let base = vi * columns;
+            for col in 0..columns {
+                genos.or_bit(base + col, a.gt[col] == src);
+            }
+        }
 
         Some(DenseChunk {
             chunk_id,

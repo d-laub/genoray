@@ -235,11 +235,18 @@ sub-streams span exactly one base, so they need no leftward overlap extension.
 Conversion normalizes variants inline as they stream through, so the on-disk model is
 always normalized:
 
-- **Left-alignment** — shift indels to their leftmost equivalent position.
-- **Atomization** — break complex/MNV records into atomic primitives.
-- **Biallelic split** — split multi-allelic sites into separate biallelic records.
+- **Atomization (M2)** — break complex/MNV records into atomic primitives (SNP /
+  anchored INS / anchored DEL), mirroring bcftools `_atomize_allele`.
+- **Biallelic split (M2)** — split multi-allelic sites into separate biallelic records,
+  remapping genotypes by original ALT index.
+- **Left-alignment (M2b, deferred)** — shift indels to their leftmost equivalent
+  position. Deferred because it is the only step requiring a reference genome.
 
 This keeps `ILEN`/ALT semantics simple and makes the inline encoding well-defined.
+Because atomization spreads atom positions rightward (and, once M2b lands,
+left-alignment shifts them leftward), the reader emits atoms through a position-keyed
+reorder buffer so each per-`(sample, ploid)` stream stays position-sorted for the
+interleaving merge.
 
 ## Overlap queries and deletions
 

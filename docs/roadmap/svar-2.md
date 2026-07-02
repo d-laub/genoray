@@ -72,14 +72,21 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
   `var_key` stream is now split into 2-bit `snp/` and 32-bit `indel/`
   sub-streams per [`data-model.md`](data-model.md#on-disk-layout); the SNP stream
   is 2-bit-packed post-merge and carries no LUT.
-- [ ] **M2. Variant normalization during conversion.** Left-alignment, atomization,
-  and biallelic splitting (split multi-allelic sites) applied inline as variants stream
-  through. See [`data-model.md`](data-model.md#variant-normalization).
-  *Not started — currently an input precondition.* The reader asserts normalized input
-  and panics on multi-allelic or complex records; the inline encoder bakes in the
-  atomized invariant `ref_len = 1` (it stores `ILEN = alt_len − 1` and decodes
-  `alt_len = ILEN + 1`). M2 is what will let conversion accept un-normalized VCFs
-  directly.
+- [~] **M2. Variant normalization during conversion.** Atomization and biallelic
+  splitting (split multi-allelic sites) applied inline as variants stream through. See
+  [`data-model.md`](data-model.md#variant-normalization). *Shipped:* the reader accepts
+  un-normalized VCFs — a pure `normalize.rs` decomposes each record into atomic
+  biallelic primitives (SNP / anchored INS / anchored DEL) mirroring bcftools
+  `_atomize_allele`, and a position-keyed reorder buffer preserves the merge's
+  sorted-position invariant across chunk boundaries. Genotypes are remapped by comparing
+  each haplotype's integer allele index to the atom's source ALT index. The former
+  "input must be normalized" asserts are gone; symbolic/breakend ALTs are rejected and
+  `*`/`.` alleles are skipped.
+- [ ] **M2b. Left-alignment during conversion.** Shift indels to their leftmost
+  equivalent position. Deferred from M2 because it is the only normalization step that
+  needs a reference genome (FASTA/faidx) and a new required conversion argument, and it
+  widens the reorder-buffer bound (leftward shifts). See
+  [`data-model.md`](data-model.md#variant-normalization).
 - [~] **M3. Per-contig split + sidecar positions.** Partition the SVAR2 directory by
   contig; keep positions as sidecar arrays. See
   [`architecture.md`](architecture.md#on-disk-layout).

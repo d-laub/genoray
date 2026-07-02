@@ -8,6 +8,7 @@ pub mod executor;
 pub mod layout;
 pub mod merge;
 pub mod monitor;
+pub mod normalize;
 pub mod nrvk;
 pub mod orchestrator;
 pub mod rvk;
