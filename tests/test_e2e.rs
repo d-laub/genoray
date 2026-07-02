@@ -177,19 +177,17 @@ fn test_e2e_normalized_bcf_pipeline() {
     // Routing (np=4): common SNP@100 (x=3) → dense/snp; INS@200 (x=1) →
     // var_key/indel; DEL@300 (x=2) → dense/indel.
     //
-    // NOTE: dense per-chunk output isn't merged into `final_*` files yet —
-    // that wiring is Task 11 (orchestrator drives dense merge). This dataset
-    // fits in a single chunk (chunk_size=100 » 3 records), so the unmerged
-    // `chunk_0_*` files ARE the complete dense payload; we read those
-    // directly rather than `final_positions.bin`/`final_genotypes.bin`.
+    // The orchestrator drives the dense merge (Task 11), so per-chunk dense
+    // output is merged into `final_*` files (and the per-chunk temp files
+    // are removed) just like the var_key streams.
     let dsnp = out_dir.join("chr1/dense/snp");
     let dindel = out_dir.join("chr1/dense/indel");
     let vk_indel = out_dir.join("chr1/var_key/indel");
 
     // dense/snp: 1 variant @100, geno bits for haps 0,2,3.
-    let dsnp_pos = read_u32_bin(&dsnp.join("chunk_0_pos.bin"));
+    let dsnp_pos = read_u32_bin(&dsnp.join("final_positions.bin"));
     assert_eq!(dsnp_pos, vec![100]);
-    let dsnp_geno = std::fs::read(dsnp.join("chunk_0_geno.bin")).unwrap();
+    let dsnp_geno = std::fs::read(dsnp.join("final_genotypes.bin")).unwrap();
     // np=4, v_dense=1 → bit h*1+0. Carriers = haps 0,2,3 (gt [1,0,1,1]).
     assert!(genoray_core::bits::get_bit(&dsnp_geno, 0));
     assert!(!genoray_core::bits::get_bit(&dsnp_geno, 1));
@@ -211,13 +209,62 @@ fn test_e2e_normalized_bcf_pipeline() {
     }
 
     // dense/indel: DEL@300 (x=2, haps 0,1).
-    let dindel_pos = read_u32_bin(&dindel.join("chunk_0_pos.bin"));
+    let dindel_pos = read_u32_bin(&dindel.join("final_positions.bin"));
     assert_eq!(dindel_pos, vec![300]);
-    let dindel_geno = std::fs::read(dindel.join("chunk_0_geno.bin")).unwrap();
+    let dindel_geno = std::fs::read(dindel.join("final_genotypes.bin")).unwrap();
     assert!(genoray_core::bits::get_bit(&dindel_geno, 0)); // hap0
     assert!(genoray_core::bits::get_bit(&dindel_geno, 1)); // hap1
     assert!(!genoray_core::bits::get_bit(&dindel_geno, 2));
     assert!(!genoray_core::bits::get_bit(&dindel_geno, 3));
+}
+
+// Dense round-trip: a SNP carried by most of a small cohort must be routed to
+// dense/snp and its genotype bits reconstructable from final_genotypes.bin.
+#[test]
+fn test_e2e_dense_snp_roundtrip() {
+    let tmp = tempdir().unwrap();
+    let bcf_path = tmp.path().join("dense.bcf");
+    let samples = vec!["S0", "S1", "S2"]; // np = 6
+
+    // One SNP A→C carried by haps 0,1,2,3,4 (5 of 6). x=5.
+    // dense = 32+2+6 = 40 < var_key 5*34 = 170 → dense.
+    let records = vec![SynthRecord {
+        pos: 500,
+        ref_allele: b"A",
+        alts: vec![&b"C"[..]],
+        gt: vec![1, 1, 1, 1, 1, 0], // S0(1,1) S1(1,1) S2(1,0)
+    }];
+    build_bcf_with_index(&bcf_path, "chr1", 10_000, &samples, &records);
+
+    let out_dir = tmp.path().join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    process_chromosome(
+        bcf_path.to_str().unwrap(),
+        "chr1",
+        out_dir.to_str().unwrap(),
+        &samples,
+        100,
+        2,
+        1,
+        4096,
+    )
+    .expect("conversion");
+
+    let dsnp = out_dir.join("chr1/dense/snp");
+    let pos = read_u32_bin(&dsnp.join("final_positions.bin"));
+    assert_eq!(pos, vec![500]);
+    // packed key: 'C' code 1, 1 variant → pack_snp_keys([1]) == [0x01]
+    assert_eq!(
+        std::fs::read(dsnp.join("final_keys.bin")).unwrap(),
+        vec![0x01u8]
+    );
+
+    // genotypes: np=6, v_dense=1 → bit h. Haps 0..5 carriers = [1,1,1,1,1,0].
+    let geno = std::fs::read(dsnp.join("final_genotypes.bin")).unwrap();
+    for h in 0..5 {
+        assert!(genoray_core::bits::get_bit(&geno, h), "hap {}", h);
+    }
+    assert!(!genoray_core::bits::get_bit(&geno, 5));
 }
 
 // Mutation conservation across the full pipeline: the total length of
@@ -274,12 +321,9 @@ fn test_e2e_mutation_conservation() {
     // Routing (np=6): all three SNPs have x=3,3,4 carriers — every one clears
     // the dense crossover (34*x > 34+np=40), so they ALL route to dense/snp
     // and var_key/snp is empty. Conservation must therefore be checked
-    // across every bucket: var_key final_positions lengths (merged, since
-    // orchestrator already drives var_key merge via `REGISTRY`) + dense
-    // genotype popcounts. Dense per-chunk output isn't merged into
-    // `final_genotypes.bin` yet (Task 11's job), so read the unmerged
-    // `chunk_0_geno.bin` directly — this dataset fits in a single chunk
-    // (chunk_size=100 » 3 records), so it holds the complete dense payload.
+    // across every bucket: var_key final_positions lengths + dense genotype
+    // popcounts — both merged by the orchestrator (Task 11 wires the dense
+    // merge alongside the pre-existing var_key merge via `REGISTRY`).
     let mut total = 0usize;
     for sub in ["var_key/snp", "var_key/indel"] {
         let p = out_dir.join(format!("chr1/{sub}/final_positions.bin"));
@@ -288,7 +332,7 @@ fn test_e2e_mutation_conservation() {
         }
     }
     for sub in ["dense/snp", "dense/indel"] {
-        let g = out_dir.join(format!("chr1/{sub}/chunk_0_geno.bin"));
+        let g = out_dir.join(format!("chr1/{sub}/final_genotypes.bin"));
         if g.exists() {
             total += std::fs::read(&g)
                 .unwrap()

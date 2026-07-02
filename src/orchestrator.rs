@@ -188,12 +188,9 @@ pub fn process_chromosome(
     let phase1 = executor_res.map_err(|_| ConversionError::WorkerPanicked {
         thread: format!("exec-{}", chrom),
     })?;
-    // dense_ledgers isn't consumed until Task 11 (dense merge wiring); bind
-    // with a leading underscore for now to keep clippy's unused-var lint
-    // green, then rename to `dense_ledgers` when it's wired up.
     let crate::executor::Phase1Output {
         var_key_ledgers: ledgers,
-        dense_ledgers: _dense_ledgers,
+        dense_ledgers,
         long_allele_offsets,
     } = phase1;
     chunk_writer_res.map_err(|_| ConversionError::WorkerPanicked {
@@ -234,6 +231,24 @@ pub fn process_chromosome(
         if let Some(hook) = spec.post_merge {
             hook(&dir);
         }
+    }
+
+    // Dense merge: one rectangular merge per dense class (no-op-safe when empty).
+    let mut dense_ledgers = dense_ledgers; // make mutable to move rows out
+    for spec in &crate::dense::DENSE_REGISTRY {
+        let dir = std::path::Path::new(base_out_dir)
+            .join(chrom)
+            .join(spec.subdir);
+        let ledger = std::mem::take(dense_ledgers.get_mut(spec.class));
+        crate::dense_merge::merge_dense_class(
+            num_chunks,
+            samples.len(),
+            ploidy,
+            spec.key_bytes,
+            spec.pack_snp,
+            dir.to_str().unwrap(),
+            ledger,
+        );
     }
 
     println!("[{}] Pipeline Execution Finished Successfully.", chrom);
