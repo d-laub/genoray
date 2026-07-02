@@ -3,6 +3,7 @@ use pyo3::prelude::*;
 use rayon::prelude::*;
 
 pub mod budget;
+pub mod cost_model;
 pub mod error;
 pub mod executor;
 pub mod layout;
