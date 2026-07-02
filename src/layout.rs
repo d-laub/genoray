@@ -78,6 +78,18 @@ pub fn genotypes(dir: &Path) -> PathBuf {
     dir.join("genotypes.bin")
 }
 
+/// Per-contig `max_del.npy` (var_key/indel per-`(sample, ploid)` max deletion
+/// length; `u32`, shape `(n_samples, ploidy)`). See the M5 `max_del` contract.
+pub fn max_del(contig_dir: &Path) -> PathBuf {
+    contig_dir.join("max_del.npy")
+}
+
+/// Per-contig `dense/max_del.npy` (single scalar max deletion length over the
+/// shared dense/indel table; `u32`, shape `(1,)`).
+pub fn dense_max_del(contig_dir: &Path) -> PathBuf {
+    contig_dir.join("dense").join("max_del.npy")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,5 +151,15 @@ mod tests {
         );
         assert_eq!(alleles(dir), Path::new("/out/chr1/var_key/snp/alleles.bin"));
         assert_eq!(offsets(dir), Path::new("/out/chr1/var_key/snp/offsets.npy"));
+    }
+
+    #[test]
+    fn test_max_del_paths() {
+        let contig = Path::new("/out/chr1");
+        assert_eq!(max_del(contig), Path::new("/out/chr1/max_del.npy"));
+        assert_eq!(
+            dense_max_del(contig),
+            Path::new("/out/chr1/dense/max_del.npy")
+        );
     }
 }
