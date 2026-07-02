@@ -2,6 +2,7 @@
 use pyo3::prelude::*;
 use rayon::prelude::*;
 
+pub mod bits;
 pub mod budget;
 pub mod cost_model;
 pub mod error;
