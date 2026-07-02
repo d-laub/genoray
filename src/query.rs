@@ -3,12 +3,6 @@
 //! region `[q_start, q_end)`, and sample, return that sample's overlapping
 //! variants per haplotype. `search.rs` is untouched.
 
-// The query internals (loaders, `gather_run`, `kway_merge`, the reader's private
-// views) are exercised only by tests until `overlap_sample` ties them together in
-// Task 6. This keeps `cargo clippy -D warnings` green in the interim.
-// REMOVE this `#![allow(dead_code)]` in Task 6, once `overlap_sample` uses them all.
-#![allow(dead_code)]
-
 use std::fs::File;
 use std::io::ErrorKind;
 use std::path::Path;
@@ -19,6 +13,7 @@ use ndarray::{Array1, Array2};
 use crate::bits;
 use crate::layout::{self, ContigPaths};
 use crate::nrvk::LongAlleleReader;
+use crate::rvk::{self, DecodedKey};
 use crate::search::{SearchTree, overlap_range};
 
 /// mmap a file into memory, returning `None` for a missing or zero-length file
@@ -296,6 +291,155 @@ impl ContigReader {
             lut,
         })
     }
+}
+
+/// Per-haplotype overlapping calls, position-sorted. Struct-of-arrays for a
+/// numpy-friendly M6 hand-off.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HapCalls {
+    pub positions: Vec<u32>,
+    pub ilens: Vec<i32>,
+    pub alts: Vec<Vec<u8>>,
+}
+
+/// Result of an `overlap_sample` query: one `HapCalls` per haplotype
+/// (`per_hap.len() == ploidy`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QueryResult {
+    pub per_hap: Vec<HapCalls>,
+}
+
+/// Decode an indel key into `(ilen, alt)` for a hit, resolving long-INS lookups
+/// through the LUT. `alt` is empty for a pure DEL.
+fn decode_indel_hit(key: u32, lut: Option<&LongAlleleReader>) -> (i32, Vec<u8>) {
+    match rvk::decode_key(key) {
+        DecodedKey::Inline { alt } => (alt.len() as i32 - 1, alt),
+        DecodedKey::PureDel { ilen } => (ilen, Vec::new()),
+        DecodedKey::Lookup { row } => {
+            let alt = lut
+                .expect("indel lookup key requires a long-allele LUT")
+                .get_allele(row);
+            (alt.len() as i32 - 1, alt)
+        }
+    }
+}
+
+/// Return every variant that `sample` carries overlapping `[q_start, q_end)`, per
+/// haplotype, position-sorted, unioning the var_key and dense sub-streams.
+pub fn overlap_sample(
+    reader: &ContigReader,
+    sample: usize,
+    q_start: u32,
+    q_end: u32,
+) -> QueryResult {
+    let ploidy = reader.ploidy;
+    let mut per_hap = Vec::with_capacity(ploidy);
+
+    for p in 0..ploidy {
+        let col = sample * ploidy + p; // flat column
+        let hap = col; // sample-major hap index == flat column
+        let mut runs: Vec<Vec<Call>> = Vec::with_capacity(4);
+
+        // --- var_key/snp column ---
+        {
+            let (o0, o1) = reader.vk_snp.column(col);
+            let positions = &reader.vk_snp.positions()[o0..o1];
+            let keys = as_bytes(&reader.vk_snp.keys);
+            let mut run = Vec::new();
+            gather_run(
+                positions,
+                0,
+                q_start,
+                q_end,
+                |_| 0,
+                |_| true,
+                |i| {
+                    (
+                        0,
+                        vec![rvk::decode_snp_2bit(rvk::unpack_snp_key_at(keys, o0 + i))],
+                    )
+                },
+                &mut run,
+            );
+            runs.push(run);
+        }
+
+        // --- var_key/indel column ---
+        {
+            let (o0, o1) = reader.vk_indel.column(col);
+            let positions = &reader.vk_indel.positions()[o0..o1];
+            let all_keys = as_u32(&reader.vk_indel.keys);
+            let keys = &all_keys[o0..o1];
+            let max_del = reader.vk_indel_max_del[[sample, p]];
+            let lut = reader.lut.as_ref();
+            let mut run = Vec::new();
+            gather_run(
+                positions,
+                max_del,
+                q_start,
+                q_end,
+                |i| rvk::deletion_len(keys[i]),
+                |_| true,
+                |i| decode_indel_hit(keys[i], lut),
+                &mut run,
+            );
+            runs.push(run);
+        }
+
+        // --- dense/snp (shared table, genotype-filtered) ---
+        if let Some(dense) = &reader.dense_snp {
+            let positions = dense.positions();
+            let keys = as_bytes(&dense.keys);
+            let mut run = Vec::new();
+            gather_run(
+                positions,
+                0,
+                q_start,
+                q_end,
+                |_| 0,
+                |col_d| dense.carried(hap, col_d),
+                |col_d| {
+                    (
+                        0,
+                        vec![rvk::decode_snp_2bit(rvk::unpack_snp_key_at(keys, col_d))],
+                    )
+                },
+                &mut run,
+            );
+            runs.push(run);
+        }
+
+        // --- dense/indel (shared table, genotype-filtered) ---
+        if let Some(dense) = &reader.dense_indel {
+            let positions = dense.positions();
+            let keys = as_u32(&dense.keys);
+            let max_del = reader.dense_indel_max_del;
+            let lut = reader.lut.as_ref();
+            let mut run = Vec::new();
+            gather_run(
+                positions,
+                max_del,
+                q_start,
+                q_end,
+                |i| rvk::deletion_len(keys[i]),
+                |col_d| dense.carried(hap, col_d),
+                |i| decode_indel_hit(keys[i], lut),
+                &mut run,
+            );
+            runs.push(run);
+        }
+
+        let merged = kway_merge(runs);
+        let mut hc = HapCalls::default();
+        for c in merged {
+            hc.positions.push(c.position);
+            hc.ilens.push(c.ilen);
+            hc.alts.push(c.alt);
+        }
+        per_hap.push(hc);
+    }
+
+    QueryResult { per_hap }
 }
 
 #[cfg(test)]
