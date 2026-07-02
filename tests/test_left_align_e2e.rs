@@ -5,6 +5,7 @@ mod common;
 
 use common::{SynthRecord, build_bcf_with_index};
 use genoray_core::vcf_reader::VcfChunkReader;
+use proptest::prelude::*;
 use std::io::Write;
 use std::path::Path;
 use tempfile::tempdir;
@@ -199,4 +200,117 @@ fn reader_matches_bcftools_norm() {
         got, expected,
         "reader atoms must match `bcftools norm -a -m-`"
     );
+}
+
+#[test]
+fn left_shifts_stay_sorted_across_chunk_boundaries() {
+    // A later record's indel left-aligns to a position *below* an earlier-emitted record's
+    // start. With chunk_size = 1, ordering must still hold across chunks.
+    // Reference: index 6:C 7:A 8:G 9:A 10:G 11:T — a SNP at 7, then GAG>G @8 which rolls
+    // to pos 6. The reorder buffer (widened by L_MAX) must emit pos 6 before pos 7.
+    let tmp = tempdir().unwrap();
+    let bcf = tmp.path().join("order.bcf");
+    let fasta = tmp.path().join("order.fa");
+    write_ref(&fasta, "chr1", REF_SEQ);
+
+    let samples = vec!["S0"];
+    let records = vec![
+        SynthRecord {
+            pos: 7,
+            ref_allele: b"A",
+            alts: vec![&b"T"[..]],
+            gt: vec![1, 0],
+        },
+        SynthRecord {
+            pos: 8,
+            ref_allele: b"GAG",
+            alts: vec![&b"G"[..]],
+            gt: vec![1, 0],
+        },
+    ];
+    build_bcf_with_index(&bcf, "chr1", REF_SEQ.len() as u64, &samples, &records);
+
+    // chunk_size = 1 forces every atom into its own chunk.
+    let mut reader = VcfChunkReader::new(
+        bcf.to_str().unwrap(),
+        fasta.to_str().unwrap(),
+        "chr1",
+        &samples,
+        1,
+        2,
+    );
+    let mut positions = Vec::new();
+    let mut cid = 0;
+    while let Some(chunk) = reader.read_next_chunk(1, cid) {
+        positions.extend_from_slice(&chunk.pos);
+        cid += 1;
+    }
+    // GAG>G rolls to pos 6, SNP stays at 7 → sorted [6, 7].
+    assert_eq!(positions, vec![6, 7]);
+    let mut sorted = positions.clone();
+    sorted.sort();
+    assert_eq!(
+        positions, sorted,
+        "emitted positions must be non-decreasing"
+    );
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    // Random homopolymer/repeat reference + random indels: whatever the reader emits is
+    // globally position-sorted, even with left-shifts and chunk_size = 1.
+    #[test]
+    fn emitted_positions_are_sorted_under_random_left_shifts(
+        seed in proptest::collection::vec(
+            prop_oneof![Just(b'A'), Just(b'C'), Just(b'G'), Just(b'T')], 20..60),
+        anchors in proptest::collection::vec(2usize..18, 1..6),
+    ) {
+        let tmp = tempdir().unwrap();
+        let bcf = tmp.path().join("p.bcf");
+        let fasta = tmp.path().join("p.fa");
+        write_ref(&fasta, "chr1", &seed);
+
+        // Build clean single-base deletions at sorted, distinct anchor positions (each
+        // deletes the base to its right, so REF is [ref, ref+1]).
+        let mut sorted_anchors: Vec<usize> = anchors.clone();
+        sorted_anchors.sort_unstable();
+        sorted_anchors.dedup();
+        let refs: Vec<(usize, Vec<u8>, Vec<u8>)> = sorted_anchors
+            .iter()
+            .filter(|&&p| p + 1 < seed.len())
+            .map(|&p| (p, vec![seed[p], seed[p + 1]], vec![seed[p]]))
+            .collect();
+        prop_assume!(!refs.is_empty());
+
+        let samples = vec!["S0"];
+        let synth: Vec<SynthRecord> = refs
+            .iter()
+            .map(|(p, r, a)| SynthRecord {
+                pos: *p as i64,
+                ref_allele: r.as_slice(),
+                alts: vec![a.as_slice()],
+                gt: vec![1, 0],
+            })
+            .collect();
+        build_bcf_with_index(&bcf, "chr1", seed.len() as u64, &samples, &synth);
+
+        let mut reader = VcfChunkReader::new(
+            bcf.to_str().unwrap(),
+            fasta.to_str().unwrap(),
+            "chr1",
+            &samples,
+            1,
+            2,
+        );
+        let mut positions = Vec::new();
+        let mut cid = 0;
+        while let Some(chunk) = reader.read_next_chunk(1, cid) {
+            positions.extend_from_slice(&chunk.pos);
+            cid += 1;
+        }
+        let mut sorted = positions.clone();
+        sorted.sort();
+        prop_assert_eq!(positions, sorted);
+    }
 }
