@@ -59,11 +59,39 @@ mod tests {
         }
     }
 
+    /// Test-only helper: strictly independent of `copy_bits`/`get_bit`/`set_bit`.
+    /// Decodes bytes into a `Vec<bool>` using inline `>>`/`&` arithmetic.
+    fn decode_bits_ref(bytes: &[u8]) -> Vec<bool> {
+        let mut bits = Vec::with_capacity(bytes.len() * 8);
+        for &b in bytes {
+            for j in 0..8u8 {
+                bits.push((b >> j) & 1 != 0);
+            }
+        }
+        bits
+    }
+
+    /// Test-only helper: strictly independent of `copy_bits`/`get_bit`/`set_bit`.
+    /// Re-encodes a `Vec<bool>` into bytes using inline `<<`/`|` arithmetic.
+    fn encode_bits_ref(bits: &[bool]) -> Vec<u8> {
+        let mut bytes = vec![0u8; bits.len().div_ceil(8)];
+        for (idx, &bit) in bits.iter().enumerate() {
+            if bit {
+                bytes[idx / 8] |= 1u8 << (idx % 8);
+            }
+        }
+        bytes
+    }
+
     proptest! {
-        // copy_bits matches a naive reference for arbitrary offsets/lengths.
+        // copy_bits matches an INDEPENDENTLY computed reference for arbitrary offsets/lengths.
+        // The reference decodes dst/src into bool vectors via inline bit arithmetic (never
+        // calling copy_bits/get_bit/set_bit), ORs the copy window, and re-encodes to bytes —
+        // so a bug shared between copy_bits and the reference's indexing math cannot hide.
         #[test]
         fn test_copy_bits_matches_reference(
             src_bytes in proptest::collection::vec(any::<u8>(), 1..8),
+            dst_bytes_seed in proptest::collection::vec(any::<u8>(), 1..8),
             dst_bit in 0usize..40,
             src_bit in 0usize..40,
             n in 0usize..40,
@@ -72,17 +100,73 @@ mod tests {
             let need_src = (src_bit + n).div_ceil(8).max(src_bytes.len());
             let mut src = src_bytes.clone();
             src.resize(need_src, 0);
-            let dst_len = (dst_bit + n).div_ceil(8).max(1);
-            let mut dst = vec![0u8; dst_len];
-            let mut reference = vec![0u8; dst_len];
+
+            // Seed dst with random pre-existing (non-zero) bytes so OR-vs-overwrite is exercised.
+            let dst_len = (dst_bit + n).div_ceil(8).max(dst_bytes_seed.len()).max(1);
+            let mut dst = dst_bytes_seed.clone();
+            dst.resize(dst_len, 0);
+            let dst_before = dst.clone();
 
             copy_bits(&mut dst, dst_bit, &src, src_bit, n);
+
+            // Independent reference: decode -> OR window -> re-encode.
+            let mut expected_bits = decode_bits_ref(&dst_before);
+            let src_bits = decode_bits_ref(&src);
             for i in 0..n {
-                if get_bit(&src, src_bit + i) {
-                    set_bit(&mut reference, dst_bit + i);
-                }
+                expected_bits[dst_bit + i] |= src_bits[src_bit + i];
             }
-            prop_assert_eq!(dst, reference);
+            let expected = encode_bits_ref(&expected_bits);
+
+            prop_assert_eq!(dst, expected);
         }
+    }
+
+    #[test]
+    fn test_copy_bits_preserves_and_ors_dst() {
+        // 3-byte dst (24 bits); copy window is dst bits [8, 20).
+        let mut dst = vec![0u8; 3];
+        // Pre-set bits OUTSIDE the window.
+        for &i in &[0usize, 2, 23] {
+            set_bit(&mut dst, i);
+        }
+        // Pre-set bits INSIDE the window:
+        //  - bit 9  (window offset 1): src offset 1 will also be 1 -> stays 1 either way.
+        //  - bit 12 (window offset 4): src offset 4 will be 0 -> must STAY 1 under OR
+        //    semantics (overwrite would incorrectly clear it to 0).
+        for &i in &[9usize, 12] {
+            set_bit(&mut dst, i);
+        }
+        let dst_before = dst.clone();
+
+        // src pattern: bits 0, 1, 9, 11 set (bit 4 deliberately left 0).
+        let mut src = vec![0u8; 2];
+        for &i in &[0usize, 1, 9, 11] {
+            set_bit(&mut src, i);
+        }
+        assert!(!get_bit(&src, 4), "test setup: src offset 4 must be 0");
+
+        copy_bits(&mut dst, 8, &src, 0, 12);
+
+        // (a) every bit outside the window is unchanged.
+        for i in (0..8).chain(20..24) {
+            assert_eq!(
+                get_bit(&dst, i),
+                get_bit(&dst_before, i),
+                "outside-window bit {} changed",
+                i
+            );
+        }
+
+        // (b) inside the window, result == dst_before OR src (OR, not overwrite).
+        for j in 0..12usize {
+            let want = get_bit(&dst_before, 8 + j) || get_bit(&src, j);
+            assert_eq!(get_bit(&dst, 8 + j), want, "window offset {}", j);
+        }
+
+        // Explicit check of the dst=1,src=0 case: proves OR semantics rather than overwrite.
+        assert!(
+            get_bit(&dst, 12),
+            "dst bit 12 was pre-set with src=0 at that offset; OR must keep it 1"
+        );
     }
 }
