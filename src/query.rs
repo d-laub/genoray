@@ -351,6 +351,10 @@ impl ContigReader {
         if let Some(d) = &self.dense_indel {
             let positions = d.positions();
             let keys = as_u32(&d.keys);
+            // Fail fast on a corrupt sidecar: `zip` would otherwise silently
+            // truncate to the shorter of the two instead of panicking like the
+            // pre-refactor indexed loop did.
+            debug_assert_eq!(positions.len(), keys.len());
             for (col, (&pos, &key)) in positions.iter().zip(keys.iter()).enumerate() {
                 items.push((pos, key, rvk::deletion_len(key), true, col));
             }
@@ -376,10 +380,24 @@ impl ContigReader {
         }
     }
 
-    /// The dense variants in `union[s..e]` that `hap` carries, as uniform KeyRefs.
-    fn dense_carried(&self, union: &DenseUnion, hap: usize, s: usize, e: usize) -> Vec<KeyRef> {
+    /// The dense variants in `union[s..e]` that `hap` carries and that TRULY
+    /// overlap `[q_start, q_end)` (exact left-overlap `q_start < v_end`; the
+    /// right half is guaranteed by `union.overlap`'s window — see
+    /// `spine::gather_keys`'s doc comment for why the per-element check is
+    /// still needed within a carried window).
+    fn dense_carried(
+        &self,
+        union: &DenseUnion,
+        hap: usize,
+        s: usize,
+        e: usize,
+        q_start: u32,
+    ) -> Vec<KeyRef> {
         let mut out = Vec::new();
         for j in s..e {
+            if union.v_ends[j] <= q_start {
+                continue;
+            }
             let (is_indel, col) = union.src[j];
             let carried = if is_indel {
                 self.dense_indel
@@ -436,7 +454,7 @@ pub fn overlap_sample(
         let col = sample * ploidy + p; // flat column
         let hap = col; // sample-major hap index == flat column
         let vk = reader.vk_slice(col, sample, p, q_start, q_end);
-        let dn = reader.dense_carried(&dense, hap, ds, de);
+        let dn = reader.dense_carried(&dense, hap, ds, de, q_start);
         let merged = spine::merge_keys(vec![vk, dn]);
 
         let mut hc = HapCalls::default();
@@ -498,7 +516,7 @@ pub fn overlap_batch(reader: &ContigReader, regions: &[(u32, u32)]) -> BatchResu
         for s in 0..n_samples {
             for p in 0..ploidy {
                 let col = s * ploidy + p;
-                let hap = col;
+                let hap = col; // sample-major hap index == flat column
 
                 // var_key channel slice for (region r, sample s, ploid p).
                 let slice = reader.vk_slice(col, s, p, qs, qe);
@@ -527,7 +545,7 @@ pub fn overlap_batch(reader: &ContigReader, regions: &[(u32, u32)]) -> BatchResu
                             .expect("snp src implies table")
                             .carried(hap, dcol)
                     };
-                    if carried {
+                    if carried && dense.v_ends[j] > qs {
                         bits::set_bit(&mut dense_present, bit_base + k);
                     }
                 }

@@ -19,6 +19,13 @@ pub struct KeyRef {
     pub key: u32,
 }
 
+/// Gathers `(position, key)` pairs from `positions` that TRULY overlap
+/// `[q_start, q_end)` (exact overlap: `pos < q_end && q_start < v_end`), among
+/// those `carried`. `overlap_range` only guarantees the right half (`pos <
+/// q_end`) of that predicate for every candidate in its window — a spanning
+/// deletion earlier in the run can widen the window's left bound and pull in
+/// later elements whose `v_end <= q_start` (they end before the query
+/// starts), so this checks the left half (`q_start < v_end`) per element.
 #[allow(clippy::too_many_arguments)]
 pub fn gather_keys(
     positions: &[u32],
@@ -41,7 +48,7 @@ pub fn gather_keys(
     let tree = SearchTree::new(positions);
     let (s_idx, e_idx) = overlap_range(&tree, &v_ends, max_region_length, q_start, q_end);
     for (i, &position) in positions.iter().enumerate().take(e_idx).skip(s_idx) {
-        if carried(i) {
+        if carried(i) && q_start < v_ends[i] {
             out.push(KeyRef {
                 position,
                 key: to_key(i),
@@ -139,6 +146,30 @@ mod tests {
             &mut out,
         );
         assert_eq!(out, vec![kr(10, 0), kr(30, 2)]);
+    }
+
+    #[test]
+    fn test_gather_keys_excludes_interior_non_overlap_behind_spanning_deletion() {
+        // v0: DEL@100, del_len 20 -> v_end 121 (widens the window's left bound).
+        // v1: SNP@105 -> v_end 106 (ends before q_start=110: NOT a true overlap,
+        // but interior to overlap_range's carried window because v0 pulled the
+        // window's start left of 105).
+        // v2: SNP@112 -> v_end 113 (truly overlaps [110, 115)).
+        // All carried; max_region_length 20 covers the deletion.
+        let positions = [100u32, 105, 112];
+        let del_len = [20u32, 0, 0];
+        let mut out = Vec::new();
+        gather_keys(
+            &positions,
+            20,
+            110,
+            115,
+            |i| del_len[i],
+            |_| true,
+            |i| i as u32,
+            &mut out,
+        );
+        assert_eq!(out, vec![kr(100, 0), kr(112, 2)]);
     }
 
     #[test]
