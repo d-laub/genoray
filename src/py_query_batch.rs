@@ -16,7 +16,11 @@ impl PyContigReader {
     /// Batched two-channel query over `regions` (half-open `[q_start, q_end)`)
     /// within this contig. Returns the frozen `BatchResult → numpy` contract as a
     /// dict keyed by the contract array names, plus `n_regions`/`n_samples`/`ploidy`.
-    fn overlap_batch<'py>(
+    ///
+    /// `pub` so the external integration-test crate can call it as a plain Rust
+    /// method (same reason `PyContigReader::new` is `pub`); pyo3 still exposes it
+    /// to Python via `#[pymethods]`.
+    pub fn overlap_batch<'py>(
         &self,
         py: Python<'py>,
         regions: Vec<(u32, u32)>,
