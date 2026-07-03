@@ -36,9 +36,30 @@ Three worktrees, all branched from current `svar-2` (genoray) / `main` (gvl):
 | --- | --- | --- | --- | --- |
 | 1 | genoray | `.claude/worktrees/svar-2-m6b` | `svar-2-m6b` | M6b genoray side: raw two-channel numpy exposure + dense-window subsetting; hosts `svar2-codec` |
 | 2 | genoray | `.claude/worktrees/svar-2-m6c` | `svar-2-m6c` | M6c: decode → `seqpro.rag.Ragged` + decode-free region counts |
-| 3 | gvl | `~/projects/GenVarLoader/.claude/worktrees/svar2-m6b-kernel` | `svar2-m6b-kernel` | M6b gvl side: two-source splice kernel + direct-feed |
+| 3 | gvl | `~/projects/GenVarLoader/.claude/worktrees/svar2-m6b-kernel` | `svar2-m6b-kernel` | M6b gvl side: **additive** two-source splice kernel (raw `var_key ⋈ dense` + `svar2-codec` inline) |
 
 All worktree dirs live under each repo's `.claude/worktrees/` per the workspace convention.
+
+## M6b gvl integration: additive two-source kernel
+
+**Decided after the gvl recon (2026-07-02).** gvl's SVAR 1.0 support is retained in
+full — the SVAR2 kernel is an **added** reconstruct/realign path alongside the existing
+`variant_idx`-into-global-table kernels, never a replacement of `_write_from_svar` /
+`Haps.from_path`.
+
+gvl's existing kernels (`reconstruct_haplotypes_fused`, `intervals_and_realign_track_fused`,
+`src/ffi/mod.rs`) index a **global variant table** by `variant_idx`. SVAR2 has no global
+table. The M6b kernel is a **two-source splice**: per hap, walk the raw `var_key` channel ⋈
+its `dense` set-bits in position order, calling `svar2_codec::decode` (or just `ilen` /
+`deletion_len` for track re-align) **inline** into the reconstructed haplotype / re-aligned
+track — **no intermediate variant table and no per-hap allele copies**. This is the chosen
+form because it emits fewer instructions and fewer copies than materializing gvl's
+global-table shape (the rejected "materialized-table bridge" alternative, which would decode
+in genoray, copy a per-query table across FFI, and duplicate dense alleles per carrier).
+
+The kernel consumes the **M6a frozen raw two-channel contract** (worktree 1) and decodes keys
+with the `svar2-codec` crate linked via Cargo path-dep (see wiring below). Track re-align
+calls only `ilen` / `deletion_len` — zero allele materialization.
 
 ## Step 0 — shared prep commit on `svar-2` (before branching 1 & 2)
 
