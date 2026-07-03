@@ -13,6 +13,7 @@ crossbeam-channel = "0.5.15"
 memmap2 = "0.9.10"
 ndarray = "0.17.2"
 ndarray-npy = "0.10.0"
+numpy = "0.29.0"
 # extension-module is gated behind the (default) `extension-module` feature below so
 # that `cargo test --no-default-features` can link libpython and run the Rust test
 # suites. maturin builds with default features, so the wheel still gets it.
@@ -29,6 +30,11 @@ thiserror = "2"
 [dev-dependencies]
 proptest = "1.11.0"
 tempfile = "3.10"
+# auto-initialize only takes effect for test/bench/example targets (dev-dependency
+# feature unification), never for the cdylib the wheel ships; it lets
+# `cargo test --no-default-features` call Python::attach without an embedding
+# main() driving Py_Initialize itself.
+pyo3 = { version = "0.29", features = ["auto-initialize"] }
 
 [features]
 default = ["extension-module"]

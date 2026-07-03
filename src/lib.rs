@@ -17,6 +17,7 @@ pub mod monitor;
 pub mod normalize;
 pub mod nrvk;
 pub mod orchestrator;
+pub mod py_convert;
 pub mod query;
 pub mod rvk;
 pub mod search;
