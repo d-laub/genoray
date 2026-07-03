@@ -4,9 +4,11 @@ import json
 from pathlib import Path
 
 from genoray import _core
+from genoray._svar2_batch import _BatchQueryMixin
+from genoray._svar2_decode import _DecodeMixin
 
 
-class SparseVar2:
+class SparseVar2(_BatchQueryMixin, _DecodeMixin):
     """Reader for a finished SVAR2 store (M6a skeleton).
 
     Loads the top-level ``meta.json`` and opens one native
