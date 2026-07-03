@@ -80,7 +80,7 @@ two-channel sparse, fused decode    materialized seqpro Ragged record
 
 ### Shared spine (M6)
 
-1. **Finish M5 disk integration.** Turn a `(contig, ranges, samples)` query into index
+1. **Finish M5 disk integration** *(M5).* Turn a `(contig, ranges, samples)` query into index
    ranges per `(sample, ploid)` per sub-stream: consume `max_del.npy` for the `indel/`
    leftward bound, read the on-disk sidecars (`positions.bin`, `offsets.npy`, dense
    `genotypes.bin`), and resolve `[s_idx, e_idx)` via the existing `overlap_range`
@@ -101,18 +101,19 @@ two-channel sparse, fused decode    materialized seqpro Ragged record
    allele buffer crossing FFI. Track re-align calls only `ilen`/`deletion_len` — zero
    allele materialization.
 
-3. **Uniform in-memory key.** On disk stays split (`snp/` 2-bit-packed, `indel/` 32-bit)
+3. **Uniform in-memory key** *(M6.1).* On disk stays split (`snp/` 2-bit-packed, `indel/` 32-bit)
    for space. A query result **re-expands SNPs into the uniform 32-bit key** (`ILEN=0`,
-   ALT base inline — the pre-M1-split encoding). Consumers then have a single
-   `decode(u32, lut)` path, and gvl's per-hap merge drops from 3-way (snp/indel/dense)
-   to 2-way (var_key/dense). Cost: one shift per SNP in genoray (the 2-bit code is
-   already unpacked at read time).
+   ALT base inline — the pre-M1-split encoding) via `svar2_codec::snp_code_to_key`.
+   Consumers then have a single `decode(u32, lut)` path, and gvl's per-hap merge drops from
+   3-way (snp/indel/dense) to 2-way (var_key/dense). Cost: one shift per SNP in genoray
+   (the 2-bit code is already unpacked at read time).
 
-4. **Sorted union.** Branch-light merge of position-sorted sub-streams (the query hot
+4. **Sorted union** *(M6.1).* Branch-light merge of position-sorted sub-streams (the query hot
    loop flagged in [`architecture.md`](../../roadmap/architecture.md#python-decode-path)).
-   genoray pre-unions `snp` + `indel` *within* `var_key` (into one per-hap stream) and
-   *within* `dense` (into one shared table). The final `var_key ⋈ dense` merge is done by
-   the consumer, interleaved with its own work (splice / materialize).
+   `overlap_batch` + `merge_keys` in `src/spine.rs` pre-union `snp` + `indel` *within*
+   `var_key` (into one per-hap stream) and *within* `dense` (into one shared table).
+   The final `var_key ⋈ dense` merge is done by the consumer, interleaved with its own work
+   (splice / materialize).
 
 ### M6b — gvl Rust variant interface (two-channel, built first)
 

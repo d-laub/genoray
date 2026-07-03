@@ -167,15 +167,23 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
   `(range, sample)` query landed (`overlap_sample` in `src/query.rs`); M6 generalizes it
   into the batched multi-region × multi-sample consumer spine, re-expands SNPs to the
   uniform 32-bit key at query time, and implements the fast sorted **union** across the
-  `{var_key, dense} × {snp, indel}` sub-streams. *Done:* the key ↔ `(ILEN, ALT)` decode
-  seam has already been extracted out of `rvk.rs` into the dependency-light,
-  crates.io publish-ready **`svar2-codec`** workspace crate, so genoray and gvl share one
-  decoder — see
-  [`../superpowers/plans/2026-07-02-svar2-codec-crate.md`](../superpowers/plans/2026-07-02-svar2-codec-crate.md).
-  What remains is the batched consumer spine above, then the two-channel/materialized
-  consumer interfaces, M6b/M6c. See
-  [`architecture.md`](architecture.md#python-decode-path) and the design spec
-  [`../superpowers/specs/2026-07-02-svar2-m6-consumer-interfaces-design.md`](../superpowers/specs/2026-07-02-svar2-m6-consumer-interfaces-design.md).
+  `{var_key, dense} × {snp, indel}` sub-streams.
+  - [x] **M6.0 `svar2-codec` seam crate (done).** The key ↔ `(ILEN, ALT)` encode/decode
+    seam is extracted out of `rvk.rs` into the dependency-light, crates.io publish-ready
+    **`svar2-codec`** workspace crate (std-only, zero runtime deps), so genoray and gvl
+    share one decoder. Verified: 16 codec tests green (PEXT↔SWAR parity, all key-lane
+    round-trips), `cargo publish --dry-run` clean. Publishing to crates.io is a maintainer
+    action, still pending (it release-gates M6b's gvl side alongside the `svar-2` PyPI
+    release). See
+    [`../superpowers/plans/2026-07-02-svar2-codec-crate.md`](../superpowers/plans/2026-07-02-svar2-codec-crate.md).
+  - [x] **M6.1 consumer spine (done).** `src/spine.rs` (`KeyRef` / `gather_keys` / `merge_keys`)
+    + `overlap_batch` / `BatchResult` / `decode_hap` in `src/query.rs` deliver the batched
+    two-channel spine; SNPs re-expand via `svar2_codec::snp_code_to_key`; `overlap_sample`
+    re-expressed on the spine (M5 tests are the regression oracle); cross-checked by
+    `tests/test_batch.rs`. See [`architecture.md`](architecture.md#python-decode-path) and
+    the design spec [`../superpowers/specs/2026-07-02-svar2-m6-consumer-interfaces-design.md`](../superpowers/specs/2026-07-02-svar2-m6-consumer-interfaces-design.md).
+    Remaining for M6: PyO3/numpy exposure of `BatchResult` and dense-window subsetting are
+    **M6b**; `seqpro.rag.Ragged` materialization is **M6c**.
 - [ ] **M6b. gvl Rust variant interface.** *(built first among M6 consumers)* The primary
   consumer. genoray returns a **two-channel** query result — `var_key` gathered per-hap
   inline (no dedup, no barrier) + a shared decode-once `dense` table with per-hap presence

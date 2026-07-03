@@ -133,6 +133,11 @@ split into an independent, position-sorted `snp/` and `indel/` sub-stream (up to
 sources) — assembling a result requires a **fast sorted union / merge** of multiple
 sorted streams.
 
+- **M6.1 implementation:** This union is realized by `overlap_batch` (`src/query.rs`) over the
+  reader-free `src/spine.rs` `gather_keys` / `merge_keys`, producing a two-channel result:
+  per-hap `var_key` KeyRefs (with uniform 32-bit keys via `svar2_codec::snp_code_to_key`)
+  + a decode-once `dense` union with per-region ranges and per-hap presence bitmasks.
+  Allele decode is deferred to the consumer via `decode_keyref` / `BatchResult::decode_hap`.
 - This is the union-shaped dual of fast sorted-array **intersection**; the techniques
   in [Doug Turnbull's "Faster intersect"](https://softwaredoug.com/blog/2024/05/05/faster-intersect)
   (branch-light, SIMD-friendly merging of sorted integer arrays) are good inspiration
