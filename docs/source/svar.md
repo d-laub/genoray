@@ -15,30 +15,73 @@ SparseVar.from_pgen("out.svar", "file.pgen", max_mem="4g")
 svar = SparseVar("out.svar")
 ```
 
-## Reading SVAR and manipulating `SparseGenotypes`
+## Haploid (ploidy=1) write option
+
+For unphased somatic cohorts where phasing information is unavailable or irrelevant,
+`from_vcf` and `from_pgen` accept `haploid=True` to OR-collapse both haplotypes into a
+single haploid call per sample. A variant is recorded for a sample if it is present on
+*either* haplotype. The resulting SVAR stores `ploidy=1` in its metadata, and all
+downstream read operations (including `write_view` and `annotate_mutations`) work
+transparently at ploidy=1.
 
 ```python
-# shape: (ranges, samples, ploidy, var: variants)
+from genoray import SparseVar, VCF
+
+# Collapse diploid genotypes to haploid (ploidy=1 in output)
+SparseVar.from_vcf("out.svar", VCF("file.vcf.gz"), max_mem="4g", haploid=True)
+
+svar = SparseVar("out.svar")
+assert svar.ploidy == 1
+# shape: (ranges, samples, ploidy=1, ~variants)
+rag = svar.read_ranges("chr1", starts=[0], ends=[1_000_000])
+```
+
+The equivalent CLI command:
+
+```bash
+genoray write file.vcf.gz out.svar --max-mem 4g --haploid
+```
+
+## Reading SVAR
+
+```python
+# shape: (ranges, samples, ploidy, ~variants)
 sp_genos = svar.read_ranges("1", starts=0, ends=365, samples="Aang")
 ```
 
-When using an SVAR file, we no longer get dense genotype matrices from `read` methods i.e. no more rectilinear arrays with shape `(samples, ploidy, variants)`. Instead, we get a [`SparseGenotypes`](api.md#genoray.SparseGenotypes) object backed by the file that only contains the ALT calls. This is represented as a ragged array where the number of ALT genotypes for each sample and ploid is no longer the same. For a brief visual description of Ragged arrays, see [this section of the GenVarLoader FAQ](https://genvarloader.readthedocs.io/en/latest/faq.html#why-does-a-dataset-return-ragged-objects-and-what-are-they). The returned sparse genotypes can be arbitrarily large because most of their data is backed by a [`numpy.memmap`](https://numpy.org/doc/stable/reference/generated/numpy.memmap.html) object. This means that the data is not loaded into memory until it is accessed, and even then, only the data that is needed is loaded.
+When using an SVAR file, `read_ranges` returns a `Ragged[V_IDX_TYPE]` — a ragged array where
+the number of ALT calls per sample and ploid varies. For a brief visual description of Ragged
+arrays, see [this section of the GenVarLoader FAQ](https://genvarloader.readthedocs.io/en/latest/faq.html#why-does-a-dataset-return-ragged-objects-and-what-are-they).
+The returned array can be arbitrarily large because its data is backed by a
+[`numpy.memmap`](https://numpy.org/doc/stable/reference/generated/numpy.memmap.html) object
+(only the offsets reside in RAM).
 
-Each value in a SparseGenotypes array is the variant number, or index, describing what variant is present in each range, sample, and ploid. It is equivalent to the row number for the variant table, which is available as a [`PyRanges`](https://pyranges.readthedocs.io/en/latest/autoapi/pyranges/index.html#pyranges.PyRanges) and polars [`DataFrame`](https://docs.pola.rs/user-guide/getting-started/) from [`SparseVar.granges`](api.md#genoray.SparseVar.granges) and [`SparseVar.attrs`](api.md#genoray.SparseVar.attrs), respectively. Thus, you can do:
-
-```python
-# select variant indices for first range, sample, and ploid
-v_idxs = sp_genos.to_awkard()[0, 0, 0].to_numpy()
-start_positions = svar.granges.loc[v_idxs, 'Start']
-variant_info = svar.attrs[v_idxs, 'INFO']
-```
-
-If you have any familiarity with [Awkward](https://awkward-array.org/doc/main/), `SparseGenotypes` also have zero-copy methods to convert to/from Awkward arrays. This can facilitate many kinds of data manipulation and analysis.
+Each value in the ragged array is a variant index: the row number in `svar.index` for the
+variant that is present in each range, sample, and ploid.
 
 ```python
-ak_genos = sp_genos.to_awkward()
-# do things with the Awkward representation...
-sp_genos = SparseGenotypes.from_awkward(ak_genos)
+v_idxs = sp_genos.to_awkward()[0, 0, 0].to_numpy()
 ```
 
-There's a lot more that can be done with `SparseVar` and `SparseGenotypes`; this documentation will be expanded as time permits.
+## Loading additional fields
+
+Custom numeric fields stored as `.npy` files in the SVAR directory can be loaded alongside
+genotype indices. Only VCF FORMAT fields with `Number=G` are currently supported.
+
+```python
+# Load at construction time
+svar = SparseVar("out.svar", fields={"dosages": np.float32})
+
+# Or derive from an existing SparseVar (shallow copy, re-opens the memmaps)
+svar_with = svar.with_fields({"dosages": np.float32})
+
+# read_ranges now returns an awkward record array
+result = svar_with.read_ranges("1", starts=0, ends=365)
+result.genos.data    # flat array of variant indices (uint32)
+result.dosages.data  # flat array of dosage values (float32)
+
+# Drop all fields to get back a plain Ragged[V_IDX_TYPE]
+svar_plain = svar_with.with_fields(False)
+```
+
+There's a lot more that can be done with `SparseVar`; this documentation will be expanded as time permits.

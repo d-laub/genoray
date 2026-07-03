@@ -8,8 +8,6 @@
 .. autoclass:: PGEN
 
 .. autoclass:: SparseVar
-
-.. autoclass:: SparseGenotypes
 ```
 
 ## `genoray.exprs`

@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import re
 import warnings
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Generator, Literal, TypeVar, cast, overload
+from typing import Any, Literal, TypeGuard, TypeVar, cast, overload
 
 import cyvcf2
+from hirola import HashTable
 import numpy as np
 import oxbow
 import polars as pl
@@ -18,12 +20,18 @@ from numpy.typing import ArrayLike, NDArray
 from phantom import Phantom
 from seqpro.rag import OFFSET_TYPE
 from tqdm.auto import tqdm
-from typing_extensions import Self, TypeGuard, assert_never
+from typing_extensions import Self, assert_never
 
 from ._types import POS_MAX, POS_TYPE
-from ._utils import ContigNormalizer, format_memory, hap_ilens, parse_memory
+from ._utils import (
+    ContigNormalizer,
+    atomic_write_path,
+    format_memory,
+    hap_ilens,
+    parse_memory,
+)
 from ._var_ranges import var_counts, var_indices
-from .exprs import ILEN
+from .exprs import ILEN, symbolic_ilen
 
 """Dtype for VCF range indices. This determines the maximum size of a contig in genoray.
 We have to use int64 because this is what htslib uses for CSI indexes."""
@@ -129,7 +137,7 @@ class Genos8Dosages(tuple[Genos8, Dosages], Phantom, predicate=_is_genos8_dosage
         )
 
 
-def _is_genos16_dosages(obj) -> TypeGuard[tuple[Genos8, Dosages]]:
+def _is_genos16_dosages(obj: object) -> TypeGuard[tuple[Genos8, Dosages]]:
     """Check if the object is a tuple of genotypes and dosages.
 
     Parameters
@@ -270,12 +278,7 @@ class VCF:
         progress: bool = False,
         with_gvi_index: bool = True,
     ):
-        if (filter is not None and pl_filter is None) or (
-            filter is None and pl_filter is not None
-        ):
-            raise ValueError(
-                "If a filter function is provided, a polars expression must also be provided, and vice versa."
-            )
+        self._check_filter_pair(filter, pl_filter)
 
         self.path = Path(path)
         if not self.path.exists():
@@ -293,6 +296,9 @@ class VCF:
         self.available_samples = vcf.samples
         self.contigs = natsorted(vcf.seqnames)
         self._c_norm = ContigNormalizer(vcf.seqnames)
+        avail = np.asarray(self.available_samples)
+        self._s2i = HashTable(max=len(avail) * 2, dtype=avail.dtype)  # type: ignore[bad-argument-type]
+        self._s2i.add(avail)
 
         self.set_samples(None)
 
@@ -302,10 +308,30 @@ class VCF:
     def _open(self) -> cyvcf2.VCF:
         return cyvcf2.VCF(self.path, samples=self._samples, lazy=True)
 
+    @staticmethod
+    def _check_filter_pair(
+        filter: Callable[[cyvcf2.Variant], bool] | None,
+        pl_filter: pl.Expr | None,
+    ) -> None:
+        """Enforce the both-or-neither invariant on a (filter, pl_filter) pair."""
+        if (filter is not None and pl_filter is None) or (
+            filter is None and pl_filter is not None
+        ):
+            raise ValueError(
+                "If a filter function is provided, a polars expression must also be provided, and vice versa."
+            )
+
     @property
-    def filter(self) -> Callable[[cyvcf2.Variant], bool] | None:
-        """Function to filter variants. Should return True for variants to keep."""
-        return self._filter
+    def filter(
+        self,
+    ) -> tuple[Callable[[cyvcf2.Variant], bool] | None, pl.Expr | None]:
+        """The ``(filter, pl_filter)`` pair currently in effect.
+
+        Returns the cyvcf2 record callable and its matching polars expression as
+        a tuple, mirroring what the setter accepts. Both elements are ``None``
+        when no filter is set. Assigning ``vcf.filter = vcf.filter`` round-trips.
+        """
+        return self._filter, self._pl_filter
 
     def _index_path(self) -> Path:
         """Path to the index file."""
@@ -316,10 +342,41 @@ class VCF:
             return base.with_suffix(".gvi.zst")
 
     @filter.setter
-    def filter(self, filter: Callable[[cyvcf2.Variant], bool] | None):
-        """Changing the filter invalidates the in-memory index."""
+    def filter(
+        self,
+        value: tuple[Callable[[cyvcf2.Variant], bool] | None, pl.Expr | None] | None,
+    ):
+        """Set the record filter and its matching polars expression together.
+
+        Assign a ``(filter, pl_filter)`` pair, or ``None`` to clear both. The VCF
+        path requires both a cyvcf2 record callable (for the genotype scan) and a
+        matching polars expression (for the ``.gvi`` index); they must be set
+        together, mirroring the constructor's both-or-neither invariant. Changing
+        the filter invalidates the in-memory index.
+        """
+        if value is None:
+            filter = pl_filter = None
+        elif isinstance(value, tuple) and len(value) == 2:
+            filter, pl_filter = value
+        else:
+            raise TypeError(
+                "VCF.filter must be assigned a (filter, pl_filter) tuple or None; "
+                f"got {type(value).__name__}."
+            )
+        self._check_filter_pair(filter, pl_filter)
         self._index = None
         self._filter = filter
+        self._pl_filter = pl_filter
+
+    @property
+    def nbytes(self) -> int:
+        """Total in-memory footprint, in bytes, of resident (non-mmap'd) data
+        structures held by this reader. Currently this is the gvi variant
+        index (CHROM/POS/REF/ALT/ILEN). Returns 0 before the index is loaded.
+        """
+        if self._index is None:
+            return 0
+        return int(self._index.estimated_size())
 
     @property
     def current_samples(self) -> list[str]:
@@ -358,11 +415,14 @@ class VCF:
                 f"Available samples: {self.available_samples}"
             )
 
-        vcf = self._open()
-        _, s_idx, _ = np.intersect1d(vcf.samples, samples, return_indices=True)
         self._samples = samples
-        self._s_sorter = np.argsort(s_idx)
-        self._vcf = vcf
+        avail_indices = self._s2i.get(np.asarray(samples))
+        vcf_order = np.argsort(avail_indices, kind="stable")
+        if np.all(vcf_order == np.arange(len(samples))):
+            self._s_sorter = slice(None)
+        else:
+            self._s_sorter = np.argsort(vcf_order, kind="stable")
+        self._vcf = self._open()
         return self
 
     @contextmanager
@@ -592,7 +652,7 @@ class VCF:
                     vcf, data, self.dosage_field, mode=mode
                 )
             else:
-                assert_never(mode)
+                assert_never(mode)  # type: ignore[bad-argument-type]
 
             out = cast(T, data)
         else:
@@ -605,7 +665,7 @@ class VCF:
                 assert self.dosage_field is not None
                 self._fill_genos_and_dosages(vcf, out, self.dosage_field)
             else:
-                assert_never(mode)
+                assert_never(mode)  # type: ignore[bad-argument-type]
 
         return out
 
@@ -679,6 +739,8 @@ class VCF:
             gt_buffer, ds_buffer = buffer
 
         vcf = self._vcf(f"{c}:{int(start + 1)}-{end}")  # range string is 1-based
+        if self._filter is not None:
+            vcf = filter(self._filter, vcf)
         if self.progress and self._pbar is None:
             vcf = tqdm(vcf, desc="Reading VCF", unit=" variant")
         i = 0
@@ -696,11 +758,11 @@ class VCF:
                 d = v.format(self.dosage_field)
                 if d is None:
                     raise DosageFieldError(
-                        f"Dosage field '{self.dosage_field}' not found for record {repr(v)}"
+                        f"Dosage field '{self.dosage_field}' not found for record {v!r}"
                     )
                 if d.shape[1] > 1:
                     raise MultiallelicDosageError(
-                        f"Multiallelic dosages are not supported, encountered in VCF record {repr(v)}"
+                        f"Multiallelic dosages are not supported, encountered in VCF record {v!r}"
                     )
                 ds_buffer[..., i] = d.squeeze(1)[self._s_sorter]
 
@@ -720,11 +782,11 @@ class VCF:
                 buffer.append(gt_buffer)
             if ds_buffer is not None:
                 ds_buffer = ds_buffer[..., :i]
-                buffer.append(ds_buffer)
+                buffer.append(ds_buffer)  # type: ignore[bad-argument-type]
             buffer = tuple(buffer)
 
             if len(buffer) == 1:
-                yield buffer[0]
+                yield buffer[0]  # type: ignore[invalid-yield]
             else:
                 yield buffer  # type: ignore
 
@@ -870,7 +932,7 @@ class VCF:
                 )
                 hap_lens += hap_ilens(out[0][:, : self.ploidy], ilens)
             else:
-                assert_never(mode)
+                assert_never(mode)  # type: ignore[bad-argument-type]
 
             if not is_last:
                 yield cast(L, out), last_end, 0
@@ -892,7 +954,7 @@ class VCF:
                     last_end,
                 )
             else:
-                assert_never(mode)
+                assert_never(mode)  # type: ignore[bad-argument-type]
 
             if len(ls_ext) > 0:
                 if issubclass(mode, (Genos8, Genos16)):
@@ -940,6 +1002,15 @@ class VCF:
         info: list[str] | None = None,
         lazy: bool = False,
     ) -> pl.DataFrame | pl.LazyFrame: ...
+    def _oxbow_reader(self) -> Callable:
+        """Return the oxbow reader callable appropriate for this file's extension."""
+        if self.path.suffix == ".bcf":
+            return oxbow.from_bcf
+        elif re.search(r"\.vcf(\.gz)?$", self.path.name) is not None:
+            return oxbow.from_vcf
+        else:
+            raise ValueError(f"Unsupported file extension: {self.path.suffix}")
+
     def get_record_info(
         self,
         contig: str | None = None,
@@ -984,12 +1055,7 @@ class VCF:
         if info is not None:
             info = [f.lower() for f in info]
 
-        if self.path.suffix == ".bcf":
-            reader = oxbow.from_bcf
-        elif re.search(r"\.vcf(\.gz)?$", self.path.name) is not None:
-            reader = oxbow.from_vcf
-        else:
-            raise ValueError(f"Unsupported file extension: {self.path.suffix}")
+        reader = self._oxbow_reader()
 
         df = (
             cast(
@@ -1013,6 +1079,47 @@ class VCF:
             df = df.collect()
 
         return df
+
+    def _declared_info_fields(self, candidates: tuple[str, ...]) -> list[str]:
+        """Return which of ``candidates`` are declared as INFO fields in the VCF header.
+
+        Uses ``header_iter()`` rather than ``get_header_type()`` because the latter
+        matches both INFO and FORMAT declarations; a FORMAT-only field must NOT be
+        treated as an INFO field (it would error when passed to oxbow's info_fields=).
+        """
+        info_ids: set[str] = {
+            h.info()["ID"]
+            for h in self._vcf.header_iter()
+            if h.info().get("HeaderType") == "INFO"
+        }
+        return [c for c in candidates if c in info_ids]
+
+    def _fetch_info_cols(self, info_names: list[str]) -> pl.LazyFrame:
+        """Fetch a set of uppercase INFO field names directly from oxbow and unnest the
+        returned struct, returning a LazyFrame with POS and those INFO columns as
+        top-level columns. POS is retained so the caller can cross-check alignment
+        against the base frame before positional concat.
+
+        Returns a LazyFrame with columns: POS, <info_names...>
+        """
+        reader = self._oxbow_reader()
+
+        # oxbow requires uppercase INFO field names; returns them nested in an 'info' struct
+        raw = (
+            cast(
+                pl.LazyFrame,
+                reader(
+                    self.path,
+                    samples=[],
+                    fields=["pos"],
+                    info_fields=info_names,
+                ).pl(lazy=True),
+            )
+            .with_columns(pl.col("pos").alias("POS"))
+            .drop("pos")
+            .unnest("info")
+        )
+        return raw
 
     def _write_gvi_index(
         self,
@@ -1045,6 +1152,12 @@ class VCF:
         if fields is not None:
             _fields.update(fields)
 
+        # Pull SVLEN/END/IMPRECISE when the header declares them so symbolic SVs
+        # can be sized. Requesting an undeclared INFO field can error in oxbow.
+        sv_info = self._declared_info_fields(("SVLEN", "END", "IMPRECISE"))
+        user_info_upper = {i.upper() for i in info} if info else set()
+        extra_sv = [f for f in sv_info if f.upper() not in user_info_upper]
+
         filt = self._pl_filter
         self._pl_filter = None
         try:
@@ -1052,9 +1165,63 @@ class VCF:
         finally:
             self._pl_filter = filt
 
-        index.with_columns(pl.col("ALT").list.join(",")).collect().write_ipc(
-            self._index_path(), compression="zstd"
+        # Fetch SV helper columns directly (oxbow requires uppercase and returns a struct).
+        # Both oxbow reads cover the identical full record set (no region, no filter, same
+        # file order), which is what makes the positional horizontal concat correct.
+        # WARNING: region-scoping or pre-concat filtering either call would silently
+        # misalign SVLEN/END/IMPRECISE to wrong variants, corrupting ILEN.
+        # POS is cross-checked element-wise to confirm the two reads are in identical order.
+        if extra_sv:
+            index_df = index.collect()
+            sv_cols_df = self._fetch_info_cols(extra_sv).collect()
+            if index_df.height != sv_cols_df.height:
+                raise ValueError(
+                    f"Row count mismatch between base index ({index_df.height}) and SV INFO "
+                    f"columns ({sv_cols_df.height}); positional concat would misalign ILEN."
+                )
+            base_pos = index_df.get_column("POS")
+            sv_pos = sv_cols_df.get_column("POS")
+            if not base_pos.equals(sv_pos):
+                raise ValueError(
+                    "POS mismatch between base index and SV INFO columns; "
+                    "positional concat would misalign ILEN. This is a bug — please report it."
+                )
+            # Drop POS from sv_cols_df to avoid duplicate column before horizontal concat
+            sv_cols_df = sv_cols_df.drop("POS")
+            index = pl.concat([index_df, sv_cols_df], how="horizontal").lazy()
+
+        # Ensure the columns symbolic_ilen references exist (nulls when absent).
+        schema = index.collect_schema()
+        for col in ("SVLEN", "END", "IMPRECISE"):
+            if col not in schema.names():
+                dtype = pl.Boolean if col == "IMPRECISE" else pl.Int64
+                index = index.with_columns(pl.lit(None, dtype=dtype).alias(col))
+
+        # SVLEN from oxbow is List(Int32) (Number=A); coerce to scalar via list.first()
+        schema = index.collect_schema()
+        coerce: list[pl.Expr] = []
+        for col in ("SVLEN", "END"):
+            if col in schema.names() and isinstance(schema[col], pl.List):
+                coerce.append(pl.col(col).list.first().alias(col))
+        if coerce:
+            index = index.with_columns(coerce)
+
+        index = index.with_columns(ILEN=symbolic_ilen())
+
+        # Drop ALL of {SVLEN, END, IMPRECISE} that the user did not explicitly request
+        # via info=. This covers both fetched helper cols AND null-placeholder cols added
+        # above, so non-SV indexes don't gain stray all-null columns.
+        sv_cols_in_frame = {"SVLEN", "END", "IMPRECISE"} & set(
+            index.collect_schema().names()
         )
+        drop_cols = [c for c in sv_cols_in_frame if c not in user_info_upper]
+        if drop_cols:
+            index = index.drop(drop_cols)
+
+        with atomic_write_path(self._index_path()) as _tmp:
+            index.with_columns(pl.col("ALT").list.join(",")).collect().write_ipc(
+                _tmp, compression="zstd"
+            )
 
     def _load_index(self) -> Self:
         """Load the index from disk, applying the filter expression if provided. You must
@@ -1082,12 +1249,15 @@ class VCF:
                 self._index_path(), row_index_name="index"
             ).with_columns(pl.col("CHROM").cast(pl.Enum(self.contigs)))
 
-        if self._pl_filter is not None:
-            index = index.filter(self._pl_filter)
-
+        # Normalize ALT (on-disk comma-Utf8) to list[str] BEFORE applying the
+        # filter so the in-memory schema documented in genoray.exprs holds and
+        # list-typed expressions (is_symbolic, is_biallelic) work on this path.
         schema = index.collect_schema()
         if schema["ALT"] == pl.Utf8:
             index = index.with_columns(pl.col("ALT").str.split(","))
+
+        if self._pl_filter is not None:
+            index = index.filter(self._pl_filter)
 
         if "ILEN" not in schema:
             index = index.with_columns(ILEN=ILEN)
@@ -1120,7 +1290,7 @@ class VCF:
             assert mode is not None
             assert ilens is None, "caller should not provide ilens if out is None"
 
-            out_ls = []
+            out_ls: list[NDArray[np.int16]] = []
 
             for i, v in enumerate(vcf):
                 if self.phasing:
@@ -1183,16 +1353,16 @@ class VCF:
             vcf = filter(self._filter, vcf)
 
         if out is None:
-            out_ls = []
+            out_ls: list[NDArray[np.float32]] = []
             for v in vcf:
                 d = v.format(dosage_field)
                 if d is None:
                     raise DosageFieldError(
-                        f"Dosage field '{dosage_field}' not found for record {repr(v)}"
+                        f"Dosage field '{dosage_field}' not found for record {v!r}"
                     )
                 if d.shape[1] > 1:
                     raise MultiallelicDosageError(
-                        f"Multiallelic dosages are not supported, encountered in VCF record {repr(v)}"
+                        f"Multiallelic dosages are not supported, encountered in VCF record {v!r}"
                     )
 
                 out_ls.append(d.squeeze(1))
@@ -1224,11 +1394,11 @@ class VCF:
             d = v.format(dosage_field)
             if d is None:
                 raise DosageFieldError(
-                    f"Dosage field '{dosage_field}' not found for record {repr(v)}"
+                    f"Dosage field '{dosage_field}' not found for record {v!r}"
                 )
             if d.shape[1] > 1:
                 raise MultiallelicDosageError(
-                    f"Multiallelic dosages are not supported, encountered in VCF record {repr(v)}"
+                    f"Multiallelic dosages are not supported, encountered in VCF record {v!r}"
                 )
             out[..., i] = d.squeeze(1)[self._s_sorter]
 
@@ -1255,8 +1425,8 @@ class VCF:
             assert mode is not None
             assert ilens is None, "caller should not provide ilens if out is None"
 
-            geno_ls = []
-            dosage_ls = []
+            geno_ls: list[NDArray[np.int16]] = []
+            dosage_ls: list[NDArray[np.float32]] = []
             for i, v in enumerate(vcf):
                 if self.phasing:
                     # (s p+1) np.int16
@@ -1268,11 +1438,11 @@ class VCF:
                 d = v.format(dosage_field)
                 if d is None:
                     raise DosageFieldError(
-                        f"Dosage field '{dosage_field}' not found for record {repr(v)}"
+                        f"Dosage field '{dosage_field}' not found for record {v!r}"
                     )
                 if d.shape[1] > 1:
                     raise MultiallelicDosageError(
-                        f"Multiallelic dosages are not supported, encountered in VCF record {repr(v)}"
+                        f"Multiallelic dosages are not supported, encountered in VCF record {v!r}"
                     )
 
                 dosage_ls.append(d.squeeze(1))
@@ -1318,11 +1488,11 @@ class VCF:
             d = v.format(dosage_field)
             if d is None:
                 raise DosageFieldError(
-                    f"Dosage field '{dosage_field}' not found for record {repr(v)}"
+                    f"Dosage field '{dosage_field}' not found for record {v!r}"
                 )
             if d.shape[1] > 1:
                 raise MultiallelicDosageError(
-                    f"Multiallelic dosages are not supported, encountered in VCF record {repr(v)}"
+                    f"Multiallelic dosages are not supported, encountered in VCF record {v!r}"
                 )
             out[1][..., i] = d.squeeze(1)[self._s_sorter]
 
@@ -1367,7 +1537,7 @@ class VCF:
             mem += self.n_samples * ploidy * mode._gdtype().itemsize
             mem += self.n_samples * np.float32().itemsize
         else:
-            assert_never(mode)
+            assert_never(mode)  # type: ignore[bad-argument-type]
 
         return mem
 
@@ -1405,7 +1575,9 @@ class VCF:
                 if v.is_indel:
                     ilen = len(v.ALT[0]) - len(v.REF)
                     dist = v.start - last_end
-                    hap_lens += dist + np.where(genos == 1, ilen, 0).squeeze(-1)
+                    hap_lens += dist + np.where(
+                        genos[:, : self.ploidy] == 1, ilen, 0
+                    ).squeeze(-1)
                     last_end = cast(int, v.end)
 
                 if i % _CHECK_LEN_EVERY_N == 0 and (hap_lens >= length).all():
@@ -1449,7 +1621,7 @@ class VCF:
                 dosages = v.format(dosage_field)
                 if dosages is None:
                     raise DosageFieldError(
-                        f"Dosage field '{dosage_field}' not found for record {repr(v)}"
+                        f"Dosage field '{dosage_field}' not found for record {v!r}"
                     )
                 # (s, 1, 1) or (s, 1)? -> (s)
                 dosages = dosages.squeeze(1)[self._s_sorter, None]
@@ -1460,7 +1632,9 @@ class VCF:
                     ilen = len(v.ALT[0]) - len(v.REF)
                     dist = v.start - last_end
                     # (s p 1)
-                    hap_lens += dist + np.where(genos == 1, ilen, 0).squeeze(-1)
+                    hap_lens += dist + np.where(
+                        genos[:, : self.ploidy] == 1, ilen, 0
+                    ).squeeze(-1)
                     last_end = cast(int, v.end)
 
                 if i % _CHECK_LEN_EVERY_N == 0 and (hap_lens >= length).all():

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from collections.abc import Callable, Generator
 from functools import partial
 from io import TextIOWrapper
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Callable, Generator, TypeVar, cast
+from typing import Any, TypeGuard, TypeVar, cast
 
 import numpy as np
 import pgenlib
@@ -15,13 +16,19 @@ from more_itertools import mark_ends, windowed
 from numpy.typing import ArrayLike, NDArray
 from phantom import Phantom
 from seqpro.rag import OFFSET_TYPE
-from typing_extensions import Self, TypeGuard, assert_never
+from typing_extensions import Self, assert_never, override
 from zstandard import ZstdDecompressor
 
 from ._types import POS_MAX, POS_TYPE
-from ._utils import ContigNormalizer, format_memory, hap_ilens, parse_memory
+from ._utils import (
+    ContigNormalizer,
+    atomic_write_path,
+    format_memory,
+    hap_ilens,
+    parse_memory,
+)
 from ._var_ranges import var_counts, var_indices
-from .exprs import ILEN, is_biallelic
+from .exprs import ILEN, is_biallelic, symbolic_ilen
 
 V_IDX_TYPE = np.uint32
 """Dtype for PGEN variant indices (uint32). This determines the maximum number of unique variants in a file."""
@@ -70,7 +77,7 @@ class Phasing(NDArray[np.bool_], Phantom, predicate=_is_phasing):
         return cls.parse(np.empty((n_samples, n_variants), dtype=cls._dtype))
 
 
-def _is_genos_phasing(obj) -> TypeGuard[GenosPhasing]:
+def _is_genos_phasing(obj: object) -> TypeGuard[GenosPhasing]:
     return (
         isinstance(obj, tuple)
         and len(obj) == 2
@@ -92,7 +99,7 @@ class GenosPhasing(tuple[Genos, Phasing], Phantom, predicate=_is_genos_phasing):
         )
 
 
-def _is_genos_dosages(obj) -> TypeGuard[GenosDosages]:
+def _is_genos_dosages(obj: object) -> TypeGuard[GenosDosages]:
     return (
         isinstance(obj, tuple)
         and len(obj) == 2
@@ -114,7 +121,7 @@ class GenosDosages(tuple[Genos, Dosages], Phantom, predicate=_is_genos_dosages):
         )
 
 
-def _is_genos_phasing_dosages(obj) -> TypeGuard[GenosPhasingDosages]:
+def _is_genos_phasing_dosages(obj: object) -> TypeGuard[GenosPhasingDosages]:
     return (
         isinstance(obj, tuple)
         and len(obj) == 3
@@ -170,7 +177,8 @@ class PGEN:
     _geno_pgen: pgenlib.PgenReader
     _dose_pgen: pgenlib.PgenReader
     _s_idx: NDArray[np.uint32] | slice
-    _s_sorter: NDArray[np.intp] | slice
+    _s_unsorter: NDArray[np.intp] | slice
+    """pgenlib always returns samples in the order they exist in the file. This array re-orders them to the order specified by the user."""
     _geno_path: Path
     _dose_path: Path | None
     _sei: StartsEndsIlens | None = None  # unfiltered so that var_idxs map correctly
@@ -219,7 +227,7 @@ class PGEN:
         )
         self._s2i.add(samples)
         self._s_idx = slice(None)
-        self._s_sorter = slice(None)
+        self._s_unsorter = slice(None)
         self._geno_pgen = pgenlib.PgenReader(bytes(geno_path), len(samples))
 
         if dosage_path is not None:
@@ -261,16 +269,34 @@ class PGEN:
     @property
     def current_samples(self) -> list[str]:
         """List of samples that are currently being used, in order."""
-        if isinstance(self._s_sorter, slice):
+        if isinstance(self._s_unsorter, slice):
             return self.available_samples
         return cast(list[str], self._s2i.keys[self._s_idx].tolist())
 
     @property
     def n_samples(self) -> int:
         """Number of samples in the file."""
-        if isinstance(self._s_sorter, slice):
+        if isinstance(self._s_unsorter, slice):
             return len(self.available_samples)
-        return len(self._s_sorter)
+        return len(self._s_unsorter)
+
+    @property
+    def nbytes(self) -> int:
+        """Total in-memory footprint, in bytes, of resident (non-mmap'd) data
+        structures held by this reader. Sums the gvi variant index dataframe
+        and the StartsEndsIlens cache. Returns 0 after `_free_index()`.
+        """
+        n = 0
+        if self._index is not None:
+            n += self._index.estimated_size()
+        if self._sei is not None:
+            n += (
+                self._sei.v_starts.nbytes
+                + self._sei.v_ends.nbytes
+                + self._sei.ilens.nbytes
+                + self._sei.alt.estimated_size()
+            )
+        return int(n)
 
     @property
     def filter(self) -> pl.Expr | None:
@@ -313,20 +339,26 @@ class PGEN:
             and (samples == np.asarray(self.available_samples)).all()
         ):
             self._s_idx = slice(None)
-            self._s_sorter = slice(None)
+            self._s_unsorter = slice(None)
             return self
 
-        s_idx = self._s2i.get(samples).astype(np.uint32)
-        if len(missing := samples[s_idx == -1]) > 0:
+        s_idx = self._s2i.get(samples)
+        if (s_idx == -1).any():
+            missing = samples[s_idx == -1]
             raise ValueError(f"Samples {missing} not found in the file.")
+        s_idx = s_idx.astype(np.uint32)
+        if len(np.unique(s_idx)) != len(s_idx):
+            raise ValueError("Samples must be unique.")
 
         self._s_idx = s_idx
-        self._s_sorter = np.argsort(s_idx)
+        sorter = np.argsort(s_idx, kind="stable")
+        sorted_s_idx = s_idx[sorter]
+        self._s_unsorter = np.argsort(sorter, kind="stable")
         # if dose path is None, then dose pgen is just a reference to geno pgen so
         # we're also (somewhat unsafely) mutating the dose pgen here
-        self._geno_pgen.change_sample_subset(np.sort(s_idx))
+        self._geno_pgen.change_sample_subset(sorted_s_idx)
         if self._dose_path is not None:
-            self._dose_pgen.change_sample_subset(np.sort(s_idx))
+            self._dose_pgen.change_sample_subset(sorted_s_idx)
         return self
 
     @property
@@ -406,7 +438,10 @@ class PGEN:
 
         Returns
         -------
-            Shape: (tot_variants). Variant indices for the given ranges.
+            Shape: (tot_variants). Variant indices for the given ranges, as
+            0-based **positions into this reader's (filtered) ``_index``** — i.e.
+            ``reader._index[var_idxs]`` is always valid. With no filter these
+            equal the physical PVAR row order.
 
             Shape: (ranges+1). Offsets to get variant indices for each range.
         """
@@ -414,6 +449,22 @@ class PGEN:
             self._init_index()
             assert self._c_norm is not None and self._index is not None
         return var_indices(V_IDX_TYPE, self._c_norm, self._index, contig, starts, ends)
+
+    def _var_idxs_phys(
+        self,
+        contig: str,
+        starts: ArrayLike = 0,
+        ends: ArrayLike = POS_MAX,
+    ) -> tuple[NDArray[V_IDX_TYPE], NDArray[OFFSET_TYPE]]:
+        """Internal: like :meth:`var_idxs`, but maps the positional indices to
+        physical (file-global) PVAR row ids for pgenlib random access. The
+        ``_index["index"]`` column holds physical ids; ``var_idxs`` returns
+        positions into ``_index`` (issue #69), so reads remap here.
+        """
+        pos, offsets = self.var_idxs(contig, starts, ends)
+        assert self._index is not None
+        phys = self._index["index"].to_numpy()[pos].astype(V_IDX_TYPE)
+        return phys, offsets
 
     def read(
         self,
@@ -450,7 +501,7 @@ class PGEN:
         if c is None:
             return mode.empty(self.n_samples, self.ploidy, 0)
 
-        var_idxs, _ = self.var_idxs(c, start, end)
+        var_idxs, _ = self._var_idxs_phys(c, start, end)
         n_variants = len(var_idxs)
 
         if n_variants == 0:
@@ -467,7 +518,7 @@ class PGEN:
         elif issubclass(mode, GenosPhasingDosages):
             out = self._read_genos_phasing_dosages(var_idxs)
         else:
-            assert_never(mode)
+            assert_never(mode)  # type: ignore[bad-argument-type]
 
         return cast(T, out)
 
@@ -517,7 +568,7 @@ class PGEN:
             yield mode.empty(self.n_samples, self.ploidy, 0)
             return
 
-        var_idxs, _ = self.var_idxs(c, start, end)
+        var_idxs, _ = self._var_idxs_phys(c, start, end)
         n_variants = len(var_idxs)
         if n_variants == 0:
             yield mode.empty(self.n_samples, self.ploidy, 0)
@@ -545,7 +596,7 @@ class PGEN:
             elif issubclass(mode, GenosPhasingDosages):
                 _out = self._read_genos_phasing_dosages(var_idx)
             else:
-                assert_never(mode)
+                assert_never(mode)  # type: ignore[bad-argument-type]
 
             yield mode.parse(_out)
 
@@ -604,7 +655,7 @@ class PGEN:
                 n_ranges + 1, OFFSET_TYPE
             )
 
-        var_idxs, offsets = self.var_idxs(c, starts, ends)
+        var_idxs, offsets = self._var_idxs_phys(c, starts, ends)
         n_variants = len(var_idxs)
         if n_variants == 0:
             return mode.empty(self.n_samples, self.ploidy, 0), np.zeros(
@@ -622,7 +673,7 @@ class PGEN:
         elif issubclass(mode, GenosPhasingDosages):
             out = self._read_genos_phasing_dosages(var_idxs)
         else:
-            assert_never(mode)
+            assert_never(mode)  # type: ignore[bad-argument-type]
 
         return cast(T, out), offsets
 
@@ -689,7 +740,7 @@ class PGEN:
 
         ends = np.atleast_1d(np.asarray(ends, POS_TYPE))
 
-        var_idxs, offsets = self.var_idxs(c, starts, ends)
+        var_idxs, offsets = self._var_idxs_phys(c, starts, ends)
         vars_per_range = np.diff(offsets)
         tot_variants = len(var_idxs)
         if tot_variants == 0:
@@ -726,7 +777,7 @@ class PGEN:
             elif issubclass(mode, GenosPhasingDosages):
                 read = self._read_genos_phasing_dosages
             else:
-                assert_never(mode)
+                assert_never(mode)  # type: ignore[bad-argument-type]
 
             yield (cast(T, read(var_idx)) for var_idx in v_chunks)
 
@@ -824,7 +875,7 @@ class PGEN:
 
         ends = np.atleast_1d(np.asarray(ends, POS_TYPE))
 
-        var_idxs, offsets = self.var_idxs(c, starts, ends)
+        var_idxs, offsets = self._var_idxs_phys(c, starts, ends)
         tot_variants = len(var_idxs)
         if tot_variants == 0:
             for e in ends:
@@ -856,7 +907,7 @@ class PGEN:
         elif issubclass(mode, GenosPhasingDosages):
             read = self._read_genos_phasing_dosages
         else:
-            assert_never(mode)
+            assert_never(mode)  # type: ignore[bad-argument-type]
 
         read = cast(Callable[[NDArray[np.uint32]], L], read)
 
@@ -897,10 +948,7 @@ class PGEN:
             mem += self.n_samples * self.ploidy * mode._dtype().itemsize
         elif issubclass(mode, Dosages):
             mem += self.n_samples * mode._dtype().itemsize
-        elif issubclass(mode, GenosPhasing):
-            mem += self.n_samples * self.ploidy * mode._dtypes[0]().itemsize
-            mem += self.n_samples * mode._dtypes[1]().itemsize
-        elif issubclass(mode, GenosDosages):
+        elif issubclass(mode, GenosPhasing) or issubclass(mode, GenosDosages):
             mem += self.n_samples * self.ploidy * mode._dtypes[0]().itemsize
             mem += self.n_samples * mode._dtypes[1]().itemsize
         elif issubclass(mode, GenosPhasingDosages):
@@ -908,9 +956,9 @@ class PGEN:
             mem += self.n_samples * mode._dtypes[1]().itemsize
             mem += self.n_samples * mode._dtypes[2]().itemsize
         else:
-            assert_never(mode)
+            assert_never(mode)  # type: ignore[bad-argument-type]
 
-        if isinstance(self._s_sorter, np.ndarray):
+        if isinstance(self._s_unsorter, np.ndarray):
             mem *= 2  # have to make a copy to sort by samples
 
         return mem
@@ -922,14 +970,14 @@ class PGEN:
         self._geno_pgen.read_alleles_list(var_idxs, out)
         out = out.reshape(len(var_idxs), self.n_samples, self.ploidy).transpose(
             1, 2, 0
-        )[self._s_sorter]
+        )[self._s_unsorter]
         out[out == -9] = -1
         return cast(Genos, out)
 
     def _read_dosages(self, var_idxs: NDArray[V_IDX_TYPE]) -> Dosages:
         out = np.empty((len(var_idxs), self.n_samples), dtype=Dosages._dtype)
         self._dose_pgen.read_dosages_list(var_idxs, out)
-        out = out.transpose(1, 0)[self._s_sorter]
+        out = out.transpose(1, 0)[self._s_unsorter]
         out[out == -9] = np.nan
         return cast(Dosages, out)
 
@@ -946,9 +994,9 @@ class PGEN:
         self._geno_pgen.read_alleles_and_phasepresent_list(var_idxs, genos, phasing)
         genos = genos.reshape(len(var_idxs), self.n_samples, self.ploidy).transpose(
             1, 2, 0
-        )[self._s_sorter]
+        )[self._s_unsorter]
         genos[genos == -9] = -1
-        phasing = phasing.transpose(1, 0)[self._s_sorter]
+        phasing = phasing.transpose(1, 0)[self._s_unsorter]
 
         return cast(GenosPhasing, (genos, phasing))
 
@@ -1051,7 +1099,7 @@ def _gen_with_length(
             )
 
         var_idx = np.arange(var_idx[0], last_idx + 1, dtype=V_IDX_TYPE)
-        yield (
+        yield (  # type: ignore[invalid-yield]
             out,  # type: ignore
             last_end,
             var_idx,
@@ -1136,7 +1184,34 @@ def _load_index(
         index = index.with_columns(pl.col("ALT").str.split(","))
 
     if "ILEN" not in schema:
-        index = index.with_columns(ILEN=ILEN)
+        if "INFO" in schema.names():
+            # ILEN is intentionally recomputed from the persisted INFO string on
+            # each _load_index call.  PGEN does NOT persist the computed ILEN in
+            # the .gvi file (unlike the VCF path, which writes ILEN at index-build
+            # time).  Do NOT "optimise" this into persistence without also updating
+            # _write_index to store ILEN — otherwise old .gvi files would silently
+            # miss symbolic-SV ILEN corrections.
+            #
+            # Regex-extract SVLEN/END/IMPRECISE from the PVAR INFO string, then
+            # use the shared symbolic_ilen() helper so symbolic SVs get correct
+            # sign-adjusted lengths (DEL→-|len|, INS/DUP→+|len|, others→null).
+            info_col = pl.col("INFO").fill_null("")
+            index = index.with_columns(
+                info_col.str.extract(r"(?:^|;)SVLEN=(-?\d+)", 1)
+                .cast(pl.Int64)
+                .alias("SVLEN"),
+                info_col.str.extract(r"(?:^|;)END=(\d+)", 1)
+                .cast(pl.Int64)
+                .alias("END"),
+                # IMPRECISE is a VCF Flag (Number=0): match the bare token only.
+                # Do NOT broaden to IMPRECISE=… — that would wrongly treat
+                # IMPRECISE=0 as set.
+                info_col.str.contains(r"(?:^|;)IMPRECISE(?:;|$)").alias("IMPRECISE"),
+            )
+            index = index.with_columns(ILEN=symbolic_ilen())
+            index = index.drop("SVLEN", "END", "IMPRECISE")
+        else:
+            index = index.with_columns(ILEN=ILEN)
 
     if filter is None:
         has_multiallelics = index.select((~is_biallelic).any()).collect().item()
@@ -1152,11 +1227,16 @@ def _load_index(
         # anyway, so they won't be accessed
         # if the filter is changed, the index is invalidated and re-read (see filter setter)
         if filter is None:
-            data = index.select("start", "end", pl.col("ILEN", "ALT").list.first())
+            data = index.select(
+                "start",
+                "end",
+                pl.col("ILEN").list.first().fill_null(0).alias("ILEN"),
+                pl.col("ALT").list.first(),
+            )
         else:
             data = index.with_columns(
                 ILEN=pl.when(filter)
-                .then(pl.col("ILEN").list.first())
+                .then(pl.col("ILEN").list.first().fill_null(0))
                 .otherwise(pl.lit(0))
             )
             data = data.select("start", "end", "ILEN", pl.col("ALT").list.first())
@@ -1179,11 +1259,12 @@ def _load_index(
 def _write_index(index_path: Path):
     """Write PVAR index."""
 
-    (
-        _scan_pvar(index_path.with_suffix(""))
-        .rename({"#CHROM": "CHROM"})
-        .sink_ipc(index_path)
-    )
+    with atomic_write_path(index_path) as _tmp:
+        (
+            _scan_pvar(index_path.with_suffix(""))
+            .rename({"#CHROM": "CHROM"})
+            .sink_ipc(_tmp)
+        )
 
 
 def _scan_pvar(pvar: Path):
@@ -1239,6 +1320,7 @@ class ZstdFile(TextIOWrapper):
         self.reader = ZstdDecompressor().stream_reader(open(path, "rb"))
         super().__init__(self.reader, newline="\n", encoding="utf-8")
 
+    @override
     def __exit__(
         self,
         exc_type: type[BaseException] | None,

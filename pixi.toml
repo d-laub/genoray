@@ -1,7 +1,7 @@
 [workspace]
 name = "genoray"
 channels = ["conda-forge", "bioconda"]
-platforms = ["linux-64"]
+platforms = ["linux-64", 'osx-arm64']
 
 [environments]
 default = ["py310"]
@@ -13,14 +13,15 @@ py313 = ["py313"]
 sbox = ["sbox", "py310"]
 # isolated env for linting: no editable genoray build (and thus no Rust compile)
 lint = { features = ["lint"], no-default-feature = true }
+sigprofiler = ["sigprofiler"]
 
 [dependencies]
 uv = "*"
 bcftools = "*"
-plink2 = "*"
 commitizen = "*"
 prek = "*"
 ruff = "*"
+pyrefly = "*"
 memray = ">=1.12.0,<2"
 pytest = "*"
 pytest-cases = "*"
@@ -40,20 +41,28 @@ clangdev = "18.*"
 # The conda compiler uses the conda sysroot, so source-built pypi deps (e.g. pgenlib)
 # need dev headers from conda rather than the system: zlib provides zlib.h.
 zlib = "*"
+pysam = ">=0.24.0,<0.25"
 
 [activation.env]
 # rust-htslib's bindgen step needs to locate libclang (provided by clangdev).
 LIBCLANG_PATH = "$CONDA_PREFIX/lib"
 
+[target.linux-64.dependencies]
+# needs to be installed manually for osx-arm64
+plink2 = "*"
+
 [pypi-dependencies]
-genoray = { path = ".", editable = true, extras = ["cli"] }
+genoray = { path = ".", editable = true }
 # dev deps
 seaborn = "*"
+pooch = "*"
+vcfixture = ">=0.6.0,<0.7"
 
 [tasks]
 gen = "sh tests/data/gen_from_vcf.sh"
 test = { cmd = "pytest tests", depends-on = "gen" }
-prek-install = "prek install -t pre-commit -t pre-push"
+typecheck = "pyrefly check genoray"
+prek-install = "prek install -t pre-commit -t pre-push -t commit-msg"
 bump-dry = "cz bump --dry-run"
 
 [feature.lint.dependencies]
@@ -104,7 +113,7 @@ loguru = "==0.7.*"
 attrs = "*"
 awkward = "*"
 numba = "*"
-seqpro = ">=0.20,<0.22"
+seqpro = "==0.21.1"
 zstandard = "*"
 pydantic = "*"
 oxbow = "==0.5.*"
@@ -129,3 +138,10 @@ fast-histogram = "*"
 
 [feature.sbox.tasks]
 i-kernel = "ipython kernel install --user --name genoray"
+
+[feature.sigprofiler.dependencies]
+python = "3.10.*"
+
+[feature.sigprofiler.pypi-dependencies]
+sigprofilermatrixgenerator = ">=1.3, <2"
+sigprofilerassignment = "*"

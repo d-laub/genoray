@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging as _logging
 from typing import cast
 
 import numba as nb
@@ -12,6 +13,8 @@ from seqpro.rag import OFFSET_TYPE, lengths_to_offsets
 
 from ._types import POS_TYPE, V_IDX_TYPE
 from ._utils import DTYPE, ContigNormalizer, np_to_pl_dtype
+
+_logging.getLogger("polars_bio").setLevel(_logging.ERROR)
 
 
 def var_ranges(
@@ -58,8 +61,12 @@ def var_ranges(
     # 0-based
     v_starts = var_table["POS"].to_numpy() - 1
     # 0-based, exclusive end
+    # null ILEN = un-sizable symbolic SV (IMPRECISE / unsupported type); treat as a
+    # point variant.  A single null upcasts the Int32 column to Float64/NaN and breaks
+    # the numba coordinate kernels.
     v_ends = (
-        var_table["POS"] - var_table["ILEN"].list.first().clip(upper_bound=0)
+        var_table["POS"]
+        - var_table["ILEN"].list.first().clip(upper_bound=0).fill_null(0)
     ).to_numpy()
     max_v_len = (v_ends - v_starts).max()
 
@@ -115,12 +122,14 @@ def var_indices(
 
     var_table = (
         var_table.lazy()
+        .with_row_index("__pos")
         .filter(pl.col("CHROM") == c)
         .select(
-            pl.col("index").cast(np_to_pl_dtype(idx_dtype)),
+            pl.col("__pos").cast(np_to_pl_dtype(idx_dtype)).alias("index"),
             chrom=pl.col("CHROM").cast(pl.Utf8),
             start=pl.col("POS") - 1,
-            end=pl.col("POS") - pl.col("ILEN").list.first().clip(upper_bound=0),
+            end=pl.col("POS")
+            - pl.col("ILEN").list.first().clip(upper_bound=0).fill_null(0),
         )
     )
     var_table.config_meta.set(coordinate_system_zero_based=True)  # type: ignore
@@ -134,16 +143,19 @@ def var_indices(
 
     join = (
         cast(pl.LazyFrame, pb.overlap(queries, var_table, projection_pushdown=True))
-        .sort("query_1", "index_2")
+        .rename({"query_1": "query", "index_2": "index"})
+        .sort("query", "index")
         .collect()
     )
 
     if join.height == 0:
         return np.empty(0, idx_dtype), np.zeros(n_ranges + 1, OFFSET_TYPE)
 
-    idxs = join["index_2"].to_numpy()
-    lens = join.group_by("query_1", maintain_order=True).len()["len"].to_numpy()
-    offsets = lengths_to_offsets(lens)
+    idxs = join["index"].to_numpy()
+    lengths = np.zeros(n_ranges, dtype=np.uint32)
+    lens = join.group_by("query").len()
+    lengths[lens["query"].to_numpy()] = lens["len"].to_numpy()
+    offsets = lengths_to_offsets(lengths)
     return idxs, offsets
 
 
@@ -171,7 +183,8 @@ def var_counts(
         .select(
             chrom=pl.col("CHROM").cast(pl.Utf8),
             start=pl.col("POS") - 1,
-            end=pl.col("POS") - pl.col("ILEN").list.first().clip(upper_bound=0),
+            end=pl.col("POS")
+            - pl.col("ILEN").list.first().clip(upper_bound=0).fill_null(0),
         )
     )
     var_table.config_meta.set(coordinate_system_zero_based=True)  # type: ignore
@@ -191,10 +204,10 @@ def var_counts(
         .collect()
     )
 
-    if counts.height == 0:
-        return np.zeros(n_ranges, dtype=np.uint32)
-
-    return counts["len"].to_numpy()
+    result = np.zeros(n_ranges, dtype=np.uint32)
+    if counts.height > 0:
+        result[counts["query_1"].to_numpy()] = counts["len"].to_numpy()
+    return result
 
 
 @nb.guvectorize(

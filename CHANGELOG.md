@@ -1,3 +1,332 @@
+## 2.15.0 (2026-06-30)
+
+### Feat
+
+- add --progress flag to genoray view CLI
+- opt-in phase-level progress bar in write_view
+- validate view source/regions-file/samples-file at parse time
+- guard write_view against writing a view in place
+
+### Fix
+
+- **deps**: require seqpro>=0.21.1 for empty-row to_numpy; drop sentinel-based empty checks
+- **svar**: emit in-bounds empty range for no-variant queries
+
+### Perf
+
+- fail fast in write_view; never delete output on a doomed run
+
+## 2.14.0 (2026-06-27)
+
+### Feat
+
+- stream write_view region resolution + whole-contig short-circuit
+- stream write_view output index via scan_ipc join+sink_ipc (no full-index collect)
+- forward n_jobs/backend through SparseVar.assign_signatures
+- parallelize fit_signatures over samples with joblib
+
+### Fix
+
+- compute genoray view default bounds lazily (no full-index materialization)
+
+### Refactor
+
+- derive _is_biallelic/_c_max_idxs/n_variants lazily so __init__ never materializes the full index
+- lazy SparseVar index scan with collect-on-demand .index property
+- default fit_signatures/assign_signatures to serial (n_jobs=1); relax parallel-equivalence tests to tolerance
+
+## 2.13.0 (2026-06-25)
+
+### Feat
+
+- add --haploid flag to genoray write CLI
+- add haploid OR-collapse option to SparseVar.from_pgen
+- add haploid OR-collapse option to SparseVar.from_vcf
+
+### Fix
+
+- filtered PGEN var_idxs returns positional indices into _index (#69)
+
+## 2.12.3 (2026-06-23)
+
+### Fix
+
+- adapt genoray to rust-backed seqpro Ragged
+- **svar**: preserve index order and fix varID column in annotate_with_gtf
+
+## 2.12.2 (2026-06-14)
+
+### Fix
+
+- remove seqpro cap
+
+## 2.12.1 (2026-06-14)
+
+### Fix
+
+- bump seqpro cap
+
+## 2.12.0 (2026-06-13)
+
+### Feat
+
+- **svar**: contig scope + NOT_ANNOTATED + mutcat_contigs in annotate_mutations (#62)
+- **svar**: add mutcat_contigs to SparseVarMetadata
+- **mutcat**: contig allowlist in classify_variants -> NOT_ANNOTATED
+- **mutcat**: add NOT_ANNOTATED sentinel and bump MUTCAT_VERSION to 3
+- **mutcat**: parallel numba ID-83 indel kernel + derived LUTs
+- **mutcat**: vectorized DBS-78 batch classifier
+- **mutcat**: vectorized SBS-96 batch classifier
+- **reference**: expose cached contig_array for vectorized lookups
+
+### Fix
+
+- **mutcat**: report deletion REF-mismatch count against indel total, not all rows
+- **utils**: treat mitochondrial aliases M/MT/chrM/chrMT as equivalent (#61)
+
+### Refactor
+
+- **mutcat**: tidy SBS-96 test imports and comment
+
+### Perf
+
+- **mutcat**: parallelize count kernel over samples
+- **mutcat**: parallelize entry-code kernel over tracks
+- **mutcat**: vectorize classify_variants (SNV/DBS numpy, indel kernel)
+
+## 2.11.1 (2026-06-13)
+
+### Fix
+
+- **svar**: convert 1-based POS to 0-based in classify_variants (#59)
+- **mutcat**: guard deletion repeat bucket against REF/reference mismatch
+- **svar**: bump MUTCAT_VERSION and warn on stale persisted mutcat
+
+## 2.11.0 (2026-06-12)
+
+### Feat
+
+- **signatures**: export fit_signatures and cosmic_signatures
+- **svar**: add SparseVar.assign_signatures convenience
+- **signatures**: add pooch-backed cosmic_signatures loader
+- **signatures**: add fit_signatures DataFrame orchestration + row alignment
+- **signatures**: add single-sample forward-selection refit
+- **signatures**: add cosine + NNLS primitives
+- **svar**: recompute mutcat on write_view via opt-in reference; never copy stale codes
+- **svar**: export Reference and document mutation catalogues in SKILL.md
+- **svar**: add mutation_matrix with per-allele/per-sample counting
+- **svar**: add annotate_mutations writing per-entry mutcat field
+- **mutcat**: add per-entry codes with DBS adjacency override
+- **mutcat**: add per-variant classification dispatcher
+- **mutcat**: add ID-83 indel classifier
+- **mutcat**: add DBS-78 doublet classifier
+- **mutcat**: add SBS-96 single-variant classifier
+- **mutcat**: add SBS-96/DBS-78/ID-83 codebooks and code space
+- **reference**: vendor pysam-backed Reference reader
+
+### Fix
+
+- **signatures**: maintain row order in cosmic_signatures join; add DBS78/ID83 loader tests
+- **signatures**: add maintain_order="left" to fit_signatures join
+- **signatures**: guard cosmic_signatures against codebook null rows; drop dead constant
+- **svar**: exclude derived mutcat field from default write_view carry-over
+
+## 2.10.0 (2026-06-11)
+
+### Feat
+
+- **svar**: from_pgen region + sample subsetting during conversion
+- **svar**: from_vcf sample subsetting with MAC=0 drop during conversion
+- **svar**: MAC=0 drop + AF recompute finalize for conversion subsetting
+- **svar**: from_vcf region subsetting during conversion
+- **svar**: add working-index build/write helpers for conversion subsetting
+
+### Fix
+
+- **svar**: make from_vcf contig-contiguity assert actually detect interleaving
+
+### Refactor
+
+- **svar**: align MAC-drop messaging with write_view, dedupe + minimal diff
+- **svar**: simplify from_vcf keep_local + document contig-block invariant
+- **svar**: extract _resolve_kept_rows from _resolve_kept_var_idxs
+
+## 2.9.2 (2026-06-08)
+
+### Fix
+
+- **deps**: allow seqpro 0.15 (relax upper bound to <0.16)
+- **types**: add pyrefly hook and resolve strict type errors
+
+## 2.9.1 (2026-06-07)
+
+### Fix
+
+- **vcf**: return (filter, pl_filter) tuple from VCF.filter getter
+
+## 2.9.0 (2026-06-05)
+
+### Feat
+
+- **vcf**: enforce filter/pl_filter pair invariant in VCF.filter setter
+- **cli**: replace --skip-symbolic-alts with --no-symbolic and --no-breakend
+- **exprs**: add record-level _record_is_symbolic/_record_is_breakend predicates
+- **exprs**: add is_breakend; treat breakend ALTs as un-sizable (null ILEN)
+
+## 2.8.0 (2026-06-05)
+
+### Feat
+
+- **pgen**: size symbolic SVs from PVAR INFO (SVLEN/END)
+- **vcf**: size symbolic SVs via SVLEN/END; persist corrected ILEN
+- **exprs**: symbolic_ilen helper + is_imprecise expression
+- **cli**: --skip-symbolic-alts builds source filter for VCF and PGEN
+- **vcf,svar**: add skip_symbolic_alts option to filter <DEL>/<INS>/<DUP>/...
+
+### Fix
+
+- **exprs**: is_snp/is_indel exclude null-ILEN symbolic SVs; test END fallback
+- **svar**: coerce null ILEN to 0 in with-length read + overlap; test lazy/svar paths
+- **ilen**: coerce null ILEN to 0 at numpy materialization boundaries
+- **vcf**: restrict INFO header detection to INFO; strengthen ILEN alignment guard
+- **vcf**: don't leak SV INFO placeholder cols; guard ILEN concat alignment
+- **svar**: use compacted chunk index in from_pgen dispatch; add multi-contig + dosage filter tests
+- **tests**: update fixtures.py to vcfixture 0.6.0 version= API
+- **svar**: from_pgen inherits and applies the source PGEN filter
+- **vcf**: apply cyvcf2 filter in chunk() so from_vcf genotypes match the filtered index
+- **svar**: from_vcf inherits and applies the source VCF filter
+- **vcf**: split ALT to list before applying pl_filter in _load_index
+
+### Refactor
+
+- **svar**: drop redundant int8 cast in _process_contig_pgen; harden pgen alignment test
+- **svar**: rename _process_contig_vcf filter param to avoid shadowing builtin
+- **vcf**: remove skip_symbolic_alts flag
+
+## 2.7.3 (2026-06-01)
+
+### Fix
+
+- bump seqpro
+
+## 2.7.2 (2026-06-01)
+
+### Fix
+
+- bump seqpro
+
+## 2.7.1 (2026-05-31)
+
+### Fix
+
+- bump seqpro
+
+## 2.7.0 (2026-05-30)
+
+### Feat
+
+- add private _dense2sparse_with_length bridge
+
+### Fix
+
+- VCF with_length hap_lens shape under phasing with indel in extension
+
+### Refactor
+
+- simplify _length_walk_n_keep to early-returns with type hints
+- extract shared _length_walk_n_keep helper for with_length
+
+### Perf
+
+- numba-accelerate _dense2sparse_with_length
+
+## 2.6.0 (2026-05-21)
+
+### Feat
+
+- **pkg**: expose genoray script; drop [cli] extra
+- **cli**: move cli source into genoray._cli
+- **svar**: drop MAC=0 variants from write_view output
+
+### Perf
+
+- **init**: make genoray.__init__ lazy via PEP 562 __getattr__
+
+## 2.5.0 (2026-05-20)
+
+### Feat
+
+- **svar**: add SparseVar.write_view for region+sample subsetting
+- **svar**: add numba kernels for write_view (count + write var_idxs + write field)
+- **svar**: add _resolve_kept_var_idxs with pos/record/variant modes
+- **svar**: add _normalize_samples and _validate_fields helpers
+- **svar**: add _normalize_regions helper
+- **utils**: add _resolve_threads and numba_threads context manager
+
+### Fix
+
+- **svar**: defer write_view output mkdir until after validation; verify genotype round-trip
+- **svar**: _resolve_kept_var_idxs use exclusive end from var_ranges
+- **svar**: support pandas/pyranges in _normalize_regions; tighten tests and types
+
+## 2.4.0 (2026-05-20)
+
+### Feat
+
+- **svar**: add nbytes property covering resident index only
+- **pgen**: add nbytes property summing index + StartsEndsIlens
+- **vcf**: add nbytes property for resident memory size
+
+## 2.3.3 (2026-05-13)
+
+### Fix
+
+- **vcf**: open subset VCF with only requested samples; fix _s_sorter for repeated set_samples calls
+
+## 2.3.2 (2026-05-12)
+
+### Fix
+
+- **svar**: correct inverse permutation and length-budget early-exit in _find_starts_ends*
+
+## 2.3.1 (2026-05-11)
+
+### Fix
+
+- VCF set_samples now returns genotypes in requested sample order
+
+## 2.3.0 (2026-05-08)
+
+### Feat
+
+- bump seqpro to 0.11, add available_fields attr, simplify fields/attrs API
+- add arbitrary field loading to SparseVar
+
+## 2.2.3 (2026-04-22)
+
+### Fix
+
+- var_counts scatter non-zero counts by query index
+
+## 2.2.2 (2026-03-31)
+
+### Fix
+
+- sample reordering and selection for PGEN
+
+## 2.2.1 (2026-03-09)
+
+### Fix
+
+- queries with no variants
+
+## 2.2.0 (2026-03-09)
+
+### Feat
+
+- **private**: unify interface to _find_starts_and_ends methods
+- **perf**: index-free VCF->SVAR to reduce memory usage
+
 ## 2.1.3 (2026-02-10)
 
 ### Fix
