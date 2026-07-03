@@ -115,6 +115,58 @@ two-channel sparse, fused decode    materialized seqpro Ragged record
    The final `var_key ⋈ dense` merge is done by the consumer, interleaved with its own work
    (splice / materialize).
 
+### M6a — PyO3 query foundation (land first)
+
+M6.0 + M6.1 landed the whole spine in Rust (`overlap_batch` → `BatchResult`,
+`decode_hap`), but **nothing query-related crosses into Python yet** — `src/lib.rs`
+exposes only `run_conversion_pipeline`, there is no `numpy` dependency, and there is no
+way to open a finished contig from Python. Both M6b-genoray and M6c stand on that missing
+seam, and both would otherwise build the same numpy plumbing. So M6a carves it out and
+**lands + merges before the M6b/M6c fan-out**:
+
+1. **`numpy` dependency.** Add the `numpy` (rust-numpy) crate to `Cargo.toml` at the
+   release that matches the in-tree `pyo3 0.29` (rust-numpy tracks pyo3's version — pick the
+   matching one from crates.io at implementation time). The FFI *contract* is numpy arrays
+   and is version-independent across the boundary; gvl's own crate may pin a different
+   `pyo3`/`numpy` pair on its side.
+
+2. **`PyContigReader` pyclass** (`src/py_query.rs`) wrapping
+   `ContigReader::open(base_out_dir, chrom, n_samples, ploidy)` — the signature already
+   matches. `meta.json` stays **Python-read** (its established convention): the Python
+   `SparseVar2` class loads `samples`/`ploidy` and passes them in. Register the class in
+   `_core`.
+
+3. **Shared numpy conversion helpers** (`Vec<u32|i32|usize> → PyArray1`, offset arrays as
+   `i64`) that both consumers reuse, so the array plumbing exists once.
+
+4. **Python `SparseVar2` skeleton** in `python/genoray/`: read `meta.json`, construct a
+   `PyContigReader` per contig. The query methods themselves land in M6b/M6c.
+
+**Frozen `BatchResult` → numpy contract.** M6b and M6c code against this fixed dtype/shape
+table so Phase-1 streams don't wait on each other. `H = n_regions · n_samples · ploidy`,
+hap-slices in region-major order `h = (r·n_samples + s)·ploidy + p`:
+
+| Array | dtype | shape | meaning |
+| --- | --- | --- | --- |
+| `vk_pos` | `i32` | `[·]` | flat var_key positions, ragged by hap |
+| `vk_key` | `u32`→exposed as `i32` bit-pattern | `[·]` | flat uniform 32-bit keys, aligned with `vk_pos` |
+| `vk_off` | `i64` | `[H+1]` | CSR offsets slicing `vk_*` per hap |
+| `dense_pos` | `i32` | `[D]` | shared dense-union positions, sorted |
+| `dense_key` | `u32`→`i32` bits | `[D]` | shared dense-union uniform keys |
+| `dense_range` | `i32` | `[R, 2]` | `[s, e)` into the dense arrays per region |
+| `dense_present` | `u8` | `[·]` | per-hap LSB-first presence bitmask, concatenated |
+| `dense_present_off` | `i64` | `[H+1]` | **bit** offsets into `dense_present` per hap |
+| `lut_bytes` | `u8` | `[·]` | shared long-allele LUT bytes |
+| `lut_off` | `i64` | `[·]` | LUT row offsets |
+
+`u32` keys cross as their `i32` bit-pattern (numpy has no unsigned-friendly zero-copy path
+gvl uses; both sides reinterpret). M6c's decoded product (`pos`/`ilen` `i32`, `allele`
+`u8`+`str_offsets`) is a separate contract, already pinned in [M6c](#m6c--python-decode--seqproragragged--region-variant-counts).
+
+Phase-1 coordination is then limited to `_core` registration and adding methods to the
+same `PyContigReader` — separate `#[pymethods]` blocks (pyo3 0.29 allows multiple), one
+per stream, so the two land without conflict.
+
 ### M6b — gvl Rust variant interface (two-channel, built first)
 
 Per query (R regions × S samples × P ploidy), per contig, genoray returns:
@@ -195,10 +247,14 @@ Replace the single M6 in [`svar-2.md`](../../roadmap/svar-2.md) with:
 
 - **M6 — Query decode core.** Finish M5 disk wiring (`max_del` consumer, sidecar reads,
   per-`(contig, sample, ploid)` index ranges); extract `svar2-codec`; uniform-key
-  re-expansion; sorted union.
+  re-expansion; sorted union. *(M6.0 codec + M6.1 spine done.)*
+- **M6a — PyO3 query foundation.** `numpy` dependency, `PyContigReader` pyclass +
+  `_core` registration, shared array-conversion helpers, Python `SparseVar2` skeleton,
+  and the frozen `BatchResult` → numpy contract. **Lands and merges before the M6b/M6c
+  fan-out** — both consumers stand on it.
 - **M6b — gvl Rust variant interface.** Two-channel sparse result + `svar2-codec`
   consumed by gvl's reconstruct/realign (two-source kernel). Cross-repo, release-gated.
-  *Built first among the M6 consumers.*
+  *Built first among the M6 consumers, on top of M6a.*
 - **M6c — Python decode → `seqpro.rag.Ragged` + region variant counts.** Materialized
   record + decode-free count/ploidy shortcut.
 

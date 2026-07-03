@@ -182,10 +182,18 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
     re-expressed on the spine (M5 tests are the regression oracle); cross-checked by
     `tests/test_batch.rs`. See [`architecture.md`](architecture.md#python-decode-path) and
     the design spec [`../superpowers/specs/2026-07-02-svar2-m6-consumer-interfaces-design.md`](../superpowers/specs/2026-07-02-svar2-m6-consumer-interfaces-design.md).
-    Remaining for M6: PyO3/numpy exposure of `BatchResult` and dense-window subsetting are
-    **M6b**; `seqpro.rag.Ragged` materialization is **M6c**.
-- [ ] **M6b. gvl Rust variant interface.** *(built first among M6 consumers)* The primary
-  consumer. genoray returns a **two-channel** query result — `var_key` gathered per-hap
+    Remaining for M6: the shared PyO3 seam is **M6a**; raw `BatchResult` exposure and
+    dense-window subsetting are **M6b**; `seqpro.rag.Ragged` materialization is **M6c**.
+  - [ ] **M6a. PyO3 query foundation (land first).** The shared seam both consumers stand
+    on, currently unbuilt (`src/lib.rs` exposes only `run_conversion_pipeline`; no `numpy`
+    dep; no way to open a contig from Python). Adds the `numpy` crate, a `PyContigReader`
+    pyclass over `ContigReader::open` + `_core` registration, shared array-conversion
+    helpers, a Python `SparseVar2` skeleton (reads `meta.json`), and **freezes the
+    `BatchResult` → numpy contract** so M6b and M6c code against a fixed interface.
+    **Merges before the M6b/M6c fan-out.** See the design spec's
+    [M6a section](../superpowers/specs/2026-07-02-svar2-m6-consumer-interfaces-design.md).
+- [ ] **M6b. gvl Rust variant interface.** *(built first among M6 consumers; on top of
+  M6a, in parallel with M6c)* The primary consumer. genoray returns a **two-channel** query result — `var_key` gathered per-hap
   inline (no dedup, no barrier) + a shared decode-once `dense` table with per-hap presence
   bitmasks — and gvl's Rust core consumes it via a **two-source splice** (`var_key ⋈
   dense` in position order), calling `svar2-codec` inline to decode keys straight into the
@@ -194,7 +202,8 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
   GenVarLoader) and release-gated:** the gvl PR is only mergeable after `svar2-codec` is
   on crates.io and `svar-2` is on PyPI; sequence managed manually. genoray-side work is
   independently mergeable.
-- [ ] **M6c. Python decode → `seqpro.rag.Ragged` + region variant counts.** The analysis
+- [ ] **M6c. Python decode → `seqpro.rag.Ragged` + region variant counts.** *(on top of
+  M6a, in parallel with M6b)* The analysis
   consumer. Materialize decoded query results into a `seqpro` `Ragged` record
   (`from_fields`: `pos` / `ilen` numeric + `allele` opaque-string, shared variant-axis
   offsets, shape `(ranges, samples, ploidy, None)` — byte-identical to gvl's
