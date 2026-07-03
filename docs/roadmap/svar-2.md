@@ -184,9 +184,11 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
     the design spec [`../superpowers/specs/2026-07-02-svar2-m6-consumer-interfaces-design.md`](../superpowers/specs/2026-07-02-svar2-m6-consumer-interfaces-design.md).
     Remaining for M6: the shared PyO3 seam is **M6a**; raw `BatchResult` exposure and
     dense-window subsetting are **M6b**; `seqpro.rag.Ragged` materialization is **M6c**.
-  - [ ] **M6a. PyO3 query foundation (land first).** The shared seam both consumers stand
-    on, currently unbuilt (`src/lib.rs` exposes only `run_conversion_pipeline`; no `numpy`
-    dep; no way to open a contig from Python). Adds the `numpy` crate, a `PyContigReader`
+  - [x] **M6a. PyO3 query foundation (land first).** *(shipped: `numpy` dep + `src/py_convert.rs`
+    Rust→numpy helpers, `PyContigReader` pyclass over `ContigReader::open` registered in `_core`,
+    and a Python `SparseVar2` skeleton reading `meta.json`; the `BatchResult` → numpy contract was
+    frozen in the M6a carve-out.)* The shared seam both consumers stand
+    on. Adds the `numpy` crate, a `PyContigReader`
     pyclass over `ContigReader::open` + `_core` registration, shared array-conversion
     helpers, a Python `SparseVar2` skeleton (reads `meta.json`), and **freezes the
     `BatchResult` → numpy contract** so M6b and M6c code against a fixed interface.
