@@ -167,14 +167,22 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
   `(range, sample)` query landed (`overlap_sample` in `src/query.rs`); M6 generalizes it
   into the batched multi-region × multi-sample consumer spine, re-expands SNPs to the
   uniform 32-bit key at query time, and implements the fast sorted **union** across the
-  `{var_key, dense} × {snp, indel}` sub-streams. *Done:* the key ↔ `(ILEN, ALT)` decode
-  seam has already been extracted out of `rvk.rs` into the dependency-light,
-  crates.io publish-ready **`svar2-codec`** workspace crate, so genoray and gvl share one
-  decoder — see
-  [`../superpowers/plans/2026-07-02-svar2-codec-crate.md`](../superpowers/plans/2026-07-02-svar2-codec-crate.md).
-  What remains is the batched consumer spine above, then the two-channel/materialized
-  consumer interfaces, M6b/M6c. See
-  [`architecture.md`](architecture.md#python-decode-path) and the design spec
+  `{var_key, dense} × {snp, indel}` sub-streams.
+  - [x] **M6.0 `svar2-codec` seam crate (done).** The key ↔ `(ILEN, ALT)` encode/decode
+    seam is extracted out of `rvk.rs` into the dependency-light, crates.io publish-ready
+    **`svar2-codec`** workspace crate (std-only, zero runtime deps), so genoray and gvl
+    share one decoder. Verified: 16 codec tests green (PEXT↔SWAR parity, all key-lane
+    round-trips), `cargo publish --dry-run` clean. Publishing to crates.io is a maintainer
+    action, still pending (it release-gates M6b's gvl side alongside the `svar-2` PyPI
+    release). See
+    [`../superpowers/plans/2026-07-02-svar2-codec-crate.md`](../superpowers/plans/2026-07-02-svar2-codec-crate.md).
+  - [ ] **M6.1 consumer spine (now unblocked — next up).** With the codec landed, build the
+    batched multi-region × multi-sample spine: uniform-key SNP re-expansion + the fast
+    sorted **union** across the four `{var_key, dense} × {snp, indel}` sub-streams. This is
+    the MVP critical path — both M6b and M6c fan out from it, so nothing else in the MVP
+    tail can proceed until it lands. (The independent tracks M7–M10 do not touch the query
+    path and can proceed in parallel.)
+  See [`architecture.md`](architecture.md#python-decode-path) and the design spec
   [`../superpowers/specs/2026-07-02-svar2-m6-consumer-interfaces-design.md`](../superpowers/specs/2026-07-02-svar2-m6-consumer-interfaces-design.md).
 - [ ] **M6b. gvl Rust variant interface.** *(built first among M6 consumers)* The primary
   consumer. genoray returns a **two-channel** query result — `var_key` gathered per-hap
