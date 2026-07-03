@@ -253,6 +253,18 @@ impl ContigReader {
     }
 }
 
+impl ContigReader {
+    /// Raw long-allele LUT for the M6b contract: all bytes + CSR row offsets.
+    /// A contig with no LUT returns empty bytes and a single `[0]` offset (an
+    /// empty CSR), so the numpy side never special-cases a missing file.
+    pub fn lut_arrays(&self) -> (Vec<u8>, Vec<u64>) {
+        match &self.lut {
+            Some(l) => (l.all_bytes(), l.offsets().to_vec()),
+            None => (Vec::new(), vec![0u64]),
+        }
+    }
+}
+
 /// The per-contig dense table unioned across `snp`+`indel`, position-sorted,
 /// carrying uniform keys plus the `(is_indel, col)` needed to test carriage.
 /// Region-independent — built once per query; `overlap` derives each region's
