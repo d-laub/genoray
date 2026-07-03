@@ -130,6 +130,26 @@ impl LongAlleleReader {
             .expect("pread long allele");
         buf
     }
+
+    /// CSR row offsets (`len == n_long_alleles + 1`); byte range of row `i` is
+    /// `offsets[i]..offsets[i+1]`.
+    pub fn offsets(&self) -> &[u64] {
+        &self.offsets
+    }
+
+    /// The entire long-allele byte bank (M6b raw-LUT exposure). Reads the whole
+    /// file once; the LUT holds only long-INS spills (SNPs never spill, most
+    /// indels are inline), so it is typically small.
+    pub fn all_bytes(&self) -> Vec<u8> {
+        let total = *self.offsets.last().unwrap_or(&0) as usize;
+        let mut buf = vec![0u8; total];
+        if total > 0 {
+            self.file
+                .read_exact_at(&mut buf, 0)
+                .expect("pread long_alleles.bin");
+        }
+        buf
+    }
 }
 
 #[cfg(test)]
@@ -169,5 +189,21 @@ mod tests {
         // &self: two immutable calls, no &mut needed
         assert_eq!(reader.get_allele(0), b"AAAA".to_vec());
         assert_eq!(reader.get_allele(1), b"CC".to_vec());
+    }
+
+    #[test]
+    fn test_reader_all_bytes_and_offsets() {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("chr1").join("indel");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut f = std::fs::File::create(dir.join("long_alleles.bin")).unwrap();
+        f.write_all(b"AAAACC").unwrap();
+        let offsets = ndarray::Array1::from_vec(vec![0u64, 4, 6]);
+        ndarray_npy::write_npy(dir.join("long_allele_offsets.npy"), &offsets).unwrap();
+
+        let reader = LongAlleleReader::new(tmp.path().to_str().unwrap(), "chr1");
+        assert_eq!(reader.offsets(), &[0u64, 4, 6]);
+        assert_eq!(reader.all_bytes(), b"AAAACC".to_vec());
     }
 }
