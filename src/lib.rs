@@ -20,6 +20,7 @@ pub mod orchestrator;
 pub mod query;
 pub mod rvk;
 pub mod search;
+pub mod spine;
 pub mod streams;
 pub mod types;
 pub mod vcf_reader;
