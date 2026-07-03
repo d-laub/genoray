@@ -186,6 +186,7 @@ fn open_dense(dir: &Path) -> std::io::Result<Option<DenseView>> {
 /// lifetime of queries against it.
 pub struct ContigReader {
     ploidy: usize,
+    n_samples: usize,
     vk_snp: SubStreamView,
     vk_indel: SubStreamView,
     dense_snp: Option<DenseView>,
@@ -240,6 +241,7 @@ impl ContigReader {
 
         Ok(Self {
             ploidy,
+            n_samples,
             vk_snp,
             vk_indel,
             dense_snp,
@@ -449,10 +451,167 @@ pub fn overlap_sample(
     QueryResult { per_hap }
 }
 
+/// The batched, two-channel query spine result for one contig (M6.1). Carries
+/// undecoded uniform keys; consumers (gvl M6b / Python M6c) do the final
+/// `var_key ⋈ dense` merge and allele decode. `H = n_regions * n_samples *
+/// ploidy` hap-slices in region-major order `h = (r * n_samples + s) * ploidy + p`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BatchResult {
+    pub n_regions: usize,
+    pub n_samples: usize,
+    pub ploidy: usize,
+    /// Flat var_key channel; `vk_off` (len H+1, CSR) slices it per hap.
+    pub vk: Vec<KeyRef>,
+    pub vk_off: Vec<usize>,
+    /// Shared dense union (uniform keys, position-sorted); decode-once.
+    pub dense: Vec<KeyRef>,
+    /// `[s, e)` into `dense` per region (len n_regions).
+    pub dense_range: Vec<(usize, usize)>,
+    /// Per-hap dense presence bitmask over that region's `dense[s..e]`, LSB-first,
+    /// concatenated; `dense_present_off` (len H+1) holds BIT offsets.
+    pub dense_present: Vec<u8>,
+    pub dense_present_off: Vec<usize>,
+}
+
+/// Batched multi-region × whole-cohort query. `regions` is a list of half-open
+/// `[q_start, q_end)`. Single-threaded; `rayon` over the H hap-slices and dense-
+/// window subsetting are M6b concerns (see the design spec's open questions).
+pub fn overlap_batch(reader: &ContigReader, regions: &[(u32, u32)]) -> BatchResult {
+    let ploidy = reader.ploidy;
+    let n_samples = reader.n_samples;
+    let n_regions = regions.len();
+
+    let dense = reader.dense_union();
+    // Per-region dense index ranges — shared across all samples in the region.
+    let ranges: Vec<(usize, usize)> = regions
+        .iter()
+        .map(|&(qs, qe)| dense.overlap(qs, qe))
+        .collect();
+
+    let mut vk: Vec<KeyRef> = Vec::new();
+    let mut vk_off: Vec<usize> = vec![0];
+    let mut dense_present: Vec<u8> = Vec::new();
+    let mut dense_present_off: Vec<usize> = vec![0];
+
+    for (r, &(qs, qe)) in regions.iter().enumerate() {
+        let (ds, de) = ranges[r];
+        for s in 0..n_samples {
+            for p in 0..ploidy {
+                let col = s * ploidy + p;
+                let hap = col;
+
+                // var_key channel slice for (region r, sample s, ploid p).
+                let slice = reader.vk_slice(col, s, p, qs, qe);
+                vk.extend_from_slice(&slice);
+                vk_off.push(vk.len());
+
+                // dense presence bits over dense[ds..de].
+                let nbits = de - ds;
+                let bit_base = *dense_present_off.last().unwrap();
+                let need_bytes = (bit_base + nbits).div_ceil(8);
+                if dense_present.len() < need_bytes {
+                    dense_present.resize(need_bytes, 0);
+                }
+                for (k, j) in (ds..de).enumerate() {
+                    let (is_indel, dcol) = dense.src[j];
+                    let carried = if is_indel {
+                        reader
+                            .dense_indel
+                            .as_ref()
+                            .expect("indel src implies table")
+                            .carried(hap, dcol)
+                    } else {
+                        reader
+                            .dense_snp
+                            .as_ref()
+                            .expect("snp src implies table")
+                            .carried(hap, dcol)
+                    };
+                    if carried {
+                        bits::set_bit(&mut dense_present, bit_base + k);
+                    }
+                }
+                dense_present_off.push(bit_base + nbits);
+            }
+        }
+    }
+
+    BatchResult {
+        n_regions,
+        n_samples,
+        ploidy,
+        vk,
+        vk_off,
+        dense: dense.refs,
+        dense_range: ranges,
+        dense_present,
+        dense_present_off,
+    }
+}
+
+impl BatchResult {
+    /// Decode the merged `var_key ⋈ dense` variants that `(sample s, ploid p)`
+    /// carries in region `r` — position-sorted `(position, ilen, alt)`, identical
+    /// to `overlap_sample(sample=s, region=r).per_hap[p]`. The M6c materialization
+    /// primitive; here also the Task 5 cross-check oracle. Needs `reader` for the
+    /// LUT (long-INS allele bytes).
+    pub fn decode_hap(&self, reader: &ContigReader, r: usize, s: usize, p: usize) -> HapCalls {
+        let h = (r * self.n_samples + s) * self.ploidy + p;
+        let vk_slice = self.vk[self.vk_off[h]..self.vk_off[h + 1]].to_vec();
+
+        let (ds, de) = self.dense_range[r];
+        let bit0 = self.dense_present_off[h];
+        let mut dn: Vec<KeyRef> = Vec::new();
+        for (k, j) in (ds..de).enumerate() {
+            if bits::get_bit(&self.dense_present, bit0 + k) {
+                dn.push(self.dense[j]);
+            }
+        }
+
+        let merged = spine::merge_keys(vec![vk_slice, dn]);
+        let lut = reader.lut.as_ref();
+        let mut hc = HapCalls::default();
+        for kr in merged {
+            let c = decode_keyref(kr, lut);
+            hc.positions.push(c.position);
+            hc.ilens.push(c.ilen);
+            hc.alts.push(c.alt);
+        }
+        hc
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn test_batch_result_offsets_are_consistent() {
+        // A hand-built BatchResult: 1 region, 2 samples, ploidy 2 -> H = 4.
+        // vk_off / dense_present_off must be non-decreasing, length H+1, and
+        // bound the flat buffers.
+        let br = BatchResult {
+            n_regions: 1,
+            n_samples: 2,
+            ploidy: 2,
+            vk: vec![KeyRef {
+                position: 10,
+                key: 1 << 25,
+            }],
+            vk_off: vec![0, 1, 1, 1, 1],
+            dense: vec![],
+            dense_range: vec![(0, 0)],
+            dense_present: vec![],
+            dense_present_off: vec![0, 0, 0, 0, 0],
+        };
+        let h = br.n_regions * br.n_samples * br.ploidy;
+        assert_eq!(br.vk_off.len(), h + 1);
+        assert_eq!(br.dense_present_off.len(), h + 1);
+        assert_eq!(*br.vk_off.last().unwrap(), br.vk.len());
+        assert!(br.vk_off.windows(2).all(|w| w[0] <= w[1]));
+        assert!(br.dense_present_off.windows(2).all(|w| w[0] <= w[1]));
+    }
 
     #[test]
     fn test_mmap_u32_roundtrip() {
