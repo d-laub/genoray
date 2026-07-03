@@ -13,7 +13,7 @@ use std::path::Path;
 // (query.rs, max_del.rs, tests) resolve.
 pub use svar2_codec::{
     DecodedKey, decode_alt_inline, decode_key, decode_snp_2bit, deletion_len, encode_snp_2bit,
-    pack_snp_keys, unpack_snp_key_at, unpack_snp_keys,
+    pack_snp_keys, snp_code_to_key, unpack_snp_key_at, unpack_snp_keys,
 };
 
 // Post-merge pass for the SNP stream: read the merged `alleles.bin` (one

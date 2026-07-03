@@ -35,6 +35,17 @@ pub fn decode_snp_2bit(code: u8) -> u8 {
     BASES[(code & 3) as usize]
 }
 
+/// Re-expand a 2-bit SNP code into the **uniform 32-bit indel key** (`ilen = 0`,
+/// the single ALT base inline at `[26:25]`, lookup flag clear). This is the
+/// pre-M1-split encoding: after re-expansion a query result has one `decode_key`
+/// path for both `snp` and `indel` sub-streams. One shift — the `<< 25` lives
+/// here so no consumer re-derives the layout. Inverse view: `decode_key` on the
+/// result is `Inline { alt: [decode_snp_2bit(code)] }`.
+#[inline]
+pub fn snp_code_to_key(code: u8) -> u32 {
+    ((code & 3) as u32) << 25
+}
+
 /// Pack 2-bit SNP codes 4-per-byte, little-pair-first: code `i` occupies bits
 /// `[(i&3)*2 + 1 : (i&3)*2]` of byte `i >> 2`. The final byte is zero-padded when
 /// `codes.len()` is not a multiple of 4. Offsets index CALLS, not bytes.
@@ -288,6 +299,32 @@ mod tests {
         for &b in b"ACGT" {
             let code = encode_snp_2bit(b);
             assert_eq!(decode_snp_2bit(code), b, "base {} round-trips", b as char);
+        }
+    }
+
+    #[test]
+    fn snp_code_to_key_decodes_to_inline_base() {
+        // Every 2-bit code re-expands to a uniform key whose decode is a 1-base
+        // Inline ALT equal to decode_snp_2bit(code), with ilen 0.
+        for code in 0u8..4 {
+            let key = snp_code_to_key(code);
+            assert_eq!(key & 1, 0, "uniform SNP key must clear the lookup flag");
+            assert_eq!(
+                decode_key(key),
+                DecodedKey::Inline {
+                    alt: vec![decode_snp_2bit(code)]
+                },
+                "code {code} round-trips through the uniform key",
+            );
+        }
+    }
+
+    #[test]
+    fn snp_code_to_key_matches_encode_alt_inline() {
+        // The one-shift re-expansion equals encoding the decoded base inline.
+        for code in 0u8..4 {
+            let base = decode_snp_2bit(code);
+            assert_eq!(snp_code_to_key(code), encode_alt_inline(&[base], 0));
         }
     }
 
