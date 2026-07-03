@@ -7,13 +7,22 @@ from typing import Union
 from . import exprs
 from ._pgen import PGEN
 from ._svar import SparseGenotypes, SparseVar
+from ._svar2 import SparseVar2
 from ._vcf import VCF
 
 Reader = Union[VCF, PGEN, SparseVar]
 
 __version__ = version("genoray")
 
-__all__ = ["Reader", "VCF", "PGEN", "SparseVar", "SparseGenotypes", "exprs"]
+__all__ = [
+    "Reader",
+    "VCF",
+    "PGEN",
+    "SparseVar",
+    "SparseVar2",
+    "SparseGenotypes",
+    "exprs",
+]
 
 logger = logging.getLogger("polars_bio")
 logger.setLevel(logging.ERROR)
