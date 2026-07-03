@@ -176,14 +176,14 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
     action, still pending (it release-gates M6b's gvl side alongside the `svar-2` PyPI
     release). See
     [`../superpowers/plans/2026-07-02-svar2-codec-crate.md`](../superpowers/plans/2026-07-02-svar2-codec-crate.md).
-  - [ ] **M6.1 consumer spine (now unblocked — next up).** With the codec landed, build the
-    batched multi-region × multi-sample spine: uniform-key SNP re-expansion + the fast
-    sorted **union** across the four `{var_key, dense} × {snp, indel}` sub-streams. This is
-    the MVP critical path — both M6b and M6c fan out from it, so nothing else in the MVP
-    tail can proceed until it lands. (The independent tracks M7–M10 do not touch the query
-    path and can proceed in parallel.)
-  See [`architecture.md`](architecture.md#python-decode-path) and the design spec
-  [`../superpowers/specs/2026-07-02-svar2-m6-consumer-interfaces-design.md`](../superpowers/specs/2026-07-02-svar2-m6-consumer-interfaces-design.md).
+  - [x] **M6.1 consumer spine (done).** `src/spine.rs` (`KeyRef` / `gather_keys` / `merge_keys`)
+    + `overlap_batch` / `BatchResult` / `decode_hap` in `src/query.rs` deliver the batched
+    two-channel spine; SNPs re-expand via `svar2_codec::snp_code_to_key`; `overlap_sample`
+    re-expressed on the spine (M5 tests are the regression oracle); cross-checked by
+    `tests/test_batch.rs`. See [`architecture.md`](architecture.md#python-decode-path) and
+    the design spec [`../superpowers/specs/2026-07-02-svar2-m6-consumer-interfaces-design.md`](../superpowers/specs/2026-07-02-svar2-m6-consumer-interfaces-design.md).
+    Remaining for M6: PyO3/numpy exposure of `BatchResult` and dense-window subsetting are
+    **M6b**; `seqpro.rag.Ragged` materialization is **M6c**.
 - [ ] **M6b. gvl Rust variant interface.** *(built first among M6 consumers)* The primary
   consumer. genoray returns a **two-channel** query result — `var_key` gathered per-hap
   inline (no dedup, no barrier) + a shared decode-once `dense` table with per-hap presence
