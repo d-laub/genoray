@@ -18,6 +18,7 @@ pub mod normalize;
 pub mod nrvk;
 pub mod orchestrator;
 pub mod py_convert;
+pub mod py_query;
 pub mod query;
 pub mod rvk;
 pub mod search;
@@ -138,5 +139,6 @@ fn run_conversion_pipeline(
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run_conversion_pipeline, m)?)?;
+    m.add_class::<crate::py_query::PyContigReader>()?;
     Ok(())
 }
