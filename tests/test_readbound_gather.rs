@@ -20,6 +20,17 @@ fn synth_reader(out: &std::path::Path) -> ContigReader {
             alts: vec![&b"C"[..]],
             gt: vec![1, 0, 0, 0],
         },
+        // Dense SNP: AC=4 (all 4 haps carry) routes to the Dense class, not
+        // VarKey. Cost model (n_samples=2, ploidy=2 → np=4): SNP dense_bits =
+        // 32+2+4 = 38, var_key_bits = 34·x; dense wins for x >= 2, so x=4 is
+        // Dense. This exercises the dense_snp / dense_snp_present channel of
+        // BatchResultSplit (the pos-100 SNP above stays VarKey at AC=1).
+        SynthRecord {
+            pos: 150,
+            ref_allele: b"A",
+            alts: vec![&b"C"[..]],
+            gt: vec![1, 1, 1, 1],
+        },
         SynthRecord {
             pos: 200,
             ref_allele: b"A",
@@ -53,12 +64,22 @@ fn test_find_ranges_emits_per_class_dense_ranges() {
     for &(s, e) in rb.dense_snp_range.iter().chain(rb.dense_indel_range.iter()) {
         assert!(s <= e);
     }
-    // Region 0 spans the whole contig: it must see the one dense SNP (pos 100 is
-    // var_key here, but the SNP class table is nonempty iff any SNP is dense) and
-    // the dense indels. The union window must equal snp∪indel counts.
+    // Region 0 spans the whole contig: it must see the dense SNP (pos 150,
+    // AC=4) and the dense indels. The union window must equal snp∪indel counts.
     let (us0, ue0) = rb.dense_range[0];
     let snp0 = rb.dense_snp_range[0].1 - rb.dense_snp_range[0].0;
     let indel0 = rb.dense_indel_range[0].1 - rb.dense_indel_range[0].0;
+    // Empirical coverage guard: the fixture MUST route at least one SNP to the
+    // Dense class, else the dense_snp / dense_snp_present channel of
+    // BatchResultSplit is never exercised with real content and a SNP-class
+    // bit-indexing / v_end bug would pass silently. If this fires, the cost
+    // model routed the AC=4 SNP to VarKey — escalate rather than weaken.
+    assert!(
+        snp0 >= 1,
+        "fixture must route >=1 SNP to Dense so the dense-SNP channel is covered \
+         (dense_snp_range[0] = {:?})",
+        rb.dense_snp_range[0]
+    );
     assert_eq!(
         ue0 - us0,
         snp0 + indel0,
