@@ -503,6 +503,34 @@ pub struct BatchResult {
     pub dense_present_off: Vec<usize>,
 }
 
+/// Read-bound analog of `BatchResult`: the var_key channel merged per hap (as
+/// today), but the dense channel **split per class** so no contig-wide
+/// `DenseUnion` is built. gvl merges `var_key ⋈ dense_snp ⋈ dense_indel` by
+/// position downstream. `H = n_regions * n_samples * ploidy`, hap index
+/// `(r*n_samples + s)*ploidy + p` over the *selected* samples.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BatchResultSplit {
+    pub n_regions: usize,
+    pub n_samples: usize,
+    pub ploidy: usize,
+    /// Flat merged var_key channel (snp+indel per hap); `vk_off` (len H+1) slices it.
+    pub vk: Vec<KeyRef>,
+    pub vk_off: Vec<usize>,
+    /// Per-region `dense/snp` windows (uniform keys), concatenated.
+    pub dense_snp: Vec<KeyRef>,
+    /// `[s, e)` into `dense_snp` per region (len n_regions).
+    pub dense_snp_range: Vec<(usize, usize)>,
+    /// Per-hap presence bitmask over that region's `dense_snp[s..e]`, LSB-first;
+    /// `dense_snp_present_off` (len H+1) holds BIT offsets.
+    pub dense_snp_present: Vec<u8>,
+    pub dense_snp_present_off: Vec<usize>,
+    /// Per-region `dense/indel` windows (uniform u32 keys), concatenated.
+    pub dense_indel: Vec<KeyRef>,
+    pub dense_indel_range: Vec<(usize, usize)>,
+    pub dense_indel_present: Vec<u8>,
+    pub dense_indel_present_off: Vec<usize>,
+}
+
 /// Batched multi-region × whole-cohort query. `regions` is a list of half-open
 /// `[q_start, q_end)`. Single-threaded; `rayon` over the H hap-slices and dense-
 /// window subsetting are M6b concerns (see the design spec's open questions).
@@ -861,6 +889,322 @@ pub fn gather_ranges(reader: &ContigReader, rb: &RangesBundle) -> BatchResult {
         dense_range: rb.dense_range.clone(),
         dense_present,
         dense_present_off,
+    }
+}
+
+/// Tree-free, union-free gather: replay a `RangesBundle` into a split-dense
+/// `BatchResultSplit`. Builds NO `SearchTree` and never calls `dense_union()` —
+/// each region's dense windows come from the per-class `dense_snp_range` /
+/// `dense_indel_range` computed in `find_ranges`. The var_key channel is
+/// identical to `gather_ranges`; only the dense side is split per class.
+#[allow(clippy::needless_range_loop)]
+pub fn gather_ranges_readbound(reader: &ContigReader, rb: &RangesBundle) -> BatchResultSplit {
+    let ploidy = rb.ploidy;
+    let n_samples = rb.n_samples;
+    let n_regions = rb.n_regions;
+    let hpr = n_samples * ploidy;
+
+    let snp_positions = reader.vk_snp.positions();
+    let snp_keys = as_bytes(&reader.vk_snp.keys);
+    let indel_positions = reader.vk_indel.positions();
+    let indel_keys = as_u32(&reader.vk_indel.keys);
+
+    // Dense class tables (may be absent).
+    let d_snp = reader.dense_snp.as_ref();
+    let d_indel = reader.dense_indel.as_ref();
+    let d_snp_pos: &[u32] = d_snp.map(|d| d.positions()).unwrap_or(&[]);
+    let d_indel_pos: &[u32] = d_indel.map(|d| d.positions()).unwrap_or(&[]);
+
+    // --- dense channel windows (per region), decoded to uniform keys once ---
+    let mut dense_snp: Vec<KeyRef> = Vec::new();
+    let mut dense_snp_range: Vec<(usize, usize)> = Vec::with_capacity(n_regions);
+    let mut dense_indel: Vec<KeyRef> = Vec::new();
+    let mut dense_indel_range: Vec<(usize, usize)> = Vec::with_capacity(n_regions);
+    for r in 0..n_regions {
+        let (ss, se) = rb.dense_snp_range[r];
+        let base = dense_snp.len();
+        if let Some(d) = d_snp {
+            let keys = as_bytes(&d.keys);
+            for j in ss..se {
+                dense_snp.push(KeyRef {
+                    position: d_snp_pos[j],
+                    key: rvk::snp_code_to_key(rvk::unpack_snp_key_at(keys, j)),
+                });
+            }
+        }
+        dense_snp_range.push((base, dense_snp.len()));
+
+        let (is_, ie_) = rb.dense_indel_range[r];
+        let base = dense_indel.len();
+        if let Some(d) = d_indel {
+            let keys = as_u32(&d.keys);
+            for j in is_..ie_ {
+                dense_indel.push(KeyRef {
+                    position: d_indel_pos[j],
+                    key: keys[j],
+                });
+            }
+        }
+        dense_indel_range.push((base, dense_indel.len()));
+    }
+
+    let mut vk: Vec<KeyRef> = Vec::new();
+    let mut vk_off: Vec<usize> = vec![0];
+    let mut dense_snp_present: Vec<u8> = Vec::new();
+    let mut dense_snp_present_off: Vec<usize> = vec![0];
+    let mut dense_indel_present: Vec<u8> = Vec::new();
+    let mut dense_indel_present_off: Vec<usize> = vec![0];
+
+    for r in 0..n_regions {
+        let qs = rb.region_starts[r];
+        let (ss, se) = rb.dense_snp_range[r];
+        let (is_r, ie_r) = rb.dense_indel_range[r];
+        for si in 0..n_samples {
+            let orig_s = rb.sample_cols[si];
+            for p in 0..ploidy {
+                let col = orig_s * ploidy + p;
+                let hap = col;
+                let row = r * hpr + si * ploidy + p;
+
+                // --- var_key gather (identical to gather_ranges) ---
+                let (vs, ve) = rb.vk_snp_range[row];
+                let mut snp_run: Vec<KeyRef> = Vec::new();
+                for (j, &pos) in snp_positions.iter().enumerate().take(ve).skip(vs) {
+                    if qs < pos + 1 {
+                        snp_run.push(KeyRef {
+                            position: pos,
+                            key: rvk::snp_code_to_key(rvk::unpack_snp_key_at(snp_keys, j)),
+                        });
+                    }
+                }
+                let (vis, vie) = rb.vk_indel_range[row];
+                let mut indel_run: Vec<KeyRef> = Vec::new();
+                for j in vis..vie {
+                    let pos = indel_positions[j];
+                    let v_end = pos + 1 + rvk::deletion_len(indel_keys[j]);
+                    if qs < v_end {
+                        indel_run.push(KeyRef {
+                            position: pos,
+                            key: indel_keys[j],
+                        });
+                    }
+                }
+                let merged = spine::merge_keys(vec![snp_run, indel_run]);
+                vk.extend_from_slice(&merged);
+                vk_off.push(vk.len());
+
+                // --- dense/snp presence bits over [ss..se) ---
+                let nbits = se - ss;
+                let bit_base = *dense_snp_present_off.last().unwrap();
+                let need = (bit_base + nbits).div_ceil(8);
+                if dense_snp_present.len() < need {
+                    dense_snp_present.resize(need, 0);
+                }
+                if let Some(d) = d_snp {
+                    for (k, j) in (ss..se).enumerate() {
+                        // snp v_end = pos + 1; left-overlap re-check qs < v_end.
+                        if d.carried(hap, j) && qs < d_snp_pos[j] + 1 {
+                            bits::set_bit(&mut dense_snp_present, bit_base + k);
+                        }
+                    }
+                }
+                dense_snp_present_off.push(bit_base + nbits);
+
+                // --- dense/indel presence bits over [is_r..ie_r) ---
+                let nbits = ie_r - is_r;
+                let bit_base = *dense_indel_present_off.last().unwrap();
+                let need = (bit_base + nbits).div_ceil(8);
+                if dense_indel_present.len() < need {
+                    dense_indel_present.resize(need, 0);
+                }
+                if let Some(d) = d_indel {
+                    let keys = as_u32(&d.keys);
+                    for (k, j) in (is_r..ie_r).enumerate() {
+                        let v_end = d_indel_pos[j] + 1 + rvk::deletion_len(keys[j]);
+                        if d.carried(hap, j) && qs < v_end {
+                            bits::set_bit(&mut dense_indel_present, bit_base + k);
+                        }
+                    }
+                }
+                dense_indel_present_off.push(bit_base + nbits);
+            }
+        }
+    }
+
+    BatchResultSplit {
+        n_regions,
+        n_samples,
+        ploidy,
+        vk,
+        vk_off,
+        dense_snp,
+        dense_snp_range,
+        dense_snp_present,
+        dense_snp_present_off,
+        dense_indel,
+        dense_indel_range,
+        dense_indel_present,
+        dense_indel_present_off,
+    }
+}
+
+/// Flat per-query read-bound gather for gvl's arbitrary-(region,sample) reads.
+/// Each of `n_q = region_starts.len()` queries is one (region, sample) pair
+/// reconstructing `ploidy` haps. Range arrays are per-query (`dense_*_range`,
+/// length n_q) or per-(query,ploid) (`vk_*_range`, length n_q*ploidy, row =
+/// q*ploidy + p). Builds zero SearchTrees and never calls `dense_union()`.
+/// Returns a `BatchResultSplit` with `n_samples = 1`, hap index `q*ploidy + p`.
+#[allow(clippy::needless_range_loop, clippy::too_many_arguments)]
+pub fn gather_haps_readbound(
+    reader: &ContigReader,
+    region_starts: &[u32],
+    orig_samples: &[usize],
+    vk_snp_range: &[(usize, usize)],
+    vk_indel_range: &[(usize, usize)],
+    dense_snp_range: &[(usize, usize)],
+    dense_indel_range: &[(usize, usize)],
+    ploidy: usize,
+) -> BatchResultSplit {
+    let n_q = region_starts.len();
+    assert_eq!(orig_samples.len(), n_q);
+    assert_eq!(dense_snp_range.len(), n_q);
+    assert_eq!(dense_indel_range.len(), n_q);
+    assert_eq!(vk_snp_range.len(), n_q * ploidy);
+    assert_eq!(vk_indel_range.len(), n_q * ploidy);
+
+    let snp_positions = reader.vk_snp.positions();
+    let snp_keys = as_bytes(&reader.vk_snp.keys);
+    let indel_positions = reader.vk_indel.positions();
+    let indel_keys = as_u32(&reader.vk_indel.keys);
+    let d_snp = reader.dense_snp.as_ref();
+    let d_indel = reader.dense_indel.as_ref();
+    let d_snp_pos: &[u32] = d_snp.map(|d| d.positions()).unwrap_or(&[]);
+    let d_indel_pos: &[u32] = d_indel.map(|d| d.positions()).unwrap_or(&[]);
+
+    // Dense windows per query (uniform keys), decoded once.
+    let mut dense_snp: Vec<KeyRef> = Vec::new();
+    let mut dense_snp_range_out: Vec<(usize, usize)> = Vec::with_capacity(n_q);
+    let mut dense_indel: Vec<KeyRef> = Vec::new();
+    let mut dense_indel_range_out: Vec<(usize, usize)> = Vec::with_capacity(n_q);
+    for q in 0..n_q {
+        let (ss, se) = dense_snp_range[q];
+        let base = dense_snp.len();
+        if let Some(d) = d_snp {
+            let keys = as_bytes(&d.keys);
+            for j in ss..se {
+                dense_snp.push(KeyRef {
+                    position: d_snp_pos[j],
+                    key: rvk::snp_code_to_key(rvk::unpack_snp_key_at(keys, j)),
+                });
+            }
+        }
+        dense_snp_range_out.push((base, dense_snp.len()));
+        let (is_, ie_) = dense_indel_range[q];
+        let base = dense_indel.len();
+        if let Some(d) = d_indel {
+            let keys = as_u32(&d.keys);
+            for j in is_..ie_ {
+                dense_indel.push(KeyRef {
+                    position: d_indel_pos[j],
+                    key: keys[j],
+                });
+            }
+        }
+        dense_indel_range_out.push((base, dense_indel.len()));
+    }
+
+    let mut vk: Vec<KeyRef> = Vec::new();
+    let mut vk_off: Vec<usize> = vec![0];
+    let mut dense_snp_present: Vec<u8> = Vec::new();
+    let mut dense_snp_present_off: Vec<usize> = vec![0];
+    let mut dense_indel_present: Vec<u8> = Vec::new();
+    let mut dense_indel_present_off: Vec<usize> = vec![0];
+
+    for q in 0..n_q {
+        let qs = region_starts[q];
+        let orig_s = orig_samples[q];
+        let (ss, se) = dense_snp_range[q];
+        let (is_r, ie_r) = dense_indel_range[q];
+        for p in 0..ploidy {
+            let hap = orig_s * ploidy + p;
+            let row = q * ploidy + p;
+
+            // var_key gather.
+            let (vs, ve) = vk_snp_range[row];
+            let mut snp_run: Vec<KeyRef> = Vec::new();
+            for (j, &pos) in snp_positions.iter().enumerate().take(ve).skip(vs) {
+                if qs < pos + 1 {
+                    snp_run.push(KeyRef {
+                        position: pos,
+                        key: rvk::snp_code_to_key(rvk::unpack_snp_key_at(snp_keys, j)),
+                    });
+                }
+            }
+            let (vis, vie) = vk_indel_range[row];
+            let mut indel_run: Vec<KeyRef> = Vec::new();
+            for j in vis..vie {
+                let pos = indel_positions[j];
+                let v_end = pos + 1 + rvk::deletion_len(indel_keys[j]);
+                if qs < v_end {
+                    indel_run.push(KeyRef {
+                        position: pos,
+                        key: indel_keys[j],
+                    });
+                }
+            }
+            vk.extend_from_slice(&spine::merge_keys(vec![snp_run, indel_run]));
+            vk_off.push(vk.len());
+
+            // dense/snp presence over [ss..se).
+            let nbits = se - ss;
+            let bit_base = *dense_snp_present_off.last().unwrap();
+            let need = (bit_base + nbits).div_ceil(8);
+            if dense_snp_present.len() < need {
+                dense_snp_present.resize(need, 0);
+            }
+            if let Some(d) = d_snp {
+                for (k, j) in (ss..se).enumerate() {
+                    if d.carried(hap, j) && qs < d_snp_pos[j] + 1 {
+                        bits::set_bit(&mut dense_snp_present, bit_base + k);
+                    }
+                }
+            }
+            dense_snp_present_off.push(bit_base + nbits);
+
+            // dense/indel presence over [is_r..ie_r).
+            let nbits = ie_r - is_r;
+            let bit_base = *dense_indel_present_off.last().unwrap();
+            let need = (bit_base + nbits).div_ceil(8);
+            if dense_indel_present.len() < need {
+                dense_indel_present.resize(need, 0);
+            }
+            if let Some(d) = d_indel {
+                let keys = as_u32(&d.keys);
+                for (k, j) in (is_r..ie_r).enumerate() {
+                    let v_end = d_indel_pos[j] + 1 + rvk::deletion_len(keys[j]);
+                    if d.carried(hap, j) && qs < v_end {
+                        bits::set_bit(&mut dense_indel_present, bit_base + k);
+                    }
+                }
+            }
+            dense_indel_present_off.push(bit_base + nbits);
+        }
+    }
+
+    BatchResultSplit {
+        n_regions: n_q,
+        n_samples: 1,
+        ploidy,
+        vk,
+        vk_off,
+        dense_snp,
+        dense_snp_range: dense_snp_range_out,
+        dense_snp_present,
+        dense_snp_present_off,
+        dense_indel,
+        dense_indel_range: dense_indel_range_out,
+        dense_indel_present,
+        dense_indel_present_off,
     }
 }
 
