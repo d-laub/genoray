@@ -4,6 +4,12 @@ use pyo3::prelude::*;
 use rayon::prelude::*;
 
 pub mod bits;
+
+/// Test-facing re-export of `bits::get_bit` for downstream (gvl-side) test
+/// oracles that reconstruct per-hap presence bitmasks from `BatchResultSplit`.
+pub fn bits_get_bit(bytes: &[u8], i: usize) -> bool {
+    bits::get_bit(bytes, i)
+}
 #[cfg(feature = "conversion")]
 pub mod budget;
 pub mod cost_model;

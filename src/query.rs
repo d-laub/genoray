@@ -15,7 +15,11 @@ use crate::layout::{self, ContigPaths};
 use crate::nrvk::LongAlleleReader;
 use crate::rvk::{self, DecodedKey};
 use crate::search::{SearchTree, overlap_range};
-use crate::spine::{self, KeyRef};
+use crate::spine;
+// Re-exported (not just imported) so downstream crates/tests can name
+// `genoray_core::query::KeyRef` directly, matching `BatchResultSplit`'s public
+// `vk: Vec<KeyRef>` field.
+pub use crate::spine::KeyRef;
 
 /// mmap a file into memory, returning `None` for a missing or zero-length file
 /// (memmap2 rejects empty maps; an absent sidecar means an empty sub-stream).
@@ -95,6 +99,14 @@ fn decode_keyref(kr: KeyRef, lut: Option<&LongAlleleReader>) -> Call {
             }
         }
     }
+}
+
+/// Test-facing public wrapper around `decode_keyref`: decode `(position, key)`
+/// against `reader`'s long-allele LUT and return just `ilen`. Lets gvl-side
+/// test oracles decode a raw `KeyRef` (as surfaced by `BatchResultSplit`)
+/// without duplicating the SNP/indel/long-INS decode logic.
+pub fn decode_keyref_pub(position: u32, key: u32, reader: &ContigReader) -> i32 {
+    decode_keyref(KeyRef { position, key }, reader.lut.as_ref()).ilen
 }
 
 /// A var_key sub-stream (snp or indel): mmap'd `positions.bin` + `alleles.bin`
