@@ -82,7 +82,8 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
   sorted-position invariant across chunk boundaries. Genotypes are remapped by comparing
   each haplotype's integer allele index to the atom's source ALT index. The former
   "input must be normalized" asserts are gone; symbolic/breakend ALTs are rejected and
-  `*`/`.` alleles are skipped.
+  `*`/`.` alleles are skipped. *(Making that hard rejection an opt-in skip instead of a
+  panic is [M13](#beyond-mvp).)*
 - [x] **M2b. Left-alignment during conversion.** Shift indels to their leftmost
   equivalent position. Deferred from M2 because it is the only normalization step that
   needs a reference genome (FASTA/faidx) and a new required conversion argument, and it
@@ -221,6 +222,19 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
   See [Format constraints](data-model.md#format-constraints-and-non-goals).
 - [ ] **M9. Subset by region.** Non-MVP. Doesn't affect cost-model calculations (no
   new variants; only shrinks variant tables), so it should be cheap.
+- [ ] **M13. Opt-in skip for out-of-scope alleles during conversion.** Today the reader
+  treats symbolic (`<DEL>`, `<INS:ME:*>`, `<DUP>`, `<INV>`, …) and breakend ALTs as a
+  hard error: `normalize::atomize_record` returns `SymbolicAllele` and
+  `vcf_reader::decompose_current_record` `.expect()`s on it, so a single out-of-scope
+  record aborts the entire conversion. Add an opt-in **skip-out-of-scope** mode to the
+  conversion entry point (`run_conversion_pipeline` / the `SparseVar2` writer) that drops
+  symbolic/breakend records — exactly as `*`/`.` alleles are already skipped in
+  `atomize_record` — and reports a count of what was dropped, rather than panicking.
+  Real short-read VCFs routinely carry a small tail of SV symbolic records that are
+  legitimately out of SVAR2's scope (e.g. 1000G chr21: 1368 symbolic ALTs out of ~1.0M,
+  surfaced during the gvl SVAR2 MVP validation), and requiring an external
+  `bcftools view -V other,bnd` pre-filter is avoidable friction. The strict default
+  (error) stays, so any silent variant drop is explicitly opt-in.
 
 ### Longer term
 
