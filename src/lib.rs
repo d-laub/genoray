@@ -7,6 +7,10 @@ pub mod bits;
 
 /// Test-facing re-export of `bits::get_bit` for downstream (gvl-side) test
 /// oracles that reconstruct per-hap presence bitmasks from `BatchResultSplit`.
+///
+/// Intentionally public (not `cfg(test)`-gated): ships in `genoray_core`'s
+/// public API as part of the gvl-side read-bound parity-oracle surface,
+/// alongside `query::decode_keyref_pub`/`query::decode_keyref_alt_pub`.
 pub fn bits_get_bit(bytes: &[u8], i: usize) -> bool {
     bits::get_bit(bytes, i)
 }

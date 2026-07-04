@@ -105,8 +105,24 @@ fn decode_keyref(kr: KeyRef, lut: Option<&LongAlleleReader>) -> Call {
 /// against `reader`'s long-allele LUT and return just `ilen`. Lets gvl-side
 /// test oracles decode a raw `KeyRef` (as surfaced by `BatchResultSplit`)
 /// without duplicating the SNP/indel/long-INS decode logic.
+///
+/// Intentionally public (not `cfg(test)`-gated): this ships in `genoray_core`'s
+/// public API as the gvl-side read-bound parity-oracle surface, alongside
+/// `decode_keyref_alt_pub` and `bits_get_bit`.
 pub fn decode_keyref_pub(position: u32, key: u32, reader: &ContigReader) -> i32 {
     decode_keyref(KeyRef { position, key }, reader.lut.as_ref()).ilen
+}
+
+/// Like `decode_keyref_pub`, but also returns the decoded ALT bytes so test
+/// oracles can assert on alleles (not just `ilen`, which is `0` for every SNP
+/// regardless of which base it decodes to).
+///
+/// Intentionally public (not `cfg(test)`-gated): part of the gvl-side
+/// read-bound parity-oracle surface alongside `decode_keyref_pub` and
+/// `bits_get_bit`.
+pub fn decode_keyref_alt_pub(position: u32, key: u32, reader: &ContigReader) -> (i32, Vec<u8>) {
+    let call = decode_keyref(KeyRef { position, key }, reader.lut.as_ref());
+    (call.ilen, call.alt)
 }
 
 /// A var_key sub-stream (snp or indel): mmap'd `positions.bin` + `alleles.bin`

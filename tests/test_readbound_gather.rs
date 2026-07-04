@@ -5,7 +5,7 @@ mod common;
 
 use common::{SynthRecord, build_contig};
 use genoray_core::query::{
-    BatchResultSplit, ContigReader, HapCalls, decode_keyref_pub, find_ranges,
+    BatchResultSplit, ContigReader, HapCalls, decode_keyref_alt_pub, find_ranges,
     gather_haps_readbound, gather_ranges_readbound, overlap_batch,
 };
 use genoray_core::search;
@@ -30,6 +30,18 @@ fn synth_reader(out: &std::path::Path) -> ContigReader {
             ref_allele: b"A",
             alts: vec![&b"C"[..]],
             gt: vec![1, 1, 1, 1],
+        },
+        // Partially-carried dense SNP: AC=2 (haps 0,1 carry; haps 2,3 don't).
+        // Same cost model as pos-150 (np=4, snp per_call=34): dense_bits=38 <
+        // var_key_bits=34·x for x>=2, so this also routes to Dense — but unlike
+        // pos-150 (AC=4, all-carried) it exercises BOTH a TRUE and a FALSE
+        // dense-SNP present bit. Different ALT (`G` vs pos-150's `C`) so an
+        // allele-level parity check actually discriminates a wrong-allele bug.
+        SynthRecord {
+            pos: 175,
+            ref_allele: b"A",
+            alts: vec![&b"G"[..]],
+            gt: vec![1, 1, 0, 0],
         },
         SynthRecord {
             pos: 200,
@@ -141,21 +153,27 @@ fn test_readbound_reconstructs_union_per_hap() {
     for r in 0..oracle.n_regions {
         for s in 0..oracle.n_samples {
             for p in 0..oracle.ploidy {
-                // Oracle: decode via the shipped union decode_hap, keep (pos, key).
+                // Oracle: decode via the shipped union decode_hap, keep the full
+                // (position, ilen, alt) triple. Comparing only (position, ilen)
+                // would miss a wrong-allele-at-correct-position bug for SNPs,
+                // since every SNP has ilen == 0 regardless of which base it
+                // decodes to.
                 let hc: HapCalls = oracle.decode_hap(&reader, r, s, p);
-                // decode_hap returns decoded alts, not raw keys — compare on the
-                // (position, ilen) projection that survives decode instead.
-                let want: Vec<(u32, i32)> = hc
+                let want: Vec<(u32, i32, Vec<u8>)> = hc
                     .positions
                     .iter()
                     .zip(hc.ilens.iter())
-                    .map(|(&a, &b)| (a, b))
+                    .zip(hc.alts.iter())
+                    .map(|((&a, &b), c)| (a, b, c.clone()))
                     .collect();
                 let got_keys = readbound_decode_hap(&got, &reader, r, s, p);
-                // Decode the read-bound raw keys the same way to get ilens.
-                let got_dec: Vec<(u32, i32)> = got_keys
+                // Decode the read-bound raw keys the same way, keeping the ALT.
+                let got_dec: Vec<(u32, i32, Vec<u8>)> = got_keys
                     .iter()
-                    .map(|&(pos, key)| (pos, decode_keyref_pub(pos, key as u32, &reader)))
+                    .map(|&(pos, key)| {
+                        let (ilen, alt) = decode_keyref_alt_pub(pos, key as u32, &reader);
+                        (pos, ilen, alt)
+                    })
                     .collect();
                 assert_eq!(got_dec, want, "hap (r={r}, s={s}, p={p})");
             }

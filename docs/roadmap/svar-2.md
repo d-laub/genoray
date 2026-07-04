@@ -256,6 +256,12 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
     primitive gvl links for its arbitrary-`(region, sample)` reads. The Python `find_ranges`
     dict exposes the two new `(R, 2)` **i32** range keys (matching the sibling `dense_range`;
     streamable via the existing generic `out=` path) for the gvl write cache.
+    Perf note: because the two per-class ranges are computed unconditionally, `find_ranges`
+    (and therefore `read_ranges`) now builds **2 extra per-region `SearchTree`s**
+    (dense_snp/dense_indel overlap) for *every* caller, including union-only readers that
+    never consume `dense_snp_range`/`dense_indel_range`. This is a small region-level cost —
+    comparable to the existing `dense_union` region overlap `SearchTree` — not the dominant
+    per-hap tree builds M6d already removed.
   **Additive:** M6d's `find_ranges`/`gather_ranges`/`read_ranges`/`overlap_batch`/`BatchResult`
   stay byte-unchanged as the parity oracle. Parity is pinned per hap against both the union
   path and the `decode_hap` oracle, with a zero-`SearchTree` control test and both dense
