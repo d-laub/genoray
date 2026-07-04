@@ -21,6 +21,7 @@ pub mod py_convert;
 pub mod py_query;
 pub mod py_query_batch;
 pub mod py_query_decode;
+pub mod py_query_ranges;
 pub mod query;
 pub mod rvk;
 pub mod search;

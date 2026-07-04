@@ -4,9 +4,53 @@
 mod common;
 
 use common::{SynthRecord, build_contig};
+use genoray_core::py_query::PyContigReader;
 use genoray_core::query::{ContigReader, find_ranges, gather_ranges, overlap_batch, read_ranges};
 use genoray_core::search;
+use numpy::{PyArray1, PyArray2, PyArrayMethods};
+use pyo3::prelude::*;
+use pyo3::types::{PyDict, PyDictMethods};
 use tempfile::tempdir;
+
+fn i32_slice<'py>(d: &Bound<'py, PyDict>, k: &str) -> Vec<i32> {
+    let obj = d.get_item(k).unwrap().unwrap();
+    let arr = obj.cast::<PyArray1<i32>>().unwrap().readonly();
+    arr.as_slice().unwrap().to_vec()
+}
+fn i64_slice<'py>(d: &Bound<'py, PyDict>, k: &str) -> Vec<i64> {
+    let obj = d.get_item(k).unwrap().unwrap();
+    let arr = obj.cast::<PyArray1<i64>>().unwrap().readonly();
+    arr.as_slice().unwrap().to_vec()
+}
+fn u8_slice<'py>(d: &Bound<'py, PyDict>, k: &str) -> Vec<u8> {
+    let obj = d.get_item(k).unwrap().unwrap();
+    let arr = obj.cast::<PyArray1<u8>>().unwrap().readonly();
+    arr.as_slice().unwrap().to_vec()
+}
+fn i32_2d_flat<'py>(d: &Bound<'py, PyDict>, k: &str) -> Vec<i32> {
+    let obj = d.get_item(k).unwrap().unwrap();
+    let arr = obj.cast::<PyArray2<i32>>().unwrap().readonly();
+    arr.as_array().iter().copied().collect()
+}
+
+fn assert_payload_dicts_eq<'py>(a: &Bound<'py, PyDict>, b: &Bound<'py, PyDict>) {
+    for k in ["vk_pos", "vk_key", "dense_pos", "dense_key"] {
+        assert_eq!(i32_slice(a, k), i32_slice(b, k), "key {k}");
+    }
+    for k in ["vk_off", "dense_present_off"] {
+        assert_eq!(i64_slice(a, k), i64_slice(b, k), "key {k}");
+    }
+    assert_eq!(
+        u8_slice(a, "dense_present"),
+        u8_slice(b, "dense_present"),
+        "key dense_present"
+    );
+    assert_eq!(
+        i32_2d_flat(a, "dense_range"),
+        i32_2d_flat(b, "dense_range"),
+        "key dense_range"
+    );
+}
 
 fn synth_reader(out: &std::path::Path) -> ContigReader {
     let samples = ["S0", "S1"];
@@ -149,4 +193,39 @@ fn test_gather_ranges_builds_no_search_tree() {
         search::search_tree_build_count() > b2,
         "find_ranges should build trees"
     );
+}
+
+#[test]
+fn test_py_read_ranges_dict_matches_overlap_batch_dict() {
+    let tmp = tempdir().unwrap();
+    let out = tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let _reader = synth_reader(&out);
+    let base = out.to_str().unwrap().to_string();
+    let regions = vec![(0u32, 1_000_000u32), (250u32, 400u32)];
+
+    Python::attach(|py| {
+        let pr = PyContigReader::new(&base, "chr1", 2, 2).unwrap();
+        let d_ob = pr.overlap_batch(py, regions.clone()).unwrap();
+        let d_rr = pr.read_ranges(py, regions.clone(), None).unwrap();
+        assert_payload_dicts_eq(&d_ob, &d_rr);
+    });
+}
+
+#[test]
+fn test_py_gather_of_find_matches_read_dict() {
+    let tmp = tempdir().unwrap();
+    let out = tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let _reader = synth_reader(&out);
+    let base = out.to_str().unwrap().to_string();
+    let regions = vec![(0u32, 1_000_000u32), (250u32, 400u32)];
+
+    Python::attach(|py| {
+        let pr = PyContigReader::new(&base, "chr1", 2, 2).unwrap();
+        let bundle = pr.find_ranges(py, regions.clone(), None).unwrap();
+        let d_gather = pr.gather_ranges(py, bundle).unwrap();
+        let d_read = pr.read_ranges(py, regions.clone(), None).unwrap();
+        assert_payload_dicts_eq(&d_gather, &d_read);
+    });
 }
