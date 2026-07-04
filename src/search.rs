@@ -44,6 +44,18 @@ fn block_upper(block: &[u32], x: u32) -> usize {
     i
 }
 
+thread_local! {
+    static TREE_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Test/observability hook: number of `SearchTree::new` calls on the current
+/// thread. Used by the SVAR2 search/gather split to prove `gather_ranges`
+/// builds zero trees (the search already happened in `find_ranges`).
+#[doc(hidden)]
+pub fn search_tree_build_count() -> usize {
+    TREE_BUILDS.with(|c| c.get())
+}
+
 /// A static search tree over a sorted ascending `u32` array. Built once, queried
 /// many times. See the module docs for the layout.
 pub struct SearchTree {
@@ -61,6 +73,7 @@ impl SearchTree {
     /// Build a tree over `sorted` (ascending). Values must be `< u32::MAX`.
     /// `O(n)` construction.
     pub fn new(sorted: &[u32]) -> Self {
+        TREE_BUILDS.with(|c| c.set(c.get() + 1));
         let n = sorted.len();
         let nblocks = n.div_ceil(B);
         let mut tree = SearchTree {

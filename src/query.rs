@@ -579,6 +579,248 @@ pub fn overlap_batch(reader: &ContigReader, regions: &[(u32, u32)]) -> BatchResu
     }
 }
 
+/// Search-only half of the batch query: every `SearchTree::new` runs here, and
+/// the result is a compact bundle of index ranges that `gather_ranges` replays
+/// with no further search.
+///
+/// `H = n_samples * ploidy` (subset-aware: `n_samples` counts only the
+/// *selected* samples); row index into `vk_snp_range`/`vk_indel_range` is
+/// `r * H + si * ploidy + p`, where `si` is the selected slot (not the
+/// original sample index — see `sample_cols`).
+pub struct RangesBundle {
+    pub n_regions: usize,
+    pub n_samples: usize,
+    pub ploidy: usize,
+    /// `q_start` per region — needed by `gather_ranges`'s left-overlap re-check.
+    pub region_starts: Vec<u32>,
+    /// `[s, e)` into the shared dense union, per region.
+    pub dense_range: Vec<(usize, usize)>,
+    /// Selected slot -> original sample index.
+    pub sample_cols: Vec<usize>,
+    /// Absolute `[start, end)` into `vk_snp`'s packed positions/keys, per
+    /// `(region, selected sample, ploid)`.
+    pub vk_snp_range: Vec<(usize, usize)>,
+    /// Absolute `[start, end)` into `vk_indel`'s packed positions/keys, per
+    /// `(region, selected sample, ploid)`.
+    pub vk_indel_range: Vec<(usize, usize)>,
+}
+
+impl ContigReader {
+    /// Absolute `[start, end)` into `vk_snp`'s packed positions/keys for
+    /// `(col, region)` — the SNP channel's search half (`max_region_length =
+    /// 0`, since a SNP always spans exactly one base). No gather.
+    fn vk_snp_overlap(&self, col: usize, q_start: u32, q_end: u32) -> (usize, usize) {
+        let (o0, o1) = self.vk_snp.column(col);
+        let positions = &self.vk_snp.positions()[o0..o1];
+        if positions.is_empty() {
+            return (o0, o0);
+        }
+        let v_ends: Vec<u32> = positions.iter().map(|&p| p + 1).collect();
+        let tree = SearchTree::new(positions);
+        let (s, e) = overlap_range(&tree, &v_ends, 0, q_start, q_end);
+        (o0 + s, o0 + e)
+    }
+
+    /// Absolute `[start, end)` into `vk_indel`'s packed positions/keys for
+    /// `(col, region)` — the indel channel's search half (per-column
+    /// `max_del` bound). No gather.
+    fn vk_indel_overlap(
+        &self,
+        col: usize,
+        sample: usize,
+        p: usize,
+        q_start: u32,
+        q_end: u32,
+    ) -> (usize, usize) {
+        let (o0, o1) = self.vk_indel.column(col);
+        let positions = &self.vk_indel.positions()[o0..o1];
+        if positions.is_empty() {
+            return (o0, o0);
+        }
+        let keys = &as_u32(&self.vk_indel.keys)[o0..o1];
+        let max_del = self.vk_indel_max_del[[sample, p]];
+        let v_ends: Vec<u32> = positions
+            .iter()
+            .enumerate()
+            .map(|(i, &pos)| pos + 1 + rvk::deletion_len(keys[i]))
+            .collect();
+        let tree = SearchTree::new(positions);
+        let (s, e) = overlap_range(&tree, &v_ends, max_del, q_start, q_end);
+        (o0 + s, o0 + e)
+    }
+}
+
+/// Search-only pass: run every `SearchTree::new` up front and record the
+/// resulting index ranges. `find_ranges` owns ALL tree builds for the batch
+/// query (region-level dense union overlap + per-hap var_key overlap);
+/// `gather_ranges` replays the ranges it produces with zero further search.
+pub fn find_ranges(
+    reader: &ContigReader,
+    regions: &[(u32, u32)],
+    samples: Option<&[usize]>,
+) -> RangesBundle {
+    let ploidy = reader.ploidy;
+    let sample_cols: Vec<usize> = match samples {
+        Some(s) => s.to_vec(),
+        None => (0..reader.n_samples).collect(),
+    };
+    let n_samples = sample_cols.len();
+    let n_regions = regions.len();
+    let h = n_samples * ploidy;
+
+    // Region-independent union; `overlap` builds one SearchTree per region.
+    let dense = reader.dense_union();
+    let dense_range: Vec<(usize, usize)> = regions
+        .iter()
+        .map(|&(qs, qe)| dense.overlap(qs, qe))
+        .collect();
+    let region_starts: Vec<u32> = regions.iter().map(|&(qs, _)| qs).collect();
+
+    let mut vk_snp_range = Vec::with_capacity(n_regions * h);
+    let mut vk_indel_range = Vec::with_capacity(n_regions * h);
+    for &(qs, qe) in regions {
+        for &orig_s in &sample_cols {
+            for p in 0..ploidy {
+                let col = orig_s * ploidy + p;
+                vk_snp_range.push(reader.vk_snp_overlap(col, qs, qe));
+                vk_indel_range.push(reader.vk_indel_overlap(col, orig_s, p, qs, qe));
+            }
+        }
+    }
+
+    RangesBundle {
+        n_regions,
+        n_samples,
+        ploidy,
+        region_starts,
+        dense_range,
+        sample_cols,
+        vk_snp_range,
+        vk_indel_range,
+    }
+}
+
+/// Tree-free gather: replay a `RangesBundle` into the same `BatchResult` that
+/// `overlap_batch` produces. Contains NO `SearchTree::new` — the search
+/// already happened in `find_ranges`. Mirrors `overlap_batch`'s inner loop
+/// exactly, except the var_key channel is replayed from the precomputed
+/// ranges (no per-column `SearchTree` rebuild, no per-element `carried` test
+/// — `vk_slice`'s `carried` closure is `|_| true` for both channels, so only
+/// the `q_start < v_end` left-overlap re-check remains) and the loop runs
+/// over the *selected* sample slots.
+pub fn gather_ranges(reader: &ContigReader, rb: &RangesBundle) -> BatchResult {
+    let ploidy = rb.ploidy;
+    let n_samples = rb.n_samples;
+    let n_regions = rb.n_regions;
+    let hpr = n_samples * ploidy; // haps per region
+
+    let dense = reader.dense_union();
+
+    let mut vk: Vec<KeyRef> = Vec::new();
+    let mut vk_off: Vec<usize> = vec![0];
+    let mut dense_present: Vec<u8> = Vec::new();
+    let mut dense_present_off: Vec<usize> = vec![0];
+
+    let snp_positions = reader.vk_snp.positions();
+    let snp_keys = as_bytes(&reader.vk_snp.keys);
+    let indel_positions = reader.vk_indel.positions();
+    let indel_keys = as_u32(&reader.vk_indel.keys);
+
+    for r in 0..n_regions {
+        let qs = rb.region_starts[r];
+        let (ds, de) = rb.dense_range[r];
+        for si in 0..n_samples {
+            let orig_s = rb.sample_cols[si];
+            for p in 0..ploidy {
+                let col = orig_s * ploidy + p;
+                let hap = col; // sample-major hap index == flat column
+                let row = r * hpr + si * ploidy + p;
+
+                // --- var_key gather (no search) ---
+                let (ss, se) = rb.vk_snp_range[row];
+                let mut snp_run: Vec<KeyRef> = Vec::new();
+                for (j, &pos) in snp_positions.iter().enumerate().take(se).skip(ss) {
+                    if qs < pos + 1 {
+                        // snp v_end = pos + 1
+                        snp_run.push(KeyRef {
+                            position: pos,
+                            key: rvk::snp_code_to_key(rvk::unpack_snp_key_at(snp_keys, j)),
+                        });
+                    }
+                }
+
+                let (is_, ie_) = rb.vk_indel_range[row];
+                let mut indel_run: Vec<KeyRef> = Vec::new();
+                for j in is_..ie_ {
+                    let pos = indel_positions[j];
+                    let v_end = pos + 1 + rvk::deletion_len(indel_keys[j]);
+                    if qs < v_end {
+                        indel_run.push(KeyRef {
+                            position: pos,
+                            key: indel_keys[j],
+                        });
+                    }
+                }
+
+                let merged = spine::merge_keys(vec![snp_run, indel_run]);
+                vk.extend_from_slice(&merged);
+                vk_off.push(vk.len());
+
+                // --- dense presence bits (verbatim from overlap_batch) ---
+                let nbits = de - ds;
+                let bit_base = *dense_present_off.last().unwrap();
+                let need_bytes = (bit_base + nbits).div_ceil(8);
+                if dense_present.len() < need_bytes {
+                    dense_present.resize(need_bytes, 0);
+                }
+                for (k, j) in (ds..de).enumerate() {
+                    let (is_indel, dcol) = dense.src[j];
+                    let carried = if is_indel {
+                        reader
+                            .dense_indel
+                            .as_ref()
+                            .expect("indel src implies table")
+                            .carried(hap, dcol)
+                    } else {
+                        reader
+                            .dense_snp
+                            .as_ref()
+                            .expect("snp src implies table")
+                            .carried(hap, dcol)
+                    };
+                    if carried && dense.v_ends[j] > qs {
+                        bits::set_bit(&mut dense_present, bit_base + k);
+                    }
+                }
+                dense_present_off.push(bit_base + nbits);
+            }
+        }
+    }
+
+    BatchResult {
+        n_regions,
+        n_samples,
+        ploidy,
+        vk,
+        vk_off,
+        dense: dense.refs,
+        dense_range: rb.dense_range.clone(),
+        dense_present,
+        dense_present_off,
+    }
+}
+
+/// Fused search+gather: `find_ranges` then `gather_ranges` in one call. The
+/// public/live-query analog of the split; byte-identical to `overlap_batch`
+/// when `samples = None`, and the parity oracle for sample subsetting.
+pub fn read_ranges(
+    reader: &ContigReader,
+    regions: &[(u32, u32)],
+    samples: Option<&[usize]>,
+) -> BatchResult {
+    gather_ranges(reader, &find_ranges(reader, regions, samples))
+}
+
 impl BatchResult {
     /// Decode the merged `var_key ⋈ dense` variants that `(sample s, ploid p)`
     /// carries in region `r` — position-sorted `(position, ilen, alt)`, identical
