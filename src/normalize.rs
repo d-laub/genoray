@@ -45,20 +45,28 @@ pub struct Atom {
 }
 
 /// Decompose one VCF record into atomic biallelic primitives, appended to `out`.
-/// `alts` are the ALT alleles only (REF excluded). `*` / `.` alleles are skipped;
-/// symbolic/breakend alleles return an error.
+/// `alts` are the ALT alleles only (REF excluded). `*` / `.` alleles are always
+/// skipped. Symbolic/breakend alleles are skipped and counted when
+/// `skip_out_of_scope` is set; otherwise they return an error. Returns the number
+/// of out-of-scope ALTs dropped (always 0 unless `skip_out_of_scope`).
 pub fn atomize_record(
     pos: u32,
     ref_allele: &[u8],
     alts: &[&[u8]],
     out: &mut Vec<Atom>,
-) -> Result<(), NormalizeError> {
+    skip_out_of_scope: bool,
+) -> Result<u32, NormalizeError> {
+    let mut dropped = 0u32;
     for (j, &alt) in alts.iter().enumerate() {
         let src = (j + 1) as u16;
         if alt == b"*" || alt == b"." {
             continue;
         }
         if is_symbolic(alt) {
+            if skip_out_of_scope {
+                dropped += 1;
+                continue;
+            }
             return Err(NormalizeError::SymbolicAllele {
                 pos,
                 alt: String::from_utf8_lossy(alt).into_owned(),
@@ -66,7 +74,7 @@ pub fn atomize_record(
         }
         atomize_biallelic(pos, ref_allele, alt, src, out);
     }
-    Ok(())
+    Ok(dropped)
 }
 
 /// Fail-fast check that a record's REF allele matches the reference FASTA. Left-alignment
@@ -246,7 +254,7 @@ mod tests {
 
     fn atoms(pos: u32, r: &[u8], alts: &[&[u8]]) -> Vec<Atom> {
         let mut out = Vec::new();
-        atomize_record(pos, r, alts, &mut out).unwrap();
+        atomize_record(pos, r, alts, &mut out, false).unwrap();
         out
     }
 
@@ -332,11 +340,39 @@ mod tests {
     fn symbolic_allele_errors() {
         let mut out = Vec::new();
         assert!(matches!(
-            atomize_record(100, b"A", &[b"<DEL>"], &mut out),
+            atomize_record(100, b"A", &[b"<DEL>"], &mut out, false),
             Err(NormalizeError::SymbolicAllele { .. })
         ));
         assert!(matches!(
-            atomize_record(100, b"A", &[b"A[chr2:321[".as_slice()], &mut out),
+            atomize_record(100, b"A", &[b"A[chr2:321[".as_slice()], &mut out, false),
+            Err(NormalizeError::SymbolicAllele { .. })
+        ));
+    }
+
+    #[test]
+    fn symbolic_allele_skipped_and_counted_when_opted_in() {
+        // Multiallelic: one real SNP + one symbolic ALT. With skip on, the SNP
+        // survives and the symbolic ALT is dropped and counted.
+        let mut out = Vec::new();
+        let dropped = atomize_record(100, b"A", &[b"C", b"<DEL>"], &mut out, true).unwrap();
+        assert_eq!(dropped, 1);
+        assert_eq!(out, vec![atom(100, 0, b"C", 1)]);
+    }
+
+    #[test]
+    fn breakend_allele_skipped_when_opted_in() {
+        let mut out = Vec::new();
+        let dropped =
+            atomize_record(100, b"A", &[b"A[chr2:321[".as_slice()], &mut out, true).unwrap();
+        assert_eq!(dropped, 1);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn out_of_scope_errors_when_skip_disabled() {
+        let mut out = Vec::new();
+        assert!(matches!(
+            atomize_record(100, b"A", &[b"<DEL>"], &mut out, false),
             Err(NormalizeError::SymbolicAllele { .. })
         ));
     }
@@ -510,7 +546,7 @@ mod tests {
             let mut out = Vec::new();
             let ref_bytes: Vec<u8> = r;
             let alt_bytes: Vec<u8> = a;
-            atomize_record(pos, &ref_bytes, &[alt_bytes.as_slice()], &mut out).unwrap();
+            atomize_record(pos, &ref_bytes, &[alt_bytes.as_slice()], &mut out, false).unwrap();
             for at in &out {
                 let alt_len = at.alt.len() as i32;
                 let valid = (at.ilen == 0 && alt_len == 1)

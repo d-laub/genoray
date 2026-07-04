@@ -166,7 +166,7 @@ impl VcfChunkReader {
 
         let alt_refs: Vec<&[u8]> = alts_owned.iter().map(|a| a.as_slice()).collect();
         let mut atoms = Vec::new();
-        atomize_record(pos, &ref_allele, &alt_refs, &mut atoms)
+        atomize_record(pos, &ref_allele, &alt_refs, &mut atoms, false)
             .expect("symbolic/breakend ALT is out of scope for SVAR2 (short-read only)");
 
         for atom in atoms {
