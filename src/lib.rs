@@ -32,6 +32,24 @@ pub mod writer;
 
 pub use orchestrator::process_chromosome;
 
+/// Build a `.csi` index next to a bgzipped-VCF / BCF at `path`. CSI (min_shift 14)
+/// is valid for both, so one path covers `.vcf.gz` and `.bcf`.
+pub fn index_bcf_csi(path: &str) -> Result<(), String> {
+    let idx = format!("{path}.csi");
+    rust_htslib::bcf::index::build(
+        path,
+        Some(idx.as_str()),
+        1,
+        rust_htslib::bcf::index::Type::Csi(14),
+    )
+    .map_err(|e| format!("failed to build .csi index for {path}: {e:?}"))
+}
+
+#[pyfunction]
+fn index_vcf(path: String) -> PyResult<()> {
+    index_bcf_csi(&path).map_err(pyo3::exceptions::PyRuntimeError::new_err)
+}
+
 //The Python Wrapper and resource allocator
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
@@ -145,6 +163,7 @@ fn run_conversion_pipeline(
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run_conversion_pipeline, m)?)?;
+    m.add_function(wrap_pyfunction!(index_vcf, m)?)?;
     m.add_class::<crate::py_query::PyContigReader>()?;
     Ok(())
 }
