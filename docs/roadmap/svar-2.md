@@ -230,6 +230,26 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
 - [ ] **M12. Bulk merge of multiple SVAR2 files.** A general N-way merge (more
   involved than the by-contig merge of M8 because it can change the cost model and
   must rebuild LUTs / variant tables).
+- [x] **M13. Opt-in skip-out-of-scope during conversion + CLI/Python entry points.**
+  Today the Rust conversion core hard-errors on symbolic (`<DEL>`, `<INS:ME:*>`, …)
+  and breakend ALTs; add an opt-in skip mode (exactly like the existing `*`/`.`
+  skip) that drops them and reports a count, keeping the strict default. Also add
+  the missing entry points for driving SVAR2 conversion outside Rust tests.
+  *Done:* `atomize_record` takes an opt-in `skip_out_of_scope` flag and returns
+  the dropped-allele count instead of erroring (`normalize.rs`); the count
+  threads through `VcfChunkReader` → `process_chromosome` →
+  `run_conversion_pipeline`, which also gained an optional `reference_path`
+  (`Option<String>`) — omitting it skips `validate_ref`/`left_align` for
+  pre-normalized input — and now returns the total dropped count; a new
+  `index_vcf` PyO3 helper builds a `.csi` for un-indexed input; the Python
+  `SparseVar2.from_vcf(out, source, reference=None, *, no_reference=False,
+  skip_out_of_scope=False, ...)` classmethod wraps all of the above (exactly one
+  of `reference`/`no_reference` required, auto-indexes, VCF/BCF-only, returns
+  the dropped count as `int`); and the `genoray write` CLI now defaults to
+  SVAR2 (`--reference` XOR `--no-reference`, `--no-symbolic`/`--no-breakend`
+  coupled → skip and print the dropped count) with `genoray write svar1` for
+  the previous SVAR 1.0 behavior. See the design spec
+  [`../superpowers/specs/2026-07-03-svar2-cli-write-and-m13-skip-design.md`](../superpowers/specs/2026-07-03-svar2-cli-write-and-m13-skip-design.md).
 
 ## Working agreement
 
