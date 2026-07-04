@@ -50,7 +50,7 @@ source** rather than reasoning from first principles.
 - `max_mem` accepts strings like `"4g"`, `"512m"`, `"2GB"`.
 - Contig names auto-normalize: `"chr1"` and `"1"` both work regardless of file convention (`ContigNormalizer`).
 - Missing genotype = `-1` (int). Missing dosage = `np.nan` (float32).
-- Ploidy is 2 by default; `SparseVar.from_vcf`/`from_pgen` (and `genoray write`) accept `haploid=True` / `--haploid`, which OR-collapses haplotypes into a single haploid call per sample and records `ploidy=1` in metadata (intended for unphased somatic data).
+- Ploidy is 2 by default; `SparseVar.from_vcf`/`from_pgen` (and `genoray write svar1`) accept `haploid=True` / `--haploid`, which OR-collapses haplotypes into a single haploid call per sample and records `ploidy=1` in metadata (intended for unphased somatic data).
 - All return arrays are NumPy; `mode` selects which arrays you get back.
 
 ## Mode constants — gotcha
