@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     import numpy as np
@@ -11,6 +11,10 @@ if TYPE_CHECKING:
 
 class _BatchQueryMixin:
     """Raw ``BatchResult`` → numpy query methods."""
+
+    # Provided by the concrete SparseVar2 host class (see SparseVar2.__init__);
+    # declared here so the mixin's use of it type-checks in isolation.
+    _readers: dict[str, Any]
 
     def overlap_batch(
         self, contig: str, regions: Iterable[tuple[int, int]]

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     import numpy as np
@@ -12,6 +12,12 @@ if TYPE_CHECKING:
 
 class _DecodeMixin:
     """Decoded-record and decode-free-count query methods."""
+
+    # Provided by the concrete SparseVar2 host class (see SparseVar2.__init__);
+    # declared here so the mixin's use of it type-checks in isolation. (n_samples
+    # and ploidy are @property on the host, so they can't be redeclared as plain
+    # attributes here without a bad-override; they're accessed via an ignore below.)
+    _readers: dict[str, Any]
 
     def decode(self, contig: str, regions: Iterable[tuple[int, int]]) -> "Ragged":
         """Materialize overlapping variants for ``contig`` into a record ``Ragged``.
@@ -42,4 +48,5 @@ class _DecodeMixin:
         ``(R, S, P)``. The simplified ``SparseVar.var_ranges`` replacement."""
         reg = [(int(s), int(e)) for s, e in regions]
         flat = self._readers[contig].region_counts(reg)
-        return flat.reshape(len(reg), self.n_samples, self.ploidy)
+        # n_samples/ploidy are @property on the SparseVar2 host (see note above).
+        return flat.reshape(len(reg), self.n_samples, self.ploidy)  # type: ignore[missing-attribute]

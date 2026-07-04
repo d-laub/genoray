@@ -343,7 +343,7 @@ def _sbs96_codes(
     tt = np.where(purine, 3 - f, t)
     sub = _SUB_LUT[np.clip(rr, 0, 3), np.clip(aa, 0, 3)]
     code = (sub * 16 + ff * 4 + tt).astype(np.int16)
-    return np.where(valid, code, _UNCL)
+    return np.where(valid, code, _UNCL)  # type: ignore[bad-argument-type]
 
 
 def _dbs78_codes(
@@ -361,7 +361,7 @@ def _dbs78_codes(
     code = _DBS_TABLE[
         np.clip(r0, 0, 3), np.clip(r1, 0, 3), np.clip(a0, 0, 3), np.clip(a1, 0, 3)
     ]
-    return np.where(valid, code, _UNCL)
+    return np.where(valid, code, _UNCL)  # type: ignore[bad-argument-type]
 
 
 def _build_id83_luts() -> tuple[np.ndarray, np.ndarray, np.ndarray]:

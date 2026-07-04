@@ -61,7 +61,7 @@ vcfixture = ">=0.6.0,<0.7"
 [tasks]
 gen = "sh tests/data/gen_from_vcf.sh"
 test = { cmd = "pytest tests", depends-on = "gen" }
-typecheck = "pyrefly check genoray"
+typecheck = "pyrefly check python/genoray"
 prek-install = "prek install -t pre-commit -t pre-push -t commit-msg"
 bump-dry = "cz bump --dry-run"
 

@@ -71,8 +71,11 @@ bindings = "pyo3"
 [tool.pyrefly]
 preset = "strict"
 project-includes = ["python/genoray"]
-# pgenlib is a compiled extension with no type stubs; treat it as untyped.
-replace-imports-with-any = ["pgenlib"]
+# pgenlib and the _core Rust extension are compiled with no type stubs; treat
+# them as untyped. `genoray._core` only matches when imported as a submodule
+# (`import genoray._core`), not `from genoray import _core` (which resolves via
+# the package __getattr__), so importers must use the submodule form.
+replace-imports-with-any = ["pgenlib", "genoray._core"]
 
 [tool.pyrefly.errors]
 # Mostly numpy-scalar noise (np.integer -> np.integer[Any]) and the Phantom

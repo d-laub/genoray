@@ -5,7 +5,7 @@ from pathlib import Path
 
 from natsort import natsorted
 
-from genoray import _core
+import genoray._core as _core
 from genoray._svar2_batch import _BatchQueryMixin
 from genoray._svar2_decode import _DecodeMixin
 
