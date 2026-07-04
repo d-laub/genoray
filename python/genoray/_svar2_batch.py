@@ -86,7 +86,13 @@ class _BatchQueryMixin:
         d = self._readers[contig].find_ranges(reg, self._sample_idxs(samples))
         if out is not None:
             for k, buf in out.items():
-                np.asarray(buf)[...] = np.asarray(d[k])
+                src = np.asarray(d[k])
+                dst = np.asarray(buf)
+                if dst.shape != src.shape:
+                    raise ValueError(
+                        f"out[{k!r}] has shape {dst.shape}, expected {src.shape}"
+                    )
+                dst[...] = src
                 d[k] = buf
         return d
 

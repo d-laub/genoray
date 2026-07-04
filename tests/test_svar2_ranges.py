@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import numpy as np
+import pytest
 
 from genoray import SparseVar2
 
@@ -58,6 +59,21 @@ def test_read_ranges_sample_subset(svar2_store: Path):
             full["vk_pos"][full["vk_off"][fh] : full["vk_off"][fh + 1]],
             sub["vk_pos"][sub["vk_off"][sh] : sub["vk_off"][sh + 1]],
         )
+
+
+def test_read_ranges_unknown_sample_raises(svar2_store: Path):
+    sv = SparseVar2(svar2_store)
+    with pytest.raises(ValueError):
+        sv.read_ranges("chr1", [0], [40], samples=["NOT_A_SAMPLE"])
+
+
+def test_gather_ranges_mismatched_samples_raises(svar2_store: Path):
+    sv = SparseVar2(svar2_store)
+    ranges = sv.find_ranges("chr1", [0], [40], samples=[sv.samples[0]])
+    with pytest.raises(ValueError):
+        sv.gather_ranges("chr1", ranges, samples=[sv.samples[1]])
+    # A matching subset is allowed and should not raise.
+    sv.gather_ranges("chr1", ranges, samples=[sv.samples[0]])
 
 
 def test_find_ranges_out_streaming(svar2_store: Path):
