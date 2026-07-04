@@ -235,7 +235,37 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
   `python/genoray/_svar2_batch.py`; tests `tests/test_ranges_split.rs` + `tests/test_svar2_ranges.py`.
   *Open question (follow-up):* whether to convert the read path to **fully read-bound** by also
   caching the region-independent dense union (so the read replay touches no per-query merge at
-  all) — deferred; the current split already removes the dominant `SearchTree::build` cost.
+  all) — **resolved in M6e**, which eliminates the contig-wide dense union entirely via a
+  per-class gather.
+
+- [x] **M6e. Read-bound per-class gather + query-only build (shipped, `svar-2`).** Answers
+  M6d's open question and gives gvl an htslib-free Rust path-dep on genoray. Two additive
+  changes on top of M6d:
+  - A **`conversion` cargo feature (default-on)** gates every htslib-touching module, so
+    `cargo build --no-default-features` compiles the read/query core alone (no `rust-htslib`).
+    That is exactly what gvl links as `genoray_core = { path = …, default-features = false }`.
+    The default (wheel) build is behavior-unchanged. (The repo's test suites run under
+    `--no-default-features --features conversion`: default `extension-module` breaks
+    test-binary linking, and the e2e tests still need htslib.)
+  - `find_ranges` additionally emits per-class `dense_snp_range` / `dense_indel_range`
+    (each per-region, computed by a per-class `SearchTree` at search time), and a new
+    `gather_ranges_readbound` slices each on-disk dense **class** window directly into a
+    split-dense `BatchResultSplit` (var_key merged per hap as before; dense split per class),
+    **never calling `dense_union()`** and building **zero** `SearchTree`s — eliminating M6d's
+    O(N_contig) per-read dense residual. A flat-per-query `gather_haps_readbound` is the
+    primitive gvl links for its arbitrary-`(region, sample)` reads. The Python `find_ranges`
+    dict exposes the two new `(R, 2)` **i32** range keys (matching the sibling `dense_range`;
+    streamable via the existing generic `out=` path) for the gvl write cache.
+  **Additive:** M6d's `find_ranges`/`gather_ranges`/`read_ranges`/`overlap_batch`/`BatchResult`
+  stay byte-unchanged as the parity oracle. Parity is pinned per hap against both the union
+  path and the `decode_hap` oracle, with a zero-`SearchTree` control test and both dense
+  classes (SNP + indel) exercised. See the design plan
+  [`../superpowers/plans/2026-07-04-svar2-genoray-readbound-gather.md`](../superpowers/plans/2026-07-04-svar2-genoray-readbound-gather.md).
+  *Done:* `conversion` feature (`Cargo.toml` + `src/lib.rs` cfg-gates); per-class
+  `dense_snp_overlap`/`dense_indel_overlap` + `RangesBundle` fields + `BatchResultSplit` +
+  `gather_ranges_readbound`/`gather_haps_readbound` in `src/query.rs`; the two new dict keys in
+  `src/py_query_ranges.rs`; tests `tests/test_query_only_build.rs` + `tests/test_readbound_gather.rs`
+  + `tests/test_py_ranges_readbound.py`.
 
 ### Beyond MVP
 
