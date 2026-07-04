@@ -164,3 +164,14 @@ sorted streams.
   budget × rayon threads. Open: how to tune the budget vs. thread count at cohort scale.
 - **PGEN path (M7).** Whether the htslib reader stage is cleanly swappable for a
   `pgenlib` FFI source behind the same chunk contract.
+- **Read-bound conversion / thread allocation for few-contig jobs.** rayon fans out across
+  *contigs*, so a conversion of one (or few) contigs runs a single Reader→Encode→Writer
+  pipeline and leaves most cores idle. Observed on a gvl SVAR2 MVP build (single contig,
+  8-core job): `1 concurrent chromosome | 3 HTSlib decompression threads each (7 total
+  active, 1 idle)`, with VCF read/decompress plainly dominating wall-clock (chr21:
+  germline ~11 min, somatic 16007-sample ~2 h). Open: when contig-parallelism is low,
+  rebalance threads toward the Reader — e.g. reserve ~1 thread for the executor+writer and
+  give the remainder to htslib decompression + record decoding, and/or parallelize the
+  Reader stage *within* a contig. Requires profiling to confirm the read stage is the
+  bottleneck and to size the split — see the gvl SVAR2 profiling follow-up spec
+  (`GenVarLoader:docs/superpowers/specs/2026-07-03-svar2-profiling-followup.md`).
