@@ -53,6 +53,9 @@ build-backend = "maturin"
 requires = ["maturin>=1.0,<2.0"]
 
 [tool.pytest.ini_options]
+# Put the repo root on sys.path so shared test helpers import as `from tests import _oracle`
+# (tests/ has no __init__.py; main's suite relies on this).
+pythonpath = ["."]
 filterwarnings = ["ignore::DeprecationWarning:sorted_nearest.*"]
 markers = [
     "network: requires network access (deselect with '-m not network')",
