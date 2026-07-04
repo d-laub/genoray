@@ -1,22 +1,37 @@
 // src/lib.rs
 use pyo3::prelude::*;
+#[cfg(feature = "conversion")]
 use rayon::prelude::*;
 
 pub mod bits;
+#[cfg(feature = "conversion")]
 pub mod budget;
 pub mod cost_model;
 pub mod dense;
+#[cfg(feature = "conversion")]
 pub mod dense_merge;
 pub mod error;
+#[cfg(feature = "conversion")]
 pub mod executor;
 pub mod layout;
+#[cfg(feature = "conversion")]
 pub mod max_del;
+#[cfg(feature = "conversion")]
 pub mod merge;
+#[cfg(feature = "conversion")]
 pub mod meta;
+#[cfg(feature = "conversion")]
 pub mod monitor;
+#[cfg(feature = "conversion")]
 pub mod normalize;
 pub mod nrvk;
+#[cfg(feature = "conversion")]
 pub mod orchestrator;
+// NOTE: `py_convert` is *not* conversion-only despite being in the original gate
+// list: query-core `py_query_batch.rs`/`py_query_decode.rs`/`py_query_ranges.rs`
+// import its numpy-array conversion helpers unconditionally, and py_convert.rs
+// itself has zero htslib dependency (pure numpy/pyo3 glue). Stays ungated as
+// shared infra, same reasoning as `streams` above.
 pub mod py_convert;
 pub mod py_query;
 pub mod py_query_batch;
@@ -26,15 +41,24 @@ pub mod query;
 pub mod rvk;
 pub mod search;
 pub mod spine;
+// NOTE: `streams` (StreamTag/StreamMap/REGISTRY) is *not* conversion-only despite
+// being in the original gate list: query-core `rvk.rs` and `types.rs` depend on it
+// unconditionally (StreamMap is a real struct field / decode-path type, not just an
+// errant import), and streams.rs itself has zero htslib dependency. Gating it broke
+// the query-core build; it stays ungated as shared infra.
 pub mod streams;
 pub mod types;
+#[cfg(feature = "conversion")]
 pub mod vcf_reader;
+#[cfg(feature = "conversion")]
 pub mod writer;
 
+#[cfg(feature = "conversion")]
 pub use orchestrator::process_chromosome;
 
 /// Build a `.csi` index next to a bgzipped-VCF / BCF at `path`. CSI (min_shift 14)
 /// is valid for both, so one path covers `.vcf.gz` and `.bcf`.
+#[cfg(feature = "conversion")]
 pub fn index_bcf_csi(path: &str) -> Result<(), String> {
     let idx = format!("{path}.csi");
     rust_htslib::bcf::index::build(
@@ -46,12 +70,14 @@ pub fn index_bcf_csi(path: &str) -> Result<(), String> {
     .map_err(|e| format!("failed to build .csi index for {path}: {e:?}"))
 }
 
+#[cfg(feature = "conversion")]
 #[pyfunction]
 fn index_vcf(path: String) -> PyResult<()> {
     index_bcf_csi(&path).map_err(pyo3::exceptions::PyRuntimeError::new_err)
 }
 
 //The Python Wrapper and resource allocator
+#[cfg(feature = "conversion")]
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
 #[pyo3(signature = (vcf_path, reference_path, chroms, output_dir, samples, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false))]
@@ -163,7 +189,9 @@ fn run_conversion_pipeline(
 
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    #[cfg(feature = "conversion")]
     m.add_function(wrap_pyfunction!(run_conversion_pipeline, m)?)?;
+    #[cfg(feature = "conversion")]
     m.add_function(wrap_pyfunction!(index_vcf, m)?)?;
     m.add_class::<crate::py_query::PyContigReader>()?;
     Ok(())
