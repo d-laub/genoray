@@ -214,6 +214,28 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
   (offset diffs + dense-mask popcount) as the simplified replacement for SVAR 1.0's
   `SparseVar.var_ranges` (variant indices no longer fit the data model — there is no
   unified variant table).
+- [x] **M6d. Search/gather split for write-time overlap caching (shipped, `svar-2`).**
+  Splits the fused `query::overlap_batch` into a **search-only** `find_ranges` (runs every
+  `SearchTree::new` and returns a compact `RangesBundle` of index ranges), a **tree-free**
+  `gather_ranges` (pure slicing + `q_start < v_end` left-overlap re-check + k-way merge, no
+  trees — a thread-local `SearchTree` build counter backs an integration test proving it
+  builds zero trees), and a fused `read_ranges = gather_ranges(find_ranges(...))` wrapper.
+  Lets a downstream cache (gvl `write`) run the interval search **once** at write time and
+  replay it at read time with no `SearchTree::build`. Exposed on `PyContigReader` and the
+  Python `SparseVar2` (`find_ranges`/`gather_ranges`/`read_ranges`, each with `samples=`
+  subsetting matching every other `SparseVar` range method; `out=` streaming on `find_ranges`
+  writes the bundle into caller-preallocated arrays so `gvl.write` can stream straight to a
+  memmap). **Additive:** `overlap_batch` stays byte-unchanged; the byte-identical parity
+  contract `overlap_batch ≡ read_ranges ≡ gather_ranges(find_ranges(...))` is pinned
+  field-for-field by cargo + pytest tests, and `overlap_batch` remains the `decode`-validated
+  oracle (`decode = overlap_batch → decode_hap`). See the design plan
+  [`../superpowers/plans/2026-07-03-svar2-genoray-search-gather-split.md`](../superpowers/plans/2026-07-03-svar2-genoray-search-gather-split.md).
+  *Done:* `RangesBundle` + `find_ranges`/`gather_ranges`/`read_ranges` in `src/query.rs`;
+  `PyContigReader` bindings in `src/py_query_ranges.rs`; `SparseVar2` methods in
+  `python/genoray/_svar2_batch.py`; tests `tests/test_ranges_split.rs` + `tests/test_svar2_ranges.py`.
+  *Open question (follow-up):* whether to convert the read path to **fully read-bound** by also
+  caching the region-independent dense union (so the read replay touches no per-query merge at
+  all) — deferred; the current split already removes the dominant `SearchTree::build` cost.
 
 ### Beyond MVP
 
