@@ -26,11 +26,12 @@ fn write_ref(fasta_path: &Path, chrom: &str, seq: &[u8]) {
 fn drain(bcf: &Path, fasta: &Path, chrom: &str, samples: &[&str]) -> Vec<(u32, i32)> {
     let mut reader = VcfChunkReader::new(
         bcf.to_str().unwrap(),
-        fasta.to_str().unwrap(),
+        Some(fasta.to_str().unwrap()),
         chrom,
         samples,
         1,
         2,
+        false,
     );
     let mut out = Vec::new();
     let mut cid = 0;
@@ -233,11 +234,12 @@ fn left_shifts_stay_sorted_across_chunk_boundaries() {
     // chunk_size = 1 forces every atom into its own chunk.
     let mut reader = VcfChunkReader::new(
         bcf.to_str().unwrap(),
-        fasta.to_str().unwrap(),
+        Some(fasta.to_str().unwrap()),
         "chr1",
         &samples,
         1,
         2,
+        false,
     );
     let mut positions = Vec::new();
     let mut cid = 0;
@@ -297,11 +299,12 @@ proptest! {
 
         let mut reader = VcfChunkReader::new(
             bcf.to_str().unwrap(),
-            fasta.to_str().unwrap(),
+            Some(fasta.to_str().unwrap()),
             "chr1",
             &samples,
             1,
             2,
+            false,
         );
         let mut positions = Vec::new();
         let mut cid = 0;

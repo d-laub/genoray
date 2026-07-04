@@ -175,7 +175,7 @@ pub fn build_contig(
     build_fasta_with_index(&fasta, chrom, 1_000_000, records);
     process_chromosome(
         bcf.to_str().unwrap(),
-        fasta.to_str().unwrap(),
+        Some(fasta.to_str().unwrap()),
         chrom,
         out.to_str().unwrap(),
         samples,
@@ -183,6 +183,7 @@ pub fn build_contig(
         ploidy,
         1,    // htslib_threads
         4096, // long_allele_capacity
+        false,
     )
     .expect("process_chromosome should succeed");
     write_max_del_fixture(&out.join(chrom), samples.len(), ploidy, records);

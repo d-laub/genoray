@@ -43,7 +43,7 @@ parallel memory architecture.
 #[allow(clippy::too_many_arguments)]
 pub fn process_chromosome(
     vcf_path: &str,
-    fasta_path: &str,
+    fasta_path: Option<&str>,
     chrom: &str,
     base_out_dir: &str,
     samples: &[&str],
@@ -51,7 +51,8 @@ pub fn process_chromosome(
     ploidy: usize,
     htslib_threads: usize,
     long_allele_capacity: usize,
-) -> Result<(), ConversionError> {
+    skip_out_of_scope: bool,
+) -> Result<u64, ConversionError> {
     // Directory Formatting: svar2/{contig}/var_key/{snp,indel}
     let paths = crate::layout::ContigPaths::new(base_out_dir, chrom);
 
@@ -119,7 +120,7 @@ pub fn process_chromosome(
         .name(format!("read-{}", chrom))
         .spawn({
             let vcf = vcf_path.to_string();
-            let fasta = fasta_path.to_string();
+            let fasta = fasta_path.map(|s| s.to_string());
             let chr = chrom.to_string();
             // Convert references into owned Strings that can safely live forever in the thread
             let s_owned: Vec<String> = samples.iter().map(|&s| s.to_string()).collect();
@@ -127,13 +128,21 @@ pub fn process_chromosome(
             move || {
                 // passing the thread budget down to HTSLib
                 let s_refs: Vec<&str> = s_owned.iter().map(|s| s.as_str()).collect();
-                let mut reader =
-                    VcfChunkReader::new(&vcf, &fasta, &chr, &s_refs, htslib_threads, ploidy);
+                let mut reader = VcfChunkReader::new(
+                    &vcf,
+                    fasta.as_deref(),
+                    &chr,
+                    &s_refs,
+                    htslib_threads,
+                    ploidy,
+                    skip_out_of_scope,
+                );
                 let mut chunk_id = 0;
                 while let Some(dense_chunk) = reader.read_next_chunk(chunk_size, chunk_id) {
                     tx_dense.send(dense_chunk).unwrap();
                     chunk_id += 1;
                 }
+                reader.dropped_out_of_scope()
             }
         })
         .expect("spawn reader");
@@ -182,7 +191,7 @@ pub fn process_chromosome(
     let chunk_writer_res = chunk_writer_thread.join();
     let long_allele_writer_res = long_allele_writer_thread.join();
 
-    reader_res.map_err(|_| ConversionError::WorkerPanicked {
+    let dropped = reader_res.map_err(|_| ConversionError::WorkerPanicked {
         thread: format!("read-{}", chrom),
     })?;
     sampler_res.map_err(|_| ConversionError::WorkerPanicked {
@@ -261,5 +270,5 @@ pub fn process_chromosome(
 
     println!("[{}] Pipeline Execution Finished Successfully.", chrom);
 
-    Ok(())
+    Ok(dropped)
 }

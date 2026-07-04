@@ -21,11 +21,12 @@ fn drain_reader(
     let fasta_path = bcf_path.with_extension("fa");
     let mut reader = VcfChunkReader::new(
         bcf_path.to_str().unwrap(),
-        fasta_path.to_str().unwrap(),
+        Some(fasta_path.to_str().unwrap()),
         chrom,
         samples,
         1,
         ploidy,
+        false,
     );
     let columns = samples.len() * ploidy;
     let mut out = Vec::new();

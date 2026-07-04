@@ -35,11 +35,11 @@ pub use orchestrator::process_chromosome;
 //The Python Wrapper and resource allocator
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (vcf_path, reference_path, chroms, output_dir, samples, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608))]
+#[pyo3(signature = (vcf_path, reference_path, chroms, output_dir, samples, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false))]
 fn run_conversion_pipeline(
     py: Python,
     vcf_path: String,
-    reference_path: String,
+    reference_path: Option<String>,
     chroms: Vec<String>, // now taking a vector
     output_dir: String,
     samples: Vec<String>,
@@ -47,10 +47,11 @@ fn run_conversion_pipeline(
     ploidy: usize,
     max_threads: Option<usize>,  // accepts an optional integer from Python
     long_allele_capacity: usize, // default 8MB — old 100MB rarely flushed mid-run, blocking executor at finalize
-) -> PyResult<()> {
+    skip_out_of_scope: bool,
+) -> PyResult<usize> {
     let sample_refs: Vec<&str> = samples.iter().map(|s| s.as_str()).collect();
 
-    let results: Vec<Result<(), crate::error::ConversionError>> = py.detach(|| {
+    let results: Vec<Result<u64, crate::error::ConversionError>> = py.detach(|| {
         // Step 1 -> HW discovery/override and budgeting
         let available_cores = match max_threads {
             Some(t) if t > 0 => {
@@ -95,6 +96,7 @@ fn run_conversion_pipeline(
             .unwrap();
 
         // Step 3 -> Dispatch
+        let fasta_ref: Option<&str> = reference_path.as_deref();
         let results = pool.install(|| {
             chroms
                 .par_iter()
@@ -102,7 +104,7 @@ fn run_conversion_pipeline(
                     println!("==> Processing {}", chrom);
                     orchestrator::process_chromosome(
                         &vcf_path,
-                        &reference_path,
+                        fasta_ref,
                         chrom,
                         &output_dir,
                         &sample_refs,
@@ -110,6 +112,7 @@ fn run_conversion_pipeline(
                         ploidy,
                         htslib_threads,
                         long_allele_capacity,
+                        skip_out_of_scope,
                     )
                 })
                 .collect::<Vec<_>>()
@@ -119,8 +122,9 @@ fn run_conversion_pipeline(
         results
     });
 
+    let mut total_dropped: u64 = 0;
     for r in results {
-        r.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        total_dropped += r.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
     }
 
     // All contigs converted — write the top-level meta.json describing the cohort.
@@ -135,7 +139,7 @@ fn run_conversion_pipeline(
         pyo3::exceptions::PyRuntimeError::new_err(format!("failed to write meta.json: {e}"))
     })?;
 
-    Ok(())
+    Ok(total_dropped as usize)
 }
 
 #[pymodule]

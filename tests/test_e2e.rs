@@ -89,7 +89,7 @@ fn test_e2e_normalized_bcf_pipeline() {
 
     process_chromosome(
         bcf_path.to_str().unwrap(),
-        bcf_path.with_extension("fa").to_str().unwrap(),
+        Some(bcf_path.with_extension("fa").to_str().unwrap()),
         "chr1",
         out_dir.to_str().unwrap(),
         &samples,
@@ -97,6 +97,7 @@ fn test_e2e_normalized_bcf_pipeline() {
         2,    // ploidy
         1,    // htslib_threads
         4096, // long_allele_capacity
+        false,
     )
     .expect("process_chromosome should succeed");
 
@@ -176,7 +177,7 @@ fn test_e2e_max_del_postpass() {
     std::fs::create_dir_all(&out_dir).unwrap();
     process_chromosome(
         bcf_path.to_str().unwrap(),
-        bcf_path.with_extension("fa").to_str().unwrap(),
+        Some(bcf_path.with_extension("fa").to_str().unwrap()),
         "chr1",
         out_dir.to_str().unwrap(),
         &samples,
@@ -184,6 +185,7 @@ fn test_e2e_max_del_postpass() {
         2,
         1,
         4096,
+        false,
     )
     .expect("conversion");
 
@@ -247,7 +249,7 @@ fn test_e2e_dense_snp_roundtrip() {
     std::fs::create_dir_all(&out_dir).unwrap();
     process_chromosome(
         bcf_path.to_str().unwrap(),
-        bcf_path.with_extension("fa").to_str().unwrap(),
+        Some(bcf_path.with_extension("fa").to_str().unwrap()),
         "chr1",
         out_dir.to_str().unwrap(),
         &samples,
@@ -255,6 +257,7 @@ fn test_e2e_dense_snp_roundtrip() {
         2,
         1,
         4096,
+        false,
     )
     .expect("conversion");
 
@@ -317,7 +320,7 @@ fn test_e2e_mutation_conservation() {
 
     process_chromosome(
         bcf_path.to_str().unwrap(),
-        bcf_path.with_extension("fa").to_str().unwrap(),
+        Some(bcf_path.with_extension("fa").to_str().unwrap()),
         "chr1",
         out_dir.to_str().unwrap(),
         &samples,
@@ -325,6 +328,7 @@ fn test_e2e_mutation_conservation() {
         2,
         1,
         4096,
+        false,
     )
     .expect("process_chromosome should succeed");
 
@@ -375,11 +379,12 @@ fn test_reader_accepts_pure_del() {
 
     let mut reader = VcfChunkReader::new(
         bcf_path.to_str().unwrap(),
-        bcf_path.with_extension("fa").to_str().unwrap(),
+        Some(bcf_path.with_extension("fa").to_str().unwrap()),
         "chr1",
         &samples,
         1,
         2,
+        false,
     );
     let chunk = reader
         .read_next_chunk(100, 0)
@@ -412,7 +417,7 @@ fn test_missing_chrom_returns_err() {
 
     let res = genoray_core::orchestrator::process_chromosome(
         bcf_path.to_str().unwrap(),
-        bcf_path.with_extension("fa").to_str().unwrap(),
+        Some(bcf_path.with_extension("fa").to_str().unwrap()),
         "chrZ",
         out_dir.to_str().unwrap(),
         &["s0"],
@@ -420,6 +425,7 @@ fn test_missing_chrom_returns_err() {
         2,
         1,
         1 << 20,
+        false,
     );
 
     assert!(matches!(

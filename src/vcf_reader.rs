@@ -42,6 +42,13 @@ pub struct VcfChunkReader {
     // full 0-based contig sequence, uppercased. Consumed by `validate_ref`/`left_align`
     // in `decompose_current_record`.
     ref_seq: Vec<u8>,
+    // Whether a reference FASTA was provided. When false, `validate_ref` and
+    // `left_align` are skipped and the input is trusted to be pre-normalized.
+    has_reference: bool,
+    // Whether to skip (vs. error on) out-of-scope symbolic/breakend ALTs.
+    skip_out_of_scope: bool,
+    // Running count of out-of-scope ALTs dropped across this contig.
+    dropped_out_of_scope: u64,
 
     // Reorder state, persisted across read_next_chunk calls.
     record: Record,
@@ -55,11 +62,12 @@ impl VcfChunkReader {
     // opens the file, applies the sample filter at the C-level, and jumps to the chromosome.
     pub fn new(
         vcf_path: &str,
-        fasta_path: &str,
+        fasta_path: Option<&str>,
         chrom: &str,
         samples: &[&str],
         htslib_threads: usize,
         ploidy: usize,
+        skip_out_of_scope: bool,
     ) -> Self {
         let mut reader = IndexedReader::from_path(vcf_path)
             .expect("Failed to open VCF/BCF index. Is there a .tbi or .csi file?");
@@ -87,28 +95,33 @@ impl VcfChunkReader {
             })
             .collect();
 
-        // Cache the full contig once per worker (simplest; one contig per worker at a
-        // time). fetch_seq's `end` is inclusive, so [0, contig_len-1]. Uppercase so
-        // soft-masked (lowercase) reference bases compare equal to uppercase VCF alleles.
-        let fasta = rust_htslib::faidx::Reader::from_path(fasta_path)
-            .expect("Failed to open reference FASTA (is there a .fai?)");
-        // htslib's faidx_seq_len returns -1 for an unknown contig, which fetch_seq_len
-        // (via rust-htslib) surfaces as u64::MAX rather than 0 — check for it explicitly
-        // so a missing contig fails fast with a clear message instead of the generic
-        // "Failed to fetch contig" panic below.
-        let contig_len_raw = fasta.fetch_seq_len(chrom);
-        if contig_len_raw == u64::MAX {
-            panic!("Contig '{chrom}' not found in reference FASTA");
-        }
-        let contig_len = contig_len_raw as usize;
-        let mut ref_seq = if contig_len == 0 {
-            Vec::new()
-        } else {
-            fasta
-                .fetch_seq(chrom, 0, contig_len - 1)
-                .expect("Failed to fetch contig from reference FASTA")
+        // Reference is optional. With a FASTA, cache the full uppercased contig for
+        // validate_ref/left_align; without one, leave it empty and skip both.
+        let (ref_seq, has_reference) = match fasta_path {
+            Some(path) => {
+                let fasta = rust_htslib::faidx::Reader::from_path(path)
+                    .expect("Failed to open reference FASTA (is there a .fai?)");
+                // htslib's faidx_seq_len returns -1 for an unknown contig, which
+                // fetch_seq_len (via rust-htslib) surfaces as u64::MAX rather than 0 —
+                // check for it explicitly so a missing contig fails fast with a clear
+                // message instead of the generic "Failed to fetch contig" panic below.
+                let contig_len_raw = fasta.fetch_seq_len(chrom);
+                if contig_len_raw == u64::MAX {
+                    panic!("Contig '{chrom}' not found in reference FASTA");
+                }
+                let contig_len = contig_len_raw as usize;
+                let mut ref_seq = if contig_len == 0 {
+                    Vec::new()
+                } else {
+                    fasta
+                        .fetch_seq(chrom, 0, contig_len - 1)
+                        .expect("Failed to fetch contig from reference FASTA")
+                };
+                ref_seq.make_ascii_uppercase();
+                (ref_seq, true)
+            }
+            None => (Vec::new(), false),
         };
-        ref_seq.make_ascii_uppercase();
 
         let record = reader.empty_record();
 
@@ -118,12 +131,20 @@ impl VcfChunkReader {
             ploidy,
             sample_indices,
             ref_seq,
+            has_reference,
+            skip_out_of_scope,
+            dropped_out_of_scope: 0,
             record,
             heap: BinaryHeap::new(),
             frontier: 0,
             eof: false,
             next_seq: 0,
         }
+    }
+
+    /// Total out-of-scope ALTs dropped so far (valid after the read loop drains).
+    pub fn dropped_out_of_scope(&self) -> u64 {
+        self.dropped_out_of_scope
     }
 
     // Decompose `self.record` into atoms and push them onto the reorder heap, sharing
@@ -159,20 +180,33 @@ impl VcfChunkReader {
         }
         let gt = Rc::new(gt);
 
-        // Fail fast if the record's REF disagrees with the reference FASTA — left-alignment
-        // rolls against the reference, so a mismatch would silently corrupt positions.
-        crate::normalize::validate_ref(pos, &ref_allele, &self.ref_seq)
-            .expect("REF disagrees with reference FASTA");
+        // Fail fast only when a reference is available; without one we trust the
+        // input is already normalized/left-aligned.
+        if self.has_reference {
+            crate::normalize::validate_ref(pos, &ref_allele, &self.ref_seq)
+                .expect("REF disagrees with reference FASTA");
+        }
 
         let alt_refs: Vec<&[u8]> = alts_owned.iter().map(|a| a.as_slice()).collect();
         let mut atoms = Vec::new();
-        atomize_record(pos, &ref_allele, &alt_refs, &mut atoms, false)
-            .expect("symbolic/breakend ALT is out of scope for SVAR2 (short-read only)");
+        let dropped = atomize_record(
+            pos,
+            &ref_allele,
+            &alt_refs,
+            &mut atoms,
+            self.skip_out_of_scope,
+        )
+        .expect("symbolic/breakend ALT is out of scope for SVAR2 (short-read only)");
+        self.dropped_out_of_scope += dropped as u64;
 
         for atom in atoms {
-            // Left-align each anchored indel to its leftmost equivalent position (SNPs and
-            // substituted-anchor insertions are returned unchanged).
-            let atom = crate::normalize::left_align(atom, &self.ref_seq, crate::normalize::L_MAX);
+            // Left-align only when a reference is available; otherwise store the atom
+            // at its as-given (right-trimmed) position.
+            let atom = if self.has_reference {
+                crate::normalize::left_align(atom, &self.ref_seq, crate::normalize::L_MAX)
+            } else {
+                atom
+            };
             let seq = self.next_seq;
             self.next_seq += 1;
             self.heap.push(Reverse(PendingAtom {
