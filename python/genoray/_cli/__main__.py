@@ -43,8 +43,86 @@ def index(source: Path):
         raise ValueError(f"Unsupported file type: {source}")
 
 
-@app.command
-def write(
+write = App(
+    name="write", help="Convert a VCF/PGEN to a SparseVar file (SVAR2 by default)."
+)
+app.command(write)
+
+
+@write.default
+def write_svar2(
+    source: Path,
+    out: Path,
+    *,
+    reference: Annotated[Path | None, Parameter(name="--reference")] = None,
+    no_reference: Annotated[
+        bool, Parameter(name="--no-reference", negative="")
+    ] = False,
+    ploidy: int = 2,
+    chunk_size: int = 25_000,
+    threads: Annotated[int | None, Parameter(name=["--threads", "-@"])] = None,
+    long_allele_capacity: int = 8 * 1024 * 1024,
+    overwrite: bool = False,
+    no_symbolic: Annotated[bool, Parameter(name="--no-symbolic", negative="")] = False,
+    no_breakend: Annotated[bool, Parameter(name="--no-breakend", negative="")] = False,
+) -> None:
+    """
+    Convert a bgzipped VCF or BCF to an SVAR2 store (the default, better-across-the-board format).
+
+    Parameters
+    ----------
+    source
+        Path to a bgzipped VCF (``.vcf.gz``) or BCF (``.bcf``). Auto-indexed
+        (``.csi``) if no index is present.
+    out
+        Path to the output SVAR2 directory.
+    reference
+        Path to a reference FASTA (with ``.fai``). Used to validate REF and
+        left-align indels. Exactly one of ``--reference`` or ``--no-reference``
+        is required.
+    no_reference
+        Skip REF validation and indel left-alignment; the input is trusted to be
+        already normalized. Use only for pre-normalized (e.g. ``bcftools norm``)
+        inputs.
+    ploidy
+        Ploidy of the samples. Default 2.
+    chunk_size
+        Variants per conversion chunk. Default 25000.
+    threads
+        Number of threads. Defaults to all available cores.
+    long_allele_capacity
+        Advanced: byte budget for the streaming long-allele buffer.
+    overwrite
+        Overwrite the output directory if it exists.
+    no_symbolic
+        Drop records with a symbolic ALT (``<DEL>``, ``<INS>``, …) instead of
+        erroring. On SVAR2 this is coupled with ``--no-breakend`` (the core does
+        not distinguish the two classes); passing either drops both.
+    no_breakend
+        Drop records with a breakend ALT. Coupled with ``--no-symbolic`` on
+        SVAR2 (see above).
+    """
+    from genoray import SparseVar2
+
+    skip_out_of_scope = no_symbolic or no_breakend
+    dropped = SparseVar2.from_vcf(
+        out,
+        source,
+        reference,
+        no_reference=no_reference,
+        skip_out_of_scope=skip_out_of_scope,
+        ploidy=ploidy,
+        chunk_size=chunk_size,
+        threads=threads,
+        overwrite=overwrite,
+        long_allele_capacity=long_allele_capacity,
+    )
+    if skip_out_of_scope:
+        print(f"Dropped {dropped} out-of-scope (symbolic/breakend) ALT alleles.")
+
+
+@write.command(name="svar1")
+def write_svar1(
     source: Path,
     out: Path,
     max_mem: str = "1g",
@@ -56,7 +134,7 @@ def write(
     haploid: Annotated[bool, Parameter(name="--haploid", negative="")] = False,
 ) -> None:
     """
-    Convert a VCF or PGEN file to a SVAR file.
+    Convert a VCF or PGEN file to a SVAR 1.0 file.
 
     Parameters
     ----------
@@ -77,19 +155,12 @@ def write(
         Number of threads to use for conversion. Defaults to the number of available CPU cores.
     no_symbolic
         If set, drop records whose ALT contains a symbolic allele
-        (``<DEL>``, ``<INS>``, etc.) per VCF 4.x. Applies to both VCF and PGEN
-        sources. Recommended for SV-bearing cohorts (e.g. 1kGP SNV_INDEL_SV
-        panels) to avoid emitting literal ``<DEL>`` ASCII bytes into downstream
-        haplotype buffers.
+        (``<DEL>``, ``<INS>``, etc.) per VCF 4.x.
     no_breakend
-        If set, drop records whose ALT contains a breakend (BND) in mate-pair or
-        single-breakend notation (``G[chr2:321[``, ``]chr2:321]G``, ``.TGCA``,
-        ``TGCA.``). A distinct ALT class from symbolic alleles; combine with
-        ``--no-symbolic`` to drop everything haplotype consumers cannot expand.
+        If set, drop records whose ALT contains a breakend (BND).
     haploid
         If set, OR-collapse the ploidy axis into a single haploid call per
-        sample (a variant present on any haplotype becomes one call) and record
-        ``ploidy=1`` in the output metadata. Intended for unphased somatic data.
+        sample and record ``ploidy=1`` in the output metadata.
     """
     from genoray import PGEN, VCF, SparseVar, exprs
     from genoray._utils import variant_file_type
@@ -104,10 +175,6 @@ def write(
     if threads is None:
         threads = -1
 
-    # Compose the requested ALT-class filters. Each flag contributes a polars
-    # expr (used by both VCF index and PGEN) and a record-level predicate (used
-    # by the VCF cyvcf2 genotype scan). The two representations of each flag are
-    # kept in parity via genoray.exprs.
     pl_terms: list[pl.Expr] = []
     record_preds: list[Callable[[list[str]], bool]] = []
     if no_symbolic:
@@ -138,9 +205,6 @@ def write(
                 "The `dosages` argument appears to be a path to an existing file, but VCF requires a FORMAT field name."
             )
 
-        # VCF requires both filters together (or neither): a cyvcf2 callable
-        # applied during the genotype scan and a matching polars expr applied to
-        # the index; both must express the same predicate.
         vcf = VCF(
             source,
             dosage_field=dosages,
