@@ -71,8 +71,9 @@ fn batch_result_to_dict<'py>(
 
 /// Compact `RangesBundle` -> numpy dict: `dense_range (R,2) i32`, `region_starts
 /// (R) i32`, `sample_cols (n_samples) i64`, `vk_snp_range (R*H,2) i64`,
-/// `vk_indel_range (R*H,2) i64`, plus `n_regions`/`n_samples`/`ploidy` scalars
-/// (H = n_samples*ploidy).
+/// `vk_indel_range (R*H,2) i64`, `dense_snp_range (R,2) i32`, `dense_indel_range
+/// (R,2) i32`, plus `n_regions`/`n_samples`/`ploidy` scalars (H =
+/// n_samples*ploidy).
 fn bundle_to_dict<'py>(py: Python<'py>, rb: &RangesBundle) -> PyResult<Bound<'py, PyDict>> {
     let pairs_to_i32_flat = |v: &[(usize, usize)]| -> Vec<i32> {
         let mut o = Vec::with_capacity(v.len() * 2);
@@ -96,6 +97,15 @@ fn bundle_to_dict<'py>(py: Python<'py>, rb: &RangesBundle) -> PyResult<Bound<'py
         .expect("dense_range shape")
         .to_pyarray(py);
 
+    let dsr = pairs_to_i32_flat(&rb.dense_snp_range);
+    let dense_snp_range = Array2::from_shape_vec((rb.n_regions, 2), dsr)
+        .expect("dense_snp_range shape")
+        .to_pyarray(py);
+    let dir_ = pairs_to_i32_flat(&rb.dense_indel_range);
+    let dense_indel_range = Array2::from_shape_vec((rb.n_regions, 2), dir_)
+        .expect("dense_indel_range shape")
+        .to_pyarray(py);
+
     let h = rb.n_samples * rb.ploidy;
     let vk_snp = pairs_to_i64_flat(&rb.vk_snp_range);
     let vk_snp_range = Array2::from_shape_vec((rb.n_regions * h, 2), vk_snp)
@@ -114,6 +124,8 @@ fn bundle_to_dict<'py>(py: Python<'py>, rb: &RangesBundle) -> PyResult<Bound<'py
     d.set_item("sample_cols", PyArray1::from_slice(py, &sample_cols))?;
     d.set_item("vk_snp_range", vk_snp_range)?;
     d.set_item("vk_indel_range", vk_indel_range)?;
+    d.set_item("dense_snp_range", dense_snp_range)?;
+    d.set_item("dense_indel_range", dense_indel_range)?;
     d.set_item("n_regions", rb.n_regions)?;
     d.set_item("n_samples", rb.n_samples)?;
     d.set_item("ploidy", rb.ploidy)?;
@@ -183,11 +195,8 @@ fn bundle_from_dict(d: &Bound<'_, PyDict>) -> RangesBundle {
             .collect(),
         vk_snp_range: get_i64_pairs("vk_snp_range"),
         vk_indel_range: get_i64_pairs("vk_indel_range"),
-        // Not (yet) round-tripped through the dict: consumed only by the
-        // read-bound gather (Task 3) and Python serialization (Task 5).
-        // TODO(Task 5): parse these from the dict once bundle_to_dict emits them.
-        dense_snp_range: Vec::new(),
-        dense_indel_range: Vec::new(),
+        dense_snp_range: get_i32_pairs("dense_snp_range"),
+        dense_indel_range: get_i32_pairs("dense_indel_range"),
     }
 }
 
