@@ -183,6 +183,11 @@ fn bundle_from_dict(d: &Bound<'_, PyDict>) -> RangesBundle {
             .collect(),
         vk_snp_range: get_i64_pairs("vk_snp_range"),
         vk_indel_range: get_i64_pairs("vk_indel_range"),
+        // Not (yet) round-tripped through the dict: consumed only by the
+        // read-bound gather (Task 3) and Python serialization (Task 5).
+        // TODO(Task 5): parse these from the dict once bundle_to_dict emits them.
+        dense_snp_range: Vec::new(),
+        dense_indel_range: Vec::new(),
     }
 }
 

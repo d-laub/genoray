@@ -603,6 +603,11 @@ pub struct RangesBundle {
     /// Absolute `[start, end)` into `vk_indel`'s packed positions/keys, per
     /// `(region, selected sample, ploid)`.
     pub vk_indel_range: Vec<(usize, usize)>,
+    /// `[s, e)` into `dense/snp`'s on-disk positions/keys, per region (dense is
+    /// cohort-shared, so one window per region, not per hap). Read-bound path.
+    pub dense_snp_range: Vec<(usize, usize)>,
+    /// `[s, e)` into `dense/indel`'s on-disk positions/keys, per region.
+    pub dense_indel_range: Vec<(usize, usize)>,
 }
 
 impl ContigReader {
@@ -648,6 +653,44 @@ impl ContigReader {
         let (s, e) = overlap_range(&tree, &v_ends, max_del, q_start, q_end);
         (o0 + s, o0 + e)
     }
+
+    /// Absolute `[s, e)` into `dense/snp`'s positions/keys for one region.
+    /// SNP v_end = pos + 1 (max_region_length = 0). `(0, 0)` if no snp table.
+    fn dense_snp_overlap(&self, q_start: u32, q_end: u32) -> (usize, usize) {
+        let d = match &self.dense_snp {
+            Some(d) => d,
+            None => return (0, 0),
+        };
+        let positions = d.positions();
+        if positions.is_empty() {
+            return (0, 0);
+        }
+        let v_ends: Vec<u32> = positions.iter().map(|&p| p + 1).collect();
+        let tree = SearchTree::new(positions);
+        overlap_range(&tree, &v_ends, 0, q_start, q_end)
+    }
+
+    /// Absolute `[s, e)` into `dense/indel`'s positions/keys for one region.
+    /// Indel v_end = pos + 1 + deletion_len(key); per-contig dense max_del bound.
+    fn dense_indel_overlap(&self, q_start: u32, q_end: u32) -> (usize, usize) {
+        let d = match &self.dense_indel {
+            Some(d) => d,
+            None => return (0, 0),
+        };
+        let positions = d.positions();
+        if positions.is_empty() {
+            return (0, 0);
+        }
+        let keys = as_u32(&d.keys);
+        debug_assert_eq!(positions.len(), keys.len());
+        let v_ends: Vec<u32> = positions
+            .iter()
+            .zip(keys.iter())
+            .map(|(&pos, &key)| pos + 1 + rvk::deletion_len(key))
+            .collect();
+        let tree = SearchTree::new(positions);
+        overlap_range(&tree, &v_ends, self.dense_indel_max_del, q_start, q_end)
+    }
 }
 
 /// Search-only pass: run every `SearchTree::new` up front and record the
@@ -676,6 +719,15 @@ pub fn find_ranges(
         .collect();
     let region_starts: Vec<u32> = regions.iter().map(|&(qs, _)| qs).collect();
 
+    let dense_snp_range: Vec<(usize, usize)> = regions
+        .iter()
+        .map(|&(qs, qe)| reader.dense_snp_overlap(qs, qe))
+        .collect();
+    let dense_indel_range: Vec<(usize, usize)> = regions
+        .iter()
+        .map(|&(qs, qe)| reader.dense_indel_overlap(qs, qe))
+        .collect();
+
     let mut vk_snp_range = Vec::with_capacity(n_regions * h);
     let mut vk_indel_range = Vec::with_capacity(n_regions * h);
     for &(qs, qe) in regions {
@@ -697,6 +749,8 @@ pub fn find_ranges(
         sample_cols,
         vk_snp_range,
         vk_indel_range,
+        dense_snp_range,
+        dense_indel_range,
     }
 }
 
