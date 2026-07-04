@@ -92,6 +92,10 @@ class _BatchQueryMixin:
                     raise ValueError(
                         f"out[{k!r}] has shape {dst.shape}, expected {src.shape}"
                     )
+                if dst.dtype != src.dtype:
+                    raise ValueError(
+                        f"out[{k!r}] has dtype {dst.dtype}, expected {src.dtype}"
+                    )
                 dst[...] = src
                 d[k] = buf
         return d
