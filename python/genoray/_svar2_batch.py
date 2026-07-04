@@ -15,8 +15,9 @@ class _BatchQueryMixin:
     """Raw ``BatchResult`` → numpy query methods."""
 
     # Provided by the concrete SparseVar2 host class (see SparseVar2.__init__);
-    # declared here so the mixin's use of it type-checks in isolation.
+    # declared here so the mixin's use of them type-checks in isolation.
     _readers: dict[str, Any]
+    samples: list[str]
 
     def overlap_batch(
         self, contig: str, regions: Iterable[tuple[int, int]]
