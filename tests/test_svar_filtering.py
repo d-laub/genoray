@@ -176,7 +176,7 @@ def test_from_pgen_no_filter_keeps_all(tmp_path):
 
 
 def test_cli_write_no_symbolic_vcf(tmp_path):
-    from genoray._cli.__main__ import write as cli_write
+    from genoray._cli.__main__ import write_svar1 as cli_write
 
     vcf_path = _mixed_vcf(tmp_path)
     out = tmp_path / "cli.svar"
@@ -187,7 +187,7 @@ def test_cli_write_no_symbolic_vcf(tmp_path):
 
 
 def test_cli_write_no_symbolic_pgen(tmp_path):
-    from genoray._cli.__main__ import write as cli_write
+    from genoray._cli.__main__ import write_svar1 as cli_write
 
     pgen_path = _mixed_pgen(tmp_path)
     out = tmp_path / "cli_pg.svar"
@@ -475,7 +475,7 @@ def _bnd_pgen(tmp_path: Path) -> Path:
 
 
 def test_cli_write_no_breakend_vcf(tmp_path):
-    from genoray._cli.__main__ import write as cli_write
+    from genoray._cli.__main__ import write_svar1 as cli_write
 
     vcf_path = _bnd_vcf(tmp_path)
     out = tmp_path / "nobnd.svar"
@@ -487,7 +487,7 @@ def test_cli_write_no_breakend_vcf(tmp_path):
 
 
 def test_cli_write_no_breakend_pgen(tmp_path):
-    from genoray._cli.__main__ import write as cli_write
+    from genoray._cli.__main__ import write_svar1 as cli_write
 
     pgen_path = _bnd_pgen(tmp_path)
     out = tmp_path / "nobnd_pg.svar"
@@ -498,7 +498,7 @@ def test_cli_write_no_breakend_pgen(tmp_path):
 
 
 def test_cli_write_no_symbolic_and_no_breakend_vcf(tmp_path):
-    from genoray._cli.__main__ import write as cli_write
+    from genoray._cli.__main__ import write_svar1 as cli_write
 
     vcf_path = _bnd_vcf(tmp_path)
     out = tmp_path / "both.svar"
@@ -512,7 +512,7 @@ def test_cli_write_no_symbolic_and_no_breakend_vcf(tmp_path):
 
 
 def test_cli_write_no_symbolic_and_no_breakend_pgen(tmp_path):
-    from genoray._cli.__main__ import write as cli_write
+    from genoray._cli.__main__ import write_svar1 as cli_write
 
     pgen_path = _bnd_pgen(tmp_path)
     out = tmp_path / "both_pg.svar"
@@ -527,7 +527,7 @@ def test_cli_write_no_symbolic_and_no_breakend_pgen(tmp_path):
 
 def test_cli_write_no_flags_keeps_all_vcf(tmp_path):
     """Back-compat: neither flag set -> all records written."""
-    from genoray._cli.__main__ import write as cli_write
+    from genoray._cli.__main__ import write_svar1 as cli_write
 
     vcf_path = _bnd_vcf(tmp_path)
     out = tmp_path / "none.svar"
@@ -538,7 +538,7 @@ def test_cli_write_no_flags_keeps_all_vcf(tmp_path):
 
 def test_cli_write_no_flags_keeps_all_pgen(tmp_path):
     """Back-compat (PGEN): neither flag set -> all records written."""
-    from genoray._cli.__main__ import write as cli_write
+    from genoray._cli.__main__ import write_svar1 as cli_write
 
     pgen_path = _bnd_pgen(tmp_path)
     out = tmp_path / "none_pg.svar"

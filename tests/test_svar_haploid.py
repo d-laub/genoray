@@ -178,7 +178,7 @@ def test_from_pgen_haploid_metadata_and_or(tmp_path: Path):
 
 
 def test_cli_write_haploid_vcf(tmp_path: Path):
-    from genoray._cli.__main__ import write as cli_write
+    from genoray._cli.__main__ import write_svar1 as cli_write
 
     out = tmp_path / "cli.svar"
     cli_write(VCF_PATH, out, max_mem="1g", overwrite=True, haploid=True)
@@ -195,6 +195,7 @@ def test_cli_write_haploid_subprocess(tmp_path: Path):
             "-m",
             "genoray._cli",
             "write",
+            "svar1",
             str(VCF_PATH),
             str(out),
             "--max-mem",
