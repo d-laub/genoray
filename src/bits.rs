@@ -13,15 +13,56 @@ pub fn get_bit(buf: &[u8], idx: usize) -> bool {
     (buf[idx >> 3] >> (idx & 7)) & 1 != 0
 }
 
+/// Read 8 LSB-first bits from `src` starting at absolute bit `bit`, returned as
+/// a byte whose bit `j` is `src` bit `bit + j`. `bit .. bit + 8` must be in range
+/// except that the final partial byte is padded with zeros (`get`/`unwrap_or`).
+#[inline(always)]
+fn read_byte(src: &[u8], bit: usize) -> u8 {
+    let byte_idx = bit >> 3;
+    let off = bit & 7;
+    if off == 0 {
+        src[byte_idx]
+    } else {
+        let lo = src[byte_idx] >> off;
+        let hi = (*src.get(byte_idx + 1).unwrap_or(&0)) << (8 - off);
+        lo | hi
+    }
+}
+
 /// Copy `n` bits from `src` (starting at bit `src_bit`) into `dst` (starting at
 /// bit `dst_bit`). Bits already set in the untouched region of `dst` are
 /// preserved; the target window is OR-written from a zeroed assumption
 /// (callers pass a zeroed destination window).
+///
+/// The middle of the window is copied a byte (8 bits) at a time once `dst` is
+/// byte-aligned — this removes the per-bit branch that made the bit-by-bit
+/// version the dense-merge hot spot. The unaligned head/tail stay bit-by-bit.
 pub fn copy_bits(dst: &mut [u8], dst_bit: usize, src: &[u8], src_bit: usize, n: usize) {
-    for i in 0..n {
+    if n == 0 {
+        return;
+    }
+    let mut i = 0usize;
+    // Head: advance bit-by-bit until the destination cursor is byte-aligned.
+    while i < n && (dst_bit + i) & 7 != 0 {
         if get_bit(src, src_bit + i) {
             set_bit(dst, dst_bit + i);
         }
+        i += 1;
+    }
+    // Body: destination is byte-aligned — OR whole bytes at a time.
+    while i + 8 <= n {
+        let byte = read_byte(src, src_bit + i);
+        if byte != 0 {
+            dst[(dst_bit + i) >> 3] |= byte;
+        }
+        i += 8;
+    }
+    // Tail: remaining < 8 bits, unaligned again.
+    while i < n {
+        if get_bit(src, src_bit + i) {
+            set_bit(dst, dst_bit + i);
+        }
+        i += 1;
     }
 }
 
