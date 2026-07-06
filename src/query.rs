@@ -1119,9 +1119,14 @@ pub fn gather_haps_readbound(
         let base = dense_snp.len();
         if let Some(d) = d_snp {
             let keys = as_bytes(&d.keys);
-            for j in ss..se {
+            // Slice once so the loop body indexes `d_snp_pos` via the
+            // iterator (no per-iteration bounds check); `keys` stays
+            // unsliced since it's 2-bit-packed and `unpack_snp_key_at`
+            // needs the true absolute call index `j`, not a local one.
+            for (k, &pos) in d_snp_pos[ss..se].iter().enumerate() {
+                let j = ss + k;
                 dense_snp.push(KeyRef {
-                    position: d_snp_pos[j],
+                    position: pos,
                     key: rvk::snp_code_to_key(rvk::unpack_snp_key_at(keys, j)),
                 });
             }
@@ -1131,11 +1136,11 @@ pub fn gather_haps_readbound(
         let base = dense_indel.len();
         if let Some(d) = d_indel {
             let keys = as_u32(&d.keys);
-            for j in is_..ie_ {
-                dense_indel.push(KeyRef {
-                    position: d_indel_pos[j],
-                    key: keys[j],
-                });
+            // Both `d_indel_pos` and `keys` are plain `&[u32]` in the same
+            // absolute index space, so a paired slice iterator hoists the
+            // bounds check to the slicing op instead of once per element.
+            for (&pos, &key) in d_indel_pos[is_..ie_].iter().zip(&keys[is_..ie_]) {
+                dense_indel.push(KeyRef { position: pos, key });
             }
         }
         dense_indel_range_out.push((base, dense_indel.len()));
@@ -1159,8 +1164,18 @@ pub fn gather_haps_readbound(
 
             // var_key gather.
             let (vs, ve) = vk_snp_range[row];
-            let mut snp_run: Vec<KeyRef> = Vec::new();
-            for (j, &pos) in snp_positions.iter().enumerate().take(ve).skip(vs) {
+            // Was `snp_positions.iter().enumerate().take(ve).skip(vs)`:
+            // `Skip::next()` drains and discards `vs` items from the front
+            // on first call, so every hap re-walked `snp_positions[0..vs]`
+            // from scratch. Slicing to `[vs..ve]` up front makes the walk
+            // start at `vs` directly (one bounds check for the slice op,
+            // not O(vs) wasted iterator steps per hap); `j = vs + k`
+            // recovers the absolute call index `unpack_snp_key_at` needs
+            // against the (unsliced, 2-bit-packed) `snp_keys` buffer.
+            // Capacity is pre-sized so the filter below never reallocs.
+            let mut snp_run: Vec<KeyRef> = Vec::with_capacity(ve.saturating_sub(vs));
+            for (k, &pos) in snp_positions[vs..ve].iter().enumerate() {
+                let j = vs + k;
                 if qs < pos + 1 {
                     snp_run.push(KeyRef {
                         position: pos,
@@ -1169,18 +1184,40 @@ pub fn gather_haps_readbound(
                 }
             }
             let (vis, vie) = vk_indel_range[row];
-            let mut indel_run: Vec<KeyRef> = Vec::new();
-            for j in vis..vie {
-                let pos = indel_positions[j];
-                let v_end = pos + 1 + rvk::deletion_len(indel_keys[j]);
+            // Same slicing treatment: `indel_positions`/`indel_keys` are
+            // both plain `&[u32]` in the same absolute index space, so a
+            // paired slice iterator drops the per-element bounds checks
+            // that `indel_positions[j]`/`indel_keys[j]` incurred.
+            let mut indel_run: Vec<KeyRef> = Vec::with_capacity(vie.saturating_sub(vis));
+            for (&pos, &key) in indel_positions[vis..vie].iter().zip(&indel_keys[vis..vie]) {
+                let v_end = pos + 1 + rvk::deletion_len(key);
                 if qs < v_end {
-                    indel_run.push(KeyRef {
-                        position: pos,
-                        key: indel_keys[j],
-                    });
+                    indel_run.push(KeyRef { position: pos, key });
                 }
             }
-            vk.extend_from_slice(&spine::merge_keys(vec![snp_run, indel_run]));
+            // Specialized 2-way merge, provably byte-identical to
+            // `spine::merge_keys(vec![snp_run, indel_run])`: that generic
+            // k-way merge picks `best = Some(0)` (snp_run) on the first
+            // scan and only switches to run 1 (indel_run) when
+            // `!(snp_run[h0].position <= indel_run[h1].position)`, i.e.
+            // exactly the `<=` two-pointer comparison below (ties still
+            // favor snp_run). Per-hap this was allocating three separate
+            // buffers every call — the outer `vec![snp_run, indel_run]`,
+            // `merge_keys`'s internal `heads`, and its `out` — plus an
+            // extra copy via `extend_from_slice(&merged)`; merging
+            // straight into `vk` removes all of that allocation churn.
+            let (mut si, mut ii) = (0usize, 0usize);
+            while si < snp_run.len() && ii < indel_run.len() {
+                if snp_run[si].position <= indel_run[ii].position {
+                    vk.push(snp_run[si]);
+                    si += 1;
+                } else {
+                    vk.push(indel_run[ii]);
+                    ii += 1;
+                }
+            }
+            vk.extend_from_slice(&snp_run[si..]);
+            vk.extend_from_slice(&indel_run[ii..]);
             vk_off.push(vk.len());
 
             // dense/snp presence over [ss..se).
@@ -1191,8 +1228,14 @@ pub fn gather_haps_readbound(
                 dense_snp_present.resize(need, 0);
             }
             if let Some(d) = d_snp {
-                for (k, j) in (ss..se).enumerate() {
-                    if d.carried(hap, j) && qs < d_snp_pos[j] + 1 {
+                // Slice `d_snp_pos` so the per-iteration `d_snp_pos[j]` read
+                // (bounds-checked every element before) is replaced by an
+                // iterator walk (single bounds check for `[ss..se]`); `j`
+                // is recovered for `d.carried`, which still needs the
+                // absolute dense-variant column index.
+                for (k, &pos) in d_snp_pos[ss..se].iter().enumerate() {
+                    let j = ss + k;
+                    if d.carried(hap, j) && qs < pos + 1 {
                         bits::set_bit(&mut dense_snp_present, bit_base + k);
                     }
                 }
@@ -1208,8 +1251,16 @@ pub fn gather_haps_readbound(
             }
             if let Some(d) = d_indel {
                 let keys = as_u32(&d.keys);
-                for (k, j) in (is_r..ie_r).enumerate() {
-                    let v_end = d_indel_pos[j] + 1 + rvk::deletion_len(keys[j]);
+                // Paired slice iterator over `d_indel_pos`/`keys`
+                // (both plain `&[u32]`, same index space) instead of
+                // per-element `d_indel_pos[j]`/`keys[j]` bounds checks.
+                for (k, (&pos, &key)) in d_indel_pos[is_r..ie_r]
+                    .iter()
+                    .zip(&keys[is_r..ie_r])
+                    .enumerate()
+                {
+                    let j = is_r + k;
+                    let v_end = pos + 1 + rvk::deletion_len(key);
                     if d.carried(hap, j) && qs < v_end {
                         bits::set_bit(&mut dense_indel_present, bit_base + k);
                     }

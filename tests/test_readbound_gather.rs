@@ -4,8 +4,9 @@
 mod common;
 
 use common::{SynthRecord, build_contig};
+use genoray_core::bits_get_bit;
 use genoray_core::query::{
-    BatchResultSplit, ContigReader, HapCalls, decode_keyref_alt_pub, find_ranges,
+    BatchResultSplit, ContigReader, HapCalls, KeyRef, decode_keyref_alt_pub, find_ranges,
     gather_haps_readbound, gather_ranges_readbound, overlap_batch,
 };
 use genoray_core::search;
@@ -277,4 +278,135 @@ fn test_flat_gather_matches_cartesian_full_cohort() {
             }
         }
     }
+}
+
+/// Byte-identical (per-hap RAW field) regression test for the
+/// `gather_haps_readbound` asm-fix pass: asserts the *raw* `vk` `KeyRef`
+/// sequence (order + position + key, no sort/decode) and the raw
+/// `dense_snp_present`/`dense_indel_present` bits for every hap match the
+/// independent `gather_ranges_readbound` (cartesian) oracle exactly.
+///
+/// This is deliberately stronger than `test_flat_gather_matches_cartesian_
+/// full_cohort` above (which decodes+sorts before comparing, so it cannot
+/// see a merge-order regression): the perf pass replaced the per-hap
+/// `spine::merge_keys(vec![snp_run, indel_run])` call in
+/// `gather_haps_readbound` with a hand-inlined two-pointer merge, and only
+/// `gather_ranges_readbound` (untouched) still calls `spine::merge_keys`.
+/// Comparing raw, unsorted `vk` slices between the two functions is exactly
+/// the check that would fail if the inlined merge's tie-break or ordering
+/// diverged from `merge_keys`'s stable (earlier-run-wins-ties) semantics.
+#[test]
+fn test_gather_haps_readbound_byte_identical() {
+    let tmp = tempdir().unwrap();
+    let out = tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let reader = synth_reader(&out); // 2 samples, ploidy 2
+    let regions = vec![(0u32, 1_000_000u32), (250u32, 400u32), (150u32, 250u32)];
+    let ploidy = 2usize;
+
+    let rb = find_ranges(&reader, &regions, None);
+    let cart = gather_ranges_readbound(&reader, &rb);
+
+    // Flatten in the same region-major, sample-major order `cart` lays out
+    // haps in, so flat query q = r*S+s, ploid p <-> cart hap (r, s, p).
+    let s_n = rb.n_samples;
+    let mut region_starts = Vec::new();
+    let mut orig_samples = Vec::new();
+    let mut vk_snp_range = Vec::new();
+    let mut vk_indel_range = Vec::new();
+    let mut dsr = Vec::new();
+    let mut dir_ = Vec::new();
+    for r in 0..regions.len() {
+        for s in 0..s_n {
+            region_starts.push(rb.region_starts[r]);
+            orig_samples.push(rb.sample_cols[s]);
+            dsr.push(rb.dense_snp_range[r]);
+            dir_.push(rb.dense_indel_range[r]);
+            for p in 0..ploidy {
+                let row = r * (s_n * ploidy) + s * ploidy + p;
+                vk_snp_range.push(rb.vk_snp_range[row]);
+                vk_indel_range.push(rb.vk_indel_range[row]);
+            }
+        }
+    }
+    let flat: BatchResultSplit = gather_haps_readbound(
+        &reader,
+        &region_starts,
+        &orig_samples,
+        &vk_snp_range,
+        &vk_indel_range,
+        &dsr,
+        &dir_,
+        ploidy,
+    );
+
+    let mut any_nonempty_vk = false;
+    let mut any_dense_snp_present = false;
+    let mut any_dense_indel_present = false;
+
+    for r in 0..regions.len() {
+        for s in 0..s_n {
+            let cart_h_base = (r * cart.n_samples + s) * cart.ploidy;
+            let flat_q = r * s_n + s;
+            let flat_h_base = flat_q * ploidy; // flat.n_samples == 1
+            for p in 0..ploidy {
+                let ch = cart_h_base + p;
+                let fh = flat_h_base + p;
+
+                // Raw vk KeyRef sequence: exact order, exact (position, key).
+                let cart_vk: &[KeyRef] = &cart.vk[cart.vk_off[ch]..cart.vk_off[ch + 1]];
+                let flat_vk: &[KeyRef] = &flat.vk[flat.vk_off[fh]..flat.vk_off[fh + 1]];
+                assert_eq!(
+                    flat_vk, cart_vk,
+                    "raw vk mismatch (r={r}, s={s}, p={p}): flat={flat_vk:?} cart={cart_vk:?}"
+                );
+                if !cart_vk.is_empty() {
+                    any_nonempty_vk = true;
+                }
+
+                // Raw dense/snp presence bits over this region's dense_snp window.
+                let (ss, se) = rb.dense_snp_range[r];
+                let cart_bit0 = cart.dense_snp_present_off[ch];
+                let flat_bit0 = flat.dense_snp_present_off[fh];
+                for k in 0..(se - ss) {
+                    let c = bits_get_bit(&cart.dense_snp_present, cart_bit0 + k);
+                    let f = bits_get_bit(&flat.dense_snp_present, flat_bit0 + k);
+                    assert_eq!(
+                        f, c,
+                        "dense_snp_present bit mismatch (r={r}, s={s}, p={p}, k={k})"
+                    );
+                    any_dense_snp_present |= c;
+                }
+
+                // Raw dense/indel presence bits over this region's dense_indel window.
+                let (is_, ie_) = rb.dense_indel_range[r];
+                let cart_bit0 = cart.dense_indel_present_off[ch];
+                let flat_bit0 = flat.dense_indel_present_off[fh];
+                for k in 0..(ie_ - is_) {
+                    let c = bits_get_bit(&cart.dense_indel_present, cart_bit0 + k);
+                    let f = bits_get_bit(&flat.dense_indel_present, flat_bit0 + k);
+                    assert_eq!(
+                        f, c,
+                        "dense_indel_present bit mismatch (r={r}, s={s}, p={p}, k={k})"
+                    );
+                    any_dense_indel_present |= c;
+                }
+            }
+        }
+    }
+
+    // Coverage guards: fail loudly if the fixture stopped exercising the
+    // channels this test exists to protect (rather than passing vacuously).
+    assert!(
+        any_nonempty_vk,
+        "fixture must exercise the var_key (vk) merge path"
+    );
+    assert!(
+        any_dense_snp_present,
+        "fixture must exercise dense_snp_present"
+    );
+    assert!(
+        any_dense_indel_present,
+        "fixture must exercise dense_indel_present"
+    );
 }
