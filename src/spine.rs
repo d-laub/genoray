@@ -60,6 +60,10 @@ pub fn gather_keys(
 /// K-way merge of already position-sorted runs into one position-sorted list.
 /// Stable across ties (earlier run wins). `O(total × n_runs)` with `n_runs`
 /// small (2 within a channel; more only if M11 adds a `pointer` sub-stream).
+///
+/// `query::gather_haps_readbound` hand-inlines a 2-run (snp_run, indel_run)
+/// equivalent of this merge for allocation reasons — any change to this
+/// function's ordering or tie-break MUST be mirrored there.
 pub fn merge_keys(runs: Vec<Vec<KeyRef>>) -> Vec<KeyRef> {
     let total: usize = runs.iter().map(|r| r.len()).sum();
     let mut heads = vec![0usize; runs.len()];

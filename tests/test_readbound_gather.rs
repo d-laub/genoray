@@ -410,3 +410,130 @@ fn test_gather_haps_readbound_byte_identical() {
         "fixture must exercise dense_indel_present"
     );
 }
+
+/// Dedicated fixture for the same-position SNP+indel tie-break: one SNP and
+/// one insertion at the identical position (400), both carried by the SAME
+/// hap (sample S0, ploid 0) and both with a single carrier (AC=1) so the cost
+/// model keeps them `VarKey` (never routed to `Dense` — see
+/// `cost_model::choose_representation`: AC=1 always yields `dense_bits >
+/// var_key_bits`). Two records sharing a POS is unusual for real VCFs but
+/// unconstrained by the reader; both share REF `A` so the shared 'N'-filler
+/// FASTA stamp is consistent between them.
+fn tie_break_reader(out: &std::path::Path) -> ContigReader {
+    let samples = ["S0", "S1"];
+    let records = vec![
+        SynthRecord {
+            pos: 400,
+            ref_allele: b"A",
+            alts: vec![&b"C"[..]],
+            gt: vec![1, 0, 0, 0], // S0 ploid0 only
+        },
+        SynthRecord {
+            pos: 400,
+            ref_allele: b"A",
+            alts: vec![&b"AT"[..]],
+            gt: vec![1, 0, 0, 0], // S0 ploid0 only — same hap as the SNP above
+        },
+    ];
+    build_contig(out, "chr1", &samples, 2, &records);
+    ContigReader::open(out.to_str().unwrap(), "chr1", 2, 2).unwrap()
+}
+
+/// Targeted regression for the SNP+indel same-position tie-break that
+/// `test_gather_haps_readbound_byte_identical`'s distinct-position fixture
+/// (100/150/175/200/300) never exercises: `merge_keys`'s k-way merge picks
+/// the earlier run (`snp_run`, index 0) on ties, so a SNP and an indel at the
+/// same position must decode with the SNP first. `gather_haps_readbound`'s
+/// hand-inlined two-pointer merge encodes the same rule as `si <= ii` (favor
+/// `snp_run` on equality) — see the comment above that loop in `query.rs`.
+///
+/// If that `<=` were weakened to `<`, the equal-position branch would fall
+/// through to the `else` arm and push the indel first, flipping the decoded
+/// order to (indel, snp). This test would then fail both assertions below:
+/// the explicit decode order check, and the byte-identical `vk` comparison
+/// against the `merge_keys`-based `gather_ranges_readbound` oracle (which
+/// does not share the bug, so `cart_vk` would stay (snp, indel) while
+/// `flat_vk` flipped to (indel, snp) — an outright mismatch).
+#[test]
+fn test_gather_haps_readbound_tie_break_snp_before_indel() {
+    let tmp = tempdir().unwrap();
+    let out = tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let reader = tie_break_reader(&out);
+    let regions = vec![(0u32, 1_000_000u32)];
+    let ploidy = 2usize;
+
+    let rb = find_ranges(&reader, &regions, None);
+    let cart = gather_ranges_readbound(&reader, &rb); // oracle: spine::merge_keys
+
+    // Flatten in the same region-major, sample-major order `cart` uses.
+    let s_n = rb.n_samples;
+    let mut region_starts = Vec::new();
+    let mut orig_samples = Vec::new();
+    let mut vk_snp_range = Vec::new();
+    let mut vk_indel_range = Vec::new();
+    let mut dsr = Vec::new();
+    let mut dir_ = Vec::new();
+    for r in 0..regions.len() {
+        for s in 0..s_n {
+            region_starts.push(rb.region_starts[r]);
+            orig_samples.push(rb.sample_cols[s]);
+            dsr.push(rb.dense_snp_range[r]);
+            dir_.push(rb.dense_indel_range[r]);
+            for p in 0..ploidy {
+                let row = r * (s_n * ploidy) + s * ploidy + p;
+                vk_snp_range.push(rb.vk_snp_range[row]);
+                vk_indel_range.push(rb.vk_indel_range[row]);
+            }
+        }
+    }
+    let flat: BatchResultSplit = gather_haps_readbound(
+        &reader,
+        &region_starts,
+        &orig_samples,
+        &vk_snp_range,
+        &vk_indel_range,
+        &dsr,
+        &dir_,
+        ploidy,
+    );
+
+    // Locate S0 ploid0 in both layouts (region 0, sample slot for S0, p=0).
+    let s0_slot = rb
+        .sample_cols
+        .iter()
+        .position(|&orig| orig == 0)
+        .expect("S0 must be present");
+    let cart_h = s0_slot * cart.ploidy; // region 0
+    let flat_q = s0_slot; // region 0
+    let flat_h = flat_q * ploidy; // flat.n_samples == 1
+
+    let cart_vk: &[KeyRef] = &cart.vk[cart.vk_off[cart_h]..cart.vk_off[cart_h + 1]];
+    let flat_vk: &[KeyRef] = &flat.vk[flat.vk_off[flat_h]..flat.vk_off[flat_h + 1]];
+
+    // Byte-identical check (same style as test_gather_haps_readbound_byte_identical):
+    // this is the assertion that would catch a wrong tie-break, since `cart_vk`
+    // is built via `spine::merge_keys` (untouched) and `flat_vk` via the
+    // hand-inlined merge under test.
+    assert_eq!(
+        flat_vk, cart_vk,
+        "raw vk mismatch at the same-position SNP+indel tie: flat={flat_vk:?} cart={cart_vk:?}"
+    );
+
+    // Explicit, self-documenting decode of the tie-break: exactly 2 calls at
+    // position 400 for this hap, SNP (ilen=0, ALT "C") strictly before the
+    // insertion (ilen=1, ALT "AT").
+    assert_eq!(cart_vk.len(), 2, "expected exactly SNP+indel at pos 400");
+    let decoded: Vec<(u32, i32, Vec<u8>)> = cart_vk
+        .iter()
+        .map(|kr| {
+            let (ilen, alt) = decode_keyref_alt_pub(kr.position, kr.key, &reader);
+            (kr.position, ilen, alt)
+        })
+        .collect();
+    assert_eq!(
+        decoded,
+        vec![(400, 0, b"C".to_vec()), (400, 1, b"AT".to_vec())],
+        "merge_keys tie-break must emit the SNP before the indel at an equal position"
+    );
+}
