@@ -1158,6 +1158,15 @@ pub fn gather_haps_readbound(
         let orig_s = orig_samples[q];
         let (ss, se) = dense_snp_range[q];
         let (is_r, ie_r) = dense_indel_range[q];
+        // The dense-SNP position filter `qs < pos + 1` (i.e. `pos >= qs`) is
+        // hap-independent, and dense positions are sorted ascending, so the
+        // columns that pass form the suffix [c0_snp..se). Compute the threshold
+        // ONCE per query (was re-tested per hap per column) so each hap's
+        // presence gather becomes a contiguous block copy of that suffix.
+        let c0_snp = match d_snp {
+            Some(_) => ss + d_snp_pos[ss..se].partition_point(|&p| p < qs),
+            None => se,
+        };
         for p in 0..ploidy {
             let hap = orig_s * ploidy + p;
             let row = q * ploidy + p;
@@ -1228,16 +1237,21 @@ pub fn gather_haps_readbound(
                 dense_snp_present.resize(need, 0);
             }
             if let Some(d) = d_snp {
-                // Slice `d_snp_pos` so the per-iteration `d_snp_pos[j]` read
-                // (bounds-checked every element before) is replaced by an
-                // iterator walk (single bounds check for `[ss..se]`); `j`
-                // is recovered for `d.carried`, which still needs the
-                // absolute dense-variant column index.
-                for (k, &pos) in d_snp_pos[ss..se].iter().enumerate() {
-                    let j = ss + k;
-                    if d.carried(hap, j) && qs < pos + 1 {
-                        bits::set_bit(&mut dense_snp_present, bit_base + k);
-                    }
+                // Columns [ss..c0_snp) fail the position filter (dest stays 0);
+                // [c0_snp..se) all pass, so their presence == this hap's genotype
+                // bits (hap-major, so contiguous) — a single block copy. Provably
+                // byte-identical to the per-column `carried(hap,j) && qs<pos+1`
+                // test: matching cols set dest bit `bit_base + (j - ss)` iff the
+                // genotype bit `hap*n_dense + j` is set.
+                if c0_snp < se {
+                    let gt = as_bytes(&d.genotypes);
+                    bits::copy_bits(
+                        &mut dense_snp_present,
+                        bit_base + (c0_snp - ss),
+                        gt,
+                        hap * d.n_dense_variants + c0_snp,
+                        se - c0_snp,
+                    );
                 }
             }
             dense_snp_present_off.push(bit_base + nbits);
