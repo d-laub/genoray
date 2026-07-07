@@ -165,16 +165,28 @@ impl VcfChunkReader {
         let columns = self.num_samples * self.ploidy;
         let mut gt = vec![-1i32; columns];
         {
-            let genotypes = self.record.genotypes().expect("Failed to read genotypes");
+            // Decode GT straight from the raw BCF integer buffer instead of
+            // `record.genotypes().get(i)`, which allocates a per-sample
+            // `Genotype(Vec<GenotypeAllele>)` for every sample of every record —
+            // the dominant reader-side allocation churn. BCF GT encoding: an
+            // allele is `(idx + 1) << 1 | phased`, so `e >= 2` decodes to
+            // `(e >> 1) - 1`; `e` of 0/1 is missing and `i32::MIN` is vector-end
+            // padding — both `< 2`, so a single `e >= 2` test reproduces the
+            // `GenotypeAllele::index()` semantics exactly.
+            let gts = self
+                .record
+                .format(b"GT")
+                .integer()
+                .expect("Failed to read GT format");
+            let ploidy = self.ploidy;
             for (s_idx, &vcf_idx) in self.sample_indices.iter().enumerate() {
-                let sample_gt = genotypes.get(vcf_idx);
-                for p in 0..self.ploidy {
-                    let idx = if p < sample_gt.len() {
-                        sample_gt[p].index().map(|v| v as i32).unwrap_or(-1)
-                    } else {
-                        -1
+                let raw = gts[vcf_idx];
+                let base = s_idx * ploidy;
+                for p in 0..ploidy {
+                    gt[base + p] = match raw.get(p) {
+                        Some(&e) if e >= 2 => (e >> 1) - 1,
+                        _ => -1,
                     };
-                    gt[s_idx * self.ploidy + p] = idx;
                 }
             }
         }
@@ -288,8 +300,29 @@ impl VcfChunkReader {
 
             let src = a.source_alt_index as i32;
             let base = vi * columns;
-            for col in 0..columns {
-                genos.or_bit(base + col, a.gt[col] == src);
+            // Pack the presence bits one 64-bit word at a time. `or_bit` wrote a
+            // whole word back to memory per bit — up to 64 redundant
+            // load-modify-stores per word; here each word is assembled in a
+            // register and written once. Bits start zeroed, so a plain OR-store
+            // is correct. Produces the identical BitGrid3 as the per-bit loop.
+            let gtc: &[i32] = &a.gt;
+            let words = &mut genos.words;
+            let mut col = 0usize;
+            while col < columns {
+                let flat = base + col;
+                let w = flat >> 6;
+                let b = flat & 63;
+                let n = (64 - b).min(columns - col);
+                let mut acc = 0u64;
+                for k in 0..n {
+                    // SAFETY: col + k < columns == gtc.len().
+                    acc |= ((unsafe { *gtc.get_unchecked(col + k) } == src) as u64) << (b + k);
+                }
+                // SAFETY: w indexes the word holding bit `base + col`, in range.
+                unsafe {
+                    *words.get_unchecked_mut(w) |= acc;
+                }
+                col += n;
             }
         }
 

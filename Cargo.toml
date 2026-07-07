@@ -45,3 +45,10 @@ extension-module = ["pyo3/extension-module"]
 
 [workspace]
 members = ["svar2-codec"]
+
+# Profiling build: release optimizations + debuginfo so perf/flamegraph symbolize
+# the conversion hot path. Build with:
+#   RUSTFLAGS="-C force-frame-pointers=yes" maturin develop --profile profiling
+[profile.profiling]
+inherits = "release"
+debug = true
