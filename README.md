@@ -132,19 +132,24 @@ For VCFs, the function must accept a [cyvcf2.Variant](https://brentp.github.io/c
 vcf = VCF("file.vcf.gz", filter=lambda v: v.INFO['AF_EUR'] > 0.05)
 ```
 
-For PGENs, the expression will operate on a polars DataFrame with all of the columns available in the underlying PVAR except `#CHROM`, `POS`, and `ALT`, which are superseded by columns added by `genoray`:
-- `Chromosome`
-- `Start`
-- `End`
-- `ALT` as a list of strings
-- `ilen` (indel length)
-- `kind` a list of strings that indicates the type of each ALT allele as `"SNP"`, `"INDEL"`, `"MNP"`, or `"OTHER"`
+For PGENs, the expression operates on the `.gvi` index — a polars DataFrame with columns:
+- `CHROM` — contig name
+- `POS` — 1-based position
+- `REF` — reference allele
+- `ALT` — list of alternate alleles
+- `ILEN` — list of indel lengths (one per ALT: `len(ALT) - len(REF)`, or a signed size for symbolic SVs; `null` for un-sizable symbolic/breakend alleles)
 
-The expression should return a boolean mask indicating which variants to include.
+Prefer the ready-made expressions in `genoray.exprs` — `is_snp`, `is_indel`, `is_biallelic`, `is_symbolic`, `is_breakend`, `is_imprecise`, and `ILEN` — and combine them with polars operators. For custom predicates, use `pl.col("CHROM"/"POS"/"REF"/"ALT"/"ILEN")` directly.
 
 ```python
+import genoray
+from genoray import PGEN
+
 # only include SNPs
-pgen = PGEN("file.pgen", filter=pl.col("kind").list.eval(pl.element() == "SNP").list.all())
+pgen = PGEN("file.pgen", filter=genoray.exprs.is_snp)
+
+# exclude symbolic alleles and breakends
+pgen = PGEN("file.pgen", filter=~genoray.exprs.is_symbolic & ~genoray.exprs.is_breakend)
 ```
 
 # ⚠️ Important ⚠️
