@@ -389,7 +389,11 @@ class PGEN:
     def __del__(self):
         if hasattr(self, "_geno_pgen"):
             self._geno_pgen.close()
-        if hasattr(self, "_dose_pgen") and self._dose_pgen is not None:
+        if (
+            hasattr(self, "_dose_pgen")
+            and self._dose_pgen is not None
+            and self._dose_pgen is not self._geno_pgen
+        ):
             self._dose_pgen.close()
 
     def n_vars_in_ranges(
