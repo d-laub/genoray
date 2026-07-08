@@ -4,7 +4,7 @@ use rust_htslib::bcf::record::Record;
 use rust_htslib::bcf::{IndexedReader, Read};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
-use std::rc::Rc;
+use std::sync::Arc;
 
 // A decomposed atom awaiting emission. Carries a shared handle to its source record's
 // per-column allele indices so genotype presence is computed at chunk-build time.
@@ -13,8 +13,8 @@ struct PendingAtom {
     ilen: i32,
     alt: Vec<u8>,
     source_alt_index: u16,
-    gt: Rc<Vec<i32>>, // len = num_samples * ploidy; allele index per column (-1 = missing)
-    seq: u64,         // stable tiebreak for equal positions
+    gt: Arc<Vec<i32>>, // len = num_samples * ploidy; allele index per column (-1 = missing)
+    seq: u64,          // stable tiebreak for equal positions
 }
 
 impl PartialEq for PendingAtom {
@@ -190,7 +190,7 @@ impl VcfChunkReader {
                 }
             }
         }
-        let gt = Rc::new(gt);
+        let gt = Arc::new(gt);
 
         // Fail fast only when a reference is available; without one we trust the
         // input is already normalized/left-aligned.
@@ -226,7 +226,7 @@ impl VcfChunkReader {
                 ilen: atom.ilen,
                 alt: atom.alt,
                 source_alt_index: atom.source_alt_index,
-                gt: Rc::clone(&gt),
+                gt: Arc::clone(&gt),
                 seq,
             }));
         }
