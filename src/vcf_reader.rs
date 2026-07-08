@@ -1,5 +1,6 @@
 use crate::normalize::atomize_record;
 use crate::types::{BitGrid3, DenseChunk};
+use rayon::prelude::*;
 use rust_htslib::bcf::record::Record;
 use rust_htslib::bcf::{IndexedReader, Read};
 use std::cmp::Reverse;
@@ -70,6 +71,57 @@ fn pack_presence_seq(words: &mut [u64], atoms: &[PendingAtom], columns: usize) {
     for (vi, a) in atoms.iter().enumerate() {
         pack_row(words, 0, vi, a, columns);
     }
+}
+
+// Below this many variants in a chunk, parallel packing's per-task overhead
+// outweighs the win — pack sequentially instead. Tunable; measure on gdc/germline.
+const PARALLEL_MIN_VARIANTS: usize = 512;
+
+#[inline]
+fn gcd(mut a: usize, mut b: usize) -> usize {
+    while b != 0 {
+        let t = a % b;
+        a = b;
+        b = t;
+    }
+    a
+}
+
+// Parallel presence packing. Variants are partitioned into word-aligned blocks:
+// row `vi` occupies bits `[vi*columns, (vi+1)*columns)`, so a block boundary at a
+// multiple of `g = 64/gcd(columns,64)` variants lands exactly on a u64 boundary.
+// `par_chunks_mut(words_per_block)` hands each rayon task a word-DISJOINT slice, so
+// there are no shared boundary words and no atomics — the result is bit-identical to
+// `pack_presence_seq`. Block `c` covers variants `[c*g, min((c+1)*g, v))` and words
+// `[c*words_per_block, ...)`, whose global base is `word_base = c*words_per_block`.
+fn pack_presence_par(
+    words: &mut [u64],
+    atoms: &[PendingAtom],
+    columns: usize,
+    pool: &rayon::ThreadPool,
+) {
+    let d = gcd(columns, 64);
+    let g = 64 / d; // variants per word-aligned block
+    let words_per_block = columns / d; // == g * columns / 64, always an integer
+    let v = atoms.len();
+
+    pool.install(|| {
+        words
+            .par_chunks_mut(words_per_block)
+            .enumerate()
+            .for_each(|(c, wchunk)| {
+                let vi_start = c * g;
+                let vi_end = ((c + 1) * g).min(v);
+                let word_base = c * words_per_block;
+                // `vi` is dual-purpose here: it's both the `atoms` index and the row
+                // index `pack_row` needs to compute the flat bit offset, so it can't
+                // be replaced by a plain iterator/enumerate.
+                #[allow(clippy::needless_range_loop)]
+                for vi in vi_start..vi_end {
+                    pack_row(wchunk, word_base, vi, &atoms[vi], columns);
+                }
+            });
+    });
 }
 
 pub struct VcfChunkReader {
@@ -305,16 +357,15 @@ impl VcfChunkReader {
     }
 
     // Pull up to `chunk_size` atoms (already globally position-sorted) and pack them
-    // into a variant-major DenseChunk. `pool`, when present, will host parallel
-    // presence packing (Task 5); this revision still packs sequentially so output is
-    // provably unchanged. Returns None once no atoms remain.
+    // into a variant-major DenseChunk. `pool`, when present and the chunk is large
+    // enough, hosts parallel presence packing (word-aligned variant blocks);
+    // otherwise packing is sequential. Returns None once no atoms remain.
     pub fn read_next_chunk(
         &mut self,
         chunk_size: usize,
         chunk_id: usize,
         pool: Option<&rayon::ThreadPool>,
     ) -> Option<DenseChunk> {
-        let _ = pool; // reserved for Task 5's parallel packing
         let mut atoms: Vec<PendingAtom> = Vec::with_capacity(chunk_size);
         while atoms.len() < chunk_size {
             match self.next_atom() {
@@ -346,8 +397,16 @@ impl VcfChunkReader {
             alt_offsets.push(off);
         }
 
-        // Presence packing (sequential for now).
-        pack_presence_seq(&mut genos.words, &atoms, columns);
+        // Presence packing: parallel over word-aligned variant blocks when a
+        // multi-thread pool is available and the chunk is large enough to amortize
+        // the fan-out; identical output to the sequential path either way.
+        let parallel =
+            matches!(pool, Some(p) if p.current_num_threads() >= 2) && v >= PARALLEL_MIN_VARIANTS;
+        if parallel {
+            pack_presence_par(&mut genos.words, &atoms, columns, pool.unwrap());
+        } else {
+            pack_presence_seq(&mut genos.words, &atoms, columns);
+        }
 
         Some(DenseChunk {
             chunk_id,
@@ -357,5 +416,77 @@ impl VcfChunkReader {
             alt_offsets,
             genos,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+    use std::sync::OnceLock;
+
+    // One shared 4-thread pool for all proptest cases (building a pool per case is slow).
+    fn test_pool() -> &'static rayon::ThreadPool {
+        static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+        POOL.get_or_init(|| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(4)
+                .build()
+                .unwrap()
+        })
+    }
+
+    // Minimal PendingAtom carrying only the fields the packers read.
+    fn atom(gt: Vec<i32>, src: u16) -> PendingAtom {
+        PendingAtom {
+            pos: 0,
+            ilen: 0,
+            alt: Vec::new(),
+            source_alt_index: src,
+            gt: std::sync::Arc::new(gt),
+            seq: 0,
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(300))]
+
+        // Parallel packing reproduces sequential packing bit-for-bit, for arbitrary
+        // shapes (incl. v not a multiple of the word-aligned block size), allele
+        // indices (incl. missing -1 and out-of-range values), and source alts.
+        #[test]
+        fn test_par_packing_matches_seq(
+            num_samples in 1usize..40,
+            ploidy in 1usize..4,
+            v in 1usize..70,
+            seed in any::<u64>(),
+        ) {
+            let columns = num_samples * ploidy;
+            // xorshift64 for deterministic per-case gt/src patterns.
+            let mut state = seed | 1;
+            let mut next = || { state ^= state << 13; state ^= state >> 7; state ^= state << 17; state };
+
+            let mut atoms = Vec::with_capacity(v);
+            for _ in 0..v {
+                let src = (next() % 4) as u16; // small alt index space
+                let gt: Vec<i32> = (0..columns)
+                    .map(|_| match next() % 5 {
+                        0 => -1,            // missing
+                        1 => src as i32,    // present (matches src)
+                        2 => 7,             // out-of-range allele
+                        _ => (next() % 4) as i32,
+                    })
+                    .collect();
+                atoms.push(atom(gt, src));
+            }
+
+            let mut seq = BitGrid3::zeros(v, num_samples, ploidy);
+            pack_presence_seq(&mut seq.words, &atoms, columns);
+
+            let mut par = BitGrid3::zeros(v, num_samples, ploidy);
+            pack_presence_par(&mut par.words, &atoms, columns, test_pool());
+
+            prop_assert_eq!(seq.words, par.words, "columns={}, v={}", columns, v);
+        }
     }
 }
