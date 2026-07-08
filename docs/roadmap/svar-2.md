@@ -164,7 +164,7 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
   batched multi-region/multi-sample **consumer interface**, the `svar2-codec` extraction,
   and uniform-key re-expansion are M6, not M5 — `overlap_sample` is a single-sample Rust
   core, not yet exposed to Python.
-- [ ] **M6. Query decode core.** The shared spine both consumers build on. M5's
+- [~] **M6. Query decode core.** The shared spine both consumers build on. M5's
   `(range, sample)` query landed (`overlap_sample` in `src/query.rs`); M6 generalizes it
   into the batched multi-region × multi-sample consumer spine, re-expands SNPs to the
   uniform 32-bit key at query time, and implements the fast sorted **union** across the
@@ -195,7 +195,7 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
     `BatchResult` → numpy contract** so M6b and M6c code against a fixed interface.
     **Merges before the M6b/M6c fan-out.** See the design spec's
     [M6a section](../superpowers/specs/2026-07-02-svar2-m6-consumer-interfaces-design.md).
-- [ ] **M6b. gvl Rust variant interface.** *(built first among M6 consumers; on top of
+- [~] **M6b. gvl Rust variant interface.** *(built first among M6 consumers; on top of
   M6a, in parallel with M6c)* The primary consumer. genoray returns a **two-channel** query result — `var_key` gathered per-hap
   inline (no dedup, no barrier) + a shared decode-once `dense` table with per-hap presence
   bitmasks — and gvl's Rust core consumes it via a **two-source splice** (`var_key ⋈
@@ -205,7 +205,22 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
   GenVarLoader) and release-gated:** the gvl PR is only mergeable after `svar2-codec` is
   on crates.io and `svar-2` is on PyPI; sequence managed manually. genoray-side work is
   independently mergeable.
-- [ ] **M6c. Python decode → `seqpro.rag.Ragged` + region variant counts.** *(on top of
+  *Built and benchmarked, blocked only on the release gate:* the genoray-side two-channel
+  result + query-only `genoray_core` (M6a/M6d/M6e) are shipped on `svar-2`. The gvl side is
+  the complete, reviewed **[mcvickerlab/GenVarLoader#266](https://github.com/mcvickerlab/GenVarLoader/pull/266)**
+  (draft, branch `svar2-m6b-kernel`, 69 commits ahead of gvl `main`): `.svar2` is a supported
+  `gvl.write` source (write-time ranges cache) and a live `Dataset` read backend reconstructing
+  all four output modes via one read-bound all-Rust FFI per read (zero `SearchTree`/dense-union
+  rebuild, byte-identical to the `.svar`/union oracle). It also adds the **`variant-windows`**
+  sequence mode and **`unphased_union`** ploidy folding, and carries the read-bound `getitem`
+  perf optimizations (B1–B5) — extensively benchmarked, profiled, and optimized (see the PR and
+  its `tmp/svar2_mvp/` harness); storage win is real (1.46–5.67×). It dev-wires genoray via
+  local path-deps + a local wheel and **will not build upstream until genoray `svar-2` is
+  published**; merge only after (1) genoray `svar-2` released, (2) path-deps → published
+  versions (`svar2-codec` on crates.io, `genoray_core` pinned by git tag, `genoray` wheel from
+  PyPI), (3) pyo3/numpy pins reconciled. See the ship plan
+  [`../superpowers/specs/2026-07-07-svar2-mvp-ship-plan-design.md`](../superpowers/specs/2026-07-07-svar2-mvp-ship-plan-design.md).
+- [x] **M6c. Python decode → `seqpro.rag.Ragged` + region variant counts.** *(on top of
   M6a, in parallel with M6b)* The analysis
   consumer. Materialize decoded query results into a `seqpro` `Ragged` record
   (`from_fields`: `pos` / `ilen` numeric + `allele` opaque-string, shared variant-axis
@@ -214,6 +229,11 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
   (offset diffs + dense-mask popcount) as the simplified replacement for SVAR 1.0's
   `SparseVar.var_ranges` (variant indices no longer fit the data model — there is no
   unified variant table).
+  *Done:* `python/genoray/_svar2_decode.py` (`_DecodeMixin`) adds `SparseVar2.decode(contig,
+  regions) -> seqpro.rag.Ragged` (record with `pos`/`ilen`/`allele` fields, shape `(R, S, P,
+  None)`, empty ALT for pure deletions) and the decode-free `region_counts(contig, regions) ->
+  (R, S, P)` offset-diff + dense-popcount count. Wired into `SparseVar2` via `_DecodeMixin`;
+  covered by `tests/test_svar2_decode.py` (the SVAR2 pytest suite is green).
 - [x] **M6d. Search/gather split for write-time overlap caching (shipped, `svar-2`).**
   Splits the fused `query::overlap_batch` into a **search-only** `find_ranges` (runs every
   `SearchTree::new` and returns a compact `RangesBundle` of index ranges), a **tree-free**
