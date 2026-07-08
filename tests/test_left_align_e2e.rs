@@ -35,7 +35,7 @@ fn drain(bcf: &Path, fasta: &Path, chrom: &str, samples: &[&str]) -> Vec<(u32, i
     );
     let mut out = Vec::new();
     let mut cid = 0;
-    while let Some(chunk) = reader.read_next_chunk(100, cid) {
+    while let Some(chunk) = reader.read_next_chunk(100, cid, None) {
         for i in 0..chunk.pos.len() {
             out.push((chunk.pos[i], chunk.ilens[i]));
         }
@@ -243,7 +243,7 @@ fn left_shifts_stay_sorted_across_chunk_boundaries() {
     );
     let mut positions = Vec::new();
     let mut cid = 0;
-    while let Some(chunk) = reader.read_next_chunk(1, cid) {
+    while let Some(chunk) = reader.read_next_chunk(1, cid, None) {
         positions.extend_from_slice(&chunk.pos);
         cid += 1;
     }
@@ -308,7 +308,7 @@ proptest! {
         );
         let mut positions = Vec::new();
         let mut cid = 0;
-        while let Some(chunk) = reader.read_next_chunk(1, cid) {
+        while let Some(chunk) = reader.read_next_chunk(1, cid, None) {
             positions.extend_from_slice(&chunk.pos);
             cid += 1;
         }

@@ -52,6 +52,7 @@ pub fn process_chromosome(
     htslib_threads: usize,
     long_allele_capacity: usize,
     skip_out_of_scope: bool,
+    processing_threads: usize,
 ) -> Result<u64, ConversionError> {
     // Directory Formatting: svar2/{contig}/var_key/{snp,indel}
     let paths = crate::layout::ContigPaths::new(base_out_dir, chrom);
@@ -115,6 +116,17 @@ pub fn process_chromosome(
         stop_sampler.clone(),
     );
 
+    // Dedicated rayon pool for the reader's intra-chunk presence packing. Sized to
+    // the idle cores (budget::plan_thread_budget). Built even at size 1 so the
+    // reader always has a handle; parallel packing self-gates off below 2 threads.
+    let processing_pool = Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(processing_threads.max(1))
+            .thread_name(|i| format!("pack-{}", i))
+            .build()
+            .expect("build processing pool"),
+    );
+
     // Step 1 -> The Producer
     let reader_thread = thread::Builder::new()
         .name(format!("read-{}", chrom))
@@ -124,6 +136,7 @@ pub fn process_chromosome(
             let chr = chrom.to_string();
             // Convert references into owned Strings that can safely live forever in the thread
             let s_owned: Vec<String> = samples.iter().map(|&s| s.to_string()).collect();
+            let pool = Arc::clone(&processing_pool);
 
             move || {
                 // passing the thread budget down to HTSLib
@@ -138,7 +151,9 @@ pub fn process_chromosome(
                     skip_out_of_scope,
                 );
                 let mut chunk_id = 0;
-                while let Some(dense_chunk) = reader.read_next_chunk(chunk_size, chunk_id) {
+                while let Some(dense_chunk) =
+                    reader.read_next_chunk(chunk_size, chunk_id, Some(&pool))
+                {
                     tx_dense.send(dense_chunk).unwrap();
                     chunk_id += 1;
                 }

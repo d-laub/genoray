@@ -34,6 +34,44 @@ impl Ord for PendingAtom {
     }
 }
 
+// Pack variant row `vi`'s presence bits into `words`, where `words[0]` corresponds
+// to global word index `word_base`. Bit for (row vi, column col) lives at global
+// flat index `vi*columns + col`; the local word index subtracts `word_base`.
+// Presence is `gt[col] == source_alt_index`. Bits start zeroed and are only OR-set,
+// and each word is assembled in a register and written once (identical result to a
+// per-bit `or_bit` loop, far fewer stores).
+#[inline]
+fn pack_row(words: &mut [u64], word_base: usize, vi: usize, a: &PendingAtom, columns: usize) {
+    let src = a.source_alt_index as i32;
+    let gtc: &[i32] = &a.gt;
+    let base = vi * columns;
+    let mut col = 0usize;
+    while col < columns {
+        let flat = base + col;
+        let w = (flat >> 6) - word_base;
+        let b = flat & 63;
+        let n = (64 - b).min(columns - col);
+        let mut acc = 0u64;
+        for k in 0..n {
+            // SAFETY: col + k < columns == gtc.len().
+            acc |= ((unsafe { *gtc.get_unchecked(col + k) } == src) as u64) << (b + k);
+        }
+        // SAFETY: w indexes a word within this row's target slice.
+        unsafe {
+            *words.get_unchecked_mut(w) |= acc;
+        }
+        col += n;
+    }
+}
+
+// Sequential full-grid presence packing: one row at a time into the whole `words`
+// slice (global word index == local word index, so `word_base == 0`).
+fn pack_presence_seq(words: &mut [u64], atoms: &[PendingAtom], columns: usize) {
+    for (vi, a) in atoms.iter().enumerate() {
+        pack_row(words, 0, vi, a, columns);
+    }
+}
+
 pub struct VcfChunkReader {
     inner_reader: IndexedReader,
     num_samples: usize,
@@ -267,8 +305,16 @@ impl VcfChunkReader {
     }
 
     // Pull up to `chunk_size` atoms (already globally position-sorted) and pack them
-    // into a variant-major DenseChunk. Returns None once no atoms remain.
-    pub fn read_next_chunk(&mut self, chunk_size: usize, chunk_id: usize) -> Option<DenseChunk> {
+    // into a variant-major DenseChunk. `pool`, when present, will host parallel
+    // presence packing (Task 5); this revision still packs sequentially so output is
+    // provably unchanged. Returns None once no atoms remain.
+    pub fn read_next_chunk(
+        &mut self,
+        chunk_size: usize,
+        chunk_id: usize,
+        pool: Option<&rayon::ThreadPool>,
+    ) -> Option<DenseChunk> {
+        let _ = pool; // reserved for Task 5's parallel packing
         let mut atoms: Vec<PendingAtom> = Vec::with_capacity(chunk_size);
         while atoms.len() < chunk_size {
             match self.next_atom() {
@@ -290,41 +336,18 @@ impl VcfChunkReader {
         alt_offsets.push(0u32);
         let mut genos = BitGrid3::zeros(v, self.num_samples, self.ploidy);
 
+        // Sequential metadata pass (cheap, ordering-preserving).
         let mut off = 0u32;
-        for (vi, a) in atoms.iter().enumerate() {
+        for a in atoms.iter() {
             pos.push(a.pos);
             ilens.push(a.ilen);
             alt.extend_from_slice(&a.alt);
             off += a.alt.len() as u32;
             alt_offsets.push(off);
-
-            let src = a.source_alt_index as i32;
-            let base = vi * columns;
-            // Pack the presence bits one 64-bit word at a time. `or_bit` wrote a
-            // whole word back to memory per bit — up to 64 redundant
-            // load-modify-stores per word; here each word is assembled in a
-            // register and written once. Bits start zeroed, so a plain OR-store
-            // is correct. Produces the identical BitGrid3 as the per-bit loop.
-            let gtc: &[i32] = &a.gt;
-            let words = &mut genos.words;
-            let mut col = 0usize;
-            while col < columns {
-                let flat = base + col;
-                let w = flat >> 6;
-                let b = flat & 63;
-                let n = (64 - b).min(columns - col);
-                let mut acc = 0u64;
-                for k in 0..n {
-                    // SAFETY: col + k < columns == gtc.len().
-                    acc |= ((unsafe { *gtc.get_unchecked(col + k) } == src) as u64) << (b + k);
-                }
-                // SAFETY: w indexes the word holding bit `base + col`, in range.
-                unsafe {
-                    *words.get_unchecked_mut(w) |= acc;
-                }
-                col += n;
-            }
         }
+
+        // Presence packing (sequential for now).
+        pack_presence_seq(&mut genos.words, &atoms, columns);
 
         Some(DenseChunk {
             chunk_id,

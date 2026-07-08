@@ -51,6 +51,7 @@ fn convert(
         1,
         8 * 1024 * 1024,
         skip,
+        1, // processing_threads
     )
 }
 

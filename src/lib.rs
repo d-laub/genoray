@@ -126,6 +126,7 @@ fn run_conversion_pipeline(
         let plan = crate::budget::plan_thread_budget(available_cores, chroms.len());
         let concurrent_chroms = plan.concurrent_chroms;
         let htslib_threads = plan.htslib_threads;
+        let processing_threads = plan.processing_threads;
 
         let total_active =
             concurrent_chroms * (crate::budget::PIPELINE_THREADS_PER_CHROM + htslib_threads);
@@ -168,6 +169,7 @@ fn run_conversion_pipeline(
                         htslib_threads,
                         long_allele_capacity,
                         skip_out_of_scope,
+                        processing_threads,
                     )
                 })
                 .collect::<Vec<_>>()

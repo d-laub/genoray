@@ -184,6 +184,7 @@ pub fn build_contig(
         1,    // htslib_threads
         4096, // long_allele_capacity
         false,
+        1, // processing_threads
     )
     .expect("process_chromosome should succeed");
     write_max_del_fixture(&out.join(chrom), samples.len(), ploidy, records);
