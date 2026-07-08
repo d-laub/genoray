@@ -6,8 +6,11 @@
 pub const PIPELINE_THREADS_PER_CHROM: usize = 4;
 // Floor for HTSlib decode threads — below this the executor channel starves.
 const MIN_HTSLIB_THREADS: usize = 2;
-// Ceiling for HTSlib decode threads — diminishing returns past 4 (BGZF block limits).
-const MAX_HTSLIB_THREADS: usize = 4;
+// Ceiling for HTSlib decode threads. Bumped 4→8 for single-/few-contig
+// workloads with many idle cores: gdc's 16007-sample records mean very large
+// BGZF blocks where extra decode threads still pay. Multi-contig runs clamp
+// well below this via cores_per_chrom, so the bump only bites when cores are idle.
+const MAX_HTSLIB_THREADS: usize = 8;
 // Min viable allocation for one chrom end-to-end.
 const MIN_THREADS_PER_CHROM: usize = PIPELINE_THREADS_PER_CHROM + MIN_HTSLIB_THREADS;
 
@@ -104,5 +107,14 @@ mod tests {
             plan_thread_budget(256, 1).htslib_threads,
             MAX_HTSLIB_THREADS
         );
+    }
+
+    #[test]
+    fn test_high_end_single_chrom_uses_raised_htslib_cap() {
+        // 33 cores → usable 32; 1 chrom → concurrent 1; cores_per_chrom 32;
+        // htslib_unclamped = 32 - 4 = 28, clamped to [2, MAX_HTSLIB_THREADS=8] → 8.
+        let plan = plan_thread_budget(33, 1);
+        assert_eq!(plan.concurrent_chroms, 1);
+        assert_eq!(plan.htslib_threads, 8);
     }
 }
