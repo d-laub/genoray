@@ -43,3 +43,19 @@ jobs:
           environments: ${{ matrix.environment }}
       - name: Test
         run: pixi run -e ${{ matrix.environment }} test
+
+  rust-test:
+    runs-on: ubuntu-latest
+    name: "Run Rust test suite"
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Setup pixi
+        uses: prefix-dev/setup-pixi@v0.9.5
+        with:
+          pixi-version: v0.70.2
+          environments: lint
+      - name: Cargo test
+        run: pixi run -e lint test-rust

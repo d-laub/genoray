@@ -18,6 +18,8 @@ sigprofiler = ["sigprofiler"]
 [dependencies]
 uv = "*"
 bcftools = "*"
+# `samtools faidx` builds the reference `.fai` in the SVAR2 conversion tests.
+samtools = "*"
 commitizen = "*"
 prek = "*"
 ruff = "*"
@@ -73,6 +75,9 @@ rust = ">=1.93.1,<1.94"
 python = "*"
 cxx-compiler = "*"
 clangdev = "18.*"
+# `cargo test` (test-rust) runs the py_convert unit tests, whose numpy-crate array
+# API imports Python's `numpy` at runtime — needed even though lint builds no wheel.
+numpy = "*"
 
 [feature.lint.activation.env]
 # lint is no-default-feature, so it doesn't inherit the top-level LIBCLANG_PATH.
@@ -80,6 +85,11 @@ LIBCLANG_PATH = "$CONDA_PREFIX/lib"
 
 [feature.lint.tasks]
 lint = "prek run --all-files --show-diff-on-failure"
+# Rust test suite. `--no-default-features` drops `extension-module` (whose
+# pyo3 symbols don't link into a standalone test binary — `undefined symbol:
+# _Py_Dealloc`); `--features conversion` keeps rust-htslib for the e2e tests.
+# Runs in `lint` (no editable-wheel build, full Rust + htslib toolchain).
+test-rust = "cargo test --no-default-features --features conversion"
 
 [feature.doc.dependencies]
 sphinx = "*"
