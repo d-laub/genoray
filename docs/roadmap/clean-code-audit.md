@@ -58,12 +58,17 @@ unless explicitly noted**. Any change to a public name reachable via `import gen
 without underscores carries a mandatory `skills/genoray-api/SKILL.md` update in the same PR
 (per `CLAUDE.md`). Ordered by recommended sequence.
 
-### SP-0 — Quick wins  ·  size S  ·  risk low  ·  **first**
+### SP-0 — Quick wins  ·  size S  ·  risk low  ·  **first**  ·  *spec written*
 De-risk and shrink the surface before the big decompositions.
-- Delete dead code: `src/utils.rs` (whole file), the scalar classifier cluster
-  (`_classify_variants_scalar` + `classify_sbs96`/`classify_id83`/`_microhomology_len`,
-  ~120 L), `is_dtype`, `POLARS_V_IDX_TYPE`, stale `#[allow(dead_code)]` on
-  `PyContigReader::inner`, dead bare annotations shadowing `cached_property`.
+See [`../superpowers/specs/2026-07-08-sp0-quick-wins-design.md`](../superpowers/specs/2026-07-08-sp0-quick-wins-design.md).
+- Delete dead code: `src/utils.rs` (whole file), `is_dtype`, `POLARS_V_IDX_TYPE`, stale
+  `#[allow(dead_code)]` on `PyContigReader::inner`, dead bare annotations shadowing
+  `cached_property`.
+  - **Correction (found during SP-0 design):** the scalar classifier cluster
+    (`_classify_variants_scalar` + `classify_sbs96`/`classify_id83`/`_microhomology_len`) is
+    **not dead** — it is a live test oracle (`tests/test_mutcat.py`,
+    `tests/test_svar_mutations.py`). Reassigned to **SP-7** as a *relocate-to-tests* task,
+    not a deletion.
 - Fix the 4 latent bugs above (with regression tests).
 - Fix broken docs: README.md + `docs/source/index.md` PGEN-filter example that references
   the nonexistent `Chromosome/Start/End/ilen/kind` schema and raises at query time.
@@ -124,7 +129,10 @@ Split `_mutcat.py` → `codebook`/`classify`/`count`; split `_utils.py` → `_io
 (+ move `hap_ilens` next to genotype code); extract the shared `_var_end_expr()` from the
 three `_var_ranges` functions; convert `np_to_pl_dtype` if/elif ladder to a lookup table;
 annotate `variant_file_type -> Literal[...] | None`; precompute `ContigNormalizer`'s
-`name_to_index`. (Dead scalar-classifier removal already handled in SP-0.)
+`name_to_index`. **Relocate the scalar mutation-catalogue oracles**
+(`_classify_variants_scalar`, `classify_sbs96`/`classify_id83`/`classify_dbs78`/
+`_microhomology_len`) out of the shipped `_mutcat.py` into a test-side oracle module —
+they are used only by `tests/` to validate the vectorized path (reassigned here from SP-0).
 
 ## Sequencing & dependencies
 
