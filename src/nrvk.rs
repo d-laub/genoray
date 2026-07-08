@@ -39,7 +39,7 @@ impl LongAlleleTableWriter {
         // enforcing the 31-bit capacity constraint
         assert!(
             self.row_index <= 0x7FFFFFFF,
-            "Exceeded 31-bit (4,294,967,295) index capacity! Cannot proceed with this many long alleles!"
+            "Exceeded 31-bit (2,147,483,647) index capacity! Cannot proceed with this many long alleles!"
         );
 
         // checking Capacity Bounds
@@ -58,8 +58,8 @@ impl LongAlleleTableWriter {
 
         self.row_index += 1;
 
-        // return strictly the 31 LSBs (masking out the 32nd bit just in case)
-        current_index & 0x7FFFFFFF
+        // the assert above guarantees the high bit is clear, so return as-is
+        current_index
     }
 
     // Double-Buffer Swap
@@ -156,6 +156,16 @@ impl LongAlleleReader {
 mod tests {
     use super::*;
     use crossbeam_channel::bounded;
+    use crossbeam_channel::unbounded;
+
+    #[test]
+    fn push_long_allele_returns_sequential_pre_increment_indices() {
+        let (tx, _rx) = unbounded::<Vec<u8>>();
+        let mut w = LongAlleleTableWriter::new(tx, 1024);
+        assert_eq!(w.push_long_allele(b"ACGT"), 0);
+        assert_eq!(w.push_long_allele(b"TTTT"), 1);
+        assert_eq!(w.push_long_allele(b"GG"), 2);
+    }
 
     #[test]
     fn test_global_u64_offsets() {
