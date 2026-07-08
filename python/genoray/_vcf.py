@@ -1421,6 +1421,9 @@ class VCF:
         ilens: NDArray[np.int32] | None = None,
         mode: type[Genos8Dosages | Genos16Dosages] | None = None,
     ) -> tuple[Genos8Dosages | Genos16Dosages, int]:
+        if self._filter is not None:
+            vcf = filter(self._filter, vcf)
+
         if out is None:
             assert mode is not None
             assert ilens is None, "caller should not provide ilens if out is None"
@@ -1467,9 +1470,6 @@ class VCF:
 
         #! assumes n_variants > 0
         n_variants = out[0].shape[-1]
-
-        if self._filter is not None:
-            vcf = filter(self._filter, vcf)
 
         if self.progress and self._pbar is None:
             vcf = tqdm(vcf, total=n_variants, desc="Reading VCF", unit=" variant")

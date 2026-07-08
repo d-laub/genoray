@@ -1,3 +1,11 @@
+## Unreleased
+
+### Fix
+
+- **vcf**: apply configured `filter` on `VCF.read(..., mode=Genos*Dosages)` when no
+  `.gvi` index is loaded, matching the genotype-only and dosage-only modes
+  (previously the filter was silently ignored on this path).
+
 ## 2.15.0 (2026-06-30)
 
 ### Feat

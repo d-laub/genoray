@@ -383,3 +383,24 @@ def test_filtered_var_idxs_consistent_with_index():
     full = v_full.read("chr1", 0, POS_MAX, mode=VCF.Genos16)
     assert filt.shape[-1] == 2
     assert np.array_equal(filt, full[..., [1, 2]])
+
+
+def test_filter_applied_to_genos_dosages_without_index():
+    # A record filter + NO .gvi index forces the out-is-None path of
+    # _fill_genos_and_dosages, where the filter was previously dropped.
+    from genoray import exprs
+
+    vcf = VCF(
+        ddir / "biallelic.vcf.gz",
+        phasing=False,
+        dosage_field="DS",
+        with_gvi_index=False,
+        filter=lambda rec: len(rec.REF) == 1 and all(len(a) == 1 for a in rec.ALT),
+        pl_filter=exprs.is_snp,
+    )
+    cse = ("chr1", 81261, 81266)  # covers the GAT>A indel and two SNPs
+    genos_only = vcf.read(*cse, VCF.Genos8)  # filters correctly today
+    genos, _dosages = vcf.read(*cse, VCF.Genos8Dosages)
+    # The genotypes from the combined mode must match the genos-only mode:
+    # both must have the SNP filter applied (indel dropped).
+    np.testing.assert_array_equal(genos, genos_only)
