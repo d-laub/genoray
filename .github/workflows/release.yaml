@@ -24,12 +24,17 @@ jobs:
           github_token: ${{ secrets.GH_ACTIONS }}
           branch: main
           changelog_increment_filename: body.md
-      - name: Release
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+      # Residual: the version-bump commit and git tag are inherent to commitizen and
+      # necessarily precede the wheel build (the wheel version comes from the bump).
+      # The user-visible GitHub Release is deferred to the `github-release` job, which
+      # only runs after `publish` succeeds, so a build/publish failure never leaves a
+      # release pointing at a tag with nothing on PyPI.
+      - name: Upload release body
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          body_path: body.md
-          tag_name: ${{ steps.cz.outputs.version }}
-          token: ${{ secrets.GH_ACTIONS }}
+          name: release-body
+          path: body.md
+          if-no-files-found: error
 
   build-wheels:
     name: Build wheel (${{ matrix.platform }})
@@ -62,7 +67,7 @@ jobs:
       - name: Repair wheel
         run: pixi run --manifest-path ci/wheel/pixi.toml repair
       - name: Upload wheel artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: wheel-${{ matrix.platform }}
           path: dist/*.whl
@@ -85,7 +90,7 @@ jobs:
       - name: Build sdist
         run: pixi run --manifest-path ci/wheel/pixi.toml sdist
       - name: Upload sdist artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: sdist
           path: dist/*.tar.gz
@@ -102,7 +107,7 @@ jobs:
       contents: read
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
           merge-multiple: true
@@ -110,6 +115,24 @@ jobs:
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
       - name: Publish
         run: uv publish
+
+  github-release:
+    name: Create GitHub release
+    needs: [bump, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release body
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-body
+      - name: Release
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+        with:
+          body_path: body.md
+          tag_name: ${{ needs.bump.outputs.version }}
+          token: ${{ secrets.GH_ACTIONS }}
 
   merge:
     name: Merge main -> stable
