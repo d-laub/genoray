@@ -78,6 +78,8 @@ clangdev = "18.*"
 # `cargo test` (test-rust) runs the py_convert unit tests, whose numpy-crate array
 # API imports Python's `numpy` at runtime — needed even though lint builds no wheel.
 numpy = "*"
+# The Rust e2e tests shell out to `bcftools norm` as a left-align/normalize oracle.
+bcftools = "*"
 
 [feature.lint.activation.env]
 # lint is no-default-feature, so it doesn't inherit the top-level LIBCLANG_PATH.
