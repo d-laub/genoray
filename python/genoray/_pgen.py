@@ -567,7 +567,7 @@ class PGEN:
         c = self._c_norm.norm(contig)
         if c is None:
             logger.warning(
-                f"Query contig {contig} not found in VCF file, even after normalizing for UCSC/Ensembl nomenclature."
+                f"Query contig {contig} not found in PGEN file, even after normalizing for UCSC/Ensembl nomenclature."
             )
             yield mode.empty(self.n_samples, self.ploidy, 0)
             return
@@ -653,7 +653,7 @@ class PGEN:
         c = self._c_norm.norm(contig)
         if c is None:
             logger.warning(
-                f"Query contig {contig} not found in VCF file, even after normalizing for UCSC/Ensembl nomenclature."
+                f"Query contig {contig} not found in PGEN file, even after normalizing for UCSC/Ensembl nomenclature."
             )
             return mode.empty(self.n_samples, self.ploidy, 0), np.zeros(
                 n_ranges + 1, OFFSET_TYPE
@@ -736,7 +736,7 @@ class PGEN:
         c = self._c_norm.norm(contig)
         if c is None:
             logger.warning(
-                f"Query contig {contig} not found in VCF file, even after normalizing for UCSC/Ensembl nomenclature."
+                f"Query contig {contig} not found in PGEN file, even after normalizing for UCSC/Ensembl nomenclature."
             )
             for _ in range(len(starts)):
                 yield (mode.empty(self.n_samples, self.ploidy, 0) for _ in range(1))
@@ -863,7 +863,7 @@ class PGEN:
         c = self._c_norm.norm(contig)
         if c is None:
             logger.warning(
-                f"Query contig {contig} not found in VCF file, even after normalizing for UCSC/Ensembl nomenclature."
+                f"Query contig {contig} not found in PGEN file, even after normalizing for UCSC/Ensembl nomenclature."
             )
             for e in ends:
                 yield (
