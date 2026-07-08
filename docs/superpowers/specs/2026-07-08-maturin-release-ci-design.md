@@ -60,22 +60,34 @@ The ~6 duplicated build-toolchain pins are a deliberate trade to keep the dev
 workspace at two platforms and its lock solvable. If a pin ever drifts, both
 manifests must be updated together.
 
-## abi3 feature — gated so the Rust test suite stays intact
+## abi3 feature — opt-in only at wheel-build time
 
-`cargo test --no-default-features` links libpython (via the `pyo3`
-`auto-initialize` dev-dependency feature) and must keep working. To keep abi3 out
-of that path, gate it behind a feature that lives in `default` (so `maturin
-build`, which uses default features, gets it) but is excluded by
-`--no-default-features`:
+Two existing cargo entry points must keep working untouched:
+
+- The lint hooks run `cargo check/clippy --all-targets` with **default** features
+  (which include `extension-module`).
+- `test-rust` runs `cargo test --no-default-features --features conversion`
+  (drops `extension-module` so the libpython-linking test binary can link the
+  `auto-initialize` dev-dependency).
+
+To disturb neither, define an `abi3` feature that is **not** in `default`, and
+enable it only when building the shipped wheel via `maturin build --features
+abi3`:
 
 ```toml
 [features]
-default = ["conversion", "extension-module", "abi3"]
-abi3    = ["pyo3/abi3-py310"]
+abi3 = ["pyo3/abi3-py310"]
 ```
 
-Result: `maturin build` → single `cp310-abi3-<platform>` wheel covering 3.10–3.13.
-`cargo test --no-default-features` → unchanged, no abi3, libpython linking intact.
+- `maturin build --features abi3` → keeps default features (`conversion` +
+  `extension-module`) and adds abi3 → single `cp310-abi3-<platform>` wheel
+  covering 3.10–3.13. maturin auto-tags the wheel from the enabled abi3 feature.
+- Lint hooks and `test-rust` → unchanged (no abi3).
+- Local `maturin develop` for dev → unchanged (full, version-specific API).
+
+This also gives a cheap local compatibility gate: `cargo check --features abi3`
+compiles the whole tree (including the `numpy` crate) under the limited API, so it
+fails fast if rust-numpy 0.29 or any pyo3 usage is abi3-incompatible.
 
 No public Python API name changes, so `skills/genoray-api/SKILL.md` does not need
 an update for this change.
@@ -104,8 +116,8 @@ Statically vendored htslib lives inside the `.so` and is untouched by repair.
    - `osx-64` → `macos-13`
 
    Each job: checkout the tag (`ref: ${{ needs.bump.outputs.version }}`) →
-   `setup-pixi` against `ci/wheel` → `maturin build --release` → repair
-   (auditwheel/delocate) → upload the repaired wheel as an artifact.
+   `setup-pixi` against `ci/wheel` → `maturin build --release --features abi3` →
+   repair (auditwheel/delocate) → upload the repaired wheel as an artifact.
 3. **`sdist`** *(new)* — `maturin sdist` once on Linux → upload artifact. This is
    the fallback for uncovered platforms and source installs.
 4. **`publish`** *(reworked)* — `needs: [build-wheels, sdist]`. Keeps the `pypi`
