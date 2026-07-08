@@ -119,6 +119,12 @@ pub fn process_chromosome(
     // Dedicated rayon pool for the reader's intra-chunk presence packing. Sized to
     // the idle cores (budget::plan_thread_budget). Built even at size 1 so the
     // reader always has a handle; parallel packing self-gates off below 2 threads.
+    // NOTE (multi-contig): process_chromosome runs once per concurrent contig, and
+    // each builds a pool of `processing_threads` — the *global* idle-core count — so
+    // N concurrent contigs allocate N pools and can oversubscribe. This is deliberate
+    // and harmless: the target is the single-contig case (concurrent == 1, exact fit),
+    // and profiling (roadmap M14) shows packing is <0.05% of reader time, so the extra
+    // threads sit idle. Divide by concurrent_chroms here if packing ever grows costly.
     let processing_pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
             .num_threads(processing_threads.max(1))

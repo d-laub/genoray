@@ -147,7 +147,8 @@ mod tests {
         // 65 cores → usable 64; 22 chroms → concurrent 10; htslib 2.
         // active = 10 * (4 + 2) = 60. processing = max(1, 64 - 60) = 4.
         assert_eq!(plan_thread_budget(65, 22).processing_threads, 4);
-        // Fully saturated: 7 cores → usable 6 → low-end, 1 chrom, htslib = min(max(1,6-4),8)=2.
+        // Fully saturated: 7 cores → usable 6 == MIN_THREADS_PER_CHROM → high-end branch
+        // (boundary: 6 < 6 is false), 1 chrom, htslib = clamp(6-4, 2, 8) = 2.
         // active = 1*(4+2)=6. processing = max(1, 6-6) = 1 (floored).
         assert_eq!(plan_thread_budget(7, 1).processing_threads, 1);
     }
