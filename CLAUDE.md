@@ -29,6 +29,18 @@ ruff check genoray tests
 ruff format genoray tests
 ```
 
+### Release wheels
+
+Release CI (`.github/workflows/release.yaml`) builds the Rust extension as
+portable wheels from an **isolated** pixi manifest at `ci/wheel/pixi.toml`
+(declares all four wheel platforms; the main `pixi.toml` stays at linux-64 +
+osx-arm64). Wheels use pyo3 abi3 (`maturin build --features abi3`) → one
+`cpXY-abi3` wheel per platform covers Python 3.10–3.13, then `auditwheel`
+(Linux) / `delocate` (macOS) repair them. The `abi3` cargo feature is opt-in
+only at wheel-build time so lint hooks and the Rust test suite are unaffected.
+Toolchain pins (`rust`, `clangdev=18`) are duplicated between the two manifests
+and must be kept in sync.
+
 ## Architecture
 
 `genoray` is a library for range-querying genetic variant data (genotypes and dosages) from VCF and PGEN files as NumPy arrays.

@@ -42,6 +42,10 @@ pyo3 = { version = "0.29", features = ["auto-initialize"] }
 default = ["conversion", "extension-module"]
 conversion = ["dep:rust-htslib"]
 extension-module = ["pyo3/extension-module"]
+# abi3 (stable ABI) is opt-in ONLY at wheel-build time (`maturin build --features
+# abi3`) so lint hooks (default features) and `cargo test --no-default-features`
+# stay unaffected. abi3-py310 => one cpXY-abi3 wheel covers Python 3.10-3.13.
+abi3 = ["pyo3/abi3-py310"]
 
 [workspace]
 members = ["svar2-codec"]

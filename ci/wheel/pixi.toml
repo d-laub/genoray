@@ -1,0 +1,48 @@
+[workspace]
+name = "genoray-wheel-build"
+channels = ["conda-forge"]
+platforms = ["linux-64", "linux-aarch64", "osx-arm64", "osx-64"]
+
+[dependencies]
+# Rust toolchain pinned to match ../../pixi.toml.
+rust = ">=1.93.1,<1.94"
+maturin = ">=1.12,<2"
+# htslib (vendored by hts-sys) build deps: C/C++ compiler builds vendored htslib,
+# clangdev provides libclang for rust-htslib's mandatory bindgen (18 is required;
+# 22 breaks rust-htslib 1.0), zlib provides zlib.h.
+cxx-compiler = "*"
+clangdev = "18.*"
+zlib = "*"
+# abi3 build interpreter: any >=3.10 satisfies abi3-py310; the wheel is tagged cp310.
+python = ">=3.10,<3.14"
+
+[activation.env]
+# rust-htslib's bindgen step needs to locate libclang (provided by clangdev).
+LIBCLANG_PATH = "$CONDA_PREFIX/lib"
+
+[tasks]
+# Tasks run with cwd = this manifest's directory, so ../../ is the repo root.
+build = "maturin build --release --features abi3 -m ../../Cargo.toml -o ../../wheelhouse"
+sdist = "maturin sdist -m ../../Cargo.toml -o ../../dist"
+
+# Wheel repair is platform-specific: auditwheel (Linux) bundles conda .so deps and
+# assigns a manylinux tag; delocate does the equivalent on macOS.
+[target.linux-64.dependencies]
+auditwheel = "*"
+patchelf = "*"
+[target.linux-aarch64.dependencies]
+auditwheel = "*"
+patchelf = "*"
+[target.osx-arm64.dependencies]
+delocate = "*"
+[target.osx-64.dependencies]
+delocate = "*"
+
+[target.linux-64.tasks]
+repair = "auditwheel repair ../../wheelhouse/*.whl -w ../../dist"
+[target.linux-aarch64.tasks]
+repair = "auditwheel repair ../../wheelhouse/*.whl -w ../../dist"
+[target.osx-arm64.tasks]
+repair = "delocate-wheel -w ../../dist -v ../../wheelhouse/*.whl"
+[target.osx-64.tasks]
+repair = "delocate-wheel -w ../../dist -v ../../wheelhouse/*.whl"
