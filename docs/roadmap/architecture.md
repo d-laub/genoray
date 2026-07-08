@@ -108,8 +108,9 @@ model.
 deletions span reference bases. Both the **format-independent overlap core**
 (`src/search.rs`) and its **disk integration** (`src/query.rs`: `ContigReader` +
 `overlap_sample`, which mmaps the sidecars, consumes `max_del.npy`, genotype-filters the
-dense classes, and unions the sub-streams) are implemented (M5). Generalizing this
-single-sample core into the batched two-channel consumer interface is M6.
+dense classes, and unions the sub-streams) are implemented (M5). The single-sample core
+has since been generalized into the batched two-channel consumer interface (M6:
+`overlap_batch` + the search/gather split, exposed to Python on `SparseVar2`).
 
 - **Index structure:** binary search over the sorted position sidecar, starting from
   the [left-tree static search tree](https://curiouscoding.nl/posts/static-search-tree/#left-tree)
@@ -127,7 +128,10 @@ single-sample core into the batched two-channel consumer interface is M6.
 
 ## Python decode path
 
-Query results (roadmap M6) decode into user-facing structs/classes (exact API TBD).
+Query results (roadmap M6) decode into user-facing structs/classes. The Python API has
+landed: `SparseVar2.decode(contig, regions)` materializes a `seqpro.rag.Ragged` record
+(`pos`/`ilen`/`allele`, shape `(R, S, P, None)`), `region_counts` is the decode-free
+count, and gvl's Rust core consumes the raw two-channel `BatchResult` inline (M6b).
 Because a single contig's variants are spread across up to three representations — each
 split into an independent, position-sorted `snp/` and `indel/` sub-stream (up to six
 sources) — assembling a result requires a **fast sorted union / merge** of multiple
@@ -164,14 +168,19 @@ sorted streams.
   budget × rayon threads. Open: how to tune the budget vs. thread count at cohort scale.
 - **PGEN path (M7).** Whether the htslib reader stage is cleanly swappable for a
   `pgenlib` FFI source behind the same chunk contract.
-- **Read-bound conversion / thread allocation for few-contig jobs.** rayon fans out across
-  *contigs*, so a conversion of one (or few) contigs runs a single Reader→Encode→Writer
-  pipeline and leaves most cores idle. Observed on a gvl SVAR2 MVP build (single contig,
-  8-core job): `1 concurrent chromosome | 3 HTSlib decompression threads each (7 total
-  active, 1 idle)`, with VCF read/decompress plainly dominating wall-clock (chr21:
-  germline ~11 min, somatic 16007-sample ~2 h). Open: when contig-parallelism is low,
-  rebalance threads toward the Reader — e.g. reserve ~1 thread for the executor+writer and
-  give the remainder to htslib decompression + record decoding, and/or parallelize the
-  Reader stage *within* a contig. Requires profiling to confirm the read stage is the
-  bottleneck and to size the split — see the gvl SVAR2 profiling follow-up spec
-  (`GenVarLoader:docs/superpowers/specs/2026-07-03-svar2-profiling-followup.md`).
+- **Read-bound conversion / thread allocation for few-contig jobs.** *Largely resolved
+  (M14), with a profiled ceiling.* rayon fans out across *contigs*, so a one/few-contig
+  conversion runs a single Reader→Encode→Writer pipeline and leaves most cores idle. M14
+  puts the idle cores to work by parallelizing the reader's genotype-presence bit-packing
+  over word-aligned variant blocks (`pack_presence_par`, byte-identical to the sequential
+  pack), while keeping all *ordering* work sequential; the thread budget
+  (`src/budget.rs`) now computes a `processing_threads` count from the idle cores. Measured
+  on 32 cores, single contig chr21: gdc **1051 s → 981 s (−6.7 %)**; germline unchanged
+  (already fast). **Why it stops there:** a frame-pointer `perf` profile shows the reader
+  is **htslib-input-bound**, not decode-bound — ~78 % of samples in the reader thread, whose
+  self-time is dominated by BGZF `inflate` (~32 %), `vcf_parse` (~9 %), and name
+  tokenization (~14 %); genoray-side GT-decode and packing do not surface at ≥0.05 %. So
+  raising the htslib decode-thread cap was inert, and fusing raw-GT decode into the parallel
+  pass was declined (its premise — a meaningful sequential GT-decode cost — is falsified by
+  the profile). Further single-contig speedup requires attacking htslib BGZF inflate / VCF
+  parsing itself, not the genoray packing. See [`svar-2.md`](svar-2.md), M14.

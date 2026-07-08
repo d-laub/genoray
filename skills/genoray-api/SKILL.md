@@ -17,7 +17,7 @@ description: Use when writing or modifying Python code that imports `genoray` to
 - `genoray.VCF` — VCF/BCF reader
 - `genoray.Reader` — type alias `VCF | PGEN | SparseVar`
 - `genoray.SparseVar` — sparse `.svar` reader/writer
-- `genoray.SparseVar2` — next-gen sparse variant store (VCF/BCF → SVAR2 conversion via `from_vcf`; read/query API still evolving)
+- `genoray.SparseVar2` — next-gen sparse variant store (VCF/BCF → SVAR2 conversion via `from_vcf`; range queries via `decode`/`region_counts`/`read_ranges`)
 - `genoray.exprs` — polars filter expressions for `.gvi` indexes
 - `genoray.cosmic_signatures` — fetch/cache COSMIC reference signatures
 - `genoray.fit_signatures` — sparse forward-selection signature refit
@@ -35,7 +35,7 @@ Prefer reading these over guessing:
 - `genoray/_vcf.py` — `VCF` class: constructor, `read`, `chunk`, mode constants near the top of the class
 - `genoray/_pgen.py` — `PGEN` class: constructor, `read`, `chunk`, `read_ranges`, `chunk_ranges`, mode constants near the top of the class
 - `genoray/_svar.py` — `SparseVar`: `__init__`, `from_vcf`, `from_pgen`, `read_ranges`, `with_fields`, `annotate_mutations`, `mutation_matrix`, `assign_signatures`
-- `genoray/_svar2.py` — `SparseVar2`: `__init__`, `from_vcf` (VCF/BCF → SVAR2 conversion entry point)
+- `genoray/_svar2.py` — `SparseVar2`: `__init__`, `from_vcf` (VCF/BCF → SVAR2 conversion entry point); `n_samples`/`samples`/`contigs`/`ploidy` metadata. Read/query methods live in the mixins: `genoray/_svar2_decode.py` (`decode`, `region_counts`) and `genoray/_svar2_batch.py` (`overlap_batch`, `read_ranges`, `find_ranges`, `gather_ranges`)
 - `genoray/_cli/__main__.py` — the `genoray` CLI (`index`, `write` / `write svar1`, `view`)
 - `genoray/_signatures.py` — `cosmic_signatures`, `fit_signatures`
 - `genoray/_reference.py` — `Reference`: `from_path`, `fetch`, `contig_array`
@@ -197,8 +197,12 @@ are **0-based half-open**. Don't conflate them.
 ## SparseVar2 (`.svar2`) — quick reference
 
 `SparseVar2` is the next-gen sparse variant store (VariantKey-style inline
-encoding + per-variant dense/sparse cost model). The read/query API is still
-evolving; the stable, documented entry point today is conversion:
+encoding + per-variant dense/sparse cost model). Two halves: **conversion**
+(`from_vcf`, below) writes a store; **range queries** (`decode` / `region_counts`
+/ `read_ranges`, further below) read it back. All coordinates are 0-based
+half-open `[start, end)`, as everywhere else in genoray.
+
+### Conversion
 
 ```python
 from genoray import SparseVar2
@@ -228,6 +232,52 @@ Signature: `from_vcf(out, source, reference=None, *, no_reference=False, skip_ou
   unless `skip_out_of_scope=True`).
 - No dosages, no `haploid=` OR-collapse, no `max_mem`-based chunking (use
   `chunk_size` instead) — these remain `SparseVar` (SVAR 1.0)-only for now.
+
+### Range queries
+
+Open a finished store, then query per contig. Construction reads `meta.json` and
+opens one native reader per contig, exposing `.samples` (list), `.n_samples`,
+`.contigs`, `.ploidy`, `.format_version`.
+
+```python
+from genoray import SparseVar2
+
+sv = SparseVar2("out.svar2")
+regions = [(0, 40), (1_000, 2_000)]   # 0-based half-open [start, end)
+
+# Analysis path — decode to a seqpro Ragged record (one call per contig)
+rag = sv.decode("chr1", regions)      # fields pos (i32), ilen (i32), allele (ALT bytes)
+                                      # shape (R, S, P, None); pure-DEL ALT is empty
+
+# Decode-free per-(region, sample, ploid) variant count — replaces SVAR 1.0's var_ranges
+counts = sv.region_counts("chr1", regions)   # np.ndarray, shape (R, S, P)
+```
+
+- `decode(contig, regions)` returns a `seqpro.rag.Ragged` whose layout is
+  **byte-identical to gvl's `RaggedVariants`** (`pos`/`ilen` numeric,
+  `allele` opaque-string ALT, one shared variant-axis offsets object). ALT is
+  empty for a pure deletion (the reference base is not re-emitted). Requires
+  `seqpro`.
+- `region_counts(contig, regions)` is the **decode-free** count (offset diffs +
+  dense-mask popcount) — the simplified stand-in for `SparseVar.var_ranges`
+  (SVAR2 has no unified variant table, so variant *indices* no longer exist).
+- Queries are **per contig** — cross-contig batching is the caller's job. Regions
+  are an iterable of `(start, end)` pairs.
+
+Lower-level array methods (what gvl's Rust core consumes) return the raw
+two-channel `BatchResult` → numpy dict (`vk_pos`/`vk_key`/`vk_off`, `dense_*`,
+`lut_*`, plus `n_regions`/`n_samples`/`ploidy`):
+
+- `overlap_batch(contig, regions)` — batched two-channel query.
+- `read_ranges(contig, starts, ends, samples=None)` — fused search+gather;
+  `starts`/`ends` are parallel 1D arrays (mirrors `SparseVar.read_ranges`),
+  `samples` selects/reorders a subset **by name**. Byte-identical to
+  `overlap_batch` over the same regions when `samples=None`.
+- `find_ranges(contig, starts, ends, samples=None, out=None)` /
+  `gather_ranges(contig, ranges, samples=None)` — the search-only + tree-free
+  replay split for a write-time overlap cache; `read_ranges ==
+  gather_ranges(find_ranges(...))`. `find_ranges(out=...)` streams the bundle into
+  caller-preallocated arrays.
 
 ## CLI (`genoray write`)
 

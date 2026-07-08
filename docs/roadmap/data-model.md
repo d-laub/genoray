@@ -323,7 +323,7 @@ already does an analogous length-aware scan
 (`_find_starts_ends_with_length` in `python/genoray/_svar.py`); SVAR 2.0 generalizes it
 across the three representations.
 
-### Implementation status (M5 — search core + disk query)
+### Implementation status (M5–M6 — search core, disk query, consumer surface)
 
 Both the **format-independent search core** (`src/search.rs`) and the **disk-integrated
 `(range, sample)` query** (`src/query.rs`) are implemented. The search core:
@@ -351,11 +351,16 @@ The core depends only on in-memory slices — no on-disk types. The **disk query
 (per-column `var_key/indel`, scalar `dense/indel`), runs `overlap_range` per
 `(sample, ploid)`, genotype-filters the dense classes, decodes each hit through `rvk`, and
 k-way-merges the four sub-streams into one position-sorted result per haplotype (proptested
-end-to-end in `tests/test_query.rs`). **Remaining beyond M5** (now M6): the batched
-multi-region/multi-sample consumer interface and uniform-key re-expansion —
-`overlap_sample` is a single-sample Rust core, not yet a Python API. The `svar2-codec`
-seam extraction listed here previously has since shipped as its own crate (see
-[`svar-2.md`](svar-2.md), M6).
+end-to-end in `tests/test_query.rs`). **M6 has since shipped** on top of this core: the
+`svar2-codec` seam is its own crate; `overlap_batch` / `BatchResult` / `decode_hap`
+(`src/query.rs` + `src/spine.rs`) generalize `overlap_sample` into the batched
+multi-region × multi-sample consumer spine with uniform-key (SNP→32-bit) re-expansion at
+query time; the search/gather split and read-bound per-class gather (`find_ranges` /
+`gather_ranges` / `gather_ranges_readbound`) back a write-time overlap cache; and the whole
+surface is exposed to Python via `PyContigReader` + `SparseVar2` (`decode` →
+`seqpro.rag.Ragged`, `region_counts`, `overlap_batch` / `read_ranges` /
+`find_ranges` / `gather_ranges`). See [`svar-2.md`](svar-2.md), M6 (and
+[`architecture.md`](architecture.md#python-decode-path)).
 
 ## Format constraints and non-goals
 
