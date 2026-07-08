@@ -910,9 +910,9 @@ class SparseVar(Generic[_SRT]):
         if samples is None:
             samples = np.atleast_1d(np.array(self.available_samples))
         else:
+            samples = np.atleast_1d(np.array(samples))
             if missing := set(samples) - set(self.available_samples):  # type: ignore
                 raise ValueError(f"Samples {missing} not found in the dataset.")
-            samples = np.atleast_1d(np.array(samples))
 
         n_samples = len(samples)
         starts = np.atleast_1d(np.asarray(starts, POS_TYPE))
