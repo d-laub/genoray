@@ -3,6 +3,7 @@ __pycache__/
 notebooks/
 .venv/
 dist/
+/wheelhouse/
 docs/build/
 data/*
 tests/data/*
