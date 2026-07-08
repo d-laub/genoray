@@ -1,0 +1,210 @@
+// src/lib.rs
+use pyo3::prelude::*;
+#[cfg(feature = "conversion")]
+use rayon::prelude::*;
+
+pub mod bits;
+
+/// Test-facing re-export of `bits::get_bit` for downstream (gvl-side) test
+/// oracles that reconstruct per-hap presence bitmasks from `BatchResultSplit`.
+///
+/// Intentionally public (not `cfg(test)`-gated): ships in `genoray_core`'s
+/// public API as part of the gvl-side read-bound parity-oracle surface,
+/// alongside `query::decode_keyref_pub`/`query::decode_keyref_alt_pub`.
+pub fn bits_get_bit(bytes: &[u8], i: usize) -> bool {
+    bits::get_bit(bytes, i)
+}
+#[cfg(feature = "conversion")]
+pub mod budget;
+pub mod cost_model;
+pub mod dense;
+#[cfg(feature = "conversion")]
+pub mod dense_merge;
+pub mod error;
+#[cfg(feature = "conversion")]
+pub mod executor;
+pub mod layout;
+#[cfg(feature = "conversion")]
+pub mod max_del;
+#[cfg(feature = "conversion")]
+pub mod merge;
+#[cfg(feature = "conversion")]
+pub mod meta;
+#[cfg(feature = "conversion")]
+pub mod monitor;
+#[cfg(feature = "conversion")]
+pub mod normalize;
+pub mod nrvk;
+#[cfg(feature = "conversion")]
+pub mod orchestrator;
+// NOTE: `py_convert` is *not* conversion-only despite being in the original gate
+// list: query-core `py_query_batch.rs`/`py_query_decode.rs`/`py_query_ranges.rs`
+// import its numpy-array conversion helpers unconditionally, and py_convert.rs
+// itself has zero htslib dependency (pure numpy/pyo3 glue). Stays ungated as
+// shared infra, same reasoning as `streams` above.
+pub mod py_convert;
+pub mod py_query;
+pub mod py_query_batch;
+pub mod py_query_decode;
+pub mod py_query_ranges;
+pub mod query;
+pub mod rvk;
+pub mod search;
+pub mod spine;
+// NOTE: `streams` (StreamTag/StreamMap/REGISTRY) is *not* conversion-only despite
+// being in the original gate list: query-core `rvk.rs` and `types.rs` depend on it
+// unconditionally (StreamMap is a real struct field / decode-path type, not just an
+// errant import), and streams.rs itself has zero htslib dependency. Gating it broke
+// the query-core build; it stays ungated as shared infra.
+pub mod streams;
+pub mod types;
+#[cfg(feature = "conversion")]
+pub mod vcf_reader;
+#[cfg(feature = "conversion")]
+pub mod writer;
+
+#[cfg(feature = "conversion")]
+pub use orchestrator::process_chromosome;
+
+/// Build a `.csi` index next to a bgzipped-VCF / BCF at `path`. CSI (min_shift 14)
+/// is valid for both, so one path covers `.vcf.gz` and `.bcf`.
+#[cfg(feature = "conversion")]
+pub fn index_bcf_csi(path: &str) -> Result<(), String> {
+    let idx = format!("{path}.csi");
+    rust_htslib::bcf::index::build(
+        path,
+        Some(idx.as_str()),
+        1,
+        rust_htslib::bcf::index::Type::Csi(14),
+    )
+    .map_err(|e| format!("failed to build .csi index for {path}: {e:?}"))
+}
+
+#[cfg(feature = "conversion")]
+#[pyfunction]
+fn index_vcf(path: String) -> PyResult<()> {
+    index_bcf_csi(&path).map_err(pyo3::exceptions::PyRuntimeError::new_err)
+}
+
+//The Python Wrapper and resource allocator
+#[cfg(feature = "conversion")]
+#[allow(clippy::too_many_arguments)]
+#[pyfunction]
+#[pyo3(signature = (vcf_path, reference_path, chroms, output_dir, samples, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false))]
+fn run_conversion_pipeline(
+    py: Python,
+    vcf_path: String,
+    reference_path: Option<String>,
+    chroms: Vec<String>, // now taking a vector
+    output_dir: String,
+    samples: Vec<String>,
+    chunk_size: usize, // default 25K variants/chunk — halves per-chunk plumbing overhead vs the old 10K
+    ploidy: usize,
+    max_threads: Option<usize>,  // accepts an optional integer from Python
+    long_allele_capacity: usize, // default 8MB — old 100MB rarely flushed mid-run, blocking executor at finalize
+    skip_out_of_scope: bool,
+) -> PyResult<usize> {
+    let sample_refs: Vec<&str> = samples.iter().map(|s| s.as_str()).collect();
+
+    let results: Vec<Result<u64, crate::error::ConversionError>> = py.detach(|| {
+        // Step 1 -> HW discovery/override and budgeting
+        let available_cores = match max_threads {
+            Some(t) if t > 0 => {
+                println!("Notice: Using user-provided thread limit: {}", t);
+                t
+            }
+            _ => {
+                let detected = std::thread::available_parallelism().unwrap().get();
+                println!(
+                    "Notice: No thread limit provided. Hardware Detected: {} cores.",
+                    detected
+                );
+                detected
+            }
+        };
+
+        let plan = crate::budget::plan_thread_budget(available_cores, chroms.len());
+        let concurrent_chroms = plan.concurrent_chroms;
+        let htslib_threads = plan.htslib_threads;
+        let processing_threads = plan.processing_threads;
+
+        let total_active =
+            concurrent_chroms * (crate::budget::PIPELINE_THREADS_PER_CHROM + htslib_threads);
+        println!("Using: {} cores.", available_cores);
+        println!(
+            "Pipeline Config: {} concurrent chromosomes | {} HTSlib decompression threads each \
+             ({} total active, {} reserved for OS/idle).",
+            concurrent_chroms,
+            htslib_threads,
+            total_active,
+            available_cores.saturating_sub(total_active),
+        );
+
+        // Step 2 -> Rayon Pool
+        // Rayon hosts one task per concurrent chrom; each task spawns its own pipeline
+        // OS threads (reader, executor, writers) plus htslib_threads HTSlib decode threads.
+        // Naming the rayon workers makes them grep-able in `top -H` / pidstat alongside
+        // the per-chrom threads (read-chr1, exec-chr1, etc.).
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(concurrent_chroms)
+            .thread_name(|i| format!("rayon-{}", i))
+            .build()
+            .unwrap();
+
+        // Step 3 -> Dispatch
+        let fasta_ref: Option<&str> = reference_path.as_deref();
+        let results = pool.install(|| {
+            chroms
+                .par_iter()
+                .map(|chrom| {
+                    println!("==> Processing {}", chrom);
+                    orchestrator::process_chromosome(
+                        &vcf_path,
+                        fasta_ref,
+                        chrom,
+                        &output_dir,
+                        &sample_refs,
+                        chunk_size,
+                        ploidy,
+                        htslib_threads,
+                        long_allele_capacity,
+                        skip_out_of_scope,
+                        processing_threads,
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+
+        println!("Cohort Processing Complete.");
+        results
+    });
+
+    let mut total_dropped: u64 = 0;
+    for r in results {
+        total_dropped += r.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+    }
+
+    // All contigs converted — write the top-level meta.json describing the cohort.
+    crate::meta::write_meta(
+        std::path::Path::new(&output_dir),
+        crate::meta::FORMAT_VERSION,
+        &samples,
+        &chroms,
+        ploidy,
+    )
+    .map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("failed to write meta.json: {e}"))
+    })?;
+
+    Ok(total_dropped as usize)
+}
+
+#[pymodule]
+fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    #[cfg(feature = "conversion")]
+    m.add_function(wrap_pyfunction!(run_conversion_pipeline, m)?)?;
+    #[cfg(feature = "conversion")]
+    m.add_function(wrap_pyfunction!(index_vcf, m)?)?;
+    m.add_class::<crate::py_query::PyContigReader>()?;
+    Ok(())
+}

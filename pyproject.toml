@@ -7,7 +7,7 @@ readme = "README.md"
 license = { file = "LICENSE.txt" }
 requires-python = ">=3.10,<3.14" # blocked by pyarrow
 dependencies = [
-    "seqpro>=0.21.1",
+    "seqpro>=0.21.1,<0.22",
     "numpy>=1.26",
     "pandas>=2.2.3",
     "hirola>=0.3.0",
@@ -49,10 +49,13 @@ update_changelog_on_bump = true
 annotated_tag = true
 
 [build-system]
-build-backend = "hatchling.build"
-requires = ["hatchling"]
+build-backend = "maturin"
+requires = ["maturin>=1.0,<2.0"]
 
 [tool.pytest.ini_options]
+# Put the repo root on sys.path so shared test helpers import as `from tests import _oracle`
+# (tests/ has no __init__.py; main's suite relies on this).
+pythonpath = ["."]
 filterwarnings = ["ignore::DeprecationWarning:sorted_nearest.*"]
 markers = [
     "network: requires network access (deselect with '-m not network')",
@@ -63,11 +66,19 @@ markers = [
 enableTypeIgnoreComments = true
 reportMissingTypeArgument = false
 
+[tool.maturin]
+python-source = "python"
+module-name = "genoray._core"
+bindings = "pyo3"
+
 [tool.pyrefly]
 preset = "strict"
-project-includes = ["genoray"]
-# pgenlib is a compiled extension with no type stubs; treat it as untyped.
-replace-imports-with-any = ["pgenlib"]
+project-includes = ["python/genoray"]
+# pgenlib and the _core Rust extension are compiled with no type stubs; treat
+# them as untyped. `genoray._core` only matches when imported as a submodule
+# (`import genoray._core`), not `from genoray import _core` (which resolves via
+# the package __getattr__), so importers must use the submodule form.
+replace-imports-with-any = ["pgenlib", "genoray._core"]
 
 [tool.pyrefly.errors]
 # Mostly numpy-scalar noise (np.integer -> np.integer[Any]) and the Phantom

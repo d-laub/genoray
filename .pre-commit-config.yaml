@@ -21,6 +21,33 @@ repos:
     stages: [commit-msg]
 - repo: local
   hooks:
+  # Run cargo through `pixi run -e lint` so the hooks use the lint env's toolchain
+  # (rust + LIBCLANG_PATH + a Python for the pyo3 build script). The explicit
+  # `-e lint` also resets CONDA_PREFIX, which matters when committing with a
+  # pixi-global git: its trampoline sets CONDA_PREFIX to ~/.pixi/envs/git (no
+  # python), and the pyo3 build script would otherwise look for python there and
+  # fail. CI already runs these via `pixi run -e lint`, so this is consistent.
+  - id: cargo-fmt
+    name: cargo fmt
+    entry: pixi run -e lint cargo fmt --all -- --check
+    language: system
+    types: [rust]
+    pass_filenames: false
+    stages: [pre-commit]
+  - id: cargo-check
+    name: cargo check
+    entry: pixi run -e lint cargo check --all-targets
+    language: system
+    types: [rust]
+    pass_filenames: false
+    stages: [pre-commit]
+  - id: cargo-clippy
+    name: cargo clippy
+    entry: pixi run -e lint cargo clippy --all-targets -- -D warnings
+    language: system
+    types: [rust]
+    pass_filenames: false
+    stages: [pre-commit]
   - id: pyrefly
     name: Type-check with pyrefly
     entry: pixi run typecheck

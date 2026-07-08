@@ -17,6 +17,7 @@ description: Use when writing or modifying Python code that imports `genoray` to
 - `genoray.VCF` — VCF/BCF reader
 - `genoray.Reader` — type alias `VCF | PGEN | SparseVar`
 - `genoray.SparseVar` — sparse `.svar` reader/writer
+- `genoray.SparseVar2` — next-gen sparse variant store (VCF/BCF → SVAR2 conversion via `from_vcf`; range queries via `decode`/`region_counts`/`read_ranges`)
 - `genoray.exprs` — polars filter expressions for `.gvi` indexes
 - `genoray.cosmic_signatures` — fetch/cache COSMIC reference signatures
 - `genoray.fit_signatures` — sparse forward-selection signature refit
@@ -34,6 +35,8 @@ Prefer reading these over guessing:
 - `genoray/_vcf.py` — `VCF` class: constructor, `read`, `chunk`, mode constants near the top of the class
 - `genoray/_pgen.py` — `PGEN` class: constructor, `read`, `chunk`, `read_ranges`, `chunk_ranges`, mode constants near the top of the class
 - `genoray/_svar.py` — `SparseVar`: `__init__`, `from_vcf`, `from_pgen`, `read_ranges`, `with_fields`, `annotate_mutations`, `mutation_matrix`, `assign_signatures`
+- `genoray/_svar2.py` — `SparseVar2`: `__init__`, `from_vcf` (VCF/BCF → SVAR2 conversion entry point); `n_samples`/`samples`/`contigs`/`ploidy` metadata. Read/query methods live in the mixins: `genoray/_svar2_decode.py` (`decode`, `region_counts`) and `genoray/_svar2_batch.py` (`overlap_batch`, `read_ranges`, `find_ranges`, `gather_ranges`)
+- `genoray/_cli/__main__.py` — the `genoray` CLI (`index`, `write` / `write svar1`, `view`)
 - `genoray/_signatures.py` — `cosmic_signatures`, `fit_signatures`
 - `genoray/_reference.py` — `Reference`: `from_path`, `fetch`, `contig_array`
 - `genoray/exprs.py` — the *complete* set of pre-built filter expressions (currently 7: `is_snp`, `is_indel`, `is_biallelic`, `is_symbolic`, `is_breakend`, `is_imprecise`, `ILEN`)
@@ -47,7 +50,7 @@ source** rather than reasoning from first principles.
 - `max_mem` accepts strings like `"4g"`, `"512m"`, `"2GB"`.
 - Contig names auto-normalize: `"chr1"` and `"1"` both work regardless of file convention (`ContigNormalizer`).
 - Missing genotype = `-1` (int). Missing dosage = `np.nan` (float32).
-- Ploidy is 2 by default; `SparseVar.from_vcf`/`from_pgen` (and `genoray write`) accept `haploid=True` / `--haploid`, which OR-collapses haplotypes into a single haploid call per sample and records `ploidy=1` in metadata (intended for unphased somatic data).
+- Ploidy is 2 by default; `SparseVar.from_vcf`/`from_pgen` (and `genoray write svar1`) accept `haploid=True` / `--haploid`, which OR-collapses haplotypes into a single haploid call per sample and records `ploidy=1` in metadata (intended for unphased somatic data).
 - All return arrays are NumPy; `mode` selects which arrays you get back.
 
 ## Mode constants — gotcha
@@ -190,6 +193,117 @@ rows = svar.index[v_idxs.tolist()].select("CHROM", "POS", "REF", "ALT")
 
 `svar.index.POS` is **1-based** (VCF convention), while query coordinates
 are **0-based half-open**. Don't conflate them.
+
+## SparseVar2 (`.svar2`) — quick reference
+
+`SparseVar2` is the next-gen sparse variant store (VariantKey-style inline
+encoding + per-variant dense/sparse cost model). Two halves: **conversion**
+(`from_vcf`, below) writes a store; **range queries** (`decode` / `region_counts`
+/ `read_ranges`, further below) read it back. All coordinates are 0-based
+half-open `[start, end)`, as everywhere else in genoray.
+
+### Conversion
+
+```python
+from genoray import SparseVar2
+
+dropped = SparseVar2.from_vcf(
+    "out.svar2", "file.vcf.gz", "ref.fa",   # reference: validates REF + left-aligns indels
+    overwrite=True,
+)
+
+# Pre-normalized input (e.g. `bcftools norm`'d): skip REF validation/left-align
+dropped = SparseVar2.from_vcf("out.svar2", "file.vcf.gz", no_reference=True)
+```
+
+Signature: `from_vcf(out, source, reference=None, *, no_reference=False, skip_out_of_scope=False, ploidy=2, chunk_size=25_000, threads=None, overwrite=False, long_allele_capacity=8*1024*1024) -> int`
+
+- `source` — a bgzipped VCF (`.vcf.gz`) or BCF (`.bcf`). **VCF/BCF only** — no PGEN
+  source yet (roadmap M7). Auto-indexes (`.csi`) if no `.csi`/`.tbi` is found.
+- Exactly one of `reference` (a FASTA path, used to validate REF and left-align
+  indels) or `no_reference=True` (trusts pre-normalized input, skips
+  validation/left-align) is required — passing both or neither raises
+  `ValueError`.
+- `skip_out_of_scope=False` — when `True`, drops out-of-scope (symbolic
+  `<DEL>`/`<INS>`/… and breakend) ALTs instead of erroring; the strict default
+  errors on the first one. The two classes are **not** distinguishable at this
+  layer — there's no separate "symbolic only" vs. "breakend only" toggle.
+- Returns the number of dropped out-of-scope ALTs as an `int` (always `0`
+  unless `skip_out_of_scope=True`).
+- No dosages, no `haploid=` OR-collapse, no `max_mem`-based chunking (use
+  `chunk_size` instead) — these remain `SparseVar` (SVAR 1.0)-only for now.
+
+### Range queries
+
+Open a finished store, then query per contig. Construction reads `meta.json` and
+opens one native reader per contig, exposing `.samples` (list), `.n_samples`,
+`.contigs`, `.ploidy`, `.format_version`.
+
+```python
+from genoray import SparseVar2
+
+sv = SparseVar2("out.svar2")
+regions = [(0, 40), (1_000, 2_000)]   # 0-based half-open [start, end)
+
+# Analysis path — decode to a seqpro Ragged record (one call per contig)
+rag = sv.decode("chr1", regions)      # fields pos (i32), ilen (i32), allele (ALT bytes)
+                                      # shape (R, S, P, None); pure-DEL ALT is empty
+
+# Decode-free per-(region, sample, ploid) variant count — replaces SVAR 1.0's var_ranges
+counts = sv.region_counts("chr1", regions)   # np.ndarray, shape (R, S, P)
+```
+
+- `decode(contig, regions)` returns a `seqpro.rag.Ragged` whose layout is
+  **byte-identical to gvl's `RaggedVariants`** (`pos`/`ilen` numeric,
+  `allele` opaque-string ALT, one shared variant-axis offsets object). ALT is
+  empty for a pure deletion (the reference base is not re-emitted). Requires
+  `seqpro`.
+- `region_counts(contig, regions)` is the **decode-free** count (offset diffs +
+  dense-mask popcount) — the simplified stand-in for `SparseVar.var_ranges`
+  (SVAR2 has no unified variant table, so variant *indices* no longer exist).
+- Queries are **per contig** — cross-contig batching is the caller's job. Regions
+  are an iterable of `(start, end)` pairs.
+
+Lower-level array methods (what gvl's Rust core consumes) return the raw
+two-channel `BatchResult` → numpy dict (`vk_pos`/`vk_key`/`vk_off`, `dense_*`,
+`lut_*`, plus `n_regions`/`n_samples`/`ploidy`):
+
+- `overlap_batch(contig, regions)` — batched two-channel query.
+- `read_ranges(contig, starts, ends, samples=None)` — fused search+gather;
+  `starts`/`ends` are parallel 1D arrays (mirrors `SparseVar.read_ranges`),
+  `samples` selects/reorders a subset **by name**. Byte-identical to
+  `overlap_batch` over the same regions when `samples=None`.
+- `find_ranges(contig, starts, ends, samples=None, out=None)` /
+  `gather_ranges(contig, ranges, samples=None)` — the search-only + tree-free
+  replay split for a write-time overlap cache; `read_ranges ==
+  gather_ranges(find_ranges(...))`. `find_ranges(out=...)` streams the bundle into
+  caller-preallocated arrays.
+
+## CLI (`genoray write`)
+
+`genoray write` **defaults to SVAR2**; `genoray write svar1` runs the previous
+SVAR 1.0 behavior.
+
+```bash
+# SVAR2 (default) — reference required XOR --no-reference
+genoray write file.vcf.gz out.svar2 --reference ref.fa
+genoray write file.vcf.gz out.svar2 --no-reference
+genoray write file.vcf.gz out.svar2 --reference ref.fa --no-symbolic --threads 4
+
+# SVAR 1.0 (previous default) — VCF or PGEN, dosages, --haploid, --max-mem
+genoray write svar1 file.vcf.gz out.svar --max-mem 4g --haploid
+```
+
+- `genoray write` (SVAR2, thin wrapper over `SparseVar2.from_vcf`): `--reference`
+  XOR `--no-reference` (required), `--ploidy` (default 2), `--chunk-size`
+  (default 25000), `--threads`/`-@`, `--overwrite`, `--long-allele-capacity`
+  (advanced), and `--no-symbolic`/`--no-breakend` — **coupled** on SVAR2 (either
+  one drops both out-of-scope classes) and print a
+  `Dropped {n} out-of-scope (symbolic/breakend) ALT alleles.` line when set.
+  VCF/BCF source only.
+- `genoray write svar1`: unchanged SVAR 1.0 behavior — VCF or PGEN source,
+  `--dosages`, `--max-mem`, `--haploid`, `--no-symbolic`/`--no-breakend`
+  (independent flags here, unlike SVAR2).
 
 ## Filtering
 

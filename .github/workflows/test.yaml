@@ -4,6 +4,7 @@ on:
   pull_request:
     branches:
       - main
+      - svar-2
   workflow_dispatch:
 
 jobs:
@@ -11,6 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     name: "Run test across all Python versions"
     strategy:
+      fail-fast: false
       matrix:
         environment: [py310, py311, py312, py313]
     steps:
@@ -21,7 +23,23 @@ jobs:
       - name: Setup pixi
         uses: prefix-dev/setup-pixi@v0.9.5
         with:
-          pixi-version: v0.68.1
+          pixi-version: v0.70.2
           environments: ${{ matrix.environment }}
       - name: Test
         run: pixi run -e ${{ matrix.environment }} test
+
+  rust-test:
+    runs-on: ubuntu-latest
+    name: "Run Rust test suite"
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Setup pixi
+        uses: prefix-dev/setup-pixi@v0.9.5
+        with:
+          pixi-version: v0.70.2
+          environments: lint
+      - name: Cargo test
+        run: pixi run -e lint test-rust

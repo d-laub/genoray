@@ -19,6 +19,7 @@ __all__ = [
     "VCF",
     "Reader",
     "SparseVar",
+    "SparseVar2",
     "exprs",
     "fit_signatures",
     "cosmic_signatures",
@@ -30,6 +31,7 @@ _LAZY: dict[str, tuple[str, str | None]] = {
     "Reference": ("genoray._reference", "Reference"),
     "VCF": ("genoray._vcf", "VCF"),
     "SparseVar": ("genoray._svar", "SparseVar"),
+    "SparseVar2": ("genoray._svar2", "SparseVar2"),
     "exprs": ("genoray.exprs", None),
     "fit_signatures": ("genoray._signatures", "fit_signatures"),
     "cosmic_signatures": ("genoray._signatures", "cosmic_signatures"),
@@ -61,6 +63,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from ._signatures import cosmic_signatures as cosmic_signatures
     from ._signatures import fit_signatures as fit_signatures
     from ._svar import SparseVar as SparseVar
+    from ._svar2 import SparseVar2 as SparseVar2
     from ._vcf import VCF as VCF
 
     Reader = VCF | PGEN | SparseVar

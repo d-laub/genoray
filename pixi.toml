@@ -11,11 +11,15 @@ py311 = ["py311"]
 py312 = ["py312"]
 py313 = ["py313"]
 sbox = ["sbox", "py310"]
+# isolated env for linting: no editable genoray build (and thus no Rust compile)
+lint = { features = ["lint"], no-default-feature = true }
 sigprofiler = ["sigprofiler"]
 
 [dependencies]
 uv = "*"
 bcftools = "*"
+# `samtools faidx` builds the reference `.fai` in the SVAR2 conversion tests.
+samtools = "*"
 commitizen = "*"
 prek = "*"
 ruff = "*"
@@ -27,7 +31,23 @@ ipykernel = "*"
 ipywidgets = "*"
 icecream = "*"
 typing-extensions = "<4.15"
+rust = ">=1.93.1,<1.94"
+maturin = ">=1.12.0,<2"
+pip = ">=26.0.1,<27"
+# Build toolchain for the Rust extension: cxx-compiler builds vendored htslib (via
+# hts-sys), clangdev provides libclang for rust-htslib's mandatory bindgen step.
+cxx-compiler = "*"
+# Pin libclang: newer majors (e.g. 22) make bindgen 0.69 emit struct layouts that
+# rust-htslib 1.0 doesn't match (nested anon fields). 18 generates compatible bindings.
+clangdev = "18.*"
+# The conda compiler uses the conda sysroot, so source-built pypi deps (e.g. pgenlib)
+# need dev headers from conda rather than the system: zlib provides zlib.h.
+zlib = "*"
 pysam = ">=0.24.0,<0.25"
+
+[activation.env]
+# rust-htslib's bindgen step needs to locate libclang (provided by clangdev).
+LIBCLANG_PATH = "$CONDA_PREFIX/lib"
 
 [target.linux-64.dependencies]
 # needs to be installed manually for osx-arm64
@@ -43,9 +63,35 @@ vcfixture = ">=0.6.0,<0.7"
 [tasks]
 gen = "sh tests/data/gen_from_vcf.sh"
 test = { cmd = "pytest tests", depends-on = "gen" }
-typecheck = "pyrefly check genoray"
+typecheck = "pyrefly check python/genoray"
 prek-install = "prek install -t pre-commit -t pre-push -t commit-msg"
 bump-dry = "cz bump --dry-run"
+
+[feature.lint.dependencies]
+prek = "*"
+# Toolchain so the cargo fmt/check/clippy hooks can run here without building the
+# editable genoray wheel: rust + python (pyo3 build script) + the htslib build deps.
+rust = ">=1.93.1,<1.94"
+python = "*"
+cxx-compiler = "*"
+clangdev = "18.*"
+# `cargo test` (test-rust) runs the py_convert unit tests, whose numpy-crate array
+# API imports Python's `numpy` at runtime — needed even though lint builds no wheel.
+numpy = "*"
+# The Rust e2e tests shell out to `bcftools norm` as a left-align/normalize oracle.
+bcftools = "*"
+
+[feature.lint.activation.env]
+# lint is no-default-feature, so it doesn't inherit the top-level LIBCLANG_PATH.
+LIBCLANG_PATH = "$CONDA_PREFIX/lib"
+
+[feature.lint.tasks]
+lint = "prek run --all-files --show-diff-on-failure"
+# Rust test suite. `--no-default-features` drops `extension-module` (whose
+# pyo3 symbols don't link into a standalone test binary — `undefined symbol:
+# _Py_Dealloc`); `--features conversion` keeps rust-htslib for the e2e tests.
+# Runs in `lint` (no editable-wheel build, full Rust + htslib toolchain).
+test-rust = "cargo test --no-default-features --features conversion"
 
 [feature.doc.dependencies]
 sphinx = "*"
@@ -76,7 +122,12 @@ pyranges = "==0.1.*"
 pyarrow = "==21.0.*"
 phantom-types = "==3.0.*"
 loguru = "==0.7.*"
+attrs = "*"
+awkward = "*"
+numba = "*"
 seqpro = "==0.21.1"
+zstandard = "*"
+pydantic = "*"
 oxbow = "==0.5.*"
 joblib = "==1.4.*"
 joblib-progress = "==1.0.*"

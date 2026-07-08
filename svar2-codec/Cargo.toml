@@ -1,0 +1,16 @@
+[package]
+name = "svar2-codec"
+version = "0.1.0"
+edition = "2024"
+description = "Encode/decode for the SVAR 2.0 variant-key bit layout (SNP 2-bit + indel 32-bit inline keys)."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/d-laub/genoray"
+readme = "README.md"
+rust-version = "1.85"
+keywords = ["bioinformatics", "genomics", "variant", "vcf"]
+categories = ["science", "encoding"]
+
+[dependencies]
+
+[dev-dependencies]
+proptest = "1.11.0"

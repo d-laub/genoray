@@ -501,7 +501,7 @@ class PGEN:
         if c is None:
             return mode.empty(self.n_samples, self.ploidy, 0)
 
-        var_idxs, _ = self._var_idxs_phys(c, start, end)
+        var_idxs, _ = self._var_idxs_phys(c, start, end)  # type: ignore[bad-argument-type]
         n_variants = len(var_idxs)
 
         if n_variants == 0:
@@ -568,7 +568,7 @@ class PGEN:
             yield mode.empty(self.n_samples, self.ploidy, 0)
             return
 
-        var_idxs, _ = self._var_idxs_phys(c, start, end)
+        var_idxs, _ = self._var_idxs_phys(c, start, end)  # type: ignore[bad-argument-type]
         n_variants = len(var_idxs)
         if n_variants == 0:
             yield mode.empty(self.n_samples, self.ploidy, 0)
@@ -1061,8 +1061,8 @@ def _gen_with_length(
             hap_lens += hap_ilens(out, ilens[var_idx])
         else:
             # (s p)
-            hap_lens = np.full(out[0].shape[:-1], initial_len, dtype=np.int32)
-            hap_lens += hap_ilens(out[0], ilens[var_idx])
+            hap_lens = np.full(out[0].shape[:-1], initial_len, dtype=np.int32)  # type: ignore[unsupported-operation]
+            hap_lens += hap_ilens(out[0], ilens[var_idx])  # type: ignore[unsupported-operation]
 
         ls_ext: list[L] = []
         while (hap_lens < length).any():
@@ -1081,7 +1081,7 @@ def _gen_with_length(
             if isinstance(ext_out, Genos):
                 ext_genos = ext_out
             else:
-                ext_genos = ext_out[0]
+                ext_genos = ext_out[0]  # type: ignore[unsupported-operation]
 
             dist = v_starts[ext_idx[-1]] - last_end
             hap_lens += dist + hap_ilens(ext_genos, ilens[ext_idx])

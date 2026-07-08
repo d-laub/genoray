@@ -610,16 +610,16 @@ class VCF:
             logger.warning(
                 f"Query contig {contig} not found in VCF file, even after normalizing for UCSC/Ensembl nomenclature."
             )
-            return mode.empty(self.n_samples, self.ploidy, 0, self.phasing)
+            return mode.empty(self.n_samples, self.ploidy, 0, self.phasing)  # type: ignore[bad-return]
 
         start = max(0, start)  # type: ignore
 
         vcf = self._vcf(f"{c}:{int(start + 1)}-{end}")  # range string is 1-based
         if out is None:
             if self._index is not None:
-                n_variants = self.n_vars_in_ranges(c, start, end)[0]
+                n_variants = self.n_vars_in_ranges(c, start, end)[0]  # type: ignore[bad-argument-type]
                 if n_variants == 0:
-                    return mode.empty(self.n_samples, self.ploidy, 0, self.phasing)
+                    return mode.empty(self.n_samples, self.ploidy, 0, self.phasing)  # type: ignore[bad-return]
             else:
                 n_variants = None
 
@@ -715,7 +715,7 @@ class VCF:
             logger.warning(
                 f"Query contig {contig} not found in VCF file, even after normalizing for UCSC/Ensembl nomenclature."
             )
-            yield mode.empty(self.n_samples, self.ploidy, 0, self.phasing)
+            yield mode.empty(self.n_samples, self.ploidy, 0, self.phasing)  # type: ignore[invalid-yield]
             return
 
         start = max(0, start)  # type: ignore
@@ -772,7 +772,7 @@ class VCF:
                 self._pbar.update()
 
             if i == vars_per_chunk:
-                yield buffer
+                yield buffer  # type: ignore[invalid-yield]
                 i = 0
 
         if i != 0:
@@ -847,7 +847,7 @@ class VCF:
                 f"Query contig {contig} not found in VCF file, even after normalizing for UCSC/Ensembl nomenclature."
             )
             for e in ends:
-                yield (
+                yield (  # type: ignore[invalid-yield]
                     (mode.empty(self.n_samples, self.ploidy, 0, self.phasing), e, 0)
                     for _ in range(1)
                 )
@@ -857,7 +857,7 @@ class VCF:
         tot_variants = n_variants.sum()
         if tot_variants == 0:
             for e in ends:
-                yield (
+                yield (  # type: ignore[invalid-yield]
                     (mode.empty(self.n_samples, self.ploidy, 0, self.phasing), e, 0)
                     for _ in range(1)
                 )
@@ -876,7 +876,7 @@ class VCF:
 
         for s, e, n in zip(starts, ends, n_variants):
             if n == 0:
-                yield (
+                yield (  # type: ignore[invalid-yield]
                     (mode.empty(self.n_samples, self.ploidy, 0, self.phasing), e, 0)
                     for _ in range(1)
                 )
@@ -939,12 +939,12 @@ class VCF:
                 continue
 
             if issubclass(mode, (Genos8, Genos16)):
-                ls_ext, last_end = self._ext_genos_with_length(
+                ls_ext, last_end = self._ext_genos_with_length(  # type: ignore[bad-specialization]
                     contig, start, end, hap_lens, mode, last_end
                 )
             elif issubclass(mode, (Genos8Dosages, Genos16Dosages)):
                 self.dosage_field = cast(str, self.dosage_field)
-                ls_ext, last_end = self._ext_genos_dosages_with_length(
+                ls_ext, last_end = self._ext_genos_dosages_with_length(  # type: ignore[bad-specialization]
                     contig,
                     start,
                     end,
