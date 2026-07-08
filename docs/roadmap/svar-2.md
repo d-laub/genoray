@@ -306,6 +306,55 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
   the dropped count) with `genoray write svar1` for the previous SVAR 1.0 behavior. See the
   design spec [`../superpowers/specs/2026-07-03-svar2-cli-write-and-m13-skip-design.md`](../superpowers/specs/2026-07-03-svar2-cli-write-and-m13-skip-design.md).
 
+- [x] **M14. Parallel presence-packing in the reader (single-/few-contig throughput).**
+  A single-contig VCF→SVAR2 run leaves ~24 cores idle: the per-contig pipeline
+  (M1) fans across contigs via rayon, so one contig uses only its 4 pipeline
+  threads + htslib decode threads. This milestone puts the idle cores to work on
+  the reader's genotype-presence bit-packing, keeping output **byte-identical**.
+  See the design plan
+  [`../superpowers/plans/2026-07-07-svar2-parallel-reader.md`](../superpowers/plans/2026-07-07-svar2-parallel-reader.md).
+  - **Thread budget (`src/budget.rs`).** `MAX_HTSLIB_THREADS` raised 4→8 (Lever 0);
+    `ThreadPlan` gains `processing_threads` = idle cores after the pipeline + htslib
+    threads across all concurrent contigs (`usable − concurrent·(pipeline+htslib)`,
+    floored at 1). `plan_thread_budget` computes it in both branches.
+  - **Processing pool + word-aligned parallel packing (`src/orchestrator.rs`,
+    `src/vcf_reader.rs`).** `process_chromosome` builds a dedicated rayon pool sized
+    to `processing_threads` and hands it to the reader thread. The reader stays
+    sequential for all *ordering* work (htslib iteration, atomize, left-align, the
+    reorder heap, chunk cutting — all **frozen**); only presence packing fans out.
+    Variant row `vi` occupies bits `[vi·columns, (vi+1)·columns)`, so a variant
+    block of `g = 64/gcd(columns,64)` rows spans exactly `words_per_block =
+    columns/gcd(columns,64)` whole `u64` words — `par_chunks_mut(words_per_block)`
+    hands each rayon task a **word-disjoint** slice, so there are no shared boundary
+    words and no atomics. `PendingAtom.gt` moved `Rc`→`Arc` for cross-thread
+    sharing; packing self-gates to sequential below `PARALLEL_MIN_VARIANTS = 512`
+    or without a ≥2-thread pool. A 300-case proptest pins `pack_presence_par` ==
+    `pack_presence_seq` bit-for-bit across shapes crossing block boundaries,
+    missing (`-1`), and out-of-range alleles.
+  - **Measured (32 cores, single contig chr21; oracle-verified byte-identical on
+    both germline `chr21.filt.bcf` and gdc `gdc.chr21.filt.bcf`).** gdc:
+    **1051 s → 981 s (−6.7 %)** from the parallel packing. germline unchanged
+    (36.3 s — already fast, not packing-bound). The htslib-cap bump (Lever 0) was
+    **inert on its own** (1051 s → 1046 s, within noise).
+  - **Why it stops there — the reader is htslib-input-bound, not decode-bound.** A
+    frame-pointer `perf` profile of this build on gdc puts **78 %** of samples in the
+    reader thread, whose identifiable self-time is dominated by htslib **input**
+    work: `inflate` (BGZF decompress) ≈ 32 %, `vcf_parse` ≈ 9 %, name tokenization
+    ≈ 14 %. The genoray-side GT-decode and packing do **not** surface as a
+    meaningful fraction (nothing at ≥0.05 %). This is why raising the htslib decode
+    cap didn't help — the reader inflates/parses on its own serial path — and why
+    the plan's optional **Task 6 (fuse raw-GT decode into the parallel pass) was
+    declined**: its premise (a meaningful sequential GT-decode cost) is falsified by
+    the profile, so it would add sample-subset/ploidy correctness risk for ~0 gain.
+    Further single-contig speedup requires attacking htslib BGZF inflate / VCF
+    parsing (e.g. more effective threaded block decode, or a leaner parse path), not
+    the genoray packing.
+  *Done:* `src/budget.rs` (cap + `processing_threads`), `src/vcf_reader.rs`
+  (`Rc`→`Arc`, `pack_row`/`pack_presence_seq`/`pack_presence_par`/`gcd`, gated
+  dispatch, proptest), `src/orchestrator.rs` + `src/lib.rs` (pool built and threaded
+  through). No public API change. Rust suite + 525 pytest green; both oracle hashes
+  byte-identical.
+
 ### Longer term
 
 - [ ] **M10. Checkpointing / resume during conversion.**
