@@ -325,3 +325,12 @@ def test_svar_nbytes_index_only():
     # nbytes counts only the resident polars index, not the mmap'd genos/fields
     assert svar.nbytes == svar.index.estimated_size()
     assert svar.nbytes > 0
+
+
+def test_read_ranges_with_length_accepts_scalar_sample_string():
+    svar = SparseVar(ddir / "biallelic.vcf.svar", "AF")
+    # A single sample name as a bare str must not be iterated char-by-char.
+    out_str = svar.read_ranges_with_length("chr1", 81261, 81266, samples="sample1")
+    out_list = svar.read_ranges_with_length("chr1", 81261, 81266, samples=["sample1"])
+    np.testing.assert_array_equal(out_str.data, out_list.data)
+    np.testing.assert_array_equal(out_str.offsets, out_list.offsets)

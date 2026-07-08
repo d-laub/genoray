@@ -33,9 +33,6 @@ from ._utils import (
 from ._var_ranges import var_counts, var_indices
 from .exprs import ILEN, symbolic_ilen
 
-"""Dtype for VCF range indices. This determines the maximum size of a contig in genoray.
-We have to use int64 because this is what htslib uses for CSI indexes."""
-
 V_IDX_TYPE = np.uint32
 """Dtype for VCF variant indices (uint32). This determines the maximum number of unique variants in a file."""
 
@@ -137,7 +134,7 @@ class Genos8Dosages(tuple[Genos8, Dosages], Phantom, predicate=_is_genos8_dosage
         )
 
 
-def _is_genos16_dosages(obj: object) -> TypeGuard[tuple[Genos8, Dosages]]:
+def _is_genos16_dosages(obj: object) -> TypeGuard[tuple[Genos16, Dosages]]:
     """Check if the object is a tuple of genotypes and dosages.
 
     Parameters
@@ -1421,6 +1418,9 @@ class VCF:
         ilens: NDArray[np.int32] | None = None,
         mode: type[Genos8Dosages | Genos16Dosages] | None = None,
     ) -> tuple[Genos8Dosages | Genos16Dosages, int]:
+        if self._filter is not None:
+            vcf = filter(self._filter, vcf)
+
         if out is None:
             assert mode is not None
             assert ilens is None, "caller should not provide ilens if out is None"
@@ -1467,9 +1467,6 @@ class VCF:
 
         #! assumes n_variants > 0
         n_variants = out[0].shape[-1]
-
-        if self._filter is not None:
-            vcf = filter(self._filter, vcf)
 
         if self.progress and self._pbar is None:
             vcf = tqdm(vcf, total=n_variants, desc="Reading VCF", unit=" variant")

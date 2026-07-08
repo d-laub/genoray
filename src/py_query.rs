@@ -10,9 +10,6 @@ use crate::query::ContigReader;
 /// `PyContigReader(base_out_dir, chrom, n_samples, ploidy)`.
 #[pyclass]
 pub struct PyContigReader {
-    // Not yet read outside this module — M6b (raw two-channel) and M6c (decoded)
-    // query methods land on this class and will consume `inner`.
-    #[allow(dead_code)]
     pub(crate) inner: ContigReader,
 }
 

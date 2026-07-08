@@ -527,3 +527,21 @@ def test_filtered_var_idxs_consistent_with_index():
     full = g_full.read("chr1", 0, POS_MAX, mode=Genos)  # (s, p, 3)
     assert filt.shape[-1] == 2
     assert np.array_equal(filt, full[..., [1, 2]])
+
+
+def test_del_does_not_double_close_shared_reader():
+    pgen = PGEN(ddir / "biallelic.pgen")  # no separate dosage path
+    assert pgen._dose_pgen is pgen._geno_pgen  # same underlying reader
+
+    class _CloseCounter:
+        def __init__(self):
+            self.n = 0
+
+        def close(self):
+            self.n += 1
+
+    counter = _CloseCounter()
+    pgen._geno_pgen = counter
+    pgen._dose_pgen = counter
+    pgen.__del__()
+    assert counter.n == 1  # closed exactly once, not twice

@@ -8,7 +8,7 @@ import tempfile
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, TypeGuard, TypeVar, overload
+from typing import TypeVar, overload
 
 import numpy as np
 import polars as pl
@@ -75,24 +75,6 @@ class ContigNormalizer:
         """
         dup_idx = self._c2dup.get(contigs)
         return self.dup2i[dup_idx]
-
-
-def is_dtype(obj: Any, dtype: type[DTYPE]) -> TypeGuard[NDArray[DTYPE]]:
-    """Check if the object is a NumPy array with the given dtype.
-
-    Parameters
-    ----------
-    obj
-        Object to check.
-    dtype
-        Dtype to check against.
-
-    Returns
-    -------
-    bool
-        True if the object is an array with the given dtype, False otherwise.
-    """
-    return isinstance(obj, np.ndarray) and obj.dtype.type == dtype
 
 
 _MEM_PARSER = re.compile(r"(?i)(\d+)(.*)")

@@ -389,7 +389,11 @@ class PGEN:
     def __del__(self):
         if hasattr(self, "_geno_pgen"):
             self._geno_pgen.close()
-        if hasattr(self, "_dose_pgen") and self._dose_pgen is not None:
+        if (
+            hasattr(self, "_dose_pgen")
+            and self._dose_pgen is not None
+            and self._dose_pgen is not self._geno_pgen
+        ):
             self._dose_pgen.close()
 
     def n_vars_in_ranges(
@@ -563,7 +567,7 @@ class PGEN:
         c = self._c_norm.norm(contig)
         if c is None:
             logger.warning(
-                f"Query contig {contig} not found in VCF file, even after normalizing for UCSC/Ensembl nomenclature."
+                f"Query contig {contig} not found in PGEN file, even after normalizing for UCSC/Ensembl nomenclature."
             )
             yield mode.empty(self.n_samples, self.ploidy, 0)
             return
@@ -649,7 +653,7 @@ class PGEN:
         c = self._c_norm.norm(contig)
         if c is None:
             logger.warning(
-                f"Query contig {contig} not found in VCF file, even after normalizing for UCSC/Ensembl nomenclature."
+                f"Query contig {contig} not found in PGEN file, even after normalizing for UCSC/Ensembl nomenclature."
             )
             return mode.empty(self.n_samples, self.ploidy, 0), np.zeros(
                 n_ranges + 1, OFFSET_TYPE
@@ -732,7 +736,7 @@ class PGEN:
         c = self._c_norm.norm(contig)
         if c is None:
             logger.warning(
-                f"Query contig {contig} not found in VCF file, even after normalizing for UCSC/Ensembl nomenclature."
+                f"Query contig {contig} not found in PGEN file, even after normalizing for UCSC/Ensembl nomenclature."
             )
             for _ in range(len(starts)):
                 yield (mode.empty(self.n_samples, self.ploidy, 0) for _ in range(1))
@@ -859,7 +863,7 @@ class PGEN:
         c = self._c_norm.norm(contig)
         if c is None:
             logger.warning(
-                f"Query contig {contig} not found in VCF file, even after normalizing for UCSC/Ensembl nomenclature."
+                f"Query contig {contig} not found in PGEN file, even after normalizing for UCSC/Ensembl nomenclature."
             )
             for e in ends:
                 yield (

@@ -500,13 +500,8 @@ class SparseVar(Generic[_SRT]):
     genos: Ragged[V_IDX_TYPE]
     available_fields: dict[str, np.dtype[np.number]]
     fields: dict[str, Ragged[np.number]]
-    index: pl.DataFrame
-    """Table of variants with columns: `CHROM`, `POS`, `REF`, `ALT`, `ILEN`, and any additional
-    attributes specified in `attrs` on construction."""
     _c_norm: ContigNormalizer
     _s2i: HashTable
-    _c_max_idxs: dict[str, int]
-    _is_biallelic: bool
 
     @property
     def n_samples(self) -> int:
@@ -528,7 +523,11 @@ class SparseVar(Generic[_SRT]):
 
     @cached_property
     def index(self) -> pl.DataFrame:
-        """The full variant index, materialized on first access."""
+        """The full variant index, materialized on first access.
+
+        Table of variants with columns ``CHROM``, ``POS``, ``REF``, ``ALT``, ``ILEN``,
+        and any additional attributes specified in ``attrs`` on construction.
+        """
         return self._index_lazy.collect()
 
     @cached_property
@@ -911,9 +910,9 @@ class SparseVar(Generic[_SRT]):
         if samples is None:
             samples = np.atleast_1d(np.array(self.available_samples))
         else:
+            samples = np.atleast_1d(np.array(samples))
             if missing := set(samples) - set(self.available_samples):  # type: ignore
                 raise ValueError(f"Samples {missing} not found in the dataset.")
-            samples = np.atleast_1d(np.array(samples))
 
         n_samples = len(samples)
         starts = np.atleast_1d(np.asarray(starts, POS_TYPE))
