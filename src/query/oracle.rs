@@ -1,39 +1,39 @@
-//! Test/gvl-facing query wrappers: `overlap_sample` (per-sample, tree-per-
+//! Oracle/testing surface for `query`: `overlap_sample` (per-sample, tree-per-
 //! query reference implementation), the split read-bound gather
-//! (`gather_ranges_readbound`), and the `decode_keyref` test-oracle wrappers
-//! (`decode_keyref_pub`/`decode_keyref_alt_pub`). A later task (M2's Task 6)
-//! renames these off the top-level `query::` path; this task moves them here
-//! verbatim and keeps the old paths alive via `query/mod.rs` re-exports.
+//! (`gather_ranges_readbound`), and the `decode_keyref`/`decode_keyref_alt`
+//! test-oracle wrappers. These are gvl-side test-oracle entry points, kept
+//! under `query::oracle::*` rather than the top-level `query::` namespace.
 
 use crate::rvk;
 use crate::spine::{self, KeyRef};
 
-use super::decode::{HapCalls, QueryResult, decode_keyref};
+use super::decode::{HapCalls, QueryResult};
 use super::gather::{BatchResultSplit, PresenceBitWriter, RangesBundle, gather_vk};
 use super::reader::ContigReader;
 use super::sidecar::{as_bytes, as_u32};
 
-/// Test-facing public wrapper around `decode_keyref`: decode `(position, key)`
-/// against `reader`'s long-allele LUT and return just `ilen`. Lets gvl-side
-/// test oracles decode a raw `KeyRef` (as surfaced by `BatchResultSplit`)
-/// without duplicating the SNP/indel/long-INS decode logic.
+/// Test-facing public wrapper around `decode::decode_keyref`: decode
+/// `(position, key)` against `reader`'s long-allele LUT and return just
+/// `ilen`. Lets gvl-side test oracles decode a raw `KeyRef` (as surfaced by
+/// `BatchResultSplit`) without duplicating the SNP/indel/long-INS decode
+/// logic.
 ///
 /// Intentionally public (not `cfg(test)`-gated): this ships in `genoray_core`'s
 /// public API as the gvl-side read-bound parity-oracle surface, alongside
-/// `decode_keyref_alt_pub` and `bits_get_bit`.
-pub fn decode_keyref_pub(position: u32, key: u32, reader: &ContigReader) -> i32 {
-    decode_keyref(KeyRef { position, key }, reader.lut.as_ref()).ilen
+/// `decode_keyref_alt` and `bits_get_bit`.
+pub fn decode_keyref(position: u32, key: u32, reader: &ContigReader) -> i32 {
+    super::decode::decode_keyref(KeyRef { position, key }, reader.lut.as_ref()).ilen
 }
 
-/// Like `decode_keyref_pub`, but also returns the decoded ALT bytes so test
+/// Like `decode_keyref`, but also returns the decoded ALT bytes so test
 /// oracles can assert on alleles (not just `ilen`, which is `0` for every SNP
 /// regardless of which base it decodes to).
 ///
 /// Intentionally public (not `cfg(test)`-gated): part of the gvl-side
-/// read-bound parity-oracle surface alongside `decode_keyref_pub` and
+/// read-bound parity-oracle surface alongside `decode_keyref` and
 /// `bits_get_bit`.
-pub fn decode_keyref_alt_pub(position: u32, key: u32, reader: &ContigReader) -> (i32, Vec<u8>) {
-    let call = decode_keyref(KeyRef { position, key }, reader.lut.as_ref());
+pub fn decode_keyref_alt(position: u32, key: u32, reader: &ContigReader) -> (i32, Vec<u8>) {
+    let call = super::decode::decode_keyref(KeyRef { position, key }, reader.lut.as_ref());
     (call.ilen, call.alt)
 }
 
@@ -62,7 +62,7 @@ pub fn overlap_sample(
 
         let mut hc = HapCalls::default();
         for kr in merged {
-            let c = decode_keyref(kr, lut);
+            let c = super::decode::decode_keyref(kr, lut);
             hc.positions.push(c.position);
             hc.ilens.push(c.ilen);
             hc.alts.push(c.alt);

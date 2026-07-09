@@ -10,7 +10,7 @@ pub mod bits;
 ///
 /// Intentionally public (not `cfg(test)`-gated): ships in `genoray_core`'s
 /// public API as part of the gvl-side read-bound parity-oracle surface,
-/// alongside `query::decode_keyref_pub`/`query::decode_keyref_alt_pub`.
+/// alongside `query::oracle::decode_keyref`/`query::oracle::decode_keyref_alt`.
 pub fn bits_get_bit(bytes: &[u8], i: usize) -> bool {
     bits::get_bit(bytes, i)
 }

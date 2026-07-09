@@ -5,9 +5,10 @@ mod common;
 
 use common::{SynthRecord, build_contig};
 use genoray_core::bits_get_bit;
+use genoray_core::query::oracle::{decode_keyref_alt, gather_ranges_readbound};
 use genoray_core::query::{
-    BatchResultSplit, ContigReader, HapCalls, KeyRef, decode_keyref_alt_pub, find_ranges,
-    gather_haps_readbound, gather_ranges_readbound, overlap_batch,
+    BatchResultSplit, ContigReader, HapCalls, KeyRef, find_ranges, gather_haps_readbound,
+    overlap_batch,
 };
 use genoray_core::search;
 use tempfile::tempdir;
@@ -172,7 +173,7 @@ fn test_readbound_reconstructs_union_per_hap() {
                 let got_dec: Vec<(u32, i32, Vec<u8>)> = got_keys
                     .iter()
                     .map(|&(pos, key)| {
-                        let (ilen, alt) = decode_keyref_alt_pub(pos, key as u32, &reader);
+                        let (ilen, alt) = decode_keyref_alt(pos, key as u32, &reader);
                         (pos, ilen, alt)
                     })
                     .collect();
@@ -527,7 +528,7 @@ fn test_gather_haps_readbound_tie_break_snp_before_indel() {
     let decoded: Vec<(u32, i32, Vec<u8>)> = cart_vk
         .iter()
         .map(|kr| {
-            let (ilen, alt) = decode_keyref_alt_pub(kr.position, kr.key, &reader);
+            let (ilen, alt) = decode_keyref_alt(kr.position, kr.key, &reader);
             (kr.position, ilen, alt)
         })
         .collect();

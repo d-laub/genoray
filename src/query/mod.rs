@@ -8,6 +8,21 @@
 //! helpers), `union` (`DenseUnion`), `decode` (`Call`/`decode_keyref` +
 //! `HapCalls`/`QueryResult`), `gather` (the batched `BatchResult{,Split}` query
 //! paths), and `oracle` (test/gvl-facing reference wrappers).
+//!
+//! ## Production entry points vs. the `oracle` reference/testing surface
+//!
+//! | Production (`query::*`)          | Oracle (`query::oracle::*`)               | Notes                                       |
+//! |-----------------------------------|--------------------------------------------|----------------------------------------------|
+//! | [`overlap_batch`]                 | [`oracle::overlap_sample`]                 | per-sample reference impl                    |
+//! | [`find_ranges`] + [`gather_ranges`] | —                                         | tree-driven batch query -> [`BatchResult`]   |
+//! | [`gather_haps_readbound`]         | [`oracle::gather_ranges_readbound`]        | split-dense read-bound gather                |
+//! | [`read_ranges`]                   | —                                          | —                                             |
+//! | [`decode::decode_keyref`]         | [`oracle::decode_keyref`] / [`oracle::decode_keyref_alt`] | oracle wrappers over the same decode logic |
+//!
+//! [`BatchResult`] is the unified-dense result produced by [`overlap_batch`] /
+//! [`gather_ranges`]. [`BatchResultSplit`] is the split-dense counterpart
+//! produced by [`gather_haps_readbound`] and its oracle twin
+//! [`oracle::gather_ranges_readbound`].
 
 pub mod decode;
 pub mod gather;
@@ -23,9 +38,3 @@ pub use gather::{
     overlap_batch, read_ranges,
 };
 pub use reader::ContigReader;
-
-// Task 6 will move these to `query::oracle::*`; kept re-exported here this task
-// so the split is a pure move.
-pub use oracle::{
-    decode_keyref_alt_pub, decode_keyref_pub, gather_ranges_readbound, overlap_sample,
-};

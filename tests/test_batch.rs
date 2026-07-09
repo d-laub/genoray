@@ -7,7 +7,8 @@
 mod common;
 
 use common::{OwnedRecord, SynthRecord, arb_records, build_contig};
-use genoray_core::query::{ContigReader, overlap_batch, overlap_sample};
+use genoray_core::query::oracle::overlap_sample;
+use genoray_core::query::{ContigReader, overlap_batch};
 use proptest::prelude::*;
 use tempfile::tempdir;
 

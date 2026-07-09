@@ -5,7 +5,8 @@ mod common;
 
 use common::{SynthRecord, build_contig};
 use genoray_core::py_query::PyContigReader;
-use genoray_core::query::{ContigReader, overlap_sample};
+use genoray_core::query::ContigReader;
+use genoray_core::query::oracle::overlap_sample;
 use numpy::{PyArray1, PyArrayMethods};
 use pyo3::prelude::*;
 use pyo3::types::PyDictMethods;
