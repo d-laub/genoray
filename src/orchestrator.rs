@@ -231,12 +231,22 @@ pub fn process_chromosome(
         dense_ledgers,
         long_allele_offsets,
     } = phase1;
-    chunk_writer_res.map_err(|_| ConversionError::WorkerPanicked {
-        thread: format!("cw-{}", chrom),
-    })?;
-    long_allele_writer_res.map_err(|_| ConversionError::WorkerPanicked {
-        thread: format!("lw-{}", chrom),
-    })?;
+    match chunk_writer_res {
+        Ok(r) => r?,
+        Err(_) => {
+            return Err(ConversionError::WorkerPanicked {
+                thread: format!("cw-{}", chrom),
+            });
+        }
+    }
+    match long_allele_writer_res {
+        Ok(r) => r?,
+        Err(_) => {
+            return Err(ConversionError::WorkerPanicked {
+                thread: format!("lw-{}", chrom),
+            });
+        }
+    }
 
     println!(
         "[{}] Phase 1 Complete. Triggering Phase 2 In-Memory Merge...",

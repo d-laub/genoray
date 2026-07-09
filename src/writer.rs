@@ -1,4 +1,5 @@
 use crate::dense::{DENSE_REGISTRY, DenseMap};
+use crate::error::ConversionError;
 use crate::layout;
 use crate::streams::StreamMap;
 use crate::types::SparseChunk;
@@ -15,7 +16,7 @@ pub fn run_io_writer(
     rx_sparse: Receiver<SparseChunk>,
     dirs: StreamMap<PathBuf>,
     dense_dirs: DenseMap<PathBuf>,
-) {
+) -> Result<(), ConversionError> {
     while let Ok(chunk) = rx_sparse.recv() {
         let id = chunk.chunk_id;
 
@@ -25,8 +26,8 @@ pub fn run_io_writer(
             write_bin(
                 &layout::chunk_pos(dir, id),
                 bytemuck::cast_slice(&sub.call_positions),
-            );
-            write_bin(&layout::chunk_key(dir, id), &sub.call_keys); // already bytes
+            )?;
+            write_bin(&layout::chunk_key(dir, id), &sub.call_keys)?; // already bytes
         }
 
         // dense per-class matrix + table (only classes with dense variants)
@@ -39,41 +40,65 @@ pub fn run_io_writer(
             write_bin(
                 &layout::chunk_pos(dir, id),
                 bytemuck::cast_slice(&sub.positions),
-            );
-            write_bin(&layout::chunk_key(dir, id), &sub.keys);
-            write_bin(&layout::chunk_geno(dir, id), &sub.geno_bits);
+            )?;
+            write_bin(&layout::chunk_key(dir, id), &sub.keys)?;
+            write_bin(&layout::chunk_geno(dir, id), &sub.geno_bits)?;
         }
     }
 
     println!("Writer Thread: Channel closed. All chunks safely committed to SSD.");
+    Ok(())
 }
 
-pub fn run_long_allele_writer(rx_long: Receiver<Vec<u8>>, out_path: &Path, chrom_label: &str) {
+pub fn run_long_allele_writer(
+    rx_long: Receiver<Vec<u8>>,
+    out_path: &Path,
+    chrom_label: &str,
+) -> Result<(), ConversionError> {
     let file = OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
         .open(out_path)
-        .unwrap();
+        .map_err(|e| ConversionError::Io {
+            context: format!("creating {}", out_path.display()),
+            source: e,
+        })?;
     let mut disk_writer = BufWriter::with_capacity(1024 * 1024, file);
     while let Ok(buffer) = rx_long.recv() {
         disk_writer
             .write_all(&buffer)
-            .expect("Failed to write long alleles");
+            .map_err(|e| ConversionError::Io {
+                context: format!("writing long alleles to {}", out_path.display()),
+                source: e,
+            })?;
     }
-    disk_writer.flush().unwrap();
+    disk_writer.flush().map_err(|e| ConversionError::Io {
+        context: format!("flushing {}", out_path.display()),
+        source: e,
+    })?;
     println!(
         "[{}] Long Allele Writer: All buffer data safely committed.",
         chrom_label
     );
+    Ok(())
 }
 
-fn write_bin(path: &Path, bytes: &[u8]) {
-    let mut f = BufWriter::new(
-        File::create(path).unwrap_or_else(|e| panic!("create {}: {}", path.display(), e)),
-    );
-    f.write_all(bytes).expect("write chunk bytes");
-    f.flush().expect("flush chunk bytes");
+fn write_bin(path: &Path, bytes: &[u8]) -> Result<(), ConversionError> {
+    let f = File::create(path).map_err(|e| ConversionError::Io {
+        context: format!("creating {}", path.display()),
+        source: e,
+    })?;
+    let mut f = BufWriter::new(f);
+    f.write_all(bytes).map_err(|e| ConversionError::Io {
+        context: format!("writing {}", path.display()),
+        source: e,
+    })?;
+    f.flush().map_err(|e| ConversionError::Io {
+        context: format!("flushing {}", path.display()),
+        source: e,
+    })?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -84,6 +109,19 @@ mod tests {
     use crate::types::{DenseSubChunk, SparseChunk, SparseSubStream};
     use crossbeam_channel::bounded;
     use tempfile::tempdir;
+
+    #[test]
+    fn write_bin_returns_io_error_on_unwritable_path() {
+        // A path whose parent dir does not exist cannot be created.
+        let bad = std::path::Path::new("/nonexistent-sp3-dir/child/out.bin");
+        let err = write_bin(bad, &[1u8, 2, 3]).unwrap_err();
+        match err {
+            crate::error::ConversionError::Io { context, .. } => {
+                assert!(context.contains("out.bin"));
+            }
+            other => panic!("expected Io, got {other:?}"),
+        }
+    }
 
     #[test]
     fn test_writer_persists_dense_chunk_files() {
@@ -132,7 +170,7 @@ mod tests {
             DenseClass::Indel => indel_dir.clone(),
         });
 
-        run_io_writer(rx, dirs, dense_dirs);
+        run_io_writer(rx, dirs, dense_dirs).unwrap();
 
         // dense snp chunk files exist with the right bytes
         let pos = std::fs::read(snp_dir.join("chunk_0_pos.bin")).unwrap();
