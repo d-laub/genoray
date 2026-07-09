@@ -295,12 +295,26 @@ def test_chunk_with_length(
     last_end: int,
     n_extension: int,
 ):
+    # _chunk_ranges_with_length now requires a loaded .gvi index (it needs
+    # variant indices from _var_idxs to build chunk_idxs); the `vcf` fixture is
+    # parametrized over with_gvi_index=[True, False], so build+load on demand.
+    if vcf._index is None:
+        vcf._write_gvi_index()
+        vcf._load_index()
+
     vcf.phasing = True
+
+    # Independently-computed in-range variant indices (not derived from the
+    # method under test) so the chunk_idxs assertions below stay non-vacuous.
+    contig, start, end_ = cse
+    in_range_idxs, _ = vcf._var_idxs(contig, start, end_)
+    in_range_idxs = in_range_idxs.astype(np.uint32)
 
     max_mem = vcf._mem_per_variant(VCF.Genos16Dosages)
     gpd = vcf._chunk_ranges_with_length(*cse, max_mem, VCF.Genos16Dosages)
+    all_idxs: list[NDArray[np.uint32]] = []
     for range_ in gpd:
-        for chunk, end, n_ext in range_:
+        for chunk, end, chunk_idxs in range_:
             gp, d = chunk
             g, p = np.array_split(gp, 2, 1)
             p = p.squeeze(1).astype(bool)
@@ -308,7 +322,50 @@ def test_chunk_with_length(
             np.testing.assert_equal(p, phasing)
             np.testing.assert_equal(d, dosages)
             assert end == last_end
-            assert n_ext == n_extension
+            # chunk_idxs is now a uint32 variant-index array, one index per
+            # variant in this chunk (matching PGEN's contract).
+            assert chunk_idxs.dtype == np.uint32
+            assert chunk_idxs.shape[0] == gp.shape[-1]
+            all_idxs.append(chunk_idxs)
+
+    full = np.concatenate(all_idxs) if all_idxs else np.empty(0, dtype=np.uint32)
+    # The in-range prefix must match the independently-computed indices...
+    assert np.array_equal(full[: in_range_idxs.size], in_range_idxs)
+    # ...and whatever is left over is exactly the extension variants, whose
+    # count must match this case's expected `n_extension` (keeps this
+    # non-vacuous: a wrong extension count/length fails here).
+    assert full.size - in_range_idxs.size == n_extension
+
+
+def test_chunk_ranges_with_length_yields_chunk_idxs():
+    """The 3rd tuple element is now the variant-index array, and the extension
+    indices are contiguous after the last in-range index (what gvl assumed)."""
+    vcf = VCF(ddir / "biallelic.vcf.gz")
+    if vcf._index is None:
+        vcf._write_gvi_index()
+        vcf._load_index()
+    contig = vcf.contigs[0]
+    starts = np.array([0], dtype=np.int32)
+    ends = np.array([10_000], dtype=np.int32)
+
+    v_idx, offsets = vcf._var_idxs(contig, starts, ends)
+    reg_unext = v_idx[offsets[0] : offsets[1]].astype(np.uint32)
+
+    all_idxs = []
+    for range_ in vcf._chunk_ranges_with_length(contig, starts, ends, "4g", VCF.Genos8):
+        for genos, _end, chunk_idxs in range_:
+            assert chunk_idxs.dtype == np.uint32
+            assert chunk_idxs.shape[0] == genos.shape[-1]
+            all_idxs.append(chunk_idxs)
+    full = np.concatenate(all_idxs) if all_idxs else np.empty(0, np.uint32)
+
+    # in-range prefix matches _var_idxs; any extension is contiguous after it
+    assert np.array_equal(full[: reg_unext.size], reg_unext)
+    if full.size > reg_unext.size:
+        ext = full[reg_unext.size :]
+        assert np.array_equal(
+            ext, np.arange(reg_unext[-1] + 1, reg_unext[-1] + 1 + ext.size)
+        )
 
 
 def test_nbytes_zero_before_index_loaded():

@@ -13,6 +13,9 @@
   The `pl_filter=` constructor kwarg and the `(filter, pl_filter)` tuple
   getter/setter are removed. Migrate `VCF(p, filter=fn, pl_filter=expr)` to
   `VCF(p, filter=Filter(record=fn, expr=expr))`.
+- `VCF._chunk_ranges_with_length` now yields `(data, end, chunk_idxs)` (a
+  `uint32` variant-index array) as its third tuple element instead of an
+  `n_extension_vars` count, matching `PGEN._chunk_ranges_with_length`.
 
 ### Fix
 

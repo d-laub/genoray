@@ -467,8 +467,12 @@ class VCF:
     def _empty(self, mode: type[T], n_variants: int = 0) -> T:
         return mode.empty(self.n_samples, self.ploidy + self.phasing, n_variants)
 
-    def _empty_gen(self, mode: type[L], end: int) -> Generator[tuple[L, int, int]]:
-        return ((self._empty(mode), end, 0) for _ in range(1))
+    def _empty_gen(
+        self, mode: type[L], end: POS_TYPE
+    ) -> Generator[tuple[L, POS_TYPE, NDArray[V_IDX_TYPE]]]:
+        return (
+            (self._empty(mode), end, np.empty(0, dtype=V_IDX_TYPE)) for _ in range(1)
+        )
 
     def read(
         self,
@@ -664,7 +668,7 @@ class VCF:
         mode: type[L] = Genos16,
     ) -> Generator[
         Generator[
-            tuple[L, int, int]  # data, end, n_extension_vars
+            tuple[L, POS_TYPE, NDArray[V_IDX_TYPE]]  # data, end, chunk_idxs
         ]
     ]:
         """Read genotypes and/or dosages in chunks approximately limited by :code:`max_mem`.
@@ -727,15 +731,20 @@ class VCF:
                 f" Memory per variant: {format_memory(mem_per_v)}."
             )
 
+        v_idx, v_offsets = self._var_idxs(c, starts, ends)  # starts still 0-based here
+
         starts = starts + 1  # cyvcf2 queries are 1-based
         ends = np.atleast_1d(np.asarray(ends, POS_TYPE))
 
-        for s, e, n in zip(starts, ends, n_variants):
+        for ri, (s, e, n) in enumerate(zip(starts, ends, n_variants)):
             if n == 0:
                 yield self._empty_gen(mode, e)  # type: ignore[invalid-yield]
                 continue
 
-            yield self._chunk_with_length_helper(n, vars_per_chunk, c, s, e, mode)
+            range_idxs = v_idx[v_offsets[ri] : v_offsets[ri + 1]].astype(V_IDX_TYPE)
+            yield self._chunk_with_length_helper(
+                n, vars_per_chunk, c, s, e, mode, range_idxs
+            )
 
     def _chunk_with_length_helper(
         self,
@@ -745,7 +754,8 @@ class VCF:
         start: POS_TYPE,
         end: POS_TYPE,
         mode: type[L],
-    ) -> Generator[tuple[L, int, int]]:
+        range_idxs: NDArray[V_IDX_TYPE],
+    ) -> Generator[tuple[L, POS_TYPE, NDArray[V_IDX_TYPE]]]:
         if (
             issubclass(mode, (Genos8Dosages, Genos16Dosages))
             and self.dosage_field is None
@@ -768,6 +778,7 @@ class VCF:
 
         vcf = self._vcf(f"{contig}:{start}-{end}")
         hap_lens = np.full((self.n_samples, self.ploidy), end - start, dtype=np.int32)
+        consumed = 0
         for _, is_last, chunk_size in mark_ends(chunk_sizes):
             ilens = np.empty(chunk_size, dtype=np.int32)
             if issubclass(mode, (Genos8, Genos16)):
@@ -787,8 +798,15 @@ class VCF:
             else:
                 assert_never(mode)  # type: ignore[bad-argument-type]
 
+            # chunk_size may carry a numpy uint dtype (from vars_per_chunk); adding a
+            # python int to a numpy uint64 upcasts to float64, which is invalid as a
+            # slice bound, so normalize to a plain int first.
+            chunk_size = int(chunk_size)
+            base_idxs = range_idxs[consumed : consumed + chunk_size]
+            consumed += chunk_size
+
             if not is_last:
-                yield cast(L, out), last_end, 0
+                yield cast(L, out), cast(POS_TYPE, last_end), base_idxs
                 continue
 
             if issubclass(mode, (Genos8, Genos16)):
@@ -818,11 +836,17 @@ class VCF:
                         for o, ls in zip(out, zip(*ls_ext))
                     )
 
-            yield (
-                cast(L, out),
-                last_end,
-                len(ls_ext),
-            )
+                last_in_range = int(range_idxs[-1])
+                ext_idxs = np.arange(
+                    last_in_range + 1,
+                    last_in_range + 1 + len(ls_ext),
+                    dtype=V_IDX_TYPE,
+                )
+                chunk_idxs = np.concatenate([base_idxs, ext_idxs])
+            else:
+                chunk_idxs = base_idxs
+
+            yield cast(L, out), cast(POS_TYPE, last_end), chunk_idxs
 
     @overload
     def get_record_info(
