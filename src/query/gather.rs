@@ -4,6 +4,8 @@
 //! `gather_ranges`/`gather_haps_readbound`), and `BatchResult::decode_hap`'s
 //! per-hap decode.
 
+use std::ops::Range;
+
 use crate::bits;
 use crate::rvk;
 use crate::spine::{self, KeyRef};
@@ -121,8 +123,8 @@ pub struct BatchResultSplit {
 /// wrapper is the seam the read-bound path replays from precomputed ranges.
 pub(crate) fn gather_vk(
     reader: &ContigReader,
-    vk_snp_range: (usize, usize),
-    vk_indel_range: (usize, usize),
+    vk_snp_range: Range<usize>,
+    vk_indel_range: Range<usize>,
     q_start: u32,
 ) -> Vec<KeyRef> {
     let snp_positions = reader.vk_snp.positions();
@@ -130,7 +132,7 @@ pub(crate) fn gather_vk(
     let indel_positions = reader.vk_indel.positions();
     let indel_keys = as_u32(&reader.vk_indel.keys);
 
-    let (ss, se) = vk_snp_range;
+    let (ss, se) = (vk_snp_range.start, vk_snp_range.end);
     let mut snp_run: Vec<KeyRef> = Vec::new();
     for (j, &pos) in snp_positions.iter().enumerate().take(se).skip(ss) {
         if q_start < pos + 1 {
@@ -142,7 +144,7 @@ pub(crate) fn gather_vk(
         }
     }
 
-    let (is_, ie_) = vk_indel_range;
+    let (is_, ie_) = (vk_indel_range.start, vk_indel_range.end);
     let mut indel_run: Vec<KeyRef> = Vec::new();
     for j in is_..ie_ {
         let pos = indel_positions[j];
@@ -170,7 +172,10 @@ pub fn overlap_batch(reader: &ContigReader, regions: &[(u32, u32)]) -> BatchResu
     // Per-region dense index ranges — shared across all samples in the region.
     let ranges: Vec<(usize, usize)> = regions
         .iter()
-        .map(|&(qs, qe)| dense.overlap(qs, qe))
+        .map(|&(qs, qe)| {
+            let r = dense.overlap(qs, qe);
+            (r.start, r.end)
+        })
         .collect();
 
     let mut vk: Vec<KeyRef> = Vec::new();
@@ -182,7 +187,6 @@ pub fn overlap_batch(reader: &ContigReader, regions: &[(u32, u32)]) -> BatchResu
         for s in 0..n_samples {
             for p in 0..ploidy {
                 let col = s * ploidy + p;
-                let hap = col; // sample-major hap index == flat column
 
                 // var_key channel slice for (region r, sample s, ploid p).
                 let slice = reader.vk_slice(col, s, p, qs, qe);
@@ -197,7 +201,7 @@ pub fn overlap_batch(reader: &ContigReader, regions: &[(u32, u32)]) -> BatchResu
                     let carried = reader
                         .dense_view(class)
                         .expect("dense src implies table")
-                        .carried(hap, dcol);
+                        .carried(col, dcol);
                     carried && dense.v_ends[j] > qs
                 });
             }
@@ -234,20 +238,20 @@ pub struct RangesBundle {
     /// `q_start` per region — needed by `gather_ranges`'s left-overlap re-check.
     pub region_starts: Vec<u32>,
     /// `[s, e)` into the shared dense union, per region.
-    pub dense_range: Vec<(usize, usize)>,
+    pub dense_range: Vec<Range<usize>>,
     /// Selected slot -> original sample index.
     pub sample_cols: Vec<usize>,
     /// Absolute `[start, end)` into `vk_snp`'s packed positions/keys, per
     /// `(region, selected sample, ploid)`.
-    pub vk_snp_range: Vec<(usize, usize)>,
+    pub vk_snp_range: Vec<Range<usize>>,
     /// Absolute `[start, end)` into `vk_indel`'s packed positions/keys, per
     /// `(region, selected sample, ploid)`.
-    pub vk_indel_range: Vec<(usize, usize)>,
+    pub vk_indel_range: Vec<Range<usize>>,
     /// `[s, e)` into `dense/snp`'s on-disk positions/keys, per region (dense is
     /// cohort-shared, so one window per region, not per hap). Read-bound path.
-    pub dense_snp_range: Vec<(usize, usize)>,
+    pub dense_snp_range: Vec<Range<usize>>,
     /// `[s, e)` into `dense/indel`'s on-disk positions/keys, per region.
-    pub dense_indel_range: Vec<(usize, usize)>,
+    pub dense_indel_range: Vec<Range<usize>>,
 }
 
 /// Search-only pass: run every `SearchTree::new` up front and record the
@@ -270,23 +274,23 @@ pub fn find_ranges(
 
     // Region-independent union; `overlap` builds one SearchTree per region.
     let dense = reader.dense_union();
-    let dense_range: Vec<(usize, usize)> = regions
+    let dense_range: Vec<Range<usize>> = regions
         .iter()
         .map(|&(qs, qe)| dense.overlap(qs, qe))
         .collect();
     let region_starts: Vec<u32> = regions.iter().map(|&(qs, _)| qs).collect();
 
-    let dense_snp_range: Vec<(usize, usize)> = regions
+    let dense_snp_range: Vec<Range<usize>> = regions
         .iter()
         .map(|&(qs, qe)| reader.dense_snp_overlap(qs, qe))
         .collect();
-    let dense_indel_range: Vec<(usize, usize)> = regions
+    let dense_indel_range: Vec<Range<usize>> = regions
         .iter()
         .map(|&(qs, qe)| reader.dense_indel_overlap(qs, qe))
         .collect();
 
-    let mut vk_snp_range = Vec::with_capacity(n_regions * h);
-    let mut vk_indel_range = Vec::with_capacity(n_regions * h);
+    let mut vk_snp_range: Vec<Range<usize>> = Vec::with_capacity(n_regions * h);
+    let mut vk_indel_range: Vec<Range<usize>> = Vec::with_capacity(n_regions * h);
     for &(qs, qe) in regions {
         for &orig_s in &sample_cols {
             for p in 0..ploidy {
@@ -333,16 +337,21 @@ pub fn gather_ranges(reader: &ContigReader, rb: &RangesBundle) -> BatchResult {
 
     for r in 0..n_regions {
         let qs = rb.region_starts[r];
-        let (ds, de) = rb.dense_range[r];
+        let dr = &rb.dense_range[r];
+        let (ds, de) = (dr.start, dr.end);
         for si in 0..n_samples {
             let orig_s = rb.sample_cols[si];
             for p in 0..ploidy {
                 let col = orig_s * ploidy + p;
-                let hap = col; // sample-major hap index == flat column
                 let row = r * hpr + si * ploidy + p;
 
                 // --- var_key gather (no search) ---
-                let merged = gather_vk(reader, rb.vk_snp_range[row], rb.vk_indel_range[row], qs);
+                let merged = gather_vk(
+                    reader,
+                    rb.vk_snp_range[row].clone(),
+                    rb.vk_indel_range[row].clone(),
+                    qs,
+                );
                 vk.extend_from_slice(&merged);
                 vk_off.push(vk.len());
 
@@ -354,7 +363,7 @@ pub fn gather_ranges(reader: &ContigReader, rb: &RangesBundle) -> BatchResult {
                     let carried = reader
                         .dense_view(class)
                         .expect("dense src implies table")
-                        .carried(hap, dcol);
+                        .carried(col, dcol);
                     carried && dense.v_ends[j] > qs
                 });
             }
@@ -370,7 +379,7 @@ pub fn gather_ranges(reader: &ContigReader, rb: &RangesBundle) -> BatchResult {
         vk,
         vk_off,
         dense: dense.refs,
-        dense_range: rb.dense_range.clone(),
+        dense_range: rb.dense_range.iter().map(|r| (r.start, r.end)).collect(),
         dense_present,
         dense_present_off,
     }

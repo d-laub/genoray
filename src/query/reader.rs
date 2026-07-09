@@ -2,6 +2,7 @@
 //! provides the per-hap var_key slice + search-range helpers that back both
 //! the union (`union.rs`) and gather (`gather.rs`) query paths.
 
+use std::ops::Range;
 use std::path::Path;
 
 use ndarray::Array2;
@@ -127,7 +128,8 @@ impl ContigReader {
 
         // var_key/snp: 2-bit codes, absolute index o0 + i into the packed buffer.
         {
-            let (o0, o1) = self.vk_snp.column(col);
+            let vk_range = self.vk_snp.column(col);
+            let (o0, o1) = (vk_range.start, vk_range.end);
             let positions = &self.vk_snp.positions()[o0..o1];
             let keys = as_bytes(&self.vk_snp.keys);
             let mut run = Vec::new();
@@ -146,7 +148,8 @@ impl ContigReader {
 
         // var_key/indel: uniform u32 keys, per-column max_del bound.
         {
-            let (o0, o1) = self.vk_indel.column(col);
+            let vk_range = self.vk_indel.column(col);
+            let (o0, o1) = (vk_range.start, vk_range.end);
             let positions = &self.vk_indel.positions()[o0..o1];
             let keys = &as_u32(&self.vk_indel.keys)[o0..o1];
             let max_del = self.vk_indel_max_del[[sample, p]];
@@ -202,16 +205,17 @@ impl ContigReader {
     /// Absolute `[start, end)` into `vk_snp`'s packed positions/keys for
     /// `(col, region)` — the SNP channel's search half (`max_region_length =
     /// 0`, since a SNP always spans exactly one base). No gather.
-    pub(crate) fn vk_snp_overlap(&self, col: usize, q_start: u32, q_end: u32) -> (usize, usize) {
-        let (o0, o1) = self.vk_snp.column(col);
+    pub(crate) fn vk_snp_overlap(&self, col: usize, q_start: u32, q_end: u32) -> Range<usize> {
+        let vk_range = self.vk_snp.column(col);
+        let (o0, o1) = (vk_range.start, vk_range.end);
         let positions = &self.vk_snp.positions()[o0..o1];
         if positions.is_empty() {
-            return (o0, o0);
+            return o0..o0;
         }
         let v_ends: Vec<u32> = positions.iter().map(|&p| p + 1).collect();
         let tree = SearchTree::new(positions);
         let (s, e) = overlap_range(&tree, &v_ends, 0, q_start, q_end);
-        (o0 + s, o0 + e)
+        (o0 + s)..(o0 + e)
     }
 
     /// Absolute `[start, end)` into `vk_indel`'s packed positions/keys for
@@ -224,11 +228,12 @@ impl ContigReader {
         p: usize,
         q_start: u32,
         q_end: u32,
-    ) -> (usize, usize) {
-        let (o0, o1) = self.vk_indel.column(col);
+    ) -> Range<usize> {
+        let vk_range = self.vk_indel.column(col);
+        let (o0, o1) = (vk_range.start, vk_range.end);
         let positions = &self.vk_indel.positions()[o0..o1];
         if positions.is_empty() {
-            return (o0, o0);
+            return o0..o0;
         }
         let keys = &as_u32(&self.vk_indel.keys)[o0..o1];
         let max_del = self.vk_indel_max_del[[sample, p]];
@@ -239,35 +244,36 @@ impl ContigReader {
             .collect();
         let tree = SearchTree::new(positions);
         let (s, e) = overlap_range(&tree, &v_ends, max_del, q_start, q_end);
-        (o0 + s, o0 + e)
+        (o0 + s)..(o0 + e)
     }
 
     /// Absolute `[s, e)` into `dense/snp`'s positions/keys for one region.
     /// SNP v_end = pos + 1 (max_region_length = 0). `(0, 0)` if no snp table.
-    pub(crate) fn dense_snp_overlap(&self, q_start: u32, q_end: u32) -> (usize, usize) {
+    pub(crate) fn dense_snp_overlap(&self, q_start: u32, q_end: u32) -> Range<usize> {
         let d = match &self.dense_snp {
             Some(d) => d,
-            None => return (0, 0),
+            None => return 0..0,
         };
         let positions = d.positions();
         if positions.is_empty() {
-            return (0, 0);
+            return 0..0;
         }
         let v_ends: Vec<u32> = positions.iter().map(|&p| p + 1).collect();
         let tree = SearchTree::new(positions);
-        overlap_range(&tree, &v_ends, 0, q_start, q_end)
+        let (s, e) = overlap_range(&tree, &v_ends, 0, q_start, q_end);
+        s..e
     }
 
     /// Absolute `[s, e)` into `dense/indel`'s positions/keys for one region.
     /// Indel v_end = pos + 1 + deletion_len(key); per-contig dense max_del bound.
-    pub(crate) fn dense_indel_overlap(&self, q_start: u32, q_end: u32) -> (usize, usize) {
+    pub(crate) fn dense_indel_overlap(&self, q_start: u32, q_end: u32) -> Range<usize> {
         let d = match &self.dense_indel {
             Some(d) => d,
-            None => return (0, 0),
+            None => return 0..0,
         };
         let positions = d.positions();
         if positions.is_empty() {
-            return (0, 0);
+            return 0..0;
         }
         let keys = as_u32(&d.keys);
         debug_assert_eq!(positions.len(), keys.len());
@@ -277,6 +283,7 @@ impl ContigReader {
             .map(|(&pos, &key)| pos + 1 + rvk::deletion_len(key))
             .collect();
         let tree = SearchTree::new(positions);
-        overlap_range(&tree, &v_ends, self.dense_indel_max_del, q_start, q_end)
+        let (s, e) = overlap_range(&tree, &v_ends, self.dense_indel_max_del, q_start, q_end);
+        s..e
     }
 }

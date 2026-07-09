@@ -2,6 +2,8 @@
 //! position-sorted, used by the union-based (non-read-bound) query paths
 //! (`oracle::overlap_sample`, `gather::overlap_batch`, `gather::gather_ranges`).
 
+use std::ops::Range;
+
 use crate::dense::DenseClass;
 use crate::rvk;
 use crate::search::{SearchTree, overlap_range};
@@ -26,12 +28,13 @@ pub(crate) struct DenseUnion {
 impl DenseUnion {
     /// `[s, e)` into `refs`/`src` for `[q_start, q_end)`, deletion-aware. Builds a
     /// fresh search tree over `positions` (cheap; one per region in a batch).
-    pub(crate) fn overlap(&self, q_start: u32, q_end: u32) -> (usize, usize) {
+    pub(crate) fn overlap(&self, q_start: u32, q_end: u32) -> Range<usize> {
         if self.refs.is_empty() {
-            return (0, 0);
+            return 0..0;
         }
         let tree = SearchTree::new(&self.positions);
-        overlap_range(&tree, &self.v_ends, self.max_del, q_start, q_end)
+        let (s, e) = overlap_range(&tree, &self.v_ends, self.max_del, q_start, q_end);
+        s..e
     }
 }
 

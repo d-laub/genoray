@@ -13,6 +13,8 @@
 //! deferred to the Python layer (Task 5) — `find_ranges` here always returns
 //! freshly-allocated numpy arrays.
 
+use std::ops::Range;
+
 use ndarray::Array2;
 use numpy::{PyArray1, PyArray2, PyArrayMethods, ToPyArray};
 use pyo3::prelude::*;
@@ -75,19 +77,19 @@ fn batch_result_to_dict<'py>(
 /// (R,2) i32`, plus `n_regions`/`n_samples`/`ploidy` scalars (H =
 /// n_samples*ploidy).
 fn bundle_to_dict<'py>(py: Python<'py>, rb: &RangesBundle) -> PyResult<Bound<'py, PyDict>> {
-    let pairs_to_i32_flat = |v: &[(usize, usize)]| -> Vec<i32> {
+    let pairs_to_i32_flat = |v: &[Range<usize>]| -> Vec<i32> {
         let mut o = Vec::with_capacity(v.len() * 2);
-        for &(a, b) in v {
-            o.push(a as i32);
-            o.push(b as i32);
+        for r in v {
+            o.push(r.start as i32);
+            o.push(r.end as i32);
         }
         o
     };
-    let pairs_to_i64_flat = |v: &[(usize, usize)]| -> Vec<i64> {
+    let pairs_to_i64_flat = |v: &[Range<usize>]| -> Vec<i64> {
         let mut o = Vec::with_capacity(v.len() * 2);
-        for &(a, b) in v {
-            o.push(a as i64);
-            o.push(b as i64);
+        for r in v {
+            o.push(r.start as i64);
+            o.push(r.end as i64);
         }
         o
     };
@@ -157,22 +159,22 @@ fn bundle_from_dict(d: &Bound<'_, PyDict>) -> RangesBundle {
             .unwrap()
             .to_vec()
     };
-    let get_i32_pairs = |k: &str| -> Vec<(usize, usize)> {
+    let get_i32_pairs = |k: &str| -> Vec<Range<usize>> {
         let obj = d.get_item(k).unwrap().unwrap();
         let arr = obj.cast::<PyArray2<i32>>().unwrap().readonly();
         arr.as_array()
             .rows()
             .into_iter()
-            .map(|row| (row[0] as usize, row[1] as usize))
+            .map(|row| (row[0] as usize)..(row[1] as usize))
             .collect()
     };
-    let get_i64_pairs = |k: &str| -> Vec<(usize, usize)> {
+    let get_i64_pairs = |k: &str| -> Vec<Range<usize>> {
         let obj = d.get_item(k).unwrap().unwrap();
         let arr = obj.cast::<PyArray2<i64>>().unwrap().readonly();
         arr.as_array()
             .rows()
             .into_iter()
-            .map(|row| (row[0] as usize, row[1] as usize))
+            .map(|row| (row[0] as usize)..(row[1] as usize))
             .collect()
     };
 

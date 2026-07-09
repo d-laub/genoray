@@ -74,14 +74,14 @@ fn test_find_ranges_emits_per_class_dense_ranges() {
     assert_eq!(rb.dense_snp_range.len(), regions.len());
     assert_eq!(rb.dense_indel_range.len(), regions.len());
     // Each per-class window is a subset of that class's table; ranges are valid.
-    for &(s, e) in rb.dense_snp_range.iter().chain(rb.dense_indel_range.iter()) {
-        assert!(s <= e);
+    for r in rb.dense_snp_range.iter().chain(rb.dense_indel_range.iter()) {
+        assert!(r.start <= r.end);
     }
     // Region 0 spans the whole contig: it must see the dense SNP (pos 150,
     // AC=4) and the dense indels. The union window must equal snp∪indel counts.
-    let (us0, ue0) = rb.dense_range[0];
-    let snp0 = rb.dense_snp_range[0].1 - rb.dense_snp_range[0].0;
-    let indel0 = rb.dense_indel_range[0].1 - rb.dense_indel_range[0].0;
+    let (us0, ue0) = (rb.dense_range[0].start, rb.dense_range[0].end);
+    let snp0 = rb.dense_snp_range[0].end - rb.dense_snp_range[0].start;
+    let indel0 = rb.dense_indel_range[0].end - rb.dense_indel_range[0].start;
     // Empirical coverage guard: the fixture MUST route at least one SNP to the
     // Dense class, else the dense_snp / dense_snp_present channel of
     // BatchResultSplit is never exercised with real content and a SNP-class
@@ -248,12 +248,12 @@ fn test_flat_gather_matches_cartesian_full_cohort() {
         for s in 0..s_n {
             region_starts.push(rb.region_starts[r]);
             orig_samples.push(rb.sample_cols[s]);
-            dsr.push(rb.dense_snp_range[r]);
-            dir_.push(rb.dense_indel_range[r]);
+            dsr.push((rb.dense_snp_range[r].start, rb.dense_snp_range[r].end));
+            dir_.push((rb.dense_indel_range[r].start, rb.dense_indel_range[r].end));
             for p in 0..ploidy {
                 let row = r * (s_n * ploidy) + s * ploidy + p;
-                vk_snp_range.push(rb.vk_snp_range[row]);
-                vk_indel_range.push(rb.vk_indel_range[row]);
+                vk_snp_range.push((rb.vk_snp_range[row].start, rb.vk_snp_range[row].end));
+                vk_indel_range.push((rb.vk_indel_range[row].start, rb.vk_indel_range[row].end));
             }
         }
     }
@@ -320,12 +320,12 @@ fn test_gather_haps_readbound_byte_identical() {
         for s in 0..s_n {
             region_starts.push(rb.region_starts[r]);
             orig_samples.push(rb.sample_cols[s]);
-            dsr.push(rb.dense_snp_range[r]);
-            dir_.push(rb.dense_indel_range[r]);
+            dsr.push((rb.dense_snp_range[r].start, rb.dense_snp_range[r].end));
+            dir_.push((rb.dense_indel_range[r].start, rb.dense_indel_range[r].end));
             for p in 0..ploidy {
                 let row = r * (s_n * ploidy) + s * ploidy + p;
-                vk_snp_range.push(rb.vk_snp_range[row]);
-                vk_indel_range.push(rb.vk_indel_range[row]);
+                vk_snp_range.push((rb.vk_snp_range[row].start, rb.vk_snp_range[row].end));
+                vk_indel_range.push((rb.vk_indel_range[row].start, rb.vk_indel_range[row].end));
             }
         }
     }
@@ -365,7 +365,7 @@ fn test_gather_haps_readbound_byte_identical() {
                 }
 
                 // Raw dense/snp presence bits over this region's dense_snp window.
-                let (ss, se) = rb.dense_snp_range[r];
+                let (ss, se) = (rb.dense_snp_range[r].start, rb.dense_snp_range[r].end);
                 let cart_bit0 = cart.dense_snp_present_off[ch];
                 let flat_bit0 = flat.dense_snp_present_off[fh];
                 for k in 0..(se - ss) {
@@ -379,7 +379,7 @@ fn test_gather_haps_readbound_byte_identical() {
                 }
 
                 // Raw dense/indel presence bits over this region's dense_indel window.
-                let (is_, ie_) = rb.dense_indel_range[r];
+                let (is_, ie_) = (rb.dense_indel_range[r].start, rb.dense_indel_range[r].end);
                 let cart_bit0 = cart.dense_indel_present_off[ch];
                 let flat_bit0 = flat.dense_indel_present_off[fh];
                 for k in 0..(ie_ - is_) {
@@ -478,12 +478,12 @@ fn test_gather_haps_readbound_tie_break_snp_before_indel() {
         for s in 0..s_n {
             region_starts.push(rb.region_starts[r]);
             orig_samples.push(rb.sample_cols[s]);
-            dsr.push(rb.dense_snp_range[r]);
-            dir_.push(rb.dense_indel_range[r]);
+            dsr.push((rb.dense_snp_range[r].start, rb.dense_snp_range[r].end));
+            dir_.push((rb.dense_indel_range[r].start, rb.dense_indel_range[r].end));
             for p in 0..ploidy {
                 let row = r * (s_n * ploidy) + s * ploidy + p;
-                vk_snp_range.push(rb.vk_snp_range[row]);
-                vk_indel_range.push(rb.vk_indel_range[row]);
+                vk_snp_range.push((rb.vk_snp_range[row].start, rb.vk_snp_range[row].end));
+                vk_indel_range.push((rb.vk_indel_range[row].start, rb.vk_indel_range[row].end));
             }
         }
     }

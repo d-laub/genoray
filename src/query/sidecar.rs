@@ -4,6 +4,7 @@
 
 use std::fs::File;
 use std::io::ErrorKind;
+use std::ops::Range;
 use std::path::Path;
 
 use memmap2::Mmap;
@@ -63,8 +64,8 @@ impl SubStreamView {
         as_u32(&self.positions)
     }
     /// Half-open `[start, end)` call range for flat column `c`.
-    pub(crate) fn column(&self, c: usize) -> (usize, usize) {
-        (self.offsets[c] as usize, self.offsets[c + 1] as usize)
+    pub(crate) fn column(&self, c: usize) -> Range<usize> {
+        (self.offsets[c] as usize)..(self.offsets[c + 1] as usize)
     }
 }
 
