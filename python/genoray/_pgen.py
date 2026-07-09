@@ -397,6 +397,25 @@ class PGEN:
         phys = self._index["index"].to_numpy()[pos].astype(V_IDX_TYPE)
         return phys, offsets
 
+    def _norm_or_warn(self, contig: str) -> str | None:
+        c = self._c_norm.norm(contig) if self._c_norm is not None else None
+        if c is None:
+            logger.warning(
+                f"Query contig {contig} not found in PGEN file, even after "
+                "normalizing for UCSC/Ensembl nomenclature."
+            )
+        return c
+
+    def _empty(self, mode: type[T], n_variants: int = 0) -> T:
+        return mode.empty(self.n_samples, self.ploidy, n_variants)
+
+    def _empty_gen(
+        self, mode: type[L], end: POS_TYPE
+    ) -> Generator[tuple[L, POS_TYPE, NDArray[V_IDX_TYPE]]]:
+        return (
+            (self._empty(mode), end, np.empty(0, dtype=V_IDX_TYPE)) for _ in range(1)
+        )
+
     def read(
         self,
         contig: str,
@@ -430,13 +449,13 @@ class PGEN:
             assert self._c_norm is not None and self._index is not None
         c = self._c_norm.norm(contig)
         if c is None:
-            return mode.empty(self.n_samples, self.ploidy, 0)
+            return self._empty(mode)
 
         var_idxs, _ = self._var_idxs_phys(c, start, end)  # type: ignore[bad-argument-type]
         n_variants = len(var_idxs)
 
         if n_variants == 0:
-            return mode.empty(self.n_samples, self.ploidy, 0)
+            return self._empty(mode)
 
         out = self._reader_for(mode)(var_idxs)
 
@@ -480,18 +499,15 @@ class PGEN:
             self._init_index()
             assert self._c_norm is not None and self._index is not None
 
-        c = self._c_norm.norm(contig)
+        c = self._norm_or_warn(contig)
         if c is None:
-            logger.warning(
-                f"Query contig {contig} not found in PGEN file, even after normalizing for UCSC/Ensembl nomenclature."
-            )
-            yield mode.empty(self.n_samples, self.ploidy, 0)
+            yield self._empty(mode)
             return
 
         var_idxs, _ = self._var_idxs_phys(c, start, end)  # type: ignore[bad-argument-type]
         n_variants = len(var_idxs)
         if n_variants == 0:
-            yield mode.empty(self.n_samples, self.ploidy, 0)
+            yield self._empty(mode)
             return
 
         mem_per_v = self._mem_per_variant(mode)
@@ -555,21 +571,14 @@ class PGEN:
             self._init_index()
             assert self._c_norm is not None and self._index is not None
 
-        c = self._c_norm.norm(contig)
+        c = self._norm_or_warn(contig)
         if c is None:
-            logger.warning(
-                f"Query contig {contig} not found in PGEN file, even after normalizing for UCSC/Ensembl nomenclature."
-            )
-            return mode.empty(self.n_samples, self.ploidy, 0), np.zeros(
-                n_ranges + 1, OFFSET_TYPE
-            )
+            return self._empty(mode), np.zeros(n_ranges + 1, OFFSET_TYPE)
 
         var_idxs, offsets = self._var_idxs_phys(c, starts, ends)
         n_variants = len(var_idxs)
         if n_variants == 0:
-            return mode.empty(self.n_samples, self.ploidy, 0), np.zeros(
-                n_ranges + 1, OFFSET_TYPE
-            )
+            return self._empty(mode), np.zeros(n_ranges + 1, OFFSET_TYPE)
 
         out = self._reader_for(mode)(var_idxs)
 
@@ -627,13 +636,10 @@ class PGEN:
             self._init_index()
             assert self._c_norm is not None and self._index is not None
 
-        c = self._c_norm.norm(contig)
+        c = self._norm_or_warn(contig)
         if c is None:
-            logger.warning(
-                f"Query contig {contig} not found in PGEN file, even after normalizing for UCSC/Ensembl nomenclature."
-            )
             for _ in range(len(starts)):
-                yield (mode.empty(self.n_samples, self.ploidy, 0) for _ in range(1))
+                yield (self._empty(mode) for _ in range(1))
             return
 
         ends = np.atleast_1d(np.asarray(ends, POS_TYPE))
@@ -643,7 +649,7 @@ class PGEN:
         tot_variants = len(var_idxs)
         if tot_variants == 0:
             for _ in range(len(starts)):
-                yield (mode.empty(self.n_samples, self.ploidy, 0) for _ in range(1))
+                yield (self._empty(mode) for _ in range(1))
             return
 
         mem_per_v = self._mem_per_variant(mode)
@@ -658,7 +664,7 @@ class PGEN:
 
         for (o_s, o_e), n_chunks in zip(windowed(offsets, 2), chunks_per_range):
             if o_s == o_e:
-                yield (mode.empty(self.n_samples, self.ploidy, 0) for _ in range(1))
+                yield (self._empty(mode) for _ in range(1))
                 continue
 
             range_idxs = var_idxs[o_s:o_e]
@@ -743,20 +749,10 @@ class PGEN:
                 and self._c_max_idxs is not None
             )
 
-        c = self._c_norm.norm(contig)
+        c = self._norm_or_warn(contig)
         if c is None:
-            logger.warning(
-                f"Query contig {contig} not found in PGEN file, even after normalizing for UCSC/Ensembl nomenclature."
-            )
             for e in ends:
-                yield (
-                    (
-                        mode.empty(self.n_samples, self.ploidy, 0),
-                        e,
-                        np.empty(0, dtype=V_IDX_TYPE),
-                    )
-                    for _ in range(1)
-                )
+                yield self._empty_gen(mode, e)
             # we have full length, no deletions in any of the ranges
             return
 
@@ -766,14 +762,7 @@ class PGEN:
         tot_variants = len(var_idxs)
         if tot_variants == 0:
             for e in ends:
-                yield (
-                    (
-                        mode.empty(self.n_samples, self.ploidy, 0),
-                        e,
-                        np.empty(0, dtype=V_IDX_TYPE),
-                    )
-                    for _ in range(1)
-                )
+                yield self._empty_gen(mode, e)
             # we have full length, no deletions in any of the ranges
             return
 
@@ -795,14 +784,7 @@ class PGEN:
             n_variants = len(range_idxs)
             if n_variants == 0:
                 # we have full length, no deletions in any of the ranges
-                yield (
-                    (
-                        mode.empty(self.n_samples, self.ploidy, 0),
-                        e,
-                        np.empty(0, dtype=V_IDX_TYPE),
-                    )
-                    for _ in range(1)
-                )
+                yield self._empty_gen(mode, e)
                 continue
 
             n_chunks = -(-n_variants // vars_per_chunk)

@@ -472,6 +472,21 @@ class VCF:
 
         return var_indices(V_IDX_TYPE, self._c_norm, self._index, contig, starts, ends)
 
+    def _norm_or_warn(self, contig: str) -> str | None:
+        c = self._c_norm.norm(contig)
+        if c is None:
+            logger.warning(
+                f"Query contig {contig} not found in VCF file, even after "
+                "normalizing for UCSC/Ensembl nomenclature."
+            )
+        return c
+
+    def _empty(self, mode: type[T], n_variants: int = 0) -> T:
+        return mode.empty(self.n_samples, self.ploidy + self.phasing, n_variants)
+
+    def _empty_gen(self, mode: type[L], end: int) -> Generator[tuple[L, int, int]]:
+        return ((self._empty(mode), end, 0) for _ in range(1))
+
     def read(
         self,
         contig: str,
@@ -510,12 +525,9 @@ class VCF:
                 "Dosage field not specified. Set the VCF reader's `dosage_field` parameter."
             )
 
-        c = self._c_norm.norm(contig)
+        c = self._norm_or_warn(contig)
         if c is None:
-            logger.warning(
-                f"Query contig {contig} not found in VCF file, even after normalizing for UCSC/Ensembl nomenclature."
-            )
-            return mode.empty(self.n_samples, self.ploidy + self.phasing, 0)  # type: ignore[bad-return]
+            return self._empty(mode)  # type: ignore[bad-return]
 
         start = max(0, start)  # type: ignore
 
@@ -524,7 +536,7 @@ class VCF:
             if self._index is not None:
                 n_variants = self.n_vars_in_ranges(c, start, end)[0]  # type: ignore[bad-argument-type]
                 if n_variants == 0:
-                    return mode.empty(self.n_samples, self.ploidy + self.phasing, 0)  # type: ignore[bad-return]
+                    return self._empty(mode)  # type: ignore[bad-return]
                 data = mode.empty(
                     self.n_samples, self.ploidy + self.phasing, n_variants
                 )
@@ -589,12 +601,9 @@ class VCF:
 
         max_mem = parse_memory(max_mem)
 
-        c = self._c_norm.norm(contig)
+        c = self._norm_or_warn(contig)
         if c is None:
-            logger.warning(
-                f"Query contig {contig} not found in VCF file, even after normalizing for UCSC/Ensembl nomenclature."
-            )
-            yield mode.empty(self.n_samples, self.ploidy + self.phasing, 0)  # type: ignore[invalid-yield]
+            yield self._empty(mode)  # type: ignore[invalid-yield]
             return
 
         start = max(0, start)  # type: ignore
@@ -714,26 +723,17 @@ class VCF:
         starts = np.atleast_1d(np.asarray(starts, POS_TYPE)).clip(min=0)
         ends = np.atleast_1d(np.asarray(ends, POS_TYPE))
 
-        c = self._c_norm.norm(contig)
+        c = self._norm_or_warn(contig)
         if c is None:
-            logger.warning(
-                f"Query contig {contig} not found in VCF file, even after normalizing for UCSC/Ensembl nomenclature."
-            )
             for e in ends:
-                yield (  # type: ignore[invalid-yield]
-                    (mode.empty(self.n_samples, self.ploidy + self.phasing, 0), e, 0)
-                    for _ in range(1)
-                )
+                yield self._empty_gen(mode, e)  # type: ignore[invalid-yield]
             return
 
         n_variants = self.n_vars_in_ranges(c, starts, ends)
         tot_variants = n_variants.sum()
         if tot_variants == 0:
             for e in ends:
-                yield (  # type: ignore[invalid-yield]
-                    (mode.empty(self.n_samples, self.ploidy + self.phasing, 0), e, 0)
-                    for _ in range(1)
-                )
+                yield self._empty_gen(mode, e)  # type: ignore[invalid-yield]
             return
 
         mem_per_v = self._mem_per_variant(mode)
@@ -749,10 +749,7 @@ class VCF:
 
         for s, e, n in zip(starts, ends, n_variants):
             if n == 0:
-                yield (  # type: ignore[invalid-yield]
-                    (mode.empty(self.n_samples, self.ploidy + self.phasing, 0), e, 0)
-                    for _ in range(1)
-                )
+                yield self._empty_gen(mode, e)  # type: ignore[invalid-yield]
                 continue
 
             yield self._chunk_with_length_helper(n, vars_per_chunk, c, s, e, mode)
@@ -1177,7 +1174,7 @@ class VCF:
                     self._pbar.update()
 
             if len(out_ls) == 0:
-                return mode.empty(self.n_samples, self.ploidy + self.phasing, 0), 0
+                return self._empty(mode), 0
 
             # (s p v)
             out = cast(
@@ -1313,7 +1310,7 @@ class VCF:
                     self._pbar.update()
 
             if len(geno_ls) == 0:
-                out = mode.empty(self.n_samples, self.ploidy + self.phasing, 0)
+                out = self._empty(mode)
                 return out, 0
 
             genos = cast(
