@@ -11,7 +11,7 @@ import polars as pl
 import pytest
 from pytest_cases import case, parametrize_with_cases
 
-from genoray._svar import _empty_annot, _get_strand_and_codon_pos
+from genoray._svar._annotate import _empty_annot, _get_strand_and_codon_pos
 from genoray._utils import ContigNormalizer
 
 GTF_SCHEMA = {

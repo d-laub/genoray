@@ -10,7 +10,7 @@ from pytest_cases import parametrize_with_cases
 from seqpro.rag import OFFSET_TYPE, lengths_to_offsets
 
 from genoray import SparseVar
-from genoray._svar import DOSAGE_TYPE, V_IDX_TYPE
+from genoray._types import DOSAGE_TYPE, V_IDX_TYPE
 from seqpro.rag import Ragged
 
 ddir = Path(__file__).parent / "data"

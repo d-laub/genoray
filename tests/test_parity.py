@@ -27,7 +27,7 @@ import numpy as np
 import pytest
 
 from genoray import PGEN, VCF, SparseVar
-from genoray._svar import _dense2sparse_with_length
+from genoray._svar._convert import _dense2sparse_with_length
 from genoray._types import V_IDX_TYPE
 
 from _length_helpers import assert_parsimonious_with_length

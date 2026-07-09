@@ -17,7 +17,7 @@ from __future__ import annotations
 import numpy as np
 from seqpro.rag import OFFSET_TYPE
 
-from genoray._svar import _find_starts_ends, _find_starts_ends_with_length
+from genoray._svar._kernels import _find_starts_ends, _find_starts_ends_with_length
 from genoray._types import POS_TYPE, V_IDX_TYPE
 
 

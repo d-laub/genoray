@@ -167,7 +167,7 @@ def test_from_vcf_atomic_no_leftover(tmp_path: Path):
 
 
 def test_from_vcf_atomic_preserves_existing_on_failure(tmp_path: Path, monkeypatch):
-    import genoray._svar as S
+    import genoray._svar._core as S
 
     out = tmp_path / "x.svar"
     SparseVar.from_vcf(out, VCF(_DDIR / "biallelic.vcf.gz"), max_mem="1g")
@@ -192,7 +192,7 @@ def test_from_pgen_atomic_no_leftover(tmp_path: Path):
 
 
 def test_from_pgen_atomic_preserves_existing_on_failure(tmp_path: Path, monkeypatch):
-    import genoray._svar as S
+    import genoray._svar._core as S
 
     out = tmp_path / "p.svar"
     SparseVar.from_pgen(out, PGEN(_DDIR / "biallelic.pgen"), max_mem="1g")
@@ -218,7 +218,7 @@ def test_write_view_atomic_no_leftover(tmp_path: Path):
 
 
 def test_write_view_atomic_preserves_existing_on_failure(tmp_path: Path, monkeypatch):
-    import genoray._svar as S
+    import genoray._svar._core as S
 
     src = SparseVar(_DDIR / "biallelic.vcf.svar")
     out = tmp_path / "v.svar"

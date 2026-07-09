@@ -8,7 +8,11 @@ import pytest
 import numpy as np
 
 from genoray import SparseVar
-from genoray._svar import _normalize_regions, _normalize_samples, _validate_fields
+from genoray._svar._regions import (
+    _normalize_regions,
+    _normalize_samples,
+    _validate_fields,
+)
 from genoray._utils import ContigNormalizer
 
 
@@ -170,7 +174,7 @@ def svar_wv():
 
 
 def test_resolve_kept_var_idxs_pos_mode(svar_wv):
-    from genoray._svar import _resolve_kept_var_idxs
+    from genoray._svar._regions import _resolve_kept_var_idxs
 
     regions = pl.DataFrame(
         {"chrom": [svar_wv.contigs[0]], "start": [0], "end": [10_000]},
@@ -183,7 +187,7 @@ def test_resolve_kept_var_idxs_pos_mode(svar_wv):
 
 
 def test_resolve_kept_var_idxs_empty_regions(svar_wv):
-    from genoray._svar import _resolve_kept_var_idxs
+    from genoray._svar._regions import _resolve_kept_var_idxs
 
     regions = pl.DataFrame(
         {
@@ -197,7 +201,7 @@ def test_resolve_kept_var_idxs_empty_regions(svar_wv):
 
 
 def test_resolve_kept_var_idxs_overlap_raises(svar_wv):
-    from genoray._svar import _resolve_kept_var_idxs
+    from genoray._svar._regions import _resolve_kept_var_idxs
 
     regions = pl.DataFrame(
         {"chrom": [svar_wv.contigs[0]] * 2, "start": [0, 5], "end": [10, 20]},
@@ -208,7 +212,7 @@ def test_resolve_kept_var_idxs_overlap_raises(svar_wv):
 
 
 def test_resolve_kept_var_idxs_overlap_merges(svar_wv):
-    from genoray._svar import _resolve_kept_var_idxs
+    from genoray._svar._regions import _resolve_kept_var_idxs
 
     regions = pl.DataFrame(
         {"chrom": [svar_wv.contigs[0]] * 2, "start": [0, 5], "end": [10, 20]},
@@ -219,7 +223,7 @@ def test_resolve_kept_var_idxs_overlap_merges(svar_wv):
 
 
 def test_resolve_kept_var_idxs_record_includes_at_least_as_much_as_pos(svar_wv):
-    from genoray._svar import _resolve_kept_var_idxs
+    from genoray._svar._regions import _resolve_kept_var_idxs
 
     regions = pl.DataFrame(
         {"chrom": [svar_wv.contigs[0]], "start": [0], "end": [50]},
@@ -235,7 +239,7 @@ def test_resolve_kept_var_idxs_record_includes_at_least_as_much_as_pos(svar_wv):
 
 
 def test_resolve_kept_var_idxs_variant_includes_at_least_as_much_as_pos(svar_wv):
-    from genoray._svar import _resolve_kept_var_idxs
+    from genoray._svar._regions import _resolve_kept_var_idxs
 
     regions = pl.DataFrame(
         {"chrom": [svar_wv.contigs[0]], "start": [0], "end": [50]},
@@ -251,7 +255,7 @@ def test_resolve_kept_var_idxs_variant_includes_at_least_as_much_as_pos(svar_wv)
 
 
 def test_resolve_kept_var_idxs_all_modes_return_sorted_unique(svar_wv):
-    from genoray._svar import _resolve_kept_var_idxs
+    from genoray._svar._regions import _resolve_kept_var_idxs
 
     regions = pl.DataFrame(
         {"chrom": [svar_wv.contigs[0]], "start": [81_000], "end": [82_000]},
@@ -272,7 +276,7 @@ def test_resolve_kept_var_idxs_pos_mode_hits_known_variant(svar_wv):
     Region [81261, 81265) in 0-based half-open should cover POS=81262 (0-based 81261)
     but not POS=81265 (0-based 81264).  Region [81261, 81266) should cover both.
     """
-    from genoray._svar import _resolve_kept_var_idxs
+    from genoray._svar._regions import _resolve_kept_var_idxs
 
     # Wide region: covers POS 81262 and 81265 (0-based 81261 and 81264)
     regions = pl.DataFrame(
@@ -288,7 +292,7 @@ def test_resolve_kept_var_idxs_pos_mode_hits_known_variant(svar_wv):
 def test_resolve_kept_var_idxs_variant_matches_var_ranges_exclusive_end(svar_wv):
     """In variant mode, the kept set must equal the union of [s, e) ranges from
     var_ranges (exclusive end)."""
-    from genoray._svar import _resolve_kept_var_idxs
+    from genoray._svar._regions import _resolve_kept_var_idxs
 
     contig = svar_wv.contigs[0]
     regions = pl.DataFrame(
@@ -320,7 +324,7 @@ def test_resolve_kept_var_idxs_variant_matches_var_ranges_exclusive_end(svar_wv)
 
 
 def test_nb_count_kept_matches_python():
-    from genoray._svar import _nb_count_kept
+    from genoray._svar._kernels import _nb_count_kept
 
     # Two samples, ploidy=2 -> 4 slots
     src_data = np.array([0, 2, 5, 1, 3, 5, 0, 4], dtype=np.int32)
@@ -345,7 +349,7 @@ def test_nb_count_kept_matches_python():
 def test_nb_write_var_idxs_matches_python():
     from seqpro.rag import lengths_to_offsets
 
-    from genoray._svar import _nb_count_kept, _nb_write_var_idxs
+    from genoray._svar._kernels import _nb_count_kept, _nb_write_var_idxs
 
     src_data = np.array([0, 2, 5, 1, 3, 5, 0, 4], dtype=np.int32)
     src_offsets = np.array([0, 2, 4, 6, 8], dtype=np.int64)
@@ -379,7 +383,7 @@ def test_nb_write_var_idxs_matches_python():
 def test_nb_write_field_matches_python():
     from seqpro.rag import lengths_to_offsets
 
-    from genoray._svar import _nb_count_kept, _nb_write_field
+    from genoray._svar._kernels import _nb_count_kept, _nb_write_field
 
     src_data = np.array([0, 2, 5, 1, 3, 5, 0, 4], dtype=np.int32)
     src_offsets = np.array([0, 2, 4, 6, 8], dtype=np.int64)
@@ -735,7 +739,7 @@ def test_covers_all_variants_short_circuit(svar_wv):
 
     assert svar_wv._covers_all_variants(regions, "pos") is True
 
-    from genoray._svar import _resolve_kept_var_idxs
+    from genoray._svar._regions import _resolve_kept_var_idxs
 
     kept = _resolve_kept_var_idxs(svar_wv, regions, mode="pos", merge_overlapping=False)
     # Short-circuit returns every variant, in ascending order.
@@ -827,7 +831,7 @@ def test_write_view_output_exists_checked_before_resolution(
     out.mkdir()
     # If region resolution runs before the output-exists check, this raises
     # AssertionError instead of FileExistsError.
-    monkeypatch.setattr("genoray._svar._resolve_kept_var_idxs", _resolve_raises)
+    monkeypatch.setattr("genoray._svar._core._resolve_kept_var_idxs", _resolve_raises)
     contig = svar.contigs[0]
     with pytest.raises(FileExistsError):
         svar.write_view(

@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 from seqpro.rag import OFFSET_TYPE
 
-from genoray._svar import _dense2sparse_with_length
+from genoray._svar._convert import _dense2sparse_with_length
 from genoray._types import V_IDX_TYPE
 
 
