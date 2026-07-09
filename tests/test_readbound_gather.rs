@@ -7,8 +7,8 @@ use common::{SynthRecord, build_contig};
 use genoray_core::bits_get_bit;
 use genoray_core::query::oracle::{decode_keyref_alt, gather_ranges_readbound};
 use genoray_core::query::{
-    BatchResultSplit, ContigReader, HapCalls, KeyRef, find_ranges, gather_haps_readbound,
-    overlap_batch,
+    BatchResultSplit, ContigReader, HapCalls, HapRanges, KeyRef, find_ranges,
+    gather_haps_readbound, overlap_batch,
 };
 use genoray_core::search;
 use tempfile::tempdir;
@@ -225,6 +225,21 @@ fn reader_ploidy(_r: &ContigReader) -> usize {
 }
 
 #[test]
+#[should_panic(expected = "vk_snp_range len must equal n_q*ploidy")]
+fn test_hapranges_new_rejects_mismatched_vk_len() {
+    use genoray_core::query::HapRanges;
+    let _ = HapRanges::new(
+        &[0u32, 100],
+        &[0, 1],
+        &[(0, 1)],
+        &[(0, 1)],
+        &[(0, 0), (0, 0)],
+        &[(0, 0), (0, 0)],
+        2,
+    );
+}
+
+#[test]
 fn test_flat_gather_matches_cartesian_full_cohort() {
     let tmp = tempdir().unwrap();
     let out = tmp.path().join("out");
@@ -258,8 +273,7 @@ fn test_flat_gather_matches_cartesian_full_cohort() {
             }
         }
     }
-    let flat = gather_haps_readbound(
-        &reader,
+    let rb = HapRanges::new(
         &region_starts,
         &orig_samples,
         &vk_snp_range,
@@ -268,6 +282,7 @@ fn test_flat_gather_matches_cartesian_full_cohort() {
         &dir_,
         ploidy,
     );
+    let flat = gather_haps_readbound(&reader, &rb);
 
     // Compare decoded per-hap. cart hap (r,s,p) == flat query q=r*S+s, ploid p.
     for r in 0..regions.len() {
@@ -330,8 +345,7 @@ fn test_gather_haps_readbound_byte_identical() {
             }
         }
     }
-    let flat: BatchResultSplit = gather_haps_readbound(
-        &reader,
+    let rb2 = HapRanges::new(
         &region_starts,
         &orig_samples,
         &vk_snp_range,
@@ -340,6 +354,7 @@ fn test_gather_haps_readbound_byte_identical() {
         &dir_,
         ploidy,
     );
+    let flat: BatchResultSplit = gather_haps_readbound(&reader, &rb2);
 
     let mut any_nonempty_vk = false;
     let mut any_dense_snp_present = false;
@@ -488,8 +503,7 @@ fn test_gather_haps_readbound_tie_break_snp_before_indel() {
             }
         }
     }
-    let flat: BatchResultSplit = gather_haps_readbound(
-        &reader,
+    let rb2 = HapRanges::new(
         &region_starts,
         &orig_samples,
         &vk_snp_range,
@@ -498,6 +512,7 @@ fn test_gather_haps_readbound_tie_break_snp_before_indel() {
         &dir_,
         ploidy,
     );
+    let flat: BatchResultSplit = gather_haps_readbound(&reader, &rb2);
 
     // Locate S0 ploid0 in both layouts (region 0, sample slot for S0, p=0).
     let s0_slot = rb

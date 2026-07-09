@@ -34,7 +34,7 @@ pub mod union;
 pub use crate::spine::KeyRef;
 pub use decode::{HapCalls, QueryResult};
 pub use gather::{
-    BatchResult, BatchResultSplit, RangesBundle, find_ranges, gather_haps_readbound, gather_ranges,
-    overlap_batch, read_ranges,
+    BatchResult, BatchResultSplit, HapRanges, RangesBundle, find_ranges, gather_haps_readbound,
+    gather_ranges, overlap_batch, read_ranges,
 };
 pub use reader::ContigReader;

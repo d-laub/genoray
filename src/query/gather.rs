@@ -385,29 +385,83 @@ pub fn gather_ranges(reader: &ContigReader, rb: &RangesBundle) -> BatchResult {
     }
 }
 
+/// Borrowed per-query range slices for `gather_haps_readbound`, bundling the six
+/// parallel slices + ploidy so the parallel-length contract is validated once at
+/// construction instead of via five `assert_eq!`s at every call. Row layout is
+/// unchanged: `dense_*_range` are per-query (len `n_q`); `vk_*_range` are
+/// per-(query,ploid) (len `n_q * ploidy`, row `q*ploidy + p`).
+pub struct HapRanges<'a> {
+    pub region_starts: &'a [u32],
+    pub orig_samples: &'a [usize],
+    pub vk_snp_range: &'a [(usize, usize)],
+    pub vk_indel_range: &'a [(usize, usize)],
+    pub dense_snp_range: &'a [(usize, usize)],
+    pub dense_indel_range: &'a [(usize, usize)],
+    pub ploidy: usize,
+}
+
+impl<'a> HapRanges<'a> {
+    /// Validate the parallel-slice length contract (panics on mismatch, matching
+    /// the invariants `gather_haps_readbound` previously asserted inline).
+    pub fn new(
+        region_starts: &'a [u32],
+        orig_samples: &'a [usize],
+        vk_snp_range: &'a [(usize, usize)],
+        vk_indel_range: &'a [(usize, usize)],
+        dense_snp_range: &'a [(usize, usize)],
+        dense_indel_range: &'a [(usize, usize)],
+        ploidy: usize,
+    ) -> Self {
+        let n_q = region_starts.len();
+        assert_eq!(orig_samples.len(), n_q, "orig_samples len must equal n_q");
+        assert_eq!(
+            dense_snp_range.len(),
+            n_q,
+            "dense_snp_range len must equal n_q"
+        );
+        assert_eq!(
+            dense_indel_range.len(),
+            n_q,
+            "dense_indel_range len must equal n_q"
+        );
+        assert_eq!(
+            vk_snp_range.len(),
+            n_q * ploidy,
+            "vk_snp_range len must equal n_q*ploidy"
+        );
+        assert_eq!(
+            vk_indel_range.len(),
+            n_q * ploidy,
+            "vk_indel_range len must equal n_q*ploidy"
+        );
+        Self {
+            region_starts,
+            orig_samples,
+            vk_snp_range,
+            vk_indel_range,
+            dense_snp_range,
+            dense_indel_range,
+            ploidy,
+        }
+    }
+}
+
 /// Flat per-query read-bound gather for gvl's arbitrary-(region,sample) reads.
 /// Each of `n_q = region_starts.len()` queries is one (region, sample) pair
 /// reconstructing `ploidy` haps. Range arrays are per-query (`dense_*_range`,
 /// length n_q) or per-(query,ploid) (`vk_*_range`, length n_q*ploidy, row =
 /// q*ploidy + p). Builds zero SearchTrees and never calls `dense_union()`.
 /// Returns a `BatchResultSplit` with `n_samples = 1`, hap index `q*ploidy + p`.
-#[allow(clippy::needless_range_loop, clippy::too_many_arguments)]
-pub fn gather_haps_readbound(
-    reader: &ContigReader,
-    region_starts: &[u32],
-    orig_samples: &[usize],
-    vk_snp_range: &[(usize, usize)],
-    vk_indel_range: &[(usize, usize)],
-    dense_snp_range: &[(usize, usize)],
-    dense_indel_range: &[(usize, usize)],
-    ploidy: usize,
-) -> BatchResultSplit {
+#[allow(clippy::needless_range_loop)]
+pub fn gather_haps_readbound(reader: &ContigReader, rb: &HapRanges<'_>) -> BatchResultSplit {
+    let region_starts = rb.region_starts;
+    let orig_samples = rb.orig_samples;
+    let vk_snp_range = rb.vk_snp_range;
+    let vk_indel_range = rb.vk_indel_range;
+    let dense_snp_range = rb.dense_snp_range;
+    let dense_indel_range = rb.dense_indel_range;
+    let ploidy = rb.ploidy;
     let n_q = region_starts.len();
-    assert_eq!(orig_samples.len(), n_q);
-    assert_eq!(dense_snp_range.len(), n_q);
-    assert_eq!(dense_indel_range.len(), n_q);
-    assert_eq!(vk_snp_range.len(), n_q * ploidy);
-    assert_eq!(vk_indel_range.len(), n_q * ploidy);
 
     let snp_positions = reader.vk_snp.positions();
     let snp_keys = as_bytes(&reader.vk_snp.keys);
