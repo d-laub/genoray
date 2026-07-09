@@ -112,6 +112,34 @@ def test_read(
     np.testing.assert_equal(d, dosages)
 
 
+def test_read_with_out_matches_without_out(vcf: VCF):
+    """Characterize existing behavior of the (previously untested) ``out=``
+    path: filling a caller-provided buffer must match allocating a fresh one."""
+    cse = "chr1", 81261, 81263
+
+    expected_g = vcf.read(*cse, VCF.Genos16)
+    out_g = VCF.Genos16.empty(
+        vcf.n_samples, vcf.ploidy + vcf.phasing, expected_g.shape[-1]
+    )
+    actual_g = vcf.read(*cse, VCF.Genos16, out=out_g)
+    np.testing.assert_array_equal(actual_g, expected_g)
+
+    expected_d = vcf.read(*cse, VCF.Dosages)
+    out_d = VCF.Dosages.empty(
+        vcf.n_samples, vcf.ploidy + vcf.phasing, expected_d.shape[-1]
+    )
+    actual_d = vcf.read(*cse, VCF.Dosages, out=out_d)
+    np.testing.assert_array_equal(actual_d, expected_d)
+
+    expected_gd = vcf.read(*cse, VCF.Genos16Dosages)
+    out_gd = VCF.Genos16Dosages.empty(
+        vcf.n_samples, vcf.ploidy + vcf.phasing, expected_gd[0].shape[-1]
+    )
+    actual_gd = vcf.read(*cse, VCF.Genos16Dosages, out=out_gd)
+    np.testing.assert_array_equal(actual_gd[0], expected_gd[0])
+    np.testing.assert_array_equal(actual_gd[1], expected_gd[1])
+
+
 @parametrize_with_cases("cse, genos, phasing, dosages", cases=".", prefix="read_")
 def test_chunk(
     vcf: VCF,

@@ -525,54 +525,28 @@ class VCF:
                 n_variants = self.n_vars_in_ranges(c, start, end)[0]  # type: ignore[bad-argument-type]
                 if n_variants == 0:
                     return mode.empty(self.n_samples, self.ploidy + self.phasing, 0)  # type: ignore[bad-return]
-            else:
-                n_variants = None
-
-            if issubclass(mode, (Genos8, Genos16)):
-                if n_variants is None:
-                    data = None
-                else:
-                    data = mode.empty(
-                        self.n_samples, self.ploidy + self.phasing, n_variants
-                    )
-                data, _ = self._fill_genos(vcf, data, mode=mode)
-            elif issubclass(mode, Dosages):
-                assert self.dosage_field is not None
-                if n_variants is None:
-                    data = None
-                else:
-                    data = mode.empty(
-                        self.n_samples, self.ploidy + self.phasing, n_variants
-                    )
-                data, _ = self._fill_dosages(vcf, data, self.dosage_field)
-            elif issubclass(mode, (Genos8Dosages, Genos16Dosages)):
-                assert self.dosage_field is not None
-                if n_variants is None:
-                    data = None
-                else:
-                    data = mode.empty(
-                        self.n_samples, self.ploidy + self.phasing, n_variants
-                    )
-                data, _ = self._fill_genos_and_dosages(
-                    vcf, data, self.dosage_field, mode=mode
+                data = mode.empty(
+                    self.n_samples, self.ploidy + self.phasing, n_variants
                 )
             else:
-                assert_never(mode)  # type: ignore[bad-argument-type]
-
-            out = cast(T, data)
+                data = None
         else:
-            if isinstance(out, (Genos8, Genos16)):
-                self._fill_genos(vcf, out)
-            elif isinstance(out, Dosages):
-                assert self.dosage_field is not None
-                self._fill_dosages(vcf, out, self.dosage_field)
-            elif isinstance(out, (Genos8Dosages, Genos16Dosages)):
-                assert self.dosage_field is not None
-                self._fill_genos_and_dosages(vcf, out, self.dosage_field)
-            else:
-                assert_never(mode)  # type: ignore[bad-argument-type]
+            data = out
 
-        return out
+        if issubclass(mode, (Genos8, Genos16)):
+            data, _ = self._fill_genos(vcf, data, mode=mode)
+        elif issubclass(mode, Dosages):
+            assert self.dosage_field is not None
+            data, _ = self._fill_dosages(vcf, data, self.dosage_field)
+        elif issubclass(mode, (Genos8Dosages, Genos16Dosages)):
+            assert self.dosage_field is not None
+            data, _ = self._fill_genos_and_dosages(
+                vcf, data, self.dosage_field, mode=mode
+            )
+        else:
+            assert_never(mode)  # type: ignore[bad-argument-type]
+
+        return cast(T, data)
 
     def chunk(
         self,
