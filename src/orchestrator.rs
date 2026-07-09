@@ -144,7 +144,7 @@ pub fn process_chromosome(
             let s_owned: Vec<String> = samples.iter().map(|&s| s.to_string()).collect();
             let pool = Arc::clone(&processing_pool);
 
-            move || {
+            move || -> Result<u64, ConversionError> {
                 // passing the thread budget down to HTSLib
                 let s_refs: Vec<&str> = s_owned.iter().map(|s| s.as_str()).collect();
                 let mut reader = VcfChunkReader::new(
@@ -155,15 +155,15 @@ pub fn process_chromosome(
                     htslib_threads,
                     ploidy,
                     skip_out_of_scope,
-                );
+                )?;
                 let mut chunk_id = 0;
                 while let Some(dense_chunk) =
-                    reader.read_next_chunk(chunk_size, chunk_id, Some(&pool))
+                    reader.read_next_chunk(chunk_size, chunk_id, Some(&pool))?
                 {
                     tx_dense.send(dense_chunk).unwrap();
                     chunk_id += 1;
                 }
-                reader.dropped_out_of_scope()
+                Ok(reader.dropped_out_of_scope())
             }
         })
         .expect("spawn reader");
@@ -212,9 +212,14 @@ pub fn process_chromosome(
     let chunk_writer_res = chunk_writer_thread.join();
     let long_allele_writer_res = long_allele_writer_thread.join();
 
-    let dropped = reader_res.map_err(|_| ConversionError::WorkerPanicked {
-        thread: format!("read-{}", chrom),
-    })?;
+    let dropped = match reader_res {
+        Ok(r) => r?, // ConversionError propagates with its real message
+        Err(_) => {
+            return Err(ConversionError::WorkerPanicked {
+                thread: format!("read-{}", chrom),
+            });
+        }
+    };
     sampler_res.map_err(|_| ConversionError::WorkerPanicked {
         thread: format!("samp-{}", chrom),
     })?;
@@ -226,12 +231,22 @@ pub fn process_chromosome(
         dense_ledgers,
         long_allele_offsets,
     } = phase1;
-    chunk_writer_res.map_err(|_| ConversionError::WorkerPanicked {
-        thread: format!("cw-{}", chrom),
-    })?;
-    long_allele_writer_res.map_err(|_| ConversionError::WorkerPanicked {
-        thread: format!("lw-{}", chrom),
-    })?;
+    match chunk_writer_res {
+        Ok(r) => r?,
+        Err(_) => {
+            return Err(ConversionError::WorkerPanicked {
+                thread: format!("cw-{}", chrom),
+            });
+        }
+    }
+    match long_allele_writer_res {
+        Ok(r) => r?,
+        Err(_) => {
+            return Err(ConversionError::WorkerPanicked {
+                thread: format!("lw-{}", chrom),
+            });
+        }
+    }
 
     println!(
         "[{}] Phase 1 Complete. Triggering Phase 2 In-Memory Merge...",
@@ -260,9 +275,9 @@ pub fn process_chromosome(
             ploidy,
             dir.to_str().unwrap(),
             ledger,
-        );
+        )?;
         if let Some(hook) = spec.post_merge {
-            hook(&dir);
+            hook(&dir)?;
         }
     }
 
@@ -281,7 +296,7 @@ pub fn process_chromosome(
             spec.pack_snp,
             dir.to_str().unwrap(),
             ledger,
-        );
+        )?;
     }
 
     // M5 post-pass: emit max-deletion-length artifacts for the overlap query.

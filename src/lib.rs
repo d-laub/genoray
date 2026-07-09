@@ -181,7 +181,7 @@ fn run_conversion_pipeline(
 
     let mut total_dropped: u64 = 0;
     for r in results {
-        total_dropped += r.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        total_dropped += r?; // ConversionError -> PyErr via From (category-aware)
     }
 
     // All contigs converted — write the top-level meta.json describing the cohort.
@@ -192,9 +192,7 @@ fn run_conversion_pipeline(
         &chroms,
         ploidy,
     )
-    .map_err(|e| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!("failed to write meta.json: {e}"))
-    })?;
+    .map_err(|e| pyo3::exceptions::PyOSError::new_err(format!("failed to write meta.json: {e}")))?;
 
     Ok(total_dropped as usize)
 }

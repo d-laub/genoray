@@ -1,5 +1,6 @@
 use crate::cost_model::{Class, Representation, choose_representation};
 use crate::dense::{DenseClass, DenseMap};
+use crate::error::ConversionError;
 use crate::layout;
 use crate::nrvk::LongAlleleTableWriter;
 use crate::streams::StreamTag;
@@ -20,12 +21,18 @@ pub use svar2_codec::{
 // u8 code per call) and rewrite it 2-bit packed (4 calls/byte). Streams in
 // 4-MiB blocks (a multiple of 4, so no pack straddles a block boundary except
 // the genuine EOF tail). Offsets are call-indexed and need no change.
-pub fn pack_snp_key_file(dir: &Path) {
+pub fn pack_snp_key_file(dir: &Path) -> Result<(), ConversionError> {
     let src = layout::alleles(dir);
     let tmp = dir.join("alleles.packed.tmp");
 
-    let mut reader = BufReader::new(File::open(&src).expect("open snp alleles.bin"));
-    let mut writer = BufWriter::new(File::create(&tmp).expect("create packed tmp"));
+    let mut reader = BufReader::new(File::open(&src).map_err(|e| ConversionError::Io {
+        context: format!("opening {}", src.display()),
+        source: e,
+    })?);
+    let mut writer = BufWriter::new(File::create(&tmp).map_err(|e| ConversionError::Io {
+        context: format!("creating {}", tmp.display()),
+        source: e,
+    })?);
 
     const BLOCK: usize = 4 * 1024 * 1024; // multiple of 4
     let mut buf = vec![0u8; BLOCK];
@@ -34,7 +41,13 @@ pub fn pack_snp_key_file(dir: &Path) {
         // multiple of 4 and pack cleanly byte-aligned).
         let mut filled = 0usize;
         while filled < BLOCK {
-            match reader.read(&mut buf[filled..]).expect("read snp keys") {
+            let n = reader
+                .read(&mut buf[filled..])
+                .map_err(|e| ConversionError::Io {
+                    context: format!("reading {}", src.display()),
+                    source: e,
+                })?;
+            match n {
                 0 => break,
                 n => filled += n,
             }
@@ -43,16 +56,26 @@ pub fn pack_snp_key_file(dir: &Path) {
             break;
         }
         let packed = pack_snp_keys(&buf[..filled]);
-        writer.write_all(&packed).expect("write packed snp keys");
+        writer.write_all(&packed).map_err(|e| ConversionError::Io {
+            context: format!("writing {}", tmp.display()),
+            source: e,
+        })?;
         if filled < BLOCK {
             break; // EOF tail handled
         }
     }
-    writer.flush().expect("flush packed snp keys");
+    writer.flush().map_err(|e| ConversionError::Io {
+        context: format!("flushing {}", tmp.display()),
+        source: e,
+    })?;
     drop(writer);
     drop(reader);
 
-    std::fs::rename(&tmp, &src).expect("replace snp alleles.bin with packed");
+    std::fs::rename(&tmp, &src).map_err(|e| ConversionError::Io {
+        context: format!("renaming {} -> {}", tmp.display(), src.display()),
+        source: e,
+    })?;
+    Ok(())
 }
 
 // Pack a single variant into its 32-bit key.
@@ -250,6 +273,16 @@ mod tests {
     use crate::types::{BitGrid3, MIN_I31};
     use crossbeam_channel::bounded;
     use proptest::prelude::*;
+
+    #[test]
+    fn pack_snp_key_file_errors_on_missing_dir() {
+        let missing = std::path::Path::new("/nonexistent-sp3-pack/dir");
+        let err = pack_snp_key_file(missing).unwrap_err();
+        match err {
+            crate::error::ConversionError::Io { .. } => {}
+            other => panic!("expected Io, got {other:?}"),
+        }
+    }
 
     // Big-capacity bank so push_long_allele never flushes during tests.
     fn make_bank() -> LongAlleleTableWriter {

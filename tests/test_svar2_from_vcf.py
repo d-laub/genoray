@@ -96,7 +96,7 @@ def test_from_vcf_skip_out_of_scope_counts(tmp_path: Path):
 def test_from_vcf_symbolic_errors_without_skip(tmp_path: Path):
     ref = _write_ref(tmp_path)
     vcf = _write_vcf(tmp_path, symbolic=True, indexed=True)
-    with pytest.raises(Exception):
+    with pytest.raises(ValueError, match="symbolic"):
         SparseVar2.from_vcf(tmp_path / "store_err", vcf, ref, threads=1)
 
 

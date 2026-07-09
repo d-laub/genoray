@@ -389,18 +389,21 @@ fn test_reader_accepts_pure_del() {
         1,
         2,
         false,
-    );
+    )
+    .unwrap();
     let chunk = reader
         .read_next_chunk(100, 0, None)
+        .expect("chunk should succeed")
         .expect("chunk should succeed");
     assert_eq!(chunk.ilens.len(), 1);
     assert_eq!(chunk.ilens, vec![-2]);
 }
 
 // Boundary error-handling: a chromosome absent from the VCF header must surface
-// as a typed `ConversionError::WorkerPanicked` (the reader thread panics on
-// `name2rid`, and `process_chromosome` converts the join panic into an Err)
-// rather than unwinding the calling thread.
+// as a typed `ConversionError::Input` (SP-3: `VcfChunkReader::new` now returns
+// `Result` instead of panicking on `name2rid`, so the reader thread's closure
+// propagates it and the join surfaces the real error, not a swallowed
+// `WorkerPanicked`).
 #[test]
 fn test_missing_chrom_returns_err() {
     let tmp = tempdir().unwrap();
@@ -435,6 +438,30 @@ fn test_missing_chrom_returns_err() {
 
     assert!(matches!(
         res,
-        Err(genoray_core::error::ConversionError::WorkerPanicked { .. })
+        Err(genoray_core::error::ConversionError::Input(_))
+    ));
+}
+
+// Boundary error-handling: a VCF/BCF path that does not exist on disk must
+// surface as a typed `ConversionError::MissingFile`, symmetric with the FASTA
+// missing-file check (SP-3 final review, M2).
+#[test]
+fn test_missing_vcf_returns_missing_file() {
+    let tmp = tempdir().unwrap();
+    let missing_path = tmp.path().join("does_not_exist.vcf.gz");
+
+    let res = VcfChunkReader::new(
+        missing_path.to_str().unwrap(),
+        None,
+        "chr1",
+        &["s0"],
+        1,
+        2,
+        false,
+    );
+
+    assert!(matches!(
+        res,
+        Err(genoray_core::error::ConversionError::MissingFile { .. })
     ));
 }

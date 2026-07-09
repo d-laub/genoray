@@ -5,6 +5,7 @@
 //! non-trivial step is the per-hap bit concatenation across chunks.
 
 use crate::bits::copy_bits;
+use crate::error::ConversionError;
 use crate::layout;
 use crate::rvk::pack_snp_keys;
 use std::fs;
@@ -21,7 +22,7 @@ pub fn merge_dense_class(
     pack_snp: bool,
     output_dir: &str,
     dense_ledger: Vec<u32>,
-) {
+) -> Result<(), ConversionError> {
     debug_assert_eq!(
         dense_ledger.len(),
         num_chunks,
@@ -38,16 +39,24 @@ pub fn merge_dense_class(
         if count == 0 {
             continue;
         }
-        positions.extend_from_slice(&fs::read(layout::chunk_pos(dir, c)).expect("read dense pos"));
-        keys.extend_from_slice(&fs::read(layout::chunk_key(dir, c)).expect("read dense key"));
+        let pos_path = layout::chunk_pos(dir, c);
+        positions.extend_from_slice(&fs::read(&pos_path).map_err(|e| ConversionError::Io {
+            context: format!("reading {}", pos_path.display()),
+            source: e,
+        })?);
+        let key_path = layout::chunk_key(dir, c);
+        keys.extend_from_slice(&fs::read(&key_path).map_err(|e| ConversionError::Io {
+            context: format!("reading {}", key_path.display()),
+            source: e,
+        })?);
     }
-    write_all(&layout::positions(dir), &positions);
+    write_all(&layout::positions(dir), &positions)?;
     let final_key_bytes = if pack_snp {
         pack_snp_keys(&keys) // keys are one raw 2-bit code per variant
     } else {
         keys
     };
-    write_all(&layout::alleles(dir), &final_key_bytes);
+    write_all(&layout::alleles(dir), &final_key_bytes)?;
 
     // ---- genotypes: per-hap bit concatenation across chunks ----
     // output bit (hap h, global col g) at flat index h * v_total + g.
@@ -65,7 +74,11 @@ pub fn merge_dense_class(
         if v_c == 0 {
             continue;
         }
-        let block = fs::read(layout::chunk_geno(dir, c)).expect("read dense geno");
+        let geno_path = layout::chunk_geno(dir, c);
+        let block = fs::read(&geno_path).map_err(|e| ConversionError::Io {
+            context: format!("reading {}", geno_path.display()),
+            source: e,
+        })?;
         // block bit (hap h, local col d) at h*v_c + d.
         for h in 0..np {
             let src_bit = h * v_c;
@@ -73,7 +86,7 @@ pub fn merge_dense_class(
             copy_bits(&mut out, dst_bit, &block, src_bit, v_c);
         }
     }
-    write_all(&layout::genotypes(dir), &out);
+    write_all(&layout::genotypes(dir), &out)?;
 
     // ---- cleanup per-chunk temp files ----
     for c in 0..num_chunks {
@@ -81,13 +94,23 @@ pub fn merge_dense_class(
         let _ = fs::remove_file(layout::chunk_key(dir, c));
         let _ = fs::remove_file(layout::chunk_geno(dir, c));
     }
+    Ok(())
 }
 
-fn write_all(path: &Path, bytes: &[u8]) {
-    let mut f =
-        fs::File::create(path).unwrap_or_else(|e| panic!("create {}: {}", path.display(), e));
-    f.write_all(bytes).expect("write dense final");
-    f.flush().expect("flush dense final");
+fn write_all(path: &Path, bytes: &[u8]) -> Result<(), ConversionError> {
+    let mut f = fs::File::create(path).map_err(|e| ConversionError::Io {
+        context: format!("creating {}", path.display()),
+        source: e,
+    })?;
+    f.write_all(bytes).map_err(|e| ConversionError::Io {
+        context: format!("writing {}", path.display()),
+        source: e,
+    })?;
+    f.flush().map_err(|e| ConversionError::Io {
+        context: format!("flushing {}", path.display()),
+        source: e,
+    })?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -109,9 +132,9 @@ mod tests {
                 }
             }
         }
-        write_all(&layout::chunk_pos(dir, c), bytemuck::cast_slice(positions));
-        write_all(&layout::chunk_key(dir, c), keys);
-        write_all(&layout::chunk_geno(dir, c), &block);
+        write_all(&layout::chunk_pos(dir, c), bytemuck::cast_slice(positions)).unwrap();
+        write_all(&layout::chunk_key(dir, c), keys).unwrap();
+        write_all(&layout::chunk_geno(dir, c), &block).unwrap();
     }
 
     fn read_u32(path: &Path) -> Vec<u32> {
@@ -144,7 +167,8 @@ mod tests {
             /*pack_snp=*/ false,
             dir.to_str().unwrap(),
             vec![2, 1],
-        );
+        )
+        .unwrap();
 
         // positions concat in chunk order
         assert_eq!(read_u32(&layout::positions(dir)), vec![100, 200, 300]);
@@ -172,7 +196,7 @@ mod tests {
     fn test_merge_dense_empty() {
         let tmp = tempdir().unwrap();
         let dir = tmp.path();
-        merge_dense_class(1, 2, 2, 1, true, dir.to_str().unwrap(), vec![0]);
+        merge_dense_class(1, 2, 2, 1, true, dir.to_str().unwrap(), vec![0]).unwrap();
         assert_eq!(fs::read(layout::positions(dir)).unwrap().len(), 0);
         assert_eq!(fs::read(layout::genotypes(dir)).unwrap().len(), 0);
     }
@@ -190,7 +214,7 @@ mod tests {
             &[1u8, 2, 3, 0, 1],
             &[vec![true, true, true, true, true]],
         );
-        merge_dense_class(1, 1, 1, 1, true, dir.to_str().unwrap(), vec![5]);
+        merge_dense_class(1, 1, 1, 1, true, dir.to_str().unwrap(), vec![5]).unwrap();
         // pack_snp_keys([1,2,3,0,1]) == [0x39, 0x01] (see rvk.rs test)
         assert_eq!(fs::read(layout::alleles(dir)).unwrap(), vec![0x39u8, 0x01]);
     }
