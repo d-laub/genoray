@@ -1,3 +1,4 @@
+use crate::error::ConversionError;
 use crate::normalize::atomize_record;
 use crate::types::{BitGrid3, DenseChunk};
 use rayon::prelude::*;
@@ -158,46 +159,66 @@ impl VcfChunkReader {
         htslib_threads: usize,
         ploidy: usize,
         skip_out_of_scope: bool,
-    ) -> Self {
-        let mut reader = IndexedReader::from_path(vcf_path)
-            .expect("Failed to open VCF/BCF index. Is there a .tbi or .csi file?");
+    ) -> Result<Self, ConversionError> {
+        let mut reader = IndexedReader::from_path(vcf_path).map_err(|e| {
+            ConversionError::Input(format!(
+                "Failed to open VCF/BCF index for '{vcf_path}' \
+                 (is there a .tbi or .csi file?): {e}"
+            ))
+        })?;
 
         reader
             .set_threads(htslib_threads)
-            .expect("Failed to allocate HTSlib background threads");
+            .map_err(|e| ConversionError::Io {
+                context: format!("allocating {htslib_threads} HTSlib background threads"),
+                source: std::io::Error::other(e.to_string()),
+            })?;
 
         let header = reader.header().clone();
 
-        let rid = header
-            .name2rid(chrom.as_bytes())
-            .expect("Chromosome not found in VCF header");
+        let rid = header.name2rid(chrom.as_bytes()).map_err(|_| {
+            ConversionError::Input(format!("Chromosome '{chrom}' not found in VCF header"))
+        })?;
 
         reader
             .fetch(rid, 0, None)
-            .expect("Failed to fetch chromosome region");
+            .map_err(|e| ConversionError::Io {
+                context: format!("fetching region for chromosome '{chrom}'"),
+                source: std::io::Error::other(e.to_string()),
+            })?;
 
         let sample_indices: Vec<usize> = samples
             .iter()
             .map(|name| {
-                header
-                    .sample_id(name.as_bytes())
-                    .unwrap_or_else(|| panic!("Sample {} not found in VCF", name))
+                header.sample_id(name.as_bytes()).ok_or_else(|| {
+                    ConversionError::Input(format!("Sample '{name}' not found in VCF"))
+                })
             })
-            .collect();
+            .collect::<Result<_, _>>()?;
 
         // Reference is optional. With a FASTA, cache the full uppercased contig for
         // validate_ref/left_align; without one, leave it empty and skip both.
         let (ref_seq, has_reference) = match fasta_path {
             Some(path) => {
-                let fasta = rust_htslib::faidx::Reader::from_path(path)
-                    .expect("Failed to open reference FASTA (is there a .fai?)");
-                // htslib's faidx_seq_len returns -1 for an unknown contig, which
-                // fetch_seq_len (via rust-htslib) surfaces as u64::MAX rather than 0 —
-                // check for it explicitly so a missing contig fails fast with a clear
-                // message instead of the generic "Failed to fetch contig" panic below.
+                // A wrong reference path reaches Rust unchecked (Python does not
+                // validate it), so surface it as FileNotFoundError specifically.
+                if !std::path::Path::new(path).exists() {
+                    return Err(ConversionError::MissingFile {
+                        path: path.to_string(),
+                    });
+                }
+                let fasta = rust_htslib::faidx::Reader::from_path(path).map_err(|e| {
+                    ConversionError::Input(format!(
+                        "Failed to open reference FASTA '{path}' (is there a .fai?): {e}"
+                    ))
+                })?;
+                // htslib's faidx_seq_len returns -1 for an unknown contig, surfaced
+                // via rust-htslib as u64::MAX — check explicitly for a clear message.
                 let contig_len_raw = fasta.fetch_seq_len(chrom);
                 if contig_len_raw == u64::MAX {
-                    panic!("Contig '{chrom}' not found in reference FASTA");
+                    return Err(ConversionError::Input(format!(
+                        "Contig '{chrom}' not found in reference FASTA"
+                    )));
                 }
                 let contig_len = contig_len_raw as usize;
                 let mut ref_seq = if contig_len == 0 {
@@ -205,7 +226,10 @@ impl VcfChunkReader {
                 } else {
                     fasta
                         .fetch_seq(chrom, 0, contig_len - 1)
-                        .expect("Failed to fetch contig from reference FASTA")
+                        .map_err(|e| ConversionError::Io {
+                            context: format!("fetching contig '{chrom}' from reference FASTA"),
+                            source: std::io::Error::other(e.to_string()),
+                        })?
                 };
                 ref_seq.make_ascii_uppercase();
                 (ref_seq, true)
@@ -215,7 +239,7 @@ impl VcfChunkReader {
 
         let record = reader.empty_record();
 
-        Self {
+        Ok(Self {
             inner_reader: reader,
             num_samples: samples.len(),
             ploidy,
@@ -229,7 +253,7 @@ impl VcfChunkReader {
             frontier: 0,
             eof: false,
             next_seq: 0,
-        }
+        })
     }
 
     /// Total out-of-scope ALTs dropped so far (valid after the read loop drains).
@@ -239,7 +263,7 @@ impl VcfChunkReader {
 
     // Decompose `self.record` into atoms and push them onto the reorder heap, sharing
     // one decoded genotype vector across all atoms of the record.
-    fn decompose_current_record(&mut self) {
+    fn decompose_current_record(&mut self) -> Result<(), ConversionError> {
         let pos = self.record.pos() as u32;
 
         // Own the alleles so the record borrow is released before we mutate self.
@@ -263,11 +287,9 @@ impl VcfChunkReader {
             // `(e >> 1) - 1`; `e` of 0/1 is missing and `i32::MIN` is vector-end
             // padding — both `< 2`, so a single `e >= 2` test reproduces the
             // `GenotypeAllele::index()` semantics exactly.
-            let gts = self
-                .record
-                .format(b"GT")
-                .integer()
-                .expect("Failed to read GT format");
+            let gts = self.record.format(b"GT").integer().map_err(|e| {
+                ConversionError::Input(format!("Failed to read GT format at pos {pos}: {e}"))
+            })?;
             let ploidy = self.ploidy;
             for (s_idx, &vcf_idx) in self.sample_indices.iter().enumerate() {
                 let raw = gts[vcf_idx];
@@ -285,8 +307,7 @@ impl VcfChunkReader {
         // Fail fast only when a reference is available; without one we trust the
         // input is already normalized/left-aligned.
         if self.has_reference {
-            crate::normalize::validate_ref(pos, &ref_allele, &self.ref_seq)
-                .expect("REF disagrees with reference FASTA");
+            crate::normalize::validate_ref(pos, &ref_allele, &self.ref_seq)?;
         }
 
         let alt_refs: Vec<&[u8]> = alts_owned.iter().map(|a| a.as_slice()).collect();
@@ -297,8 +318,7 @@ impl VcfChunkReader {
             &alt_refs,
             &mut atoms,
             self.skip_out_of_scope,
-        )
-        .expect("symbolic/breakend ALT is out of scope for SVAR2 (short-read only)");
+        )?;
         self.dropped_out_of_scope += dropped as u64;
 
         for atom in atoms {
@@ -320,6 +340,7 @@ impl VcfChunkReader {
                 seq,
             }));
         }
+        Ok(())
     }
 
     // Yield the next atom in global position order, reading and decomposing more
@@ -335,22 +356,27 @@ impl VcfChunkReader {
     // atoms sharing a single start position — a run of many records all starting at the
     // same pos never advances the frontier, so the heap can still grow unboundedly in
     // that (pre-existing) pathological case.
-    fn next_atom(&mut self) -> Option<PendingAtom> {
+    fn next_atom(&mut self) -> Result<Option<PendingAtom>, ConversionError> {
         loop {
             if let Some(Reverse(top)) = self.heap.peek() {
                 if self.eof || top.pos < self.frontier.saturating_sub(crate::normalize::L_MAX) {
-                    return Some(self.heap.pop().unwrap().0);
+                    return Ok(Some(self.heap.pop().unwrap().0));
                 }
             } else if self.eof {
-                return None;
+                return Ok(None);
             }
 
             match self.inner_reader.read(&mut self.record) {
                 Some(Ok(())) => {
                     self.frontier = self.record.pos() as u32;
-                    self.decompose_current_record();
+                    self.decompose_current_record()?;
                 }
-                Some(Err(e)) => panic!("VCF Read Error: {}", e),
+                Some(Err(e)) => {
+                    return Err(ConversionError::Io {
+                        context: "reading next VCF record".to_string(),
+                        source: std::io::Error::other(e.to_string()),
+                    });
+                }
                 None => self.eof = true,
             }
         }
@@ -365,16 +391,16 @@ impl VcfChunkReader {
         chunk_size: usize,
         chunk_id: usize,
         pool: Option<&rayon::ThreadPool>,
-    ) -> Option<DenseChunk> {
+    ) -> Result<Option<DenseChunk>, ConversionError> {
         let mut atoms: Vec<PendingAtom> = Vec::with_capacity(chunk_size);
         while atoms.len() < chunk_size {
-            match self.next_atom() {
+            match self.next_atom()? {
                 Some(a) => atoms.push(a),
                 None => break,
             }
         }
         if atoms.is_empty() {
-            return None;
+            return Ok(None);
         }
 
         let v = atoms.len();
@@ -408,14 +434,14 @@ impl VcfChunkReader {
             pack_presence_seq(&mut genos.words, &atoms, columns);
         }
 
-        Some(DenseChunk {
+        Ok(Some(DenseChunk {
             chunk_id,
             pos,
             ilens,
             alt,
             alt_offsets,
             genos,
-        })
+        }))
     }
 }
 

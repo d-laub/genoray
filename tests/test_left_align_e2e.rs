@@ -32,10 +32,11 @@ fn drain(bcf: &Path, fasta: &Path, chrom: &str, samples: &[&str]) -> Vec<(u32, i
         1,
         2,
         false,
-    );
+    )
+    .unwrap();
     let mut out = Vec::new();
     let mut cid = 0;
-    while let Some(chunk) = reader.read_next_chunk(100, cid, None) {
+    while let Some(chunk) = reader.read_next_chunk(100, cid, None).unwrap() {
         for i in 0..chunk.pos.len() {
             out.push((chunk.pos[i], chunk.ilens[i]));
         }
@@ -89,8 +90,8 @@ fn indels_left_align_to_bcftools_positions() {
 
 #[test]
 fn ref_mismatch_panics() {
-    // FASTA says pos 3 is 'A' but the record claims REF "GG" → validate_ref fails, and
-    // the reader (which .expect()s it) panics.
+    // FASTA says pos 3 is 'A' but the record claims REF "GG" → validate_ref fails,
+    // read_next_chunk returns Err, and `drain`'s `.unwrap()` turns that into a panic.
     let tmp = tempdir().unwrap();
     let bcf = tmp.path().join("mm.bcf");
     let fasta = tmp.path().join("mm.fa");
@@ -240,10 +241,11 @@ fn left_shifts_stay_sorted_across_chunk_boundaries() {
         1,
         2,
         false,
-    );
+    )
+    .unwrap();
     let mut positions = Vec::new();
     let mut cid = 0;
-    while let Some(chunk) = reader.read_next_chunk(1, cid, None) {
+    while let Some(chunk) = reader.read_next_chunk(1, cid, None).unwrap() {
         positions.extend_from_slice(&chunk.pos);
         cid += 1;
     }
@@ -305,10 +307,11 @@ proptest! {
             1,
             2,
             false,
-        );
+        )
+        .unwrap();
         let mut positions = Vec::new();
         let mut cid = 0;
-        while let Some(chunk) = reader.read_next_chunk(1, cid, None) {
+        while let Some(chunk) = reader.read_next_chunk(1, cid, None).unwrap() {
             positions.extend_from_slice(&chunk.pos);
             cid += 1;
         }

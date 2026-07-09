@@ -27,11 +27,12 @@ fn drain_reader(
         1,
         ploidy,
         false,
-    );
+    )
+    .unwrap();
     let columns = samples.len() * ploidy;
     let mut out = Vec::new();
     let mut chunk_id = 0;
-    while let Some(chunk) = reader.read_next_chunk(chunk_size, chunk_id, None) {
+    while let Some(chunk) = reader.read_next_chunk(chunk_size, chunk_id, None).unwrap() {
         let v = chunk.pos.len();
         for i in 0..v {
             let mut presence = Vec::with_capacity(columns);
