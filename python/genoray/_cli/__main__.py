@@ -162,7 +162,7 @@ def write_svar1(
         If set, OR-collapse the ploidy axis into a single haploid call per
         sample and record ``ploidy=1`` in the output metadata.
     """
-    from genoray import PGEN, VCF, SparseVar, exprs
+    from genoray import PGEN, VCF, Filter, SparseVar, exprs
     from genoray._utils import variant_file_type
 
     file_type = variant_file_type(source)
@@ -184,6 +184,7 @@ def write_svar1(
         pl_terms.append(~exprs.is_breakend)
         record_preds.append(exprs._record_is_breakend)
 
+    vcf_filter: Filter | None
     if pl_terms:
         from functools import reduce
         from operator import and_
@@ -195,9 +196,11 @@ def write_svar1(
             _preds: tuple[Callable[[list[str]], bool], ...] = tuple(record_preds),
         ) -> bool:
             return not any(pred(rec.ALT) for pred in _preds)
+
+        vcf_filter = Filter(record=record_filter, expr=pl_filter)
     else:
         pl_filter = None
-        record_filter = None
+        vcf_filter = None
 
     if file_type == "vcf":
         if dosages is not None and Path(dosages).exists():
@@ -208,8 +211,7 @@ def write_svar1(
         vcf = VCF(
             source,
             dosage_field=dosages,
-            filter=record_filter,
-            pl_filter=pl_filter,
+            filter=vcf_filter,
         )
         SparseVar.from_vcf(
             out,

@@ -3,10 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import polars as pl
 import pytest
 from numpy.typing import ArrayLike, NDArray
 from pytest_cases import fixture, parametrize_with_cases
 
+from genoray import Filter
 from genoray._vcf import POS_MAX, VCF
 from tests import _oracle
 from tests.data.fixtures import FIXTURES
@@ -349,9 +351,26 @@ def test_chunk_with_length_phased_indel_in_extension():
     assert genos_phasing.shape[-1] > 0
 
 
-def test_filter_setter_enforces_pair_invariant():
-    import polars as pl  # noqa: F401
+def test_filter_object_roundtrip():
+    f = Filter(record=lambda v: True, expr=pl.col("POS") > 0)
+    vcf = VCF(ddir / "biallelic.vcf.gz", filter=f)
+    assert vcf.filter is f
+    vcf.filter = None
+    assert vcf.filter is None
 
+
+def test_filter_object_is_frozen():
+    f = Filter(record=lambda v: True, expr=pl.lit(True))
+    with pytest.raises(Exception):
+        f.record = lambda v: False  # frozen dataclass
+
+
+def test_old_pl_filter_kwarg_removed():
+    with pytest.raises(TypeError):
+        VCF(ddir / "biallelic.vcf.gz", pl_filter=pl.lit(True))  # kwarg no longer exists
+
+
+def test_filter_setter_enforces_pair_invariant():
     from genoray import exprs
 
     vcf = VCF(ddir / "biallelic.vcf.gz")
@@ -360,32 +379,25 @@ def test_filter_setter_enforces_pair_invariant():
         return not any(a.startswith("<") for a in v.ALT)
 
     pl_expr = ~exprs.is_symbolic
+    f = Filter(record=record_fn, expr=pl_expr)
 
-    # Setting a valid (filter, pl_filter) pair updates both and invalidates the index.
+    # Setting a Filter updates both halves together and invalidates the index.
     vcf._index = "sentinel"
-    vcf.filter = (record_fn, pl_expr)
-    assert vcf.filter == (record_fn, pl_expr)
-    assert vcf._pl_filter is pl_expr
+    vcf.filter = f
+    assert vcf.filter is f
     assert vcf._index is None
 
     # The getter mirrors the setter, so assigning the getter back round-trips.
     vcf.filter = vcf.filter
-    assert vcf.filter == (record_fn, pl_expr)
+    assert vcf.filter is f
 
-    # Assigning None clears both; the getter returns (None, None).
+    # Assigning None clears the filter; the getter returns None.
+    vcf._index = "sentinel"
     vcf.filter = None
-    assert vcf.filter == (None, None)
-    assert vcf._pl_filter is None
+    assert vcf.filter is None
+    assert vcf._index is None
 
-    # A mismatched pair raises ValueError and leaves state untouched.
-    with pytest.raises(ValueError):
-        vcf.filter = (record_fn, None)
-    with pytest.raises(ValueError):
-        vcf.filter = (None, pl_expr)
-    assert vcf.filter == (None, None)
-    assert vcf._pl_filter is None
-
-    # A bare (non-tuple) value is rejected.
+    # A bare (non-Filter) value is rejected.
     with pytest.raises(TypeError):
         vcf.filter = record_fn
 
@@ -399,14 +411,13 @@ def test_filtered_var_idxs_consistent_with_index():
     """
     from genoray import exprs
 
-    # is_snp as a (cyvcf2 record callable, pl.Expr) pair (VCF requires both).
+    # is_snp as a Filter bundling a cyvcf2 record predicate + pl.Expr (VCF requires both).
     def record_is_snp(rec):
         return len(rec.REF) == 1 and all(len(a) == 1 for a in rec.ALT)
 
     v_filt = VCF(
         ddir / "biallelic.vcf.gz",
-        filter=record_is_snp,
-        pl_filter=exprs.is_snp,
+        filter=Filter(record=record_is_snp, expr=exprs.is_snp),
     )
     v_filt._write_gvi_index()
     v_filt._load_index()
@@ -437,8 +448,10 @@ def test_filter_applied_to_genos_dosages_without_index():
         phasing=False,
         dosage_field="DS",
         with_gvi_index=False,
-        filter=lambda rec: len(rec.REF) == 1 and all(len(a) == 1 for a in rec.ALT),
-        pl_filter=exprs.is_snp,
+        filter=Filter(
+            record=lambda rec: len(rec.REF) == 1 and all(len(a) == 1 for a in rec.ALT),
+            expr=exprs.is_snp,
+        ),
     )
     cse = ("chr1", 81261, 81266)  # covers the GAT>A indel and two SNPs
     genos_only = vcf.read(*cse, VCF.Genos8)  # filters correctly today

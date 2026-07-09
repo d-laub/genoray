@@ -76,8 +76,10 @@ vcf = genoray.VCF(
     "file.vcf.gz",
     phasing=True,             # constructor-time, not per-read
     dosage_field="DS",        # required to read dosages; FORMAT field with Number=A
-    filter=lambda v: ...,     # cyvcf2.Variant -> bool
-    pl_filter=~genoray.exprs.is_symbolic,  # drop <DEL>/<INS>/...; pair with a matching `filter` callable
+    filter=genoray.Filter(
+        record=lambda v: ...,                 # cyvcf2.Variant -> bool
+        expr=~genoray.exprs.is_symbolic,       # matching .gvi index predicate
+    ),
 )
 
 # Single range
@@ -318,21 +320,32 @@ genoray write svar1 file.vcf.gz out.svar --max-mem 4g --haploid
 
 ## Filtering
 
-VCF: pass a `Callable[[cyvcf2.Variant], bool]` to `filter=`. For index-based
-predicates (e.g. `is_symbolic`), also pass the matching polars `pl.Expr` to
-`pl_filter=` — VCF requires **both** when filtering via the `.gvi` index.
+VCF: pass a `genoray.Filter(record=, expr=)` value object to `filter=`.
+`record` is a `Callable[[cyvcf2.Variant], bool]` applied during the genotype
+scan; `expr` is the matching polars `pl.Expr` applied to the `.gvi` index —
+VCF requires **both** halves, bundled together so they can never diverge.
 
-To change a VCF's filter after construction, assign a `(filter, pl_filter)`
-tuple to the `vcf.filter` setter (or `None` to clear both); the same
-both-or-neither invariant is enforced, and the in-memory index is invalidated.
-The getter returns the `(filter, pl_filter)` tuple, mirroring the setter
-(`(None, None)` when unset), so `vcf.filter = vcf.filter` round-trips.
+To change a VCF's filter after construction, assign a `Filter` (or `None` to
+clear it) to the `vcf.filter` setter; the in-memory index is invalidated.
+The getter returns the `Filter | None` currently in effect, so `vcf.filter =
+vcf.filter` round-trips.
 
 ```python
-vcf.filter = (lambda rec: ..., ~genoray.exprs.is_symbolic)  # set both
-vcf.filter = None                                           # clear both
-fn, expr = vcf.filter                                       # get both
+from genoray import VCF, Filter
+
+vcf = VCF("file.vcf", filter=Filter(
+    record=lambda v: not v.INFO.get("SVTYPE"),   # cyvcf2 record predicate
+    expr=~genoray.exprs.is_symbolic,               # matching .gvi index predicate
+))
+vcf.filter = None                                  # clear
+f = vcf.filter                                      # -> Filter | None
 ```
+
+The former two-argument constructor (a separate polars-expression keyword
+argument alongside `filter=`) and its tuple-valued `vcf.filter` getter/setter
+are **removed in 3.0.0** — migrate any code passing the record predicate and
+polars expression separately to the single `Filter(record=, expr=)` object
+shown above.
 
 PGEN: pass a polars `pl.Expr` returning a boolean mask, operating on the
 `.gvi` index columns. Built-in expressions in `genoray.exprs` (the
@@ -359,7 +372,8 @@ type is unsupported (`<BND>`, `<CNV>`, `<INV>`, `<*>`/`<NON_REF>`), or the ALT i
 a breakend in mate-pair / single-breakend notation (e.g. `G[chr2:321[`). At NumPy
 materialization, `null` ILEN is coerced to 0 (treated as a point variant).
 
-**Filtering guidance** (no new constructor kwarg — use the existing `filter`/`pl_filter` API):
+**Filtering guidance** (use `filter=` — a bare `pl.Expr` for PGEN, a
+`genoray.Filter` for VCF):
 
 - `~genoray.exprs.is_symbolic` — drops *all* symbolic alleles (precise or not).
   Required for haplotype consumers (e.g. `genvarloader`) that cannot expand any
@@ -368,11 +382,13 @@ materialization, `null` ILEN is coerced to 0 (treated as a point variant).
   ```python
   # PGEN
   pgen = genoray.PGEN("file.pgen", filter=~genoray.exprs.is_symbolic)
-  # VCF (both required)
+  # VCF (both halves required, bundled in a Filter)
   vcf = genoray.VCF(
       "file.vcf.gz",
-      filter=lambda rec: not any(a.startswith("<") for a in rec.ALT),
-      pl_filter=~genoray.exprs.is_symbolic,
+      filter=genoray.Filter(
+          record=lambda rec: not any(a.startswith("<") for a in rec.ALT),
+          expr=~genoray.exprs.is_symbolic,
+      ),
   )
   ```
 

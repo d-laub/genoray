@@ -9,6 +9,10 @@
 - VCF chunk-size memory estimates now double when a sample subset/reorder is
   active, matching PGEN. This only affects internal chunk sizing (more
   conservative memory use), never returned data.
+- VCF filtering now uses a single `genoray.Filter(record=, expr=)` value object.
+  The `pl_filter=` constructor kwarg and the `(filter, pl_filter)` tuple
+  getter/setter are removed. Migrate `VCF(p, filter=fn, pl_filter=expr)` to
+  `VCF(p, filter=Filter(record=fn, expr=expr))`.
 
 ### Fix
 

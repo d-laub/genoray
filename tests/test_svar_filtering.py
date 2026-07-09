@@ -1,8 +1,8 @@
 """Filter-inheritance tests for VCF/PGEN -> SVAR.
 
 Replaces the old skip_symbolic_alts flag tests: symbolic filtering is now just
-`pl_filter=~exprs.is_symbolic` (+ paired cyvcf2 `filter`), and SparseVar inherits
-the source's filter.
+`Filter(record=..., expr=~exprs.is_symbolic)`, and SparseVar inherits the
+source's filter.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ import polars as pl
 import pytest
 from vcfixture import Bnd, Number, Seq, Sym, Type, VcfBuilder, VcfVersion
 
-from genoray import PGEN, VCF, SparseVar
+from genoray import PGEN, VCF, Filter, SparseVar
 from genoray import exprs as gexprs
 
 
@@ -58,9 +58,9 @@ def _mixed_vcf(tmp_path: Path) -> Path:
 
 
 def test_vcf_load_index_list_typed_filter(tmp_path):
-    """A list-typed pl_filter (is_symbolic) must evaluate on the VCF path."""
+    """A list-typed Filter.expr (is_symbolic) must evaluate on the VCF path."""
     vcf_path = _mixed_vcf(tmp_path)
-    v = VCF(vcf_path, filter=_not_symbolic, pl_filter=~gexprs.is_symbolic)
+    v = VCF(vcf_path, filter=Filter(record=_not_symbolic, expr=~gexprs.is_symbolic))
     v._write_gvi_index()
     v._load_index()
     assert v._index is not None
@@ -70,7 +70,7 @@ def test_vcf_load_index_list_typed_filter(tmp_path):
 
 def test_from_vcf_inherits_symbolic_filter(tmp_path):
     vcf_path = _mixed_vcf(tmp_path)
-    v = VCF(vcf_path, filter=_not_symbolic, pl_filter=~gexprs.is_symbolic)
+    v = VCF(vcf_path, filter=Filter(record=_not_symbolic, expr=~gexprs.is_symbolic))
     out = tmp_path / "out.svar"
     SparseVar.from_vcf(out, v, max_mem="1g", overwrite=True)
 
@@ -97,8 +97,10 @@ def test_from_vcf_inherits_general_filter(tmp_path):
     vcf_path = _mixed_vcf(tmp_path)
     v = VCF(
         vcf_path,
-        filter=lambda rec: len(rec.REF) == 1 and all(len(a) == 1 for a in rec.ALT),
-        pl_filter=gexprs.is_snp,
+        filter=Filter(
+            record=lambda rec: len(rec.REF) == 1 and all(len(a) == 1 for a in rec.ALT),
+            expr=gexprs.is_snp,
+        ),
     )
     out = tmp_path / "snp.svar"
     SparseVar.from_vcf(out, v, max_mem="1g", overwrite=True)
@@ -263,7 +265,7 @@ def test_from_vcf_multi_contig_filtered(tmp_path):
     """from_vcf with symbolic filter across 2 contigs: correct n_variants, per-contig
     POS, and genotype/index alignment."""
     vcf_path = _two_contig_vcf(tmp_path)
-    v = VCF(vcf_path, filter=_not_symbolic, pl_filter=~gexprs.is_symbolic)
+    v = VCF(vcf_path, filter=Filter(record=_not_symbolic, expr=~gexprs.is_symbolic))
     out = tmp_path / "two_contig.svar"
     SparseVar.from_vcf(out, v, max_mem="1g", overwrite=True)
 
@@ -374,8 +376,7 @@ def test_from_vcf_filtered_with_dosages(tmp_path):
     vcf_path = _dosage_vcf(tmp_path)
     v = VCF(
         vcf_path,
-        filter=_not_symbolic,
-        pl_filter=~gexprs.is_symbolic,
+        filter=Filter(record=_not_symbolic, expr=~gexprs.is_symbolic),
         dosage_field="DS",
     )
     out = tmp_path / "dosage.svar"

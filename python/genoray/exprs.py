@@ -75,12 +75,15 @@ expression suffices::
 
     pgen = genoray.PGEN("file.pgen", filter=~genoray.exprs.is_symbolic)
 
-For VCF, pair it with the equivalent cyvcf2 ``filter`` (both are required)::
+For VCF, bundle it with the equivalent cyvcf2 record predicate in a
+:class:`genoray.Filter` (both are required)::
 
     vcf = genoray.VCF(
         "file.vcf.gz",
-        filter=lambda rec: not any(a.startswith("<") for a in rec.ALT),
-        pl_filter=~genoray.exprs.is_symbolic,
+        filter=genoray.Filter(
+            record=lambda rec: not any(a.startswith("<") for a in rec.ALT),
+            expr=~genoray.exprs.is_symbolic,
+        ),
     )
 
 ``SparseVar.from_vcf`` / ``from_pgen`` inherit the source's filter, so the SVAR
@@ -108,10 +111,11 @@ not expandable into nucleotides — the bracket/colon/position bytes corrupt
 personalized DNA buffers in haplotype consumers (e.g. ``genvarloader``). Their
 :func:`symbolic_ilen` value is ``null`` (so they are also :data:`is_imprecise`).
 
-To drop breakends, pass ``pl_filter=~genoray.exprs.is_breakend``. To drop *all*
-un-expandable ALTs (symbolic + breakends) for haplotype consumers, combine::
+To drop breakends, use ``expr=~genoray.exprs.is_breakend`` in a
+:class:`genoray.Filter`. To drop *all* un-expandable ALTs (symbolic +
+breakends) for haplotype consumers, combine::
 
-    pl_filter=~genoray.exprs.is_symbolic & ~genoray.exprs.is_breakend
+    expr=~genoray.exprs.is_symbolic & ~genoray.exprs.is_breakend
 """
 
 
@@ -119,8 +123,8 @@ def _record_is_symbolic(alts: Iterable[str]) -> bool:
     """Record-level mirror of :data:`is_symbolic` for a cyvcf2 ``Variant.ALT``.
 
     True if any ALT allele is a symbolic allele (starts with ``<``). Used by the
-    CLI to build the cyvcf2 ``filter`` callable that must match the polars
-    ``pl_filter`` on the VCF path.
+    CLI to build the cyvcf2 record predicate half of a :class:`genoray.Filter`
+    that must match its ``expr`` half on the VCF path.
     """
     return any(a.startswith("<") for a in alts)
 
@@ -129,8 +133,8 @@ def _record_is_breakend(alts: Iterable[str]) -> bool:
     """Record-level mirror of :data:`is_breakend` for a cyvcf2 ``Variant.ALT``.
 
     True if any ALT allele is a breakend (matches :data:`_BND_PATTERN`). Reuses
-    the same regex as :data:`is_breakend` so the cyvcf2 ``filter`` callable and
-    the polars ``pl_filter`` cannot drift apart.
+    the same regex as :data:`is_breakend` so a :class:`genoray.Filter`'s
+    ``record`` and ``expr`` halves cannot drift apart.
     """
     return any(re.search(_BND_PATTERN, a) is not None for a in alts)
 
@@ -234,7 +238,8 @@ is_imprecise = pl.col("ILEN").list.eval(pl.element().is_null()).list.any()
 """True if any ALT allele's ILEN could not be precisely determined (an un-sizable
 symbolic allele — ``IMPRECISE``, missing ``SVLEN``/``END``, or an unsupported
 symbolic type). Such alleles carry ``null`` ILEN. Filter them out with
-``pl_filter=~genoray.exprs.is_imprecise`` to keep precise structural variants while
-dropping the rest; use ``~genoray.exprs.is_symbolic`` to drop *all* symbolic alleles
+``expr=~genoray.exprs.is_imprecise`` (in a :class:`genoray.Filter` for VCF, or
+directly for PGEN) to keep precise structural variants while dropping the
+rest; use ``~genoray.exprs.is_symbolic`` to drop *all* symbolic alleles
 (required for haplotype consumers such as genvarloader, which cannot expand any
 symbolic ALT)."""

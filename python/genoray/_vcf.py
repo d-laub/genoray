@@ -4,6 +4,7 @@ import re
 import warnings
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, TypeVar, cast, overload
 
@@ -98,6 +99,20 @@ class _Index:
         self.df = df
 
 
+@dataclass(frozen=True)
+class Filter:
+    """A cyvcf2 record predicate paired with its matching ``.gvi`` polars expression.
+
+    Both travel together so the record scan (``record``) and the index-level
+    filter (``expr``) can never diverge. ``record`` should return True for
+    variants to keep; ``expr`` must be an equivalent predicate over the index
+    columns (``CHROM``, ``POS``, ``REF``, ``ALT``, ``ILEN``).
+    """
+
+    record: Callable[[cyvcf2.Variant], bool]
+    expr: pl.Expr
+
+
 class VCF:
     """Create a VCF reader.
 
@@ -106,22 +121,22 @@ class VCF:
     path
         Path to the VCF file.
     filter
-        Function to filter variants. Should return True for variants to keep.
+        A :class:`Filter` bundling a cyvcf2 record predicate with its matching
+        ``.gvi`` polars expression, or ``None`` to disable filtering.
 
         .. note::
-            To avoid KeyErrors, this function needs to be tolerant to missing fields. For example, if you
+            The ``record`` predicate needs to be tolerant to missing fields. For example, if you
             access an INFO or FORMAT field, not all variants are guaranteed to have the same fields.
             The `cyvcf2.Variant <https://brentp.github.io/cyvcf2/docstrings.html#cyvcf2.cyvcf2.Variant>`_
             API provides the :meth:`.get <dict.get>` method on the INFO and FORMAT attributes. For example,
             :code:`lambda v: v.INFO.get("AF", 0) > 0.05` will skip any variants with an AF <= 0.05 or a
             missing AF by treating missing AFs as 0.
-    pl_filter
-        Polars expression to filter variants. Should return True for variants to keep. Must match the filter function.
 
         .. note::
-            This expression will be applied to the polars DataFrame returned by :meth:`get_record_info`.
-            It is not applied to the VCF file itself, so it will not be able to use the cyvcf2.Variant API.
-            For example, if you want to filter variants by INFO field, you can use:
+            The ``expr`` polars expression will be applied to the polars DataFrame returned by
+            :meth:`get_record_info`. It is not applied to the VCF file itself, so it will not be
+            able to use the cyvcf2.Variant API. For example, if you want to filter variants by INFO
+            field, you can use:
             :code:`pl.col("AF") > 0.05`
             but you can not use:
             :code:`lambda v: v.INFO.get("AF", 0) > 0.05`
@@ -146,10 +161,8 @@ class VCF:
     """Naturally sorted list of available contigs in the VCF file."""
     ploidy: int = 2
     """Ploidy of the VCF file. This is currently always 2 since we use cyvcf2."""
-    _filter: Callable[[cyvcf2.Variant], bool] | None
-    """Function to filter variants. Should return True for variants to keep."""
-    _pl_filter: pl.Expr | None
-    """Polars expression to filter variants. Should return True for variants to keep. Must match the filter function."""
+    _filter: Filter | None
+    """The record predicate + matching polars expression currently in effect."""
     phasing: bool
     """Whether to include phasing information on genotypes. If True, the ploidy axis will be length 3 such that
     phasing is indicated by the 3rd value: 0 = unphased, 1 = phased. If False, the ploidy axis will be length 2."""
@@ -178,21 +191,17 @@ class VCF:
     def __init__(
         self,
         path: str | Path,
-        filter: Callable[[cyvcf2.Variant], bool] | None = None,
-        pl_filter: pl.Expr | None = None,
+        filter: Filter | None = None,
         phasing: bool = False,
         dosage_field: str | None = None,
         progress: bool = False,
         with_gvi_index: bool = True,
     ):
-        self._check_filter_pair(filter, pl_filter)
-
         self.path = Path(path)
         if not self.path.exists():
             raise FileNotFoundError(f"VCF file {self.path} does not exist.")
 
         self._filter = filter
-        self._pl_filter = pl_filter
         self.phasing = phasing
         self.dosage_field = dosage_field
         self.progress = progress
@@ -215,30 +224,13 @@ class VCF:
     def _open(self) -> cyvcf2.VCF:
         return cyvcf2.VCF(self.path, samples=self._samples, lazy=True)
 
-    @staticmethod
-    def _check_filter_pair(
-        filter: Callable[[cyvcf2.Variant], bool] | None,
-        pl_filter: pl.Expr | None,
-    ) -> None:
-        """Enforce the both-or-neither invariant on a (filter, pl_filter) pair."""
-        if (filter is not None and pl_filter is None) or (
-            filter is None and pl_filter is not None
-        ):
-            raise ValueError(
-                "If a filter function is provided, a polars expression must also be provided, and vice versa."
-            )
-
     @property
-    def filter(
-        self,
-    ) -> tuple[Callable[[cyvcf2.Variant], bool] | None, pl.Expr | None]:
-        """The ``(filter, pl_filter)`` pair currently in effect.
+    def filter(self) -> Filter | None:
+        """The :class:`Filter` currently in effect, or ``None`` if no filter is set.
 
-        Returns the cyvcf2 record callable and its matching polars expression as
-        a tuple, mirroring what the setter accepts. Both elements are ``None``
-        when no filter is set. Assigning ``vcf.filter = vcf.filter`` round-trips.
+        Assigning ``vcf.filter = vcf.filter`` round-trips.
         """
-        return self._filter, self._pl_filter
+        return self._filter
 
     def _index_path(self) -> Path:
         """Path to the index file."""
@@ -249,31 +241,20 @@ class VCF:
             return base.with_suffix(".gvi.zst")
 
     @filter.setter
-    def filter(
-        self,
-        value: tuple[Callable[[cyvcf2.Variant], bool] | None, pl.Expr | None] | None,
-    ):
-        """Set the record filter and its matching polars expression together.
+    def filter(self, value: Filter | None):
+        """Set the record + index filter together, or clear it with ``None``.
 
-        Assign a ``(filter, pl_filter)`` pair, or ``None`` to clear both. The VCF
-        path requires both a cyvcf2 record callable (for the genotype scan) and a
-        matching polars expression (for the ``.gvi`` index); they must be set
-        together, mirroring the constructor's both-or-neither invariant. Changing
-        the filter invalidates the in-memory index.
+        Assign a :class:`Filter` bundling the cyvcf2 record predicate (for the
+        genotype scan) and the matching polars expression (for the ``.gvi``
+        index), or ``None`` to disable filtering. Changing the filter
+        invalidates the in-memory index.
         """
-        if value is None:
-            filter = pl_filter = None
-        elif isinstance(value, tuple) and len(value) == 2:
-            filter, pl_filter = value
-        else:
+        if value is not None and not isinstance(value, Filter):
             raise TypeError(
-                "VCF.filter must be assigned a (filter, pl_filter) tuple or None; "
-                f"got {type(value).__name__}."
+                f"VCF.filter must be a genoray.Filter or None; got {type(value).__name__}."
             )
-        self._check_filter_pair(filter, pl_filter)
         self._index = None
-        self._filter = filter
-        self._pl_filter = pl_filter
+        self._filter = value
 
     @property
     def nbytes(self) -> int:
@@ -409,7 +390,7 @@ class VCF:
             if self._filter is None:
                 out[i] = sum(1 for _ in self._vcf(coord))
             else:
-                out[i] = sum(self._filter(v) for v in self._vcf(coord))
+                out[i] = sum(self._filter.record(v) for v in self._vcf(coord))
 
         return out
 
@@ -630,7 +611,7 @@ class VCF:
 
         vcf = self._vcf(f"{c}:{int(start + 1)}-{end}")  # range string is 1-based
         if self._filter is not None:
-            vcf = filter(self._filter, vcf)
+            vcf = filter(self._filter.record, vcf)
         if self.progress and self._pbar is None:
             vcf = tqdm(vcf, desc="Reading VCF", unit=" variant")
         i = 0
@@ -935,8 +916,8 @@ class VCF:
             .with_columns(pl.col("CHROM").cast(pl.Enum(self.contigs)))
         )
 
-        if self._pl_filter is not None:
-            df = df.filter(self._pl_filter)
+        if self._filter is not None:
+            df = df.filter(self._filter.expr)
 
         if not lazy:
             df = df.collect()
@@ -1030,12 +1011,12 @@ class VCF:
         user_info_upper = {i.upper() for i in info} if info else set()
         extra_sv = [f for f in sv_info if f.upper() not in user_info_upper]
 
-        filt = self._pl_filter
-        self._pl_filter = None
+        filt = self._filter
+        self._filter = None
         try:
             index = self.get_record_info(fields=list(_fields), info=info, lazy=True)
         finally:
-            self._pl_filter = filt
+            self._filter = filt
 
         # Fetch SV helper columns directly (oxbow requires uppercase and returns a struct).
         # Both oxbow reads cover the identical full record set (no region, no filter, same
@@ -1128,8 +1109,8 @@ class VCF:
         if schema["ALT"] == pl.Utf8:
             index = index.with_columns(pl.col("ALT").str.split(","))
 
-        if self._pl_filter is not None:
-            index = index.filter(self._pl_filter)
+        if self._filter is not None:
+            index = index.filter(self._filter.expr)
 
         if "ILEN" not in schema:
             index = index.with_columns(ILEN=ILEN)
@@ -1156,7 +1137,7 @@ class VCF:
         mode: type[Genos8 | Genos16] | None = None,
     ) -> tuple[Genos8 | Genos16, int]:
         if self._filter is not None:
-            vcf = filter(self._filter, vcf)
+            vcf = filter(self._filter.record, vcf)
 
         if out is None:
             assert mode is not None
@@ -1237,7 +1218,7 @@ class VCF:
         self, vcf: cyvcf2.VCF, out: Dosages | None, dosage_field: str
     ) -> tuple[Dosages, int]:
         if self._filter is not None:
-            vcf = filter(self._filter, vcf)
+            vcf = filter(self._filter.record, vcf)
 
         if out is None:
             out_ls: list[NDArray[np.float32]] = []
@@ -1290,7 +1271,7 @@ class VCF:
         mode: type[Genos8Dosages | Genos16Dosages] | None = None,
     ) -> tuple[Genos8Dosages | Genos16Dosages, int]:
         if self._filter is not None:
-            vcf = filter(self._filter, vcf)
+            vcf = filter(self._filter.record, vcf)
 
         if out is None:
             assert mode is not None
@@ -1395,7 +1376,7 @@ class VCF:
             )
             for i, v in enumerate(self._vcf(coord)):
                 if v.start < ext_start or (
-                    self._filter is not None and not self._filter(v)
+                    self._filter is not None and not self._filter.record(v)
                 ):
                     continue
 

@@ -6,7 +6,7 @@ import numpy as np
 import polars as pl
 import pytest
 
-from genoray import PGEN, VCF, SparseVar, exprs
+from genoray import PGEN, VCF, Filter, SparseVar, exprs
 from genoray.exprs import is_breakend, is_imprecise, symbolic_ilen
 from tests import _oracle
 from tests.data.fixtures import FIXTURES as _FIXTURES
@@ -353,12 +353,11 @@ def test_filter_parity_symbolic_vs_imprecise(tmp_path):
     # ~is_symbolic drops the 6 <...> symbolic rows but KEEPS the breakend, which
     # is a distinct ALT class (is_symbolic only matches `<...>`).  This is the gap
     # the breakend row was added to lock: ~is_symbolic alone is NOT haplotype-safe.
-    # The `_index` is filtered solely by `pl_filter`; the `filter` callable is an
-    # inert no-op required by the VCF constructor's filter/pl_filter pairing.
+    # The `_index` is filtered solely by `Filter.expr`; `Filter.record` is an
+    # inert no-op required by the VCF constructor's Filter.
     vcf_all = VCF(
         str(path),
-        filter=lambda r: True,
-        pl_filter=~exprs.is_symbolic,
+        filter=Filter(record=lambda r: True, expr=~exprs.is_symbolic),
     )
     vcf_all._load_index()
     assert vcf_all._index.height == 1
@@ -367,19 +366,19 @@ def test_filter_parity_symbolic_vs_imprecise(tmp_path):
     # ~is_symbolic & ~is_breakend drops everything un-expandable -> empty index.
     vcf_hap = VCF(
         str(path),
-        filter=lambda r: True,
-        pl_filter=~exprs.is_symbolic & ~exprs.is_breakend,
+        filter=Filter(
+            record=lambda r: True, expr=~exprs.is_symbolic & ~exprs.is_breakend
+        ),
     )
     vcf_hap._load_index()
     assert vcf_hap._index.height == 0
 
     # ~is_imprecise keeps the 3 precise SVs, drops the 4 un-sizable ones
     # (IMPRECISE <DEL>, <CNV>, <INV>, and the breakend).
-    # pl_filter-only requires pairing with a no-op filter callable per the VCF API.
+    # expr-only filtering requires pairing with a no-op record callable per the Filter API.
     vcf_precise = VCF(
         str(path),
-        filter=lambda r: True,
-        pl_filter=~exprs.is_imprecise,
+        filter=Filter(record=lambda r: True, expr=~exprs.is_imprecise),
     )
     vcf_precise._load_index()
     assert vcf_precise._index.height == 3
@@ -454,8 +453,7 @@ def test_svar_inherits_symbolic_ilen(tmp_path):
     )
     vcf = VCF(
         str(path),
-        filter=lambda r: True,
-        pl_filter=~exprs.is_imprecise,
+        filter=Filter(record=lambda r: True, expr=~exprs.is_imprecise),
     )
     svar_path = tmp_path / "sym.svar"
     SparseVar.from_vcf(svar_path, vcf, max_mem="100MB", overwrite=True)
