@@ -12,6 +12,58 @@ use super::decode::{HapCalls, decode_keyref};
 use super::reader::ContigReader;
 use super::sidecar::{as_bytes, as_u32};
 
+/// CSR presence-bitmask accumulator: owns the `(bits, offsets)` pair, one row of
+/// `nbits` bits appended per hap. `offsets` starts `[0]`; after each `push_hap`,
+/// `offsets.last()` is the total bit count.
+pub(crate) struct PresenceBitWriter {
+    bits: Vec<u8>,
+    offsets: Vec<usize>,
+}
+
+impl PresenceBitWriter {
+    pub(crate) fn new() -> Self {
+        Self {
+            bits: Vec::new(),
+            offsets: vec![0],
+        }
+    }
+
+    /// Append one hap row of `nbits` bits; `set` is called with each in-row
+    /// index `k in 0..nbits` and must return whether bit `k` is present.
+    pub(crate) fn push_hap(&mut self, nbits: usize, mut set: impl FnMut(usize) -> bool) {
+        let base = *self.offsets.last().unwrap();
+        let need_bytes = (base + nbits).div_ceil(8);
+        if self.bits.len() < need_bytes {
+            self.bits.resize(need_bytes, 0);
+        }
+        for k in 0..nbits {
+            if set(k) {
+                crate::bits::set_bit(&mut self.bits, base + k);
+            }
+        }
+        self.offsets.push(base + nbits);
+    }
+
+    /// Append one hap row of `nbits` bits, filled in bulk: `fill(bits, base)`
+    /// receives the (resized) bit buffer and this row's starting bit offset
+    /// `base`, and is responsible for setting whichever bits are present
+    /// (e.g. via a `copy_bits` block copy). For the per-bit case use `push_hap`.
+    pub(crate) fn push_hap_bulk(&mut self, nbits: usize, fill: impl FnOnce(&mut [u8], usize)) {
+        let base = *self.offsets.last().unwrap();
+        let need_bytes = (base + nbits).div_ceil(8);
+        if self.bits.len() < need_bytes {
+            self.bits.resize(need_bytes, 0);
+        }
+        fill(&mut self.bits, base);
+        self.offsets.push(base + nbits);
+    }
+
+    /// Consume into the `(present, present_off)` fields the result structs expect.
+    pub(crate) fn into_parts(self) -> (Vec<u8>, Vec<usize>) {
+        (self.bits, self.offsets)
+    }
+}
+
 /// The batched, two-channel query spine result for one contig (M6.1). Carries
 /// undecoded uniform keys; consumers (gvl M6b / Python M6c) do the final
 /// `var_key ⋈ dense` merge and allele decode. `H = n_regions * n_samples *
@@ -79,8 +131,7 @@ pub fn overlap_batch(reader: &ContigReader, regions: &[(u32, u32)]) -> BatchResu
 
     let mut vk: Vec<KeyRef> = Vec::new();
     let mut vk_off: Vec<usize> = vec![0];
-    let mut dense_present: Vec<u8> = Vec::new();
-    let mut dense_present_off: Vec<usize> = vec![0];
+    let mut presence = PresenceBitWriter::new();
 
     for (r, &(qs, qe)) in regions.iter().enumerate() {
         let (ds, de) = ranges[r];
@@ -96,12 +147,8 @@ pub fn overlap_batch(reader: &ContigReader, regions: &[(u32, u32)]) -> BatchResu
 
                 // dense presence bits over dense[ds..de].
                 let nbits = de - ds;
-                let bit_base = *dense_present_off.last().unwrap();
-                let need_bytes = (bit_base + nbits).div_ceil(8);
-                if dense_present.len() < need_bytes {
-                    dense_present.resize(need_bytes, 0);
-                }
-                for (k, j) in (ds..de).enumerate() {
+                presence.push_hap(nbits, |k| {
+                    let j = ds + k;
                     let (is_indel, dcol) = dense.src[j];
                     let carried = if is_indel {
                         reader
@@ -116,14 +163,13 @@ pub fn overlap_batch(reader: &ContigReader, regions: &[(u32, u32)]) -> BatchResu
                             .expect("snp src implies table")
                             .carried(hap, dcol)
                     };
-                    if carried && dense.v_ends[j] > qs {
-                        bits::set_bit(&mut dense_present, bit_base + k);
-                    }
-                }
-                dense_present_off.push(bit_base + nbits);
+                    carried && dense.v_ends[j] > qs
+                });
             }
         }
     }
+
+    let (dense_present, dense_present_off) = presence.into_parts();
 
     BatchResult {
         n_regions,
@@ -248,8 +294,7 @@ pub fn gather_ranges(reader: &ContigReader, rb: &RangesBundle) -> BatchResult {
 
     let mut vk: Vec<KeyRef> = Vec::new();
     let mut vk_off: Vec<usize> = vec![0];
-    let mut dense_present: Vec<u8> = Vec::new();
-    let mut dense_present_off: Vec<usize> = vec![0];
+    let mut presence = PresenceBitWriter::new();
 
     let snp_positions = reader.vk_snp.positions();
     let snp_keys = as_bytes(&reader.vk_snp.keys);
@@ -298,12 +343,8 @@ pub fn gather_ranges(reader: &ContigReader, rb: &RangesBundle) -> BatchResult {
 
                 // --- dense presence bits (verbatim from overlap_batch) ---
                 let nbits = de - ds;
-                let bit_base = *dense_present_off.last().unwrap();
-                let need_bytes = (bit_base + nbits).div_ceil(8);
-                if dense_present.len() < need_bytes {
-                    dense_present.resize(need_bytes, 0);
-                }
-                for (k, j) in (ds..de).enumerate() {
+                presence.push_hap(nbits, |k| {
+                    let j = ds + k;
                     let (is_indel, dcol) = dense.src[j];
                     let carried = if is_indel {
                         reader
@@ -318,14 +359,13 @@ pub fn gather_ranges(reader: &ContigReader, rb: &RangesBundle) -> BatchResult {
                             .expect("snp src implies table")
                             .carried(hap, dcol)
                     };
-                    if carried && dense.v_ends[j] > qs {
-                        bits::set_bit(&mut dense_present, bit_base + k);
-                    }
-                }
-                dense_present_off.push(bit_base + nbits);
+                    carried && dense.v_ends[j] > qs
+                });
             }
         }
     }
+
+    let (dense_present, dense_present_off) = presence.into_parts();
 
     BatchResult {
         n_regions,
@@ -412,10 +452,8 @@ pub fn gather_haps_readbound(
 
     let mut vk: Vec<KeyRef> = Vec::new();
     let mut vk_off: Vec<usize> = vec![0];
-    let mut dense_snp_present: Vec<u8> = Vec::new();
-    let mut dense_snp_present_off: Vec<usize> = vec![0];
-    let mut dense_indel_present: Vec<u8> = Vec::new();
-    let mut dense_indel_present_off: Vec<usize> = vec![0];
+    let mut snp_presence = PresenceBitWriter::new();
+    let mut indel_presence = PresenceBitWriter::new();
 
     for q in 0..n_q {
         let qs = region_starts[q];
@@ -493,60 +531,44 @@ pub fn gather_haps_readbound(
             vk.extend_from_slice(&indel_run[ii..]);
             vk_off.push(vk.len());
 
-            // dense/snp presence over [ss..se).
+            // dense/snp presence over [ss..se). Columns [ss..c0_snp) fail the
+            // position filter (bit stays 0); [c0_snp..se) all pass, so their
+            // presence == this hap's genotype bits (hap-major, contiguous) — a
+            // single block copy, byte-identical to the per-column test.
             let nbits = se - ss;
-            let bit_base = *dense_snp_present_off.last().unwrap();
-            let need = (bit_base + nbits).div_ceil(8);
-            if dense_snp_present.len() < need {
-                dense_snp_present.resize(need, 0);
-            }
-            if let Some(d) = d_snp {
-                // Columns [ss..c0_snp) fail the position filter (dest stays 0);
-                // [c0_snp..se) all pass, so their presence == this hap's genotype
-                // bits (hap-major, so contiguous) — a single block copy. Provably
-                // byte-identical to the per-column `carried(hap,j) && qs<pos+1`
-                // test: matching cols set dest bit `bit_base + (j - ss)` iff the
-                // genotype bit `hap*n_dense + j` is set.
-                if c0_snp < se {
+            snp_presence.push_hap_bulk(nbits, |bits, base| {
+                if let Some(d) = d_snp
+                    && c0_snp < se
+                {
                     let gt = as_bytes(&d.genotypes);
                     bits::copy_bits(
-                        &mut dense_snp_present,
-                        bit_base + (c0_snp - ss),
+                        bits,
+                        base + (c0_snp - ss),
                         gt,
                         hap * d.n_dense_variants + c0_snp,
                         se - c0_snp,
                     );
                 }
-            }
-            dense_snp_present_off.push(bit_base + nbits);
+            });
 
             // dense/indel presence over [is_r..ie_r).
             let nbits = ie_r - is_r;
-            let bit_base = *dense_indel_present_off.last().unwrap();
-            let need = (bit_base + nbits).div_ceil(8);
-            if dense_indel_present.len() < need {
-                dense_indel_present.resize(need, 0);
-            }
-            if let Some(d) = d_indel {
-                let keys = as_u32(&d.keys);
-                // Paired slice iterator over `d_indel_pos`/`keys`
-                // (both plain `&[u32]`, same index space) instead of
-                // per-element `d_indel_pos[j]`/`keys[j]` bounds checks.
-                for (k, (&pos, &key)) in d_indel_pos[is_r..ie_r]
-                    .iter()
-                    .zip(&keys[is_r..ie_r])
-                    .enumerate()
-                {
-                    let j = is_r + k;
-                    let v_end = pos + 1 + rvk::deletion_len(key);
-                    if d.carried(hap, j) && qs < v_end {
-                        bits::set_bit(&mut dense_indel_present, bit_base + k);
+            indel_presence.push_hap(nbits, |k| {
+                let j = is_r + k;
+                match d_indel {
+                    Some(d) => {
+                        let keys = as_u32(&d.keys);
+                        let v_end = d_indel_pos[j] + 1 + rvk::deletion_len(keys[j]);
+                        d.carried(hap, j) && qs < v_end
                     }
+                    None => false,
                 }
-            }
-            dense_indel_present_off.push(bit_base + nbits);
+            });
         }
     }
+
+    let (dense_snp_present, dense_snp_present_off) = snp_presence.into_parts();
+    let (dense_indel_present, dense_indel_present_off) = indel_presence.into_parts();
 
     BatchResultSplit {
         n_regions: n_q,

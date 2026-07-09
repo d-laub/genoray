@@ -5,12 +5,11 @@
 //! renames these off the top-level `query::` path; this task moves them here
 //! verbatim and keeps the old paths alive via `query/mod.rs` re-exports.
 
-use crate::bits;
 use crate::rvk;
 use crate::spine::{self, KeyRef};
 
 use super::decode::{HapCalls, QueryResult, decode_keyref};
-use super::gather::{BatchResultSplit, RangesBundle};
+use super::gather::{BatchResultSplit, PresenceBitWriter, RangesBundle};
 use super::reader::ContigReader;
 use super::sidecar::{as_bytes, as_u32};
 
@@ -131,10 +130,8 @@ pub fn gather_ranges_readbound(reader: &ContigReader, rb: &RangesBundle) -> Batc
 
     let mut vk: Vec<KeyRef> = Vec::new();
     let mut vk_off: Vec<usize> = vec![0];
-    let mut dense_snp_present: Vec<u8> = Vec::new();
-    let mut dense_snp_present_off: Vec<usize> = vec![0];
-    let mut dense_indel_present: Vec<u8> = Vec::new();
-    let mut dense_indel_present_off: Vec<usize> = vec![0];
+    let mut snp_presence = PresenceBitWriter::new();
+    let mut indel_presence = PresenceBitWriter::new();
 
     for r in 0..n_regions {
         let qs = rb.region_starts[r];
@@ -176,41 +173,34 @@ pub fn gather_ranges_readbound(reader: &ContigReader, rb: &RangesBundle) -> Batc
 
                 // --- dense/snp presence bits over [ss..se) ---
                 let nbits = se - ss;
-                let bit_base = *dense_snp_present_off.last().unwrap();
-                let need = (bit_base + nbits).div_ceil(8);
-                if dense_snp_present.len() < need {
-                    dense_snp_present.resize(need, 0);
-                }
-                if let Some(d) = d_snp {
-                    for (k, j) in (ss..se).enumerate() {
+                snp_presence.push_hap(nbits, |k| {
+                    let j = ss + k;
+                    match d_snp {
                         // snp v_end = pos + 1; left-overlap re-check qs < v_end.
-                        if d.carried(hap, j) && qs < d_snp_pos[j] + 1 {
-                            bits::set_bit(&mut dense_snp_present, bit_base + k);
-                        }
+                        Some(d) => d.carried(hap, j) && qs < d_snp_pos[j] + 1,
+                        None => false,
                     }
-                }
-                dense_snp_present_off.push(bit_base + nbits);
+                });
 
                 // --- dense/indel presence bits over [is_r..ie_r) ---
                 let nbits = ie_r - is_r;
-                let bit_base = *dense_indel_present_off.last().unwrap();
-                let need = (bit_base + nbits).div_ceil(8);
-                if dense_indel_present.len() < need {
-                    dense_indel_present.resize(need, 0);
-                }
-                if let Some(d) = d_indel {
-                    let keys = as_u32(&d.keys);
-                    for (k, j) in (is_r..ie_r).enumerate() {
-                        let v_end = d_indel_pos[j] + 1 + rvk::deletion_len(keys[j]);
-                        if d.carried(hap, j) && qs < v_end {
-                            bits::set_bit(&mut dense_indel_present, bit_base + k);
+                indel_presence.push_hap(nbits, |k| {
+                    let j = is_r + k;
+                    match d_indel {
+                        Some(d) => {
+                            let keys = as_u32(&d.keys);
+                            let v_end = d_indel_pos[j] + 1 + rvk::deletion_len(keys[j]);
+                            d.carried(hap, j) && qs < v_end
                         }
+                        None => false,
                     }
-                }
-                dense_indel_present_off.push(bit_base + nbits);
+                });
             }
         }
     }
+
+    let (dense_snp_present, dense_snp_present_off) = snp_presence.into_parts();
+    let (dense_indel_present, dense_indel_present_off) = indel_presence.into_parts();
 
     BatchResultSplit {
         n_regions,
