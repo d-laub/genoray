@@ -30,20 +30,27 @@ impl PresenceBitWriter {
         }
     }
 
-    /// Append one hap row of `nbits` bits; `set` is called with each in-row
-    /// index `k in 0..nbits` and must return whether bit `k` is present.
-    pub(crate) fn push_hap(&mut self, nbits: usize, mut set: impl FnMut(usize) -> bool) {
+    /// Reserve one hap row of `nbits` bits: grow `bits` to fit, record the new
+    /// end offset, and return this row's starting bit offset.
+    fn reserve_row(&mut self, nbits: usize) -> usize {
         let base = *self.offsets.last().unwrap();
         let need_bytes = (base + nbits).div_ceil(8);
         if self.bits.len() < need_bytes {
             self.bits.resize(need_bytes, 0);
         }
+        self.offsets.push(base + nbits);
+        base
+    }
+
+    /// Append one hap row of `nbits` bits; `set` is called with each in-row
+    /// index `k in 0..nbits` and must return whether bit `k` is present.
+    pub(crate) fn push_hap(&mut self, nbits: usize, mut set: impl FnMut(usize) -> bool) {
+        let base = self.reserve_row(nbits);
         for k in 0..nbits {
             if set(k) {
-                crate::bits::set_bit(&mut self.bits, base + k);
+                bits::set_bit(&mut self.bits, base + k);
             }
         }
-        self.offsets.push(base + nbits);
     }
 
     /// Append one hap row of `nbits` bits, filled in bulk: `fill(bits, base)`
@@ -51,13 +58,8 @@ impl PresenceBitWriter {
     /// `base`, and is responsible for setting whichever bits are present
     /// (e.g. via a `copy_bits` block copy). For the per-bit case use `push_hap`.
     pub(crate) fn push_hap_bulk(&mut self, nbits: usize, fill: impl FnOnce(&mut [u8], usize)) {
-        let base = *self.offsets.last().unwrap();
-        let need_bytes = (base + nbits).div_ceil(8);
-        if self.bits.len() < need_bytes {
-            self.bits.resize(need_bytes, 0);
-        }
+        let base = self.reserve_row(nbits);
         fill(&mut self.bits, base);
-        self.offsets.push(base + nbits);
     }
 
     /// Consume into the `(present, present_off)` fields the result structs expect.
