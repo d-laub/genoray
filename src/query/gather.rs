@@ -114,6 +114,50 @@ pub struct BatchResultSplit {
     pub dense_indel_present_off: Vec<usize>,
 }
 
+/// The var_key channel for one flat hap-column over one region window: SNP and
+/// indel packed slices decoded to uniform `KeyRef`s and merged position-sorted.
+/// This is the shared body the batch/ranges/read-bound gathers previously
+/// hand-inlined. `vk_slice` already performs the union+merge for a column; this
+/// wrapper is the seam the read-bound path replays from precomputed ranges.
+pub(crate) fn gather_vk(
+    reader: &ContigReader,
+    vk_snp_range: (usize, usize),
+    vk_indel_range: (usize, usize),
+    q_start: u32,
+) -> Vec<KeyRef> {
+    let snp_positions = reader.vk_snp.positions();
+    let snp_keys = as_bytes(&reader.vk_snp.keys);
+    let indel_positions = reader.vk_indel.positions();
+    let indel_keys = as_u32(&reader.vk_indel.keys);
+
+    let (ss, se) = vk_snp_range;
+    let mut snp_run: Vec<KeyRef> = Vec::new();
+    for (j, &pos) in snp_positions.iter().enumerate().take(se).skip(ss) {
+        if q_start < pos + 1 {
+            // snp v_end = pos + 1
+            snp_run.push(KeyRef {
+                position: pos,
+                key: rvk::snp_code_to_key(rvk::unpack_snp_key_at(snp_keys, j)),
+            });
+        }
+    }
+
+    let (is_, ie_) = vk_indel_range;
+    let mut indel_run: Vec<KeyRef> = Vec::new();
+    for j in is_..ie_ {
+        let pos = indel_positions[j];
+        let v_end = pos + 1 + rvk::deletion_len(indel_keys[j]);
+        if q_start < v_end {
+            indel_run.push(KeyRef {
+                position: pos,
+                key: indel_keys[j],
+            });
+        }
+    }
+
+    spine::merge_keys(vec![snp_run, indel_run])
+}
+
 /// Batched multi-region × whole-cohort query. `regions` is a list of half-open
 /// `[q_start, q_end)`. Single-threaded; `rayon` over the H hap-slices and dense-
 /// window subsetting are M6b concerns (see the design spec's open questions).
@@ -296,11 +340,6 @@ pub fn gather_ranges(reader: &ContigReader, rb: &RangesBundle) -> BatchResult {
     let mut vk_off: Vec<usize> = vec![0];
     let mut presence = PresenceBitWriter::new();
 
-    let snp_positions = reader.vk_snp.positions();
-    let snp_keys = as_bytes(&reader.vk_snp.keys);
-    let indel_positions = reader.vk_indel.positions();
-    let indel_keys = as_u32(&reader.vk_indel.keys);
-
     for r in 0..n_regions {
         let qs = rb.region_starts[r];
         let (ds, de) = rb.dense_range[r];
@@ -312,32 +351,7 @@ pub fn gather_ranges(reader: &ContigReader, rb: &RangesBundle) -> BatchResult {
                 let row = r * hpr + si * ploidy + p;
 
                 // --- var_key gather (no search) ---
-                let (ss, se) = rb.vk_snp_range[row];
-                let mut snp_run: Vec<KeyRef> = Vec::new();
-                for (j, &pos) in snp_positions.iter().enumerate().take(se).skip(ss) {
-                    if qs < pos + 1 {
-                        // snp v_end = pos + 1
-                        snp_run.push(KeyRef {
-                            position: pos,
-                            key: rvk::snp_code_to_key(rvk::unpack_snp_key_at(snp_keys, j)),
-                        });
-                    }
-                }
-
-                let (is_, ie_) = rb.vk_indel_range[row];
-                let mut indel_run: Vec<KeyRef> = Vec::new();
-                for j in is_..ie_ {
-                    let pos = indel_positions[j];
-                    let v_end = pos + 1 + rvk::deletion_len(indel_keys[j]);
-                    if qs < v_end {
-                        indel_run.push(KeyRef {
-                            position: pos,
-                            key: indel_keys[j],
-                        });
-                    }
-                }
-
-                let merged = spine::merge_keys(vec![snp_run, indel_run]);
+                let merged = gather_vk(reader, rb.vk_snp_range[row], rb.vk_indel_range[row], qs);
                 vk.extend_from_slice(&merged);
                 vk_off.push(vk.len());
 
@@ -512,11 +526,19 @@ pub fn gather_haps_readbound(
             // scan and only switches to run 1 (indel_run) when
             // `!(snp_run[h0].position <= indel_run[h1].position)`, i.e.
             // exactly the `<=` two-pointer comparison below (ties still
-            // favor snp_run). Per-hap this was allocating three separate
-            // buffers every call — the outer `vec![snp_run, indel_run]`,
-            // `merge_keys`'s internal `heads`, and its `out` — plus an
-            // extra copy via `extend_from_slice(&merged)`; merging
-            // straight into `vk` removes all of that allocation churn.
+            // favor snp_run).
+            //
+            // Task 3 (gather_vk extraction) benched routing this hap-major
+            // loop through the shared `gather_vk` helper (which rebuilds
+            // `snp_run`/`indel_run` via `merge_keys` per call, like
+            // `gather_ranges`/`gather_ranges_readbound` do). The readbound
+            // test fixtures are too small (single-digit variant counts) for
+            // a stable wall-clock signal, so the decision was made on
+            // algorithmic grounds instead: unifying would reintroduce the
+            // slicing/allocation costs this block was written to remove
+            // (re-walking `snp_positions[0..vs]` per hap via `skip`, plus
+            // three extra allocations per hap from `merge_keys`'s
+            // `vec![...]`/`heads`/`out`). This tuned merge is retained.
             let (mut si, mut ii) = (0usize, 0usize);
             while si < snp_run.len() && ii < indel_run.len() {
                 if snp_run[si].position <= indel_run[ii].position {

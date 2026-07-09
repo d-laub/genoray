@@ -9,7 +9,7 @@ use crate::rvk;
 use crate::spine::{self, KeyRef};
 
 use super::decode::{HapCalls, QueryResult, decode_keyref};
-use super::gather::{BatchResultSplit, PresenceBitWriter, RangesBundle};
+use super::gather::{BatchResultSplit, PresenceBitWriter, RangesBundle, gather_vk};
 use super::reader::ContigReader;
 use super::sidecar::{as_bytes, as_u32};
 
@@ -84,11 +84,6 @@ pub fn gather_ranges_readbound(reader: &ContigReader, rb: &RangesBundle) -> Batc
     let n_regions = rb.n_regions;
     let hpr = n_samples * ploidy;
 
-    let snp_positions = reader.vk_snp.positions();
-    let snp_keys = as_bytes(&reader.vk_snp.keys);
-    let indel_positions = reader.vk_indel.positions();
-    let indel_keys = as_u32(&reader.vk_indel.keys);
-
     // Dense class tables (may be absent).
     let d_snp = reader.dense_snp.as_ref();
     let d_indel = reader.dense_indel.as_ref();
@@ -144,30 +139,8 @@ pub fn gather_ranges_readbound(reader: &ContigReader, rb: &RangesBundle) -> Batc
                 let hap = col;
                 let row = r * hpr + si * ploidy + p;
 
-                // --- var_key gather (identical to gather_ranges) ---
-                let (vs, ve) = rb.vk_snp_range[row];
-                let mut snp_run: Vec<KeyRef> = Vec::new();
-                for (j, &pos) in snp_positions.iter().enumerate().take(ve).skip(vs) {
-                    if qs < pos + 1 {
-                        snp_run.push(KeyRef {
-                            position: pos,
-                            key: rvk::snp_code_to_key(rvk::unpack_snp_key_at(snp_keys, j)),
-                        });
-                    }
-                }
-                let (vis, vie) = rb.vk_indel_range[row];
-                let mut indel_run: Vec<KeyRef> = Vec::new();
-                for j in vis..vie {
-                    let pos = indel_positions[j];
-                    let v_end = pos + 1 + rvk::deletion_len(indel_keys[j]);
-                    if qs < v_end {
-                        indel_run.push(KeyRef {
-                            position: pos,
-                            key: indel_keys[j],
-                        });
-                    }
-                }
-                let merged = spine::merge_keys(vec![snp_run, indel_run]);
+                // --- var_key gather (via gather_vk, identical to gather_ranges) ---
+                let merged = gather_vk(reader, rb.vk_snp_range[row], rb.vk_indel_range[row], qs);
                 vk.extend_from_slice(&merged);
                 vk_off.push(vk.len());
 
