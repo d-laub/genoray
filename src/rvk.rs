@@ -130,6 +130,14 @@ pub fn dense2sparse_vk(chunk: &DenseChunk, bank: &mut LongAlleleTableWriter) -> 
     let mut routes: Vec<Route> = Vec::with_capacity(v_variants);
 
     for v in 0..v_variants {
+        // SAFETY: `v` ranges over `0..v_variants` and `chunk.ilens.len() ==
+        // v_variants` (one entry per variant), so `ilens[v]` is in bounds.
+        // `chunk.alt_offsets` is a CSR offset array of length `v_variants + 1`
+        // (one extra sentinel past the last variant), so both `alt_offsets[v]`
+        // and `alt_offsets[v + 1]` are in bounds for `v < v_variants`. By CSR
+        // construction those two offsets are monotonically non-decreasing and
+        // bound exactly the ALT bytes for variant `v` within `chunk.alt`, so
+        // `alt[start_idx..end_idx]` is a valid sub-slice.
         let ilen = unsafe { *chunk.ilens.get_unchecked(v) };
         let start_idx = unsafe { *chunk.alt_offsets.get_unchecked(v) } as usize;
         let end_idx = unsafe { *chunk.alt_offsets.get_unchecked(v + 1) } as usize;
@@ -147,6 +155,9 @@ pub fn dense2sparse_vk(chunk: &DenseChunk, bank: &mut LongAlleleTableWriter) -> 
             Representation::Dense => {
                 let sub = dense.get_mut(dclass);
                 let col = sub.n_dense_variants as u32;
+                // SAFETY: `v` is the same loop index bound by `0..v_variants`
+                // above, and `chunk.pos.len() == v_variants`, so `pos[v]` is
+                // in bounds.
                 let pos = unsafe { *chunk.pos.get_unchecked(v) };
                 sub.positions.push(pos);
                 match vk {
@@ -184,10 +195,22 @@ pub fn dense2sparse_vk(chunk: &DenseChunk, bank: &mut LongAlleleTableWriter) -> 
 
             for v in 0..v_variants {
                 let flat_idx = (v * stride) + base_idx;
+                // SAFETY: `stride == columns == num_samples * ploidy` and
+                // `base_idx = s * ploidy + p < columns`, so for `v <
+                // v_variants` we have `flat_idx < v_variants * columns ==
+                // total_bits` (the `BitGrid3`'s (V, S, P) shape product).
+                // `words.len() == total_bits.div_ceil(64)`, so `flat_idx >>
+                // 6` is a valid word index.
                 let word = unsafe { *words.get_unchecked(flat_idx >> 6) };
                 if (word >> (flat_idx & 63)) & 1 == 0 {
                     continue;
                 }
+                // SAFETY: `routes` was built by the pre-pass loop above,
+                // which pushes exactly one `Route` per `v in 0..v_variants`,
+                // so `routes.len() == v_variants` and `routes[v]` is in
+                // bounds here for the same `v`. `chunk.pos.len() ==
+                // v_variants` (see the dense-branch comment above), so
+                // `pos[v]` is likewise in bounds.
                 match unsafe { routes.get_unchecked(v) } {
                     Route::VarKey(vk) => {
                         let pos = unsafe { *chunk.pos.get_unchecked(v) };
