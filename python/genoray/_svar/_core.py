@@ -6,7 +6,6 @@ from collections.abc import Iterable, Sequence
 from functools import cached_property
 from os import PathLike
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from typing import Any, Generic, Literal, TypeVar, cast, overload
 
 import awkward as ak
@@ -15,7 +14,6 @@ import numpy as np
 import polars as pl
 from awkward.contents import Content, NumpyArray
 from hirola import HashTable
-from joblib_progress import joblib_progress
 from loguru import logger
 from numpy.typing import ArrayLike, NDArray
 from polars._typing import IntoExpr
@@ -27,18 +25,16 @@ from .._mutcat import MUTCAT_VERSION
 from .._pgen import PGEN
 from .._reference import Reference
 from .._types import DOSAGE_TYPE, POS_MAX, POS_TYPE, V_IDX_TYPE
-from .._utils import ContigNormalizer, atomic_write_dir, parse_memory
+from .._utils import ContigNormalizer, atomic_write_dir
 from .._var_ranges import var_ranges
 from .._vcf import VCF
 from ..exprs import ILEN
 from ._annotate import SparseVarAnnotateMixin
-from ._convert import _process_contig_pgen, _process_contig_vcf, _concat_data
+from ._convert import _process_contig_pgen, _process_contig_vcf, _write_from_reader
 from ._io import (
     _build_working_index,
     _open_fmt,
     _open_genos,
-    _subset_var_idxs_and_recompute_af,
-    _write_index_from_working,
 )
 from ._kernels import (
     _find_starts_ends,
@@ -701,87 +697,49 @@ class SparseVar(SparseVarAnnotateMixin, Generic[_SRT]):
 
         out_ploidy = 1 if haploid else vcf.ploidy
 
-        with atomic_write_dir(out) as staging:
-            with open(staging / "metadata.json", "w") as f:
-                json_str = SparseVarMetadata(
-                    version=CURRENT_VERSION,
-                    contigs=contigs,
-                    samples=caller_samples,
-                    ploidy=out_ploidy,
-                    fields={"dosages": np.dtype(DOSAGE_TYPE).name}
-                    if with_dosages
-                    else {},
-                ).model_dump_json()
-                f.write(json_str)
+        metadata_json = SparseVarMetadata(
+            version=CURRENT_VERSION,
+            contigs=contigs,
+            samples=caller_samples,
+            ploidy=out_ploidy,
+            fields={"dosages": np.dtype(DOSAGE_TYPE).name} if with_dosages else {},
+        ).model_dump_json()
 
-            subsetting_samples = samples is not None
-            # When NOT subsetting samples, write the (region-restricted) index up front.
-            if not subsetting_samples:
-                _write_index_from_working(
-                    working_df,
-                    kept_rows,
-                    cls._index_path(staging),
-                    alt_is_utf8,
-                    ilen_added,
+        def make_tasks(chunk_dir: Path, job_mem: int) -> list[Any]:
+            tasks: list[Any] = []
+            for chunk_idx, c in enumerate(contigs):
+                task = joblib.delayed(_process_contig_vcf)(
+                    vcf.path,
+                    dosage_field=vcf.dosage_field if with_dosages else None,
+                    max_mem=job_mem,
+                    contig=c,
+                    chunk_dir=chunk_dir,
+                    chunk_idx=chunk_idx,
+                    cyvcf2_filter=vcf._filter,
+                    pl_filter=vcf._pl_filter,
+                    caller_samples=None if samples is None else caller_samples,
+                    keep_local=keep_local_by_contig.get(c),
+                    haploid=haploid,
                 )
+                tasks.append(task)
+            return tasks
 
-            max_mem = parse_memory(max_mem)
-            n_out = len(caller_samples)
-            effective_n_jobs = joblib.cpu_count() if n_jobs == -1 else n_jobs
-            effective_n_jobs = min(effective_n_jobs, len(contigs))
-            job_mem = max_mem // effective_n_jobs
-
-            with TemporaryDirectory(dir=out.parent) as chunk_dir:
-                chunk_dir = Path(chunk_dir)
-
-                shape = (n_out, out_ploidy)
-                tasks = []
-                for chunk_idx, c in enumerate(contigs):
-                    task = joblib.delayed(_process_contig_vcf)(
-                        vcf.path,
-                        dosage_field=vcf.dosage_field if with_dosages else None,
-                        max_mem=job_mem,
-                        contig=c,
-                        chunk_dir=chunk_dir,
-                        chunk_idx=chunk_idx,
-                        cyvcf2_filter=vcf._filter,
-                        pl_filter=vcf._pl_filter,
-                        caller_samples=None if samples is None else caller_samples,
-                        keep_local=keep_local_by_contig.get(c),
-                        haploid=haploid,
-                    )
-                    tasks.append(task)
-
-                with (
-                    joblib_progress(
-                        description=f"Processing contigs using {effective_n_jobs} jobs",
-                        total=len(tasks),
-                    ),
-                    joblib.Parallel(n_jobs=effective_n_jobs) as parallel,
-                ):
-                    results: list[tuple[int, int]] = list(parallel(tasks))  # type: ignore
-
-                logger.info("Concatenating intermediate chunks")
-                _concat_data(
-                    staging, chunk_dir, shape, results, with_dosages=with_dosages
-                )
-
-                if subsetting_samples:
-                    survivors, af = _subset_var_idxs_and_recompute_af(
-                        staging,
-                        n_total=len(kept_rows),
-                        n_out=n_out,
-                        ploidy=out_ploidy,
-                        with_dosages=with_dosages,
-                    )
-                    _write_index_from_working(
-                        working_df,
-                        kept_rows[survivors],
-                        cls._index_path(staging),
-                        alt_is_utf8,
-                        ilen_added,
-                        af=af,
-                    )
+        return _write_from_reader(
+            out=out,
+            contigs=contigs,
+            caller_samples=caller_samples,
+            out_ploidy=out_ploidy,
+            with_dosages=with_dosages,
+            metadata_json=metadata_json,
+            working_df=working_df,
+            kept_rows=kept_rows,
+            alt_is_utf8=alt_is_utf8,
+            ilen_added=ilen_added,
+            subsetting_samples=samples is not None,
+            max_mem=max_mem,
+            n_jobs=n_jobs,
+            make_tasks=make_tasks,
+        )
 
     @classmethod
     def from_pgen(
@@ -863,7 +821,6 @@ class SparseVar(SparseVarAnnotateMixin, Generic[_SRT]):
             if not caller_samples:
                 raise ValueError("from_pgen: `samples` selected no samples")
             sample_subset = pgen._s2i.get(np.asarray(caller_samples)).astype(np.uint32)
-        n_out = len(caller_samples)
 
         # --- working index (filtered) for region resolution + output index ---
         working_df, alt_is_utf8, ilen_added = _build_working_index(
@@ -910,103 +867,72 @@ class SparseVar(SparseVarAnnotateMixin, Generic[_SRT]):
 
         out_ploidy = 1 if haploid else pgen.ploidy
 
-        with atomic_write_dir(out) as staging:
-            with open(staging / "metadata.json", "w") as f:
-                json_str = SparseVarMetadata(
-                    version=CURRENT_VERSION,
-                    contigs=contigs,
-                    samples=caller_samples,
-                    ploidy=out_ploidy,
-                    fields={"dosages": np.dtype(DOSAGE_TYPE).name}
-                    if with_dosages
-                    else {},
-                ).model_dump_json()
-                f.write(json_str)
+        metadata_json = SparseVarMetadata(
+            version=CURRENT_VERSION,
+            contigs=contigs,
+            samples=caller_samples,
+            ploidy=out_ploidy,
+            fields={"dosages": np.dtype(DOSAGE_TYPE).name} if with_dosages else {},
+        ).model_dump_json()
 
+        def pre_run_check() -> None:
+            # Placement preserved: fires inside the staging block, right after the
+            # metadata write and before any index/chunk work.
             if with_dosages and pgen._sei is None:
                 raise ValueError("PGEN must be bi-allelic with filters applied")
 
-            subsetting_samples = samples is not None
-            # (mirrors from_vcf; keep in sync) metadata written + no-subset index path
-            if not subsetting_samples:
-                _write_index_from_working(
-                    working_df,
-                    kept_rows,
-                    cls._index_path(staging),
-                    alt_is_utf8,
-                    ilen_added,
-                )
-
-            max_mem = parse_memory(max_mem)
-            effective_n_jobs = joblib.cpu_count() if n_jobs == -1 else n_jobs
-            effective_n_jobs = min(effective_n_jobs, len(contigs))
-            job_mem = max_mem // effective_n_jobs
+        def make_tasks(chunk_dir: Path, job_mem: int) -> list[Any]:
             mem_per_var = pgen._mem_per_variant(
                 pgen.GenosDosages if with_dosages else pgen.Genos  # type: ignore
             )
+            tasks: list[Any] = []
+            for c in contigs:
+                keep_idxs = keep_by_contig.get(c)
+                if keep_idxs is None or len(keep_idxs) == 0:
+                    continue
 
-            shape = (n_out, out_ploidy)
-            with TemporaryDirectory(dir=out.parent) as contig_dir:
-                contig_dir = Path(contig_dir)
-
-                tasks: list[Any] = []
-                for c in contigs:
-                    keep_idxs = keep_by_contig.get(c)
-                    if keep_idxs is None or len(keep_idxs) == 0:
-                        continue
-
-                    task = joblib.delayed(_process_contig_pgen)(
-                        geno_path=pgen.geno_path,
-                        dosage_path=pgen.dosage_path if with_dosages else None,
-                        max_mem=job_mem,
-                        keep_idxs=keep_idxs,
-                        mem_per_var=mem_per_var,
-                        n_samples=pgen.n_samples,
-                        ploidy=pgen.ploidy,
-                        chunk_dir=contig_dir,
-                        chunk_idx=len(tasks),
-                        sample_subset=sample_subset,
-                        haploid=haploid,
-                    )
-                    tasks.append(task)
-
-                pgen._free_index()
-                # PgenReaders can be multi-GB allocations, close them to free memory
-                pgen._geno_pgen.close()
-                if pgen.dosage_path is not None:
-                    pgen._dose_pgen.close()
-
-                with (
-                    joblib_progress(
-                        description=f"Processing contigs using {effective_n_jobs} jobs",
-                        total=len(tasks),
-                    ),
-                    joblib.Parallel(n_jobs=effective_n_jobs) as parallel,
-                ):
-                    results: list[tuple[int, int]] = list(parallel(tasks))  # type: ignore
-
-                logger.info("Concatenating intermediate chunks")
-                _concat_data(
-                    staging, contig_dir, shape, results, with_dosages=with_dosages
+                task = joblib.delayed(_process_contig_pgen)(
+                    geno_path=pgen.geno_path,
+                    dosage_path=pgen.dosage_path if with_dosages else None,
+                    max_mem=job_mem,
+                    keep_idxs=keep_idxs,
+                    mem_per_var=mem_per_var,
+                    n_samples=pgen.n_samples,
+                    ploidy=pgen.ploidy,
+                    chunk_dir=chunk_dir,
+                    chunk_idx=len(tasks),
+                    sample_subset=sample_subset,
+                    haploid=haploid,
                 )
+                tasks.append(task)
 
-                # (mirrors from_vcf; keep in sync) MAC-drop + subset-sample index finalize
-                if subsetting_samples:
-                    survivors, af = _subset_var_idxs_and_recompute_af(
-                        staging,
-                        n_total=len(kept_rows),
-                        n_out=n_out,
-                        ploidy=out_ploidy,
-                        with_dosages=with_dosages,
-                    )
-                    _write_index_from_working(
-                        working_df,
-                        kept_rows[survivors],
-                        cls._index_path(staging),
-                        alt_is_utf8,
-                        ilen_added,
-                        af=af,
-                    )
+            # Free parent-process memory after task construction but before the
+            # parallel run (workers re-open the readers themselves).
+            pgen._free_index()
+            # PgenReaders can be multi-GB allocations, close them to free memory
+            pgen._geno_pgen.close()
+            if pgen.dosage_path is not None:
+                pgen._dose_pgen.close()
+
+            return tasks
+
+        return _write_from_reader(
+            out=out,
+            contigs=contigs,
+            caller_samples=caller_samples,
+            out_ploidy=out_ploidy,
+            with_dosages=with_dosages,
+            metadata_json=metadata_json,
+            working_df=working_df,
+            kept_rows=kept_rows,
+            alt_is_utf8=alt_is_utf8,
+            ilen_added=ilen_added,
+            subsetting_samples=samples is not None,
+            max_mem=max_mem,
+            n_jobs=n_jobs,
+            make_tasks=make_tasks,
+            pre_run_check=pre_run_check,
+        )
 
     @classmethod
     def _index_path(cls, root: Path):

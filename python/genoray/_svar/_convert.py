@@ -3,19 +3,30 @@ from __future__ import annotations
 import shutil
 from collections.abc import Callable
 from pathlib import Path
-from typing import overload
+from tempfile import TemporaryDirectory
+from typing import Any, overload
 
+import joblib
 import numpy as np
 import polars as pl
+from joblib_progress import joblib_progress
+from loguru import logger
 from numpy.typing import NDArray
 from pgenlib import PgenReader
 from rich.progress import MofNCompleteColumn, Progress
 from seqpro.rag import Ragged, lengths_to_offsets
 
 from .._types import DOSAGE_TYPE, POS_TYPE, V_IDX_TYPE
-from .._utils import format_memory
+from .._utils import atomic_write_dir, format_memory, parse_memory
 from .._vcf import VCF
-from ._io import _open_fmt, _open_genos, _write_dosages, _write_genos
+from ._io import (
+    _open_fmt,
+    _open_genos,
+    _subset_var_idxs_and_recompute_af,
+    _write_dosages,
+    _write_genos,
+    _write_index_from_working,
+)
 from ._kernels import (
     _copy_chunk_dosages_helper,
     _copy_chunk_helper,
@@ -457,3 +468,106 @@ def _concat_data(
         dosages_memmap.flush()
 
     pbar.stop()
+
+
+def _write_from_reader(
+    *,
+    out: Path,
+    contigs: list[str],
+    caller_samples: list[str],
+    out_ploidy: int,
+    with_dosages: bool,
+    metadata_json: str,
+    working_df: pl.DataFrame,
+    kept_rows: NDArray[V_IDX_TYPE],
+    alt_is_utf8: bool,
+    ilen_added: bool,
+    subsetting_samples: bool,
+    max_mem: int | str,
+    n_jobs: int,
+    make_tasks: Callable[[Path, int], list[Any]],
+    pre_run_check: Callable[[], None] | None = None,
+) -> None:
+    """Shared writer spine for :meth:`SparseVar.from_vcf`/:meth:`SparseVar.from_pgen`.
+
+    Everything that differs between the two readers (dosage-field validation,
+    reader index init, sample resolution, working-index construction,
+    region/kept-row resolution, and per-contig keep-index bucketing) is done by
+    the caller *before* invoking this function. This function only holds the
+    parts that are byte-for-byte identical between the two writers: the atomic
+    staging directory, the metadata write, the optional up-front index write
+    (when not subsetting samples), job-size resolution, the parallel per-contig
+    run, chunk concatenation, and the sample-subsetting MAC-drop finalize.
+
+    Parameters
+    ----------
+    make_tasks
+        ``(chunk_dir, job_mem) -> list[joblib.delayed task]``. Builds the
+        per-contig joblib tasks (wrapping ``_process_contig_vcf`` /
+        ``_process_contig_pgen``). For PGEN this callback is also responsible
+        for freeing/closing the source reader right before returning, so that
+        happens after task construction but before ``joblib.Parallel`` runs —
+        matching ``from_pgen``'s original memory-freeing order exactly.
+    pre_run_check
+        Optional callback invoked inside the ``atomic_write_dir`` staging block
+        immediately after the metadata write. This is where ``from_pgen``'s
+        ``with_dosages and pgen._sei is None`` check lived; its placement
+        (inside staging, right after the metadata write) is preserved exactly.
+    """
+    with atomic_write_dir(out) as staging:
+        with open(staging / "metadata.json", "w") as f:
+            f.write(metadata_json)
+
+        if pre_run_check is not None:
+            pre_run_check()
+
+        # When NOT subsetting samples, write the (region-restricted) index up front.
+        if not subsetting_samples:
+            _write_index_from_working(
+                working_df,
+                kept_rows,
+                staging / "index.arrow",
+                alt_is_utf8,
+                ilen_added,
+            )
+
+        max_mem_parsed = parse_memory(max_mem)
+        n_out = len(caller_samples)
+        effective_n_jobs = joblib.cpu_count() if n_jobs == -1 else n_jobs
+        effective_n_jobs = min(effective_n_jobs, len(contigs))
+        job_mem = max_mem_parsed // effective_n_jobs
+
+        shape = (n_out, out_ploidy)
+        with TemporaryDirectory(dir=out.parent) as chunk_dir:
+            chunk_dir = Path(chunk_dir)
+
+            tasks = make_tasks(chunk_dir, job_mem)
+
+            with (
+                joblib_progress(
+                    description=f"Processing contigs using {effective_n_jobs} jobs",
+                    total=len(tasks),
+                ),
+                joblib.Parallel(n_jobs=effective_n_jobs) as parallel,
+            ):
+                results: list[tuple[int, int]] = list(parallel(tasks))  # type: ignore
+
+            logger.info("Concatenating intermediate chunks")
+            _concat_data(staging, chunk_dir, shape, results, with_dosages=with_dosages)
+
+            if subsetting_samples:
+                survivors, af = _subset_var_idxs_and_recompute_af(
+                    staging,
+                    n_total=len(kept_rows),
+                    n_out=n_out,
+                    ploidy=out_ploidy,
+                    with_dosages=with_dosages,
+                )
+                _write_index_from_working(
+                    working_df,
+                    kept_rows[survivors],
+                    staging / "index.arrow",
+                    alt_is_utf8,
+                    ilen_added,
+                    af=af,
+                )

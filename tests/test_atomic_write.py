@@ -167,13 +167,13 @@ def test_from_vcf_atomic_no_leftover(tmp_path: Path):
 
 
 def test_from_vcf_atomic_preserves_existing_on_failure(tmp_path: Path, monkeypatch):
-    import genoray._svar._core as S
+    import genoray._svar._convert as C
 
     out = tmp_path / "x.svar"
     SparseVar.from_vcf(out, VCF(_DDIR / "biallelic.vcf.gz"), max_mem="1g")
     before = _dir_digest(out)
 
-    monkeypatch.setattr(S, "_concat_data", _corrupt_outdir_then_boom)
+    monkeypatch.setattr(C, "_concat_data", _corrupt_outdir_then_boom)
     with pytest.raises(RuntimeError, match="write boom"):
         SparseVar.from_vcf(
             out, VCF(_DDIR / "biallelic.vcf.gz"), max_mem="1g", overwrite=True
@@ -192,13 +192,13 @@ def test_from_pgen_atomic_no_leftover(tmp_path: Path):
 
 
 def test_from_pgen_atomic_preserves_existing_on_failure(tmp_path: Path, monkeypatch):
-    import genoray._svar._core as S
+    import genoray._svar._convert as C
 
     out = tmp_path / "p.svar"
     SparseVar.from_pgen(out, PGEN(_DDIR / "biallelic.pgen"), max_mem="1g")
     before = _dir_digest(out)
 
-    monkeypatch.setattr(S, "_concat_data", _corrupt_outdir_then_boom)
+    monkeypatch.setattr(C, "_concat_data", _corrupt_outdir_then_boom)
     with pytest.raises(RuntimeError, match="write boom"):
         SparseVar.from_pgen(
             out, PGEN(_DDIR / "biallelic.pgen"), max_mem="1g", overwrite=True
