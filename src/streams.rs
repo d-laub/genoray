@@ -23,12 +23,15 @@ impl StreamTag {
     }
 }
 
+/// Post-merge rewrite hook applied to a stream's final files (e.g. 2-bit packing).
+pub type PostMergeHook = fn(&Path) -> Result<(), crate::error::ConversionError>;
+
 pub struct StreamSpec {
     pub tag: StreamTag,
     pub subdir: &'static str,
     pub key_bytes: usize,
     /// Post-merge rewrite hook applied to the stream's final files (e.g. 2-bit packing).
-    pub post_merge: Option<fn(&Path)>,
+    pub post_merge: Option<PostMergeHook>,
 }
 
 /// One entry per active on-disk sub-stream. Order matches `StreamTag as usize`.

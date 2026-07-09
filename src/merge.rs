@@ -1,3 +1,4 @@
+use crate::error::ConversionError;
 use crate::layout;
 use bytemuck;
 use ndarray::Array1;
@@ -28,7 +29,7 @@ pub fn merge_mini_sc(
     ploidy: usize,
     output_dir: &str,
     ram_ledger: Vec<Vec<u32>>,
-) {
+) -> Result<(), ConversionError> {
     let output_dir_path = Path::new(output_dir);
     let total_columns = num_samples * ploidy;
     let pos_size = std::mem::size_of::<u32>(); // positions are always u32
@@ -52,8 +53,14 @@ pub fn merge_mini_sc(
 
     // save the global offsets array immediately
     let offsets_array = Array1::from_vec(final_offsets.clone());
-    write_npy(layout::offsets(output_dir_path), &offsets_array)
-        .expect("Failed to write final offsets");
+    write_npy(layout::offsets(output_dir_path), &offsets_array).map_err(|source| {
+        ConversionError::Npy {
+            path: layout::offsets(output_dir_path)
+                .to_string_lossy()
+                .into_owned(),
+            source,
+        }
+    })?;
 
     let total_items: u64 = final_offsets[total_columns];
     let pos_total_bytes: u64 = total_items * pos_size as u64;
@@ -65,27 +72,47 @@ pub fn merge_mini_sc(
     // disjoint byte ranges. set_len doesn't allocate disk space (sparse file)
     // until each tile actually writes.
     let final_pos_file =
-        File::create(layout::positions(output_dir_path)).expect("Failed to create positions.bin");
+        File::create(layout::positions(output_dir_path)).map_err(|e| ConversionError::Io {
+            context: "creating positions.bin".to_string(),
+            source: e,
+        })?;
     final_pos_file
         .set_len(pos_total_bytes)
-        .expect("Failed to size positions.bin");
+        .map_err(|e| ConversionError::Io {
+            context: "sizing positions.bin".to_string(),
+            source: e,
+        })?;
     let final_key_file =
-        File::create(layout::alleles(output_dir_path)).expect("Failed to create alleles.bin");
+        File::create(layout::alleles(output_dir_path)).map_err(|e| ConversionError::Io {
+            context: "creating alleles.bin".to_string(),
+            source: e,
+        })?;
     final_key_file
         .set_len(key_total_bytes)
-        .expect("Failed to size alleles.bin");
+        .map_err(|e| ConversionError::Io {
+            context: "sizing alleles.bin".to_string(),
+            source: e,
+        })?;
 
     // Open every chunk's pos/key file exactly once; pread() is stateless and
     // safe to call concurrently from multiple rayon workers.
     let chunk_files: Vec<(File, File)> = (0..num_chunks)
-        .map(|c| {
-            let pf = File::open(layout::chunk_pos(output_dir_path, c))
-                .unwrap_or_else(|e| panic!("Failed to open chunk_{}_pos.bin: {}", c, e));
-            let kf = File::open(layout::chunk_key(output_dir_path, c))
-                .unwrap_or_else(|e| panic!("Failed to open chunk_{}_key.bin: {}", c, e));
-            (pf, kf)
+        .map(|c| -> Result<(File, File), ConversionError> {
+            let pf = File::open(layout::chunk_pos(output_dir_path, c)).map_err(|e| {
+                ConversionError::Io {
+                    context: format!("opening chunk_{c}_pos.bin"),
+                    source: e,
+                }
+            })?;
+            let kf = File::open(layout::chunk_key(output_dir_path, c)).map_err(|e| {
+                ConversionError::Io {
+                    context: format!("opening chunk_{c}_key.bin"),
+                    source: e,
+                }
+            })?;
+            Ok((pf, kf))
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
 
     // Adaptive tile size: target TILE_RAM_BUDGET per tile.
     // pos buffer (u32) + key buffer (key_bytes-wide) → (pos_size + key_bytes) bytes per item.
@@ -117,100 +144,115 @@ pub fn merge_mini_sc(
     let final_pos_ref = &final_pos_file;
     let final_key_ref = &final_key_file;
 
-    tile_starts.par_iter().for_each(|&tile_start_col| {
-        let tile_end_col = std::cmp::min(tile_start_col + columns_per_tile, total_columns);
-        let tile_n_cols = tile_end_col - tile_start_col;
-        let tile_start_item = final_offsets_ref[tile_start_col] as usize;
-        let tile_end_item = final_offsets_ref[tile_end_col] as usize;
-        let tile_total_items = tile_end_item - tile_start_item;
+    tile_starts
+        .par_iter()
+        .try_for_each(|&tile_start_col| -> Result<(), ConversionError> {
+            let tile_end_col = std::cmp::min(tile_start_col + columns_per_tile, total_columns);
+            let tile_n_cols = tile_end_col - tile_start_col;
+            let tile_start_item = final_offsets_ref[tile_start_col] as usize;
+            let tile_end_item = final_offsets_ref[tile_end_col] as usize;
+            let tile_total_items = tile_end_item - tile_start_item;
 
-        if tile_total_items == 0 {
-            return;
-        }
-
-        let mut tile_pos_buffer = vec![0u32; tile_total_items];
-        let mut tile_key_buffer = vec![0u8; tile_total_items * key_bytes];
-
-        // per-column write head (offset within this tile buffer)
-        let mut tile_write_heads = vec![0usize; tile_n_cols];
-        // index loop: `i` indexes tile_write_heads while `col` offsets into the global ledger.
-        #[allow(clippy::needless_range_loop)]
-        for i in 0..tile_n_cols {
-            let col = tile_start_col + i;
-            tile_write_heads[i] = (final_offsets_ref[col] as usize) - tile_start_item;
-        }
-
-        // gather from chunks
-        for chunk_id in 0..num_chunks {
-            let chunk_start_item = chunk_offsets_ref[chunk_id][tile_start_col] as usize;
-            let chunk_end_item = chunk_offsets_ref[chunk_id][tile_end_col] as usize;
-            let chunk_items_to_read = chunk_end_item - chunk_start_item;
-
-            if chunk_items_to_read == 0 {
-                continue;
+            if tile_total_items == 0 {
+                return Ok(());
             }
 
-            // Stateless positional reads — multiple workers can read the same File
-            // concurrently without locking or seek-state contention.
-            let mut chunk_pos_bytes = vec![0u8; chunk_items_to_read * pos_size];
-            let mut chunk_key_bytes = vec![0u8; chunk_items_to_read * key_bytes];
-            let pos_byte_offset = (chunk_start_item * pos_size) as u64;
-            let key_byte_offset = (chunk_start_item * key_bytes) as u64;
-            chunk_files_ref[chunk_id]
-                .0
-                .read_exact_at(&mut chunk_pos_bytes, pos_byte_offset)
-                .expect("Failed to pread chunk pos");
-            chunk_files_ref[chunk_id]
-                .1
-                .read_exact_at(&mut chunk_key_bytes, key_byte_offset)
-                .expect("Failed to pread chunk key");
+            let mut tile_pos_buffer = vec![0u32; tile_total_items];
+            let mut tile_key_buffer = vec![0u8; tile_total_items * key_bytes];
 
-            // zero-copy cast back to typed slice (positions only — keys stay raw bytes)
-            let chunk_pos_u32: &[u32] = bytemuck::cast_slice(&chunk_pos_bytes);
-
-            // stitch this chunk's block into the main Tile buffer
-            let mut local_chunk_cursor = 0usize;
-            // index loop: `i` indexes tile-local write heads while `col` offsets the ledger.
+            // per-column write head (offset within this tile buffer)
+            let mut tile_write_heads = vec![0usize; tile_n_cols];
+            // index loop: `i` indexes tile_write_heads while `col` offsets into the global ledger.
             #[allow(clippy::needless_range_loop)]
             for i in 0..tile_n_cols {
                 let col = tile_start_col + i;
-                let calls = ram_ledger_ref[chunk_id][col] as usize;
-                if calls == 0 {
+                tile_write_heads[i] = (final_offsets_ref[col] as usize) - tile_start_item;
+            }
+
+            // gather from chunks
+            for chunk_id in 0..num_chunks {
+                let chunk_start_item = chunk_offsets_ref[chunk_id][tile_start_col] as usize;
+                let chunk_end_item = chunk_offsets_ref[chunk_id][tile_end_col] as usize;
+                let chunk_items_to_read = chunk_end_item - chunk_start_item;
+
+                if chunk_items_to_read == 0 {
                     continue;
                 }
 
-                let dest_start = tile_write_heads[i];
-                let dest_end = dest_start + calls;
+                // Stateless positional reads — multiple workers can read the same File
+                // concurrently without locking or seek-state contention.
+                let mut chunk_pos_bytes = vec![0u8; chunk_items_to_read * pos_size];
+                let mut chunk_key_bytes = vec![0u8; chunk_items_to_read * key_bytes];
+                let pos_byte_offset = (chunk_start_item * pos_size) as u64;
+                let key_byte_offset = (chunk_start_item * key_bytes) as u64;
+                chunk_files_ref[chunk_id]
+                    .0
+                    .read_exact_at(&mut chunk_pos_bytes, pos_byte_offset)
+                    .map_err(|e| ConversionError::Io {
+                        context: "pread chunk pos".into(),
+                        source: e,
+                    })?;
+                chunk_files_ref[chunk_id]
+                    .1
+                    .read_exact_at(&mut chunk_key_bytes, key_byte_offset)
+                    .map_err(|e| ConversionError::Io {
+                        context: "pread chunk key".into(),
+                        source: e,
+                    })?;
 
-                tile_pos_buffer[dest_start..dest_end].copy_from_slice(
-                    &chunk_pos_u32[local_chunk_cursor..local_chunk_cursor + calls],
-                );
+                // zero-copy cast back to typed slice (positions only — keys stay raw bytes)
+                let chunk_pos_u32: &[u32] = bytemuck::cast_slice(&chunk_pos_bytes);
 
-                let key_dest_start = dest_start * key_bytes;
-                let key_src_start = local_chunk_cursor * key_bytes;
-                tile_key_buffer[key_dest_start..key_dest_start + calls * key_bytes]
-                    .copy_from_slice(
-                        &chunk_key_bytes[key_src_start..key_src_start + calls * key_bytes],
+                // stitch this chunk's block into the main Tile buffer
+                let mut local_chunk_cursor = 0usize;
+                // index loop: `i` indexes tile-local write heads while `col` offsets the ledger.
+                #[allow(clippy::needless_range_loop)]
+                for i in 0..tile_n_cols {
+                    let col = tile_start_col + i;
+                    let calls = ram_ledger_ref[chunk_id][col] as usize;
+                    if calls == 0 {
+                        continue;
+                    }
+
+                    let dest_start = tile_write_heads[i];
+                    let dest_end = dest_start + calls;
+
+                    tile_pos_buffer[dest_start..dest_end].copy_from_slice(
+                        &chunk_pos_u32[local_chunk_cursor..local_chunk_cursor + calls],
                     );
 
-                tile_write_heads[i] += calls;
-                local_chunk_cursor += calls;
-            }
-        }
+                    let key_dest_start = dest_start * key_bytes;
+                    let key_src_start = local_chunk_cursor * key_bytes;
+                    tile_key_buffer[key_dest_start..key_dest_start + calls * key_bytes]
+                        .copy_from_slice(
+                            &chunk_key_bytes[key_src_start..key_src_start + calls * key_bytes],
+                        );
 
-        // pwrite the assembled tile to its known byte range in the final files.
-        // Tiles are disjoint by construction (final_offsets is monotonically increasing),
-        // so concurrent write_all_at calls touch non-overlapping regions.
-        let tile_pos_byte_offset = (tile_start_item * pos_size) as u64;
-        let tile_key_byte_offset = (tile_start_item * key_bytes) as u64;
-        let tile_pos_bytes: &[u8] = bytemuck::cast_slice(&tile_pos_buffer);
-        final_pos_ref
-            .write_all_at(tile_pos_bytes, tile_pos_byte_offset)
-            .expect("Failed to pwrite tile to positions.bin");
-        final_key_ref
-            .write_all_at(&tile_key_buffer, tile_key_byte_offset)
-            .expect("Failed to pwrite tile to alleles.bin");
-    });
+                    tile_write_heads[i] += calls;
+                    local_chunk_cursor += calls;
+                }
+            }
+
+            // pwrite the assembled tile to its known byte range in the final files.
+            // Tiles are disjoint by construction (final_offsets is monotonically increasing),
+            // so concurrent write_all_at calls touch non-overlapping regions.
+            let tile_pos_byte_offset = (tile_start_item * pos_size) as u64;
+            let tile_key_byte_offset = (tile_start_item * key_bytes) as u64;
+            let tile_pos_bytes: &[u8] = bytemuck::cast_slice(&tile_pos_buffer);
+            final_pos_ref
+                .write_all_at(tile_pos_bytes, tile_pos_byte_offset)
+                .map_err(|e| ConversionError::Io {
+                    context: "pwrite positions.bin".into(),
+                    source: e,
+                })?;
+            final_key_ref
+                .write_all_at(&tile_key_buffer, tile_key_byte_offset)
+                .map_err(|e| ConversionError::Io {
+                    context: "pwrite alleles.bin".into(),
+                    source: e,
+                })?;
+            Ok(())
+        })?;
 
     // Drop file handles to flush metadata before cleanup
     drop(chunk_files);
@@ -224,6 +266,7 @@ pub fn merge_mini_sc(
     }
 
     println!("Merge Complete.");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -275,7 +318,7 @@ mod tests {
         let key: Vec<u32> = vec![10, 20, 30, 40, 50, 60];
         write_chunk_files(dir, 0, &pos, &key);
 
-        merge_mini_sc(4, 1, 2, 2, dir.to_str().unwrap(), ram_ledger);
+        merge_mini_sc(4, 1, 2, 2, dir.to_str().unwrap(), ram_ledger).unwrap();
 
         let final_pos = read_u32_bin(&dir.join("positions.bin"));
         let final_key = read_u32_bin(&dir.join("alleles.bin"));
@@ -304,7 +347,7 @@ mod tests {
         write_chunk_files(dir, 0, &[100, 200, 300], &[1, 2, 3]);
         write_chunk_files(dir, 1, &[400, 500, 600], &[4, 5, 6]);
 
-        merge_mini_sc(4, 2, 2, 1, dir.to_str().unwrap(), ram_ledger);
+        merge_mini_sc(4, 2, 2, 1, dir.to_str().unwrap(), ram_ledger).unwrap();
 
         let final_pos = read_u32_bin(&dir.join("positions.bin"));
         let final_key = read_u32_bin(&dir.join("alleles.bin"));
@@ -324,7 +367,7 @@ mod tests {
         let ram_ledger = vec![vec![0u32; 4]];
         write_chunk_files(dir, 0, &[], &[]);
 
-        merge_mini_sc(4, 1, 2, 2, dir.to_str().unwrap(), ram_ledger);
+        merge_mini_sc(4, 1, 2, 2, dir.to_str().unwrap(), ram_ledger).unwrap();
 
         let final_pos = read_u32_bin(&dir.join("positions.bin"));
         let final_off = read_offsets_npy(&dir.join("offsets.npy"));
@@ -344,7 +387,7 @@ mod tests {
         write_chunk_files(dir, 0, &[], &[]);
         write_chunk_files(dir, 1, &[10, 20, 30, 40, 50], &[1, 2, 3, 4, 5]);
 
-        merge_mini_sc(4, 2, 2, 1, dir.to_str().unwrap(), ram_ledger);
+        merge_mini_sc(4, 2, 2, 1, dir.to_str().unwrap(), ram_ledger).unwrap();
 
         let final_pos = read_u32_bin(&dir.join("positions.bin"));
         let final_off = read_offsets_npy(&dir.join("offsets.npy"));
@@ -381,7 +424,7 @@ mod tests {
             kf.write_all(&[4u8, 5, 6]).unwrap();
         }
 
-        merge_mini_sc(1, 2, 2, 1, dir.to_str().unwrap(), ram_ledger);
+        merge_mini_sc(1, 2, 2, 1, dir.to_str().unwrap(), ram_ledger).unwrap();
 
         let final_pos = read_u32_bin(&dir.join("positions.bin"));
         let final_key = read_u8_bin(&dir.join("alleles.bin"));
@@ -447,7 +490,7 @@ mod tests {
                 write_chunk_files(dir, chunk_id, &pos_buf, &key_buf);
             }
 
-            merge_mini_sc(4, num_chunks, num_samples, ploidy, dir.to_str().unwrap(), ram_ledger.clone());
+            merge_mini_sc(4, num_chunks, num_samples, ploidy, dir.to_str().unwrap(), ram_ledger.clone()).unwrap();
 
             let final_pos = read_u32_bin(&dir.join("positions.bin"));
             let final_key = read_u32_bin(&dir.join("alleles.bin"));

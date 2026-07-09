@@ -275,9 +275,9 @@ pub fn process_chromosome(
             ploidy,
             dir.to_str().unwrap(),
             ledger,
-        );
+        )?;
         if let Some(hook) = spec.post_merge {
-            hook(&dir);
+            hook(&dir)?;
         }
     }
 
@@ -296,7 +296,7 @@ pub fn process_chromosome(
             spec.pack_snp,
             dir.to_str().unwrap(),
             ledger,
-        );
+        )?;
     }
 
     // M5 post-pass: emit max-deletion-length artifacts for the overlap query.
