@@ -3,10 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import polars as pl
 import pytest
 from numpy.typing import ArrayLike, NDArray
 from pytest_cases import fixture, parametrize_with_cases
 
+from genoray import Filter
 from genoray._vcf import POS_MAX, VCF
 from tests import _oracle
 from tests.data.fixtures import FIXTURES
@@ -54,7 +56,7 @@ def read_spanning_del():
 def read_missing_contig():
     cse = "🥸", 81261, 81263
     # (s p v)
-    genos_phasing, dosages = VCF.Genos8Dosages.empty(N_SAMPLES, VCF.ploidy, 0, True)
+    genos_phasing, dosages = VCF.Genos8Dosages.empty(N_SAMPLES, VCF.ploidy + 1, 0)
     genos, phasing = np.array_split(genos_phasing, 2, 1)
     phasing = phasing.squeeze(1).astype(bool)
     return cse, genos, phasing, dosages
@@ -63,7 +65,7 @@ def read_missing_contig():
 def read_none():
     cse = "chr1", 0, 1
     # (s p v)
-    genos_phasing, dosages = VCF.Genos8Dosages.empty(N_SAMPLES, VCF.ploidy, 0, True)
+    genos_phasing, dosages = VCF.Genos8Dosages.empty(N_SAMPLES, VCF.ploidy + 1, 0)
     genos, phasing = np.array_split(genos_phasing, 2, 1)
     phasing = phasing.squeeze(1).astype(bool)
     return cse, genos, phasing, dosages
@@ -110,6 +112,34 @@ def test_read(
     np.testing.assert_equal(g, genos)
     np.testing.assert_equal(p, phasing)
     np.testing.assert_equal(d, dosages)
+
+
+def test_read_with_out_matches_without_out(vcf: VCF):
+    """Characterize existing behavior of the (previously untested) ``out=``
+    path: filling a caller-provided buffer must match allocating a fresh one."""
+    cse = "chr1", 81261, 81263
+
+    expected_g = vcf.read(*cse, VCF.Genos16)
+    out_g = VCF.Genos16.empty(
+        vcf.n_samples, vcf.ploidy + vcf.phasing, expected_g.shape[-1]
+    )
+    actual_g = vcf.read(*cse, VCF.Genos16, out=out_g)
+    np.testing.assert_array_equal(actual_g, expected_g)
+
+    expected_d = vcf.read(*cse, VCF.Dosages)
+    out_d = VCF.Dosages.empty(
+        vcf.n_samples, vcf.ploidy + vcf.phasing, expected_d.shape[-1]
+    )
+    actual_d = vcf.read(*cse, VCF.Dosages, out=out_d)
+    np.testing.assert_array_equal(actual_d, expected_d)
+
+    expected_gd = vcf.read(*cse, VCF.Genos16Dosages)
+    out_gd = VCF.Genos16Dosages.empty(
+        vcf.n_samples, vcf.ploidy + vcf.phasing, expected_gd[0].shape[-1]
+    )
+    actual_gd = vcf.read(*cse, VCF.Genos16Dosages, out=out_gd)
+    np.testing.assert_array_equal(actual_gd[0], expected_gd[0])
+    np.testing.assert_array_equal(actual_gd[1], expected_gd[1])
 
 
 @parametrize_with_cases("cse, genos, phasing, dosages", cases=".", prefix="read_")
@@ -204,6 +234,20 @@ def test_sample_reorder(vcf: VCF):
     np.testing.assert_equal(d, np.array([[2.0, 1.0], [1.0, np.nan]], np.float32))
 
 
+def test_vcf_mem_per_variant_doubles_when_sorted(vcf: VCF):
+    ploidy = vcf.ploidy + vcf.phasing
+    # a fresh reader has no active sample sorter -> estimate is NOT doubled
+    unsorted = vcf._mem_per_variant(VCF.Genos16)
+    assert unsorted == VCF.Genos16.nbytes_per_variant(vcf.n_samples, ploidy)
+    # a single-sample subset is trivially "sorted" (a length-1 permutation is
+    # always in order), so it does NOT install the ndarray sorter; a genuine
+    # reorder of >=2 samples does (mirrors test_sample_reorder above).
+    vcf.set_samples(list(reversed(vcf.available_samples)))
+    assert vcf._mem_per_variant(VCF.Genos16) == 2 * VCF.Genos16.nbytes_per_variant(
+        vcf.n_samples, ploidy
+    )
+
+
 def length_no_ext():
     cse = "chr1", 81264, 81265  # just 81265 in VCF
     # (s p v)
@@ -231,7 +275,7 @@ def length_ext():
 def length_none():
     cse = "chr1", 0, 1
     # (s p v)
-    genos_phasing, dosages = VCF.Genos8Dosages.empty(N_SAMPLES, VCF.ploidy, 0, True)
+    genos_phasing, dosages = VCF.Genos8Dosages.empty(N_SAMPLES, VCF.ploidy + 1, 0)
     genos, phasing = np.array_split(genos_phasing, 2, 1)
     phasing = phasing.squeeze(1).astype(bool)
     last_end = 1
@@ -251,12 +295,26 @@ def test_chunk_with_length(
     last_end: int,
     n_extension: int,
 ):
+    # _chunk_ranges_with_length now requires a loaded .gvi index (it needs
+    # variant indices from _var_idxs to build chunk_idxs); the `vcf` fixture is
+    # parametrized over with_gvi_index=[True, False], so build+load on demand.
+    if vcf._index is None:
+        vcf._write_gvi_index()
+        vcf._load_index()
+
     vcf.phasing = True
+
+    # Independently-computed in-range variant indices (not derived from the
+    # method under test) so the chunk_idxs assertions below stay non-vacuous.
+    contig, start, end_ = cse
+    in_range_idxs, _ = vcf._var_idxs(contig, start, end_)
+    in_range_idxs = in_range_idxs.astype(np.uint32)
 
     max_mem = vcf._mem_per_variant(VCF.Genos16Dosages)
     gpd = vcf._chunk_ranges_with_length(*cse, max_mem, VCF.Genos16Dosages)
+    all_idxs: list[NDArray[np.uint32]] = []
     for range_ in gpd:
-        for chunk, end, n_ext in range_:
+        for chunk, end, chunk_idxs in range_:
             gp, d = chunk
             g, p = np.array_split(gp, 2, 1)
             p = p.squeeze(1).astype(bool)
@@ -264,7 +322,50 @@ def test_chunk_with_length(
             np.testing.assert_equal(p, phasing)
             np.testing.assert_equal(d, dosages)
             assert end == last_end
-            assert n_ext == n_extension
+            # chunk_idxs is now a uint32 variant-index array, one index per
+            # variant in this chunk (matching PGEN's contract).
+            assert chunk_idxs.dtype == np.uint32
+            assert chunk_idxs.shape[0] == gp.shape[-1]
+            all_idxs.append(chunk_idxs)
+
+    full = np.concatenate(all_idxs) if all_idxs else np.empty(0, dtype=np.uint32)
+    # The in-range prefix must match the independently-computed indices...
+    assert np.array_equal(full[: in_range_idxs.size], in_range_idxs)
+    # ...and whatever is left over is exactly the extension variants, whose
+    # count must match this case's expected `n_extension` (keeps this
+    # non-vacuous: a wrong extension count/length fails here).
+    assert full.size - in_range_idxs.size == n_extension
+
+
+def test_chunk_ranges_with_length_yields_chunk_idxs():
+    """The 3rd tuple element is now the variant-index array, and the extension
+    indices are contiguous after the last in-range index (what gvl assumed)."""
+    vcf = VCF(ddir / "biallelic.vcf.gz")
+    if vcf._index is None:
+        vcf._write_gvi_index()
+        vcf._load_index()
+    contig = vcf.contigs[0]
+    starts = np.array([0], dtype=np.int32)
+    ends = np.array([10_000], dtype=np.int32)
+
+    v_idx, offsets = vcf._var_idxs(contig, starts, ends)
+    reg_unext = v_idx[offsets[0] : offsets[1]].astype(np.uint32)
+
+    all_idxs = []
+    for range_ in vcf._chunk_ranges_with_length(contig, starts, ends, "4g", VCF.Genos8):
+        for genos, _end, chunk_idxs in range_:
+            assert chunk_idxs.dtype == np.uint32
+            assert chunk_idxs.shape[0] == genos.shape[-1]
+            all_idxs.append(chunk_idxs)
+    full = np.concatenate(all_idxs) if all_idxs else np.empty(0, np.uint32)
+
+    # in-range prefix matches _var_idxs; any extension is contiguous after it
+    assert np.array_equal(full[: reg_unext.size], reg_unext)
+    if full.size > reg_unext.size:
+        ext = full[reg_unext.size :]
+        assert np.array_equal(
+            ext, np.arange(reg_unext[-1] + 1, reg_unext[-1] + 1 + ext.size)
+        )
 
 
 def test_nbytes_zero_before_index_loaded():
@@ -307,9 +408,26 @@ def test_chunk_with_length_phased_indel_in_extension():
     assert genos_phasing.shape[-1] > 0
 
 
-def test_filter_setter_enforces_pair_invariant():
-    import polars as pl  # noqa: F401
+def test_filter_object_roundtrip():
+    f = Filter(record=lambda v: True, expr=pl.col("POS") > 0)
+    vcf = VCF(ddir / "biallelic.vcf.gz", filter=f)
+    assert vcf.filter is f
+    vcf.filter = None
+    assert vcf.filter is None
 
+
+def test_filter_object_is_frozen():
+    f = Filter(record=lambda v: True, expr=pl.lit(True))
+    with pytest.raises(Exception):
+        f.record = lambda v: False  # frozen dataclass
+
+
+def test_old_pl_filter_kwarg_removed():
+    with pytest.raises(TypeError):
+        VCF(ddir / "biallelic.vcf.gz", pl_filter=pl.lit(True))  # kwarg no longer exists
+
+
+def test_filter_setter_enforces_pair_invariant():
     from genoray import exprs
 
     vcf = VCF(ddir / "biallelic.vcf.gz")
@@ -318,32 +436,25 @@ def test_filter_setter_enforces_pair_invariant():
         return not any(a.startswith("<") for a in v.ALT)
 
     pl_expr = ~exprs.is_symbolic
+    f = Filter(record=record_fn, expr=pl_expr)
 
-    # Setting a valid (filter, pl_filter) pair updates both and invalidates the index.
+    # Setting a Filter updates both halves together and invalidates the index.
     vcf._index = "sentinel"
-    vcf.filter = (record_fn, pl_expr)
-    assert vcf.filter == (record_fn, pl_expr)
-    assert vcf._pl_filter is pl_expr
+    vcf.filter = f
+    assert vcf.filter is f
     assert vcf._index is None
 
     # The getter mirrors the setter, so assigning the getter back round-trips.
     vcf.filter = vcf.filter
-    assert vcf.filter == (record_fn, pl_expr)
+    assert vcf.filter is f
 
-    # Assigning None clears both; the getter returns (None, None).
+    # Assigning None clears the filter; the getter returns None.
+    vcf._index = "sentinel"
     vcf.filter = None
-    assert vcf.filter == (None, None)
-    assert vcf._pl_filter is None
+    assert vcf.filter is None
+    assert vcf._index is None
 
-    # A mismatched pair raises ValueError and leaves state untouched.
-    with pytest.raises(ValueError):
-        vcf.filter = (record_fn, None)
-    with pytest.raises(ValueError):
-        vcf.filter = (None, pl_expr)
-    assert vcf.filter == (None, None)
-    assert vcf._pl_filter is None
-
-    # A bare (non-tuple) value is rejected.
+    # A bare (non-Filter) value is rejected.
     with pytest.raises(TypeError):
         vcf.filter = record_fn
 
@@ -357,14 +468,13 @@ def test_filtered_var_idxs_consistent_with_index():
     """
     from genoray import exprs
 
-    # is_snp as a (cyvcf2 record callable, pl.Expr) pair (VCF requires both).
+    # is_snp as a Filter bundling a cyvcf2 record predicate + pl.Expr (VCF requires both).
     def record_is_snp(rec):
         return len(rec.REF) == 1 and all(len(a) == 1 for a in rec.ALT)
 
     v_filt = VCF(
         ddir / "biallelic.vcf.gz",
-        filter=record_is_snp,
-        pl_filter=exprs.is_snp,
+        filter=Filter(record=record_is_snp, expr=exprs.is_snp),
     )
     v_filt._write_gvi_index()
     v_filt._load_index()
@@ -395,8 +505,10 @@ def test_filter_applied_to_genos_dosages_without_index():
         phasing=False,
         dosage_field="DS",
         with_gvi_index=False,
-        filter=lambda rec: len(rec.REF) == 1 and all(len(a) == 1 for a in rec.ALT),
-        pl_filter=exprs.is_snp,
+        filter=Filter(
+            record=lambda rec: len(rec.REF) == 1 and all(len(a) == 1 for a in rec.ALT),
+            expr=exprs.is_snp,
+        ),
     )
     cse = ("chr1", 81261, 81266)  # covers the GAT>A indel and two SNPs
     genos_only = vcf.read(*cse, VCF.Genos8)  # filters correctly today

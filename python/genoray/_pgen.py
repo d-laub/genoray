@@ -5,7 +5,7 @@ from functools import partial
 from io import TextIOWrapper
 from pathlib import Path
 from types import TracebackType
-from typing import Any, TypeGuard, TypeVar, cast
+from typing import TypeVar, cast
 
 import numpy as np
 import pgenlib
@@ -14,11 +14,11 @@ from hirola import HashTable
 from loguru import logger
 from more_itertools import mark_ends, windowed
 from numpy.typing import ArrayLike, NDArray
-from phantom import Phantom
 from seqpro.rag import OFFSET_TYPE
 from typing_extensions import Self, assert_never, override
 from zstandard import ZstdDecompressor
 
+from ._modes import make_array_mode, make_tuple_mode
 from ._types import POS_MAX, POS_TYPE
 from ._utils import (
     ContigNormalizer,
@@ -34,117 +34,44 @@ V_IDX_TYPE = np.uint32
 """Dtype for PGEN variant indices (uint32). This determines the maximum number of unique variants in a file."""
 
 
-def _is_genos(obj: Any) -> TypeGuard[Genos]:
-    return (
-        isinstance(obj, np.ndarray)
-        and obj.dtype.type == np.int32
-        and obj.ndim == 3
-        and obj.shape[1] == 2
-    )
+_GenosBase = make_array_mode("Genos", np.int32, 3, genos=True)
+_DosagesBase = make_array_mode("Dosages", np.float32, 2)
+_PhasingBase = make_array_mode("Phasing", np.bool_, 2)
 
 
-class Genos(NDArray[np.int32], Phantom, predicate=_is_genos):
-    _dtype = np.int32
-
-    @classmethod
-    def empty(cls, n_samples: int, ploidy: int, n_variants: int) -> Self:
-        return cls.parse(np.empty((n_samples, ploidy, n_variants), dtype=cls._dtype))
+class Genos(_GenosBase):
+    pass
 
 
-def _is_dosages(obj: Any) -> TypeGuard[Dosages]:
-    return (
-        isinstance(obj, np.ndarray) and obj.dtype.type == np.float32 and obj.ndim == 2
-    )
+class Dosages(_DosagesBase):
+    pass
 
 
-class Dosages(NDArray[np.float32], Phantom, predicate=_is_dosages):
-    _dtype = np.float32
-
-    @classmethod
-    def empty(cls, n_samples: int, ploidy: int, n_variants: int) -> Self:
-        return cls.parse(np.empty((n_samples, n_variants), dtype=cls._dtype))
+class Phasing(_PhasingBase):
+    pass
 
 
-def _is_phasing(obj: Any) -> TypeGuard[Phasing]:
-    return isinstance(obj, np.ndarray) and obj.dtype.type == np.bool_ and obj.ndim == 2
+_GenosPhasingBase = make_tuple_mode(
+    "GenosPhasing", (Genos, Phasing), genos_dtype=np.int32
+)
+_GenosDosagesBase = make_tuple_mode(
+    "GenosDosages", (Genos, Dosages), genos_dtype=np.int32
+)
+_GenosPhasingDosagesBase = make_tuple_mode(
+    "GenosPhasingDosages", (Genos, Phasing, Dosages), genos_dtype=np.int32
+)
 
 
-class Phasing(NDArray[np.bool_], Phantom, predicate=_is_phasing):
-    _dtype = np.bool_
-
-    @classmethod
-    def empty(cls, n_samples: int, ploidy: int, n_variants: int) -> Self:
-        return cls.parse(np.empty((n_samples, n_variants), dtype=cls._dtype))
+class GenosPhasing(_GenosPhasingBase):
+    pass
 
 
-def _is_genos_phasing(obj: object) -> TypeGuard[GenosPhasing]:
-    return (
-        isinstance(obj, tuple)
-        and len(obj) == 2
-        and isinstance(obj[0], Genos)
-        and isinstance(obj[1], Phasing)
-    )
+class GenosDosages(_GenosDosagesBase):
+    pass
 
 
-class GenosPhasing(tuple[Genos, Phasing], Phantom, predicate=_is_genos_phasing):
-    _dtypes = (np.int32, np.bool_)
-
-    @classmethod
-    def empty(cls, n_samples: int, ploidy: int, n_variants: int) -> Self:
-        return cls.parse(
-            (
-                Genos.empty(n_samples, ploidy, n_variants),
-                Phasing.empty(n_samples, ploidy, n_variants),
-            )
-        )
-
-
-def _is_genos_dosages(obj: object) -> TypeGuard[GenosDosages]:
-    return (
-        isinstance(obj, tuple)
-        and len(obj) == 2
-        and isinstance(obj[0], Genos)
-        and isinstance(obj[1], Dosages)
-    )
-
-
-class GenosDosages(tuple[Genos, Dosages], Phantom, predicate=_is_genos_dosages):
-    _dtypes = (np.int32, np.float32)
-
-    @classmethod
-    def empty(cls, n_samples: int, ploidy: int, n_variants: int) -> Self:
-        return cls.parse(
-            (
-                Genos.empty(n_samples, ploidy, n_variants),
-                Dosages.empty(n_samples, ploidy, n_variants),
-            )
-        )
-
-
-def _is_genos_phasing_dosages(obj: object) -> TypeGuard[GenosPhasingDosages]:
-    return (
-        isinstance(obj, tuple)
-        and len(obj) == 3
-        and isinstance(obj[0], Genos)
-        and isinstance(obj[1], Phasing)
-        and isinstance(obj[2], Dosages)
-    )
-
-
-class GenosPhasingDosages(
-    tuple[Genos, Phasing, Dosages], Phantom, predicate=_is_genos_phasing_dosages
-):
-    _dtypes = (np.int32, np.bool_, np.float32)
-
-    @classmethod
-    def empty(cls, n_samples: int, ploidy: int, n_variants: int) -> Self:
-        return cls.parse(
-            (
-                Genos.empty(n_samples, ploidy, n_variants),
-                Phasing.empty(n_samples, ploidy, n_variants),
-                Dosages.empty(n_samples, ploidy, n_variants),
-            )
-        )
+class GenosPhasingDosages(_GenosPhasingDosagesBase):
+    pass
 
 
 T = TypeVar("T", Genos, Dosages, GenosPhasing, GenosDosages, GenosPhasingDosages)
@@ -470,6 +397,25 @@ class PGEN:
         phys = self._index["index"].to_numpy()[pos].astype(V_IDX_TYPE)
         return phys, offsets
 
+    def _norm_or_warn(self, contig: str) -> str | None:
+        c = self._c_norm.norm(contig) if self._c_norm is not None else None
+        if c is None:
+            logger.warning(
+                f"Query contig {contig} not found in PGEN file, even after "
+                "normalizing for UCSC/Ensembl nomenclature."
+            )
+        return c
+
+    def _empty(self, mode: type[T], n_variants: int = 0) -> T:
+        return mode.empty(self.n_samples, self.ploidy, n_variants)
+
+    def _empty_gen(
+        self, mode: type[L], end: POS_TYPE
+    ) -> Generator[tuple[L, POS_TYPE, NDArray[V_IDX_TYPE]]]:
+        return (
+            (self._empty(mode), end, np.empty(0, dtype=V_IDX_TYPE)) for _ in range(1)
+        )
+
     def read(
         self,
         contig: str,
@@ -503,26 +449,15 @@ class PGEN:
             assert self._c_norm is not None and self._index is not None
         c = self._c_norm.norm(contig)
         if c is None:
-            return mode.empty(self.n_samples, self.ploidy, 0)
+            return self._empty(mode)
 
         var_idxs, _ = self._var_idxs_phys(c, start, end)  # type: ignore[bad-argument-type]
         n_variants = len(var_idxs)
 
         if n_variants == 0:
-            return mode.empty(self.n_samples, self.ploidy, 0)
+            return self._empty(mode)
 
-        if issubclass(mode, Genos):
-            out = self._read_genos(var_idxs)
-        elif issubclass(mode, Dosages):
-            out = self._read_dosages(var_idxs)
-        elif issubclass(mode, GenosPhasing):
-            out = self._read_genos_phasing(var_idxs)
-        elif issubclass(mode, GenosDosages):
-            out = self._read_genos_dosages(var_idxs)
-        elif issubclass(mode, GenosPhasingDosages):
-            out = self._read_genos_phasing_dosages(var_idxs)
-        else:
-            assert_never(mode)  # type: ignore[bad-argument-type]
+        out = self._reader_for(mode)(var_idxs)
 
         return cast(T, out)
 
@@ -564,18 +499,15 @@ class PGEN:
             self._init_index()
             assert self._c_norm is not None and self._index is not None
 
-        c = self._c_norm.norm(contig)
+        c = self._norm_or_warn(contig)
         if c is None:
-            logger.warning(
-                f"Query contig {contig} not found in PGEN file, even after normalizing for UCSC/Ensembl nomenclature."
-            )
-            yield mode.empty(self.n_samples, self.ploidy, 0)
+            yield self._empty(mode)
             return
 
         var_idxs, _ = self._var_idxs_phys(c, start, end)  # type: ignore[bad-argument-type]
         n_variants = len(var_idxs)
         if n_variants == 0:
-            yield mode.empty(self.n_samples, self.ploidy, 0)
+            yield self._empty(mode)
             return
 
         mem_per_v = self._mem_per_variant(mode)
@@ -589,18 +521,7 @@ class PGEN:
         n_chunks = -(-n_variants // vars_per_chunk)
         v_chunks = np.array_split(var_idxs, n_chunks)
         for var_idx in v_chunks:
-            if issubclass(mode, Genos):
-                _out = self._read_genos(var_idx)
-            elif issubclass(mode, Dosages):
-                _out = self._read_dosages(var_idx)
-            elif issubclass(mode, GenosPhasing):
-                _out = self._read_genos_phasing(var_idx)
-            elif issubclass(mode, GenosDosages):
-                _out = self._read_genos_dosages(var_idx)
-            elif issubclass(mode, GenosPhasingDosages):
-                _out = self._read_genos_phasing_dosages(var_idx)
-            else:
-                assert_never(mode)  # type: ignore[bad-argument-type]
+            _out = self._reader_for(mode)(var_idx)
 
             yield mode.parse(_out)
 
@@ -650,34 +571,16 @@ class PGEN:
             self._init_index()
             assert self._c_norm is not None and self._index is not None
 
-        c = self._c_norm.norm(contig)
+        c = self._norm_or_warn(contig)
         if c is None:
-            logger.warning(
-                f"Query contig {contig} not found in PGEN file, even after normalizing for UCSC/Ensembl nomenclature."
-            )
-            return mode.empty(self.n_samples, self.ploidy, 0), np.zeros(
-                n_ranges + 1, OFFSET_TYPE
-            )
+            return self._empty(mode), np.zeros(n_ranges + 1, OFFSET_TYPE)
 
         var_idxs, offsets = self._var_idxs_phys(c, starts, ends)
         n_variants = len(var_idxs)
         if n_variants == 0:
-            return mode.empty(self.n_samples, self.ploidy, 0), np.zeros(
-                n_ranges + 1, OFFSET_TYPE
-            )
+            return self._empty(mode), np.zeros(n_ranges + 1, OFFSET_TYPE)
 
-        if issubclass(mode, Genos):
-            out = self._read_genos(var_idxs)
-        elif issubclass(mode, Dosages):
-            out = self._read_dosages(var_idxs)
-        elif issubclass(mode, GenosPhasing):
-            out = self._read_genos_phasing(var_idxs)
-        elif issubclass(mode, GenosDosages):
-            out = self._read_genos_dosages(var_idxs)
-        elif issubclass(mode, GenosPhasingDosages):
-            out = self._read_genos_phasing_dosages(var_idxs)
-        else:
-            assert_never(mode)  # type: ignore[bad-argument-type]
+        out = self._reader_for(mode)(var_idxs)
 
         return cast(T, out), offsets
 
@@ -733,13 +636,10 @@ class PGEN:
             self._init_index()
             assert self._c_norm is not None and self._index is not None
 
-        c = self._c_norm.norm(contig)
+        c = self._norm_or_warn(contig)
         if c is None:
-            logger.warning(
-                f"Query contig {contig} not found in PGEN file, even after normalizing for UCSC/Ensembl nomenclature."
-            )
             for _ in range(len(starts)):
-                yield (mode.empty(self.n_samples, self.ploidy, 0) for _ in range(1))
+                yield (self._empty(mode) for _ in range(1))
             return
 
         ends = np.atleast_1d(np.asarray(ends, POS_TYPE))
@@ -749,7 +649,7 @@ class PGEN:
         tot_variants = len(var_idxs)
         if tot_variants == 0:
             for _ in range(len(starts)):
-                yield (mode.empty(self.n_samples, self.ploidy, 0) for _ in range(1))
+                yield (self._empty(mode) for _ in range(1))
             return
 
         mem_per_v = self._mem_per_variant(mode)
@@ -764,24 +664,13 @@ class PGEN:
 
         for (o_s, o_e), n_chunks in zip(windowed(offsets, 2), chunks_per_range):
             if o_s == o_e:
-                yield (mode.empty(self.n_samples, self.ploidy, 0) for _ in range(1))
+                yield (self._empty(mode) for _ in range(1))
                 continue
 
             range_idxs = var_idxs[o_s:o_e]
             v_chunks = np.array_split(range_idxs, n_chunks)
 
-            if issubclass(mode, Genos):
-                read = self._read_genos
-            elif issubclass(mode, Dosages):
-                read = self._read_dosages
-            elif issubclass(mode, GenosPhasing):
-                read = self._read_genos_phasing
-            elif issubclass(mode, GenosDosages):
-                read = self._read_genos_dosages
-            elif issubclass(mode, GenosPhasingDosages):
-                read = self._read_genos_phasing_dosages
-            else:
-                assert_never(mode)  # type: ignore[bad-argument-type]
+            read = self._reader_for(mode)
 
             yield (cast(T, read(var_idx)) for var_idx in v_chunks)
 
@@ -860,20 +749,10 @@ class PGEN:
                 and self._c_max_idxs is not None
             )
 
-        c = self._c_norm.norm(contig)
+        c = self._norm_or_warn(contig)
         if c is None:
-            logger.warning(
-                f"Query contig {contig} not found in PGEN file, even after normalizing for UCSC/Ensembl nomenclature."
-            )
             for e in ends:
-                yield (
-                    (
-                        mode.empty(self.n_samples, self.ploidy, 0),
-                        e,
-                        np.empty(0, dtype=V_IDX_TYPE),
-                    )
-                    for _ in range(1)
-                )
+                yield self._empty_gen(mode, e)
             # we have full length, no deletions in any of the ranges
             return
 
@@ -883,14 +762,7 @@ class PGEN:
         tot_variants = len(var_idxs)
         if tot_variants == 0:
             for e in ends:
-                yield (
-                    (
-                        mode.empty(self.n_samples, self.ploidy, 0),
-                        e,
-                        np.empty(0, dtype=V_IDX_TYPE),
-                    )
-                    for _ in range(1)
-                )
+                yield self._empty_gen(mode, e)
             # we have full length, no deletions in any of the ranges
             return
 
@@ -902,16 +774,7 @@ class PGEN:
                 f" Memory per variant: {format_memory(mem_per_v)}."
             )
 
-        if issubclass(mode, Genos):
-            read = self._read_genos
-        elif issubclass(mode, GenosPhasing):
-            read = self._read_genos_phasing
-        elif issubclass(mode, GenosDosages):
-            read = self._read_genos_dosages
-        elif issubclass(mode, GenosPhasingDosages):
-            read = self._read_genos_phasing_dosages
-        else:
-            assert_never(mode)  # type: ignore[bad-argument-type]
+        read = self._reader_for(mode, include_dosages=False)
 
         read = cast(Callable[[NDArray[np.uint32]], L], read)
 
@@ -921,14 +784,7 @@ class PGEN:
             n_variants = len(range_idxs)
             if n_variants == 0:
                 # we have full length, no deletions in any of the ranges
-                yield (
-                    (
-                        mode.empty(self.n_samples, self.ploidy, 0),
-                        e,
-                        np.empty(0, dtype=V_IDX_TYPE),
-                    )
-                    for _ in range(1)
-                )
+                yield self._empty_gen(mode, e)
                 continue
 
             n_chunks = -(-n_variants // vars_per_chunk)
@@ -946,25 +802,16 @@ class PGEN:
             )
 
     def _mem_per_variant(self, mode: type[T]) -> int:
-        mem = 0
+        """Calculate the memory required per variant for the given mode.
 
-        if issubclass(mode, Genos):
-            mem += self.n_samples * self.ploidy * mode._dtype().itemsize
-        elif issubclass(mode, Dosages):
-            mem += self.n_samples * mode._dtype().itemsize
-        elif issubclass(mode, GenosPhasing) or issubclass(mode, GenosDosages):
-            mem += self.n_samples * self.ploidy * mode._dtypes[0]().itemsize
-            mem += self.n_samples * mode._dtypes[1]().itemsize
-        elif issubclass(mode, GenosPhasingDosages):
-            mem += self.n_samples * self.ploidy * mode._dtypes[0]().itemsize
-            mem += self.n_samples * mode._dtypes[1]().itemsize
-            mem += self.n_samples * mode._dtypes[2]().itemsize
-        else:
-            assert_never(mode)  # type: ignore[bad-argument-type]
-
+        Returns
+        -------
+        int
+            Memory required per variant in bytes.
+        """
+        mem = mode.nbytes_per_variant(self.n_samples, self.ploidy)
         if isinstance(self._s_unsorter, np.ndarray):
-            mem *= 2  # have to make a copy to sort by samples
-
+            mem *= 2  # a copy is made to reorder by samples
         return mem
 
     def _read_genos(self, var_idxs: NDArray[V_IDX_TYPE]) -> Genos:
@@ -1010,6 +857,21 @@ class PGEN:
         genos_phasing = self._read_genos_phasing(var_idxs)
         dosages = self._read_dosages(var_idxs)
         return cast(GenosPhasingDosages, (*genos_phasing, dosages))
+
+    def _reader_for(self, mode: type, include_dosages: bool = True) -> Callable:
+        """Map a mode class to its bound ``_read_*`` method."""
+        table: dict[type, Callable] = {
+            Genos: self._read_genos,
+            GenosPhasing: self._read_genos_phasing,
+            GenosDosages: self._read_genos_dosages,
+            GenosPhasingDosages: self._read_genos_phasing_dosages,
+        }
+        if include_dosages:
+            table[Dosages] = self._read_dosages
+        try:
+            return table[mode]
+        except KeyError:
+            assert_never(mode)  # type: ignore[bad-argument-type]
 
 
 def _gen_with_length(
@@ -1061,7 +923,7 @@ def _gen_with_length(
 
         if isinstance(out, Genos):
             # (s p)
-            hap_lens = np.full(out.shape[:-1], initial_len, dtype=np.int32)
+            hap_lens = np.full(out.shape[:-1], initial_len, dtype=np.int32)  # type: ignore
             hap_lens += hap_ilens(out, ilens[var_idx])
         else:
             # (s p)

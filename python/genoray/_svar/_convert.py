@@ -18,7 +18,7 @@ from seqpro.rag import Ragged, lengths_to_offsets
 
 from .._types import DOSAGE_TYPE, POS_TYPE, V_IDX_TYPE
 from .._utils import atomic_write_dir, format_memory, parse_memory
-from .._vcf import VCF
+from .._vcf import VCF, Filter
 from ._io import (
     _open_fmt,
     _open_genos,
@@ -179,10 +179,16 @@ def _process_contig_vcf(
     keep_local: np.ndarray | None = None,
     haploid: bool = False,
 ) -> tuple[int, int]:
+    vcf_filter: Filter | None = None
+    if cyvcf2_filter is not None:
+        assert pl_filter is not None, (
+            "cyvcf2_filter and pl_filter must be provided together"
+        )
+        vcf_filter = Filter(record=cyvcf2_filter, expr=pl_filter)
+
     vcf = VCF(
         path,
-        filter=cyvcf2_filter,
-        pl_filter=pl_filter,
+        filter=vcf_filter,
         dosage_field=dosage_field,
         with_gvi_index=False,
     )

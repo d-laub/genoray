@@ -1,5 +1,22 @@
 ## Unreleased
 
+### BREAKING CHANGES
+
+- `Phantom` mode `empty()` classmethods now take a uniform
+  `empty(n_samples, ploidy, n_variants)` signature on both VCF and PGEN
+  backends. VCF's former 4th `phasing` argument is removed; pass the effective
+  ploidy (`ploidy + phasing`) instead.
+- VCF chunk-size memory estimates now double when a sample subset/reorder is
+  active, matching PGEN. This only affects internal chunk sizing (more
+  conservative memory use), never returned data.
+- VCF filtering now uses a single `genoray.Filter(record=, expr=)` value object.
+  The `pl_filter=` constructor kwarg and the `(filter, pl_filter)` tuple
+  getter/setter are removed. Migrate `VCF(p, filter=fn, pl_filter=expr)` to
+  `VCF(p, filter=Filter(record=fn, expr=expr))`.
+- `VCF._chunk_ranges_with_length` now yields `(data, end, chunk_idxs)` (a
+  `uint32` variant-index array) as its third tuple element instead of an
+  `n_extension_vars` count, matching `PGEN._chunk_ranges_with_length`.
+
 ### Fix
 
 - **vcf**: apply configured `filter` on `VCF.read(..., mode=Genos*Dosages)` when no

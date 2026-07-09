@@ -629,7 +629,7 @@ class SparseVar(SparseVarAnnotateMixin, Generic[_SRT]):
 
         # --- build working index (filtered) and resolve kept rows ---
         working_df, alt_is_utf8, ilen_added = _build_working_index(
-            vcf._index_path(), vcf._pl_filter
+            vcf._index_path(), vcf._filter.expr if vcf._filter is not None else None
         )
         if regions is None:
             kept_rows = working_df["index"].to_numpy().astype(V_IDX_TYPE)
@@ -696,8 +696,10 @@ class SparseVar(SparseVarAnnotateMixin, Generic[_SRT]):
                     contig=c,
                     chunk_dir=chunk_dir,
                     chunk_idx=chunk_idx,
-                    cyvcf2_filter=vcf._filter,
-                    pl_filter=vcf._pl_filter,
+                    cyvcf2_filter=vcf._filter.record
+                    if vcf._filter is not None
+                    else None,
+                    pl_filter=vcf._filter.expr if vcf._filter is not None else None,
                     caller_samples=None if samples is None else caller_samples,
                     keep_local=keep_local_by_contig.get(c),
                     haploid=haploid,

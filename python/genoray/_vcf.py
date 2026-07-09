@@ -4,8 +4,9 @@ import re
 import warnings
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, TypeGuard, TypeVar, cast, overload
+from typing import Literal, TypeVar, cast, overload
 
 import cyvcf2
 from hirola import HashTable
@@ -17,11 +18,11 @@ from loguru import logger
 from more_itertools import mark_ends
 from natsort import natsorted
 from numpy.typing import ArrayLike, NDArray
-from phantom import Phantom
 from seqpro.rag import OFFSET_TYPE
 from tqdm.auto import tqdm
 from typing_extensions import Self, assert_never
 
+from ._modes import make_array_mode, make_tuple_mode
 from ._types import POS_MAX, POS_TYPE
 from ._utils import (
     ContigNormalizer,
@@ -36,6 +37,8 @@ from .exprs import ILEN, symbolic_ilen
 V_IDX_TYPE = np.uint32
 """Dtype for VCF variant indices (uint32). This determines the maximum number of unique variants in a file."""
 
+_CHECK_LEN_EVERY_N = 20
+
 
 class DosageFieldError(RuntimeError): ...
 
@@ -45,129 +48,37 @@ class MultiallelicDosageError(RuntimeError): ...
 
 GDTYPE = TypeVar("GDTYPE", np.int8, np.int16)
 
-
-def _is_genos8(obj: Any) -> TypeGuard[NDArray[np.int8]]:
-    return (
-        isinstance(obj, np.ndarray)
-        and obj.dtype.type == np.int8
-        and obj.ndim == 3
-        and obj.shape[1] in (2, 3)  # diploid with/without phasing
-    )
+_Genos8Base = make_array_mode("Genos8", np.int8, 3, genos=True)
+_Genos16Base = make_array_mode("Genos16", np.int16, 3, genos=True)
+_DosagesBase = make_array_mode("Dosages", np.float32, 2)
 
 
-class Genos8(NDArray[np.int8], Phantom, predicate=_is_genos8):
-    _gdtype = np.int8
-
-    @classmethod
-    def empty(
-        cls, n_samples: int, ploidy: int, n_variants: int, phasing: bool
-    ) -> Genos8:
-        return cls.parse(np.empty((n_samples, ploidy + phasing, n_variants), np.int8))
+class Genos8(_Genos8Base):
+    pass
 
 
-def _is_genos16(obj: Any) -> TypeGuard[NDArray[np.int16]]:
-    return (
-        isinstance(obj, np.ndarray)
-        and obj.dtype.type == np.int16
-        and obj.ndim == 3
-        and obj.shape[1] in (2, 3)  # diploid with/without phasing
-    )
+class Genos16(_Genos16Base):
+    pass
 
 
-class Genos16(NDArray[np.int16], Phantom, predicate=_is_genos16):
-    _gdtype = np.int16
-
-    @classmethod
-    def empty(
-        cls, n_samples: int, ploidy: int, n_variants: int, phasing: bool
-    ) -> Genos16:
-        return cls.parse(np.empty((n_samples, ploidy + phasing, n_variants), np.int16))
+class Dosages(_DosagesBase):
+    pass
 
 
-def _is_dosages(obj: Any) -> TypeGuard[NDArray[np.float32]]:
-    return (
-        isinstance(obj, np.ndarray) and obj.dtype.type == np.float32 and obj.ndim == 2
-    )
+_Genos8DosagesBase = make_tuple_mode(
+    "Genos8Dosages", (Genos8, Dosages), genos_dtype=np.int8
+)
+_Genos16DosagesBase = make_tuple_mode(
+    "Genos16Dosages", (Genos16, Dosages), genos_dtype=np.int16
+)
 
 
-class Dosages(NDArray[np.float32], Phantom, predicate=_is_dosages):
-    @classmethod
-    def empty(
-        cls, n_samples: int, ploidy: int, n_variants: int, phasing: bool
-    ) -> Dosages:
-        return cls.parse(np.empty((n_samples, n_variants), np.float32))
+class Genos8Dosages(_Genos8DosagesBase):
+    pass
 
 
-def _is_genos8_dosages(obj: Any) -> TypeGuard[tuple[Genos8, Dosages]]:
-    """Check if the object is a tuple of genotypes and dosages.
-
-    Parameters
-    ----------
-    obj
-        Object to check.
-
-    Returns
-    -------
-    bool
-        True if the object is a tuple of genotypes and dosages, False otherwise.
-    """
-    return (
-        isinstance(obj, tuple)
-        and len(obj) == 2
-        and isinstance(obj[0], Genos8)
-        and isinstance(obj[1], Dosages)
-    )
-
-
-class Genos8Dosages(tuple[Genos8, Dosages], Phantom, predicate=_is_genos8_dosages):
-    _gdtype = np.int8
-
-    @classmethod
-    def empty(
-        cls, n_samples: int, ploidy: int, n_variants: int, phasing: bool
-    ) -> Genos8Dosages:
-        return cls.parse(
-            (
-                Genos8.empty(n_samples, ploidy, n_variants, phasing),
-                Dosages.empty(n_samples, ploidy, n_variants, phasing),
-            )
-        )
-
-
-def _is_genos16_dosages(obj: object) -> TypeGuard[tuple[Genos16, Dosages]]:
-    """Check if the object is a tuple of genotypes and dosages.
-
-    Parameters
-    ----------
-    obj
-        Object to check.
-
-    Returns
-    -------
-    bool
-        True if the object is a tuple of genotypes and dosages, False otherwise.
-    """
-    return (
-        isinstance(obj, tuple)
-        and len(obj) == 2
-        and isinstance(obj[0], Genos16)
-        and isinstance(obj[1], Dosages)
-    )
-
-
-class Genos16Dosages(tuple[Genos16, Dosages], Phantom, predicate=_is_genos16_dosages):
-    _gdtype = np.int16
-
-    @classmethod
-    def empty(
-        cls, n_samples: int, ploidy: int, n_variants: int, phasing: bool
-    ) -> Genos16Dosages:
-        return cls.parse(
-            (
-                Genos16.empty(n_samples, ploidy, n_variants, phasing),
-                Dosages.empty(n_samples, ploidy, n_variants, phasing),
-            )
-        )
+class Genos16Dosages(_Genos16DosagesBase):
+    pass
 
 
 T = TypeVar("T", Genos8, Genos16, Dosages, Genos8Dosages, Genos16Dosages)
@@ -188,6 +99,20 @@ class _Index:
         self.df = df
 
 
+@dataclass(frozen=True)
+class Filter:
+    """A cyvcf2 record predicate paired with its matching ``.gvi`` polars expression.
+
+    Both travel together so the record scan (``record``) and the index-level
+    filter (``expr``) can never diverge. ``record`` should return True for
+    variants to keep; ``expr`` must be an equivalent predicate over the index
+    columns (``CHROM``, ``POS``, ``REF``, ``ALT``, ``ILEN``).
+    """
+
+    record: Callable[[cyvcf2.Variant], bool]
+    expr: pl.Expr
+
+
 class VCF:
     """Create a VCF reader.
 
@@ -196,22 +121,22 @@ class VCF:
     path
         Path to the VCF file.
     filter
-        Function to filter variants. Should return True for variants to keep.
+        A :class:`Filter` bundling a cyvcf2 record predicate with its matching
+        ``.gvi`` polars expression, or ``None`` to disable filtering.
 
         .. note::
-            To avoid KeyErrors, this function needs to be tolerant to missing fields. For example, if you
+            The ``record`` predicate needs to be tolerant to missing fields. For example, if you
             access an INFO or FORMAT field, not all variants are guaranteed to have the same fields.
             The `cyvcf2.Variant <https://brentp.github.io/cyvcf2/docstrings.html#cyvcf2.cyvcf2.Variant>`_
             API provides the :meth:`.get <dict.get>` method on the INFO and FORMAT attributes. For example,
             :code:`lambda v: v.INFO.get("AF", 0) > 0.05` will skip any variants with an AF <= 0.05 or a
             missing AF by treating missing AFs as 0.
-    pl_filter
-        Polars expression to filter variants. Should return True for variants to keep. Must match the filter function.
 
         .. note::
-            This expression will be applied to the polars DataFrame returned by :meth:`get_record_info`.
-            It is not applied to the VCF file itself, so it will not be able to use the cyvcf2.Variant API.
-            For example, if you want to filter variants by INFO field, you can use:
+            The ``expr`` polars expression will be applied to the polars DataFrame returned by
+            :meth:`get_record_info`. It is not applied to the VCF file itself, so it will not be
+            able to use the cyvcf2.Variant API. For example, if you want to filter variants by INFO
+            field, you can use:
             :code:`pl.col("AF") > 0.05`
             but you can not use:
             :code:`lambda v: v.INFO.get("AF", 0) > 0.05`
@@ -236,10 +161,8 @@ class VCF:
     """Naturally sorted list of available contigs in the VCF file."""
     ploidy: int = 2
     """Ploidy of the VCF file. This is currently always 2 since we use cyvcf2."""
-    _filter: Callable[[cyvcf2.Variant], bool] | None
-    """Function to filter variants. Should return True for variants to keep."""
-    _pl_filter: pl.Expr | None
-    """Polars expression to filter variants. Should return True for variants to keep. Must match the filter function."""
+    _filter: Filter | None
+    """The record predicate + matching polars expression currently in effect."""
     phasing: bool
     """Whether to include phasing information on genotypes. If True, the ploidy axis will be length 3 such that
     phasing is indicated by the 3rd value: 0 = unphased, 1 = phased. If False, the ploidy axis will be length 2."""
@@ -268,21 +191,17 @@ class VCF:
     def __init__(
         self,
         path: str | Path,
-        filter: Callable[[cyvcf2.Variant], bool] | None = None,
-        pl_filter: pl.Expr | None = None,
+        filter: Filter | None = None,
         phasing: bool = False,
         dosage_field: str | None = None,
         progress: bool = False,
         with_gvi_index: bool = True,
     ):
-        self._check_filter_pair(filter, pl_filter)
-
         self.path = Path(path)
         if not self.path.exists():
             raise FileNotFoundError(f"VCF file {self.path} does not exist.")
 
         self._filter = filter
-        self._pl_filter = pl_filter
         self.phasing = phasing
         self.dosage_field = dosage_field
         self.progress = progress
@@ -305,30 +224,13 @@ class VCF:
     def _open(self) -> cyvcf2.VCF:
         return cyvcf2.VCF(self.path, samples=self._samples, lazy=True)
 
-    @staticmethod
-    def _check_filter_pair(
-        filter: Callable[[cyvcf2.Variant], bool] | None,
-        pl_filter: pl.Expr | None,
-    ) -> None:
-        """Enforce the both-or-neither invariant on a (filter, pl_filter) pair."""
-        if (filter is not None and pl_filter is None) or (
-            filter is None and pl_filter is not None
-        ):
-            raise ValueError(
-                "If a filter function is provided, a polars expression must also be provided, and vice versa."
-            )
-
     @property
-    def filter(
-        self,
-    ) -> tuple[Callable[[cyvcf2.Variant], bool] | None, pl.Expr | None]:
-        """The ``(filter, pl_filter)`` pair currently in effect.
+    def filter(self) -> Filter | None:
+        """The :class:`Filter` currently in effect, or ``None`` if no filter is set.
 
-        Returns the cyvcf2 record callable and its matching polars expression as
-        a tuple, mirroring what the setter accepts. Both elements are ``None``
-        when no filter is set. Assigning ``vcf.filter = vcf.filter`` round-trips.
+        Assigning ``vcf.filter = vcf.filter`` round-trips.
         """
-        return self._filter, self._pl_filter
+        return self._filter
 
     def _index_path(self) -> Path:
         """Path to the index file."""
@@ -339,31 +241,20 @@ class VCF:
             return base.with_suffix(".gvi.zst")
 
     @filter.setter
-    def filter(
-        self,
-        value: tuple[Callable[[cyvcf2.Variant], bool] | None, pl.Expr | None] | None,
-    ):
-        """Set the record filter and its matching polars expression together.
+    def filter(self, value: Filter | None):
+        """Set the record + index filter together, or clear it with ``None``.
 
-        Assign a ``(filter, pl_filter)`` pair, or ``None`` to clear both. The VCF
-        path requires both a cyvcf2 record callable (for the genotype scan) and a
-        matching polars expression (for the ``.gvi`` index); they must be set
-        together, mirroring the constructor's both-or-neither invariant. Changing
-        the filter invalidates the in-memory index.
+        Assign a :class:`Filter` bundling the cyvcf2 record predicate (for the
+        genotype scan) and the matching polars expression (for the ``.gvi``
+        index), or ``None`` to disable filtering. Changing the filter
+        invalidates the in-memory index.
         """
-        if value is None:
-            filter = pl_filter = None
-        elif isinstance(value, tuple) and len(value) == 2:
-            filter, pl_filter = value
-        else:
+        if value is not None and not isinstance(value, Filter):
             raise TypeError(
-                "VCF.filter must be assigned a (filter, pl_filter) tuple or None; "
-                f"got {type(value).__name__}."
+                f"VCF.filter must be a genoray.Filter or None; got {type(value).__name__}."
             )
-        self._check_filter_pair(filter, pl_filter)
         self._index = None
-        self._filter = filter
-        self._pl_filter = pl_filter
+        self._filter = value
 
     @property
     def nbytes(self) -> int:
@@ -499,7 +390,7 @@ class VCF:
             if self._filter is None:
                 out[i] = sum(1 for _ in self._vcf(coord))
             else:
-                out[i] = sum(self._filter(v) for v in self._vcf(coord))
+                out[i] = sum(self._filter.record(v) for v in self._vcf(coord))
 
         return out
 
@@ -564,6 +455,25 @@ class VCF:
 
         return var_indices(V_IDX_TYPE, self._c_norm, self._index, contig, starts, ends)
 
+    def _norm_or_warn(self, contig: str) -> str | None:
+        c = self._c_norm.norm(contig)
+        if c is None:
+            logger.warning(
+                f"Query contig {contig} not found in VCF file, even after "
+                "normalizing for UCSC/Ensembl nomenclature."
+            )
+        return c
+
+    def _empty(self, mode: type[T], n_variants: int = 0) -> T:
+        return mode.empty(self.n_samples, self.ploidy + self.phasing, n_variants)
+
+    def _empty_gen(
+        self, mode: type[L], end: POS_TYPE
+    ) -> Generator[tuple[L, POS_TYPE, NDArray[V_IDX_TYPE]]]:
+        return (
+            (self._empty(mode), end, np.empty(0, dtype=V_IDX_TYPE)) for _ in range(1)
+        )
+
     def read(
         self,
         contig: str,
@@ -602,12 +512,9 @@ class VCF:
                 "Dosage field not specified. Set the VCF reader's `dosage_field` parameter."
             )
 
-        c = self._c_norm.norm(contig)
+        c = self._norm_or_warn(contig)
         if c is None:
-            logger.warning(
-                f"Query contig {contig} not found in VCF file, even after normalizing for UCSC/Ensembl nomenclature."
-            )
-            return mode.empty(self.n_samples, self.ploidy, 0, self.phasing)  # type: ignore[bad-return]
+            return self._empty(mode)  # type: ignore[bad-return]
 
         start = max(0, start)  # type: ignore
 
@@ -616,55 +523,29 @@ class VCF:
             if self._index is not None:
                 n_variants = self.n_vars_in_ranges(c, start, end)[0]  # type: ignore[bad-argument-type]
                 if n_variants == 0:
-                    return mode.empty(self.n_samples, self.ploidy, 0, self.phasing)  # type: ignore[bad-return]
-            else:
-                n_variants = None
-
-            if issubclass(mode, (Genos8, Genos16)):
-                if n_variants is None:
-                    data = None
-                else:
-                    data = mode.empty(
-                        self.n_samples, self.ploidy, n_variants, self.phasing
-                    )
-                data, _ = self._fill_genos(vcf, data, mode=mode)
-            elif issubclass(mode, Dosages):
-                assert self.dosage_field is not None
-                if n_variants is None:
-                    data = None
-                else:
-                    data = mode.empty(
-                        self.n_samples, self.ploidy, n_variants, self.phasing
-                    )
-                data, _ = self._fill_dosages(vcf, data, self.dosage_field)
-            elif issubclass(mode, (Genos8Dosages, Genos16Dosages)):
-                assert self.dosage_field is not None
-                if n_variants is None:
-                    data = None
-                else:
-                    data = mode.empty(
-                        self.n_samples, self.ploidy, n_variants, self.phasing
-                    )
-                data, _ = self._fill_genos_and_dosages(
-                    vcf, data, self.dosage_field, mode=mode
+                    return self._empty(mode)  # type: ignore[bad-return]
+                data = mode.empty(
+                    self.n_samples, self.ploidy + self.phasing, n_variants
                 )
             else:
-                assert_never(mode)  # type: ignore[bad-argument-type]
-
-            out = cast(T, data)
+                data = None
         else:
-            if isinstance(out, (Genos8, Genos16)):
-                self._fill_genos(vcf, out)
-            elif isinstance(out, Dosages):
-                assert self.dosage_field is not None
-                self._fill_dosages(vcf, out, self.dosage_field)
-            elif isinstance(out, (Genos8Dosages, Genos16Dosages)):
-                assert self.dosage_field is not None
-                self._fill_genos_and_dosages(vcf, out, self.dosage_field)
-            else:
-                assert_never(mode)  # type: ignore[bad-argument-type]
+            data = out
 
-        return out
+        if issubclass(mode, (Genos8, Genos16)):
+            data, _ = self._fill_genos(vcf, data, mode=mode)
+        elif issubclass(mode, Dosages):
+            assert self.dosage_field is not None
+            data, _ = self._fill_dosages(vcf, data, self.dosage_field)
+        elif issubclass(mode, (Genos8Dosages, Genos16Dosages)):
+            assert self.dosage_field is not None
+            data, _ = self._fill_genos_and_dosages(
+                vcf, data, self.dosage_field, mode=mode
+            )
+        else:
+            assert_never(mode)  # type: ignore[bad-argument-type]
+
+        return cast(T, data)
 
     def chunk(
         self,
@@ -707,12 +588,9 @@ class VCF:
 
         max_mem = parse_memory(max_mem)
 
-        c = self._c_norm.norm(contig)
+        c = self._norm_or_warn(contig)
         if c is None:
-            logger.warning(
-                f"Query contig {contig} not found in VCF file, even after normalizing for UCSC/Ensembl nomenclature."
-            )
-            yield mode.empty(self.n_samples, self.ploidy, 0, self.phasing)  # type: ignore[invalid-yield]
+            yield self._empty(mode)  # type: ignore[invalid-yield]
             return
 
         start = max(0, start)  # type: ignore
@@ -725,7 +603,7 @@ class VCF:
                 + f" Memory per variant: {format_memory(mem_per_v)}."
             )
 
-        buffer = mode.empty(self.n_samples, self.ploidy, vars_per_chunk, self.phasing)
+        buffer = mode.empty(self.n_samples, self.ploidy + self.phasing, vars_per_chunk)
         if isinstance(buffer, (Genos8, Genos16)):
             gt_buffer = buffer
             ds_buffer = None
@@ -737,7 +615,7 @@ class VCF:
 
         vcf = self._vcf(f"{c}:{int(start + 1)}-{end}")  # range string is 1-based
         if self._filter is not None:
-            vcf = filter(self._filter, vcf)
+            vcf = filter(self._filter.record, vcf)
         if self.progress and self._pbar is None:
             vcf = tqdm(vcf, desc="Reading VCF", unit=" variant")
         i = 0
@@ -752,16 +630,10 @@ class VCF:
                     ]
 
             if ds_buffer is not None:
-                d = v.format(self.dosage_field)
-                if d is None:
-                    raise DosageFieldError(
-                        f"Dosage field '{self.dosage_field}' not found for record {v!r}"
-                    )
-                if d.shape[1] > 1:
-                    raise MultiallelicDosageError(
-                        f"Multiallelic dosages are not supported, encountered in VCF record {v!r}"
-                    )
-                ds_buffer[..., i] = d.squeeze(1)[self._s_sorter]
+                assert self.dosage_field is not None
+                ds_buffer[..., i] = self._extract_dosage(v, self.dosage_field)[
+                    self._s_sorter
+                ]
 
             i += 1
 
@@ -796,7 +668,7 @@ class VCF:
         mode: type[L] = Genos16,
     ) -> Generator[
         Generator[
-            tuple[L, int, int]  # data, end, n_extension_vars
+            tuple[L, POS_TYPE, NDArray[V_IDX_TYPE]]  # data, end, chunk_idxs
         ]
     ]:
         """Read genotypes and/or dosages in chunks approximately limited by :code:`max_mem`.
@@ -838,26 +710,17 @@ class VCF:
         starts = np.atleast_1d(np.asarray(starts, POS_TYPE)).clip(min=0)
         ends = np.atleast_1d(np.asarray(ends, POS_TYPE))
 
-        c = self._c_norm.norm(contig)
+        c = self._norm_or_warn(contig)
         if c is None:
-            logger.warning(
-                f"Query contig {contig} not found in VCF file, even after normalizing for UCSC/Ensembl nomenclature."
-            )
             for e in ends:
-                yield (  # type: ignore[invalid-yield]
-                    (mode.empty(self.n_samples, self.ploidy, 0, self.phasing), e, 0)
-                    for _ in range(1)
-                )
+                yield self._empty_gen(mode, e)  # type: ignore[invalid-yield]
             return
 
         n_variants = self.n_vars_in_ranges(c, starts, ends)
         tot_variants = n_variants.sum()
         if tot_variants == 0:
             for e in ends:
-                yield (  # type: ignore[invalid-yield]
-                    (mode.empty(self.n_samples, self.ploidy, 0, self.phasing), e, 0)
-                    for _ in range(1)
-                )
+                yield self._empty_gen(mode, e)  # type: ignore[invalid-yield]
             return
 
         mem_per_v = self._mem_per_variant(mode)
@@ -868,18 +731,20 @@ class VCF:
                 f" Memory per variant: {format_memory(mem_per_v)}."
             )
 
+        v_idx, v_offsets = self._var_idxs(c, starts, ends)  # starts still 0-based here
+
         starts = starts + 1  # cyvcf2 queries are 1-based
         ends = np.atleast_1d(np.asarray(ends, POS_TYPE))
 
-        for s, e, n in zip(starts, ends, n_variants):
+        for ri, (s, e, n) in enumerate(zip(starts, ends, n_variants)):
             if n == 0:
-                yield (  # type: ignore[invalid-yield]
-                    (mode.empty(self.n_samples, self.ploidy, 0, self.phasing), e, 0)
-                    for _ in range(1)
-                )
+                yield self._empty_gen(mode, e)  # type: ignore[invalid-yield]
                 continue
 
-            yield self._chunk_with_length_helper(n, vars_per_chunk, c, s, e, mode)
+            range_idxs = v_idx[v_offsets[ri] : v_offsets[ri + 1]].astype(V_IDX_TYPE)
+            yield self._chunk_with_length_helper(
+                n, vars_per_chunk, c, s, e, mode, range_idxs
+            )
 
     def _chunk_with_length_helper(
         self,
@@ -889,7 +754,8 @@ class VCF:
         start: POS_TYPE,
         end: POS_TYPE,
         mode: type[L],
-    ) -> Generator[tuple[L, int, int]]:
+        range_idxs: NDArray[V_IDX_TYPE],
+    ) -> Generator[tuple[L, POS_TYPE, NDArray[V_IDX_TYPE]]]:
         if (
             issubclass(mode, (Genos8Dosages, Genos16Dosages))
             and self.dosage_field is None
@@ -912,18 +778,19 @@ class VCF:
 
         vcf = self._vcf(f"{contig}:{start}-{end}")
         hap_lens = np.full((self.n_samples, self.ploidy), end - start, dtype=np.int32)
+        consumed = 0
         for _, is_last, chunk_size in mark_ends(chunk_sizes):
             ilens = np.empty(chunk_size, dtype=np.int32)
             if issubclass(mode, (Genos8, Genos16)):
                 out = cast(
                     Genos8 | Genos16,
-                    mode.empty(self.n_samples, self.ploidy, chunk_size, self.phasing),
+                    mode.empty(self.n_samples, self.ploidy + self.phasing, chunk_size),
                 )
                 out, last_end = self._fill_genos(vcf, out, ilens)
                 hap_lens += hap_ilens(out[:, : self.ploidy], ilens)
             elif issubclass(mode, (Genos8Dosages, Genos16Dosages)):
                 self.dosage_field = cast(str, self.dosage_field)
-                out = mode.empty(self.n_samples, self.ploidy, chunk_size, self.phasing)
+                out = mode.empty(self.n_samples, self.ploidy + self.phasing, chunk_size)
                 out, last_end = self._fill_genos_and_dosages(
                     vcf, out, self.dosage_field, ilens
                 )
@@ -931,24 +798,31 @@ class VCF:
             else:
                 assert_never(mode)  # type: ignore[bad-argument-type]
 
+            # chunk_size may carry a numpy uint dtype (from vars_per_chunk); adding a
+            # python int to a numpy uint64 upcasts to float64, which is invalid as a
+            # slice bound, so normalize to a plain int first.
+            chunk_size = int(chunk_size)
+            base_idxs = range_idxs[consumed : consumed + chunk_size]
+            consumed += chunk_size
+
             if not is_last:
-                yield cast(L, out), last_end, 0
+                yield cast(L, out), cast(POS_TYPE, last_end), base_idxs
                 continue
 
             if issubclass(mode, (Genos8, Genos16)):
-                ls_ext, last_end = self._ext_genos_with_length(  # type: ignore[bad-specialization]
+                ls_ext, last_end = self._ext_with_length(  # type: ignore[bad-specialization]
                     contig, start, end, hap_lens, mode, last_end
                 )
             elif issubclass(mode, (Genos8Dosages, Genos16Dosages)):
                 self.dosage_field = cast(str, self.dosage_field)
-                ls_ext, last_end = self._ext_genos_dosages_with_length(  # type: ignore[bad-specialization]
+                ls_ext, last_end = self._ext_with_length(  # type: ignore[bad-specialization]
                     contig,
                     start,
                     end,
                     hap_lens,
                     mode,
-                    self.dosage_field,
                     last_end,
+                    dosage_field=self.dosage_field,
                 )
             else:
                 assert_never(mode)  # type: ignore[bad-argument-type]
@@ -962,11 +836,17 @@ class VCF:
                         for o, ls in zip(out, zip(*ls_ext))
                     )
 
-            yield (
-                cast(L, out),
-                last_end,
-                len(ls_ext),
-            )
+                last_in_range = int(range_idxs[-1])
+                ext_idxs = np.arange(
+                    last_in_range + 1,
+                    last_in_range + 1 + len(ls_ext),
+                    dtype=V_IDX_TYPE,
+                )
+                chunk_idxs = np.concatenate([base_idxs, ext_idxs])
+            else:
+                chunk_idxs = base_idxs
+
+            yield cast(L, out), cast(POS_TYPE, last_end), chunk_idxs
 
     @overload
     def get_record_info(
@@ -999,15 +879,6 @@ class VCF:
         info: list[str] | None = None,
         lazy: bool = False,
     ) -> pl.DataFrame | pl.LazyFrame: ...
-    def _oxbow_reader(self) -> Callable:
-        """Return the oxbow reader callable appropriate for this file's extension."""
-        if self.path.suffix == ".bcf":
-            return oxbow.from_bcf
-        elif re.search(r"\.vcf(\.gz)?$", self.path.name) is not None:
-            return oxbow.from_vcf
-        else:
-            raise ValueError(f"Unsupported file extension: {self.path.suffix}")
-
     def get_record_info(
         self,
         contig: str | None = None,
@@ -1069,13 +940,22 @@ class VCF:
             .with_columns(pl.col("CHROM").cast(pl.Enum(self.contigs)))
         )
 
-        if self._pl_filter is not None:
-            df = df.filter(self._pl_filter)
+        if self._filter is not None:
+            df = df.filter(self._filter.expr)
 
         if not lazy:
             df = df.collect()
 
         return df
+
+    def _oxbow_reader(self) -> Callable:
+        """Return the oxbow reader callable appropriate for this file's extension."""
+        if self.path.suffix == ".bcf":
+            return oxbow.from_bcf
+        elif re.search(r"\.vcf(\.gz)?$", self.path.name) is not None:
+            return oxbow.from_vcf
+        else:
+            raise ValueError(f"Unsupported file extension: {self.path.suffix}")
 
     def _declared_info_fields(self, candidates: tuple[str, ...]) -> list[str]:
         """Return which of ``candidates`` are declared as INFO fields in the VCF header.
@@ -1155,12 +1035,12 @@ class VCF:
         user_info_upper = {i.upper() for i in info} if info else set()
         extra_sv = [f for f in sv_info if f.upper() not in user_info_upper]
 
-        filt = self._pl_filter
-        self._pl_filter = None
+        filt = self._filter
+        self._filter = None
         try:
             index = self.get_record_info(fields=list(_fields), info=info, lazy=True)
         finally:
-            self._pl_filter = filt
+            self._filter = filt
 
         # Fetch SV helper columns directly (oxbow requires uppercase and returns a struct).
         # Both oxbow reads cover the identical full record set (no region, no filter, same
@@ -1253,8 +1133,8 @@ class VCF:
         if schema["ALT"] == pl.Utf8:
             index = index.with_columns(pl.col("ALT").str.split(","))
 
-        if self._pl_filter is not None:
-            index = index.filter(self._pl_filter)
+        if self._filter is not None:
+            index = index.filter(self._filter.expr)
 
         if "ILEN" not in schema:
             index = index.with_columns(ILEN=ILEN)
@@ -1281,7 +1161,7 @@ class VCF:
         mode: type[Genos8 | Genos16] | None = None,
     ) -> tuple[Genos8 | Genos16, int]:
         if self._filter is not None:
-            vcf = filter(self._filter, vcf)
+            vcf = filter(self._filter.record, vcf)
 
         if out is None:
             assert mode is not None
@@ -1301,7 +1181,7 @@ class VCF:
                     self._pbar.update()
 
             if len(out_ls) == 0:
-                return mode.empty(self.n_samples, self.ploidy, 0, self.phasing), 0
+                return self._empty(mode), 0
 
             # (s p v)
             out = cast(
@@ -1343,32 +1223,37 @@ class VCF:
 
         return out, v.end  # type: ignore
 
+    def _extract_dosage(
+        self, v: cyvcf2.Variant, dosage_field: str
+    ) -> NDArray[np.float32]:
+        """Fetch, validate, and squeeze the per-sample dosage for one record."""
+        d = v.format(dosage_field)
+        if d is None:
+            raise DosageFieldError(
+                f"Dosage field '{dosage_field}' not found for record {v!r}"
+            )
+        if d.shape[1] > 1:
+            raise MultiallelicDosageError(
+                f"Multiallelic dosages are not supported, encountered in VCF record {v!r}"
+            )
+        return d.squeeze(1)
+
     def _fill_dosages(
         self, vcf: cyvcf2.VCF, out: Dosages | None, dosage_field: str
     ) -> tuple[Dosages, int]:
         if self._filter is not None:
-            vcf = filter(self._filter, vcf)
+            vcf = filter(self._filter.record, vcf)
 
         if out is None:
             out_ls: list[NDArray[np.float32]] = []
             for v in vcf:
-                d = v.format(dosage_field)
-                if d is None:
-                    raise DosageFieldError(
-                        f"Dosage field '{dosage_field}' not found for record {v!r}"
-                    )
-                if d.shape[1] > 1:
-                    raise MultiallelicDosageError(
-                        f"Multiallelic dosages are not supported, encountered in VCF record {v!r}"
-                    )
-
-                out_ls.append(d.squeeze(1))
+                out_ls.append(self._extract_dosage(v, dosage_field))
 
                 if self._pbar is not None:
                     self._pbar.update()
 
             if len(out_ls) == 0:
-                return Dosages.empty(self.n_samples, self.ploidy, 0, self.phasing), 0
+                return Dosages.empty(self.n_samples, self.ploidy + self.phasing, 0), 0
 
             _out = cast(
                 Dosages, np.stack(out_ls, axis=-1, dtype=np.float32)[self._s_sorter]
@@ -1388,16 +1273,7 @@ class VCF:
         i = 0
         for i, v in enumerate(vcf):
             # (samples alts)
-            d = v.format(dosage_field)
-            if d is None:
-                raise DosageFieldError(
-                    f"Dosage field '{dosage_field}' not found for record {v!r}"
-                )
-            if d.shape[1] > 1:
-                raise MultiallelicDosageError(
-                    f"Multiallelic dosages are not supported, encountered in VCF record {v!r}"
-                )
-            out[..., i] = d.squeeze(1)[self._s_sorter]
+            out[..., i] = self._extract_dosage(v, dosage_field)[self._s_sorter]
 
             if self._pbar is not None:
                 self._pbar.update()
@@ -1419,7 +1295,7 @@ class VCF:
         mode: type[Genos8Dosages | Genos16Dosages] | None = None,
     ) -> tuple[Genos8Dosages | Genos16Dosages, int]:
         if self._filter is not None:
-            vcf = filter(self._filter, vcf)
+            vcf = filter(self._filter.record, vcf)
 
         if out is None:
             assert mode is not None
@@ -1435,23 +1311,13 @@ class VCF:
                     # (s p) np.int16
                     geno_ls.append(v.genotype.array()[:, : self.ploidy])
 
-                d = v.format(dosage_field)
-                if d is None:
-                    raise DosageFieldError(
-                        f"Dosage field '{dosage_field}' not found for record {v!r}"
-                    )
-                if d.shape[1] > 1:
-                    raise MultiallelicDosageError(
-                        f"Multiallelic dosages are not supported, encountered in VCF record {v!r}"
-                    )
-
-                dosage_ls.append(d.squeeze(1))
+                dosage_ls.append(self._extract_dosage(v, dosage_field))
 
                 if self._pbar is not None:
                     self._pbar.update()
 
             if len(geno_ls) == 0:
-                out = mode.empty(self.n_samples, self.ploidy, 0, self.phasing)
+                out = self._empty(mode)
                 return out, 0
 
             genos = cast(
@@ -1482,16 +1348,7 @@ class VCF:
             else:
                 out[0][..., i] = v.genotype.array()[self._s_sorter, : self.ploidy]
 
-            d = v.format(dosage_field)
-            if d is None:
-                raise DosageFieldError(
-                    f"Dosage field '{dosage_field}' not found for record {v!r}"
-                )
-            if d.shape[1] > 1:
-                raise MultiallelicDosageError(
-                    f"Multiallelic dosages are not supported, encountered in VCF record {v!r}"
-                )
-            out[1][..., i] = d.squeeze(1)[self._s_sorter]
+            out[1][..., i] = self._extract_dosage(v, dosage_field)[self._s_sorter]
 
             if ilens is not None:
                 ilens[i] = len(v.ALT[0]) - len(v.REF)
@@ -1508,66 +1365,53 @@ class VCF:
         return out, v.end  # type: ignore
 
     def _mem_per_variant(self, mode: type[T]) -> int:
-        """Calculate the memory required per variant for the given genotypes and dosages.
-
-        Parameters
-        ----------
-        genotypes
-            Whether to include genotypes.
-        dosages
-            Whether to include dosages.
+        """Calculate the memory required per variant for the given mode.
 
         Returns
         -------
         int
             Memory required per variant in bytes.
         """
-        mem = 0
-
-        ploidy = self.ploidy + self.phasing
-
-        if issubclass(mode, (Genos8, Genos16)):
-            mem += self.n_samples * ploidy * mode._gdtype().itemsize
-        elif issubclass(mode, Dosages):
-            mem += self.n_samples * np.float32().itemsize
-        elif issubclass(mode, (Genos8Dosages, Genos16Dosages)):
-            mem += self.n_samples * ploidy * mode._gdtype().itemsize
-            mem += self.n_samples * np.float32().itemsize
-        else:
-            assert_never(mode)  # type: ignore[bad-argument-type]
-
+        mem = mode.nbytes_per_variant(self.n_samples, self.ploidy + self.phasing)
+        if isinstance(self._s_sorter, np.ndarray):
+            mem *= 2  # a copy is made to reorder by samples
         return mem
 
-    def _ext_genos_with_length(
+    def _ext_with_length(
         self,
         contig: str,
         start: int | np.integer,
         end: int | np.integer,
         hap_lens: NDArray[np.int32],
-        mode: type[G],
+        mode: type,
         last_end: int,
-    ) -> tuple[list[G], int]:
+        *,
+        dosage_field: str | None = None,
+    ) -> tuple[list, int]:
         ploidy = self.ploidy + self.phasing
         length = end - start
         ext_start = end
         coord = f"{contig}:{ext_start + 1}"
 
-        _CHECK_LEN_EVERY_N = 20
-        ls_genos: list[G] = []
+        out_ls: list = []
         with warnings.catch_warnings():
             warnings.filterwarnings(
                 "ignore", message="no intervals found for", category=UserWarning
             )
             for i, v in enumerate(self._vcf(coord)):
                 if v.start < ext_start or (
-                    self._filter is not None and not self._filter(v)
+                    self._filter is not None and not self._filter.record(v)
                 ):
                     continue
 
-                # (s p, 1)
-                genos = v.genotype.array()[:, :ploidy, None]
-                genos = genos.astype(mode._gdtype)
-                ls_genos.append(genos)
+                genos = v.genotype.array()[:, :ploidy, None].astype(mode._gdtype)
+                if dosage_field is None:
+                    out_ls.append(genos)
+                else:
+                    dosages = self._extract_dosage(v, dosage_field)[
+                        self._s_sorter, None
+                    ]
+                    out_ls.append((genos, dosages))
 
                 if v.is_indel:
                     ilen = len(v.ALT[0]) - len(v.REF)
@@ -1580,64 +1424,7 @@ class VCF:
                 if i % _CHECK_LEN_EVERY_N == 0 and (hap_lens >= length).all():
                     break
 
-        if len(ls_genos) > 0:
-            last_end = cast(int, v.end)  # type: ignore | guaranteed bound by len(ls) > 0
+        if len(out_ls) > 0:
+            last_end = cast(int, v.end)  # type: ignore | bound by len(out_ls) > 0
 
-        return ls_genos, last_end
-
-    def _ext_genos_dosages_with_length(
-        self,
-        contig: str,
-        start: int | np.integer,
-        end: int | np.integer,
-        hap_lens: NDArray[np.int32],
-        mode: type[GD],
-        dosage_field: str,
-        last_end: int,
-    ) -> tuple[list[GD], int]:
-        ploidy = self.ploidy + self.phasing
-        length = end - start
-        ext_start = end
-        coord = f"{contig}:{ext_start + 1}"
-
-        _CHECK_LEN_EVERY_N = 20
-        ls_geno_dosages: list[GD] = []
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore", message="no intervals found for", category=UserWarning
-            )
-            for i, v in enumerate(self._vcf(coord)):
-                if v.start < ext_start or (
-                    self._filter is not None and not self._filter(v)
-                ):
-                    continue
-                # (s p 1)
-                genos = v.genotype.array()[:, :ploidy, None]
-                genos = genos.astype(mode._gdtype)
-
-                dosages = v.format(dosage_field)
-                if dosages is None:
-                    raise DosageFieldError(
-                        f"Dosage field '{dosage_field}' not found for record {v!r}"
-                    )
-                # (s, 1, 1) or (s, 1)? -> (s)
-                dosages = dosages.squeeze(1)[self._s_sorter, None]
-
-                ls_geno_dosages.append((genos, dosages))  # type: ignore
-
-                if v.is_indel:
-                    ilen = len(v.ALT[0]) - len(v.REF)
-                    dist = v.start - last_end
-                    # (s p 1)
-                    hap_lens += dist + np.where(
-                        genos[:, : self.ploidy] == 1, ilen, 0
-                    ).squeeze(-1)
-                    last_end = cast(int, v.end)
-
-                if i % _CHECK_LEN_EVERY_N == 0 and (hap_lens >= length).all():
-                    break
-
-        if len(ls_geno_dosages) > 0:
-            last_end = cast(int, v.end)  # type: ignore | guaranteed bound by len(ls) > 0
-
-        return ls_geno_dosages, last_end
+        return out_ls, last_end
