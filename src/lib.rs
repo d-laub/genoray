@@ -192,9 +192,7 @@ fn run_conversion_pipeline(
         &chroms,
         ploidy,
     )
-    .map_err(|e| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!("failed to write meta.json: {e}"))
-    })?;
+    .map_err(|e| pyo3::exceptions::PyOSError::new_err(format!("failed to write meta.json: {e}")))?;
 
     Ok(total_dropped as usize)
 }

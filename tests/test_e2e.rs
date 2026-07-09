@@ -441,3 +441,27 @@ fn test_missing_chrom_returns_err() {
         Err(genoray_core::error::ConversionError::Input(_))
     ));
 }
+
+// Boundary error-handling: a VCF/BCF path that does not exist on disk must
+// surface as a typed `ConversionError::MissingFile`, symmetric with the FASTA
+// missing-file check (SP-3 final review, M2).
+#[test]
+fn test_missing_vcf_returns_missing_file() {
+    let tmp = tempdir().unwrap();
+    let missing_path = tmp.path().join("does_not_exist.vcf.gz");
+
+    let res = VcfChunkReader::new(
+        missing_path.to_str().unwrap(),
+        None,
+        "chr1",
+        &["s0"],
+        1,
+        2,
+        false,
+    );
+
+    assert!(matches!(
+        res,
+        Err(genoray_core::error::ConversionError::MissingFile { .. })
+    ));
+}

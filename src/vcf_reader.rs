@@ -160,6 +160,14 @@ impl VcfChunkReader {
         ploidy: usize,
         skip_out_of_scope: bool,
     ) -> Result<Self, ConversionError> {
+        // A wrong VCF path reaches Rust when the file was removed after Python's
+        // upstream indexing/open; surface it as FileNotFoundError, not a ".tbi?" Input.
+        if !std::path::Path::new(vcf_path).exists() {
+            return Err(ConversionError::MissingFile {
+                path: vcf_path.to_string(),
+            });
+        }
+
         let mut reader = IndexedReader::from_path(vcf_path).map_err(|e| {
             ConversionError::Input(format!(
                 "Failed to open VCF/BCF index for '{vcf_path}' \
