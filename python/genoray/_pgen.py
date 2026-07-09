@@ -5,7 +5,7 @@ from functools import partial
 from io import TextIOWrapper
 from pathlib import Path
 from types import TracebackType
-from typing import Any, TypeGuard, TypeVar, cast
+from typing import TypeVar, cast
 
 import numpy as np
 import pgenlib
@@ -14,11 +14,11 @@ from hirola import HashTable
 from loguru import logger
 from more_itertools import mark_ends, windowed
 from numpy.typing import ArrayLike, NDArray
-from phantom import Phantom
 from seqpro.rag import OFFSET_TYPE
 from typing_extensions import Self, assert_never, override
 from zstandard import ZstdDecompressor
 
+from ._modes import make_array_mode, make_tuple_mode
 from ._types import POS_MAX, POS_TYPE
 from ._utils import (
     ContigNormalizer,
@@ -34,117 +34,44 @@ V_IDX_TYPE = np.uint32
 """Dtype for PGEN variant indices (uint32). This determines the maximum number of unique variants in a file."""
 
 
-def _is_genos(obj: Any) -> TypeGuard[Genos]:
-    return (
-        isinstance(obj, np.ndarray)
-        and obj.dtype.type == np.int32
-        and obj.ndim == 3
-        and obj.shape[1] == 2
-    )
+_GenosBase = make_array_mode("Genos", np.int32, 3, genos=True)
+_DosagesBase = make_array_mode("Dosages", np.float32, 2)
+_PhasingBase = make_array_mode("Phasing", np.bool_, 2)
 
 
-class Genos(NDArray[np.int32], Phantom, predicate=_is_genos):
-    _dtype = np.int32
-
-    @classmethod
-    def empty(cls, n_samples: int, ploidy: int, n_variants: int) -> Self:
-        return cls.parse(np.empty((n_samples, ploidy, n_variants), dtype=cls._dtype))
+class Genos(_GenosBase):
+    pass
 
 
-def _is_dosages(obj: Any) -> TypeGuard[Dosages]:
-    return (
-        isinstance(obj, np.ndarray) and obj.dtype.type == np.float32 and obj.ndim == 2
-    )
+class Dosages(_DosagesBase):
+    pass
 
 
-class Dosages(NDArray[np.float32], Phantom, predicate=_is_dosages):
-    _dtype = np.float32
-
-    @classmethod
-    def empty(cls, n_samples: int, ploidy: int, n_variants: int) -> Self:
-        return cls.parse(np.empty((n_samples, n_variants), dtype=cls._dtype))
+class Phasing(_PhasingBase):
+    pass
 
 
-def _is_phasing(obj: Any) -> TypeGuard[Phasing]:
-    return isinstance(obj, np.ndarray) and obj.dtype.type == np.bool_ and obj.ndim == 2
+_GenosPhasingBase = make_tuple_mode(
+    "GenosPhasing", (Genos, Phasing), genos_dtype=np.int32
+)
+_GenosDosagesBase = make_tuple_mode(
+    "GenosDosages", (Genos, Dosages), genos_dtype=np.int32
+)
+_GenosPhasingDosagesBase = make_tuple_mode(
+    "GenosPhasingDosages", (Genos, Phasing, Dosages), genos_dtype=np.int32
+)
 
 
-class Phasing(NDArray[np.bool_], Phantom, predicate=_is_phasing):
-    _dtype = np.bool_
-
-    @classmethod
-    def empty(cls, n_samples: int, ploidy: int, n_variants: int) -> Self:
-        return cls.parse(np.empty((n_samples, n_variants), dtype=cls._dtype))
+class GenosPhasing(_GenosPhasingBase):
+    pass
 
 
-def _is_genos_phasing(obj: object) -> TypeGuard[GenosPhasing]:
-    return (
-        isinstance(obj, tuple)
-        and len(obj) == 2
-        and isinstance(obj[0], Genos)
-        and isinstance(obj[1], Phasing)
-    )
+class GenosDosages(_GenosDosagesBase):
+    pass
 
 
-class GenosPhasing(tuple[Genos, Phasing], Phantom, predicate=_is_genos_phasing):
-    _dtypes = (np.int32, np.bool_)
-
-    @classmethod
-    def empty(cls, n_samples: int, ploidy: int, n_variants: int) -> Self:
-        return cls.parse(
-            (
-                Genos.empty(n_samples, ploidy, n_variants),
-                Phasing.empty(n_samples, ploidy, n_variants),
-            )
-        )
-
-
-def _is_genos_dosages(obj: object) -> TypeGuard[GenosDosages]:
-    return (
-        isinstance(obj, tuple)
-        and len(obj) == 2
-        and isinstance(obj[0], Genos)
-        and isinstance(obj[1], Dosages)
-    )
-
-
-class GenosDosages(tuple[Genos, Dosages], Phantom, predicate=_is_genos_dosages):
-    _dtypes = (np.int32, np.float32)
-
-    @classmethod
-    def empty(cls, n_samples: int, ploidy: int, n_variants: int) -> Self:
-        return cls.parse(
-            (
-                Genos.empty(n_samples, ploidy, n_variants),
-                Dosages.empty(n_samples, ploidy, n_variants),
-            )
-        )
-
-
-def _is_genos_phasing_dosages(obj: object) -> TypeGuard[GenosPhasingDosages]:
-    return (
-        isinstance(obj, tuple)
-        and len(obj) == 3
-        and isinstance(obj[0], Genos)
-        and isinstance(obj[1], Phasing)
-        and isinstance(obj[2], Dosages)
-    )
-
-
-class GenosPhasingDosages(
-    tuple[Genos, Phasing, Dosages], Phantom, predicate=_is_genos_phasing_dosages
-):
-    _dtypes = (np.int32, np.bool_, np.float32)
-
-    @classmethod
-    def empty(cls, n_samples: int, ploidy: int, n_variants: int) -> Self:
-        return cls.parse(
-            (
-                Genos.empty(n_samples, ploidy, n_variants),
-                Phasing.empty(n_samples, ploidy, n_variants),
-                Dosages.empty(n_samples, ploidy, n_variants),
-            )
-        )
+class GenosPhasingDosages(_GenosPhasingDosagesBase):
+    pass
 
 
 T = TypeVar("T", Genos, Dosages, GenosPhasing, GenosDosages, GenosPhasingDosages)
@@ -1061,7 +988,7 @@ def _gen_with_length(
 
         if isinstance(out, Genos):
             # (s p)
-            hap_lens = np.full(out.shape[:-1], initial_len, dtype=np.int32)
+            hap_lens = np.full(out.shape[:-1], initial_len, dtype=np.int32)  # type: ignore
             hap_lens += hap_ilens(out, ilens[var_idx])
         else:
             # (s p)
