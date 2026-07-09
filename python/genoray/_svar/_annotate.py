@@ -220,7 +220,7 @@ class SparseVarAnnotateMixin:
         level_filter : int or None, default 1
             If set, keep rows with GTF 'level' <= level_filter (1 = highest quality).
         write_back : bool, default True
-            If True, update self.var_table in-place and write to index.arrow file.
+            If True, update self.index in-place and write to index.arrow file.
         strand_encoding : dict or None, optional
             Encode strand as integers. Example: {'+': 0, '-': 1, None: 2}
         codon_null_token : int or None, optional
