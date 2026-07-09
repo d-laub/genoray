@@ -36,6 +36,8 @@ from .exprs import ILEN, symbolic_ilen
 V_IDX_TYPE = np.uint32
 """Dtype for VCF variant indices (uint32). This determines the maximum number of unique variants in a file."""
 
+_CHECK_LEN_EVERY_N = 20
+
 
 class DosageFieldError(RuntimeError): ...
 
@@ -809,19 +811,19 @@ class VCF:
                 continue
 
             if issubclass(mode, (Genos8, Genos16)):
-                ls_ext, last_end = self._ext_genos_with_length(  # type: ignore[bad-specialization]
+                ls_ext, last_end = self._ext_with_length(  # type: ignore[bad-specialization]
                     contig, start, end, hap_lens, mode, last_end
                 )
             elif issubclass(mode, (Genos8Dosages, Genos16Dosages)):
                 self.dosage_field = cast(str, self.dosage_field)
-                ls_ext, last_end = self._ext_genos_dosages_with_length(  # type: ignore[bad-specialization]
+                ls_ext, last_end = self._ext_with_length(  # type: ignore[bad-specialization]
                     contig,
                     start,
                     end,
                     hap_lens,
                     mode,
-                    self.dosage_field,
                     last_end,
+                    dosage_field=self.dosage_field,
                 )
             else:
                 assert_never(mode)  # type: ignore[bad-argument-type]
@@ -1370,22 +1372,23 @@ class VCF:
             mem *= 2  # a copy is made to reorder by samples
         return mem
 
-    def _ext_genos_with_length(
+    def _ext_with_length(
         self,
         contig: str,
         start: int | np.integer,
         end: int | np.integer,
         hap_lens: NDArray[np.int32],
-        mode: type[G],
+        mode: type,
         last_end: int,
-    ) -> tuple[list[G], int]:
+        *,
+        dosage_field: str | None = None,
+    ) -> tuple[list, int]:
         ploidy = self.ploidy + self.phasing
         length = end - start
         ext_start = end
         coord = f"{contig}:{ext_start + 1}"
 
-        _CHECK_LEN_EVERY_N = 20
-        ls_genos: list[G] = []
+        out_ls: list = []
         with warnings.catch_warnings():
             warnings.filterwarnings(
                 "ignore", message="no intervals found for", category=UserWarning
@@ -1396,10 +1399,14 @@ class VCF:
                 ):
                     continue
 
-                # (s p, 1)
-                genos = v.genotype.array()[:, :ploidy, None]
-                genos = genos.astype(mode._gdtype)
-                ls_genos.append(genos)
+                genos = v.genotype.array()[:, :ploidy, None].astype(mode._gdtype)
+                if dosage_field is None:
+                    out_ls.append(genos)
+                else:
+                    dosages = self._extract_dosage(v, dosage_field)[
+                        self._s_sorter, None
+                    ]
+                    out_ls.append((genos, dosages))
 
                 if v.is_indel:
                     ilen = len(v.ALT[0]) - len(v.REF)
@@ -1412,59 +1419,7 @@ class VCF:
                 if i % _CHECK_LEN_EVERY_N == 0 and (hap_lens >= length).all():
                     break
 
-        if len(ls_genos) > 0:
-            last_end = cast(int, v.end)  # type: ignore | guaranteed bound by len(ls) > 0
+        if len(out_ls) > 0:
+            last_end = cast(int, v.end)  # type: ignore | bound by len(out_ls) > 0
 
-        return ls_genos, last_end
-
-    def _ext_genos_dosages_with_length(
-        self,
-        contig: str,
-        start: int | np.integer,
-        end: int | np.integer,
-        hap_lens: NDArray[np.int32],
-        mode: type[GD],
-        dosage_field: str,
-        last_end: int,
-    ) -> tuple[list[GD], int]:
-        ploidy = self.ploidy + self.phasing
-        length = end - start
-        ext_start = end
-        coord = f"{contig}:{ext_start + 1}"
-
-        _CHECK_LEN_EVERY_N = 20
-        ls_geno_dosages: list[GD] = []
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore", message="no intervals found for", category=UserWarning
-            )
-            for i, v in enumerate(self._vcf(coord)):
-                if v.start < ext_start or (
-                    self._filter is not None and not self._filter(v)
-                ):
-                    continue
-                # (s p 1)
-                genos = v.genotype.array()[:, :ploidy, None]
-                genos = genos.astype(mode._gdtype)
-
-                # (s, 1, 1) or (s, 1)? -> (s)
-                dosages = self._extract_dosage(v, dosage_field)[self._s_sorter, None]
-
-                ls_geno_dosages.append((genos, dosages))  # type: ignore
-
-                if v.is_indel:
-                    ilen = len(v.ALT[0]) - len(v.REF)
-                    dist = v.start - last_end
-                    # (s p 1)
-                    hap_lens += dist + np.where(
-                        genos[:, : self.ploidy] == 1, ilen, 0
-                    ).squeeze(-1)
-                    last_end = cast(int, v.end)
-
-                if i % _CHECK_LEN_EVERY_N == 0 and (hap_lens >= length).all():
-                    break
-
-        if len(ls_geno_dosages) > 0:
-            last_end = cast(int, v.end)  # type: ignore | guaranteed bound by len(ls) > 0
-
-        return ls_geno_dosages, last_end
+        return out_ls, last_end
