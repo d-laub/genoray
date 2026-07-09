@@ -17,6 +17,7 @@ use std::ops::Range;
 
 use ndarray::Array2;
 use numpy::{PyArray1, PyArray2, PyArrayMethods, ToPyArray};
+use pyo3::exceptions::{PyKeyError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyDictMethods};
 
@@ -135,71 +136,77 @@ fn bundle_to_dict<'py>(py: Python<'py>, rb: &RangesBundle) -> PyResult<Bound<'py
 }
 
 /// Inverse of `bundle_to_dict`: read a `find_ranges` dict back into a
-/// `RangesBundle` for `gather_ranges`.
-fn bundle_from_dict(d: &Bound<'_, PyDict>) -> RangesBundle {
-    let get_i32 = |k: &str| -> Vec<i32> {
-        d.get_item(k)
-            .unwrap()
-            .unwrap()
-            .cast::<PyArray1<i32>>()
-            .unwrap()
-            .readonly()
-            .as_slice()
-            .unwrap()
-            .to_vec()
+/// `RangesBundle` for `gather_ranges`. Fallible: a missing key or wrong
+/// dtype/shape becomes a Python KeyError/TypeError rather than a Rust panic.
+fn bundle_from_dict(d: &Bound<'_, PyDict>) -> PyResult<RangesBundle> {
+    let require = |k: &str| -> PyResult<Bound<'_, PyAny>> {
+        d.get_item(k)?
+            .ok_or_else(|| PyKeyError::new_err(format!("bundle missing key '{k}'")))
     };
-    let get_i64 = |k: &str| -> Vec<i64> {
-        d.get_item(k)
-            .unwrap()
-            .unwrap()
-            .cast::<PyArray1<i64>>()
-            .unwrap()
-            .readonly()
-            .as_slice()
-            .unwrap()
-            .to_vec()
+    let get_i32 = |k: &str| -> PyResult<Vec<i32>> {
+        let obj = require(k)?;
+        let arr = obj.cast::<PyArray1<i32>>().map_err(|_| {
+            PyTypeError::new_err(format!("bundle key '{k}' must be an int32 1D array"))
+        })?;
+        Ok(arr.readonly().as_slice()?.to_vec())
     };
-    let get_i32_pairs = |k: &str| -> Vec<Range<usize>> {
-        let obj = d.get_item(k).unwrap().unwrap();
-        let arr = obj.cast::<PyArray2<i32>>().unwrap().readonly();
-        arr.as_array()
+    let get_i64 = |k: &str| -> PyResult<Vec<i64>> {
+        let obj = require(k)?;
+        let arr = obj.cast::<PyArray1<i64>>().map_err(|_| {
+            PyTypeError::new_err(format!("bundle key '{k}' must be an int64 1D array"))
+        })?;
+        Ok(arr.readonly().as_slice()?.to_vec())
+    };
+    let get_i32_pairs = |k: &str| -> PyResult<Vec<Range<usize>>> {
+        let obj = require(k)?;
+        let arr = obj
+            .cast::<PyArray2<i32>>()
+            .map_err(|_| {
+                PyTypeError::new_err(format!("bundle key '{k}' must be an int32 (N,2) array"))
+            })?
+            .readonly();
+        Ok(arr
+            .as_array()
             .rows()
             .into_iter()
             .map(|row| (row[0] as usize)..(row[1] as usize))
-            .collect()
+            .collect())
     };
-    let get_i64_pairs = |k: &str| -> Vec<Range<usize>> {
-        let obj = d.get_item(k).unwrap().unwrap();
-        let arr = obj.cast::<PyArray2<i64>>().unwrap().readonly();
-        arr.as_array()
+    let get_i64_pairs = |k: &str| -> PyResult<Vec<Range<usize>>> {
+        let obj = require(k)?;
+        let arr = obj
+            .cast::<PyArray2<i64>>()
+            .map_err(|_| {
+                PyTypeError::new_err(format!("bundle key '{k}' must be an int64 (N,2) array"))
+            })?
+            .readonly();
+        Ok(arr
+            .as_array()
             .rows()
             .into_iter()
             .map(|row| (row[0] as usize)..(row[1] as usize))
-            .collect()
+            .collect())
     };
+    let get_usize = |k: &str| -> PyResult<usize> { require(k)?.extract() };
 
-    let n_regions: usize = d.get_item("n_regions").unwrap().unwrap().extract().unwrap();
-    let n_samples: usize = d.get_item("n_samples").unwrap().unwrap().extract().unwrap();
-    let ploidy: usize = d.get_item("ploidy").unwrap().unwrap().extract().unwrap();
-
-    RangesBundle {
-        n_regions,
-        n_samples,
-        ploidy,
-        region_starts: get_i32("region_starts")
+    Ok(RangesBundle {
+        n_regions: get_usize("n_regions")?,
+        n_samples: get_usize("n_samples")?,
+        ploidy: get_usize("ploidy")?,
+        region_starts: get_i32("region_starts")?
             .into_iter()
             .map(|x| x as u32)
             .collect(),
-        dense_range: get_i32_pairs("dense_range"),
-        sample_cols: get_i64("sample_cols")
+        dense_range: get_i32_pairs("dense_range")?,
+        sample_cols: get_i64("sample_cols")?
             .into_iter()
             .map(|x| x as usize)
             .collect(),
-        vk_snp_range: get_i64_pairs("vk_snp_range"),
-        vk_indel_range: get_i64_pairs("vk_indel_range"),
-        dense_snp_range: get_i32_pairs("dense_snp_range"),
-        dense_indel_range: get_i32_pairs("dense_indel_range"),
-    }
+        vk_snp_range: get_i64_pairs("vk_snp_range")?,
+        vk_indel_range: get_i64_pairs("vk_indel_range")?,
+        dense_snp_range: get_i32_pairs("dense_snp_range")?,
+        dense_indel_range: get_i32_pairs("dense_indel_range")?,
+    })
 }
 
 #[pymethods]
@@ -239,7 +246,7 @@ impl PyContigReader {
         py: Python<'py>,
         bundle: Bound<'py, PyDict>,
     ) -> PyResult<Bound<'py, PyDict>> {
-        let rb = bundle_from_dict(&bundle);
+        let rb = bundle_from_dict(&bundle)?;
         let br = gather_ranges(&self.inner, &rb);
         batch_result_to_dict(py, self.inner.lut_arrays(), &br)
     }

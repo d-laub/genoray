@@ -54,3 +54,20 @@ def test_missing_reference_raises_file_not_found(tmp_path: Path):
     vcf = _write_vcf(tmp_path, "chr1\t3\t.\tA\tG\t.\t.\t.\tGT\t1|0\t0|0\n")
     with pytest.raises(FileNotFoundError):
         SparseVar2.from_vcf(tmp_path / "store", vcf, tmp_path / "nope.fa", threads=1)
+
+
+def test_gather_ranges_malformed_bundle_raises_keyerror(tmp_path: Path):
+    ref = _write_ref(tmp_path)
+    vcf = _write_vcf(
+        tmp_path,
+        "chr1\t3\t.\tA\tG\t.\t.\t.\tGT\t1|0\t0|0\n"
+        "chr1\t7\t.\tC\tCAT\t.\t.\t.\tGT\t0|1\t1|1\n",
+    )
+    out = tmp_path / "store"
+    SparseVar2.from_vcf(out, vcf, ref, threads=1)
+    sv = SparseVar2(out)
+
+    bundle = sv.find_ranges("chr1", [0], [40])
+    del bundle["sample_cols"]  # drop a required key
+    with pytest.raises(KeyError, match="sample_cols"):
+        sv.gather_ranges("chr1", bundle)
