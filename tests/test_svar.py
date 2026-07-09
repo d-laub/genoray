@@ -10,7 +10,7 @@ from pytest_cases import parametrize_with_cases
 from seqpro.rag import OFFSET_TYPE, lengths_to_offsets
 
 from genoray import SparseVar
-from genoray._svar import DOSAGE_TYPE, V_IDX_TYPE
+from genoray._types import DOSAGE_TYPE, V_IDX_TYPE
 from seqpro.rag import Ragged
 
 ddir = Path(__file__).parent / "data"
@@ -334,3 +334,10 @@ def test_read_ranges_with_length_accepts_scalar_sample_string():
     out_list = svar.read_ranges_with_length("chr1", 81261, 81266, samples=["sample1"])
     np.testing.assert_array_equal(out_str.data, out_list.data)
     np.testing.assert_array_equal(out_str.offsets, out_list.offsets)
+
+
+def test_read_ranges_preserves_duplicate_samples(svar: SparseVar):
+    # Behavior-preserving invariant: duplicates are NOT deduped on the read path.
+    s = svar.available_samples[0]
+    out = svar.read_ranges("chr1", 81261, 81266, samples=[s, s])
+    assert out.shape[1] == 2  # (ranges, samples, ploidy, ~variants) -> sample axis == 1

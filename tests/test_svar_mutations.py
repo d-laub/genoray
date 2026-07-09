@@ -29,7 +29,8 @@ def annotated_svar(tmp_path):
 
 def _build_tiny_svar(path):
     """Write a minimal valid SVAR directory with 2 samples, ploidy 1, 3 SNVs."""
-    from genoray._svar import SparseVarMetadata, _write_genos
+    from genoray._svar._core import SparseVarMetadata
+    from genoray._svar._io import _write_genos
     from seqpro.rag import Ragged
 
     path.mkdir(parents=True)
@@ -126,7 +127,8 @@ def _build_ploidy2_svar(path):
     offsets length = n_samples*ploidy + 1 = 2*2 + 1 = 5.
     offsets = [0, 1, 2, 2, 2]
     """
-    from genoray._svar import SparseVarMetadata, _write_genos
+    from genoray._svar._core import SparseVarMetadata
+    from genoray._svar._io import _write_genos
     from seqpro.rag import Ragged
 
     path.mkdir(parents=True)
@@ -495,7 +497,7 @@ def test_classify_variants_snv_context_uses_pos_minus_one(tmp_path):
 
 
 def test_metadata_has_mutcat_contigs_default():
-    from genoray._svar import SparseVarMetadata
+    from genoray._svar._core import SparseVarMetadata
 
     m = SparseVarMetadata(samples=["s0"], ploidy=1, contigs=["chr1"])
     assert m.mutcat_contigs is None
@@ -519,7 +521,8 @@ def _build_two_contig_svar(path):
     Variants (1-based POS): chr1@2, chr1@3, chr1@9, chr2@2, chr2@3.
     chr2@2 and chr2@3 are adjacent SNVs on sample 0's single haplotype.
     """
-    from genoray._svar import SparseVarMetadata, _write_genos
+    from genoray._svar._core import SparseVarMetadata
+    from genoray._svar._io import _write_genos
     from seqpro.rag import Ragged
 
     path.mkdir(parents=True)
@@ -637,7 +640,7 @@ def test_annotate_scope_adjacent_oos_snvs_not_dbs(tmp_path):
 
 
 def test_annotate_scope_persists_mutcat_contigs(tmp_path):
-    from genoray._svar import SparseVarMetadata
+    from genoray._svar._core import SparseVarMetadata
 
     d = tmp_path / "two.svar"
     _build_two_contig_svar(d)
@@ -652,7 +655,7 @@ def test_annotate_scope_persists_mutcat_contigs(tmp_path):
 
 
 def test_annotate_no_scope_persists_none(tmp_path):
-    from genoray._svar import SparseVarMetadata
+    from genoray._svar._core import SparseVarMetadata
 
     d = tmp_path / "two.svar"
     _build_two_contig_svar(d)
