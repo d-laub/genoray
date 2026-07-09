@@ -156,10 +156,12 @@ ID83_INDEX = {lbl: ID83_OFFSET + i for i, lbl in enumerate(ID83)}
 
 MUTCAT_VERSION = 3
 
+Kind = Literal["SBS96", "DBS78", "ID83"]
+
 _LABELS: dict[str, list[str]] = {"SBS96": SBS96, "DBS78": DBS78, "ID83": ID83}
 
 
-def code_ranges() -> dict[str, tuple[int, int]]:
+def code_ranges() -> dict[Kind, tuple[int, int]]:
     """Half-open ``[start, end)`` code range per matrix kind."""
     return {
         "SBS96": (SBS96_OFFSET, DBS78_OFFSET),
@@ -168,7 +170,7 @@ def code_ranges() -> dict[str, tuple[int, int]]:
     }
 
 
-def labels(kind: str) -> list[str]:
+def labels(kind: Kind) -> list[str]:
     """Return the ordered label list for a given mutation category kind."""
     if kind not in _LABELS:
         raise ValueError(
@@ -663,7 +665,7 @@ def count_matrix(
     ploidy: int,
     n_samples: int,
     sample_names: list[str],
-    kind: Literal["SBS96", "DBS78", "ID83"],
+    kind: Kind,
     per_sample: bool,
 ) -> "pl.DataFrame":
     counts = np.zeros((n_samples, N_CODES), dtype=np.int64)
