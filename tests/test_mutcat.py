@@ -579,7 +579,10 @@ def test_not_annotated_sentinel_and_version():
 
     # distinct from the existing sentinels and from MISSING (-3)
     assert Sentinel.NOT_ANNOTATED == -4
-    assert len(set(Sentinel)) == len(Sentinel)
+    # Guard against a future accidental duplicate value: use __members__ (which
+    # includes aliases) rather than iterating the enum (which drops aliases and
+    # would make this a tautology).
+    assert len(set(Sentinel.__members__.values())) == len(Sentinel.__members__)
     # on-disk semantics changed -> version bumped
     assert MUTCAT_VERSION == 3
 
