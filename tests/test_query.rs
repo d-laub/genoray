@@ -10,7 +10,7 @@ use proptest::prelude::*;
 
 use common::{OwnedRecord, SynthRecord, arb_records, build_contig};
 use genoray_core::query::ContigReader;
-use genoray_core::query::overlap_sample;
+use genoray_core::query::oracle::overlap_sample;
 use tempfile::tempdir;
 
 #[test]

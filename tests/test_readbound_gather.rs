@@ -5,9 +5,10 @@ mod common;
 
 use common::{SynthRecord, build_contig};
 use genoray_core::bits_get_bit;
+use genoray_core::query::oracle::{decode_keyref_alt, gather_ranges_readbound};
 use genoray_core::query::{
-    BatchResultSplit, ContigReader, HapCalls, KeyRef, decode_keyref_alt_pub, find_ranges,
-    gather_haps_readbound, gather_ranges_readbound, overlap_batch,
+    BatchResultSplit, ContigReader, HapCalls, HapRanges, KeyRef, find_ranges,
+    gather_haps_readbound, overlap_batch,
 };
 use genoray_core::search;
 use tempfile::tempdir;
@@ -74,14 +75,14 @@ fn test_find_ranges_emits_per_class_dense_ranges() {
     assert_eq!(rb.dense_snp_range.len(), regions.len());
     assert_eq!(rb.dense_indel_range.len(), regions.len());
     // Each per-class window is a subset of that class's table; ranges are valid.
-    for &(s, e) in rb.dense_snp_range.iter().chain(rb.dense_indel_range.iter()) {
-        assert!(s <= e);
+    for r in rb.dense_snp_range.iter().chain(rb.dense_indel_range.iter()) {
+        assert!(r.start <= r.end);
     }
     // Region 0 spans the whole contig: it must see the dense SNP (pos 150,
     // AC=4) and the dense indels. The union window must equal snp∪indel counts.
-    let (us0, ue0) = rb.dense_range[0];
-    let snp0 = rb.dense_snp_range[0].1 - rb.dense_snp_range[0].0;
-    let indel0 = rb.dense_indel_range[0].1 - rb.dense_indel_range[0].0;
+    let (us0, ue0) = (rb.dense_range[0].start, rb.dense_range[0].end);
+    let snp0 = rb.dense_snp_range[0].end - rb.dense_snp_range[0].start;
+    let indel0 = rb.dense_indel_range[0].end - rb.dense_indel_range[0].start;
     // Empirical coverage guard: the fixture MUST route at least one SNP to the
     // Dense class, else the dense_snp / dense_snp_present channel of
     // BatchResultSplit is never exercised with real content and a SNP-class
@@ -172,7 +173,7 @@ fn test_readbound_reconstructs_union_per_hap() {
                 let got_dec: Vec<(u32, i32, Vec<u8>)> = got_keys
                     .iter()
                     .map(|&(pos, key)| {
-                        let (ilen, alt) = decode_keyref_alt_pub(pos, key as u32, &reader);
+                        let (ilen, alt) = decode_keyref_alt(pos, key as u32, &reader);
                         (pos, ilen, alt)
                     })
                     .collect();
@@ -224,6 +225,21 @@ fn reader_ploidy(_r: &ContigReader) -> usize {
 }
 
 #[test]
+#[should_panic(expected = "vk_snp_range len must equal n_q*ploidy")]
+fn test_hapranges_new_rejects_mismatched_vk_len() {
+    use genoray_core::query::HapRanges;
+    let _ = HapRanges::new(
+        &[0u32, 100],
+        &[0, 1],
+        &[(0, 1)],
+        &[(0, 1)],
+        &[(0, 0), (0, 0)],
+        &[(0, 0), (0, 0)],
+        2,
+    );
+}
+
+#[test]
 fn test_flat_gather_matches_cartesian_full_cohort() {
     let tmp = tempdir().unwrap();
     let out = tmp.path().join("out");
@@ -248,17 +264,16 @@ fn test_flat_gather_matches_cartesian_full_cohort() {
         for s in 0..s_n {
             region_starts.push(rb.region_starts[r]);
             orig_samples.push(rb.sample_cols[s]);
-            dsr.push(rb.dense_snp_range[r]);
-            dir_.push(rb.dense_indel_range[r]);
+            dsr.push((rb.dense_snp_range[r].start, rb.dense_snp_range[r].end));
+            dir_.push((rb.dense_indel_range[r].start, rb.dense_indel_range[r].end));
             for p in 0..ploidy {
                 let row = r * (s_n * ploidy) + s * ploidy + p;
-                vk_snp_range.push(rb.vk_snp_range[row]);
-                vk_indel_range.push(rb.vk_indel_range[row]);
+                vk_snp_range.push((rb.vk_snp_range[row].start, rb.vk_snp_range[row].end));
+                vk_indel_range.push((rb.vk_indel_range[row].start, rb.vk_indel_range[row].end));
             }
         }
     }
-    let flat = gather_haps_readbound(
-        &reader,
+    let rb = HapRanges::new(
         &region_starts,
         &orig_samples,
         &vk_snp_range,
@@ -267,6 +282,7 @@ fn test_flat_gather_matches_cartesian_full_cohort() {
         &dir_,
         ploidy,
     );
+    let flat = gather_haps_readbound(&reader, &rb);
 
     // Compare decoded per-hap. cart hap (r,s,p) == flat query q=r*S+s, ploid p.
     for r in 0..regions.len() {
@@ -320,17 +336,16 @@ fn test_gather_haps_readbound_byte_identical() {
         for s in 0..s_n {
             region_starts.push(rb.region_starts[r]);
             orig_samples.push(rb.sample_cols[s]);
-            dsr.push(rb.dense_snp_range[r]);
-            dir_.push(rb.dense_indel_range[r]);
+            dsr.push((rb.dense_snp_range[r].start, rb.dense_snp_range[r].end));
+            dir_.push((rb.dense_indel_range[r].start, rb.dense_indel_range[r].end));
             for p in 0..ploidy {
                 let row = r * (s_n * ploidy) + s * ploidy + p;
-                vk_snp_range.push(rb.vk_snp_range[row]);
-                vk_indel_range.push(rb.vk_indel_range[row]);
+                vk_snp_range.push((rb.vk_snp_range[row].start, rb.vk_snp_range[row].end));
+                vk_indel_range.push((rb.vk_indel_range[row].start, rb.vk_indel_range[row].end));
             }
         }
     }
-    let flat: BatchResultSplit = gather_haps_readbound(
-        &reader,
+    let rb2 = HapRanges::new(
         &region_starts,
         &orig_samples,
         &vk_snp_range,
@@ -339,6 +354,7 @@ fn test_gather_haps_readbound_byte_identical() {
         &dir_,
         ploidy,
     );
+    let flat: BatchResultSplit = gather_haps_readbound(&reader, &rb2);
 
     let mut any_nonempty_vk = false;
     let mut any_dense_snp_present = false;
@@ -365,7 +381,7 @@ fn test_gather_haps_readbound_byte_identical() {
                 }
 
                 // Raw dense/snp presence bits over this region's dense_snp window.
-                let (ss, se) = rb.dense_snp_range[r];
+                let (ss, se) = (rb.dense_snp_range[r].start, rb.dense_snp_range[r].end);
                 let cart_bit0 = cart.dense_snp_present_off[ch];
                 let flat_bit0 = flat.dense_snp_present_off[fh];
                 for k in 0..(se - ss) {
@@ -379,7 +395,7 @@ fn test_gather_haps_readbound_byte_identical() {
                 }
 
                 // Raw dense/indel presence bits over this region's dense_indel window.
-                let (is_, ie_) = rb.dense_indel_range[r];
+                let (is_, ie_) = (rb.dense_indel_range[r].start, rb.dense_indel_range[r].end);
                 let cart_bit0 = cart.dense_indel_present_off[ch];
                 let flat_bit0 = flat.dense_indel_present_off[fh];
                 for k in 0..(ie_ - is_) {
@@ -478,17 +494,16 @@ fn test_gather_haps_readbound_tie_break_snp_before_indel() {
         for s in 0..s_n {
             region_starts.push(rb.region_starts[r]);
             orig_samples.push(rb.sample_cols[s]);
-            dsr.push(rb.dense_snp_range[r]);
-            dir_.push(rb.dense_indel_range[r]);
+            dsr.push((rb.dense_snp_range[r].start, rb.dense_snp_range[r].end));
+            dir_.push((rb.dense_indel_range[r].start, rb.dense_indel_range[r].end));
             for p in 0..ploidy {
                 let row = r * (s_n * ploidy) + s * ploidy + p;
-                vk_snp_range.push(rb.vk_snp_range[row]);
-                vk_indel_range.push(rb.vk_indel_range[row]);
+                vk_snp_range.push((rb.vk_snp_range[row].start, rb.vk_snp_range[row].end));
+                vk_indel_range.push((rb.vk_indel_range[row].start, rb.vk_indel_range[row].end));
             }
         }
     }
-    let flat: BatchResultSplit = gather_haps_readbound(
-        &reader,
+    let rb2 = HapRanges::new(
         &region_starts,
         &orig_samples,
         &vk_snp_range,
@@ -497,6 +512,7 @@ fn test_gather_haps_readbound_tie_break_snp_before_indel() {
         &dir_,
         ploidy,
     );
+    let flat: BatchResultSplit = gather_haps_readbound(&reader, &rb2);
 
     // Locate S0 ploid0 in both layouts (region 0, sample slot for S0, p=0).
     let s0_slot = rb
@@ -527,7 +543,7 @@ fn test_gather_haps_readbound_tie_break_snp_before_indel() {
     let decoded: Vec<(u32, i32, Vec<u8>)> = cart_vk
         .iter()
         .map(|kr| {
-            let (ilen, alt) = decode_keyref_alt_pub(kr.position, kr.key, &reader);
+            let (ilen, alt) = decode_keyref_alt(kr.position, kr.key, &reader);
             (kr.position, ilen, alt)
         })
         .collect();
