@@ -15,6 +15,7 @@ description: Use when writing or modifying Python code that imports `genoray` to
 - `genoray.PGEN` — PLINK 2 PGEN reader
 - `genoray.Reference` — indexed-FASTA reference genome reader
 - `genoray.VCF` — VCF/BCF reader
+- `genoray.Filter` — VCF filter value object bundling a cyvcf2 record predicate (`record`) with its matching `.gvi` polars expression (`expr`)
 - `genoray.Reader` — type alias `VCF | PGEN | SparseVar`
 - `genoray.SparseVar` — sparse `.svar` reader/writer
 - `genoray.SparseVar2` — next-gen sparse variant store (VCF/BCF → SVAR2 conversion via `from_vcf`; range queries via `decode`/`region_counts`/`read_ranges`)
@@ -95,6 +96,7 @@ for chunk in vcf.chunk("chr1", start=0, end=1_000_000,
 - Shape with `phasing=True`: `(samples, ploidy+1=3, variants)` — the 3rd row along the ploidy axis is `0` (unphased) / `1` (phased), matching cyvcf2.
 - Dosage arrays drop the ploidy axis: `(samples, variants)`, dtype `float32`.
 - VCF intentionally has **no `read_ranges`** — benchmarking showed no throughput benefit.
+- `read(out=...)` is **VCF-only** — pass a pre-allocated array to fill in place. PGEN random-access reads allocate fresh and have no `out=` buffer.
 
 ## PGEN — quick reference
 
