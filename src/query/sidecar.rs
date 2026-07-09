@@ -91,32 +91,39 @@ impl DenseView {
 
 /// Load a CSR `offsets.npy` (len `columns + 1`); a missing file means an empty
 /// stream — return an all-zero prefix-sum so every column is empty.
-pub(crate) fn load_offsets(path: &Path, columns: usize) -> Vec<u64> {
+pub(crate) fn load_offsets(path: &Path, columns: usize) -> std::io::Result<Vec<u64>> {
     if path.exists() {
-        let a: Array1<u64> = ndarray_npy::read_npy(path).expect("read offsets.npy");
-        a.to_vec()
+        let a: Array1<u64> = ndarray_npy::read_npy(path)
+            .map_err(|e| std::io::Error::other(format!("read {}: {e}", path.display())))?;
+        Ok(a.to_vec())
     } else {
-        vec![0u64; columns + 1]
+        Ok(vec![0u64; columns + 1])
     }
 }
 
 /// Load `max_del.npy` (`u32`, shape `(n_samples, ploidy)`); a missing file
 /// (pure-SNP contig, or predating the post-pass) defaults to all-zero.
-pub(crate) fn load_max_del(path: &Path, n_samples: usize, ploidy: usize) -> Array2<u32> {
+pub(crate) fn load_max_del(
+    path: &Path,
+    n_samples: usize,
+    ploidy: usize,
+) -> std::io::Result<Array2<u32>> {
     if path.exists() {
-        ndarray_npy::read_npy(path).expect("read max_del.npy")
+        ndarray_npy::read_npy(path)
+            .map_err(|e| std::io::Error::other(format!("read {}: {e}", path.display())))
     } else {
-        Array2::zeros((n_samples, ploidy))
+        Ok(Array2::zeros((n_samples, ploidy)))
     }
 }
 
 /// Load `dense/max_del.npy` (`u32`, shape `(1,)`); missing defaults to `0`.
-pub(crate) fn load_dense_max_del(path: &Path) -> u32 {
+pub(crate) fn load_dense_max_del(path: &Path) -> std::io::Result<u32> {
     if path.exists() {
-        let a: Array1<u32> = ndarray_npy::read_npy(path).expect("read dense/max_del.npy");
-        a.into_iter().next().unwrap_or(0)
+        let a: Array1<u32> = ndarray_npy::read_npy(path)
+            .map_err(|e| std::io::Error::other(format!("read {}: {e}", path.display())))?;
+        Ok(a.into_iter().next().unwrap_or(0))
     } else {
-        0
+        Ok(0)
     }
 }
 
@@ -134,4 +141,24 @@ pub(crate) fn open_dense(dir: &Path) -> std::io::Result<Option<DenseView>> {
         positions,
         n_dense_variants,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_offsets_missing_file_is_empty_prefix_sum() {
+        let p = std::path::Path::new("/nonexistent-sp3/offsets.npy");
+        let v = load_offsets(p, 3).unwrap();
+        assert_eq!(v, vec![0u64; 4]);
+    }
+
+    #[test]
+    fn load_offsets_corrupt_file_returns_err() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("offsets.npy");
+        std::fs::write(&p, b"not a valid npy header").unwrap();
+        assert!(load_offsets(&p, 3).is_err());
+    }
 }

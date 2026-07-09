@@ -102,20 +102,17 @@ pub struct LongAlleleReader {
 }
 
 impl LongAlleleReader {
-    // TODO: Decide which will call this (or create this instance)
-    pub fn new(output_dir: &str, chrom: &str) -> Self {
+    pub fn new(output_dir: &str, chrom: &str) -> std::io::Result<Self> {
         // Layout matches the writer: {output_dir}/{chrom}/indel/{long_alleles.bin, long_allele_offsets.npy}
         let paths = ContigPaths::new(output_dir, chrom);
-
-        let file = File::open(paths.long_alleles_bin()).expect("Failed to open long_alleles.bin");
-
+        let file = File::open(paths.long_alleles_bin())?;
         let offsets_array: ndarray::Array1<u64> =
-            ndarray_npy::read_npy(paths.long_allele_offsets()).expect("Failed to load offsets npy");
-
-        Self {
+            ndarray_npy::read_npy(paths.long_allele_offsets())
+                .map_err(|e| std::io::Error::other(format!("read long_allele_offsets.npy: {e}")))?;
+        Ok(Self {
             file,
             offsets: offsets_array.into_raw_vec_and_offset().0,
-        }
+        })
     }
 
     // Fetches the exact DNA string from the disk using the 31-bit row index.
@@ -195,7 +192,7 @@ mod tests {
         let offsets = ndarray::Array1::from_vec(vec![0u64, 4, 6]);
         ndarray_npy::write_npy(dir.join("long_allele_offsets.npy"), &offsets).unwrap();
 
-        let reader = LongAlleleReader::new(tmp.path().to_str().unwrap(), "chr1");
+        let reader = LongAlleleReader::new(tmp.path().to_str().unwrap(), "chr1").unwrap();
         // &self: two immutable calls, no &mut needed
         assert_eq!(reader.get_allele(0), b"AAAA".to_vec());
         assert_eq!(reader.get_allele(1), b"CC".to_vec());
@@ -212,7 +209,7 @@ mod tests {
         let offsets = ndarray::Array1::from_vec(vec![0u64, 4, 6]);
         ndarray_npy::write_npy(dir.join("long_allele_offsets.npy"), &offsets).unwrap();
 
-        let reader = LongAlleleReader::new(tmp.path().to_str().unwrap(), "chr1");
+        let reader = LongAlleleReader::new(tmp.path().to_str().unwrap(), "chr1").unwrap();
         assert_eq!(reader.offsets(), &[0u64, 4, 6]);
         assert_eq!(reader.all_bytes(), b"AAAACC".to_vec());
     }

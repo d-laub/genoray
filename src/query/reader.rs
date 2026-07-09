@@ -57,22 +57,22 @@ impl ContigReader {
         let vk_snp = SubStreamView {
             positions: mmap_file(&layout::positions(&vk_snp_dir))?,
             keys: mmap_file(&layout::alleles(&vk_snp_dir))?,
-            offsets: load_offsets(&layout::offsets(&vk_snp_dir), columns),
+            offsets: load_offsets(&layout::offsets(&vk_snp_dir), columns)?,
         };
         let vk_indel = SubStreamView {
             positions: mmap_file(&layout::positions(&vk_indel_dir))?,
             keys: mmap_file(&layout::alleles(&vk_indel_dir))?,
-            offsets: load_offsets(&layout::offsets(&vk_indel_dir), columns),
+            offsets: load_offsets(&layout::offsets(&vk_indel_dir), columns)?,
         };
 
         let dense_snp = open_dense(&paths.dense_snp_dir())?;
         let dense_indel = open_dense(&paths.dense_indel_dir())?;
 
-        let vk_indel_max_del = load_max_del(&layout::max_del(&contig_dir), n_samples, ploidy);
-        let dense_indel_max_del = load_dense_max_del(&layout::dense_max_del(&contig_dir));
+        let vk_indel_max_del = load_max_del(&layout::max_del(&contig_dir), n_samples, ploidy)?;
+        let dense_indel_max_del = load_dense_max_del(&layout::dense_max_del(&contig_dir))?;
 
         let lut = if paths.long_alleles_bin().exists() {
-            Some(LongAlleleReader::new(base_out_dir, chrom))
+            Some(LongAlleleReader::new(base_out_dir, chrom)?)
         } else {
             None
         };
