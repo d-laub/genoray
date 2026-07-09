@@ -6,6 +6,7 @@ use std::path::Path;
 
 use ndarray::Array2;
 
+use crate::dense::DenseClass;
 use crate::layout::{self, ContigPaths};
 use crate::nrvk::LongAlleleReader;
 use crate::rvk;
@@ -99,6 +100,16 @@ impl ContigReader {
             None => (Vec::new(), vec![0u64]),
         }
     }
+
+    /// The dense view backing `class`, or `None` if this contig has no table of
+    /// that class. Replaces the `if is_indel { &self.dense_indel } else { ... }`
+    /// dispatch that a bool-and-col src pair forced at every carriage test.
+    pub(crate) fn dense_view(&self, class: DenseClass) -> Option<&DenseView> {
+        match class {
+            DenseClass::Snp => self.dense_snp.as_ref(),
+            DenseClass::Indel => self.dense_indel.as_ref(),
+        }
+    }
 }
 
 impl ContigReader {
@@ -174,18 +185,11 @@ impl ContigReader {
             if union.v_ends[j] <= q_start {
                 continue;
             }
-            let (is_indel, col) = union.src[j];
-            let carried = if is_indel {
-                self.dense_indel
-                    .as_ref()
-                    .expect("indel src implies table")
-                    .carried(hap, col)
-            } else {
-                self.dense_snp
-                    .as_ref()
-                    .expect("snp src implies table")
-                    .carried(hap, col)
-            };
+            let (class, col) = union.src[j];
+            let carried = self
+                .dense_view(class)
+                .expect("dense src implies table")
+                .carried(hap, col);
             if carried {
                 out.push(union.refs[j]);
             }

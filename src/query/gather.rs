@@ -193,20 +193,11 @@ pub fn overlap_batch(reader: &ContigReader, regions: &[(u32, u32)]) -> BatchResu
                 let nbits = de - ds;
                 presence.push_hap(nbits, |k| {
                     let j = ds + k;
-                    let (is_indel, dcol) = dense.src[j];
-                    let carried = if is_indel {
-                        reader
-                            .dense_indel
-                            .as_ref()
-                            .expect("indel src implies table")
-                            .carried(hap, dcol)
-                    } else {
-                        reader
-                            .dense_snp
-                            .as_ref()
-                            .expect("snp src implies table")
-                            .carried(hap, dcol)
-                    };
+                    let (class, dcol) = dense.src[j];
+                    let carried = reader
+                        .dense_view(class)
+                        .expect("dense src implies table")
+                        .carried(hap, dcol);
                     carried && dense.v_ends[j] > qs
                 });
             }
@@ -359,20 +350,11 @@ pub fn gather_ranges(reader: &ContigReader, rb: &RangesBundle) -> BatchResult {
                 let nbits = de - ds;
                 presence.push_hap(nbits, |k| {
                     let j = ds + k;
-                    let (is_indel, dcol) = dense.src[j];
-                    let carried = if is_indel {
-                        reader
-                            .dense_indel
-                            .as_ref()
-                            .expect("indel src implies table")
-                            .carried(hap, dcol)
-                    } else {
-                        reader
-                            .dense_snp
-                            .as_ref()
-                            .expect("snp src implies table")
-                            .carried(hap, dcol)
-                    };
+                    let (class, dcol) = dense.src[j];
+                    let carried = reader
+                        .dense_view(class)
+                        .expect("dense src implies table")
+                        .carried(hap, dcol);
                     carried && dense.v_ends[j] > qs
                 });
             }
