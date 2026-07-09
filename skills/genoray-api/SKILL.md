@@ -279,6 +279,17 @@ two-channel `BatchResult` → numpy dict (`vk_pos`/`vk_key`/`vk_off`, `dense_*`,
   gather_ranges(find_ranges(...))`. `find_ranges(out=...)` streams the bundle into
   caller-preallocated arrays.
 
+### Errors
+
+genoray raises standard Python builtins, by category:
+
+- `ValueError` — bad input content: contig/sample not found, REF disagrees with
+  the reference FASTA, or a symbolic/breakend ALT with `skip_out_of_scope=False`.
+- `FileNotFoundError` — a required input file is missing.
+- `OSError` — a corrupt/truncated store sidecar or an underlying disk I/O failure.
+- `RuntimeError` — an internal genoray bug (a worker thread panicked); please
+  report it.
+
 ## CLI (`genoray write`)
 
 `genoray write` **defaults to SVAR2**; `genoray write svar1` runs the previous
