@@ -874,15 +874,6 @@ class VCF:
         info: list[str] | None = None,
         lazy: bool = False,
     ) -> pl.DataFrame | pl.LazyFrame: ...
-    def _oxbow_reader(self) -> Callable:
-        """Return the oxbow reader callable appropriate for this file's extension."""
-        if self.path.suffix == ".bcf":
-            return oxbow.from_bcf
-        elif re.search(r"\.vcf(\.gz)?$", self.path.name) is not None:
-            return oxbow.from_vcf
-        else:
-            raise ValueError(f"Unsupported file extension: {self.path.suffix}")
-
     def get_record_info(
         self,
         contig: str | None = None,
@@ -951,6 +942,15 @@ class VCF:
             df = df.collect()
 
         return df
+
+    def _oxbow_reader(self) -> Callable:
+        """Return the oxbow reader callable appropriate for this file's extension."""
+        if self.path.suffix == ".bcf":
+            return oxbow.from_bcf
+        elif re.search(r"\.vcf(\.gz)?$", self.path.name) is not None:
+            return oxbow.from_vcf
+        else:
+            raise ValueError(f"Unsupported file extension: {self.path.suffix}")
 
     def _declared_info_fields(self, candidates: tuple[str, ...]) -> list[str]:
         """Return which of ``candidates`` are declared as INFO fields in the VCF header.
