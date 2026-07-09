@@ -8,14 +8,14 @@ import tempfile
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import TypeVar, overload
+from typing import overload
 
 import numpy as np
 import polars as pl
 from hirola import HashTable
 from numpy.typing import ArrayLike, DTypeLike, NDArray
 
-DTYPE = TypeVar("DTYPE", bound=np.generic)
+from ._types import DTYPE as DTYPE
 
 _MITO_ALIASES = ("M", "MT", "chrM", "chrMT")
 
