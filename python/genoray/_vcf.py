@@ -660,16 +660,10 @@ class VCF:
                     ]
 
             if ds_buffer is not None:
-                d = v.format(self.dosage_field)
-                if d is None:
-                    raise DosageFieldError(
-                        f"Dosage field '{self.dosage_field}' not found for record {v!r}"
-                    )
-                if d.shape[1] > 1:
-                    raise MultiallelicDosageError(
-                        f"Multiallelic dosages are not supported, encountered in VCF record {v!r}"
-                    )
-                ds_buffer[..., i] = d.squeeze(1)[self._s_sorter]
+                assert self.dosage_field is not None
+                ds_buffer[..., i] = self._extract_dosage(v, self.dosage_field)[
+                    self._s_sorter
+                ]
 
             i += 1
 
@@ -1251,6 +1245,21 @@ class VCF:
 
         return out, v.end  # type: ignore
 
+    def _extract_dosage(
+        self, v: cyvcf2.Variant, dosage_field: str
+    ) -> NDArray[np.float32]:
+        """Fetch, validate, and squeeze the per-sample dosage for one record."""
+        d = v.format(dosage_field)
+        if d is None:
+            raise DosageFieldError(
+                f"Dosage field '{dosage_field}' not found for record {v!r}"
+            )
+        if d.shape[1] > 1:
+            raise MultiallelicDosageError(
+                f"Multiallelic dosages are not supported, encountered in VCF record {v!r}"
+            )
+        return d.squeeze(1)
+
     def _fill_dosages(
         self, vcf: cyvcf2.VCF, out: Dosages | None, dosage_field: str
     ) -> tuple[Dosages, int]:
@@ -1260,17 +1269,7 @@ class VCF:
         if out is None:
             out_ls: list[NDArray[np.float32]] = []
             for v in vcf:
-                d = v.format(dosage_field)
-                if d is None:
-                    raise DosageFieldError(
-                        f"Dosage field '{dosage_field}' not found for record {v!r}"
-                    )
-                if d.shape[1] > 1:
-                    raise MultiallelicDosageError(
-                        f"Multiallelic dosages are not supported, encountered in VCF record {v!r}"
-                    )
-
-                out_ls.append(d.squeeze(1))
+                out_ls.append(self._extract_dosage(v, dosage_field))
 
                 if self._pbar is not None:
                     self._pbar.update()
@@ -1296,16 +1295,7 @@ class VCF:
         i = 0
         for i, v in enumerate(vcf):
             # (samples alts)
-            d = v.format(dosage_field)
-            if d is None:
-                raise DosageFieldError(
-                    f"Dosage field '{dosage_field}' not found for record {v!r}"
-                )
-            if d.shape[1] > 1:
-                raise MultiallelicDosageError(
-                    f"Multiallelic dosages are not supported, encountered in VCF record {v!r}"
-                )
-            out[..., i] = d.squeeze(1)[self._s_sorter]
+            out[..., i] = self._extract_dosage(v, dosage_field)[self._s_sorter]
 
             if self._pbar is not None:
                 self._pbar.update()
@@ -1343,17 +1333,7 @@ class VCF:
                     # (s p) np.int16
                     geno_ls.append(v.genotype.array()[:, : self.ploidy])
 
-                d = v.format(dosage_field)
-                if d is None:
-                    raise DosageFieldError(
-                        f"Dosage field '{dosage_field}' not found for record {v!r}"
-                    )
-                if d.shape[1] > 1:
-                    raise MultiallelicDosageError(
-                        f"Multiallelic dosages are not supported, encountered in VCF record {v!r}"
-                    )
-
-                dosage_ls.append(d.squeeze(1))
+                dosage_ls.append(self._extract_dosage(v, dosage_field))
 
                 if self._pbar is not None:
                     self._pbar.update()
@@ -1390,16 +1370,7 @@ class VCF:
             else:
                 out[0][..., i] = v.genotype.array()[self._s_sorter, : self.ploidy]
 
-            d = v.format(dosage_field)
-            if d is None:
-                raise DosageFieldError(
-                    f"Dosage field '{dosage_field}' not found for record {v!r}"
-                )
-            if d.shape[1] > 1:
-                raise MultiallelicDosageError(
-                    f"Multiallelic dosages are not supported, encountered in VCF record {v!r}"
-                )
-            out[1][..., i] = d.squeeze(1)[self._s_sorter]
+            out[1][..., i] = self._extract_dosage(v, dosage_field)[self._s_sorter]
 
             if ilens is not None:
                 ilens[i] = len(v.ALT[0]) - len(v.REF)
@@ -1523,13 +1494,8 @@ class VCF:
                 genos = v.genotype.array()[:, :ploidy, None]
                 genos = genos.astype(mode._gdtype)
 
-                dosages = v.format(dosage_field)
-                if dosages is None:
-                    raise DosageFieldError(
-                        f"Dosage field '{dosage_field}' not found for record {v!r}"
-                    )
                 # (s, 1, 1) or (s, 1)? -> (s)
-                dosages = dosages.squeeze(1)[self._s_sorter, None]
+                dosages = self._extract_dosage(v, dosage_field)[self._s_sorter, None]
 
                 ls_geno_dosages.append((genos, dosages))  # type: ignore
 
