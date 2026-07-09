@@ -6,7 +6,7 @@ from collections.abc import Iterable, Sequence
 from functools import cached_property
 from os import PathLike
 from pathlib import Path
-from typing import Any, Generic, Literal, TypeVar, cast, overload
+from typing import Any, Generic, Literal, TypeVar, overload
 
 import awkward as ak
 import joblib
@@ -50,6 +50,7 @@ from ._regions import (
     _normalize_samples,
     _resolve_kept_rows,
     _resolve_kept_var_idxs,
+    _resolve_sample_idxs,
     _validate_fields,
 )
 
@@ -308,14 +309,9 @@ class SparseVar(SparseVarAnnotateMixin, Generic[_SRT]):
             Shape: (2, ranges, samples, ploidy). The first column is the start index of the variant
             and the second column is the end index of the variant.
         """
-        if samples is None:
-            samples = np.atleast_1d(np.array(self.available_samples))
-        else:
-            samples = np.atleast_1d(np.array(samples))
-            if missing := set(samples) - set(self.available_samples):  # type: ignore
-                raise ValueError(f"Samples {missing} not found in the dataset.")
-
-        s_idxs = cast(NDArray[np.int64], self._s2i[samples])
+        samples, s_idxs = _resolve_sample_idxs(
+            samples, self.available_samples, self._s2i
+        )
 
         starts = np.atleast_1d(np.asarray(starts, POS_TYPE))
         n_ranges = len(starts)
@@ -379,14 +375,9 @@ class SparseVar(SparseVarAnnotateMixin, Generic[_SRT]):
                 "Cannot use with_length operations with multiallelic variants."
             )
 
-        if samples is None:
-            samples = np.atleast_1d(np.array(self.available_samples))
-        else:
-            samples = np.atleast_1d(np.array(samples))
-            if missing := set(samples) - set(self.available_samples):  # type: ignore
-                raise ValueError(f"Samples {missing} not found in the dataset.")
-
-        s_idxs = cast(NDArray[np.int64], self._s2i[samples])
+        samples, s_idxs = _resolve_sample_idxs(
+            samples, self.available_samples, self._s2i
+        )
 
         starts = np.atleast_1d(np.asarray(starts, POS_TYPE))
         n_ranges = len(starts)
@@ -446,12 +437,7 @@ class SparseVar(SparseVarAnnotateMixin, Generic[_SRT]):
             a ``Ragged`` of its respective dtype. All arrays are backed by memory-mapped
             data so only the offsets reside in RAM.
         """
-        if samples is None:
-            samples = np.atleast_1d(np.array(self.available_samples))
-        else:
-            samples = np.atleast_1d(np.array(samples))
-            if missing := set(samples) - set(self.available_samples):  # type: ignore
-                raise ValueError(f"Samples {missing} not found in the dataset.")
+        samples, _ = _resolve_sample_idxs(samples, self.available_samples, self._s2i)
 
         n_samples = len(samples)
         starts = np.atleast_1d(np.asarray(starts, POS_TYPE))
@@ -501,12 +487,7 @@ class SparseVar(SparseVarAnnotateMixin, Generic[_SRT]):
         -------
             Same return structure as :meth:`read_ranges`.
         """
-        if samples is None:
-            samples = np.atleast_1d(np.array(self.available_samples))
-        else:
-            samples = np.atleast_1d(np.array(samples))
-            if missing := set(samples) - set(self.available_samples):  # type: ignore
-                raise ValueError(f"Samples {missing} not found in the dataset.")
+        samples, _ = _resolve_sample_idxs(samples, self.available_samples, self._s2i)
 
         n_samples = len(samples)
         starts = np.atleast_1d(np.asarray(starts, POS_TYPE))

@@ -5,12 +5,13 @@ import warnings
 from collections.abc import Sequence
 from os import PathLike
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, cast
 
 import numpy as np
 import polars as pl
 import seqpro as sp
-from numpy.typing import NDArray
+from hirola import HashTable
+from numpy.typing import ArrayLike, NDArray
 
 from .._types import V_IDX_TYPE
 from .._utils import ContigNormalizer
@@ -166,6 +167,27 @@ def _normalize_samples(
             seen.add(s)
             deduped.append(s)
     return deduped
+
+
+def _resolve_sample_idxs(
+    samples: "ArrayLike | None",
+    available: Sequence[str],
+    s2i: HashTable,
+) -> tuple[NDArray, NDArray[np.int64]]:
+    """Validate `samples` against `available`, preserving caller order AND
+    duplicates, and return (name_array, integer_sample_indices).
+
+    `None` selects all `available`. A bare `str` is coerced to a single-element
+    array first, so it is treated as one sample name (not iterated per-character).
+    """
+    if samples is None:
+        names = np.atleast_1d(np.asarray(available))
+    else:
+        names = np.atleast_1d(np.asarray(samples))
+        if missing := set(names.tolist()) - set(available):
+            raise ValueError(f"Samples {missing} not found in the dataset.")
+    s_idxs = cast(NDArray[np.int64], s2i[names])
+    return names, s_idxs
 
 
 def _validate_fields(
