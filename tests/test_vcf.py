@@ -54,7 +54,7 @@ def read_spanning_del():
 def read_missing_contig():
     cse = "🥸", 81261, 81263
     # (s p v)
-    genos_phasing, dosages = VCF.Genos8Dosages.empty(N_SAMPLES, VCF.ploidy, 0, True)
+    genos_phasing, dosages = VCF.Genos8Dosages.empty(N_SAMPLES, VCF.ploidy + 1, 0)
     genos, phasing = np.array_split(genos_phasing, 2, 1)
     phasing = phasing.squeeze(1).astype(bool)
     return cse, genos, phasing, dosages
@@ -63,7 +63,7 @@ def read_missing_contig():
 def read_none():
     cse = "chr1", 0, 1
     # (s p v)
-    genos_phasing, dosages = VCF.Genos8Dosages.empty(N_SAMPLES, VCF.ploidy, 0, True)
+    genos_phasing, dosages = VCF.Genos8Dosages.empty(N_SAMPLES, VCF.ploidy + 1, 0)
     genos, phasing = np.array_split(genos_phasing, 2, 1)
     phasing = phasing.squeeze(1).astype(bool)
     return cse, genos, phasing, dosages
@@ -231,7 +231,7 @@ def length_ext():
 def length_none():
     cse = "chr1", 0, 1
     # (s p v)
-    genos_phasing, dosages = VCF.Genos8Dosages.empty(N_SAMPLES, VCF.ploidy, 0, True)
+    genos_phasing, dosages = VCF.Genos8Dosages.empty(N_SAMPLES, VCF.ploidy + 1, 0)
     genos, phasing = np.array_split(genos_phasing, 2, 1)
     phasing = phasing.squeeze(1).astype(bool)
     last_end = 1

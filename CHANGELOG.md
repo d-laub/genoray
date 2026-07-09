@@ -1,5 +1,12 @@
 ## Unreleased
 
+### BREAKING CHANGES
+
+- `Phantom` mode `empty()` classmethods now take a uniform
+  `empty(n_samples, ploidy, n_variants)` signature on both VCF and PGEN
+  backends. VCF's former 4th `phasing` argument is removed; pass the effective
+  ploidy (`ploidy + phasing`) instead.
+
 ### Fix
 
 - **vcf**: apply configured `filter` on `VCF.read(..., mode=Genos*Dosages)` when no

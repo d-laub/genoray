@@ -5,7 +5,7 @@ import warnings
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Literal, TypeGuard, TypeVar, cast, overload
+from typing import Literal, TypeVar, cast, overload
 
 import cyvcf2
 from hirola import HashTable
@@ -17,11 +17,11 @@ from loguru import logger
 from more_itertools import mark_ends
 from natsort import natsorted
 from numpy.typing import ArrayLike, NDArray
-from phantom import Phantom
 from seqpro.rag import OFFSET_TYPE
 from tqdm.auto import tqdm
 from typing_extensions import Self, assert_never
 
+from ._modes import make_array_mode, make_tuple_mode
 from ._types import POS_MAX, POS_TYPE
 from ._utils import (
     ContigNormalizer,
@@ -45,129 +45,37 @@ class MultiallelicDosageError(RuntimeError): ...
 
 GDTYPE = TypeVar("GDTYPE", np.int8, np.int16)
 
-
-def _is_genos8(obj: Any) -> TypeGuard[NDArray[np.int8]]:
-    return (
-        isinstance(obj, np.ndarray)
-        and obj.dtype.type == np.int8
-        and obj.ndim == 3
-        and obj.shape[1] in (2, 3)  # diploid with/without phasing
-    )
+_Genos8Base = make_array_mode("Genos8", np.int8, 3, genos=True)
+_Genos16Base = make_array_mode("Genos16", np.int16, 3, genos=True)
+_DosagesBase = make_array_mode("Dosages", np.float32, 2)
 
 
-class Genos8(NDArray[np.int8], Phantom, predicate=_is_genos8):
-    _gdtype = np.int8
-
-    @classmethod
-    def empty(
-        cls, n_samples: int, ploidy: int, n_variants: int, phasing: bool
-    ) -> Genos8:
-        return cls.parse(np.empty((n_samples, ploidy + phasing, n_variants), np.int8))
+class Genos8(_Genos8Base):
+    pass
 
 
-def _is_genos16(obj: Any) -> TypeGuard[NDArray[np.int16]]:
-    return (
-        isinstance(obj, np.ndarray)
-        and obj.dtype.type == np.int16
-        and obj.ndim == 3
-        and obj.shape[1] in (2, 3)  # diploid with/without phasing
-    )
+class Genos16(_Genos16Base):
+    pass
 
 
-class Genos16(NDArray[np.int16], Phantom, predicate=_is_genos16):
-    _gdtype = np.int16
-
-    @classmethod
-    def empty(
-        cls, n_samples: int, ploidy: int, n_variants: int, phasing: bool
-    ) -> Genos16:
-        return cls.parse(np.empty((n_samples, ploidy + phasing, n_variants), np.int16))
+class Dosages(_DosagesBase):
+    pass
 
 
-def _is_dosages(obj: Any) -> TypeGuard[NDArray[np.float32]]:
-    return (
-        isinstance(obj, np.ndarray) and obj.dtype.type == np.float32 and obj.ndim == 2
-    )
+_Genos8DosagesBase = make_tuple_mode(
+    "Genos8Dosages", (Genos8, Dosages), genos_dtype=np.int8
+)
+_Genos16DosagesBase = make_tuple_mode(
+    "Genos16Dosages", (Genos16, Dosages), genos_dtype=np.int16
+)
 
 
-class Dosages(NDArray[np.float32], Phantom, predicate=_is_dosages):
-    @classmethod
-    def empty(
-        cls, n_samples: int, ploidy: int, n_variants: int, phasing: bool
-    ) -> Dosages:
-        return cls.parse(np.empty((n_samples, n_variants), np.float32))
+class Genos8Dosages(_Genos8DosagesBase):
+    pass
 
 
-def _is_genos8_dosages(obj: Any) -> TypeGuard[tuple[Genos8, Dosages]]:
-    """Check if the object is a tuple of genotypes and dosages.
-
-    Parameters
-    ----------
-    obj
-        Object to check.
-
-    Returns
-    -------
-    bool
-        True if the object is a tuple of genotypes and dosages, False otherwise.
-    """
-    return (
-        isinstance(obj, tuple)
-        and len(obj) == 2
-        and isinstance(obj[0], Genos8)
-        and isinstance(obj[1], Dosages)
-    )
-
-
-class Genos8Dosages(tuple[Genos8, Dosages], Phantom, predicate=_is_genos8_dosages):
-    _gdtype = np.int8
-
-    @classmethod
-    def empty(
-        cls, n_samples: int, ploidy: int, n_variants: int, phasing: bool
-    ) -> Genos8Dosages:
-        return cls.parse(
-            (
-                Genos8.empty(n_samples, ploidy, n_variants, phasing),
-                Dosages.empty(n_samples, ploidy, n_variants, phasing),
-            )
-        )
-
-
-def _is_genos16_dosages(obj: object) -> TypeGuard[tuple[Genos16, Dosages]]:
-    """Check if the object is a tuple of genotypes and dosages.
-
-    Parameters
-    ----------
-    obj
-        Object to check.
-
-    Returns
-    -------
-    bool
-        True if the object is a tuple of genotypes and dosages, False otherwise.
-    """
-    return (
-        isinstance(obj, tuple)
-        and len(obj) == 2
-        and isinstance(obj[0], Genos16)
-        and isinstance(obj[1], Dosages)
-    )
-
-
-class Genos16Dosages(tuple[Genos16, Dosages], Phantom, predicate=_is_genos16_dosages):
-    _gdtype = np.int16
-
-    @classmethod
-    def empty(
-        cls, n_samples: int, ploidy: int, n_variants: int, phasing: bool
-    ) -> Genos16Dosages:
-        return cls.parse(
-            (
-                Genos16.empty(n_samples, ploidy, n_variants, phasing),
-                Dosages.empty(n_samples, ploidy, n_variants, phasing),
-            )
-        )
+class Genos16Dosages(_Genos16DosagesBase):
+    pass
 
 
 T = TypeVar("T", Genos8, Genos16, Dosages, Genos8Dosages, Genos16Dosages)
@@ -607,7 +515,7 @@ class VCF:
             logger.warning(
                 f"Query contig {contig} not found in VCF file, even after normalizing for UCSC/Ensembl nomenclature."
             )
-            return mode.empty(self.n_samples, self.ploidy, 0, self.phasing)  # type: ignore[bad-return]
+            return mode.empty(self.n_samples, self.ploidy + self.phasing, 0)  # type: ignore[bad-return]
 
         start = max(0, start)  # type: ignore
 
@@ -616,7 +524,7 @@ class VCF:
             if self._index is not None:
                 n_variants = self.n_vars_in_ranges(c, start, end)[0]  # type: ignore[bad-argument-type]
                 if n_variants == 0:
-                    return mode.empty(self.n_samples, self.ploidy, 0, self.phasing)  # type: ignore[bad-return]
+                    return mode.empty(self.n_samples, self.ploidy + self.phasing, 0)  # type: ignore[bad-return]
             else:
                 n_variants = None
 
@@ -625,7 +533,7 @@ class VCF:
                     data = None
                 else:
                     data = mode.empty(
-                        self.n_samples, self.ploidy, n_variants, self.phasing
+                        self.n_samples, self.ploidy + self.phasing, n_variants
                     )
                 data, _ = self._fill_genos(vcf, data, mode=mode)
             elif issubclass(mode, Dosages):
@@ -634,7 +542,7 @@ class VCF:
                     data = None
                 else:
                     data = mode.empty(
-                        self.n_samples, self.ploidy, n_variants, self.phasing
+                        self.n_samples, self.ploidy + self.phasing, n_variants
                     )
                 data, _ = self._fill_dosages(vcf, data, self.dosage_field)
             elif issubclass(mode, (Genos8Dosages, Genos16Dosages)):
@@ -643,7 +551,7 @@ class VCF:
                     data = None
                 else:
                     data = mode.empty(
-                        self.n_samples, self.ploidy, n_variants, self.phasing
+                        self.n_samples, self.ploidy + self.phasing, n_variants
                     )
                 data, _ = self._fill_genos_and_dosages(
                     vcf, data, self.dosage_field, mode=mode
@@ -712,7 +620,7 @@ class VCF:
             logger.warning(
                 f"Query contig {contig} not found in VCF file, even after normalizing for UCSC/Ensembl nomenclature."
             )
-            yield mode.empty(self.n_samples, self.ploidy, 0, self.phasing)  # type: ignore[invalid-yield]
+            yield mode.empty(self.n_samples, self.ploidy + self.phasing, 0)  # type: ignore[invalid-yield]
             return
 
         start = max(0, start)  # type: ignore
@@ -725,7 +633,7 @@ class VCF:
                 + f" Memory per variant: {format_memory(mem_per_v)}."
             )
 
-        buffer = mode.empty(self.n_samples, self.ploidy, vars_per_chunk, self.phasing)
+        buffer = mode.empty(self.n_samples, self.ploidy + self.phasing, vars_per_chunk)
         if isinstance(buffer, (Genos8, Genos16)):
             gt_buffer = buffer
             ds_buffer = None
@@ -845,7 +753,7 @@ class VCF:
             )
             for e in ends:
                 yield (  # type: ignore[invalid-yield]
-                    (mode.empty(self.n_samples, self.ploidy, 0, self.phasing), e, 0)
+                    (mode.empty(self.n_samples, self.ploidy + self.phasing, 0), e, 0)
                     for _ in range(1)
                 )
             return
@@ -855,7 +763,7 @@ class VCF:
         if tot_variants == 0:
             for e in ends:
                 yield (  # type: ignore[invalid-yield]
-                    (mode.empty(self.n_samples, self.ploidy, 0, self.phasing), e, 0)
+                    (mode.empty(self.n_samples, self.ploidy + self.phasing, 0), e, 0)
                     for _ in range(1)
                 )
             return
@@ -874,7 +782,7 @@ class VCF:
         for s, e, n in zip(starts, ends, n_variants):
             if n == 0:
                 yield (  # type: ignore[invalid-yield]
-                    (mode.empty(self.n_samples, self.ploidy, 0, self.phasing), e, 0)
+                    (mode.empty(self.n_samples, self.ploidy + self.phasing, 0), e, 0)
                     for _ in range(1)
                 )
                 continue
@@ -917,13 +825,13 @@ class VCF:
             if issubclass(mode, (Genos8, Genos16)):
                 out = cast(
                     Genos8 | Genos16,
-                    mode.empty(self.n_samples, self.ploidy, chunk_size, self.phasing),
+                    mode.empty(self.n_samples, self.ploidy + self.phasing, chunk_size),
                 )
                 out, last_end = self._fill_genos(vcf, out, ilens)
                 hap_lens += hap_ilens(out[:, : self.ploidy], ilens)
             elif issubclass(mode, (Genos8Dosages, Genos16Dosages)):
                 self.dosage_field = cast(str, self.dosage_field)
-                out = mode.empty(self.n_samples, self.ploidy, chunk_size, self.phasing)
+                out = mode.empty(self.n_samples, self.ploidy + self.phasing, chunk_size)
                 out, last_end = self._fill_genos_and_dosages(
                     vcf, out, self.dosage_field, ilens
                 )
@@ -1301,7 +1209,7 @@ class VCF:
                     self._pbar.update()
 
             if len(out_ls) == 0:
-                return mode.empty(self.n_samples, self.ploidy, 0, self.phasing), 0
+                return mode.empty(self.n_samples, self.ploidy + self.phasing, 0), 0
 
             # (s p v)
             out = cast(
@@ -1368,7 +1276,7 @@ class VCF:
                     self._pbar.update()
 
             if len(out_ls) == 0:
-                return Dosages.empty(self.n_samples, self.ploidy, 0, self.phasing), 0
+                return Dosages.empty(self.n_samples, self.ploidy + self.phasing, 0), 0
 
             _out = cast(
                 Dosages, np.stack(out_ls, axis=-1, dtype=np.float32)[self._s_sorter]
@@ -1451,7 +1359,7 @@ class VCF:
                     self._pbar.update()
 
             if len(geno_ls) == 0:
-                out = mode.empty(self.n_samples, self.ploidy, 0, self.phasing)
+                out = mode.empty(self.n_samples, self.ploidy + self.phasing, 0)
                 return out, 0
 
             genos = cast(
