@@ -232,6 +232,20 @@ def test_sample_reorder(vcf: VCF):
     np.testing.assert_equal(d, np.array([[2.0, 1.0], [1.0, np.nan]], np.float32))
 
 
+def test_vcf_mem_per_variant_doubles_when_sorted(vcf: VCF):
+    ploidy = vcf.ploidy + vcf.phasing
+    # a fresh reader has no active sample sorter -> estimate is NOT doubled
+    unsorted = vcf._mem_per_variant(VCF.Genos16)
+    assert unsorted == VCF.Genos16.nbytes_per_variant(vcf.n_samples, ploidy)
+    # a single-sample subset is trivially "sorted" (a length-1 permutation is
+    # always in order), so it does NOT install the ndarray sorter; a genuine
+    # reorder of >=2 samples does (mirrors test_sample_reorder above).
+    vcf.set_samples(list(reversed(vcf.available_samples)))
+    assert vcf._mem_per_variant(VCF.Genos16) == 2 * VCF.Genos16.nbytes_per_variant(
+        vcf.n_samples, ploidy
+    )
+
+
 def length_no_ext():
     cse = "chr1", 81264, 81265  # just 81265 in VCF
     # (s p v)

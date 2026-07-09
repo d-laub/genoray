@@ -802,25 +802,16 @@ class PGEN:
             )
 
     def _mem_per_variant(self, mode: type[T]) -> int:
-        mem = 0
+        """Calculate the memory required per variant for the given mode.
 
-        if issubclass(mode, Genos):
-            mem += self.n_samples * self.ploidy * mode._dtype().itemsize
-        elif issubclass(mode, Dosages):
-            mem += self.n_samples * mode._dtype().itemsize
-        elif issubclass(mode, GenosPhasing) or issubclass(mode, GenosDosages):
-            mem += self.n_samples * self.ploidy * mode._dtypes[0]().itemsize
-            mem += self.n_samples * mode._dtypes[1]().itemsize
-        elif issubclass(mode, GenosPhasingDosages):
-            mem += self.n_samples * self.ploidy * mode._dtypes[0]().itemsize
-            mem += self.n_samples * mode._dtypes[1]().itemsize
-            mem += self.n_samples * mode._dtypes[2]().itemsize
-        else:
-            assert_never(mode)  # type: ignore[bad-argument-type]
-
+        Returns
+        -------
+        int
+            Memory required per variant in bytes.
+        """
+        mem = mode.nbytes_per_variant(self.n_samples, self.ploidy)
         if isinstance(self._s_unsorter, np.ndarray):
-            mem *= 2  # have to make a copy to sort by samples
-
+            mem *= 2  # a copy is made to reorder by samples
         return mem
 
     def _read_genos(self, var_idxs: NDArray[V_IDX_TYPE]) -> Genos:

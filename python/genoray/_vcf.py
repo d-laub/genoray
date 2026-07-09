@@ -1358,34 +1358,16 @@ class VCF:
         return out, v.end  # type: ignore
 
     def _mem_per_variant(self, mode: type[T]) -> int:
-        """Calculate the memory required per variant for the given genotypes and dosages.
-
-        Parameters
-        ----------
-        genotypes
-            Whether to include genotypes.
-        dosages
-            Whether to include dosages.
+        """Calculate the memory required per variant for the given mode.
 
         Returns
         -------
         int
             Memory required per variant in bytes.
         """
-        mem = 0
-
-        ploidy = self.ploidy + self.phasing
-
-        if issubclass(mode, (Genos8, Genos16)):
-            mem += self.n_samples * ploidy * mode._gdtype().itemsize
-        elif issubclass(mode, Dosages):
-            mem += self.n_samples * np.float32().itemsize
-        elif issubclass(mode, (Genos8Dosages, Genos16Dosages)):
-            mem += self.n_samples * ploidy * mode._gdtype().itemsize
-            mem += self.n_samples * np.float32().itemsize
-        else:
-            assert_never(mode)  # type: ignore[bad-argument-type]
-
+        mem = mode.nbytes_per_variant(self.n_samples, self.ploidy + self.phasing)
+        if isinstance(self._s_sorter, np.ndarray):
+            mem *= 2  # a copy is made to reorder by samples
         return mem
 
     def _ext_genos_with_length(

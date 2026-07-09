@@ -6,6 +6,9 @@
   `empty(n_samples, ploidy, n_variants)` signature on both VCF and PGEN
   backends. VCF's former 4th `phasing` argument is removed; pass the effective
   ploidy (`ploidy + phasing`) instead.
+- VCF chunk-size memory estimates now double when a sample subset/reorder is
+  active, matching PGEN. This only affects internal chunk sizing (more
+  conservative memory use), never returned data.
 
 ### Fix
 
