@@ -8,7 +8,6 @@ reference signatures. Pure numpy/scipy/polars; no SigProfiler dependency.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Literal
 
 import numpy as np
 import polars as pl
@@ -17,9 +16,7 @@ from numpy.typing import NDArray
 from joblib import Parallel, delayed
 from scipy.optimize import nnls
 
-from ._mutcat import labels
-
-Kind = Literal["SBS96", "DBS78", "ID83"]
+from ._mutcat import Kind, labels
 
 
 def _cosine(a: NDArray[np.floating], b: NDArray[np.floating]) -> float:

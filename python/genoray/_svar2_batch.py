@@ -2,13 +2,46 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
-from typing import TYPE_CHECKING, Any
+from collections.abc import Iterable, Mapping
+from typing import TYPE_CHECKING, Any, TypedDict
 
 import numpy as np
 
 if TYPE_CHECKING:
     from numpy.typing import ArrayLike
+
+
+class BatchResult(TypedDict):
+    """Two-channel batch-query result contract (see py_query_batch.rs)."""
+
+    vk_pos: np.ndarray
+    vk_key: np.ndarray
+    vk_off: np.ndarray
+    dense_pos: np.ndarray
+    dense_key: np.ndarray
+    dense_range: np.ndarray
+    dense_present: np.ndarray
+    dense_present_off: np.ndarray
+    lut_bytes: np.ndarray
+    lut_off: np.ndarray
+    n_regions: int
+    n_samples: int
+    ploidy: int
+
+
+class RangesBundle(TypedDict):
+    """Compact search-only bundle replayed by ``gather_ranges`` (see py_query_ranges.rs)."""
+
+    dense_range: np.ndarray
+    region_starts: np.ndarray
+    sample_cols: np.ndarray
+    vk_snp_range: np.ndarray
+    vk_indel_range: np.ndarray
+    dense_snp_range: np.ndarray
+    dense_indel_range: np.ndarray
+    n_regions: int
+    n_samples: int
+    ploidy: int
 
 
 class _BatchQueryMixin:
@@ -21,7 +54,7 @@ class _BatchQueryMixin:
 
     def overlap_batch(
         self, contig: str, regions: Iterable[tuple[int, int]]
-    ) -> dict[str, "np.ndarray"]:
+    ) -> BatchResult:
         """Batched two-channel query for one ``contig``.
 
         ``regions`` is an iterable of half-open ``(q_start, q_end)`` pairs. Returns
@@ -53,7 +86,7 @@ class _BatchQueryMixin:
         starts: "ArrayLike",
         ends: "ArrayLike",
         samples: "ArrayLike | None" = None,
-    ) -> dict[str, "np.ndarray"]:
+    ) -> BatchResult:
         """Fused search+gather query for one ``contig``.
 
         ``starts``/``ends`` are parallel 1D arrays of half-open ``(start, end)``
@@ -74,8 +107,8 @@ class _BatchQueryMixin:
         starts: "ArrayLike",
         ends: "ArrayLike",
         samples: "ArrayLike | None" = None,
-        out: dict[str, "np.ndarray"] | None = None,
-    ) -> dict[str, Any]:
+        out: Mapping[str, "np.ndarray"] | None = None,
+    ) -> RangesBundle:
         """Search-only step: returns a compact ranges bundle to be replayed by
         ``gather_ranges``, doing no per-element gather. ``starts``/``ends`` and
         ``samples`` behave as in ``read_ranges``.
@@ -110,7 +143,7 @@ class _BatchQueryMixin:
         contig: str,
         ranges: dict[str, Any],
         samples: "ArrayLike | None" = None,
-    ) -> dict[str, "np.ndarray"]:
+    ) -> BatchResult:
         """Tree-free gather step: replay a ``find_ranges`` bundle into the same
         dict contract as ``overlap_batch``/``read_ranges``, with no further
         search-tree work.
