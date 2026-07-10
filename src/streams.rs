@@ -54,6 +54,17 @@ pub const REGISTRY: [StreamSpec; StreamTag::COUNT] = [
 /// Fixed-size map keyed by `StreamTag`, backed by an array (O(1), no hashing).
 pub type StreamMap<T> = EnumMap<StreamTag, T, { StreamTag::COUNT }>;
 
+impl StreamTag {
+    /// Bridge to the canonical variant-class axis (mirrors `DenseClass::cost_class`).
+    #[inline]
+    pub fn class(self) -> crate::cost_model::Class {
+        match self {
+            StreamTag::VarKeySnp => crate::cost_model::Class::Snp,
+            StreamTag::VarKeyIndel => crate::cost_model::Class::Indel,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,5 +100,12 @@ mod tests {
         assert_eq!(*m.get(StreamTag::VarKeyIndel), 7);
         let collected: Vec<_> = m.iter().map(|(_, v)| *v).collect();
         assert_eq!(collected, vec![0, 7]);
+    }
+
+    #[test]
+    fn test_streamtag_class_bridge() {
+        use crate::cost_model::Class;
+        assert_eq!(StreamTag::VarKeySnp.class(), Class::Snp);
+        assert_eq!(StreamTag::VarKeyIndel.class(), Class::Indel);
     }
 }
