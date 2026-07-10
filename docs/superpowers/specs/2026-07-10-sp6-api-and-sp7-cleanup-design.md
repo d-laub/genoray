@@ -146,10 +146,12 @@ codebook construction), `classify` (classification logic), and `count`
 importers are unaffected.
 
 **D2. Relocate the scalar mutation-catalogue oracles** out of shipped code into a test-side
-oracle module (e.g. `tests/_mutcat_oracle.py`): `classify_sbs96`, `classify_dbs78`,
-`classify_id83`, `_microhomology_len`, `_classify_variants_scalar`. **Verify there is no
-production caller first** (they are expected to be used only by `tests/test_mutcat.py`,
-`tests/test_svar_mutations.py`); move them and repoint the test imports.
+oracle module (e.g. `tests/_mutcat_oracle.py`): `_classify_variants_scalar`,
+`classify_sbs96`, `classify_id83`, `_microhomology_len`. These are test-only (verified: the
+sole non-test caller of each is `_classify_variants_scalar` itself, which only tests call).
+**`classify_dbs78` stays shipped** — it is production-live via `_build_dbs_table`
+(`_mutcat.py:534`). The relocated oracle imports `classify_dbs78` back from the shipped
+module. Repoint the test imports (`tests/test_mutcat.py`, `tests/test_svar_mutations.py`).
 
 **D3. `_utils.py` (303 L) → `_io` + `_contigs`.** Split IO helpers (`variant_file_type`,
 `np_to_pl_dtype`, memory parsing) from `ContigNormalizer`. Move `hap_ilens` (`_utils.py:117`)
