@@ -25,7 +25,9 @@ prek = "*"
 ruff = "*"
 pyrefly = "*"
 memray = ">=1.12.0,<2"
-pytest = "*"
+# pytest-cases 3.10.1 (latest) is incompatible with pytest 9 (IdMaker signature change);
+# cap until a pytest-9-compatible pytest-cases is released.
+pytest = "<9"
 pytest-cases = "*"
 ipykernel = "*"
 ipywidgets = "*"
