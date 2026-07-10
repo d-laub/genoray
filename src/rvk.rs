@@ -1,5 +1,6 @@
 use crate::cost_model::{Class, Representation, choose_representation};
 use crate::dense::{DenseClass, DenseMap};
+use crate::enum_map::EnumKey;
 use crate::error::ConversionError;
 use crate::layout;
 use crate::nrvk::LongAlleleTableWriter;

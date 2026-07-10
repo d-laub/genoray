@@ -105,6 +105,7 @@ fn write_bin(path: &Path, bytes: &[u8]) -> Result<(), ConversionError> {
 mod tests {
     use super::*;
     use crate::dense::{DenseClass, DenseMap};
+    use crate::enum_map::EnumKey;
     use crate::streams::{StreamMap, StreamTag};
     use crate::types::{DenseSubChunk, SparseChunk, SparseSubStream};
     use crossbeam_channel::bounded;

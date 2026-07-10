@@ -3,6 +3,7 @@
 //! (packed post-merge, no LUT) and 32-bit indel (shares the per-contig LUT).
 
 use crate::cost_model::Class;
+use crate::enum_map::{EnumKey, EnumMap};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DenseClass {
@@ -10,13 +11,16 @@ pub enum DenseClass {
     Indel = 1,
 }
 
-impl DenseClass {
-    pub const COUNT: usize = 2;
-    pub const ALL: [DenseClass; Self::COUNT] = [DenseClass::Snp, DenseClass::Indel];
+impl EnumKey for DenseClass {
+    const COUNT: usize = 2;
+    const ALL: &'static [DenseClass] = &[DenseClass::Snp, DenseClass::Indel];
     #[inline]
-    pub fn index(self) -> usize {
+    fn index(self) -> usize {
         self as usize
     }
+}
+
+impl DenseClass {
     #[inline]
     pub fn key_bytes(self) -> usize {
         match self {
@@ -57,34 +61,7 @@ pub const DENSE_REGISTRY: [DenseSpec; DenseClass::COUNT] = [
 ];
 
 /// Fixed-size map keyed by `DenseClass`, array-backed (O(1), no hashing).
-pub struct DenseMap<T> {
-    slots: [T; DenseClass::COUNT],
-}
-
-impl<T> DenseMap<T> {
-    pub fn from_fn(f: impl FnMut(DenseClass) -> T) -> Self {
-        Self {
-            slots: DenseClass::ALL.map(f),
-        }
-    }
-    #[inline]
-    pub fn get(&self, c: DenseClass) -> &T {
-        &self.slots[c.index()]
-    }
-    #[inline]
-    pub fn get_mut(&mut self, c: DenseClass) -> &mut T {
-        &mut self.slots[c.index()]
-    }
-    pub fn iter(&self) -> impl Iterator<Item = (DenseClass, &T)> {
-        DenseClass::ALL.into_iter().zip(self.slots.iter())
-    }
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = (DenseClass, &mut T)> {
-        DenseClass::ALL.into_iter().zip(self.slots.iter_mut())
-    }
-    pub fn into_iter_tagged(self) -> impl Iterator<Item = (DenseClass, T)> {
-        DenseClass::ALL.into_iter().zip(self.slots)
-    }
-}
+pub type DenseMap<T> = EnumMap<DenseClass, T, { DenseClass::COUNT }>;
 
 #[cfg(test)]
 mod tests {
