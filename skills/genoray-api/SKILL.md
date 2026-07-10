@@ -269,8 +269,10 @@ counts = sv.region_counts("chr1", regions)   # np.ndarray, shape (R, S, P)
   are an iterable of `(start, end)` pairs.
 
 Lower-level array methods (what gvl's Rust core consumes) return the raw
-two-channel `BatchResult` → numpy dict (`vk_pos`/`vk_key`/`vk_off`, `dense_*`,
-`lut_*`, plus `n_regions`/`n_samples`/`ploidy`):
+two-channel `BatchResult` → numpy dict, a `TypedDict` with a fixed field set:
+`vk_pos`/`vk_key`/`vk_off`, `dense_pos`/`dense_key`/`dense_range`/
+`dense_present`/`dense_present_off`, `lut_bytes`/`lut_off`, and scalars
+`n_regions`/`n_samples`/`ploidy`:
 
 - `overlap_batch(contig, regions)` — batched two-channel query.
 - `read_ranges(contig, starts, ends, samples=None)` — fused search+gather;
@@ -281,7 +283,12 @@ two-channel `BatchResult` → numpy dict (`vk_pos`/`vk_key`/`vk_off`, `dense_*`,
   `gather_ranges(contig, ranges, samples=None)` — the search-only + tree-free
   replay split for a write-time overlap cache; `read_ranges ==
   gather_ranges(find_ranges(...))`. `find_ranges(out=...)` streams the bundle into
-  caller-preallocated arrays.
+  caller-preallocated arrays. `find_ranges` returns the compact `RangesBundle`
+  `TypedDict` instead — `dense_range`/`region_starts`/`sample_cols`/
+  `vk_snp_range`/`vk_indel_range`/`dense_snp_range`/`dense_indel_range` plus
+  the same `n_regions`/`n_samples`/`ploidy` scalars — which `gather_ranges`
+  replays back into a `BatchResult`. Both are static-only annotations; the
+  dict contract these methods return at runtime is unchanged.
 
 ### Errors
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from enum import IntEnum
 from typing import Any, Literal
 
 import numba as nb
@@ -133,12 +134,15 @@ DBS78_OFFSET = SBS96_OFFSET + len(SBS96)  # 96
 ID83_OFFSET = DBS78_OFFSET + len(DBS78)  # 174
 N_CODES = ID83_OFFSET + len(ID83)  # 257
 
-SENTINELS: dict[str, int] = {
-    "DBS_PARTNER": -1,  # 3' half of an adjacency doublet; never counted
-    "UNCLASSIFIED": -2,  # symbolic/complex/MNV>2bp/non-ACGT
-    "MISSING": -3,
-    "NOT_ANNOTATED": -4,  # entry on a contig excluded from the annotation scope
-}
+
+class Sentinel(IntEnum):
+    """Negative sentinel codes in the int16 mutation-code space (closed set)."""
+
+    DBS_PARTNER = -1  # 3' half of an adjacency doublet; never counted
+    UNCLASSIFIED = -2  # symbolic/complex/MNV>2bp/non-ACGT
+    MISSING = -3
+    NOT_ANNOTATED = -4  # entry on a contig excluded from the annotation scope
+
 
 # Internal boundary signal (NOT a public sentinel): a deletion whose deleted unit
 # is absent in the reference at scan_start, i.e. REF disagrees with the reference
@@ -152,10 +156,12 @@ ID83_INDEX = {lbl: ID83_OFFSET + i for i, lbl in enumerate(ID83)}
 
 MUTCAT_VERSION = 3
 
+Kind = Literal["SBS96", "DBS78", "ID83"]
+
 _LABELS: dict[str, list[str]] = {"SBS96": SBS96, "DBS78": DBS78, "ID83": ID83}
 
 
-def code_ranges() -> dict[str, tuple[int, int]]:
+def code_ranges() -> dict[Kind, tuple[int, int]]:
     """Half-open ``[start, end)`` code range per matrix kind."""
     return {
         "SBS96": (SBS96_OFFSET, DBS78_OFFSET),
@@ -164,7 +170,7 @@ def code_ranges() -> dict[str, tuple[int, int]]:
     }
 
 
-def labels(kind: str) -> list[str]:
+def labels(kind: Kind) -> list[str]:
     """Return the ordered label list for a given mutation category kind."""
     if kind not in _LABELS:
         raise ValueError(
@@ -183,18 +189,18 @@ def _comp(b: int) -> int:
 
 
 def classify_sbs96(five: bytes, ref: bytes, alt: bytes, three: bytes) -> int:
-    """Return the SBS-96 code for one SNV, or SENTINELS['UNCLASSIFIED'].
+    """Return the SBS-96 code for one SNV, or Sentinel.UNCLASSIFIED.
 
     Each argument is expected to be a single-base bytes object (e.g. b"A").
-    Empty or otherwise invalid input yields SENTINELS['UNCLASSIFIED'].
+    Empty or otherwise invalid input yields Sentinel.UNCLASSIFIED.
     """
     if not (five and ref and alt and three):
-        return SENTINELS["UNCLASSIFIED"]
+        return Sentinel.UNCLASSIFIED
     f, r, a, t = five[0], ref[0], alt[0], three[0]
     if r not in _COMP or a not in _COMP or r == a:
-        return SENTINELS["UNCLASSIFIED"]
+        return Sentinel.UNCLASSIFIED
     if f not in _COMP or t not in _COMP:
-        return SENTINELS["UNCLASSIFIED"]
+        return Sentinel.UNCLASSIFIED
     if r not in _PYR:  # purine ref -> fold to reverse complement
         r, a = _comp(r), _comp(a)
         f, t = _comp(t), _comp(f)  # flanks swap and complement
@@ -210,22 +216,22 @@ def _revcomp(seq: bytes) -> bytes:
 
 
 def classify_dbs78(ref: bytes, alt: bytes) -> int:
-    """Return the DBS-78 code for a 2bp doublet, or SENTINELS['UNCLASSIFIED'].
+    """Return the DBS-78 code for a 2bp doublet, or Sentinel.UNCLASSIFIED.
 
     Tries the literal ``REF>ALT`` first, then its reverse-complement, since
     DBS-78 collapses strand-equivalent doublets.
     """
     if len(ref) != 2 or len(alt) != 2 or ref == alt:
-        return SENTINELS["UNCLASSIFIED"]
+        return Sentinel.UNCLASSIFIED
     if any(b not in _COMP for b in ref) or any(b not in _COMP for b in alt):
-        return SENTINELS["UNCLASSIFIED"]
+        return Sentinel.UNCLASSIFIED
     key = f"{ref.decode()}>{alt.decode()}"
     if key in DBS78_INDEX:
         return DBS78_INDEX[key]
     rc_key = f"{_revcomp(ref).decode()}>{_revcomp(alt).decode()}"
     if rc_key in DBS78_INDEX:
         return DBS78_INDEX[rc_key]
-    return SENTINELS["UNCLASSIFIED"]
+    return Sentinel.UNCLASSIFIED
 
 
 # ---- ID-83 indel classifier ----
@@ -248,14 +254,14 @@ def classify_id83(
     anchor base (standard left-aligned VCF representation).
     """
     if len(ref) == len(alt):  # SNV or MNV, not an indel
-        return SENTINELS["UNCLASSIFIED"]
+        return Sentinel.UNCLASSIFIED
     if ref[0] != alt[0]:
-        return SENTINELS["UNCLASSIFIED"]  # not anchored; complex
+        return Sentinel.UNCLASSIFIED  # not anchored; complex
     is_del = len(ref) > len(alt)
     indel = ref[1:] if is_del else alt[1:]
     ilen = len(indel)
     if any(b not in _COMP for b in indel):
-        return SENTINELS["UNCLASSIFIED"]
+        return Sentinel.UNCLASSIFIED
 
     # downstream sequence begins just after the anchor (deletions) / after pos (ins)
     # The first changed base sits at pos+1.
@@ -315,7 +321,7 @@ _SUB_LUT = np.full((4, 4), -1, dtype=np.int64)
 for _si, _sub in enumerate(_SBS_SUBS):
     _SUB_LUT[_BASE2IDX[ord(_sub[0])], _BASE2IDX[ord(_sub[2])]] = _si
 
-_UNCL = np.int16(SENTINELS["UNCLASSIFIED"])
+_UNCL = np.int16(Sentinel.UNCLASSIFIED)
 
 
 def _sbs96_codes(
@@ -365,7 +371,7 @@ def _dbs78_codes(
 
 
 def _build_id83_luts() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    u = SENTINELS["UNCLASSIFIED"]
+    u = Sentinel.UNCLASSIFIED
     id1 = np.full((2, 2, 6), u, dtype=np.int16)  # [kind(Del,Ins), base(C,T), rep]
     idr = np.full((2, 4, 6), u, dtype=np.int16)  # [kind, size_bucket(2..5), rep]
     idm = np.full((4, 6), u, dtype=np.int16)  # [size_bucket(2..5), mh]
@@ -507,7 +513,7 @@ def _id83_codes_for_contig(
         _IDR_CODE,
         _IDM_CODE,
         _MH_CAP,
-        np.int16(SENTINELS["UNCLASSIFIED"]),
+        np.int16(Sentinel.UNCLASSIFIED),
         np.int16(_REF_MISMATCH),
         out,
     )
@@ -517,7 +523,7 @@ def _id83_codes_for_contig(
 def _build_dbs_table() -> np.ndarray:
     """tbl[r0, r1, a0, a1] -> DBS-78 code or UNCLASSIFIED for doublets not in
     the (folded) catalogue. Bases encoded A=0,C=1,G=2,T=3."""
-    tbl = np.full((4, 4, 4, 4), SENTINELS["UNCLASSIFIED"], dtype=np.int16)
+    tbl = np.full((4, 4, 4, 4), Sentinel.UNCLASSIFIED, dtype=np.int16)
     bases = b"ACGT"
     for r0 in range(4):
         for r1 in range(4):
@@ -530,7 +536,7 @@ def _build_dbs_table() -> np.ndarray:
 
 
 _DBS_TABLE = _build_dbs_table()
-_DBS_PARTNER = SENTINELS["DBS_PARTNER"]
+_DBS_PARTNER = Sentinel.DBS_PARTNER
 
 
 @nb.njit(parallel=True, nogil=True, cache=True)
@@ -659,7 +665,7 @@ def count_matrix(
     ploidy: int,
     n_samples: int,
     sample_names: list[str],
-    kind: Literal["SBS96", "DBS78", "ID83"],
+    kind: Kind,
     per_sample: bool,
 ) -> "pl.DataFrame":
     counts = np.zeros((n_samples, N_CODES), dtype=np.int64)
@@ -692,7 +698,7 @@ def _classify_variants_scalar(index: pl.DataFrame, reference: Reference) -> np.n
     ref = index["REF"].to_list()
     alt0 = index["ALT"].list.first().to_list()
 
-    out = np.full(index.height, SENTINELS["UNCLASSIFIED"], dtype=np.int16)
+    out = np.full(index.height, Sentinel.UNCLASSIFIED, dtype=np.int16)
 
     n_mismatch = 0
     mismatch_examples: list[str] = []
@@ -723,7 +729,7 @@ def _classify_variants_scalar(index: pl.DataFrame, reference: Reference) -> np.n
                 n_mismatch += 1
                 if len(mismatch_examples) < 5:
                     mismatch_examples.append(f"{c}:{int(pos[i])}")
-                out[i] = SENTINELS["UNCLASSIFIED"]
+                out[i] = Sentinel.UNCLASSIFIED
             else:
                 out[i] = code
         # else: MNV>2bp or symbolic -> stays UNCLASSIFIED
@@ -778,13 +784,13 @@ def classify_variants(
     chrom = index["CHROM"].to_numpy()
     if contigs is None:
         scope: set[str] | None = None
-        out = np.full(n, SENTINELS["UNCLASSIFIED"], dtype=np.int16)
+        out = np.full(n, Sentinel.UNCLASSIFIED, dtype=np.int16)
     else:
         scope = set(map(str, contigs))
         in_scope = np.array([str(c) in scope for c in chrom], dtype=np.bool_)
-        out = np.where(
-            in_scope, SENTINELS["UNCLASSIFIED"], SENTINELS["NOT_ANNOTATED"]
-        ).astype(np.int16)
+        out = np.where(in_scope, Sentinel.UNCLASSIFIED, Sentinel.NOT_ANNOTATED).astype(
+            np.int16
+        )
     if n == 0:
         return out
     pos0 = index["POS"].to_numpy().astype(np.int64) - 1  # 1-based -> 0-based
@@ -842,7 +848,7 @@ def classify_variants(
                     if len(mismatch_examples) < 5:
                         mismatch_examples.append(f"{chrom[ri]}:{int(pos0[ri]) + 1}")
                 codes = codes.copy()
-                codes[mm] = SENTINELS["UNCLASSIFIED"]
+                codes[mm] = Sentinel.UNCLASSIFIED
             out[i_rows] = codes
 
     if n_mismatch:

@@ -11,7 +11,7 @@ from genoray._mutcat import (
     ID83,
     ID83_INDEX,
     SBS96,
-    SENTINELS,
+    Sentinel,
     SBS96_INDEX,
     _ID1_CODE,
     _IDM_CODE,
@@ -64,8 +64,8 @@ def test_code_ranges_are_contiguous_and_disjoint():
 
 def test_sentinels_outside_category_ranges():
     # sentinels must not collide with 0..256
-    assert all(v < 0 for v in SENTINELS.values())
-    assert SENTINELS["DBS_PARTNER"] != SENTINELS["UNCLASSIFIED"]
+    assert all(v < 0 for v in Sentinel)
+    assert Sentinel.DBS_PARTNER != Sentinel.UNCLASSIFIED
 
 
 def test_sbs96_pyrimidine_direct():
@@ -83,7 +83,7 @@ def test_sbs96_purine_folds_to_revcomp():
 
 
 def test_sbs96_unclassified_cases():
-    unc = SENTINELS["UNCLASSIFIED"]
+    unc = Sentinel.UNCLASSIFIED
     # identity mutation (ref == alt)
     assert classify_sbs96(five=b"A", ref=b"C", alt=b"C", three=b"G") == unc
     # non-ACGT ref
@@ -105,9 +105,9 @@ def test_dbs78_folds_to_revcomp_member():
 
 
 def test_dbs78_non_doublet_unclassified():
-    assert classify_dbs78(b"AC", b"AC") == SENTINELS["UNCLASSIFIED"]  # no change
-    assert classify_dbs78(b"ACG", b"TTT") == SENTINELS["UNCLASSIFIED"]  # >2bp
-    assert classify_dbs78(b"AN", b"CA") == SENTINELS["UNCLASSIFIED"]  # non-ACGT base
+    assert classify_dbs78(b"AC", b"AC") == Sentinel.UNCLASSIFIED  # no change
+    assert classify_dbs78(b"ACG", b"TTT") == Sentinel.UNCLASSIFIED  # >2bp
+    assert classify_dbs78(b"AN", b"CA") == Sentinel.UNCLASSIFIED  # non-ACGT base
 
 
 def _ref_fn(seq: bytes):
@@ -144,8 +144,7 @@ def test_id83_1bp_insertion_T():
 def test_id83_non_indel_unclassified():
     fetch = _ref_fn(b"ACGT")
     assert (
-        classify_id83(pos=0, ref=b"A", alt=b"C", fetch=fetch)
-        == SENTINELS["UNCLASSIFIED"]
+        classify_id83(pos=0, ref=b"A", alt=b"C", fetch=fetch) == Sentinel.UNCLASSIFIED
     )
 
 
@@ -203,7 +202,7 @@ def test_build_entry_codes_marks_adjacent_dbs():
     # entry for var0 -> a DBS code (>=DBS78_OFFSET), var1 -> DBS_PARTNER, var2 unchanged
     assert codes[0] >= DBS78_OFFSET and codes[0] < DBS78_OFFSET + 78
     assert codes[0] == classify_dbs78(b"AC", b"GT")
-    assert codes[1] == SENTINELS["DBS_PARTNER"]
+    assert codes[1] == Sentinel.DBS_PARTNER
     assert codes[2] == 12
 
 
@@ -518,7 +517,7 @@ def test_classify_variants_contig_boundary(tmp_path):
     )
     got = classify_variants(index, ref)
     exp = _classify_variants_scalar(index, ref)
-    assert list(got) == list(exp) == [SENTINELS["UNCLASSIFIED"]] * 2
+    assert list(got) == list(exp) == [Sentinel.UNCLASSIFIED] * 2
 
 
 def test_entry_codes_thread_invariant():
@@ -576,11 +575,14 @@ def test_count_matrix_thread_invariant():
 
 
 def test_not_annotated_sentinel_and_version():
-    from genoray._mutcat import SENTINELS, MUTCAT_VERSION
+    from genoray._mutcat import MUTCAT_VERSION
 
     # distinct from the existing sentinels and from MISSING (-3)
-    assert SENTINELS["NOT_ANNOTATED"] == -4
-    assert len(set(SENTINELS.values())) == len(SENTINELS)
+    assert Sentinel.NOT_ANNOTATED == -4
+    # Guard against a future accidental duplicate value: use __members__ (which
+    # includes aliases) rather than iterating the enum (which drops aliases and
+    # would make this a tautology).
+    assert len(set(Sentinel.__members__.values())) == len(Sentinel.__members__)
     # on-disk semantics changed -> version bumped
     assert MUTCAT_VERSION == 3
 
@@ -589,7 +591,7 @@ def test_classify_variants_contig_scope(tmp_path):
     import pysam
     import polars as pl
     from genoray._reference import Reference
-    from genoray._mutcat import classify_variants, SENTINELS
+    from genoray._mutcat import classify_variants, Sentinel
 
     # two contigs; chr2 is a valid SNV that WOULD classify if in scope
     fa = tmp_path / "ref.fa"
@@ -609,7 +611,7 @@ def test_classify_variants_contig_scope(tmp_path):
     # scope to chr1 only: chr2 must be NOT_ANNOTATED, chr1 must be classified
     out = classify_variants(index, ref, contigs=["chr1"])
     assert out[0] >= 0  # chr1 classified to a real SBS code
-    assert out[1] == SENTINELS["NOT_ANNOTATED"]
+    assert out[1] == Sentinel.NOT_ANNOTATED
 
     # contigs=None -> both classified (unchanged behavior)
     out_all = classify_variants(index, ref, contigs=None)

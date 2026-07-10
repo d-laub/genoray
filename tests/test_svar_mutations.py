@@ -182,13 +182,13 @@ def test_count_unit_allele_vs_sample_strict(annotated_svar_ploidy2):
 
 
 def test_annotate_dbs_partner_present(annotated_svar):
-    from genoray._mutcat import SENTINELS, code_ranges
+    from genoray._mutcat import Sentinel, code_ranges
 
     mut = np.memmap(annotated_svar / "mutcat.npy", dtype=np.int16, mode="r")
     # sample 0's two adjacent SNVs -> [DBS code, DBS_PARTNER]
     lo, hi = code_ranges()["DBS78"]
     assert lo <= mut[0] < hi
-    assert mut[1] == SENTINELS["DBS_PARTNER"]
+    assert mut[1] == Sentinel.DBS_PARTNER
 
 
 def test_public_reference_export():
@@ -558,7 +558,7 @@ def _two_contig_ref(tmp_path):
 
 
 def test_annotate_scope_marks_excluded_not_annotated(tmp_path):
-    from genoray._mutcat import SENTINELS
+    from genoray._mutcat import Sentinel
 
     d = tmp_path / "two.svar"
     _build_two_contig_svar(d)
@@ -570,10 +570,10 @@ def test_annotate_scope_marks_excluded_not_annotated(tmp_path):
     mut = svar.fields["mutcat"]
     # data order matches genos: [chr1@2, chr1@3, chr2@2, chr2@3, chr1@9]
     flat = mut.data
-    assert flat[2] == SENTINELS["NOT_ANNOTATED"]
-    assert flat[3] == SENTINELS["NOT_ANNOTATED"]
+    assert flat[2] == Sentinel.NOT_ANNOTATED
+    assert flat[3] == Sentinel.NOT_ANNOTATED
     # chr1 entries are NOT NOT_ANNOTATED (classified or DBS)
-    assert flat[0] != SENTINELS["NOT_ANNOTATED"]
+    assert flat[0] != Sentinel.NOT_ANNOTATED
 
 
 def test_annotate_scope_excludes_from_matrix(tmp_path):
@@ -594,7 +594,7 @@ def test_annotate_scope_excludes_from_matrix(tmp_path):
 
 def test_annotate_scope_normalizes_contig_names(tmp_path):
     """Allowlist given without 'chr' prefix still matches a chr-prefixed index."""
-    from genoray._mutcat import SENTINELS
+    from genoray._mutcat import Sentinel
 
     d = tmp_path / "two.svar"
     _build_two_contig_svar(d)
@@ -602,8 +602,8 @@ def test_annotate_scope_normalizes_contig_names(tmp_path):
     # index uses 'chr1'/'chr2'; pass '1' -> should match chr1
     svar.annotate_mutations(_two_contig_ref(tmp_path), contigs=["1"], write_back=False)
     flat = svar.fields["mutcat"].data
-    assert flat[2] == SENTINELS["NOT_ANNOTATED"]  # chr2 excluded
-    assert flat[0] != SENTINELS["NOT_ANNOTATED"]  # chr1 annotated
+    assert flat[2] == Sentinel.NOT_ANNOTATED  # chr2 excluded
+    assert flat[0] != Sentinel.NOT_ANNOTATED  # chr1 annotated
 
 
 def test_annotate_scope_warns_on_unmatched_contig(tmp_path):
@@ -624,7 +624,7 @@ def test_annotate_scope_warns_on_unmatched_contig(tmp_path):
 
 def test_annotate_scope_adjacent_oos_snvs_not_dbs(tmp_path):
     """chr2's adjacent SNV pair, when out of scope, is NOT collapsed to DBS."""
-    from genoray._mutcat import SENTINELS
+    from genoray._mutcat import Sentinel
 
     d = tmp_path / "two.svar"
     _build_two_contig_svar(d)
@@ -634,9 +634,9 @@ def test_annotate_scope_adjacent_oos_snvs_not_dbs(tmp_path):
     )
     flat = svar.fields["mutcat"].data
     # both chr2 entries are NOT_ANNOTATED; neither is a DBS code or DBS_PARTNER
-    assert flat[2] == SENTINELS["NOT_ANNOTATED"]
-    assert flat[3] == SENTINELS["NOT_ANNOTATED"]
-    assert flat[3] != SENTINELS["DBS_PARTNER"]
+    assert flat[2] == Sentinel.NOT_ANNOTATED
+    assert flat[3] == Sentinel.NOT_ANNOTATED
+    assert flat[3] != Sentinel.DBS_PARTNER
 
 
 def test_annotate_scope_persists_mutcat_contigs(tmp_path):
