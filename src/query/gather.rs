@@ -700,6 +700,7 @@ impl BatchResult {
 mod tests {
     use super::super::sidecar::mmap_file;
     use super::*;
+    use svar2_codec::PAYLOAD_TOP_SHIFT;
     use tempfile::tempdir;
 
     #[test]
@@ -714,7 +715,7 @@ mod tests {
             ploidy: 2,
             vk: vec![KeyRef {
                 position: 10,
-                key: 1 << 25,
+                key: 1 << PAYLOAD_TOP_SHIFT,
             }],
             vk_off: vec![0, 1, 1, 1, 1],
             dense: vec![],

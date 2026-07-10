@@ -17,6 +17,14 @@ pub const MIN_I31: i32 = -(1 << 30);
 /// 13). Beyond this, a pure-INS variant spills to the long-allele bank.
 pub const MAX_INLINE_ALT_LEN: usize = 13;
 
+/// Bit position of base[0]'s 2-bit code in the inline payload (base[0] at [26:25]).
+/// The single source of truth for the payload's low half; PEXT/SWAR shifts derive
+/// from it.
+pub const PAYLOAD_TOP_SHIFT: u32 = 25;
+
+/// Bit position of the 5-bit `ilen` field (occupies [31:27]).
+pub const ILEN_SHIFT: u32 = 27;
+
 /// 2-bit code → ALT base. `A=00 C=01 T=10 G=11`. `T`/`G` are swapped vs. the
 /// obvious alphabetical order — the values are an implementation detail of this
 /// crate and carry no meaning outside it.
@@ -43,7 +51,7 @@ pub fn decode_snp_2bit(code: u8) -> u8 {
 /// result is `Inline { alt: [decode_snp_2bit(code)] }`.
 #[inline]
 pub fn snp_code_to_key(code: u8) -> u32 {
-    ((code & 3) as u32) << 25
+    ((code & 3) as u32) << PAYLOAD_TOP_SHIFT
 }
 
 /// Pack 2-bit SNP codes 4-per-byte, little-pair-first: code `i` occupies bits
@@ -118,7 +126,7 @@ unsafe fn pext_reduce(block1: u64, block2: u64, n_bases: usize) -> u32 {
 
     let bits1 = (block1 >> 1) & SWAR_MASK;
     let extracted1 = _pext_u64(bits1, SWAR_MASK) as u32;
-    let part1 = extracted1 << 11; // 25 - 14
+    let part1 = extracted1 << (PAYLOAD_TOP_SHIFT - 14); // 25 - 14
 
     if n_bases <= 8 {
         return part1;
@@ -126,7 +134,7 @@ unsafe fn pext_reduce(block1: u64, block2: u64, n_bases: usize) -> u32 {
 
     let bits2 = (block2 >> 1) & SWAR_MASK;
     let extracted2 = _pext_u64(bits2, SWAR_MASK) as u32;
-    let part2 = extracted2 >> 5; // 30 - 25
+    let part2 = extracted2 >> (30 - PAYLOAD_TOP_SHIFT); // 30 - 25
     part1 | part2
 }
 
@@ -139,7 +147,7 @@ fn swar_reduce_portable(block1: u64, block2: u64, n_bases: usize) -> u32 {
     let bits2 = (block2 >> 1) & SWAR_MASK;
 
     let mut payload: u32 = 0;
-    let mut shift: i32 = 25;
+    let mut shift: i32 = PAYLOAD_TOP_SHIFT as i32;
 
     let n1 = n_bases.min(8);
     for i in 0..n1 {
@@ -178,7 +186,7 @@ fn encode_bases(alt_allele: &[u8], n_bases: usize) -> u32 {
 #[inline(always)]
 fn encode_snp(alt_base: u8) -> u32 {
     // (byte >> 1) & 3 → A=00, C=01, T=10, G=11.
-    ((alt_base as u32 >> 1) & 3) << 25
+    ((alt_base as u32 >> 1) & 3) << PAYLOAD_TOP_SHIFT
 }
 
 // Packs up to 13 DNA bases into a single u32 with the inline-encoding layout:
@@ -201,18 +209,18 @@ pub fn encode_alt_inline(alt_allele: &[u8], ilen: u32) -> u32 {
     }
 
     let payload = encode_bases(alt_allele, alt_len);
-    payload | (ilen << 27) // LSB stays 0 → no lookup flag
+    payload | (ilen << ILEN_SHIFT) // LSB stays 0 → no lookup flag
 }
 
 /// Decode the inline INS/SNP lane's ALT bases. Top 5 bits hold `ilen`;
 /// `alt_len = ilen + 1` (atomized invariant). Bases read MSB-first from `[26:25]`.
 #[inline(always)]
 pub fn decode_alt_inline(payload: u32) -> Vec<u8> {
-    let ilen = (payload >> 27) as usize;
+    let ilen = (payload >> ILEN_SHIFT) as usize;
     let alt_len = ilen + 1;
     let mut decoded = Vec::with_capacity(alt_len);
     for i in 0..alt_len {
-        let shift = 25 - (i * 2);
+        let shift = PAYLOAD_TOP_SHIFT as usize - (i * 2);
         let bit_val = ((payload >> shift) & 3) as usize;
         decoded.push(BASES[bit_val]);
     }
