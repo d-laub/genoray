@@ -83,7 +83,7 @@ pub struct BatchResult {
     /// Shared dense union (uniform keys, position-sorted); decode-once.
     pub dense: Vec<KeyRef>,
     /// `[s, e)` into `dense` per region (len n_regions).
-    pub dense_range: Vec<(usize, usize)>,
+    pub dense_range: Vec<Range<usize>>,
     /// Per-hap dense presence bitmask over that region's `dense[s..e]`, LSB-first,
     /// concatenated; `dense_present_off` (len H+1) holds BIT offsets.
     pub dense_present: Vec<u8>,
@@ -106,14 +106,14 @@ pub struct BatchResultSplit {
     /// Per-region `dense/snp` windows (uniform keys), concatenated.
     pub dense_snp: Vec<KeyRef>,
     /// `[s, e)` into `dense_snp` per region (len n_regions).
-    pub dense_snp_range: Vec<(usize, usize)>,
+    pub dense_snp_range: Vec<Range<usize>>,
     /// Per-hap presence bitmask over that region's `dense_snp[s..e]`, LSB-first;
     /// `dense_snp_present_off` (len H+1) holds BIT offsets.
     pub dense_snp_present: Vec<u8>,
     pub dense_snp_present_off: Vec<usize>,
     /// Per-region `dense/indel` windows (uniform u32 keys), concatenated.
     pub dense_indel: Vec<KeyRef>,
-    pub dense_indel_range: Vec<(usize, usize)>,
+    pub dense_indel_range: Vec<Range<usize>>,
     pub dense_indel_present: Vec<u8>,
     pub dense_indel_present_off: Vec<usize>,
 }
@@ -172,12 +172,9 @@ pub fn overlap_batch(reader: &ContigReader, regions: &[(u32, u32)]) -> BatchResu
 
     let dense = reader.dense_union();
     // Per-region dense index ranges — shared across all samples in the region.
-    let ranges: Vec<(usize, usize)> = regions
+    let ranges: Vec<Range<usize>> = regions
         .iter()
-        .map(|&(qs, qe)| {
-            let r = dense.overlap(qs, qe);
-            (r.start, r.end)
-        })
+        .map(|&(qs, qe)| dense.overlap(qs, qe))
         .collect();
 
     let mut vk: Vec<KeyRef> = Vec::new();
@@ -185,7 +182,7 @@ pub fn overlap_batch(reader: &ContigReader, regions: &[(u32, u32)]) -> BatchResu
     let mut presence = PresenceBitWriter::new();
 
     for (r, &(qs, qe)) in regions.iter().enumerate() {
-        let (ds, de) = ranges[r];
+        let (ds, de) = (ranges[r].start, ranges[r].end);
         for s in 0..n_samples {
             for p in 0..ploidy {
                 let col = s * ploidy + p;
@@ -381,7 +378,7 @@ pub fn gather_ranges(reader: &ContigReader, rb: &RangesBundle) -> BatchResult {
         vk,
         vk_off,
         dense: dense.refs,
-        dense_range: rb.dense_range.iter().map(|r| (r.start, r.end)).collect(),
+        dense_range: rb.dense_range.clone(),
         dense_present,
         dense_present_off,
     }
@@ -395,10 +392,10 @@ pub fn gather_ranges(reader: &ContigReader, rb: &RangesBundle) -> BatchResult {
 pub struct HapRanges<'a> {
     pub region_starts: &'a [u32],
     pub orig_samples: &'a [usize],
-    pub vk_snp_range: &'a [(usize, usize)],
-    pub vk_indel_range: &'a [(usize, usize)],
-    pub dense_snp_range: &'a [(usize, usize)],
-    pub dense_indel_range: &'a [(usize, usize)],
+    pub vk_snp_range: &'a [Range<usize>],
+    pub vk_indel_range: &'a [Range<usize>],
+    pub dense_snp_range: &'a [Range<usize>],
+    pub dense_indel_range: &'a [Range<usize>],
     pub ploidy: usize,
 }
 
@@ -408,10 +405,10 @@ impl<'a> HapRanges<'a> {
     pub fn new(
         region_starts: &'a [u32],
         orig_samples: &'a [usize],
-        vk_snp_range: &'a [(usize, usize)],
-        vk_indel_range: &'a [(usize, usize)],
-        dense_snp_range: &'a [(usize, usize)],
-        dense_indel_range: &'a [(usize, usize)],
+        vk_snp_range: &'a [Range<usize>],
+        vk_indel_range: &'a [Range<usize>],
+        dense_snp_range: &'a [Range<usize>],
+        dense_indel_range: &'a [Range<usize>],
         ploidy: usize,
     ) -> Self {
         let n_q = region_starts.len();
@@ -476,11 +473,11 @@ pub fn gather_haps_readbound(reader: &ContigReader, rb: &HapRanges<'_>) -> Batch
 
     // Dense windows per query (uniform keys), decoded once.
     let mut dense_snp: Vec<KeyRef> = Vec::new();
-    let mut dense_snp_range_out: Vec<(usize, usize)> = Vec::with_capacity(n_q);
+    let mut dense_snp_range_out: Vec<Range<usize>> = Vec::with_capacity(n_q);
     let mut dense_indel: Vec<KeyRef> = Vec::new();
-    let mut dense_indel_range_out: Vec<(usize, usize)> = Vec::with_capacity(n_q);
+    let mut dense_indel_range_out: Vec<Range<usize>> = Vec::with_capacity(n_q);
     for q in 0..n_q {
-        let (ss, se) = dense_snp_range[q];
+        let (ss, se) = (dense_snp_range[q].start, dense_snp_range[q].end);
         let base = dense_snp.len();
         if let Some(d) = d_snp {
             let keys = as_bytes(&d.keys);
@@ -496,8 +493,8 @@ pub fn gather_haps_readbound(reader: &ContigReader, rb: &HapRanges<'_>) -> Batch
                 });
             }
         }
-        dense_snp_range_out.push((base, dense_snp.len()));
-        let (is_, ie_) = dense_indel_range[q];
+        dense_snp_range_out.push(base..dense_snp.len());
+        let (is_, ie_) = (dense_indel_range[q].start, dense_indel_range[q].end);
         let base = dense_indel.len();
         if let Some(d) = d_indel {
             let keys = as_u32(&d.keys);
@@ -508,7 +505,7 @@ pub fn gather_haps_readbound(reader: &ContigReader, rb: &HapRanges<'_>) -> Batch
                 dense_indel.push(KeyRef { position: pos, key });
             }
         }
-        dense_indel_range_out.push((base, dense_indel.len()));
+        dense_indel_range_out.push(base..dense_indel.len());
     }
 
     let mut vk: Vec<KeyRef> = Vec::new();
@@ -519,8 +516,8 @@ pub fn gather_haps_readbound(reader: &ContigReader, rb: &HapRanges<'_>) -> Batch
     for q in 0..n_q {
         let qs = region_starts[q];
         let orig_s = orig_samples[q];
-        let (ss, se) = dense_snp_range[q];
-        let (is_r, ie_r) = dense_indel_range[q];
+        let (ss, se) = (dense_snp_range[q].start, dense_snp_range[q].end);
+        let (is_r, ie_r) = (dense_indel_range[q].start, dense_indel_range[q].end);
         // The dense-SNP position filter `qs < pos + 1` (i.e. `pos >= qs`) is
         // hap-independent, and dense positions are sorted ascending, so the
         // columns that pass form the suffix [c0_snp..se). Compute the threshold
@@ -535,7 +532,7 @@ pub fn gather_haps_readbound(reader: &ContigReader, rb: &HapRanges<'_>) -> Batch
             let row = q * ploidy + p;
 
             // var_key gather.
-            let (vs, ve) = vk_snp_range[row];
+            let (vs, ve) = (vk_snp_range[row].start, vk_snp_range[row].end);
             // Was `snp_positions.iter().enumerate().take(ve).skip(vs)`:
             // `Skip::next()` drains and discards `vs` items from the front
             // on first call, so every hap re-walked `snp_positions[0..vs]`
@@ -555,7 +552,7 @@ pub fn gather_haps_readbound(reader: &ContigReader, rb: &HapRanges<'_>) -> Batch
                     });
                 }
             }
-            let (vis, vie) = vk_indel_range[row];
+            let (vis, vie) = (vk_indel_range[row].start, vk_indel_range[row].end);
             // Same slicing treatment: `indel_positions`/`indel_keys` are
             // both plain `&[u32]` in the same absolute index space, so a
             // paired slice iterator drops the per-element bounds checks
@@ -677,7 +674,7 @@ impl BatchResult {
         let h = (r * self.n_samples + s) * self.ploidy + p;
         let vk_slice = self.vk[self.vk_off[h]..self.vk_off[h + 1]].to_vec();
 
-        let (ds, de) = self.dense_range[r];
+        let (ds, de) = (self.dense_range[r].start, self.dense_range[r].end);
         let bit0 = self.dense_present_off[h];
         let mut dn: Vec<KeyRef> = Vec::new();
         for (k, j) in (ds..de).enumerate() {
@@ -703,9 +700,11 @@ impl BatchResult {
 mod tests {
     use super::super::sidecar::mmap_file;
     use super::*;
+    use svar2_codec::PAYLOAD_TOP_SHIFT;
     use tempfile::tempdir;
 
     #[test]
+    #[allow(clippy::single_range_in_vec_init)]
     fn test_batch_result_offsets_are_consistent() {
         // A hand-built BatchResult: 1 region, 2 samples, ploidy 2 -> H = 4.
         // vk_off / dense_present_off must be non-decreasing, length H+1, and
@@ -716,11 +715,11 @@ mod tests {
             ploidy: 2,
             vk: vec![KeyRef {
                 position: 10,
-                key: 1 << 25,
+                key: 1 << PAYLOAD_TOP_SHIFT,
             }],
             vk_off: vec![0, 1, 1, 1, 1],
             dense: vec![],
-            dense_range: vec![(0, 0)],
+            dense_range: vec![0..0],
             dense_present: vec![],
             dense_present_off: vec![0, 0, 0, 0, 0],
         };

@@ -114,14 +114,14 @@ fn readbound_decode_hap(
     let h = (r * br.n_samples + s) * br.ploidy + p;
     let mut merged: Vec<KeyRef> = br.vk[br.vk_off[h]..br.vk_off[h + 1]].to_vec();
 
-    let (ss, se) = br.dense_snp_range[r];
+    let (ss, se) = (br.dense_snp_range[r].start, br.dense_snp_range[r].end);
     let bit0 = br.dense_snp_present_off[h];
     for (k, j) in (ss..se).enumerate() {
         if genoray_core::bits_get_bit(&br.dense_snp_present, bit0 + k) {
             merged.push(br.dense_snp[j]);
         }
     }
-    let (is_, ie_) = br.dense_indel_range[r];
+    let (is_, ie_) = (br.dense_indel_range[r].start, br.dense_indel_range[r].end);
     let bit0 = br.dense_indel_present_off[h];
     for (k, j) in (is_..ie_).enumerate() {
         if genoray_core::bits_get_bit(&br.dense_indel_present, bit0 + k) {
@@ -226,15 +226,16 @@ fn reader_ploidy(_r: &ContigReader) -> usize {
 
 #[test]
 #[should_panic(expected = "vk_snp_range len must equal n_q*ploidy")]
+#[allow(clippy::single_range_in_vec_init)]
 fn test_hapranges_new_rejects_mismatched_vk_len() {
     use genoray_core::query::HapRanges;
     let _ = HapRanges::new(
         &[0u32, 100],
         &[0, 1],
-        &[(0, 1)],
-        &[(0, 1)],
-        &[(0, 0), (0, 0)],
-        &[(0, 0), (0, 0)],
+        &[0..1],
+        &[0..1],
+        &[0..0, 0..0],
+        &[0..0, 0..0],
         2,
     );
 }
@@ -264,12 +265,12 @@ fn test_flat_gather_matches_cartesian_full_cohort() {
         for s in 0..s_n {
             region_starts.push(rb.region_starts[r]);
             orig_samples.push(rb.sample_cols[s]);
-            dsr.push((rb.dense_snp_range[r].start, rb.dense_snp_range[r].end));
-            dir_.push((rb.dense_indel_range[r].start, rb.dense_indel_range[r].end));
+            dsr.push(rb.dense_snp_range[r].clone());
+            dir_.push(rb.dense_indel_range[r].clone());
             for p in 0..ploidy {
                 let row = r * (s_n * ploidy) + s * ploidy + p;
-                vk_snp_range.push((rb.vk_snp_range[row].start, rb.vk_snp_range[row].end));
-                vk_indel_range.push((rb.vk_indel_range[row].start, rb.vk_indel_range[row].end));
+                vk_snp_range.push(rb.vk_snp_range[row].clone());
+                vk_indel_range.push(rb.vk_indel_range[row].clone());
             }
         }
     }
@@ -336,12 +337,12 @@ fn test_gather_haps_readbound_byte_identical() {
         for s in 0..s_n {
             region_starts.push(rb.region_starts[r]);
             orig_samples.push(rb.sample_cols[s]);
-            dsr.push((rb.dense_snp_range[r].start, rb.dense_snp_range[r].end));
-            dir_.push((rb.dense_indel_range[r].start, rb.dense_indel_range[r].end));
+            dsr.push(rb.dense_snp_range[r].clone());
+            dir_.push(rb.dense_indel_range[r].clone());
             for p in 0..ploidy {
                 let row = r * (s_n * ploidy) + s * ploidy + p;
-                vk_snp_range.push((rb.vk_snp_range[row].start, rb.vk_snp_range[row].end));
-                vk_indel_range.push((rb.vk_indel_range[row].start, rb.vk_indel_range[row].end));
+                vk_snp_range.push(rb.vk_snp_range[row].clone());
+                vk_indel_range.push(rb.vk_indel_range[row].clone());
             }
         }
     }
@@ -494,12 +495,12 @@ fn test_gather_haps_readbound_tie_break_snp_before_indel() {
         for s in 0..s_n {
             region_starts.push(rb.region_starts[r]);
             orig_samples.push(rb.sample_cols[s]);
-            dsr.push((rb.dense_snp_range[r].start, rb.dense_snp_range[r].end));
-            dir_.push((rb.dense_indel_range[r].start, rb.dense_indel_range[r].end));
+            dsr.push(rb.dense_snp_range[r].clone());
+            dir_.push(rb.dense_indel_range[r].clone());
             for p in 0..ploidy {
                 let row = r * (s_n * ploidy) + s * ploidy + p;
-                vk_snp_range.push((rb.vk_snp_range[row].start, rb.vk_snp_range[row].end));
-                vk_indel_range.push((rb.vk_indel_range[row].start, rb.vk_indel_range[row].end));
+                vk_snp_range.push(rb.vk_snp_range[row].clone());
+                vk_indel_range.push(rb.vk_indel_range[row].clone());
             }
         }
     }

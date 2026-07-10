@@ -6,6 +6,7 @@
 
 use std::path::Path;
 
+use crate::enum_map::{EnumKey, EnumMap};
 use crate::rvk::pack_snp_key_file;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14,11 +15,11 @@ pub enum StreamTag {
     VarKeyIndel = 1,
 }
 
-impl StreamTag {
-    pub const COUNT: usize = 2;
-    pub const ALL: [StreamTag; Self::COUNT] = [StreamTag::VarKeySnp, StreamTag::VarKeyIndel];
+impl EnumKey for StreamTag {
+    const COUNT: usize = 2;
+    const ALL: &'static [StreamTag] = &[StreamTag::VarKeySnp, StreamTag::VarKeyIndel];
     #[inline]
-    pub fn index(self) -> usize {
+    fn index(self) -> usize {
         self as usize
     }
 }
@@ -51,29 +52,16 @@ pub const REGISTRY: [StreamSpec; StreamTag::COUNT] = [
 ];
 
 /// Fixed-size map keyed by `StreamTag`, backed by an array (O(1), no hashing).
-pub struct StreamMap<T> {
-    slots: [T; StreamTag::COUNT],
-}
+pub type StreamMap<T> = EnumMap<StreamTag, T, { StreamTag::COUNT }>;
 
-impl<T> StreamMap<T> {
-    pub fn from_fn(f: impl FnMut(StreamTag) -> T) -> Self {
-        Self {
-            slots: StreamTag::ALL.map(f),
+impl StreamTag {
+    /// Bridge to the canonical variant-class axis (mirrors `DenseClass::cost_class`).
+    #[inline]
+    pub fn class(self) -> crate::cost_model::Class {
+        match self {
+            StreamTag::VarKeySnp => crate::cost_model::Class::Snp,
+            StreamTag::VarKeyIndel => crate::cost_model::Class::Indel,
         }
-    }
-    #[inline]
-    pub fn get(&self, tag: StreamTag) -> &T {
-        &self.slots[tag.index()]
-    }
-    #[inline]
-    pub fn get_mut(&mut self, tag: StreamTag) -> &mut T {
-        &mut self.slots[tag.index()]
-    }
-    pub fn iter(&self) -> impl Iterator<Item = (StreamTag, &T)> {
-        StreamTag::ALL.into_iter().zip(self.slots.iter())
-    }
-    pub fn into_iter_tagged(self) -> impl Iterator<Item = (StreamTag, T)> {
-        StreamTag::ALL.into_iter().zip(self.slots)
     }
 }
 
@@ -112,5 +100,12 @@ mod tests {
         assert_eq!(*m.get(StreamTag::VarKeyIndel), 7);
         let collected: Vec<_> = m.iter().map(|(_, v)| *v).collect();
         assert_eq!(collected, vec![0, 7]);
+    }
+
+    #[test]
+    fn test_streamtag_class_bridge() {
+        use crate::cost_model::Class;
+        assert_eq!(StreamTag::VarKeySnp.class(), Class::Snp);
+        assert_eq!(StreamTag::VarKeyIndel.class(), Class::Indel);
     }
 }

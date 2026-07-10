@@ -90,9 +90,7 @@ fn test_find_ranges_dense_range_matches_overlap_batch() {
     let rb = find_ranges(&reader, &regions, None);
 
     // Same per-region dense index ranges; H+1 vk_off implies R*H vk sub-ranges.
-    let rb_dense_range: Vec<(usize, usize)> =
-        rb.dense_range.iter().map(|r| (r.start, r.end)).collect();
-    assert_eq!(rb_dense_range, br.dense_range);
+    assert_eq!(rb.dense_range, br.dense_range);
     assert_eq!(rb.n_regions, br.n_regions);
     assert_eq!(rb.n_samples, br.n_samples);
     assert_eq!(rb.ploidy, br.ploidy);

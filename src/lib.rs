@@ -20,6 +20,7 @@ pub mod cost_model;
 pub mod dense;
 #[cfg(feature = "conversion")]
 pub mod dense_merge;
+mod enum_map;
 pub mod error;
 #[cfg(feature = "conversion")]
 pub mod executor;

@@ -41,9 +41,9 @@ fn batch_result_to_dict<'py>(
     // dense_range as [R, 2] i32.
     let r = br.dense_range.len();
     let mut dr: Vec<i32> = Vec::with_capacity(r * 2);
-    for &(s, e) in &br.dense_range {
-        dr.push(s as i32);
-        dr.push(e as i32);
+    for range in &br.dense_range {
+        dr.push(range.start as i32);
+        dr.push(range.end as i32);
     }
     let dense_range = Array2::from_shape_vec((r, 2), dr)
         .expect("dense_range shape")

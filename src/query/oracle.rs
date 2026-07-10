@@ -4,6 +4,8 @@
 //! test-oracle wrappers. These are gvl-side test-oracle entry points, kept
 //! under `query::oracle::*` rather than the top-level `query::` namespace.
 
+use std::ops::Range;
+
 use crate::rvk;
 use crate::spine::{self, KeyRef};
 
@@ -92,9 +94,9 @@ pub fn gather_ranges_readbound(reader: &ContigReader, rb: &RangesBundle) -> Batc
 
     // --- dense channel windows (per region), decoded to uniform keys once ---
     let mut dense_snp: Vec<KeyRef> = Vec::new();
-    let mut dense_snp_range: Vec<(usize, usize)> = Vec::with_capacity(n_regions);
+    let mut dense_snp_range: Vec<Range<usize>> = Vec::with_capacity(n_regions);
     let mut dense_indel: Vec<KeyRef> = Vec::new();
-    let mut dense_indel_range: Vec<(usize, usize)> = Vec::with_capacity(n_regions);
+    let mut dense_indel_range: Vec<Range<usize>> = Vec::with_capacity(n_regions);
     for r in 0..n_regions {
         let snp_r = &rb.dense_snp_range[r];
         let (ss, se) = (snp_r.start, snp_r.end);
@@ -108,7 +110,7 @@ pub fn gather_ranges_readbound(reader: &ContigReader, rb: &RangesBundle) -> Batc
                 });
             }
         }
-        dense_snp_range.push((base, dense_snp.len()));
+        dense_snp_range.push(base..dense_snp.len());
 
         let indel_r = &rb.dense_indel_range[r];
         let (is_, ie_) = (indel_r.start, indel_r.end);
@@ -122,7 +124,7 @@ pub fn gather_ranges_readbound(reader: &ContigReader, rb: &RangesBundle) -> Batc
                 });
             }
         }
-        dense_indel_range.push((base, dense_indel.len()));
+        dense_indel_range.push(base..dense_indel.len());
     }
 
     let mut vk: Vec<KeyRef> = Vec::new();
