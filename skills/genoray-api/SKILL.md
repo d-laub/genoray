@@ -303,7 +303,7 @@ SVAR 1.0 behavior.
 # SVAR2 (default) — reference required XOR --no-reference
 genoray write file.vcf.gz out.svar2 --reference ref.fa
 genoray write file.vcf.gz out.svar2 --no-reference
-genoray write file.vcf.gz out.svar2 --reference ref.fa --no-symbolic --threads 4
+genoray write file.vcf.gz out.svar2 --reference ref.fa --skip-symbolics-and-breakends --threads 4
 
 # SVAR 1.0 (previous default) — VCF or PGEN, dosages, --haploid, --max-mem
 genoray write svar1 file.vcf.gz out.svar --max-mem 4g --haploid
@@ -312,10 +312,11 @@ genoray write svar1 file.vcf.gz out.svar --max-mem 4g --haploid
 - `genoray write` (SVAR2, thin wrapper over `SparseVar2.from_vcf`): `--reference`
   XOR `--no-reference` (required), `--ploidy` (default 2), `--chunk-size`
   (default 25000), `--threads`/`-@`, `--overwrite`, `--long-allele-capacity`
-  (advanced), and `--no-symbolic`/`--no-breakend` — **coupled** on SVAR2 (either
-  one drops both out-of-scope classes) and print a
-  `Dropped {n} out-of-scope (symbolic/breakend) ALT alleles.` line when set.
-  VCF/BCF source only.
+  (advanced), and a single `--skip-symbolics-and-breakends` flag (maps to
+  `skip_out_of_scope=`) — the SVAR2 core can't expand either symbolic ALTs
+  (`<DEL>`, `<INS>`, …) or breakends into nucleotides, so they're dropped
+  together; prints a `Dropped {n} out-of-scope (symbolic/breakend) ALT
+  alleles.` line when set. VCF/BCF source only.
 - `genoray write svar1`: unchanged SVAR 1.0 behavior — VCF or PGEN source,
   `--dosages`, `--max-mem`, `--haploid`, `--no-symbolic`/`--no-breakend`
   (independent flags here, unlike SVAR2).

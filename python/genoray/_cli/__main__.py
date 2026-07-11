@@ -63,8 +63,9 @@ def write_svar2(
     threads: Annotated[int | None, Parameter(name=["--threads", "-@"])] = None,
     long_allele_capacity: int = 8 * 1024 * 1024,
     overwrite: bool = False,
-    no_symbolic: Annotated[bool, Parameter(name="--no-symbolic", negative="")] = False,
-    no_breakend: Annotated[bool, Parameter(name="--no-breakend", negative="")] = False,
+    skip_symbolics_and_breakends: Annotated[
+        bool, Parameter(name="--skip-symbolics-and-breakends", negative="")
+    ] = False,
 ) -> None:
     """
     Convert a bgzipped VCF or BCF to an SVAR2 store (the default, better-across-the-board format).
@@ -94,17 +95,16 @@ def write_svar2(
         Advanced: byte budget for the streaming long-allele buffer.
     overwrite
         Overwrite the output directory if it exists.
-    no_symbolic
-        Drop records with a symbolic ALT (``<DEL>``, ``<INS>``, …) instead of
-        erroring. On SVAR2 this is coupled with ``--no-breakend`` (the core does
-        not distinguish the two classes); passing either drops both.
-    no_breakend
-        Drop records with a breakend ALT. Coupled with ``--no-symbolic`` on
-        SVAR2 (see above).
+    skip_symbolics_and_breakends
+        Drop records whose ALT is symbolic (``<DEL>``, ``<INS>``, …) or a
+        breakend, instead of erroring. The SVAR2 core cannot expand either
+        class into nucleotides, so they are dropped together. (On
+        ``genoray write svar1`` the two classes are filtered independently
+        via ``--no-symbolic`` / ``--no-breakend``.)
     """
     from genoray import SparseVar2
 
-    skip_out_of_scope = no_symbolic or no_breakend
+    skip_out_of_scope = skip_symbolics_and_breakends
     dropped = SparseVar2.from_vcf(
         out,
         source,
