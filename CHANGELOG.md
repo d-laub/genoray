@@ -1,3 +1,12 @@
+## Unreleased
+
+### Added
+
+- `SparseVar2.annotate_mutations`, `mutation_matrix`, and `assign_signatures`
+  for COSMIC mutational-signature workflows (SBS96/ID83/DBS78), implemented in
+  Rust with a per-record sidecar and streaming count matrix. `from_vcf` gains a
+  `signatures=` flag to classify during the write (factored into the cost model).
+
 ## 3.0.0 (2026-07-10)
 
 ### BREAKING CHANGE

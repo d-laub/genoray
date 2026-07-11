@@ -17,7 +17,7 @@ description: Use when writing or modifying Python code that imports `genoray` to
 - `genoray.VCF` — VCF/BCF reader
 - `genoray.Filter` — VCF filter value object bundling a cyvcf2 record predicate (`record`) with its matching `.gvi` polars expression (`expr`)
 - `genoray.SparseVar` — sparse `.svar` reader/writer
-- `genoray.SparseVar2` — next-gen sparse variant store (VCF/BCF → SVAR2 conversion via `from_vcf`; range queries via `decode`/`region_counts`/`read_ranges`)
+- `genoray.SparseVar2` — next-gen sparse variant store (VCF/BCF → SVAR2 conversion via `from_vcf`; range queries via `decode`/`region_counts`/`read_ranges`; mutational-signature support (SBS96/DBS78/ID83) via `annotate_mutations`/`mutation_matrix`/`assign_signatures`, or classify during the write with `from_vcf(signatures=True)`)
 - `genoray.exprs` — polars filter expressions for `.gvi` indexes
 - `genoray.cosmic_signatures` — fetch/cache COSMIC reference signatures
 - `genoray.fit_signatures` — sparse forward-selection signature refit
@@ -35,7 +35,7 @@ Prefer reading these over guessing:
 - `genoray/_vcf.py` — `VCF` class: constructor, `read`, `chunk`, mode constants near the top of the class; `get_record_info(contig=None, start=None, end=None, fields=None, info=None, lazy=False)` — non-FORMAT record-level fields (including INFO) for a range or the whole file, returns `pl.DataFrame` (or `pl.LazyFrame` when `lazy=True`)
 - `genoray/_pgen.py` — `PGEN` class: constructor, `read`, `chunk`, `read_ranges`, `chunk_ranges`, mode constants near the top of the class
 - `genoray/_svar.py` — `SparseVar`: `__init__`, `from_vcf`, `from_pgen`, `read_ranges`, `read_ranges_with_length(contig, starts=0, ends=POS_MAX, samples=None)` (length-guaranteed range read; returns the same type as `read_ranges` — a `Ragged` or fields-augmented record), `with_fields`, `annotate_mutations`, `mutation_matrix`, `assign_signatures`, `annotate_with_gtf(gtf, level_filter=1, write_back=True, *, strand_encoding=None, codon_null_token=None)` (GTF CDS annotation entry point, returns `pl.DataFrame` with `varID`/`gene_id`/`strand`/`codon_pos`), `cache_afs()` (computes and persists an `AF` column to the `.gvi` index; returns `None`)
-- `genoray/_svar2.py` — `SparseVar2`: `__init__`, `from_vcf` (VCF/BCF → SVAR2 conversion entry point); `n_samples`/`available_samples`/`contigs`/`ploidy` metadata. Read/query methods live in the mixins: `genoray/_svar2_decode.py` (`decode`, `region_counts`) and `genoray/_svar2_batch.py` (public `read_ranges`; internal gvl-only `_overlap_batch`/`_find_ranges`/`_gather_ranges`)
+- `genoray/_svar2.py` — `SparseVar2`: `__init__`, `from_vcf` (VCF/BCF → SVAR2 conversion entry point, `signatures=` classifies during the write); `n_samples`/`available_samples`/`contigs`/`ploidy` metadata. Read/query methods live in the mixins: `genoray/_svar2_decode.py` (`decode`, `region_counts`), `genoray/_svar2_batch.py` (public `read_ranges`; internal gvl-only `_overlap_batch`/`_find_ranges`/`_gather_ranges`), and `genoray/_svar2_mutcat.py` (`annotate_mutations`, `mutation_matrix`, `assign_signatures` — COSMIC mutational-signature workflow, mirroring `SparseVar`'s but backed by a per-contig Rust sidecar instead of a `.gvi`-attached field)
 - `genoray/_cli/__main__.py` — the `genoray` CLI (`index`, `write` / `write svar1`, `view`)
 - `genoray/_signatures.py` — `cosmic_signatures`, `fit_signatures`
 - `genoray/_reference.py` — `Reference`: `from_path`, `fetch`, `contig_array`
@@ -315,6 +315,49 @@ scalars `n_regions`/`n_samples`/`ploidy`.
 the search/gather split used by a write-time overlap cache. They are **not**
 part of the public API, are not covered by semver, and may change or
 disappear without notice; don't call them from user code.
+
+### Mutational signatures (SBS96 / DBS78 / ID83)
+
+Same COSMIC workflow as `SparseVar` (see "Mutation catalogues" above), backed
+by a Rust per-contig sidecar instead of a `.gvi`-attached field. Annotation is
+**required** before `mutation_matrix` — either post-hoc, or by passing
+`signatures=True` to `from_vcf` (above):
+
+```python
+sv = SparseVar2("out.svar2")
+ref = genoray.Reference.from_path("hg38.fa")
+
+sv.annotate_mutations(ref)                   # post-hoc; writes the mutcat sidecar
+sv.annotate_mutations(ref, contigs=["chr1"])  # restrict to a subset of contigs
+
+df = sv.mutation_matrix("SBS96")                     # count="allele" (default)
+df = sv.mutation_matrix("DBS78", count="sample")
+act = sv.assign_signatures("SBS96")                  # mutation_matrix + fit_signatures
+```
+
+- `annotate_mutations(reference, *, contigs=None) -> None` — `reference` is a
+  `genoray.Reference` or a FASTA path; `contigs=None` (default) annotates every
+  contig. Unlike `SparseVar.annotate_mutations`, there is **no `write_back=`
+  toggle** — SVAR2 always persists the sidecar to disk.
+- `mutation_matrix(kind, *, count="allele"|"sample") -> pl.DataFrame` — a
+  `MutationType` column (fixed COSMIC codebook order) plus one column per
+  sample. `kind ∈ {"SBS96", "DBS78", "ID83"}`. `count="allele"` counts every
+  non-ref allele copy; `count="sample"` counts each category at most once per
+  sample, OR-combined across contigs. **Raises `ValueError`** if called before
+  the store is annotated (no on-disk sidecar for every contig) — annotate
+  first, either via `annotate_mutations` or `from_vcf(..., signatures=True)`.
+- `assign_signatures(kind, *, reference=None, count="allele", max_delta=0.01, min_activity=0.005, n_jobs=1, backend="loky") -> pl.DataFrame`
+  — `mutation_matrix(kind, count=...)` then `genoray.fit_signatures(...)`.
+  `reference` accepts a `pl.DataFrame`, a TSV path, or `None` (defaults to
+  `genoray.cosmic_signatures(kind)`).
+- Same classification rules as v1 (shared Rust classifier): **DBS78 arises
+  only from isolated adjacent same-haplotype SNV pairs** — runs of ≥3
+  adjacent SNVs stay as individual SBS96 entries, native MNVs > 2bp are
+  atomized into SBS96, and each isolated doublet is counted **once** (not
+  once per constituent SNV).
+- No public read-side access to the raw per-genotype `mutcat` codes for
+  SVAR2 (unlike v1's `fields=["mutcat"]`) — only the aggregated
+  `mutation_matrix` output is exposed.
 
 ### Errors
 
