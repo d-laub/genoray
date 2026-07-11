@@ -36,7 +36,7 @@ Prefer reading these over guessing:
 - `genoray/_vcf.py` — `VCF` class: constructor, `read`, `chunk`, mode constants near the top of the class
 - `genoray/_pgen.py` — `PGEN` class: constructor, `read`, `chunk`, `read_ranges`, `chunk_ranges`, mode constants near the top of the class
 - `genoray/_svar.py` — `SparseVar`: `__init__`, `from_vcf`, `from_pgen`, `read_ranges`, `with_fields`, `annotate_mutations`, `mutation_matrix`, `assign_signatures`
-- `genoray/_svar2.py` — `SparseVar2`: `__init__`, `from_vcf` (VCF/BCF → SVAR2 conversion entry point); `n_samples`/`samples`/`contigs`/`ploidy` metadata. Read/query methods live in the mixins: `genoray/_svar2_decode.py` (`decode`, `region_counts`) and `genoray/_svar2_batch.py` (`overlap_batch`, `read_ranges`, `find_ranges`, `gather_ranges`)
+- `genoray/_svar2.py` — `SparseVar2`: `__init__`, `from_vcf` (VCF/BCF → SVAR2 conversion entry point); `n_samples`/`available_samples`/`contigs`/`ploidy` metadata. Read/query methods live in the mixins: `genoray/_svar2_decode.py` (`decode`, `region_counts`) and `genoray/_svar2_batch.py` (`overlap_batch`, `read_ranges`, `find_ranges`, `gather_ranges`)
 - `genoray/_cli/__main__.py` — the `genoray` CLI (`index`, `write` / `write svar1`, `view`)
 - `genoray/_signatures.py` — `cosmic_signatures`, `fit_signatures`
 - `genoray/_reference.py` — `Reference`: `from_path`, `fetch`, `contig_array`
@@ -240,8 +240,9 @@ Signature: `from_vcf(out, source, reference=None, *, no_reference=False, skip_ou
 ### Range queries
 
 Open a finished store, then query per contig. Construction reads `meta.json` and
-opens one native reader per contig, exposing `.samples` (list), `.n_samples`,
-`.contigs`, `.ploidy`, `.format_version`.
+opens one native reader per contig, exposing `.available_samples` (list; the
+canonical sample-name accessor shared with `VCF`/`PGEN`/`SparseVar`),
+`.n_samples`, `.contigs`, `.ploidy`, `.format_version`.
 
 ```python
 from genoray import SparseVar2

@@ -50,7 +50,7 @@ class _BatchQueryMixin:
     # Provided by the concrete SparseVar2 host class (see SparseVar2.__init__);
     # declared here so the mixin's use of them type-checks in isolation.
     _readers: dict[str, Any]
-    samples: list[str]
+    available_samples: list[str]
 
     def overlap_batch(
         self, contig: str, regions: Iterable[tuple[int, int]]
@@ -75,9 +75,9 @@ class _BatchQueryMixin:
             return None
         idxs = []
         for s in np.atleast_1d(np.asarray(samples)).tolist():
-            if s not in self.samples:
+            if s not in self.available_samples:
                 raise ValueError(f"Sample {s!r} not found in the dataset.")
-            idxs.append(self.samples.index(s))
+            idxs.append(self.available_samples.index(s))
         return idxs
 
     def read_ranges(

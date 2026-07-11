@@ -49,7 +49,7 @@ def test_gather_of_find_matches_read(svar2_store: Path):
 def test_read_ranges_sample_subset(svar2_store: Path):
     sv = SparseVar2(svar2_store)
     full = sv.overlap_batch("chr1", [(0, 40)])
-    sub = sv.read_ranges("chr1", [0], [40], samples=[sv.samples[1]])
+    sub = sv.read_ranges("chr1", [0], [40], samples=[sv.available_samples[1]])
     assert int(sub["n_samples"]) == 1
     ploidy = sv.ploidy
     for p in range(ploidy):
@@ -69,11 +69,11 @@ def test_read_ranges_unknown_sample_raises(svar2_store: Path):
 
 def test_gather_ranges_mismatched_samples_raises(svar2_store: Path):
     sv = SparseVar2(svar2_store)
-    ranges = sv.find_ranges("chr1", [0], [40], samples=[sv.samples[0]])
+    ranges = sv.find_ranges("chr1", [0], [40], samples=[sv.available_samples[0]])
     with pytest.raises(ValueError):
-        sv.gather_ranges("chr1", ranges, samples=[sv.samples[1]])
+        sv.gather_ranges("chr1", ranges, samples=[sv.available_samples[1]])
     # A matching subset is allowed and should not raise.
-    sv.gather_ranges("chr1", ranges, samples=[sv.samples[0]])
+    sv.gather_ranges("chr1", ranges, samples=[sv.available_samples[0]])
 
 
 def test_find_ranges_out_streaming(svar2_store: Path):

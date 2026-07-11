@@ -41,19 +41,19 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin):
         self.path = Path(path)
         meta = json.loads((self.path / "meta.json").read_text())
         self.format_version: int = meta["format_version"]
-        self.samples: list[str] = list(meta["samples"])
+        self.available_samples: list[str] = list(meta["samples"])
         self.contigs: list[str] = list(meta["contigs"])
         self.ploidy: int = meta["ploidy"]
         self._readers: dict[str, _core.PyContigReader] = {
             contig: _core.PyContigReader(
-                str(self.path), contig, len(self.samples), self.ploidy
+                str(self.path), contig, len(self.available_samples), self.ploidy
             )
             for contig in self.contigs
         }
 
     @property
     def n_samples(self) -> int:
-        return len(self.samples)
+        return len(self.available_samples)
 
     @classmethod
     def from_vcf(

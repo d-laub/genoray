@@ -49,7 +49,7 @@ def test_from_vcf_with_reference_roundtrips(tmp_path: Path):
     assert dropped == 0
     assert (out / "meta.json").exists()
     sv = SparseVar2(out)
-    assert sv.samples == ["S0", "S1"]
+    assert sv.available_samples == ["S0", "S1"]
     assert sv.contigs == ["chr1"]
 
 
