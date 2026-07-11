@@ -16,7 +16,6 @@ description: Use when writing or modifying Python code that imports `genoray` to
 - `genoray.Reference` — indexed-FASTA reference genome reader
 - `genoray.VCF` — VCF/BCF reader
 - `genoray.Filter` — VCF filter value object bundling a cyvcf2 record predicate (`record`) with its matching `.gvi` polars expression (`expr`)
-- `genoray.Reader` — type alias `VCF | PGEN | SparseVar`
 - `genoray.SparseVar` — sparse `.svar` reader/writer
 - `genoray.SparseVar2` — next-gen sparse variant store (VCF/BCF → SVAR2 conversion via `from_vcf`; range queries via `decode`/`region_counts`/`read_ranges`)
 - `genoray.exprs` — polars filter expressions for `.gvi` indexes

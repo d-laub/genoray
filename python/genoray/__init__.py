@@ -18,7 +18,6 @@ __all__ = [
     "Reference",
     "VCF",
     "Filter",
-    "Reader",
     "SparseVar",
     "SparseVar2",
     "exprs",
@@ -41,14 +40,6 @@ _LAZY: dict[str, tuple[str, str | None]] = {
 
 
 def __getattr__(name: str):
-    if name == "Reader":
-        from ._pgen import PGEN
-        from ._svar import SparseVar
-        from ._vcf import VCF
-
-        result = VCF | PGEN | SparseVar
-        globals()[name] = result
-        return result
     if name in _LAZY:
         mod_path, attr = _LAZY[name]
         mod = importlib.import_module(mod_path)
@@ -68,5 +59,3 @@ if TYPE_CHECKING:  # pragma: no cover
     from ._svar2 import SparseVar2 as SparseVar2
     from ._vcf import Filter as Filter
     from ._vcf import VCF as VCF
-
-    Reader = VCF | PGEN | SparseVar
