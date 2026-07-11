@@ -2,6 +2,7 @@
 //! Code-space layout MUST match python/genoray/_mutcat/codebook.py.
 
 pub mod classify;
+pub mod sidecar;
 
 use std::ops::Range;
 
