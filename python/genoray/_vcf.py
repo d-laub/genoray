@@ -29,7 +29,7 @@ from ._modes import make_array_mode, make_tuple_mode
 from ._types import POS_MAX, POS_TYPE
 from ._utils import format_memory, parse_memory
 from ._var_ranges import var_counts, var_indices
-from .exprs import ILEN, symbolic_ilen
+from .exprs import ILEN, _symbolic_ilen
 
 V_IDX_TYPE = np.uint32
 """Dtype for VCF variant indices (uint32). This determines the maximum number of unique variants in a file."""
@@ -1064,7 +1064,7 @@ class VCF:
             sv_cols_df = sv_cols_df.drop("POS")
             index = pl.concat([index_df, sv_cols_df], how="horizontal").lazy()
 
-        # Ensure the columns symbolic_ilen references exist (nulls when absent).
+        # Ensure the columns _symbolic_ilen references exist (nulls when absent).
         schema = index.collect_schema()
         for col in ("SVLEN", "END", "IMPRECISE"):
             if col not in schema.names():
@@ -1080,7 +1080,7 @@ class VCF:
         if coerce:
             index = index.with_columns(coerce)
 
-        index = index.with_columns(ILEN=symbolic_ilen())
+        index = index.with_columns(ILEN=_symbolic_ilen())
 
         # Drop ALL of {SVLEN, END, IMPRECISE} that the user did not explicitly request
         # via info=. This covers both fetched helper cols AND null-placeholder cols added

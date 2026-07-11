@@ -14,5 +14,4 @@
 
 ```{eval-rst}
 .. automodule:: genoray.exprs
-    :exclude-members: IndexSchema
 ```
