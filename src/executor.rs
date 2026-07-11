@@ -29,7 +29,9 @@ pub fn run_compute_engine(
     let mut dense_ledgers: DenseMap<Vec<u32>> = DenseMap::from_fn(|_| Vec::with_capacity(10_000));
 
     while let Ok(chunk) = rx_dense.recv() {
-        let sparse_chunk = dense2sparse_vk(&chunk, &mut bank);
+        // Task 12 wires the real `signatures` flag through here; until then
+        // the sidecar-bits cost model stays off in the production path.
+        let sparse_chunk = dense2sparse_vk(&chunk, &mut bank, false);
 
         for (tag, sub) in sparse_chunk.streams.iter() {
             var_key_ledgers
