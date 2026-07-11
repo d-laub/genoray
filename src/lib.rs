@@ -33,6 +33,7 @@ pub mod merge;
 pub mod meta;
 #[cfg(feature = "conversion")]
 pub mod monitor;
+pub mod mutcat;
 #[cfg(feature = "conversion")]
 pub mod normalize;
 pub mod nrvk;
