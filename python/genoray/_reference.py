@@ -6,7 +6,7 @@ import numpy as np
 import pysam
 from numpy.typing import NDArray
 
-from ._utils import ContigNormalizer
+from ._contigs import ContigNormalizer
 
 _PAD = ord("N")
 

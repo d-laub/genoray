@@ -74,9 +74,9 @@ def expected_ilen(truth: GroundTruth, idx: Index) -> list[list[int | None]]:
 
     SV type normalization: at.sv_type may be a compound string like "DUP:TANDEM"
     (vcfixture stores the full type_str). The first ':'-delimited token is used for
-    matching, mirroring genoray.exprs.symbolic_ilen's regex + split behaviour.
+    matching, mirroring genoray.exprs._symbolic_ilen's regex + split behaviour.
 
-    Limitation: genoray.exprs.symbolic_ilen has an END-fallback
+    Limitation: genoray.exprs._symbolic_ilen has an END-fallback
     (abs(END - POS) when SVLEN is absent) that reads END from the index. The
     oracle cannot faithfully replicate this because vcfixture sets
     sv_end = pos + svlen (None iff svlen is None), so there is no END-only case in

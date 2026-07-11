@@ -20,16 +20,19 @@ from genoray._mutcat import (
     _dbs78_codes,
     _id83_codes_for_contig,
     _sbs96_codes,
-    _classify_variants_scalar,
     build_entry_codes,
     classify_dbs78,
-    classify_id83,
-    classify_sbs96,
     classify_variants,
     code_ranges,
     count_matrix,
 )
 from genoray._reference import Reference
+
+from _mutcat_oracle import (
+    _classify_variants_scalar,
+    classify_id83,
+    classify_sbs96,
+)
 
 
 def test_codebook_sizes():

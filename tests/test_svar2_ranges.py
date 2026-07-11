@@ -31,7 +31,7 @@ PAYLOAD_KEYS = [
 def test_read_ranges_matches_overlap_batch(svar2_store: Path):
     sv = SparseVar2(svar2_store)
     starts, ends = [0, 5], [40, 20]
-    ob = sv.overlap_batch("chr1", list(zip(starts, ends)))
+    ob = sv._overlap_batch("chr1", list(zip(starts, ends)))
     rr = sv.read_ranges("chr1", starts, ends)
     _assert_dicts_equal(ob, rr, PAYLOAD_KEYS)
     assert int(rr["n_regions"]) == 2
@@ -40,16 +40,16 @@ def test_read_ranges_matches_overlap_batch(svar2_store: Path):
 def test_gather_of_find_matches_read(svar2_store: Path):
     sv = SparseVar2(svar2_store)
     starts, ends = [0], [40]
-    ranges = sv.find_ranges("chr1", starts, ends)
-    gathered = sv.gather_ranges("chr1", ranges)
+    ranges = sv._find_ranges("chr1", starts, ends)
+    gathered = sv._gather_ranges("chr1", ranges)
     read = sv.read_ranges("chr1", starts, ends)
     _assert_dicts_equal(read, gathered, PAYLOAD_KEYS)
 
 
 def test_read_ranges_sample_subset(svar2_store: Path):
     sv = SparseVar2(svar2_store)
-    full = sv.overlap_batch("chr1", [(0, 40)])
-    sub = sv.read_ranges("chr1", [0], [40], samples=[sv.samples[1]])
+    full = sv._overlap_batch("chr1", [(0, 40)])
+    sub = sv.read_ranges("chr1", [0], [40], samples=[sv.available_samples[1]])
     assert int(sub["n_samples"]) == 1
     ploidy = sv.ploidy
     for p in range(ploidy):
@@ -69,16 +69,16 @@ def test_read_ranges_unknown_sample_raises(svar2_store: Path):
 
 def test_gather_ranges_mismatched_samples_raises(svar2_store: Path):
     sv = SparseVar2(svar2_store)
-    ranges = sv.find_ranges("chr1", [0], [40], samples=[sv.samples[0]])
+    ranges = sv._find_ranges("chr1", [0], [40], samples=[sv.available_samples[0]])
     with pytest.raises(ValueError):
-        sv.gather_ranges("chr1", ranges, samples=[sv.samples[1]])
+        sv._gather_ranges("chr1", ranges, samples=[sv.available_samples[1]])
     # A matching subset is allowed and should not raise.
-    sv.gather_ranges("chr1", ranges, samples=[sv.samples[0]])
+    sv._gather_ranges("chr1", ranges, samples=[sv.available_samples[0]])
 
 
 def test_find_ranges_out_streaming(svar2_store: Path):
     sv = SparseVar2(svar2_store)
-    ranges = sv.find_ranges("chr1", [0], [40])
+    ranges = sv._find_ranges("chr1", [0], [40])
     # Pre-allocate matching-shape buffers and stream into them.
     out = {
         k: np.empty_like(np.asarray(ranges[k]))
@@ -90,7 +90,7 @@ def test_find_ranges_out_streaming(svar2_store: Path):
             "vk_indel_range",
         )
     }
-    ranges2 = sv.find_ranges("chr1", [0], [40], out=out)
+    ranges2 = sv._find_ranges("chr1", [0], [40], out=out)
     for k in out:
         np.testing.assert_array_equal(np.asarray(ranges2[k]), np.asarray(ranges[k]))
         # out= wrote in place: returned array shares the buffer.

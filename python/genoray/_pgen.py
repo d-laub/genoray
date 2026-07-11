@@ -18,17 +18,14 @@ from seqpro.rag import OFFSET_TYPE
 from typing_extensions import Self, assert_never, override
 from zstandard import ZstdDecompressor
 
+from ._contigs import ContigNormalizer
+from ._genos import hap_ilens
+from ._io import atomic_write_path
 from ._modes import make_array_mode, make_tuple_mode
 from ._types import POS_MAX, POS_TYPE
-from ._utils import (
-    ContigNormalizer,
-    atomic_write_path,
-    format_memory,
-    hap_ilens,
-    parse_memory,
-)
+from ._utils import format_memory, parse_memory
 from ._var_ranges import var_counts, var_indices
-from .exprs import ILEN, is_biallelic, symbolic_ilen
+from .exprs import ILEN, _symbolic_ilen, is_biallelic
 
 V_IDX_TYPE = np.uint32
 """Dtype for PGEN variant indices (uint32). This determines the maximum number of unique variants in a file."""
@@ -1059,7 +1056,7 @@ def _load_index(
             # miss symbolic-SV ILEN corrections.
             #
             # Regex-extract SVLEN/END/IMPRECISE from the PVAR INFO string, then
-            # use the shared symbolic_ilen() helper so symbolic SVs get correct
+            # use the shared _symbolic_ilen() helper so symbolic SVs get correct
             # sign-adjusted lengths (DEL→-|len|, INS/DUP→+|len|, others→null).
             info_col = pl.col("INFO").fill_null("")
             index = index.with_columns(
@@ -1074,7 +1071,7 @@ def _load_index(
                 # IMPRECISE=0 as set.
                 info_col.str.contains(r"(?:^|;)IMPRECISE(?:;|$)").alias("IMPRECISE"),
             )
-            index = index.with_columns(ILEN=symbolic_ilen())
+            index = index.with_columns(ILEN=_symbolic_ilen())
             index = index.drop("SVLEN", "END", "IMPRECISE")
         else:
             index = index.with_columns(ILEN=ILEN)

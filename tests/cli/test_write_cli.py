@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -9,11 +10,15 @@ from genoray import SparseVar, SparseVar2
 _REF = "ACAGTACATGGGTACTAGCTAGGCTAACCGGTTAACCGGT"
 
 
-def _run(argv: list[str]) -> subprocess.CompletedProcess:
+def _run(argv: list[str], *, columns: int | None = None) -> subprocess.CompletedProcess:
+    env = os.environ.copy()
+    if columns is not None:
+        env["COLUMNS"] = str(columns)
     return subprocess.run(
         [sys.executable, "-m", "genoray._cli", *argv],
         capture_output=True,
         text=True,
+        env=env,
     )
 
 
@@ -83,13 +88,65 @@ def test_write_skip_symbolic(tmp_path: Path):
             str(out),
             "--reference",
             str(ref),
-            "--no-symbolic",
+            "--skip-symbolics-and-breakends",
             "--threads",
             "1",
         ]
     )
     assert r.returncode == 0, r.stderr
     assert (out / "meta.json").exists()
+
+
+def test_write_svar2_has_single_skip_flag():
+    # --help lists the new collapsed flag. Wide COLUMNS avoids the rich help
+    # table wrapping the long flag name across lines.
+    r = _run(["write", "--help"], columns=200)
+    assert r.returncode == 0, r.stderr
+    assert "--skip-symbolics-and-breakends" in r.stdout
+    # The docstring's cross-reference note mentions svar1's --no-symbolic /
+    # --no-breakend by name for context, so we can't grep --help for their
+    # absence; see test_write_no_{symbolic,breakend}_removed_from_svar2 below
+    # for the behavioral check that they're no longer accepted options here.
+
+
+def test_write_no_symbolic_removed_from_svar2(tmp_path: Path):
+    ref = _ref(tmp_path)
+    vcf = _vcf(tmp_path, symbolic=False)
+    out = tmp_path / "store5"
+    r = _run(
+        [
+            "write",
+            str(vcf),
+            str(out),
+            "--reference",
+            str(ref),
+            "--no-symbolic",
+            "--threads",
+            "1",
+        ]
+    )
+    assert r.returncode != 0
+    assert "no-symbolic" in (r.stdout + r.stderr).lower()
+
+
+def test_write_no_breakend_removed_from_svar2(tmp_path: Path):
+    ref = _ref(tmp_path)
+    vcf = _vcf(tmp_path, symbolic=False)
+    out = tmp_path / "store6"
+    r = _run(
+        [
+            "write",
+            str(vcf),
+            str(out),
+            "--reference",
+            str(ref),
+            "--no-breakend",
+            "--threads",
+            "1",
+        ]
+    )
+    assert r.returncode != 0
+    assert "no-breakend" in (r.stdout + r.stderr).lower()
 
 
 def test_write_svar1_still_works(tmp_path: Path):

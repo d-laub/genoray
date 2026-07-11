@@ -7,7 +7,7 @@ given the minimum set of index columns:
 - :code:`"ALT"` : :code:`pl.List[Utf8]`
 - :code:`"ILEN"` : :code:`pl.List[Int32]`
 
-Applicable for PGEN files and the experimental :meth:`VCF._load_index` method.
+Applicable to PGEN indexes, and to VCF indexes when one has been built.
 
 .. note::
     For PGEN, all columns that existed in the underlying PVAR will be available in the index.
@@ -26,7 +26,7 @@ ILEN is optional list[int]
 """
 
 # in-memory schema
-IndexSchema = {
+_IndexSchema = {
     "CHROM": pl.Enum,
     "POS": pl.Int64,
     "REF": pl.Utf8,
@@ -109,7 +109,7 @@ Breakends are a *distinct* ALT class from symbolic ``<...>`` alleles, so
 :data:`is_symbolic` does **not** flag them. But like symbolic alleles they are
 not expandable into nucleotides — the bracket/colon/position bytes corrupt
 personalized DNA buffers in haplotype consumers (e.g. ``genvarloader``). Their
-:func:`symbolic_ilen` value is ``null`` (so they are also :data:`is_imprecise`).
+:func:`_symbolic_ilen` value is ``null`` (so they are also :data:`is_imprecise`).
 
 To drop breakends, use ``expr=~genoray.exprs.is_breakend`` in a
 :class:`genoray.Filter`. To drop *all* un-expandable ALTs (symbolic +
@@ -145,7 +145,7 @@ ILEN = pl.col("ALT").list.eval(pl.element().str.len_bytes().cast(pl.Int32)) - pl
 """Indel length of the variant. Positive for insertions, negative for deletions, and zero for SNPs and MNPs."""
 
 
-def symbolic_ilen(
+def _symbolic_ilen(
     alt: str = "ALT",
     ref: str = "REF",
     svlen: str = "SVLEN",

@@ -5,8 +5,8 @@ from unittest.mock import patch
 import pytest
 from pytest_cases import parametrize_with_cases
 
+from genoray._contigs import ContigNormalizer
 from genoray._utils import (
-    ContigNormalizer,
     _resolve_threads,
     format_memory,
     parse_memory,

@@ -16,7 +16,6 @@ description: Use when writing or modifying Python code that imports `genoray` to
 - `genoray.Reference` — indexed-FASTA reference genome reader
 - `genoray.VCF` — VCF/BCF reader
 - `genoray.Filter` — VCF filter value object bundling a cyvcf2 record predicate (`record`) with its matching `.gvi` polars expression (`expr`)
-- `genoray.Reader` — type alias `VCF | PGEN | SparseVar`
 - `genoray.SparseVar` — sparse `.svar` reader/writer
 - `genoray.SparseVar2` — next-gen sparse variant store (VCF/BCF → SVAR2 conversion via `from_vcf`; range queries via `decode`/`region_counts`/`read_ranges`)
 - `genoray.exprs` — polars filter expressions for `.gvi` indexes
@@ -33,10 +32,10 @@ Prefer reading these over guessing:
 - `docs/source/index.md` — narrative tour with full examples (VCF, PGEN, filtering, chunking)
 - `docs/source/svar.md` — SparseVar usage
 - `genoray/__init__.py` — confirms the public surface
-- `genoray/_vcf.py` — `VCF` class: constructor, `read`, `chunk`, mode constants near the top of the class
+- `genoray/_vcf.py` — `VCF` class: constructor, `read`, `chunk`, mode constants near the top of the class; `get_record_info(contig=None, start=None, end=None, fields=None, info=None, lazy=False)` — non-FORMAT record-level fields (including INFO) for a range or the whole file, returns `pl.DataFrame` (or `pl.LazyFrame` when `lazy=True`)
 - `genoray/_pgen.py` — `PGEN` class: constructor, `read`, `chunk`, `read_ranges`, `chunk_ranges`, mode constants near the top of the class
-- `genoray/_svar.py` — `SparseVar`: `__init__`, `from_vcf`, `from_pgen`, `read_ranges`, `with_fields`, `annotate_mutations`, `mutation_matrix`, `assign_signatures`
-- `genoray/_svar2.py` — `SparseVar2`: `__init__`, `from_vcf` (VCF/BCF → SVAR2 conversion entry point); `n_samples`/`samples`/`contigs`/`ploidy` metadata. Read/query methods live in the mixins: `genoray/_svar2_decode.py` (`decode`, `region_counts`) and `genoray/_svar2_batch.py` (`overlap_batch`, `read_ranges`, `find_ranges`, `gather_ranges`)
+- `genoray/_svar.py` — `SparseVar`: `__init__`, `from_vcf`, `from_pgen`, `read_ranges`, `read_ranges_with_length(contig, starts=0, ends=POS_MAX, samples=None)` (length-guaranteed range read; returns the same type as `read_ranges` — a `Ragged` or fields-augmented record), `with_fields`, `annotate_mutations`, `mutation_matrix`, `assign_signatures`, `annotate_with_gtf(gtf, level_filter=1, write_back=True, *, strand_encoding=None, codon_null_token=None)` (GTF CDS annotation entry point, returns `pl.DataFrame` with `varID`/`gene_id`/`strand`/`codon_pos`), `cache_afs()` (computes and persists an `AF` column to the `.gvi` index; returns `None`)
+- `genoray/_svar2.py` — `SparseVar2`: `__init__`, `from_vcf` (VCF/BCF → SVAR2 conversion entry point); `n_samples`/`available_samples`/`contigs`/`ploidy` metadata. Read/query methods live in the mixins: `genoray/_svar2_decode.py` (`decode`, `region_counts`) and `genoray/_svar2_batch.py` (public `read_ranges`; internal gvl-only `_overlap_batch`/`_find_ranges`/`_gather_ranges`)
 - `genoray/_cli/__main__.py` — the `genoray` CLI (`index`, `write` / `write svar1`, `view`)
 - `genoray/_signatures.py` — `cosmic_signatures`, `fit_signatures`
 - `genoray/_reference.py` — `Reference`: `from_path`, `fetch`, `contig_array`
@@ -53,6 +52,31 @@ source** rather than reasoning from first principles.
 - Missing genotype = `-1` (int). Missing dosage = `np.nan` (float32).
 - Ploidy is 2 by default; `SparseVar.from_vcf`/`from_pgen` (and `genoray write svar1`) accept `haploid=True` / `--haploid`, which OR-collapses haplotypes into a single haploid call per sample and records `ploidy=1` in metadata (intended for unphased somatic data).
 - All return arrays are NumPy; `mode` selects which arrays you get back.
+
+## Sample accessors — canonical name + why the idioms diverge
+
+`available_samples` (a `list[str]`) is the canonical "all samples in the
+file" accessor — present on all four readers (`VCF`, `PGEN`, `SparseVar`,
+`SparseVar2`).
+
+`VCF` and `PGEN` additionally expose:
+- `current_samples` — the currently-selected subset (read-only property).
+- `set_samples(samples) -> Self` — a stateful call that mutates the reader
+  in place to select a subset (or restore all samples with `None`), then
+  returns `self`.
+
+`SparseVar` and `SparseVar2` have **no** `current_samples`/`set_samples`.
+Instead, every read method (`read_ranges`, `read_ranges_with_length`, etc.)
+takes samples as a per-call `samples=` kwarg.
+
+**Why the two idioms differ (performance):** subsetting samples on VCF/PGEN
+is costly — it re-initializes the backend reader — so it's a deliberate,
+stateful `set_samples()` call made once and reused across reads. On
+`SparseVar`/`SparseVar2`, subsetting is ~free (it's just an index selection
+over already-memory-mapped data), so it's exposed as a lightweight per-call
+`samples=` kwarg instead of a persistent reader state. This is an
+intentional divergence, not an inconsistency — don't "fix" one to match
+the other.
 
 ## Mode constants — gotcha
 
@@ -240,8 +264,9 @@ Signature: `from_vcf(out, source, reference=None, *, no_reference=False, skip_ou
 ### Range queries
 
 Open a finished store, then query per contig. Construction reads `meta.json` and
-opens one native reader per contig, exposing `.samples` (list), `.n_samples`,
-`.contigs`, `.ploidy`, `.format_version`.
+opens one native reader per contig, exposing `.available_samples` (list; the
+canonical sample-name accessor shared with `VCF`/`PGEN`/`SparseVar`),
+`.n_samples`, `.contigs`, `.ploidy`, `.format_version`.
 
 ```python
 from genoray import SparseVar2
@@ -268,27 +293,20 @@ counts = sv.region_counts("chr1", regions)   # np.ndarray, shape (R, S, P)
 - Queries are **per contig** — cross-contig batching is the caller's job. Regions
   are an iterable of `(start, end)` pairs.
 
-Lower-level array methods (what gvl's Rust core consumes) return the raw
-two-channel `BatchResult` → numpy dict, a `TypedDict` with a fixed field set:
-`vk_pos`/`vk_key`/`vk_off`, `dense_pos`/`dense_key`/`dense_range`/
-`dense_present`/`dense_present_off`, `lut_bytes`/`lut_off`, and scalars
-`n_regions`/`n_samples`/`ploidy`:
+The user-facing SVAR2 query API is `decode` / `region_counts` / `read_ranges`
+(above). `read_ranges(contig, starts, ends, samples=None)` is a fused
+search+gather; `starts`/`ends` are parallel 1D arrays (mirrors
+`SparseVar.read_ranges`), `samples` selects/reorders a subset **by name**. It
+returns the raw two-channel `BatchResult` → numpy dict, a `TypedDict` with a
+fixed field set: `vk_pos`/`vk_key`/`vk_off`, `dense_pos`/`dense_key`/
+`dense_range`/`dense_present`/`dense_present_off`, `lut_bytes`/`lut_off`, and
+scalars `n_regions`/`n_samples`/`ploidy`.
 
-- `overlap_batch(contig, regions)` — batched two-channel query.
-- `read_ranges(contig, starts, ends, samples=None)` — fused search+gather;
-  `starts`/`ends` are parallel 1D arrays (mirrors `SparseVar.read_ranges`),
-  `samples` selects/reorders a subset **by name**. Byte-identical to
-  `overlap_batch` over the same regions when `samples=None`.
-- `find_ranges(contig, starts, ends, samples=None, out=None)` /
-  `gather_ranges(contig, ranges, samples=None)` — the search-only + tree-free
-  replay split for a write-time overlap cache; `read_ranges ==
-  gather_ranges(find_ranges(...))`. `find_ranges(out=...)` streams the bundle into
-  caller-preallocated arrays. `find_ranges` returns the compact `RangesBundle`
-  `TypedDict` instead — `dense_range`/`region_starts`/`sample_cols`/
-  `vk_snp_range`/`vk_indel_range`/`dense_snp_range`/`dense_indel_range` plus
-  the same `n_regions`/`n_samples`/`ploidy` scalars — which `gather_ranges`
-  replays back into a `BatchResult`. Both are static-only annotations; the
-  dict contract these methods return at runtime is unchanged.
+`SparseVar2` also has `_overlap_batch`/`_find_ranges`/`_gather_ranges`
+(underscore-prefixed) — an internal, gvl-only numpy-dict wire contract for
+the search/gather split used by a write-time overlap cache. They are **not**
+part of the public API, are not covered by semver, and may change or
+disappear without notice; don't call them from user code.
 
 ### Errors
 
@@ -310,7 +328,7 @@ SVAR 1.0 behavior.
 # SVAR2 (default) — reference required XOR --no-reference
 genoray write file.vcf.gz out.svar2 --reference ref.fa
 genoray write file.vcf.gz out.svar2 --no-reference
-genoray write file.vcf.gz out.svar2 --reference ref.fa --no-symbolic --threads 4
+genoray write file.vcf.gz out.svar2 --reference ref.fa --skip-symbolics-and-breakends --threads 4
 
 # SVAR 1.0 (previous default) — VCF or PGEN, dosages, --haploid, --max-mem
 genoray write svar1 file.vcf.gz out.svar --max-mem 4g --haploid
@@ -319,10 +337,11 @@ genoray write svar1 file.vcf.gz out.svar --max-mem 4g --haploid
 - `genoray write` (SVAR2, thin wrapper over `SparseVar2.from_vcf`): `--reference`
   XOR `--no-reference` (required), `--ploidy` (default 2), `--chunk-size`
   (default 25000), `--threads`/`-@`, `--overwrite`, `--long-allele-capacity`
-  (advanced), and `--no-symbolic`/`--no-breakend` — **coupled** on SVAR2 (either
-  one drops both out-of-scope classes) and print a
-  `Dropped {n} out-of-scope (symbolic/breakend) ALT alleles.` line when set.
-  VCF/BCF source only.
+  (advanced), and a single `--skip-symbolics-and-breakends` flag (maps to
+  `skip_out_of_scope=`) — the SVAR2 core can't expand either symbolic ALTs
+  (`<DEL>`, `<INS>`, …) or breakends into nucleotides, so they're dropped
+  together; prints a `Dropped {n} out-of-scope (symbolic/breakend) ALT
+  alleles.` line when set. VCF/BCF source only.
 - `genoray write svar1`: unchanged SVAR 1.0 behavior — VCF or PGEN source,
   `--dosages`, `--max-mem`, `--haploid`, `--no-symbolic`/`--no-breakend`
   (independent flags here, unlike SVAR2).

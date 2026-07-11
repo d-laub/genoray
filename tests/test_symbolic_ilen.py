@@ -7,7 +7,7 @@ import polars as pl
 import pytest
 
 from genoray import PGEN, VCF, Filter, SparseVar, exprs
-from genoray.exprs import is_breakend, is_imprecise, symbolic_ilen
+from genoray.exprs import _symbolic_ilen, is_breakend, is_imprecise
 from tests import _oracle
 from tests.data.fixtures import FIXTURES as _FIXTURES
 
@@ -27,7 +27,7 @@ def _frame():
 
 
 def test_symbolic_ilen_precise_and_unsizable():
-    out = _frame().with_columns(ILEN=symbolic_ilen()).get_column("ILEN").to_list()
+    out = _frame().with_columns(ILEN=_symbolic_ilen()).get_column("ILEN").to_list()
     assert out[0] == [-100]  # <DEL> SVLEN=100
     assert out[1] == [50]  # <INS> SVLEN=50
     assert out[2] == [30]  # <DUP> SVLEN=30
@@ -37,7 +37,7 @@ def test_symbolic_ilen_precise_and_unsizable():
 
 
 def test_is_imprecise_flags_only_unsizable():
-    df = _frame().with_columns(ILEN=symbolic_ilen()).with_columns(imp=is_imprecise)
+    df = _frame().with_columns(ILEN=_symbolic_ilen()).with_columns(imp=is_imprecise)
     assert df.get_column("imp").to_list() == [False, False, False, True, False, True]
 
 
@@ -58,7 +58,7 @@ def test_mixed_literal_symbolic_alt():
             "POS": [1000],
         }
     )
-    out = df.with_columns(ILEN=symbolic_ilen()).get_column("ILEN").to_list()
+    out = df.with_columns(ILEN=_symbolic_ilen()).get_column("ILEN").to_list()
     assert out[0] == [0, -80]
 
 
@@ -105,7 +105,7 @@ def test_is_snp_is_indel_null_ilen_excluded():
 def test_symbolic_ilen_end_fallback_no_svlen():
     """Unit test: END-based fallback when SVLEN is absent (null).
 
-    Pins the |END - POS| convention used by symbolic_ilen() when coalesce()
+    Pins the |END - POS| convention used by _symbolic_ilen() when coalesce()
     falls back from SVLEN to END.  Every fixture row that has END also has
     SVLEN, so this path was previously uncovered end-to-end.
 
@@ -131,7 +131,7 @@ def test_symbolic_ilen_end_fallback_no_svlen():
             "POS": pl.Int64,
         },
     )
-    out = df.with_columns(ILEN=symbolic_ilen()).get_column("ILEN").to_list()
+    out = df.with_columns(ILEN=_symbolic_ilen()).get_column("ILEN").to_list()
     assert out[0] == [-100], f"<DEL> END-fallback: expected [-100], got {out[0]}"
     assert out[1] == [30], f"<DUP> END-fallback: expected [30], got {out[1]}"
 
@@ -163,7 +163,7 @@ def test_expected_ilen_from_oracle():
     assert exp[0] == [-100]  # <DEL>
     assert exp[1] == [50]  # <INS>
     assert exp[2] == [30]  # <DUP>
-    assert exp[3] == [None]  # IMPRECISE <DEL> -> null (mirrors symbolic_ilen)
+    assert exp[3] == [None]  # IMPRECISE <DEL> -> null (mirrors _symbolic_ilen)
     assert exp[4] == [None]  # <CNV> unsupported
     assert exp[5] == [None]  # <INV> unsupported
     assert exp[6] == [None]  # breakend (BND) -> null
@@ -204,7 +204,7 @@ def test_oracle_normalizes_compound_sv_type():
     """Oracle correctly handles compound SV types like DUP:TANDEM and DEL:ME.
 
     vcfixture stores sv_type as the full type_str (e.g. "DUP:TANDEM"), while
-    symbolic_ilen normalizes to the first ':'-delimited token.  The oracle must
+    _symbolic_ilen normalizes to the first ':'-delimited token.  The oracle must
     apply the same normalization or subtyped SVs wrongly fall through to None.
     """
     from vcfixture import Sym, VcfBuilder, VcfVersion
@@ -476,7 +476,7 @@ def test_property_ilen_matches_oracle():
     - NO END-only sized SVs (SVLEN always present when sv_end is set) — case #1 never occurs.
     - NO IMPRECISE flag in generated docs.
     - NO literal ALTs (is_sequence always False).
-    - CNV / INV / <*>: both oracle and symbolic_ilen return None → they AGREE.
+    - CNV / INV / <*>: both oracle and _symbolic_ilen return None → they AGREE.
     Therefore the simple got == exp assertion is correct and meaningful.
     """
     import tempfile
@@ -560,7 +560,7 @@ def test_symbolic_ilen_breakend_is_null():
             "POS": pl.Int64,
         },
     )
-    out = df.with_columns(ILEN=symbolic_ilen()).get_column("ILEN").to_list()
+    out = df.with_columns(ILEN=_symbolic_ilen()).get_column("ILEN").to_list()
     assert out[0] == [None], f"paired breakend should be null, got {out[0]}"
     assert out[1] == [None], f"single breakend should be null, got {out[1]}"
     assert out[2] == [0], f"SNP should be literal 0, got {out[2]}"

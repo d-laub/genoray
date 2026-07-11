@@ -472,7 +472,9 @@ def test_mutation_matrix_thread_invariant(tmp_path):
 def test_classify_variants_snv_context_uses_pos_minus_one(tmp_path):
     import polars as pl
 
-    from genoray._mutcat import classify_sbs96, classify_variants
+    from genoray._mutcat import classify_variants
+
+    from _mutcat_oracle import classify_sbs96
 
     # Reference where the base at 0-based index differs left vs right of the variant,
     # so a +1 shift would pick a different trinucleotide context.
