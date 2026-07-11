@@ -1,6 +1,8 @@
 //! COSMIC mutation-catalogue code space and classifiers for SVAR2.
 //! Code-space layout MUST match python/genoray/_mutcat/codebook.py.
 
+pub mod classify;
+
 use std::ops::Range;
 
 /// Class-local index counts (COSMIC codebook sizes).
