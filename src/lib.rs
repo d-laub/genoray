@@ -45,6 +45,7 @@ pub mod orchestrator;
 // itself has zero htslib dependency (pure numpy/pyo3 glue). Stays ungated as
 // shared infra, same reasoning as `streams` above.
 pub mod py_convert;
+pub mod py_mutcat;
 pub mod py_query;
 pub mod py_query_batch;
 pub mod py_query_decode;
