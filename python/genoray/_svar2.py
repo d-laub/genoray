@@ -8,6 +8,7 @@ from natsort import natsorted
 import genoray._core as _core
 from genoray._svar2_batch import _BatchQueryMixin
 from genoray._svar2_decode import _DecodeMixin
+from genoray._svar2_mutcat import _MutcatMixin
 
 
 def _ensure_bgzipped(source: Path) -> None:
@@ -29,7 +30,7 @@ def _ensure_index(source: Path) -> None:
     _core.index_vcf(str(source))
 
 
-class SparseVar2(_BatchQueryMixin, _DecodeMixin):
+class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
     """Reader for a finished SVAR2 store (M6a skeleton).
 
     Loads the top-level ``meta.json`` and opens one native
