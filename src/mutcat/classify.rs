@@ -211,6 +211,60 @@ pub fn id83_code(seq: &[u8], pos0: usize, refa: &[u8], alta: &[u8]) -> u8 {
     ID83_LUTS.idr[if is_del { 0 } else { 1 }][si][rep]
 }
 
+// Canonical DBS78 doublet labels, codebook order (must match codebook.py DBS78).
+const DBS78_LABELS: [&str; 78] = [
+    "AC>CA", "AC>CG", "AC>CT", "AC>GA", "AC>GG", "AC>GT", "AC>TA", "AC>TG", "AC>TT", "AT>CA",
+    "AT>CC", "AT>CG", "AT>GA", "AT>GC", "AT>TA", "CC>AA", "CC>AG", "CC>AT", "CC>GA", "CC>GG",
+    "CC>GT", "CC>TA", "CC>TG", "CC>TT", "CG>AT", "CG>GC", "CG>GT", "CG>TA", "CG>TC", "CG>TT",
+    "CT>AA", "CT>AC", "CT>AG", "CT>GA", "CT>GC", "CT>GG", "CT>TA", "CT>TC", "CT>TG", "GC>AA",
+    "GC>AG", "GC>AT", "GC>CA", "GC>CG", "GC>TA", "TA>AT", "TA>CG", "TA>CT", "TA>GC", "TA>GG",
+    "TA>GT", "TC>AA", "TC>AG", "TC>AT", "TC>CA", "TC>CG", "TC>CT", "TC>GA", "TC>GG", "TC>GT",
+    "TG>AA", "TG>AC", "TG>AT", "TG>CA", "TG>CC", "TG>CT", "TG>GA", "TG>GC", "TG>GT", "TT>AA",
+    "TT>AC", "TT>AG", "TT>CA", "TT>CC", "TT>CG", "TT>GA", "TT>GC", "TT>GG",
+];
+
+#[inline]
+fn comp(b: u8) -> u8 {
+    match b {
+        b'A' => b'T',
+        b'T' => b'A',
+        b'C' => b'G',
+        b'G' => b'C',
+        _ => b,
+    }
+}
+
+// Build the (r0,a0,r1,a1) -> code table once. Bases A=0 C=1 G=2 T=3.
+// Only exercised by the exhaustive test below; not otherwise called from
+// production code, hence the narrow dead_code allow for non-test builds.
+#[allow(dead_code)]
+const BASES_ACGT: [u8; 4] = [b'A', b'C', b'G', b'T'];
+
+fn dbs_index_of(key: &str) -> Option<u8> {
+    DBS78_LABELS.iter().position(|&l| l == key).map(|i| i as u8)
+}
+
+/// DBS78 class-local index (0..=77) or `UNCLASSIFIED`. Try literal then
+/// reverse-complement of the doublet REF>ALT.
+pub fn dbs78_code(r0: u8, a0: u8, r1: u8, a1: u8) -> u8 {
+    if base_index(r0) < 0 || base_index(r1) < 0 || base_index(a0) < 0 || base_index(a1) < 0 {
+        return UNCLASSIFIED;
+    }
+    let literal = format!("{}{}>{}{}", r0 as char, r1 as char, a0 as char, a1 as char);
+    if let Some(c) = dbs_index_of(&literal) {
+        return c;
+    }
+    // reverse-complement both sides
+    let rc = format!(
+        "{}{}>{}{}",
+        comp(r1) as char,
+        comp(r0) as char,
+        comp(a1) as char,
+        comp(a0) as char
+    );
+    dbs_index_of(&rc).unwrap_or(UNCLASSIFIED)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,5 +316,32 @@ mod tests {
     fn id83_rejects_non_acgt_unit() {
         let seq = b"ANNNG";
         assert_eq!(id83_code(seq, 0, b"AN", b"A"), UNCLASSIFIED);
+    }
+
+    #[test]
+    fn dbs78_literal_hit() {
+        // "AC>CA" is index 0.
+        assert_eq!(dbs78_code(b'A', b'C', b'C', b'A'), 0);
+    }
+
+    #[test]
+    fn dbs78_revcomp_fold() {
+        // "GT>TG" is not literal; revcomp = "AC>CA" (index 0).
+        assert_eq!(dbs78_code(b'G', b'T', b'T', b'G'), 0);
+    }
+
+    #[test]
+    fn dbs78_all_16_doublets_map_or_uncl() {
+        // Every ACGT^4 combo with r!=a on both is either a code < 78 or UNCLASSIFIED.
+        for &r0 in &BASES_ACGT {
+            for &r1 in &BASES_ACGT {
+                for &a0 in &BASES_ACGT {
+                    for &a1 in &BASES_ACGT {
+                        let c = dbs78_code(r0, a0, r1, a1);
+                        assert!(c < 78 || c == UNCLASSIFIED);
+                    }
+                }
+            }
+        }
     }
 }
