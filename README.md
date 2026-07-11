@@ -15,6 +15,15 @@ The `genoray` API more-or-less boils down to just two classes and up to five met
 
 The other important arguments to know are `mode` (and `phasing` for VCF) to set the return type and `max_mem` for chunking. The modes that are available for each file format are always accessible from the class itself, e.g. `VCF.Genos16`, `PGEN.GenosDosages`, etc. You can also filter variants on the fly using the `filter` argument to class constructors.
 
+Also included:
+
+- `SparseVar` and `SparseVar2` sparse variant stores for compact, range-queryable on-disk representations of genotype data.
+- `Reference` for reading reference genome sequence.
+- Mutation catalogues and signature refitting via `cosmic_signatures` and `fit_signatures`.
+- A `genoray index|write|view` CLI for building indices, converting VCF/PGEN to sparse formats, and inspecting variant files.
+
+See the [`genoray-api` skill](skills/genoray-api/SKILL.md) and the [docs](docs/source/api.md) for details.
+
 # Examples
 
 ## VCF

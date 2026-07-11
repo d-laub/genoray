@@ -7,7 +7,7 @@ given the minimum set of index columns:
 - :code:`"ALT"` : :code:`pl.List[Utf8]`
 - :code:`"ILEN"` : :code:`pl.List[Int32]`
 
-Applicable for PGEN files and the experimental :meth:`VCF._load_index` method.
+Applicable to PGEN indexes, and to VCF indexes when one has been built.
 
 .. note::
     For PGEN, all columns that existed in the underlying PVAR will be available in the index.
