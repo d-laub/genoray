@@ -21,6 +21,7 @@ class ContigNormalizer:
 
     def __init__(self, contigs: Iterable[str]):
         self.contigs = list(contigs)
+        self._name_to_index = {c: i for i, c in enumerate(self.contigs)}
         mito = next((c for c in self.contigs if c in _MITO_ALIASES), None)
         mito_map = {a: mito for a in _MITO_ALIASES} if mito is not None else {}
         self.contig_map = (
@@ -29,7 +30,7 @@ class ContigNormalizer:
             | {c: c for c in contigs}
             | mito_map
         )
-        self.remapper = {k: self.contigs.index(c) for k, c in self.contig_map.items()}
+        self.remapper = {k: self._name_to_index[c] for k, c in self.contig_map.items()}
         keys = np.array(list(self.remapper.keys()))
         self._c2dup = HashTable(
             max=len(self.contig_map) * 2,  # type: ignore
