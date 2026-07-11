@@ -3,6 +3,7 @@
 
 pub mod annotate;
 pub mod classify;
+pub mod count;
 pub mod sidecar;
 
 use std::ops::Range;
