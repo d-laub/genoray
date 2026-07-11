@@ -35,7 +35,6 @@ pub fn emit_snv_codes(snvs: &[SnvCall], out: &mut impl FnMut(usize)) {
                 );
                 if code != UNCLASSIFIED {
                     out(DBS78_OFFSET + code as usize);
-                    out(DBS78_OFFSET + code as usize);
                     j += 2;
                     continue;
                 }
@@ -67,12 +66,12 @@ mod tests {
     }
 
     #[test]
-    fn isolated_pair_emits_two_dbs() {
+    fn isolated_pair_emits_one_dbs() {
         let snvs = [snv(10, b'A', b'C'), snv(11, b'C', b'A')];
         let mut codes = vec![];
         emit_snv_codes(&snvs, &mut |c| codes.push(c));
-        // AC>CA is DBS index 0 → unified 96; both members contribute.
-        assert_eq!(codes, vec![96, 96]);
+        // AC>CA is DBS index 0 → unified 96; the doublet contributes exactly once.
+        assert_eq!(codes, vec![96]);
     }
 
     #[test]
@@ -82,13 +81,17 @@ mod tests {
             snv(11, b'C', b'A'),
             snv(12, b'C', b'A'),
         ];
-        let mut n_dbs = 0;
-        emit_snv_codes(&snvs, &mut |c| {
-            if c >= DBS78_OFFSET {
-                n_dbs += 1;
-            }
-        });
-        assert_eq!(n_dbs, 0, "runs of 3 must stay SBS");
+        let mut codes = vec![];
+        emit_snv_codes(&snvs, &mut |c| codes.push(c));
+        assert_eq!(
+            codes.len(),
+            3,
+            "all three SNVs in the run must emit an SBS code"
+        );
+        assert!(
+            codes.iter().all(|&c| c < DBS78_OFFSET),
+            "runs of 3 must stay SBS"
+        );
     }
 
     #[test]
