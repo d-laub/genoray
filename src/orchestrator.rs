@@ -54,6 +54,7 @@ pub fn process_chromosome(
     long_allele_capacity: usize,
     skip_out_of_scope: bool,
     processing_threads: usize,
+    signatures: bool,
 ) -> Result<u64, ConversionError> {
     // Directory Formatting: svar2/{contig}/var_key/{snp,indel}
     let paths = crate::layout::ContigPaths::new(base_out_dir, chrom);
@@ -175,7 +176,7 @@ pub fn process_chromosome(
         .spawn({
             move || {
                 let bank = LongAlleleTableWriter::new(tx_long, long_allele_capacity);
-                executor::run_compute_engine(rx_dense, tx_sparse, bank)
+                executor::run_compute_engine(rx_dense, tx_sparse, bank, signatures)
             }
         })
         .expect("spawn executor");
@@ -304,6 +305,24 @@ pub fn process_chromosome(
     // A pure scan of the finished indel key streams — decoupled from the merge.
     let contig_dir = std::path::Path::new(base_out_dir).join(chrom);
     crate::max_del::write_max_del(&contig_dir, samples.len(), ploidy)?;
+
+    // Optional M-signatures write-time annotation: classify SBS96/ID83 codes
+    // and store the mutcat sidecar now, while we're already in the
+    // conversion-gated write path. Requires a reference (checked in Python).
+    if signatures && let Some(fasta) = fasta_path {
+        let ref_seq = crate::vcf_reader::load_contig_seq(fasta, chrom)?;
+        let reader = crate::query::ContigReader::open(base_out_dir, chrom, samples.len(), ploidy)
+            .map_err(|e| ConversionError::Io {
+            context: format!("open ContigReader for mutcat annotate {chrom}"),
+            source: e,
+        })?;
+        crate::mutcat::annotate::annotate_contig(&reader, &paths, &ref_seq).map_err(|e| {
+            ConversionError::Io {
+                context: format!("annotate mutcat {chrom}"),
+                source: e,
+            }
+        })?;
+    }
 
     println!("[{}] Pipeline Execution Finished Successfully.", chrom);
 

@@ -244,7 +244,7 @@ dropped = SparseVar2.from_vcf(
 dropped = SparseVar2.from_vcf("out.svar2", "file.vcf.gz", no_reference=True)
 ```
 
-Signature: `from_vcf(out, source, reference=None, *, no_reference=False, skip_out_of_scope=False, ploidy=2, chunk_size=25_000, threads=None, overwrite=False, long_allele_capacity=8*1024*1024) -> int`
+Signature: `from_vcf(out, source, reference=None, *, no_reference=False, skip_out_of_scope=False, ploidy=2, chunk_size=25_000, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False) -> int`
 
 - `source` — a bgzipped VCF (`.vcf.gz`) or BCF (`.bcf`). **VCF/BCF only** — no PGEN
   source yet (roadmap M7). Auto-indexes (`.csi`) if no `.csi`/`.tbi` is found.
@@ -260,6 +260,14 @@ Signature: `from_vcf(out, source, reference=None, *, no_reference=False, skip_ou
   unless `skip_out_of_scope=True`).
 - No dosages, no `haploid=` OR-collapse, no `max_mem`-based chunking (use
   `chunk_size` instead) — these remain `SparseVar` (SVAR 1.0)-only for now.
+- `signatures=False` — when `True`, classifies every SNP/indel into its
+  SBS96/ID83 mutation-type code during the write and stores a `mutcat`
+  sidecar per contig (factored into the write's dense/var_key cost model).
+  Requires a reference (`reference=`); raises `ValueError` if combined with
+  `no_reference=True`. There is no public read-side API for the SVAR2
+  `mutcat` sidecar yet (unlike `SparseVar.annotate_mutations`/
+  `mutation_matrix`, below) — this flag only controls whether the sidecar is
+  written.
 
 ### Range queries
 

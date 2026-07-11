@@ -149,6 +149,46 @@ pub struct VcfChunkReader {
     next_seq: u64,
 }
 
+/// Load `chrom`'s full sequence from the FASTA at `fasta_path`, uppercased to
+/// ASCII (matching the classifiers'/normalizer's expectation). Shared by
+/// `VcfChunkReader::new` (validate_ref/left_align) and the orchestrator's
+/// write-time `signatures` annotation — keep both call sites byte-identical.
+pub(crate) fn load_contig_seq(fasta_path: &str, chrom: &str) -> Result<Vec<u8>, ConversionError> {
+    // A wrong reference path reaches Rust unchecked (Python does not validate
+    // it), so surface it as FileNotFoundError specifically.
+    if !std::path::Path::new(fasta_path).exists() {
+        return Err(ConversionError::MissingFile {
+            path: fasta_path.to_string(),
+        });
+    }
+    let fasta = rust_htslib::faidx::Reader::from_path(fasta_path).map_err(|e| {
+        ConversionError::Input(format!(
+            "Failed to open reference FASTA '{fasta_path}' (is there a .fai?): {e}"
+        ))
+    })?;
+    // htslib's faidx_seq_len returns -1 for an unknown contig, surfaced via
+    // rust-htslib as u64::MAX — check explicitly for a clear message.
+    let contig_len_raw = fasta.fetch_seq_len(chrom);
+    if contig_len_raw == u64::MAX {
+        return Err(ConversionError::Input(format!(
+            "Contig '{chrom}' not found in reference FASTA"
+        )));
+    }
+    let contig_len = contig_len_raw as usize;
+    let mut ref_seq = if contig_len == 0 {
+        Vec::new()
+    } else {
+        fasta
+            .fetch_seq(chrom, 0, contig_len - 1)
+            .map_err(|e| ConversionError::Io {
+                context: format!("fetching contig '{chrom}' from reference FASTA"),
+                source: std::io::Error::other(e.to_string()),
+            })?
+    };
+    ref_seq.make_ascii_uppercase();
+    Ok(ref_seq)
+}
+
 impl VcfChunkReader {
     // opens the file, applies the sample filter at the C-level, and jumps to the chromosome.
     pub fn new(
@@ -207,41 +247,7 @@ impl VcfChunkReader {
         // Reference is optional. With a FASTA, cache the full uppercased contig for
         // validate_ref/left_align; without one, leave it empty and skip both.
         let (ref_seq, has_reference) = match fasta_path {
-            Some(path) => {
-                // A wrong reference path reaches Rust unchecked (Python does not
-                // validate it), so surface it as FileNotFoundError specifically.
-                if !std::path::Path::new(path).exists() {
-                    return Err(ConversionError::MissingFile {
-                        path: path.to_string(),
-                    });
-                }
-                let fasta = rust_htslib::faidx::Reader::from_path(path).map_err(|e| {
-                    ConversionError::Input(format!(
-                        "Failed to open reference FASTA '{path}' (is there a .fai?): {e}"
-                    ))
-                })?;
-                // htslib's faidx_seq_len returns -1 for an unknown contig, surfaced
-                // via rust-htslib as u64::MAX — check explicitly for a clear message.
-                let contig_len_raw = fasta.fetch_seq_len(chrom);
-                if contig_len_raw == u64::MAX {
-                    return Err(ConversionError::Input(format!(
-                        "Contig '{chrom}' not found in reference FASTA"
-                    )));
-                }
-                let contig_len = contig_len_raw as usize;
-                let mut ref_seq = if contig_len == 0 {
-                    Vec::new()
-                } else {
-                    fasta
-                        .fetch_seq(chrom, 0, contig_len - 1)
-                        .map_err(|e| ConversionError::Io {
-                            context: format!("fetching contig '{chrom}' from reference FASTA"),
-                            source: std::io::Error::other(e.to_string()),
-                        })?
-                };
-                ref_seq.make_ascii_uppercase();
-                (ref_seq, true)
-            }
+            Some(path) => (load_contig_seq(path, chrom)?, true),
             None => (Vec::new(), false),
         };
 

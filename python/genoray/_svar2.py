@@ -69,6 +69,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin):
         threads: int | None = None,
         overwrite: bool = False,
         long_allele_capacity: int = 8 * 1024 * 1024,
+        signatures: bool = False,
     ) -> int:
         """Convert a bgzipped VCF or BCF to an SVAR2 store.
 
@@ -78,6 +79,10 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin):
         input is trusted to be already normalized. Returns the number of
         out-of-scope (symbolic/breakend) ALTs dropped (0 unless
         `skip_out_of_scope`).
+
+        signatures: if True, classify SBS96/ID83 codes during the write and
+        store the mutcat sidecar (factored into the dense/var_key cost model).
+        Requires a reference; raises if `no_reference=True`.
         """
         from cyvcf2 import VCF as _CyVCF
 
@@ -89,6 +94,8 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin):
                 "provide exactly one of `reference` (a FASTA path) or "
                 "`no_reference=True`"
             )
+        if signatures and no_reference:
+            raise ValueError("signatures=True requires a reference (not no_reference).")
         if out.exists() and not overwrite:
             raise FileExistsError(
                 f"Output path {out} already exists. Use overwrite=True to overwrite."
@@ -116,4 +123,5 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin):
             threads,  # max_threads; None => auto
             long_allele_capacity,
             skip_out_of_scope,
+            signatures,
         )
