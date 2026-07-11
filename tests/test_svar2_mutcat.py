@@ -161,6 +161,60 @@ def test_matrix_parity_with_v1(tmp_path: Path):
     assert d2.select("S1").sum().item() == 1
 
 
+def _write_parity_ref_softmasked(d: Path) -> Path:
+    """Same sequence as ``_write_parity_ref`` but entirely lower-case, simulating
+    a soft-masked reference (e.g. UCSC hg38, ~50% lower-case repeat-mask)."""
+    ref = d / "parity_ref_softmasked.fa"
+    ref.write_text(f">chr1\n{_PARITY_SEQ.lower()}\n")
+    pysam.faidx(str(ref))
+    return ref
+
+
+def test_annotate_handles_softmasked_reference(tmp_path: Path):
+    """Post-hoc ``annotate_mutations`` must classify identically whether the
+    reference FASTA is upper- or lower-case (soft-masked).
+
+    Regression for a bug where write-time ``from_vcf(signatures=True)``
+    uppercases the reference it loads (``load_contig_seq``) but post-hoc
+    ``annotate_mutations`` (via ``Reference._load_contig``, which only does
+    ``seq.encode("ascii")``) did not. The shared Rust classifiers'
+    ``base_index`` matches uppercase A/C/G/T only, so a soft-masked
+    reference would silently classify every SNV/indel in a lower-case region
+    as UNCLASSIFIED post-hoc while write-time counted them -- corrupting the
+    "post-hoc == write-time" invariant on any real (soft-masked) genome.
+
+    Builds two identical stores from the same VCF (using the upper-case
+    reference for conversion, so REF/ALT validation is unaffected), then
+    annotates one post-hoc with the upper-case reference and the other with
+    an all-lower-case version of the exact same sequence. Without the fix
+    the lower-case run returns all-UNCLASSIFIED/zero matrices; with the fix
+    the two matrices are bit-for-bit identical.
+    """
+    fa_upper = _write_parity_ref(tmp_path)
+    fa_soft = _write_parity_ref_softmasked(tmp_path)
+    vcf = _write_parity_vcf(tmp_path)
+
+    out_upper = tmp_path / "softmask_upper.svar2"
+    SparseVar2.from_vcf(out_upper, vcf, fa_upper, overwrite=True, threads=1)
+    sv_upper = SparseVar2(out_upper)
+    sv_upper.annotate_mutations(fa_upper)
+
+    out_soft = tmp_path / "softmask_lower.svar2"
+    SparseVar2.from_vcf(out_soft, vcf, fa_upper, overwrite=True, threads=1)
+    sv_soft = SparseVar2(out_soft)
+    sv_soft.annotate_mutations(fa_soft)
+
+    for kind in ("SBS96", "ID83"):
+        m_upper = sv_upper.mutation_matrix(kind)
+        m_soft = sv_soft.mutation_matrix(kind)
+        assert m_upper.equals(m_soft), (
+            f"{kind} mismatch between upper-case and soft-masked reference:\n"
+            f"upper:\n{m_upper}\nsoft-masked:\n{m_soft}"
+        )
+        total = m_upper.select(sv_upper.available_samples).sum().sum_horizontal().item()
+        assert total > 0, f"{kind} matrix is unexpectedly all-zero"
+
+
 def test_write_time_signatures_match_posthoc(tmp_path: Path):
     """Write-time (`signatures=True`) and post-hoc `annotate_mutations` must
     produce identical mutation matrices.

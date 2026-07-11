@@ -15,6 +15,13 @@ pub fn annotate_contig(
     paths: &ContigPaths,
     ref_seq: &[u8],
 ) -> std::io::Result<()> {
+    // Classifiers match uppercase ACGT only; normalize here so BOTH entry points
+    // (write-time from_vcf(signatures=True) and post-hoc annotate_mutations, which
+    // reads a possibly soft-masked reference) classify identically. base_index()
+    // treats lowercase as non-ACGT -> UNCLASSIFIED, so a soft-masked reference would
+    // otherwise silently drop masked-region variants from SBS96/ID83.
+    let ref_seq: Vec<u8> = ref_seq.to_ascii_uppercase();
+    let ref_seq: &[u8] = &ref_seq;
     // --- var_key/snp (per call) ---
     {
         let (positions, keys) = reader.vk_snp_records(); // &[u32], packed 2-bit keys
