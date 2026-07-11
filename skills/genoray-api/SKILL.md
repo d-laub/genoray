@@ -36,7 +36,7 @@ Prefer reading these over guessing:
 - `genoray/_vcf.py` — `VCF` class: constructor, `read`, `chunk`, mode constants near the top of the class
 - `genoray/_pgen.py` — `PGEN` class: constructor, `read`, `chunk`, `read_ranges`, `chunk_ranges`, mode constants near the top of the class
 - `genoray/_svar.py` — `SparseVar`: `__init__`, `from_vcf`, `from_pgen`, `read_ranges`, `with_fields`, `annotate_mutations`, `mutation_matrix`, `assign_signatures`
-- `genoray/_svar2.py` — `SparseVar2`: `__init__`, `from_vcf` (VCF/BCF → SVAR2 conversion entry point); `n_samples`/`available_samples`/`contigs`/`ploidy` metadata. Read/query methods live in the mixins: `genoray/_svar2_decode.py` (`decode`, `region_counts`) and `genoray/_svar2_batch.py` (`overlap_batch`, `read_ranges`, `find_ranges`, `gather_ranges`)
+- `genoray/_svar2.py` — `SparseVar2`: `__init__`, `from_vcf` (VCF/BCF → SVAR2 conversion entry point); `n_samples`/`available_samples`/`contigs`/`ploidy` metadata. Read/query methods live in the mixins: `genoray/_svar2_decode.py` (`decode`, `region_counts`) and `genoray/_svar2_batch.py` (public `read_ranges`; internal gvl-only `_overlap_batch`/`_find_ranges`/`_gather_ranges`)
 - `genoray/_cli/__main__.py` — the `genoray` CLI (`index`, `write` / `write svar1`, `view`)
 - `genoray/_signatures.py` — `cosmic_signatures`, `fit_signatures`
 - `genoray/_reference.py` — `Reference`: `from_path`, `fetch`, `contig_array`
@@ -269,27 +269,20 @@ counts = sv.region_counts("chr1", regions)   # np.ndarray, shape (R, S, P)
 - Queries are **per contig** — cross-contig batching is the caller's job. Regions
   are an iterable of `(start, end)` pairs.
 
-Lower-level array methods (what gvl's Rust core consumes) return the raw
-two-channel `BatchResult` → numpy dict, a `TypedDict` with a fixed field set:
-`vk_pos`/`vk_key`/`vk_off`, `dense_pos`/`dense_key`/`dense_range`/
-`dense_present`/`dense_present_off`, `lut_bytes`/`lut_off`, and scalars
-`n_regions`/`n_samples`/`ploidy`:
+The user-facing SVAR2 query API is `decode` / `region_counts` / `read_ranges`
+(above). `read_ranges(contig, starts, ends, samples=None)` is a fused
+search+gather; `starts`/`ends` are parallel 1D arrays (mirrors
+`SparseVar.read_ranges`), `samples` selects/reorders a subset **by name**. It
+returns the raw two-channel `BatchResult` → numpy dict, a `TypedDict` with a
+fixed field set: `vk_pos`/`vk_key`/`vk_off`, `dense_pos`/`dense_key`/
+`dense_range`/`dense_present`/`dense_present_off`, `lut_bytes`/`lut_off`, and
+scalars `n_regions`/`n_samples`/`ploidy`.
 
-- `overlap_batch(contig, regions)` — batched two-channel query.
-- `read_ranges(contig, starts, ends, samples=None)` — fused search+gather;
-  `starts`/`ends` are parallel 1D arrays (mirrors `SparseVar.read_ranges`),
-  `samples` selects/reorders a subset **by name**. Byte-identical to
-  `overlap_batch` over the same regions when `samples=None`.
-- `find_ranges(contig, starts, ends, samples=None, out=None)` /
-  `gather_ranges(contig, ranges, samples=None)` — the search-only + tree-free
-  replay split for a write-time overlap cache; `read_ranges ==
-  gather_ranges(find_ranges(...))`. `find_ranges(out=...)` streams the bundle into
-  caller-preallocated arrays. `find_ranges` returns the compact `RangesBundle`
-  `TypedDict` instead — `dense_range`/`region_starts`/`sample_cols`/
-  `vk_snp_range`/`vk_indel_range`/`dense_snp_range`/`dense_indel_range` plus
-  the same `n_regions`/`n_samples`/`ploidy` scalars — which `gather_ranges`
-  replays back into a `BatchResult`. Both are static-only annotations; the
-  dict contract these methods return at runtime is unchanged.
+`SparseVar2` also has `_overlap_batch`/`_find_ranges`/`_gather_ranges`
+(underscore-prefixed) — an internal, gvl-only numpy-dict wire contract for
+the search/gather split used by a write-time overlap cache. They are **not**
+part of the public API, are not covered by semver, and may change or
+disappear without notice; don't call them from user code.
 
 ### Errors
 

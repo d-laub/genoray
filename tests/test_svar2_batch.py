@@ -19,7 +19,7 @@ def _carried_counts(res: dict, n_samples: int, ploidy: int) -> list[int]:
 
 def test_overlap_batch_counts_and_dtypes(svar2_store):
     sv = SparseVar2(svar2_store)
-    res = sv.overlap_batch("chr1", [(0, 40)])
+    res = sv._overlap_batch("chr1", [(0, 40)])
 
     # Frozen-contract dtypes.
     for k in ("vk_pos", "vk_key", "dense_pos", "dense_key"):

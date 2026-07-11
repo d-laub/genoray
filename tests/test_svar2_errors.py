@@ -67,7 +67,7 @@ def test_gather_ranges_malformed_bundle_raises_keyerror(tmp_path: Path):
     SparseVar2.from_vcf(out, vcf, ref, threads=1)
     sv = SparseVar2(out)
 
-    bundle = sv.find_ranges("chr1", [0], [40])
+    bundle = sv._find_ranges("chr1", [0], [40])
     del bundle["sample_cols"]  # drop a required key
     with pytest.raises(KeyError, match="sample_cols"):
-        sv.gather_ranges("chr1", bundle)
+        sv._gather_ranges("chr1", bundle)

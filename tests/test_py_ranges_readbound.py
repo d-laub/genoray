@@ -17,7 +17,7 @@ NEW_KEYS = ("dense_snp_range", "dense_indel_range")
 def test_find_ranges_exposes_dense_class_ranges(svar2_store: Path):
     sv = SparseVar2(svar2_store)
     starts, ends = [0, 5], [40, 20]
-    d = sv.find_ranges("chr1", starts, ends)
+    d = sv._find_ranges("chr1", starts, ends)
 
     assert "dense_snp_range" in d and "dense_indel_range" in d
 
@@ -34,10 +34,10 @@ def test_find_ranges_exposes_dense_class_ranges(svar2_store: Path):
 def test_find_ranges_out_streaming_includes_dense_class_ranges(svar2_store: Path):
     sv = SparseVar2(svar2_store)
     starts, ends = [0, 5], [40, 20]
-    d = sv.find_ranges("chr1", starts, ends)
+    d = sv._find_ranges("chr1", starts, ends)
 
     out = {k: np.empty_like(np.asarray(d[k])) for k in NEW_KEYS}
-    d2 = sv.find_ranges("chr1", starts, ends, out=out)
+    d2 = sv._find_ranges("chr1", starts, ends, out=out)
 
     for k in NEW_KEYS:
         np.testing.assert_array_equal(np.asarray(d2[k]), np.asarray(d[k]))
@@ -48,4 +48,4 @@ def test_gather_ranges_roundtrips_with_dense_class_ranges(svar2_store: Path):
     sv = SparseVar2(svar2_store)
     # Should not raise: dense_snp_range/dense_indel_range round-trip through
     # bundle_from_dict without breaking the union gather.
-    sv.gather_ranges("chr1", sv.find_ranges("chr1", [0], [40]))
+    sv._gather_ranges("chr1", sv._find_ranges("chr1", [0], [40]))

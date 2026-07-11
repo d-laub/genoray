@@ -30,7 +30,7 @@ class BatchResult(TypedDict):
 
 
 class RangesBundle(TypedDict):
-    """Compact search-only bundle replayed by ``gather_ranges`` (see py_query_ranges.rs)."""
+    """Compact search-only bundle replayed by ``_gather_ranges`` (see py_query_ranges.rs)."""
 
     dense_range: np.ndarray
     region_starts: np.ndarray
@@ -52,7 +52,7 @@ class _BatchQueryMixin:
     _readers: dict[str, Any]
     available_samples: list[str]
 
-    def overlap_batch(
+    def _overlap_batch(
         self, contig: str, regions: Iterable[tuple[int, int]]
     ) -> BatchResult:
         """Batched two-channel query for one ``contig``.
@@ -91,8 +91,8 @@ class _BatchQueryMixin:
 
         ``starts``/``ends`` are parallel 1D arrays of half-open ``(start, end)``
         region bounds (mirrors ``SparseVar.read_ranges``'s ``starts``/``ends``
-        signature rather than ``overlap_batch``'s ``regions`` iterable). When
-        ``samples=None`` the result is byte-identical to ``overlap_batch`` over
+        signature rather than ``_overlap_batch``'s ``regions`` iterable). When
+        ``samples=None`` the result is byte-identical to ``_overlap_batch`` over
         the same regions; the returned dict has the exact same contract
         (``vk_pos``/``vk_key``/``vk_off``, ``dense_*``, ``lut_*``, plus
         ``n_regions``/``n_samples``/``ploidy``). ``samples``, if given, is a
@@ -101,7 +101,7 @@ class _BatchQueryMixin:
         reg = self._regions(starts, ends)
         return self._readers[contig].read_ranges(reg, self._sample_idxs(samples))
 
-    def find_ranges(
+    def _find_ranges(
         self,
         contig: str,
         starts: "ArrayLike",
@@ -110,7 +110,7 @@ class _BatchQueryMixin:
         out: Mapping[str, "np.ndarray"] | None = None,
     ) -> RangesBundle:
         """Search-only step: returns a compact ranges bundle to be replayed by
-        ``gather_ranges``, doing no per-element gather. ``starts``/``ends`` and
+        ``_gather_ranges``, doing no per-element gather. ``starts``/``ends`` and
         ``samples`` behave as in ``read_ranges``.
 
         If ``out`` is given, it must be a dict of preallocated arrays keyed by
@@ -138,18 +138,18 @@ class _BatchQueryMixin:
                 d[k] = buf
         return d
 
-    def gather_ranges(
+    def _gather_ranges(
         self,
         contig: str,
         ranges: dict[str, Any],
         samples: "ArrayLike | None" = None,
     ) -> BatchResult:
-        """Tree-free gather step: replay a ``find_ranges`` bundle into the same
-        dict contract as ``overlap_batch``/``read_ranges``, with no further
+        """Tree-free gather step: replay a ``_find_ranges`` bundle into the same
+        dict contract as ``_overlap_batch``/``read_ranges``, with no further
         search-tree work.
 
         ``samples`` is accepted only for call-signature symmetry with
-        ``read_ranges``/``find_ranges``: the sample subset is already fixed by
+        ``read_ranges``/``_find_ranges``: the sample subset is already fixed by
         ``ranges`` (it was baked in when the bundle was produced), so passing a
         ``samples`` value that disagrees with the bundle's ``sample_cols`` is a
         ``ValueError``; passing ``None`` (or a value that matches) is a no-op.
