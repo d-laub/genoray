@@ -32,9 +32,9 @@ Prefer reading these over guessing:
 - `docs/source/index.md` — narrative tour with full examples (VCF, PGEN, filtering, chunking)
 - `docs/source/svar.md` — SparseVar usage
 - `genoray/__init__.py` — confirms the public surface
-- `genoray/_vcf.py` — `VCF` class: constructor, `read`, `chunk`, mode constants near the top of the class
+- `genoray/_vcf.py` — `VCF` class: constructor, `read`, `chunk`, mode constants near the top of the class; `get_record_info(contig=None, start=None, end=None, fields=None, info=None, lazy=False)` — non-FORMAT record-level fields (including INFO) for a range or the whole file, returns `pl.DataFrame` (or `pl.LazyFrame` when `lazy=True`)
 - `genoray/_pgen.py` — `PGEN` class: constructor, `read`, `chunk`, `read_ranges`, `chunk_ranges`, mode constants near the top of the class
-- `genoray/_svar.py` — `SparseVar`: `__init__`, `from_vcf`, `from_pgen`, `read_ranges`, `with_fields`, `annotate_mutations`, `mutation_matrix`, `assign_signatures`
+- `genoray/_svar.py` — `SparseVar`: `__init__`, `from_vcf`, `from_pgen`, `read_ranges`, `read_ranges_with_length(contig, starts=0, ends=POS_MAX, samples=None)` (length-guaranteed range read; returns the same type as `read_ranges` — a `Ragged` or fields-augmented record), `with_fields`, `annotate_mutations`, `mutation_matrix`, `assign_signatures`, `annotate_with_gtf(gtf, level_filter=1, write_back=True, *, strand_encoding=None, codon_null_token=None)` (GTF CDS annotation entry point, returns `pl.DataFrame` with `varID`/`gene_id`/`strand`/`codon_pos`), `cache_afs()` (computes and persists an `AF` column to the `.gvi` index; returns `None`)
 - `genoray/_svar2.py` — `SparseVar2`: `__init__`, `from_vcf` (VCF/BCF → SVAR2 conversion entry point); `n_samples`/`available_samples`/`contigs`/`ploidy` metadata. Read/query methods live in the mixins: `genoray/_svar2_decode.py` (`decode`, `region_counts`) and `genoray/_svar2_batch.py` (public `read_ranges`; internal gvl-only `_overlap_batch`/`_find_ranges`/`_gather_ranges`)
 - `genoray/_cli/__main__.py` — the `genoray` CLI (`index`, `write` / `write svar1`, `view`)
 - `genoray/_signatures.py` — `cosmic_signatures`, `fit_signatures`
@@ -52,6 +52,31 @@ source** rather than reasoning from first principles.
 - Missing genotype = `-1` (int). Missing dosage = `np.nan` (float32).
 - Ploidy is 2 by default; `SparseVar.from_vcf`/`from_pgen` (and `genoray write svar1`) accept `haploid=True` / `--haploid`, which OR-collapses haplotypes into a single haploid call per sample and records `ploidy=1` in metadata (intended for unphased somatic data).
 - All return arrays are NumPy; `mode` selects which arrays you get back.
+
+## Sample accessors — canonical name + why the idioms diverge
+
+`available_samples` (a `list[str]`) is the canonical "all samples in the
+file" accessor — present on all four readers (`VCF`, `PGEN`, `SparseVar`,
+`SparseVar2`).
+
+`VCF` and `PGEN` additionally expose:
+- `current_samples` — the currently-selected subset (read-only property).
+- `set_samples(samples) -> Self` — a stateful call that mutates the reader
+  in place to select a subset (or restore all samples with `None`), then
+  returns `self`.
+
+`SparseVar` and `SparseVar2` have **no** `current_samples`/`set_samples`.
+Instead, every read method (`read_ranges`, `read_ranges_with_length`, etc.)
+takes samples as a per-call `samples=` kwarg.
+
+**Why the two idioms differ (performance):** subsetting samples on VCF/PGEN
+is costly — it re-initializes the backend reader — so it's a deliberate,
+stateful `set_samples()` call made once and reused across reads. On
+`SparseVar`/`SparseVar2`, subsetting is ~free (it's just an index selection
+over already-memory-mapped data), so it's exposed as a lightweight per-call
+`samples=` kwarg instead of a persistent reader state. This is an
+intentional divergence, not an inconsistency — don't "fix" one to match
+the other.
 
 ## Mode constants — gotcha
 
