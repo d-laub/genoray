@@ -18,6 +18,15 @@ from ._utils import DTYPE, np_to_pl_dtype
 _logging.getLogger("polars_bio").setLevel(_logging.ERROR)
 
 
+def _var_end_expr() -> pl.Expr:
+    """0-based exclusive end for a variant. A null/absent ILEN (symbolic SV with
+    no computable length) is treated as a point variant (end == POS); a negative
+    ILEN (deletion) extends the span leftward. Shared by var_ranges/var_indices/
+    var_counts so the symbolic-SV handling stays consistent across all three.
+    """
+    return pl.col("POS") - pl.col("ILEN").list.first().clip(upper_bound=0).fill_null(0)
+
+
 def var_ranges(
     contig_normalizer: ContigNormalizer,
     var_table: pl.DataFrame,
@@ -61,14 +70,11 @@ def var_ranges(
 
     # 0-based
     v_starts = var_table["POS"].to_numpy() - 1
-    # 0-based, exclusive end
+    # 0-based, exclusive end (same rule as _var_end_expr())
     # null ILEN = un-sizable symbolic SV (IMPRECISE / unsupported type); treat as a
     # point variant.  A single null upcasts the Int32 column to Float64/NaN and breaks
     # the numba coordinate kernels.
-    v_ends = (
-        var_table["POS"]
-        - var_table["ILEN"].list.first().clip(upper_bound=0).fill_null(0)
-    ).to_numpy()
+    v_ends = var_table.select(_var_end_expr()).to_series().to_numpy()
     max_v_len = (v_ends - v_starts).max()
 
     lower_bound_s_idx = np.searchsorted(v_starts + max_v_len, starts)
@@ -95,10 +101,10 @@ def var_ranges(
     s_idx = var_table[s_idx, "index"].to_numpy()
     e_idx = var_table[e_idx, "index"].to_numpy() + 1  # exclusive end
 
-    var_ranges = np.stack([s_idx, e_idx], axis=1, dtype=V_IDX_TYPE)
-    var_ranges[no_vars] = np.iinfo(V_IDX_TYPE).max
+    ranges = np.stack([s_idx, e_idx], axis=1, dtype=V_IDX_TYPE)
+    ranges[no_vars] = np.iinfo(V_IDX_TYPE).max
 
-    return var_ranges
+    return ranges
 
 
 def var_indices(
@@ -129,8 +135,7 @@ def var_indices(
             pl.col("__pos").cast(np_to_pl_dtype(idx_dtype)).alias("index"),
             chrom=pl.col("CHROM").cast(pl.Utf8),
             start=pl.col("POS") - 1,
-            end=pl.col("POS")
-            - pl.col("ILEN").list.first().clip(upper_bound=0).fill_null(0),
+            end=_var_end_expr(),
         )
     )
     var_table.config_meta.set(coordinate_system_zero_based=True)  # type: ignore
@@ -184,8 +189,7 @@ def var_counts(
         .select(
             chrom=pl.col("CHROM").cast(pl.Utf8),
             start=pl.col("POS") - 1,
-            end=pl.col("POS")
-            - pl.col("ILEN").list.first().clip(upper_bound=0).fill_null(0),
+            end=_var_end_expr(),
         )
     )
     var_table.config_meta.set(coordinate_system_zero_based=True)  # type: ignore
