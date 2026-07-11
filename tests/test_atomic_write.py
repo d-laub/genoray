@@ -7,9 +7,9 @@ from pathlib import Path
 import polars as pl
 import pytest
 
-import genoray._utils as U
+import genoray._io as U
 from genoray import PGEN, SparseVar, VCF
-from genoray._utils import atomic_write_dir, atomic_write_path
+from genoray._io import atomic_write_dir, atomic_write_path
 
 _DDIR = Path(__file__).parent / "data"
 

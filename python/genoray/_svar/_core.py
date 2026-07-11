@@ -21,11 +21,12 @@ from pydantic import BaseModel
 from rich.progress import MofNCompleteColumn, Progress
 from seqpro.rag import OFFSET_TYPE, Ragged, lengths_to_offsets
 
+from .._contigs import ContigNormalizer
+from .._io import atomic_write_dir
 from .._mutcat import MUTCAT_VERSION
 from .._pgen import PGEN
 from .._reference import Reference
 from .._types import DOSAGE_TYPE, POS_MAX, POS_TYPE, V_IDX_TYPE
-from .._utils import ContigNormalizer, atomic_write_dir
 from .._var_ranges import var_ranges
 from .._vcf import VCF
 from ..exprs import ILEN

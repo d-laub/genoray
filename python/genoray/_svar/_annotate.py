@@ -13,10 +13,10 @@ from numpy.typing import NDArray
 from seqpro.rag import Ragged
 from tqdm.auto import tqdm
 
+from .._contigs import ContigNormalizer
 from .._mutcat import MUTCAT_VERSION, build_entry_codes, classify_variants, count_matrix
 from .._reference import Reference
 from .._signatures import _load_signature_file, cosmic_signatures, fit_signatures
-from .._utils import ContigNormalizer
 from ._io import _open_fmt
 from ._kernels import _nb_af_helper
 
@@ -340,7 +340,7 @@ class SparseVarAnnotateMixin:
             If given, only variants on these contigs are classified; entries on
             all other contigs are marked ``NOT_ANNOTATED`` and their contigs are
             never fetched from the reference.  Names are matched via the
-            :class:`~genoray._utils.ContigNormalizer` (so ``chr1``/``1`` both
+            :class:`~genoray._contigs.ContigNormalizer` (so ``chr1``/``1`` both
             work).  Requested contigs absent from the ``.svar`` index are skipped
             with a warning.  A listed contig present in the index but absent from
             the reference still raises (use the allowlist to exclude it instead).

@@ -13,8 +13,8 @@ import seqpro as sp
 from hirola import HashTable
 from numpy.typing import ArrayLike, NDArray
 
+from .._contigs import ContigNormalizer
 from .._types import V_IDX_TYPE
-from .._utils import ContigNormalizer
 from .._var_ranges import var_ranges
 
 if TYPE_CHECKING:

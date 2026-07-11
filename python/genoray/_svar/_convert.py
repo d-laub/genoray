@@ -16,8 +16,9 @@ from pgenlib import PgenReader
 from rich.progress import MofNCompleteColumn, Progress
 from seqpro.rag import Ragged, lengths_to_offsets
 
+from .._io import atomic_write_dir
 from .._types import DOSAGE_TYPE, POS_TYPE, V_IDX_TYPE
-from .._utils import atomic_write_dir, format_memory, parse_memory
+from .._utils import format_memory, parse_memory
 from .._vcf import VCF, Filter
 from ._io import (
     _open_fmt,

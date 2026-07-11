@@ -13,7 +13,7 @@ from genoray import PGEN, VCF, SparseVar
 from genoray._svar._io import _build_working_index, _subset_var_idxs_and_recompute_af
 from genoray._svar._regions import _resolve_kept_rows
 from genoray._types import V_IDX_TYPE
-from genoray._utils import ContigNormalizer
+from genoray._contigs import ContigNormalizer
 
 
 def _index_df(rows, index_values=None):

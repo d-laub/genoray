@@ -13,7 +13,7 @@ from genoray._svar._regions import (
     _normalize_samples,
     _validate_fields,
 )
-from genoray._utils import ContigNormalizer
+from genoray._contigs import ContigNormalizer
 
 
 @pytest.fixture

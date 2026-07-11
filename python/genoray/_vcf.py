@@ -22,15 +22,12 @@ from seqpro.rag import OFFSET_TYPE
 from tqdm.auto import tqdm
 from typing_extensions import Self, assert_never
 
+from ._contigs import ContigNormalizer
+from ._genos import hap_ilens
+from ._io import atomic_write_path
 from ._modes import make_array_mode, make_tuple_mode
 from ._types import POS_MAX, POS_TYPE
-from ._utils import (
-    ContigNormalizer,
-    atomic_write_path,
-    format_memory,
-    hap_ilens,
-    parse_memory,
-)
+from ._utils import format_memory, parse_memory
 from ._var_ranges import var_counts, var_indices
 from .exprs import ILEN, symbolic_ilen
 
