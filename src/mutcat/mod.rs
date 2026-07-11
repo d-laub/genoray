@@ -1,6 +1,7 @@
 //! COSMIC mutation-catalogue code space and classifiers for SVAR2.
 //! Code-space layout MUST match python/genoray/_mutcat/codebook.py.
 
+pub mod annotate;
 pub mod classify;
 pub mod sidecar;
 

@@ -8,7 +8,7 @@ use std::path::Path;
 use ndarray::Array2;
 
 use crate::dense::DenseClass;
-use crate::layout::{self, ContigPaths};
+use crate::layout::{self, ContigPaths, MutcatSub};
 use crate::nrvk::LongAlleleReader;
 use crate::rvk;
 use crate::search::{SearchTree, overlap_range};
@@ -285,5 +285,44 @@ impl ContigReader {
         let tree = SearchTree::new(positions);
         let (s, e) = overlap_range(&tree, &v_ends, self.dense_indel_max_del, q_start, q_end);
         s..e
+    }
+}
+
+impl ContigReader {
+    /// All var_key/snp records for this contig: absolute positions + the
+    /// packed 2-bit key bytes (index with `unpack_snp_key_at`, not `keys[i]`).
+    pub(crate) fn vk_snp_records(&self) -> (&[u32], &[u8]) {
+        (self.vk_snp.positions(), as_bytes(&self.vk_snp.keys))
+    }
+
+    /// All dense/snp records, if this contig has a dense-SNP table: absolute
+    /// positions + packed 2-bit key bytes (same indexing caveat as above).
+    pub(crate) fn dense_snp_records(&self) -> Option<(&[u32], &[u8])> {
+        self.dense_snp
+            .as_ref()
+            .map(|d| (d.positions(), as_bytes(&d.keys)))
+    }
+
+    /// All indel records for `sub` (`VkIndel`/`DenseIndel` only): absolute
+    /// positions + uniform u32 keys. `None` if the requested dense table is
+    /// absent from this contig.
+    pub(crate) fn indel_records(&self, sub: MutcatSub) -> Option<(&[u32], &[u32])> {
+        match sub {
+            MutcatSub::VkIndel => Some((self.vk_indel.positions(), as_u32(&self.vk_indel.keys))),
+            MutcatSub::DenseIndel => self
+                .dense_indel
+                .as_ref()
+                .map(|d| (d.positions(), as_u32(&d.keys))),
+            _ => None,
+        }
+    }
+
+    /// Long-allele bytes for a `Lookup` indel key's row. Panics if this
+    /// contig has no LUT (a `Lookup` key implies one exists).
+    pub(crate) fn lut_allele(&self, row: u32) -> Vec<u8> {
+        self.lut
+            .as_ref()
+            .expect("Lookup key implies a LUT")
+            .get_allele(row)
     }
 }
