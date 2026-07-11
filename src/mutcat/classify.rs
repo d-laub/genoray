@@ -55,6 +55,162 @@ pub fn sbs96_code(five: u8, refb: u8, altb: u8, three: u8) -> u8 {
     (sub as u8) * 16 + (ff as u8) * 4 + (tt as u8)
 }
 
+// ID83 lookup tables, built to match codebook.py ID83 order.
+// ID83 label order (see _build_id83): 24 single-base (Del/Ins x C/T x rep0..5),
+// then 48 repeat (Del/Ins x size2..5 x rep0..5), then 11 microhomology-Del.
+struct Id83Luts {
+    id1: [[[u8; 6]; 2]; 2], // [kind(Del=0,Ins=1)][base(C=0,T=1)][rep0..5]
+    idr: [[[u8; 6]; 4]; 2], // [kind][size_bucket(2..5)][rep0..5]
+    idm: [[u8; 6]; 4],      // [size_bucket][mh]
+}
+
+const fn build_id83_luts() -> Id83Luts {
+    // Index formula mirrors codebook order:
+    //   single: base = (kind*2 + base_ct)*6 + rep                          [0..24)
+    //   repeat: 24 + (kind*4 + size_bucket)*6 + rep                        [24..72)
+    //   mh    : 72 + cumulative(mh caps 1,2,3,5) offset + (m-1)            [72..83)
+    let u = UNCLASSIFIED;
+    let mut id1 = [[[u; 6]; 2]; 2];
+    let mut idr = [[[u; 6]; 4]; 2];
+    let mut idm = [[u; 6]; 4];
+    let mut kind = 0;
+    while kind < 2 {
+        let mut b = 0;
+        while b < 2 {
+            let mut r = 0;
+            while r < 6 {
+                id1[kind][b][r] = ((kind * 2 + b) * 6 + r) as u8;
+                r += 1;
+            }
+            b += 1;
+        }
+        let mut s = 0;
+        while s < 4 {
+            let mut r = 0;
+            while r < 6 {
+                idr[kind][s][r] = (24 + (kind * 4 + s) * 6 + r) as u8;
+                r += 1;
+            }
+            s += 1;
+        }
+        kind += 1;
+    }
+    // microhomology (Del only): caps per size bucket = [1,2,3,5]; base offset 72.
+    let caps = [1usize, 2, 3, 5];
+    let mut s = 0;
+    let mut base = 72usize;
+    while s < 4 {
+        let mut m = 1;
+        while m <= caps[s] {
+            idm[s][m] = (base + (m - 1)) as u8;
+            m += 1;
+        }
+        base += caps[s];
+        s += 1;
+    }
+    Id83Luts { id1, idr, idm }
+}
+
+const ID83_LUTS: Id83Luts = build_id83_luts();
+const MH_CAP: [usize; 4] = [1, 2, 3, 5];
+
+/// ID83 class-local index (0..=82) or `UNCLASSIFIED`. Port of `_id83_kernel`.
+pub fn id83_code(seq: &[u8], pos0: usize, refa: &[u8], alta: &[u8]) -> u8 {
+    let n = seq.len();
+    let rl = refa.len();
+    let al = alta.len();
+    // atomized indels always share an anchor base; require it and equal anchors.
+    if rl == 0 || al == 0 || refa[0] != alta[0] {
+        return UNCLASSIFIED;
+    }
+    let is_del = rl > al;
+    // deleted/inserted unit = allele[1..]
+    let (buf, ilen): (&[u8], usize) = if is_del {
+        (&refa[1..], rl - 1)
+    } else {
+        (&alta[1..], al - 1)
+    };
+    if ilen == 0 {
+        return UNCLASSIFIED;
+    }
+    for &c in buf {
+        if base_index(c) < 0 {
+            return UNCLASSIFIED;
+        }
+    }
+    // count tandem repeats of the unit downstream from pos0+1
+    let scan = pos0 + 1;
+    let mut n_rep = 0usize;
+    let mut i = 0usize;
+    while scan + i + ilen <= n {
+        let mut m = true;
+        let mut j = 0;
+        while j < ilen {
+            if seq[scan + i + j] != buf[j] {
+                m = false;
+                break;
+            }
+            j += 1;
+        }
+        if !m {
+            break;
+        }
+        n_rep += 1;
+        i += ilen;
+    }
+    if ilen == 1 {
+        let mut bi = base_index(buf[0]);
+        if bi == 0 || bi == 2 {
+            bi = 3 - bi; // A/G -> pyrimidine partner
+        }
+        let base_ct = if bi == 1 { 0 } else { 1 }; // C->0, T->1
+        if is_del && n_rep == 0 {
+            return UNCLASSIFIED; // v1 _REF_MISMATCH -> UNCLASSIFIED
+        }
+        let mut rep = if is_del { n_rep - 1 } else { n_rep };
+        if rep > 5 {
+            rep = 5;
+        }
+        return ID83_LUTS.id1[if is_del { 0 } else { 1 }][base_ct][rep];
+    }
+    let sb = if ilen < 5 { ilen } else { 5 };
+    let si = sb - 2; // 0..3
+    let rep;
+    if is_del {
+        // microhomology: longest prefix of the unit matching downstream
+        let mut mh = 0usize;
+        let mut kk = 1;
+        while kk < ilen {
+            let mut eq = true;
+            let mut j = 0;
+            while j < kk {
+                if scan + j >= n || seq[scan + j] != buf[j] {
+                    eq = false;
+                    break;
+                }
+                j += 1;
+            }
+            if eq {
+                mh = kk;
+            }
+            kk += 1;
+        }
+        if mh > 0 && n_rep <= 1 {
+            let cap = MH_CAP[si];
+            let m = if mh < cap { mh } else { cap };
+            return ID83_LUTS.idm[si][m];
+        }
+        if n_rep == 0 {
+            return UNCLASSIFIED; // _REF_MISMATCH
+        }
+        rep = n_rep - 1;
+    } else {
+        rep = n_rep;
+    }
+    let rep = if rep > 5 { 5 } else { rep };
+    ID83_LUTS.idr[if is_del { 0 } else { 1 }][si][rep]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -80,5 +236,31 @@ mod tests {
     fn sbs96_rejects_non_acgt_and_ref_eq_alt() {
         assert_eq!(sbs96_code(b'N', b'C', b'A', b'G'), UNCLASSIFIED);
         assert_eq!(sbs96_code(b'A', b'C', b'C', b'G'), UNCLASSIFIED); // ref==alt
+    }
+
+    #[test]
+    fn id83_1bp_del_in_repeat() {
+        // seq: ...A C C C C... delete one C at a run of 4 C's.
+        // REF="AC" ALT="A" (anchor A, deleted unit "C"), pos0 at the 'A'.
+        // downstream run of C's from pos0+1: 4 -> is_del, rep=n_rep-1=3.
+        // base C -> base_ct=0, kind Del=0 -> id1[0][0][3] = (0*2+0)*6+3 = 3
+        let seq = b"AACCCCG"; // pos0 = 1 ('A'), then CCCC
+        assert_eq!(id83_code(seq, 1, b"AC", b"A"), 3);
+    }
+
+    #[test]
+    #[allow(clippy::identity_op)] // spelled-out kind*2+base_ct to mirror the LUT formula
+    fn id83_1bp_ins() {
+        // REF="A" ALT="AC" insert one C; downstream C run from pos0+1.
+        // seq A C C C: n_rep counts inserted-unit "C" copies present downstream.
+        // kind Ins=1, base C base_ct=0, rep=n_rep (no -1 for ins).
+        let seq = b"ACCCG"; // pos0=0 ('A'); downstream from index1: C C C -> n_rep=3
+        assert_eq!(id83_code(seq, 0, b"A", b"AC"), (1 * 2 + 0) * 6 + 3);
+    }
+
+    #[test]
+    fn id83_rejects_non_acgt_unit() {
+        let seq = b"ANNNG";
+        assert_eq!(id83_code(seq, 0, b"AN", b"A"), UNCLASSIFIED);
     }
 }
