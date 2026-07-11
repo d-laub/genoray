@@ -4,6 +4,30 @@
 
 use std::path::{Path, PathBuf};
 
+/// The four sub-streams a mutcat sidecar mirrors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MutcatSub {
+    VkSnp,
+    VkIndel,
+    DenseSnp,
+    DenseIndel,
+}
+
+impl MutcatSub {
+    fn dir_name(self) -> &'static str {
+        match self {
+            MutcatSub::VkSnp => "var_key_snp",
+            MutcatSub::VkIndel => "var_key_indel",
+            MutcatSub::DenseSnp => "dense_snp",
+            MutcatSub::DenseIndel => "dense_indel",
+        }
+    }
+    /// Whether this sub-stream carries a 2-bit ref-base stream (snp only).
+    pub fn has_ref(self) -> bool {
+        matches!(self, MutcatSub::VkSnp | MutcatSub::DenseSnp)
+    }
+}
+
 pub struct ContigPaths {
     base_out_dir: String,
     chrom: String,
@@ -53,6 +77,23 @@ impl ContigPaths {
     }
     pub fn long_allele_offsets(&self) -> PathBuf {
         self.shared_indel_dir().join("long_allele_offsets.npy")
+    }
+
+    fn mutcat_dir(&self, sub: MutcatSub) -> PathBuf {
+        Path::new(&self.base_out_dir)
+            .join(&self.chrom)
+            .join("mutcat")
+            .join(sub.dir_name())
+    }
+    pub fn mutcat_code(&self, sub: MutcatSub) -> PathBuf {
+        self.mutcat_dir(sub).join("code.bin")
+    }
+    pub fn mutcat_ref(&self, sub: MutcatSub) -> PathBuf {
+        self.mutcat_dir(sub).join("ref.bin")
+    }
+    /// Directory created before writing a sidecar sub-stream.
+    pub fn mutcat_sub_dir(&self, sub: MutcatSub) -> PathBuf {
+        self.mutcat_dir(sub)
     }
 }
 
@@ -175,5 +216,20 @@ mod tests {
             dense_max_del(contig),
             Path::new("/out/chr1/dense/max_del.npy")
         );
+    }
+
+    #[test]
+    fn mutcat_paths() {
+        let p = ContigPaths::new("/out", "chr1");
+        assert_eq!(
+            p.mutcat_code(MutcatSub::VkSnp),
+            Path::new("/out/chr1/mutcat/var_key_snp/code.bin")
+        );
+        assert_eq!(
+            p.mutcat_ref(MutcatSub::DenseSnp),
+            Path::new("/out/chr1/mutcat/dense_snp/ref.bin")
+        );
+        assert!(MutcatSub::VkSnp.has_ref());
+        assert!(!MutcatSub::VkIndel.has_ref());
     }
 }
