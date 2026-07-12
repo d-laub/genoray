@@ -26,6 +26,8 @@ pub mod error;
 #[cfg(feature = "conversion")]
 pub mod executor;
 pub mod field;
+#[cfg(feature = "conversion")]
+pub mod field_finalize;
 pub mod layout;
 #[cfg(feature = "conversion")]
 pub mod max_del;
@@ -199,6 +201,13 @@ fn run_conversion_pipeline(
     for r in results {
         total_dropped += r?; // ConversionError -> PyErr via From (category-aware)
     }
+
+    // All contigs staged — resolve each field's global on-disk dtype and
+    // rewrite its staged values.bin files to that width.
+    let resolved_fields =
+        crate::field_finalize::finalize_fields(std::path::Path::new(&output_dir), &chroms, &fields)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    let _ = &resolved_fields; // consumed by write_meta in the next task
 
     // All contigs converted — write the top-level meta.json describing the cohort.
     crate::meta::write_meta(
