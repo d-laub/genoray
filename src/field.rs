@@ -44,11 +44,6 @@ impl StorageDtype {
         })
     }
 
-    /// `true` iff the given htslib type should be staged as floating point.
-    pub fn stage_is_float(htype: HtslibType) -> bool {
-        htype == HtslibType::Float
-    }
-
     fn parse(s: &str) -> Option<Self> {
         Some(match s {
             "bool" => Self::Bool,

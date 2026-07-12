@@ -285,6 +285,7 @@ pub fn process_chromosome(
             let dest_dir = std::path::Path::new(base_out_dir)
                 .join(chrom)
                 .join("fields")
+                .join(field.category.as_str())
                 .join(&field.name)
                 .join(&sub_label);
             fs::create_dir_all(&dest_dir).map_err(|e| ConversionError::Io {
@@ -351,6 +352,7 @@ pub fn process_chromosome(
             let dest_dir = std::path::Path::new(base_out_dir)
                 .join(chrom)
                 .join("fields")
+                .join(field.category.as_str())
                 .join(&field.name)
                 .join(&sub_label);
             fs::create_dir_all(&dest_dir).map_err(|e| ConversionError::Io {

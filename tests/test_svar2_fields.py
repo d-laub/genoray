@@ -105,7 +105,7 @@ def test_from_vcf_writes_dosage_field(tmp_path: Path):
     ds = next(f for f in meta["fields"] if f["name"] == "DS")
     assert ds["category"] == "format" and ds["dtype"] == "f32"
     contig = meta["contigs"][0]
-    vals = list((out / contig / "fields" / "DS").glob("*/values.bin"))
+    vals = list((out / contig / "fields" / "format" / "DS").glob("*/values.bin"))
     assert vals and all(p.stat().st_size % 4 == 0 for p in vals)
 
 
@@ -118,3 +118,76 @@ def test_from_vcf_with_no_fields_writes_empty_fields_list(tmp_path: Path):
     SparseVar2.from_vcf(out, "tests/data/biallelic.vcf.gz", no_reference=True)
     meta = json.loads((out / "meta.json").read_text())
     assert meta["fields"] == []
+
+
+def _dup_name_vcf(tmp_path: Path) -> Path:
+    """A VCF where `DP` is declared as BOTH an INFO field (site depth) and a
+    FORMAT field (per-sample depth) — a supported `from_vcf` input per the
+    design spec ("a name may exist in both"). Regression fixture for the
+    fields/{name}/ collision bug: without a category segment in the on-disk
+    path, INFO DP and FORMAT DP would merge/finalize into the same
+    `values.bin`, corrupting one or both.
+    """
+    doc = (
+        VcfBuilder(samples=["s0", "s1"], contigs=[("chr1", 100_000)])
+        .info("DP", Number.ONE, Type.INTEGER)
+        .fmt("GT")
+        .fmt("DP", Number.ONE, Type.INTEGER)
+        .record(
+            "chr1",
+            100,
+            ref="A",
+            alt=[Seq("C")],
+            gt=["0|1", "1|1"],
+            info={"DP": 30},
+            DP=[[10], [20]],
+        )
+        .record(
+            "chr1",
+            200,
+            ref="G",
+            alt=[Seq("T")],
+            gt=["1|0", "0|1"],
+            info={"DP": 40},
+            DP=[[15], [25]],
+        )
+    )
+    return doc.write(tmp_path / "dup.vcf.gz", bgzip=True, index=True)
+
+
+def test_from_vcf_same_name_info_and_format(tmp_path: Path):
+    import json
+
+    from genoray import SparseVar2
+
+    src = _dup_name_vcf(tmp_path)
+    out = tmp_path / "store_dup.svar2"
+    SparseVar2.from_vcf(
+        out, str(src), no_reference=True, info_fields=["DP"], format_fields=["DP"]
+    )
+    meta = json.loads((out / "meta.json").read_text())
+    dps = [f for f in meta["fields"] if f["name"] == "DP"]
+    # Both the INFO and FORMAT DP specs must survive finalize independently
+    # (no clobber, no double-finalize on a shared file).
+    assert {f["category"] for f in dps} == {"info", "format"}
+    contig = meta["contigs"][0]
+    info_vals = list((out / contig / "fields" / "info" / "DP").glob("*/values.bin"))
+    format_vals = list((out / contig / "fields" / "format" / "DP").glob("*/values.bin"))
+    assert info_vals
+    assert format_vals
+    # Auto-narrowing may resolve DP to a sub-4-byte width, and unrouted subs
+    # legitimately finalize to empty (0-byte) files, so just require: every
+    # file is a whole number of its own category's resolved dtype width
+    # (proves each category's rewrite used its own width, undisturbed by the
+    # other category sharing the name), and each category wrote SOME data.
+    byte_width = {"bool": 1, "i8": 1, "u8": 1, "i16": 2, "u16": 2, "f16": 2}
+    info_width = byte_width.get(
+        next(f["dtype"] for f in dps if f["category"] == "info"), 4
+    )
+    format_width = byte_width.get(
+        next(f["dtype"] for f in dps if f["category"] == "format"), 4
+    )
+    assert all(p.stat().st_size % info_width == 0 for p in info_vals)
+    assert all(p.stat().st_size % format_width == 0 for p in format_vals)
+    assert sum(p.stat().st_size for p in info_vals) > 0
+    assert sum(p.stat().st_size for p in format_vals) > 0

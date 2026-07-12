@@ -240,11 +240,12 @@ svar2/
     │       ├── alleles.bin         # 32-bit keys, one per call (ragged, points into shared LUT), u32 LE
     │       └── offsets.npy         # per (sample, ploid) ragged offsets into alleles, u64
     └── fields/                     # INFO/FORMAT field values (see below); only present
-        └── {name}/                 # when `from_vcf(info_fields=, format_fields=)` is used
-            ├── var_key_snp/values.bin
-            ├── var_key_indel/values.bin
-            ├── dense_snp/values.bin
-            └── dense_indel/values.bin       # only the subs with records for this contig exist
+        └── {category}/             # when `from_vcf(info_fields=, format_fields=)` is used
+            └── {name}/             # category ∈ {info, format}; same name may exist in both
+                ├── var_key_snp/values.bin
+                ├── var_key_indel/values.bin
+                ├── dense_snp/values.bin
+                └── dense_indel/values.bin       # only the subs with records for this contig exist
 ```
 
 ### INFO/FORMAT field storage
@@ -254,10 +255,13 @@ svar2/
 representation (`var_key`/`dense`) each variant already routed to — see
 `docs/superpowers/specs/2026-07-11-svar2-info-format-fields-write-design.md`
 for the full design. Each requested field gets its own
-`{contig}/fields/{name}/{sub}/values.bin`, where `sub ∈ {var_key_snp,
-var_key_indel, dense_snp, dense_indel}` (only the subs that actually had
-records for that contig/representation are written). `values.bin` is a raw
-little-endian array in the field's resolved storage dtype:
+`{contig}/fields/{category}/{name}/{sub}/values.bin`, where `category ∈
+{info, format}` (a name may be requested as both an INFO and a FORMAT field
+at once — the category segment keeps their `values.bin` files from
+colliding) and `sub ∈ {var_key_snp, var_key_indel, dense_snp, dense_indel}`
+(only the subs that actually had records for that contig/representation are
+written). `values.bin` is a raw little-endian array in the field's resolved
+storage dtype:
 
 - **var_key**: one value per call (INFO values duplicated across a variant's
   calls; FORMAT values one per carrier call) — parallel to that sub's

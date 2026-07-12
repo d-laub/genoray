@@ -97,7 +97,7 @@ fn finalize_one(
     contigs: &[String],
     field: &FieldSpec,
 ) -> Result<ResolvedField, ConversionError> {
-    let files = field_files(output_dir, contigs, &field.name);
+    let files = field_files(output_dir, contigs, field.category.as_str(), &field.name);
     let stats = scan(&files, field)?;
     let dtype = resolve_dtype(field, &stats)?;
     for path in &files {
@@ -114,13 +114,14 @@ fn finalize_one(
 /// Enumerate the `values.bin` files that exist for `name`, across every
 /// contig and all four sub labels. Iterating the known sub labels directly
 /// (rather than globbing) is simpler and matches the fixed staging layout.
-fn field_files(output_dir: &Path, contigs: &[String], name: &str) -> Vec<PathBuf> {
+fn field_files(output_dir: &Path, contigs: &[String], category: &str, name: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for contig in contigs {
         for sub in SUB_LABELS {
             let path = output_dir
                 .join(contig)
                 .join("fields")
+                .join(category)
                 .join(name)
                 .join(sub)
                 .join("values.bin");
@@ -462,15 +463,28 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
+    // Test fields below always pair `write_i32_field` with `int_field`
+    // (category "info") and `write_f32_field` with `float_field` (category
+    // "format"), so the category segment is hardcoded here to match.
     fn write_i32_field(root: &Path, contig: &str, name: &str, sub: &str, values: &[i32]) {
-        let dir = root.join(contig).join("fields").join(name).join(sub);
+        let dir = root
+            .join(contig)
+            .join("fields")
+            .join("info")
+            .join(name)
+            .join(sub);
         fs::create_dir_all(&dir).unwrap();
         let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
         fs::write(dir.join("values.bin"), bytes).unwrap();
     }
 
     fn write_f32_field(root: &Path, contig: &str, name: &str, sub: &str, values: &[f32]) {
-        let dir = root.join(contig).join("fields").join(name).join(sub);
+        let dir = root
+            .join(contig)
+            .join("fields")
+            .join("format")
+            .join(name)
+            .join(sub);
         fs::create_dir_all(&dir).unwrap();
         let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
         fs::write(dir.join("values.bin"), bytes).unwrap();
@@ -514,11 +528,11 @@ mod tests {
         assert_eq!(resolved.len(), 1);
         assert!(matches!(resolved[0].dtype, StorageDtype::U8));
 
-        let path1 = root.join("chr1/fields/AC/var_key_snp/values.bin");
+        let path1 = root.join("chr1/fields/info/AC/var_key_snp/values.bin");
         let bytes1 = read_values_bin(&path1);
         assert_eq!(bytes1, vec![0u8, 50, 200]);
 
-        let path2 = root.join("chr2/fields/AC/var_key_snp/values.bin");
+        let path2 = root.join("chr2/fields/info/AC/var_key_snp/values.bin");
         let bytes2 = read_values_bin(&path2);
         assert_eq!(bytes2, vec![0u8, 5, 10]);
     }
@@ -538,7 +552,7 @@ mod tests {
 
         assert!(matches!(resolved[0].dtype, StorageDtype::U16));
 
-        let path = root.join("chr1/fields/DP/var_key_snp/values.bin");
+        let path = root.join("chr1/fields/info/DP/var_key_snp/values.bin");
         let bytes = read_values_bin(&path);
         let words: Vec<u16> = bytes
             .chunks_exact(2)
@@ -560,7 +574,7 @@ mod tests {
         let resolved = finalize_fields(root, &contigs, &[field]).unwrap();
         assert!(matches!(resolved[0].dtype, StorageDtype::U8));
 
-        let path = root.join("chr1/fields/AF/var_key_snp/values.bin");
+        let path = root.join("chr1/fields/info/AF/var_key_snp/values.bin");
         let bytes = read_values_bin(&path);
         assert_eq!(bytes, vec![0u8, 200, u8::MAX]);
     }
@@ -576,7 +590,7 @@ mod tests {
         let resolved = finalize_fields(root, &contigs, &[field]).unwrap();
         assert!(matches!(resolved[0].dtype, StorageDtype::F16));
 
-        let path = root.join("chr1/fields/DS/dense_snp/values.bin");
+        let path = root.join("chr1/fields/format/DS/dense_snp/values.bin");
         let bytes = read_values_bin(&path);
         assert_eq!(bytes.len(), 3 * 2);
         let words: Vec<half::f16> = bytes
@@ -631,7 +645,7 @@ mod tests {
             resolved[0].dtype
         );
 
-        let path = root.join("chr1/fields/SC/var_key_snp/values.bin");
+        let path = root.join("chr1/fields/info/SC/var_key_snp/values.bin");
         let bytes = read_values_bin(&path);
         let decoded: Vec<i8> = bytes.iter().map(|&b| b as i8).collect();
         assert_eq!(decoded, vec![-5i8, 0, 100]);
@@ -654,7 +668,7 @@ mod tests {
             resolved[0].dtype
         );
 
-        let path = root.join("chr1/fields/SC2/var_key_snp/values.bin");
+        let path = root.join("chr1/fields/info/SC2/var_key_snp/values.bin");
         let bytes = read_values_bin(&path);
         let decoded: Vec<i16> = bytes
             .chunks_exact(2)

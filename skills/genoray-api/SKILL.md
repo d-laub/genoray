@@ -300,9 +300,10 @@ Signature: `from_vcf(out, source, reference=None, *, no_reference=False, skip_ou
     range, raises `ValueError`. `f16` is the only lossy option and must be
     requested explicitly.
   - **`default`** — the value written for VCF-missing entries; otherwise a
-    reserved sentinel (`NaN` for float widths, the width-specific
-    `INT*_MIN` for ints). `Flag` fields are never missing (absent ⇒
-    `false`/`0`).
+    reserved sentinel at the extreme of the chosen width (`INT*_MIN` for
+    signed widths, `u*::MAX` for unsigned widths — auto-narrowing prefers
+    unsigned when the observed range is non-negative — and `NaN` for float
+    widths). `Flag` fields are never missing (absent ⇒ `false`/`0`).
   - **FORMAT is genotype-aligned, not independently lossless**: a FORMAT
     value is stored only where the genotype has a call — one value per
     carrier call in var_key-routed variants, or a full dense per-sample
