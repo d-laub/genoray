@@ -155,6 +155,12 @@ pub struct SparseSubStream {
     // Calls per (sample, ploid) in THIS sub-stream. Length == samples * ploidy.
     pub sample_lengths: Vec<u32>,
     pub key_bytes: usize,
+    // Genotype-aligned (Option A) per-call field values: one `StagedColumn`
+    // per field in FLAT `fields` order (INFO and FORMAT interleaved as they
+    // appear in the `fields` slice passed to `dense2sparse_vk`), each pushed
+    // in lockstep with `push_call` — `field_calls[i].len() ==
+    // call_positions.len()`. Empty when no fields were requested.
+    pub field_calls: Vec<StagedColumn>,
 }
 
 impl SparseSubStream {
@@ -164,6 +170,7 @@ impl SparseSubStream {
             call_keys: Vec::with_capacity(nnz * key_bytes),
             sample_lengths: Vec::with_capacity(columns),
             key_bytes,
+            field_calls: Vec::new(),
         }
     }
     #[inline(always)]
@@ -185,6 +192,14 @@ pub struct DenseSubChunk {
     // Hap-major bit block, shape (S, P, n_dense_variants), variant fastest.
     // Bit (hap h, dense col d) at flat index h*n_dense_variants + d.
     pub geno_bits: Vec<u8>,
+    // Genotype-aligned (Option A) dense field columns. `field_info[i]` is one
+    // per INFO field, `len() == n_dense_variants`. `field_format[j]` is one
+    // per FORMAT field, a FULL per-sample column: `len() == n_dense_variants
+    // * num_samples`; carrier samples get the read value, non-carrier
+    // samples get the field's default/sentinel. Both empty when no fields
+    // were requested.
+    pub field_info: Vec<StagedColumn>,
+    pub field_format: Vec<StagedColumn>,
 }
 
 impl DenseSubChunk {
@@ -195,6 +210,8 @@ impl DenseSubChunk {
             positions: Vec::new(),
             keys: Vec::new(),
             geno_bits: Vec::new(),
+            field_info: Vec::new(),
+            field_format: Vec::new(),
         }
     }
 }

@@ -174,12 +174,13 @@ pub fn process_chromosome(
         .expect("spawn reader");
 
     // Step 2 -> The Executor
+    let fields_exec: Vec<crate::field::FieldSpec> = fields.to_vec();
     let executor_thread = thread::Builder::new()
         .name(format!("exec-{}", chrom))
         .spawn({
             move || {
                 let bank = LongAlleleTableWriter::new(tx_long, long_allele_capacity);
-                executor::run_compute_engine(rx_dense, tx_sparse, bank, signatures)
+                executor::run_compute_engine(rx_dense, tx_sparse, bank, signatures, &fields_exec)
             }
         })
         .expect("spawn executor");

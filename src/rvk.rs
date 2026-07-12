@@ -2,10 +2,13 @@ use crate::cost_model::{Class, Representation, choose_representation};
 use crate::dense::{DenseClass, DenseMap};
 use crate::enum_map::EnumKey;
 use crate::error::ConversionError;
+use crate::field::{FieldCategory, FieldSpec};
 use crate::layout;
 use crate::nrvk::LongAlleleTableWriter;
 use crate::streams::StreamTag;
-use crate::types::{DenseChunk, DenseSubChunk, MAX_INLINE_ALT_LEN, SparseChunk, SparseSubStream};
+use crate::types::{
+    DenseChunk, DenseSubChunk, MAX_INLINE_ALT_LEN, SparseChunk, SparseSubStream, StagedColumn,
+};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
@@ -139,6 +142,7 @@ pub fn dense2sparse_vk(
     chunk: &DenseChunk,
     bank: &mut LongAlleleTableWriter,
     sidecar_bits_enabled: bool,
+    fields: &[FieldSpec],
 ) -> SparseChunk {
     let (v_variants, num_samples, ploidy) = chunk.genos.shape;
     let columns = num_samples * ploidy;
@@ -150,11 +154,73 @@ pub fn dense2sparse_vk(
         Dense { class: DenseClass, col: u32 },
     }
 
+    // Read a staged column's value back as `f64` (the common currency for
+    // field resolution). `Int` also carries Flag columns (staged as 0/1).
+    #[inline(always)]
+    fn staged_f64(col: &StagedColumn, idx: usize) -> f64 {
+        match col {
+            StagedColumn::Int(v) => v[idx] as f64,
+            StagedColumn::Float(v) => v[idx] as f64,
+        }
+    }
+
+    // Map each flat index in `fields` to (is_format, per-category index) so
+    // both routing branches can index straight into `chunk.info_staged` /
+    // `chunk.format_staged` without re-filtering `fields` per variant/call.
+    // INVARIANT (reader-side): `info_staged`/`format_staged` are ordered to
+    // match the INFO/FORMAT-filtered order of `fields` (see types.rs).
+    let per_cat: Vec<(bool, usize)> = {
+        let mut info_i = 0usize;
+        let mut fmt_i = 0usize;
+        fields
+            .iter()
+            .map(|f| match f.category {
+                FieldCategory::Info => {
+                    let idx = info_i;
+                    info_i += 1;
+                    (false, idx)
+                }
+                FieldCategory::Format => {
+                    let idx = fmt_i;
+                    fmt_i += 1;
+                    (true, idx)
+                }
+            })
+            .collect()
+    };
+    let format_specs: Vec<&FieldSpec> = fields
+        .iter()
+        .filter(|f| f.category == FieldCategory::Format)
+        .collect();
+
+    // Genotype-aligned carrier test: sample `s` carries variant `v` iff any
+    // of its ploidy bits are set in `chunk.genos`. Used only for the dense
+    // FORMAT per-sample fill (Option A semantics) — not the hot bit-test in
+    // the transpose loop below, which walks bits directly for speed.
+    let is_carrier = |v: usize, s: usize| -> bool {
+        (0..ploidy).any(|p| {
+            let flat_idx = v * columns + s * ploidy + p;
+            (chunk.genos.words[flat_idx >> 6] >> (flat_idx & 63)) & 1 == 1
+        })
+    };
+
     // Dense per-class tables accumulate positions + keys as we discover dense
     // variants; geno_bits is sized after the pre-pass (n_dense known). This
     // also ensures a long insertion is pushed to the bank a single time, not
     // once per carrying haplotype.
     let mut dense = DenseMap::from_fn(|c| DenseSubChunk::empty(c.key_bytes()));
+    for (_c, sub) in dense.iter_mut() {
+        sub.field_info = fields
+            .iter()
+            .filter(|f| f.category == FieldCategory::Info)
+            .map(|f| StagedColumn::with_capacity(f.stage_is_float(), v_variants))
+            .collect();
+        sub.field_format = fields
+            .iter()
+            .filter(|f| f.category == FieldCategory::Format)
+            .map(|f| StagedColumn::with_capacity(f.stage_is_float(), v_variants * num_samples))
+            .collect();
+    }
     let mut routes: Vec<Route> = Vec::with_capacity(v_variants);
 
     for v in 0..v_variants {
@@ -201,6 +267,27 @@ pub fn dense2sparse_vk(
                     VarKey::Indel(key) => sub.keys.extend_from_slice(&key.to_le_bytes()),
                 }
                 sub.n_dense_variants += 1;
+
+                // Genotype-aligned (Option A) dense field push: INFO once per
+                // dense variant; FORMAT as a full per-sample column, with
+                // non-carrier samples filled with the field's sentinel/default.
+                for &(is_format, idx) in &per_cat {
+                    if is_format {
+                        let default_val = format_specs[idx].missing_sentinel();
+                        for s in 0..num_samples {
+                            let val = if is_carrier(v, s) {
+                                staged_f64(&chunk.format_staged[idx], v * num_samples + s)
+                            } else {
+                                default_val
+                            };
+                            sub.field_format[idx].push_f64(val);
+                        }
+                    } else {
+                        let val = staged_f64(&chunk.info_staged[idx], v);
+                        sub.field_info[idx].push_f64(val);
+                    }
+                }
+
                 routes.push(Route::Dense { class: dclass, col });
             }
         }
@@ -217,6 +304,12 @@ pub fn dense2sparse_vk(
         let spec = &crate::streams::REGISTRY[tag.index()];
         SparseSubStream::with_capacity(spec.key_bytes, estimated_nnz, columns)
     });
+    for (_tag, st) in streams.iter_mut() {
+        st.field_calls = fields
+            .iter()
+            .map(|f| StagedColumn::with_capacity(f.stage_is_float(), estimated_nnz))
+            .collect();
+    }
 
     let words: &[u64] = &chunk.genos.words;
 
@@ -255,9 +348,19 @@ pub fn dense2sparse_vk(
                             VarKey::Indel(key) => (StreamTag::VarKeyIndel, key.to_le_bytes()),
                         };
                         let spec = &crate::streams::REGISTRY[tag.index()];
-                        streams
-                            .get_mut(tag)
-                            .push_call(pos, &key_le[..spec.key_bytes]);
+                        let st = streams.get_mut(tag);
+                        st.push_call(pos, &key_le[..spec.key_bytes]);
+                        // Genotype-aligned (Option A) per-call field push,
+                        // aligned to call order: INFO uses the variant's
+                        // single value; FORMAT uses the calling sample's.
+                        for (i, &(is_format, idx)) in per_cat.iter().enumerate() {
+                            let val = if is_format {
+                                staged_f64(&chunk.format_staged[idx], v * num_samples + s)
+                            } else {
+                                staged_f64(&chunk.info_staged[idx], v)
+                            };
+                            st.field_calls[i].push_f64(val);
+                        }
                         *counts.get_mut(tag) += 1;
                     }
                     Route::Dense { class, col } => {
@@ -541,7 +644,7 @@ mod tests {
         // Zero variants, just shape edge case.
         let chunk = build_test_chunk(0, 2, 2, &[], &[], &[]);
         let mut bank = make_bank();
-        let sparse = dense2sparse_vk(&chunk, &mut bank, false);
+        let sparse = dense2sparse_vk(&chunk, &mut bank, false, &[]);
         let snp = sparse.streams.get(StreamTag::VarKeySnp);
         let indel = sparse.streams.get(StreamTag::VarKeyIndel);
         assert_eq!(snp.call_positions.len(), 0);
@@ -572,7 +675,7 @@ mod tests {
 
         let chunk = build_test_chunk(n_variants, n_samples, ploidy, &refs, &alts, &bit_pattern);
         let mut bank = make_bank();
-        let sparse = dense2sparse_vk(&chunk, &mut bank, false);
+        let sparse = dense2sparse_vk(&chunk, &mut bank, false, &[]);
         let snp = sparse.streams.get(StreamTag::VarKeySnp);
         let indel = sparse.streams.get(StreamTag::VarKeyIndel);
 
@@ -608,7 +711,7 @@ mod tests {
         let chunk = build_test_chunk(3, 1, 2, &refs, &alts, &bit_pattern);
 
         let mut bank = make_bank();
-        let sparse = dense2sparse_vk(&chunk, &mut bank, false);
+        let sparse = dense2sparse_vk(&chunk, &mut bank, false, &[]);
         let snp = sparse.streams.get(StreamTag::VarKeySnp);
         let indel = sparse.streams.get(StreamTag::VarKeyIndel);
 
@@ -644,7 +747,7 @@ mod tests {
         let chunk = build_test_chunk(1, 2, 2, &refs, &alts, &bits);
 
         let mut bank = make_bank();
-        let sparse = dense2sparse_vk(&chunk, &mut bank, false);
+        let sparse = dense2sparse_vk(&chunk, &mut bank, false, &[]);
 
         // var_key snp stream is empty (variant went dense)
         let snp = sparse.streams.get(StreamTag::VarKeySnp);
@@ -674,7 +777,7 @@ mod tests {
         let chunk = build_test_chunk(1, n, 2, &refs, &alts, &bits);
 
         let mut bank = make_bank();
-        let sparse = dense2sparse_vk(&chunk, &mut bank, false);
+        let sparse = dense2sparse_vk(&chunk, &mut bank, false, &[]);
         assert_eq!(
             sparse
                 .streams
@@ -711,7 +814,7 @@ mod tests {
             let chunk = build_test_chunk(n_variants, n_samples, ploidy, &refs, &alts, &bit_pattern);
 
             let mut bank = make_bank();
-            let sparse = dense2sparse_vk(&chunk, &mut bank, false);
+            let sparse = dense2sparse_vk(&chunk, &mut bank, false, &[]);
             let snp = sparse.streams.get(StreamTag::VarKeySnp);
             let indel = sparse.streams.get(StreamTag::VarKeyIndel);
 
@@ -748,7 +851,7 @@ mod tests {
             let chunk = build_test_chunk(n_variants, n_samples, ploidy, &refs, &alts, &bit_pattern);
 
             let mut bank = make_bank();
-            let sparse = dense2sparse_vk(&chunk, &mut bank, false);
+            let sparse = dense2sparse_vk(&chunk, &mut bank, false, &[]);
             let snp = sparse.streams.get(StreamTag::VarKeySnp);
 
             let np = n_samples * ploidy;
@@ -798,7 +901,7 @@ mod tests {
             let chunk = build_test_chunk(n_variants, n_samples, ploidy, &refs, &alts, &bits);
 
             let mut bank = make_bank();
-            let sparse = dense2sparse_vk(&chunk, &mut bank, false);
+            let sparse = dense2sparse_vk(&chunk, &mut bank, false, &[]);
 
             let vk_calls: usize = sparse.streams.get(StreamTag::VarKeySnp)
                 .sample_lengths.iter().map(|&c| c as usize).sum::<usize>()
@@ -810,6 +913,128 @@ mod tests {
                 dense_calls += sub.geno_bits.iter().map(|b| b.count_ones() as usize).sum::<usize>();
             }
             prop_assert_eq!(vk_calls + dense_calls, true_count, "lost or double-counted a call");
+        }
+    }
+
+    // Genotype-aligned (Option A) field routing: one INFO (Int) + one FORMAT
+    // (Float) field, engineered so v0 stays var_key (single carrier) and v1
+    // routes dense (4/6 haps carry, well over the 34*x<=34+np crossover),
+    // with v1 leaving sample 2 a genuine non-carrier (both ploidy bits unset)
+    // to exercise the default-fill path.
+    #[test]
+    fn test_dense2sparse_routes_field_values_option_a() {
+        use crate::field::{HtslibType, StorageDtype};
+
+        let refs: Vec<&[u8]> = vec![b"A", b"A"];
+        let alts: Vec<&[u8]> = vec![b"C", b"G"];
+        let n_variants = 2;
+        let n_samples = 3;
+        let ploidy = 2;
+        let columns = n_samples * ploidy; // 6, np = 6
+
+        #[rustfmt::skip]
+        let bit_pattern = vec![
+            // v0: only s0p0 carries -> x=1, var_key (34*1 <= 34+6=40)
+            true, false, false, false, false, false,
+            // v1: s0(p0,p1) + s1(p0,p1) carry, s2 fully absent -> x=4, dense
+            true, true, true, true, false, false,
+        ];
+        assert_eq!(bit_pattern.len(), n_variants * columns);
+
+        let mut chunk = build_test_chunk(n_variants, n_samples, ploidy, &refs, &alts, &bit_pattern);
+        chunk.info_staged = vec![StagedColumn::Int(vec![10, 20])];
+        chunk.format_staged = vec![StagedColumn::Float(vec![
+            1.5, 2.5, 3.5, // v0: s0,s1,s2
+            10.5, 20.5, 30.5, // v1: s0,s1,s2
+        ])];
+
+        let fields = vec![
+            FieldSpec {
+                name: "AF".into(),
+                category: FieldCategory::Info,
+                htype: HtslibType::Int,
+                dtype: StorageDtype::Auto,
+                default: None,
+            },
+            FieldSpec {
+                name: "DS".into(),
+                category: FieldCategory::Format,
+                htype: HtslibType::Float,
+                dtype: StorageDtype::Auto,
+                default: Some(-1.0),
+            },
+        ];
+
+        let mut bank = make_bank();
+        let sparse = dense2sparse_vk(&chunk, &mut bank, false, &fields);
+
+        // Routing sanity, asserted before trusting the field data below.
+        let vk = sparse.streams.get(StreamTag::VarKeySnp);
+        assert_eq!(vk.call_positions.len(), 1, "v0 must stay var_key");
+        let d = sparse.dense.get(DenseClass::Snp);
+        assert_eq!(d.n_dense_variants, 1, "v1 must route dense");
+
+        // var_key: field_calls aligned to the single call (v0, hap s0p0).
+        assert_eq!(vk.field_calls.len(), 2);
+        match &vk.field_calls[0] {
+            StagedColumn::Int(v) => {
+                assert_eq!(v.len(), vk.call_positions.len());
+                assert_eq!(v[0], 10, "INFO value is the variant's single value");
+            }
+            other => panic!(
+                "expected Int INFO field_calls[0], got {:?}",
+                other_kind(other)
+            ),
+        }
+        match &vk.field_calls[1] {
+            StagedColumn::Float(v) => {
+                assert_eq!(v.len(), vk.call_positions.len());
+                assert_eq!(v[0], 1.5, "FORMAT value is the calling sample's value");
+            }
+            other => panic!(
+                "expected Float FORMAT field_calls[1], got {:?}",
+                other_kind(other)
+            ),
+        }
+
+        // dense: field_info one-per-variant.
+        assert_eq!(d.field_info.len(), 1);
+        match &d.field_info[0] {
+            StagedColumn::Int(v) => {
+                assert_eq!(v.len(), d.n_dense_variants);
+                assert_eq!(
+                    v[0], 20,
+                    "dense INFO value matches the dense variant's staged value"
+                );
+            }
+            other => panic!(
+                "expected Int dense field_info[0], got {:?}",
+                other_kind(other)
+            ),
+        }
+
+        // dense: field_format is a full per-sample column; carriers get the
+        // read value, the non-carrier gets the field's default.
+        assert_eq!(d.field_format.len(), 1);
+        match &d.field_format[0] {
+            StagedColumn::Float(v) => {
+                assert_eq!(v.len(), d.n_dense_variants * n_samples);
+                assert_eq!(v[0], 10.5, "carrier sample 0 keeps its staged value");
+                assert_eq!(v[1], 20.5, "carrier sample 1 keeps its staged value");
+                assert_eq!(v[2], -1.0, "non-carrier sample 2 gets the field default");
+            }
+            other => panic!(
+                "expected Float dense field_format[0], got {:?}",
+                other_kind(other)
+            ),
+        }
+    }
+
+    // Debug helper for panic messages above (StagedColumn has no Debug impl).
+    fn other_kind(col: &StagedColumn) -> &'static str {
+        match col {
+            StagedColumn::Int(_) => "Int",
+            StagedColumn::Float(_) => "Float",
         }
     }
 }

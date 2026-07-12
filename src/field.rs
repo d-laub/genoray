@@ -78,6 +78,20 @@ impl FieldSpec {
     pub fn stage_is_float(&self) -> bool {
         self.htype == HtslibType::Float
     }
+
+    /// The sentinel a resolved field value falls back to when htslib reports
+    /// it missing and the spec has no explicit `default`: htslib's own
+    /// missing-int encoding for Int/Flag columns, NaN for Float columns
+    /// (mirrors htslib's float-missing encoding, which is itself a NaN bit
+    /// pattern). Also used as the non-carrier fill for genotype-aligned
+    /// dense FORMAT columns.
+    pub fn missing_sentinel(&self) -> f64 {
+        self.default.unwrap_or(if self.stage_is_float() {
+            f64::from(f32::NAN)
+        } else {
+            i32::MIN as f64
+        })
+    }
 }
 
 fn bad(ctx: &str) -> ConversionError {

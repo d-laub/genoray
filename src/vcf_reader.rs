@@ -135,16 +135,10 @@ fn pack_presence_par(
     });
 }
 
-// The sentinel a resolved field value falls back to when htslib reports it
-// missing and the spec has no explicit `default`: htslib's own missing-int
-// encoding for Int/Flag columns, NaN for Float columns (mirrors htslib's
-// float-missing encoding, which is itself a NaN bit pattern).
+// Delegates to `FieldSpec::missing_sentinel` — single source of truth shared
+// with `dense2sparse_vk`'s genotype-aligned non-carrier fill (src/rvk.rs).
 fn sentinel_default(spec: &FieldSpec) -> f64 {
-    spec.default.unwrap_or(if spec.stage_is_float() {
-        f64::from(f32::NAN)
-    } else {
-        i32::MIN as f64
-    })
+    spec.missing_sentinel()
 }
 
 // htslib missing-value detection on an already-widened f64: floats use NaN
