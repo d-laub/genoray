@@ -337,16 +337,16 @@ pub fn process_chromosome(
         let mut info_ix = 0usize;
         let mut format_ix = 0usize;
         for field in fields.iter() {
-            let (prefix, field_ix) = match field.category {
+            let field_ix = match field.category {
                 crate::field::FieldCategory::Info => {
                     let ix = info_ix;
                     info_ix += 1;
-                    ("finfo", ix)
+                    ix
                 }
                 crate::field::FieldCategory::Format => {
                     let ix = format_ix;
                     format_ix += 1;
-                    ("fformat", ix)
+                    ix
                 }
             };
             let dest_dir = std::path::Path::new(base_out_dir)
@@ -364,7 +364,7 @@ pub fn process_chromosome(
                 dir.to_str().unwrap(),
                 num_chunks,
                 &ledger,
-                prefix,
+                field.category,
                 field_ix,
                 &dest_values_bin,
             )?;

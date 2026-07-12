@@ -107,10 +107,10 @@ pub fn merge_dense_class(
 /// concatenation reproduces the final layout. Chunks with `dense_ledger[c] == 0`
 /// wrote no per-chunk field file (Task 7) and are skipped here too.
 ///
-/// `prefix` selects which per-chunk file family to read: `"finfo"` for INFO
-/// fields (`layout::chunk_field_info`) or `"fformat"` for FORMAT fields
-/// (`layout::chunk_field_format`). `field_ix` is the per-category (INFO-only or
-/// FORMAT-only) field index Task 7 staged under.
+/// `category` selects which per-chunk file family to read: `FieldCategory::Info`
+/// for INFO fields (`layout::chunk_field_info`) or `FieldCategory::Format` for
+/// FORMAT fields (`layout::chunk_field_format`). `field_ix` is the per-category
+/// (INFO-only or FORMAT-only) field index Task 7 staged under.
 ///
 /// The caller is responsible for creating `dest_values_bin`'s parent directory
 /// before calling this function (this function does not call `create_dir_all`),
@@ -121,7 +121,7 @@ pub fn merge_dense_field_values(
     output_dir: &str,
     num_chunks: usize,
     dense_ledger: &[u32],
-    prefix: &str,
+    category: crate::field::FieldCategory,
     field_ix: usize,
     dest_values_bin: &Path,
 ) -> Result<(), ConversionError> {
@@ -137,14 +137,9 @@ pub fn merge_dense_field_values(
         if count == 0 {
             continue;
         }
-        let path = match prefix {
-            "finfo" => layout::chunk_field_info(dir, c, field_ix),
-            "fformat" => layout::chunk_field_format(dir, c, field_ix),
-            other => {
-                return Err(ConversionError::Input(format!(
-                    "merge_dense_field_values: unknown prefix {other:?}, expected \"finfo\" or \"fformat\""
-                )));
-            }
+        let path = match category {
+            crate::field::FieldCategory::Info => layout::chunk_field_info(dir, c, field_ix),
+            crate::field::FieldCategory::Format => layout::chunk_field_format(dir, c, field_ix),
         };
         values.extend_from_slice(&fs::read(&path).map_err(|e| ConversionError::Io {
             context: format!("reading {}", path.display()),
@@ -179,6 +174,7 @@ fn write_all(path: &Path, bytes: &[u8]) -> Result<(), ConversionError> {
 mod tests {
     use super::*;
     use crate::bits::{get_bit, set_bit};
+    use crate::field::FieldCategory;
     use tempfile::tempdir;
 
     // Build a hap-major block (np rows × v_c cols) from a bool matrix
@@ -322,8 +318,15 @@ mod tests {
             .join("values.bin");
         fs::create_dir_all(dest.parent().unwrap()).unwrap();
 
-        merge_dense_field_values(dir.to_str().unwrap(), 3, &dense_ledger, "finfo", 0, &dest)
-            .unwrap();
+        merge_dense_field_values(
+            dir.to_str().unwrap(),
+            3,
+            &dense_ledger,
+            FieldCategory::Info,
+            0,
+            &dest,
+        )
+        .unwrap();
 
         assert_eq!(read_i32(&dest), vec![10, 20, 30]);
         // Consumed per-chunk field files are removed.
@@ -355,27 +358,18 @@ mod tests {
             .join("values.bin");
         fs::create_dir_all(dest.parent().unwrap()).unwrap();
 
-        merge_dense_field_values(dir.to_str().unwrap(), 2, &dense_ledger, "fformat", 1, &dest)
-            .unwrap();
+        merge_dense_field_values(
+            dir.to_str().unwrap(),
+            2,
+            &dense_ledger,
+            FieldCategory::Format,
+            1,
+            &dest,
+        )
+        .unwrap();
 
         assert_eq!(read_f32(&dest), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         assert!(!layout::chunk_field_format(dir, 0, 1).exists());
         assert!(!layout::chunk_field_format(dir, 1, 1).exists());
-    }
-
-    #[test]
-    fn test_merge_dense_field_values_unknown_prefix_errors() {
-        let tmp = tempdir().unwrap();
-        let dir = tmp.path();
-        let dense_ledger = vec![1u32];
-        write_all(
-            &layout::chunk_field_info(dir, 0, 0),
-            bytemuck::cast_slice(&[1i32]),
-        )
-        .unwrap();
-        let dest = dir.join("values.bin");
-        let err =
-            merge_dense_field_values(dir.to_str().unwrap(), 1, &dense_ledger, "bogus", 0, &dest);
-        assert!(err.is_err());
     }
 }
