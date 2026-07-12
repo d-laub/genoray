@@ -28,6 +28,9 @@ pub fn run_io_writer(
                 bytemuck::cast_slice(&sub.call_positions),
             )?;
             write_bin(&layout::chunk_key(dir, id), &sub.call_keys)?; // already bytes
+            for (i, col) in sub.field_calls.iter().enumerate() {
+                write_bin(&layout::chunk_field(dir, id, i), staged_bytes(col))?;
+            }
         }
 
         // dense per-class matrix + table (only classes with dense variants)
@@ -43,6 +46,12 @@ pub fn run_io_writer(
             )?;
             write_bin(&layout::chunk_key(dir, id), &sub.keys)?;
             write_bin(&layout::chunk_geno(dir, id), &sub.geno_bits)?;
+            for (i, col) in sub.field_info.iter().enumerate() {
+                write_bin(&layout::chunk_field_info(dir, id, i), staged_bytes(col))?;
+            }
+            for (i, col) in sub.field_format.iter().enumerate() {
+                write_bin(&layout::chunk_field_format(dir, id, i), staged_bytes(col))?;
+            }
         }
     }
 
@@ -82,6 +91,15 @@ pub fn run_long_allele_writer(
         chrom_label
     );
     Ok(())
+}
+
+/// View a staged field column as raw bytes for a flat write, matching the
+/// element type's native representation (`i32`/`f32`).
+fn staged_bytes(col: &crate::types::StagedColumn) -> &[u8] {
+    match col {
+        crate::types::StagedColumn::Int(v) => bytemuck::cast_slice(v),
+        crate::types::StagedColumn::Float(v) => bytemuck::cast_slice(v),
+    }
 }
 
 fn write_bin(path: &Path, bytes: &[u8]) -> Result<(), ConversionError> {
@@ -180,5 +198,73 @@ mod tests {
         assert_eq!(geno, vec![0b0000_1011u8]);
         // indel had 0 dense variants → no files written
         assert!(!indel_dir.join("chunk_0_geno.bin").exists());
+    }
+
+    #[test]
+    fn test_writer_persists_field_chunk_files() {
+        let tmp = tempdir().unwrap();
+
+        let vk_snp = tmp.path().join("var_key/snp");
+        let vk_indel = tmp.path().join("var_key/indel");
+        std::fs::create_dir_all(&vk_snp).unwrap();
+        std::fs::create_dir_all(&vk_indel).unwrap();
+
+        let snp_dir = tmp.path().join("dense/snp");
+        let indel_dir = tmp.path().join("dense/indel");
+        std::fs::create_dir_all(&snp_dir).unwrap();
+        std::fs::create_dir_all(&indel_dir).unwrap();
+
+        // var_key/snp stream: 3 calls, one staged Float field.
+        let mut streams = StreamMap::from_fn(|tag| {
+            let kb = crate::streams::REGISTRY[tag.index()].key_bytes;
+            SparseSubStream::with_capacity(kb, 0, 0)
+        });
+        let snp_stream = streams.get_mut(StreamTag::VarKeySnp);
+        snp_stream.call_positions = vec![10, 20, 30];
+        snp_stream.call_keys = vec![1u8, 2u8, 3u8];
+        snp_stream.field_calls = vec![crate::types::StagedColumn::Float(vec![0.5, 1.5, 2.5])];
+
+        // dense/snp class: 2 dense variants, one INFO field + one FORMAT field.
+        let mut dense = DenseMap::from_fn(|c| DenseSubChunk::empty(c.key_bytes()));
+        let snp_dense = dense.get_mut(DenseClass::Snp);
+        snp_dense.n_dense_variants = 2;
+        snp_dense.positions = vec![100, 200];
+        snp_dense.keys = vec![1u8, 2u8];
+        snp_dense.geno_bits = vec![0u8];
+        snp_dense.field_info = vec![crate::types::StagedColumn::Int(vec![7, 8])];
+        snp_dense.field_format = vec![crate::types::StagedColumn::Float(vec![1.0, 2.0, 3.0, 4.0])];
+
+        let chunk = SparseChunk {
+            chunk_id: 0,
+            streams,
+            dense,
+        };
+
+        let (tx, rx) = bounded(1);
+        tx.send(chunk).unwrap();
+        drop(tx);
+
+        let dirs = StreamMap::from_fn(|tag| match tag {
+            StreamTag::VarKeySnp => vk_snp.clone(),
+            StreamTag::VarKeyIndel => vk_indel.clone(),
+        });
+        let dense_dirs = DenseMap::from_fn(|c| match c {
+            DenseClass::Snp => snp_dir.clone(),
+            DenseClass::Indel => indel_dir.clone(),
+        });
+
+        run_io_writer(rx, dirs, dense_dirs).unwrap();
+
+        // var_key/snp field0: 3 f32 = 12 bytes.
+        let field0 = std::fs::read(vk_snp.join("chunk_0_field0.bin")).unwrap();
+        assert_eq!(field0.len(), 12);
+
+        // dense/snp finfo0: 2 i32 = 8 bytes.
+        let finfo0 = std::fs::read(snp_dir.join("chunk_0_finfo0.bin")).unwrap();
+        assert_eq!(finfo0.len(), 8);
+
+        // dense/snp fformat0: 4 f32 = 16 bytes.
+        let fformat0 = std::fs::read(snp_dir.join("chunk_0_fformat0.bin")).unwrap();
+        assert_eq!(fformat0.len(), 16);
     }
 }
