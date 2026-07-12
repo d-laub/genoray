@@ -223,6 +223,21 @@ pub fn dense2sparse_vk(
     }
     let mut routes: Vec<Route> = Vec::with_capacity(v_variants);
 
+    // Summed per-record storage width (bits) of the active INFO/FORMAT
+    // fields, computed once outside the per-variant loop. `Auto` dtype has
+    // no fixed width yet, so it's estimated at the 4-byte (32-bit) staged
+    // i32/f32 width used during staging.
+    let info_bits: u64 = fields
+        .iter()
+        .filter(|f| f.category == FieldCategory::Info)
+        .map(|f| f.dtype.width_bytes().unwrap_or(4) as u64 * 8)
+        .sum();
+    let format_bits: u64 = fields
+        .iter()
+        .filter(|f| f.category == FieldCategory::Format)
+        .map(|f| f.dtype.width_bytes().unwrap_or(4) as u64 * 8)
+        .sum();
+
     for v in 0..v_variants {
         // SAFETY: `v` ranges over `0..v_variants` and `chunk.ilens.len() ==
         // v_variants` (one entry per variant), so `ilens[v]` is in bounds.
@@ -252,7 +267,15 @@ pub fn dense2sparse_vk(
         } else {
             0
         };
-        match choose_representation(class, num_samples, ploidy, x, sidecar_bits) {
+        match choose_representation(
+            class,
+            num_samples,
+            ploidy,
+            x,
+            sidecar_bits,
+            info_bits,
+            format_bits,
+        ) {
             Representation::VarKey => routes.push(Route::VarKey(vk)),
             Representation::Dense => {
                 let sub = dense.get_mut(dclass);
