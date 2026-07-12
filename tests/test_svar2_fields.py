@@ -191,3 +191,114 @@ def test_from_vcf_same_name_info_and_format(tmp_path: Path):
     assert all(p.stat().st_size % format_width == 0 for p in format_vals)
     assert sum(p.stat().st_size for p in info_vals) > 0
     assert sum(p.stat().st_size for p in format_vals) > 0
+
+
+def _rare_indel_vcf(tmp_path: Path) -> Path:
+    """2 samples; a biallelic indel carried by exactly ONE call, plus a FORMAT
+    float DS. With np=4 and a single carrier call, choose_representation routes
+    the indel to var_key_indel (var_key ~64 bits < dense ~68), so DS must land
+    in fields/format/DS/var_key_indel/values.bin."""
+    doc = (
+        VcfBuilder(samples=["s0", "s1"], contigs=[("chr1", 100_000)])
+        .fmt("GT")
+        .fmt("DS", Number.ONE, Type.FLOAT)
+        .record(
+            "chr1",
+            100,
+            ref="AT",
+            alt=[Seq("A")],  # 1bp deletion (indel)
+            gt=["0|1", "0|0"],  # one carrier call total
+            DS=[[0.5], [0.0]],
+        )
+    )
+    return doc.write(tmp_path / "rare_indel.vcf.gz", bgzip=True, index=True)
+
+
+def test_from_vcf_varkey_indel_format_field_written(tmp_path: Path):
+    from genoray import SparseVar2
+
+    src = _rare_indel_vcf(tmp_path)
+    out = tmp_path / "store_vk_indel.svar2"
+    SparseVar2.from_vcf(
+        out, str(src), no_reference=True, format_fields=[FormatField("DS", default=0.0)]
+    )
+    import json
+
+    meta = json.loads((out / "meta.json").read_text())
+    contig = meta["contigs"][0]
+    vk_indel = (
+        out / contig / "fields" / "format" / "DS" / "var_key_indel" / "values.bin"
+    )
+    assert vk_indel.is_file(), "var_key_indel DS values.bin missing"
+    assert vk_indel.stat().st_size > 0, "var_key_indel DS field_calls not written"
+
+
+def _multifield_vcf(tmp_path: Path) -> Path:
+    """2 INFO + 2 FORMAT scalar fields with distinct values, to prove per-field
+    files don't cross-contaminate through routing/merge/finalize."""
+    doc = (
+        VcfBuilder(samples=["s0", "s1"], contigs=[("chr1", 100_000)])
+        .info("AC", Number.A, Type.INTEGER)
+        .info("AN", Number.ONE, Type.INTEGER)
+        .fmt("GT")
+        .fmt("DP", Number.ONE, Type.INTEGER)
+        .fmt("DS", Number.ONE, Type.FLOAT)
+        .record(
+            "chr1",
+            100,
+            ref="A",
+            alt=[Seq("C")],
+            gt=["0|1", "1|1"],
+            info={"AC": 3, "AN": 4},
+            DP=[[10], [20]],
+            DS=[[0.25], [0.75]],
+        )
+    )
+    return doc.write(tmp_path / "multifield.vcf.gz", bgzip=True, index=True)
+
+
+def test_from_vcf_multi_field_no_cross_contamination(tmp_path: Path):
+    import json
+
+    from genoray import SparseVar2
+
+    src = _multifield_vcf(tmp_path)
+    out = tmp_path / "store_multi.svar2"
+    SparseVar2.from_vcf(
+        out,
+        str(src),
+        no_reference=True,
+        info_fields=["AC", "AN"],
+        format_fields=["DP", "DS"],
+    )
+    meta = json.loads((out / "meta.json").read_text())
+    by_name = {f["name"]: f for f in meta["fields"]}
+    # Each field is recorded exactly once under its own category.
+    assert by_name["AC"]["category"] == "info"
+    assert by_name["AN"]["category"] == "info"
+    assert by_name["DP"]["category"] == "format"
+    assert by_name["DS"]["category"] == "format"
+    # DS is the only Float field -> f32; the ints auto-narrow to a sub-4b width.
+    assert by_name["DS"]["dtype"] == "f32"
+    assert by_name["DP"]["dtype"] in {"i8", "u8", "i16", "u16"}
+    contig = meta["contigs"][0]
+    # Every declared field has at least one non-empty values.bin, and int fields
+    # stay a whole number of their own resolved width (proves disjoint files).
+    width = {
+        "bool": 1,
+        "i8": 1,
+        "u8": 1,
+        "i16": 2,
+        "u16": 2,
+        "f16": 2,
+        "f32": 4,
+        "i32": 4,
+        "u32": 4,
+    }
+    for name, spec in by_name.items():
+        cat = spec["category"]
+        files = list((out / contig / "fields" / cat / name).glob("*/values.bin"))
+        assert files, f"{cat}/{name} has no values.bin"
+        assert sum(p.stat().st_size for p in files) > 0, f"{cat}/{name} all empty"
+        w = width[spec["dtype"]]
+        assert all(p.stat().st_size % w == 0 for p in files), f"{cat}/{name} bad width"
