@@ -302,3 +302,72 @@ def test_from_vcf_multi_field_no_cross_contamination(tmp_path: Path):
         assert sum(p.stat().st_size for p in files) > 0, f"{cat}/{name} all empty"
         w = width[spec["dtype"]]
         assert all(p.stat().st_size % w == 0 for p in files), f"{cat}/{name} bad width"
+
+
+def _ref_and_fields_vcf(tmp_path: Path) -> tuple[Path, Path]:
+    """A reference FASTA + a bgzipped/indexed VCF whose REF bases match it,
+    carrying one INFO int (AC) and one FORMAT float (DS). Reuses the 40bp
+    reference convention from tests/test_svar2_from_vcf.py (_REF)."""
+    import subprocess
+
+    ref_seq = "ACAGTACATGGGTACTAGCTAGGCTAACCGGTTAACCGGT"  # POS3='A', POS7='C'
+    ref = tmp_path / "ref.fa"
+    ref.write_text(f">chr1\n{ref_seq}\n")
+    subprocess.run(["samtools", "faidx", str(ref)], check=True)
+
+    doc = (
+        VcfBuilder(samples=["s0", "s1"], contigs=[("chr1", 40)])
+        .info("AC", Number.A, Type.INTEGER)
+        .fmt("GT")
+        .fmt("DS", Number.ONE, Type.FLOAT)
+        .record(
+            "chr1",
+            3,
+            ref="A",
+            alt=[Seq("G")],
+            gt=["1|0", "0|0"],
+            info={"AC": 1},
+            DS=[[0.5], [0.0]],
+        )
+        .record(
+            "chr1",
+            7,
+            ref="C",
+            alt=[Seq("CAT")],
+            gt=["0|1", "1|1"],
+            info={"AC": 3},
+            DS=[[0.9], [0.2]],
+        )
+    )
+    vcf = doc.write(tmp_path / "ref_fields.vcf.gz", bgzip=True, index=True)
+    return vcf, ref
+
+
+def test_from_vcf_signatures_and_fields_compose(tmp_path: Path):
+    import json
+
+    from genoray import SparseVar2
+
+    vcf, ref = _ref_and_fields_vcf(tmp_path)
+    out = tmp_path / "store_sig_fields.svar2"
+    SparseVar2.from_vcf(
+        out,
+        str(vcf),
+        str(ref),
+        signatures=True,
+        info_fields=["AC"],
+        format_fields=[FormatField("DS", default=0.0)],
+        threads=1,
+    )
+    meta = json.loads((out / "meta.json").read_text())
+    names = {f["name"] for f in meta["fields"]}
+    assert {"AC", "DS"} <= names, "field manifest missing AC/DS under signatures=True"
+    contig = meta["contigs"][0]
+    # fields written
+    assert list((out / contig / "fields" / "info" / "AC").glob("*/values.bin"))
+    assert list((out / contig / "fields" / "format" / "DS").glob("*/values.bin"))
+    # mutcat sidecar written alongside (signatures path ran)
+    sidecar = list((out / contig).rglob("*sig*")) + list(
+        (out / contig).rglob("*mutcat*")
+    )
+    assert sidecar, "signatures=True produced no mutcat sidecar next to fields"
