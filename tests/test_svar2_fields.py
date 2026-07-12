@@ -76,3 +76,45 @@ def test_reject_float_stored_as_int(vcf_path: Path):
 def test_reject_nonscalar_number(vcf_path: Path):
     with pytest.raises(ValueError, match="Number"):
         _resolve_fields(str(vcf_path), [], [FormatField("AD")])
+
+
+# --- end-to-end: from_vcf -> _core.run_conversion_pipeline -> meta.json/on-disk files ---
+
+
+def test_import_field_specs_from_package():
+    from genoray import FormatField as _FF
+    from genoray import InfoField as _IF
+
+    assert _IF.__name__ == "InfoField"
+    assert _FF is FormatField
+
+
+def test_from_vcf_writes_dosage_field(tmp_path: Path):
+    import json
+
+    from genoray import SparseVar2
+
+    out = tmp_path / "store.svar2"
+    SparseVar2.from_vcf(
+        out,
+        "tests/data/biallelic.vcf.gz",
+        no_reference=True,
+        format_fields=[FormatField("DS", default=0.0)],
+    )
+    meta = json.loads((out / "meta.json").read_text())
+    ds = next(f for f in meta["fields"] if f["name"] == "DS")
+    assert ds["category"] == "format" and ds["dtype"] == "f32"
+    contig = meta["contigs"][0]
+    vals = list((out / contig / "fields" / "DS").glob("*/values.bin"))
+    assert vals and all(p.stat().st_size % 4 == 0 for p in vals)
+
+
+def test_from_vcf_with_no_fields_writes_empty_fields_list(tmp_path: Path):
+    import json
+
+    from genoray import SparseVar2
+
+    out = tmp_path / "store_nofields.svar2"
+    SparseVar2.from_vcf(out, "tests/data/biallelic.vcf.gz", no_reference=True)
+    meta = json.loads((out / "meta.json").read_text())
+    assert meta["fields"] == []
