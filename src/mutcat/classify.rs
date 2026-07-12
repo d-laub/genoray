@@ -223,46 +223,73 @@ const DBS78_LABELS: [&str; 78] = [
     "TT>AC", "TT>AG", "TT>CA", "TT>CC", "TT>CG", "TT>GA", "TT>GC", "TT>GG",
 ];
 
-#[inline]
-fn comp(b: u8) -> u8 {
-    match b {
-        b'A' => b'T',
-        b'T' => b'A',
-        b'C' => b'G',
-        b'G' => b'C',
-        _ => b,
-    }
-}
-
-// Build the (r0,a0,r1,a1) -> code table once. Bases A=0 C=1 G=2 T=3.
 // Only exercised by the exhaustive test below; not otherwise called from
 // production code, hence the narrow dead_code allow for non-test builds.
 #[allow(dead_code)]
 const BASES_ACGT: [u8; 4] = [b'A', b'C', b'G', b'T'];
 
-fn dbs_index_of(key: &str) -> Option<u8> {
-    DBS78_LABELS.iter().position(|&l| l == key).map(|i| i as u8)
+/// ACGT base -> 2-bit index (A=0 C=1 G=2 T=3), for indexing `DBS78_LUT`.
+/// Labels contain only ACGT, so the fallthrough is unreachable.
+const fn dbs_bidx(b: u8) -> usize {
+    match b {
+        b'A' => 0,
+        b'C' => 1,
+        b'G' => 2,
+        b'T' => 3,
+        _ => 0,
+    }
 }
 
-/// DBS78 class-local index (0..=77) or `UNCLASSIFIED`. Try literal then
-/// reverse-complement of the doublet REF>ALT.
+/// Compile-time `(r0,a0,r1,a1) -> code` table, indexed by
+/// `(r0<<6)|(a0<<4)|(r1<<2)|a1` over 2-bit base codes. Built from `DBS78_LABELS`
+/// (source of truth): each label fills its literal key, then every remaining
+/// key folds to its reverse-complement's literal — reproducing the old
+/// literal-then-revcomp search with a single array load and zero allocation.
+const DBS78_LUT: [u8; 256] = {
+    let mut lut = [UNCLASSIFIED; 256];
+    let mut i = 0;
+    while i < DBS78_LABELS.len() {
+        // Label "R0R1>A0A1": bytes [0,1] = ref doublet, [3,4] = alt doublet.
+        let s = DBS78_LABELS[i].as_bytes();
+        let key =
+            (dbs_bidx(s[0]) << 6) | (dbs_bidx(s[3]) << 4) | (dbs_bidx(s[1]) << 2) | dbs_bidx(s[4]);
+        lut[key] = i as u8;
+        i += 1;
+    }
+    // Snapshot the literal-only table so the revcomp fold never reads a value
+    // written by this second pass (RC is involutive, so a self-referential read
+    // would otherwise be order-dependent).
+    let literal = lut;
+    let mut idx = 0;
+    while idx < 256 {
+        if lut[idx] == UNCLASSIFIED {
+            let r0 = (idx >> 6) & 3;
+            let a0 = (idx >> 4) & 3;
+            let r1 = (idx >> 2) & 3;
+            let a1 = idx & 3;
+            // revcomp: complement (3 - b) each base and swap the two positions.
+            let rc = ((3 - r1) << 6) | ((3 - a1) << 4) | ((3 - r0) << 2) | (3 - a0);
+            lut[idx] = literal[rc];
+        }
+        idx += 1;
+    }
+    lut
+};
+
+/// DBS78 class-local index (0..=77) or `UNCLASSIFIED`. Literal-then-revcomp
+/// canonicalization folded into `DBS78_LUT` at compile time.
+#[inline]
 pub fn dbs78_code(r0: u8, a0: u8, r1: u8, a1: u8) -> u8 {
-    if base_index(r0) < 0 || base_index(r1) < 0 || base_index(a0) < 0 || base_index(a1) < 0 {
+    let (i0, i1, i2, i3) = (
+        base_index(r0),
+        base_index(a0),
+        base_index(r1),
+        base_index(a1),
+    );
+    if i0 < 0 || i1 < 0 || i2 < 0 || i3 < 0 {
         return UNCLASSIFIED;
     }
-    let literal = format!("{}{}>{}{}", r0 as char, r1 as char, a0 as char, a1 as char);
-    if let Some(c) = dbs_index_of(&literal) {
-        return c;
-    }
-    // reverse-complement both sides
-    let rc = format!(
-        "{}{}>{}{}",
-        comp(r1) as char,
-        comp(r0) as char,
-        comp(a1) as char,
-        comp(a0) as char
-    );
-    dbs_index_of(&rc).unwrap_or(UNCLASSIFIED)
+    DBS78_LUT[((i0 as usize) << 6) | ((i1 as usize) << 4) | ((i2 as usize) << 2) | (i3 as usize)]
 }
 
 #[cfg(test)]

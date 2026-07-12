@@ -83,32 +83,68 @@ impl Sidecars {
     }
 }
 
+/// Push `v` unless it duplicates the last-pushed position (the `dedup_by_key`
+/// half of the old sort+dedup, applied inline during the merge).
+#[inline]
+fn push_unique(out: &mut Vec<SnvCall>, v: SnvCall) {
+    if out.last().is_none_or(|l| l.pos != v.pos) {
+        out.push(v);
+    }
+}
+
+/// Merge two already-position-sorted SNV runs (`a` = var_key, `b` = dense) into
+/// `out`, deduped by position. O(len a + len b) — replaces sorting the
+/// concatenation. On an equal position the var_key call wins (matches the old
+/// stable-sort + `dedup_by_key`, which kept the first / var_key entry).
+fn merge_dedup(a: &[SnvCall], b: &[SnvCall], out: &mut Vec<SnvCall>) {
+    out.clear();
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < a.len() && j < b.len() {
+        if a[i].pos <= b[j].pos {
+            push_unique(out, a[i]);
+            i += 1;
+        } else {
+            push_unique(out, b[j]);
+            j += 1;
+        }
+    }
+    while i < a.len() {
+        push_unique(out, a[i]);
+        i += 1;
+    }
+    while j < b.len() {
+        push_unique(out, b[j]);
+        j += 1;
+    }
+}
+
 /// Gather + classify one flat `(sample, ploid)` column's SNVs/indels
-/// (`col = sample * ploidy + ploid`, matching
-/// `ContigReader::vk_slice`/`dense_carried`'s convention), returning its raw
-/// `(N_CODES,)` count row:
-/// 1. Gathers that hap's SNVs from `var_key/snp` (per-call, sidecar-indexed
-///    by the absolute call index) and `dense/snp` (per dense variant the hap
-///    carries, sidecar-indexed by the dense variant column), merges by
-///    position, dedups, and runs `emit_snv_codes` for on-the-fly DBS pairing.
+/// (`col = sample * ploidy + ploid`), accumulating raw (increment-only) counts
+/// into `row` (a `(N_CODES,)` slice, shared across the sample's ploidy columns):
+/// 1. Gathers that hap's SNVs from `var_key/snp` (per-call, sidecar-indexed by
+///    the absolute call index) and `dense/snp` (per carried dense variant),
+///    both already position-sorted; `merge_dedup` unions them in O(n) and
+///    `emit_snv_codes` runs on-the-fly DBS pairing over the merged run.
 /// 2. Gathers that hap's indels from `var_key/indel` + `dense/indel`; each
 ///    emits `ID83_OFFSET + code` directly (no pairing). A sentinel code
 ///    (`UNCLASSIFIED`/`NOT_ANNOTATED`, both `>= N_ID83`) pushes the unified
 ///    code past `N_CODES`, so the single `unified < N_CODES` bound filters
 ///    both sentinels without naming them.
 ///
-/// Every emitted code increments its slot by one (raw counts) — this column
-/// is independent of every other column, so it can run on its own thread;
-/// per-sample presence-clipping happens once, after `count_contig` reduces
-/// a sample's columns together.
-fn count_column(reader: &ContigReader, sidecars: &Sidecars, col: usize) -> Vec<i64> {
-    let mut row = vec![0i64; N_CODES];
-    let mut bump = |code: usize| {
-        row[code] += 1;
-    };
-
-    // --- SNVs: var_key/snp + dense/snp, merged by position ---
-    let mut snvs: Vec<SnvCall> = Vec::new();
+/// `vk`/`dn`/`merged` are caller-owned scratch buffers reused across columns so
+/// this does no per-column heap allocation.
+#[allow(clippy::too_many_arguments)]
+fn count_column_into(
+    reader: &ContigReader,
+    sidecars: &Sidecars,
+    col: usize,
+    row: &mut [i64],
+    vk: &mut Vec<SnvCall>,
+    dn: &mut Vec<SnvCall>,
+    merged: &mut Vec<SnvCall>,
+) {
+    // --- SNVs: var_key/snp (already position-sorted) ---
+    vk.clear();
     {
         let vk_range = reader.vk_snp.column(col);
         let (o0, o1) = (vk_range.start, vk_range.end);
@@ -116,7 +152,7 @@ fn count_column(reader: &ContigReader, sidecars: &Sidecars, col: usize) -> Vec<i
         let keys = as_bytes(&reader.vk_snp.keys);
         for (i, &pos) in positions.iter().enumerate() {
             let abs_i = o0 + i;
-            snvs.push(SnvCall {
+            vk.push(SnvCall {
                 pos,
                 sbs: sidecars.vk_snp.code_at(abs_i),
                 ref_i: sidecars.vk_snp.ref_at(abs_i),
@@ -124,22 +160,22 @@ fn count_column(reader: &ContigReader, sidecars: &Sidecars, col: usize) -> Vec<i
             });
         }
     }
+    // --- dense/snp (position-sorted); iterate only carried variants ---
+    dn.clear();
     if let Some(dense) = reader.dense_view(DenseClass::Snp) {
+        let positions = dense.positions();
         let keys = as_bytes(&dense.keys);
-        for (dcol, &pos) in dense.positions().iter().enumerate() {
-            if dense.carried(col, dcol) {
-                snvs.push(SnvCall {
-                    pos,
-                    sbs: sidecars.dense_snp.code_at(dcol),
-                    ref_i: sidecars.dense_snp.ref_at(dcol),
-                    alt_i: unpack_snp_key_at(keys, dcol),
-                });
-            }
-        }
+        dense.for_each_carried(col, |dcol| {
+            dn.push(SnvCall {
+                pos: positions[dcol],
+                sbs: sidecars.dense_snp.code_at(dcol),
+                ref_i: sidecars.dense_snp.ref_at(dcol),
+                alt_i: unpack_snp_key_at(keys, dcol),
+            });
+        });
     }
-    snvs.sort_by_key(|s| s.pos);
-    snvs.dedup_by_key(|s| s.pos);
-    emit_snv_codes(&snvs, &mut bump);
+    merge_dedup(vk, dn, merged);
+    emit_snv_codes(merged, &mut |code| row[code] += 1);
 
     // --- indels: var_key/indel + dense/indel, each direct (no pairing) ---
     {
@@ -147,43 +183,36 @@ fn count_column(reader: &ContigReader, sidecars: &Sidecars, col: usize) -> Vec<i
         for abs_i in vk_range {
             let unified = ID83_OFFSET + sidecars.vk_indel.code_at(abs_i) as usize;
             if unified < N_CODES {
-                bump(unified);
+                row[unified] += 1;
             }
         }
     }
     if let Some(dense) = reader.dense_view(DenseClass::Indel) {
-        for dcol in 0..dense.n_dense_variants {
-            if dense.carried(col, dcol) {
-                let unified = ID83_OFFSET + sidecars.dense_indel.code_at(dcol) as usize;
-                if unified < N_CODES {
-                    bump(unified);
-                }
+        dense.for_each_carried(col, |dcol| {
+            let unified = ID83_OFFSET + sidecars.dense_indel.code_at(dcol) as usize;
+            if unified < N_CODES {
+                row[unified] += 1;
             }
-        }
+        });
     }
-
-    row
 }
 
 /// Accumulate one contig's full mutation-count matrix into `acc`
 /// (`(n_samples, N_CODES)`).
 ///
-/// Parallelized over flat `(sample, ploid)` columns with `rayon`:
-/// `count_column` gathers/classifies each column independently and returns
-/// its own raw (increment-only) `(N_CODES,)` row. `fold` sums each thread's
-/// columns into a private `(n_samples, N_CODES)` accumulator (a column's row
-/// lands in `local[[col / ploidy, ..]]`), and `reduce` sums those private
-/// accumulators together with elementwise `+`. Integer addition is
-/// associative & commutative, so the resulting per-sample sums are identical
-/// no matter how columns are split across threads.
+/// Parallelized over **samples** with `rayon`: each sample owns one contiguous
+/// `N_CODES` row of `acc` and folds its `ploidy` columns straight into that row
+/// (`count_column_into`). Rows are disjoint, so no per-job full-matrix
+/// accumulator and no reduce step are needed — the old `fold`/`reduce`
+/// allocated and summed an `(n_samples, N_CODES)` matrix per rayon split-job,
+/// which dominated the runtime. `acc` is the accumulator, so counting straight
+/// into its rows IS `acc += this contig`. The result is still order-independent:
+/// each sample's counts come only from its own columns.
 ///
-/// `per_sample` (presence) semantics are applied AFTER that full
-/// column->sample reduce, by clipping each sample's row to `{0, 1}`: a code
-/// counts once if it occurred on ANY of that sample's ploidy columns. This
-/// exactly reproduces the single-threaded per-sample `seen` bitmap (which
-/// marked a code at most once per sample across all its ploids), and doing
-/// the clip once — post-reduce, on the fully-summed row — makes it
-/// independent of fold/column order too.
+/// `per_sample` (presence) semantics are applied per row AFTER its columns are
+/// summed, by clipping to `{0, 1}`: a code counts once if it occurred on ANY of
+/// that sample's ploidy columns — reproducing the single-threaded per-sample
+/// `seen` bitmap.
 pub fn count_contig(
     reader: &ContigReader,
     sidecars: &Sidecars,
@@ -191,28 +220,51 @@ pub fn count_contig(
     acc: &mut Array2<i64>,
 ) {
     let ploidy = reader.ploidy;
-    let n_samples = reader.n_samples;
-    let n_cols = n_samples * ploidy;
 
-    let mut sample_rows = (0..n_cols)
-        .into_par_iter()
-        .fold(
-            || Array2::<i64>::zeros((n_samples, N_CODES)),
-            |mut local, col| {
-                let sample = col / ploidy;
-                for (code, v) in count_column(reader, sidecars, col).into_iter().enumerate() {
-                    local[[sample, code]] += v;
+    // Write each sample's counts straight into its own `acc` row. `acc` is the
+    // accumulator (`acc += this contig`), so `count_column_into`'s `row[c] += 1`
+    // onto the acc row IS that accumulation — no intermediate matrix, no memset,
+    // no full-matrix add. Rows are disjoint chunks, so this parallelizes cleanly.
+    acc.as_slice_mut()
+        .expect("count matrix accumulator must be C-contiguous")
+        .par_chunks_mut(N_CODES)
+        .enumerate()
+        .for_each(|(sample, acc_row)| {
+            let mut vk = Vec::new();
+            let mut dn = Vec::new();
+            let mut merged = Vec::new();
+            if per_sample {
+                // Presence within THIS contig, then OR (add) into acc: count this
+                // sample's ploidy columns into a private row, clip to {0,1}, add.
+                let mut local = [0i64; N_CODES];
+                for p in 0..ploidy {
+                    count_column_into(
+                        reader,
+                        sidecars,
+                        sample * ploidy + p,
+                        &mut local,
+                        &mut vk,
+                        &mut dn,
+                        &mut merged,
+                    );
                 }
-                local
-            },
-        )
-        .reduce(|| Array2::<i64>::zeros((n_samples, N_CODES)), |a, b| a + b);
-
-    if per_sample {
-        sample_rows.mapv_inplace(|v| v.min(1));
-    }
-
-    *acc += &sample_rows;
+                for (a, &l) in acc_row.iter_mut().zip(local.iter()) {
+                    *a += l.min(1);
+                }
+            } else {
+                for p in 0..ploidy {
+                    count_column_into(
+                        reader,
+                        sidecars,
+                        sample * ploidy + p,
+                        acc_row,
+                        &mut vk,
+                        &mut dn,
+                        &mut merged,
+                    );
+                }
+            }
+        });
 }
 
 #[cfg(test)]

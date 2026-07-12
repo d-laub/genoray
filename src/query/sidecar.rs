@@ -87,6 +87,19 @@ impl DenseView {
     pub(crate) fn carried(&self, hap: usize, col: usize) -> bool {
         bits::get_bit(as_bytes(&self.genotypes), hap * self.n_dense_variants + col)
     }
+    /// Call `f(col)` for each dense variant `col` that `hap` carries, ascending.
+    /// The hap's carriage is a contiguous `n_dense_variants`-bit row at bit
+    /// `hap * n_dense_variants`; scanning it whole-byte (skipping zero bytes)
+    /// touches only carried variants, unlike a per-`col` `carried()` loop.
+    #[inline]
+    pub(crate) fn for_each_carried(&self, hap: usize, f: impl FnMut(usize)) {
+        bits::for_each_set_bit(
+            as_bytes(&self.genotypes),
+            hap * self.n_dense_variants,
+            self.n_dense_variants,
+            f,
+        );
+    }
 }
 
 /// Load a CSR `offsets.npy` (len `columns + 1`); a missing file means an empty
