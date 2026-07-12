@@ -164,7 +164,10 @@ fn is_htslib_missing(raw_val: f64, is_float: bool) -> bool {
 // Resolve one atom's value from a record-level raw buffer (already widened to
 // f64): `None` (field absent from the record/sample) or an out-of-range
 // Number=A index falls back to the spec's sentinel/default; a length-1 buffer
-// is a Number=1 scalar, otherwise indexed by `source_alt_index` (Number=A).
+// is a Number=1 scalar, otherwise indexed by `source_alt_index - 1` (Number=A):
+// `source_alt_index` is 1-based (ALT1 → 1, matching BCF GT allele codes; see
+// `normalize::atomize_record`), but htslib's Number=A buffer is 0-based
+// per-ALT (ALT1's value lives at `vals[0]`).
 fn resolve_scalar(vals: Option<&[f64]>, source_alt_index: u16, spec: &FieldSpec) -> f64 {
     let default_val = sentinel_default(spec);
     let Some(vals) = vals else {
@@ -176,7 +179,8 @@ fn resolve_scalar(vals: Option<&[f64]>, source_alt_index: u16, spec: &FieldSpec)
     let raw_val = if vals.len() == 1 {
         vals[0]
     } else {
-        match vals.get(source_alt_index as usize) {
+        // source_alt_index is 1-based; htslib Number=A buffers are 0-based per-ALT.
+        match vals.get(source_alt_index.saturating_sub(1) as usize) {
             Some(&v) => v,
             None => return default_val,
         }
