@@ -273,6 +273,37 @@ pub fn process_chromosome(
     let mut ledgers = ledgers; // make mutable to move rows out
     for spec in &REGISTRY {
         let dir = stream_dirs.get(spec.tag).clone();
+
+        // Var_key field values are staged 1:1 with calls, so they share the
+        // ledger's column-major reordering with the pos/key streams merged
+        // below. Merge every field FIRST (borrowing the ledger) — merge_mini_sc
+        // moves the ledger out right after, and the two merges touch disjoint
+        // per-chunk files (chunk_{c}_field*.bin vs chunk_{c}_pos/key.bin), so
+        // ordering between them doesn't matter for correctness.
+        let sub_label = spec.subdir.replace('/', "_");
+        for (field_ix, field) in fields.iter().enumerate() {
+            let dest_dir = std::path::Path::new(base_out_dir)
+                .join(chrom)
+                .join("fields")
+                .join(&field.name)
+                .join(&sub_label);
+            fs::create_dir_all(&dest_dir).map_err(|e| ConversionError::Io {
+                context: format!("create_dir_all {:?}", dest_dir),
+                source: e,
+            })?;
+            let dest_values_bin = dest_dir.join("values.bin");
+            merge::merge_var_key_field_values(
+                dir.to_str().unwrap(),
+                num_chunks,
+                samples.len(),
+                ploidy,
+                ledgers.get(spec.tag),
+                field_ix,
+                4, // staged width (i32/f32); narrowed to final dtype at finalize (Task 9)
+                &dest_values_bin,
+            )?;
+        }
+
         let ledger = std::mem::take(ledgers.get_mut(spec.tag));
         merge::merge_mini_sc(
             spec.key_bytes,

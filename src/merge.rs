@@ -269,6 +269,189 @@ pub fn merge_mini_sc(
     Ok(())
 }
 
+/// Merge one var_key field's per-chunk `chunk_{c}_field{field_ix}.bin` files into
+/// `dest_values_bin`, in the same column-major order as `alleles.bin`/`positions.bin`.
+///
+/// `item_width` is the staged per-value byte width (4 for the i32/f32 staged
+/// representation Task 7 writes — narrowing to a final storage dtype happens later,
+/// at finalize time, not here). `ram_ledger` is the SAME calls-per-(chunk, column)
+/// ledger `merge_mini_sc` uses for the pos/key streams — field values are staged
+/// 1:1 with calls, so the identical column-major reordering applies; only the
+/// per-item width differs.
+///
+/// This performs its own Phase A (offsets) + Phase B (parallel tile gather) local
+/// to this one field stream, mirroring `merge_mini_sc`'s tile arithmetic exactly
+/// but for a single flat byte buffer (no separate pos/key arrays, and no
+/// `offsets.npy` — the offsets already written by `merge_mini_sc` for this stream
+/// apply unchanged to every field, since fields share the same per-call ordering).
+///
+/// The caller is responsible for creating `dest_values_bin`'s parent directory
+/// before calling this function (this function does not call `create_dir_all`).
+///
+/// On success, the per-chunk `chunk_{c}_field{field_ix}.bin` source files are
+/// removed (Phase C cleanup), mirroring `merge_mini_sc`'s pos/key cleanup.
+#[allow(clippy::too_many_arguments)]
+pub fn merge_var_key_field_values(
+    output_dir: &str,
+    num_chunks: usize,
+    num_samples: usize,
+    ploidy: usize,
+    ram_ledger: &[Vec<u32>],
+    field_ix: usize,
+    item_width: usize,
+    dest_values_bin: &Path,
+) -> Result<(), ConversionError> {
+    let output_dir_path = Path::new(output_dir);
+    let total_columns = num_samples * ploidy;
+
+    // Phase A: derive global per-column offsets + per-chunk local offsets from
+    // the RAM Ledger. Identical arithmetic to merge_mini_sc — deliberately NOT
+    // shared as a helper to keep the working pos/key merge untouched; see the
+    // task report for the "replicate vs refactor" tradeoff.
+    let mut final_offsets = vec![0u64; total_columns + 1];
+    let mut chunk_offsets = vec![vec![0u32; total_columns + 1]; num_chunks];
+
+    for col in 0..total_columns {
+        let mut col_total = 0u64;
+        for chunk_id in 0..num_chunks {
+            let calls = ram_ledger[chunk_id][col];
+            chunk_offsets[chunk_id][col + 1] = chunk_offsets[chunk_id][col] + calls;
+            col_total += calls as u64;
+        }
+        final_offsets[col + 1] = final_offsets[col] + col_total;
+    }
+
+    let total_items: u64 = final_offsets[total_columns];
+    let total_bytes: u64 = total_items * item_width as u64;
+
+    // Pre-create the monolithic output at full size so worker pwrites land in
+    // disjoint byte ranges (sparse file — no disk space consumed until written).
+    let dest_file = File::create(dest_values_bin).map_err(|e| ConversionError::Io {
+        context: format!("creating {:?}", dest_values_bin),
+        source: e,
+    })?;
+    dest_file
+        .set_len(total_bytes)
+        .map_err(|e| ConversionError::Io {
+            context: format!("sizing {:?}", dest_values_bin),
+            source: e,
+        })?;
+
+    // Open every chunk's field file exactly once; pread() is stateless and safe
+    // to call concurrently from multiple rayon workers.
+    let chunk_files: Vec<File> = (0..num_chunks)
+        .map(|c| -> Result<File, ConversionError> {
+            File::open(layout::chunk_field(output_dir_path, c, field_ix)).map_err(|e| {
+                ConversionError::Io {
+                    context: format!("opening chunk_{c}_field{field_ix}.bin"),
+                    source: e,
+                }
+            })
+        })
+        .collect::<Result<_, _>>()?;
+
+    // Adaptive tile size: target TILE_RAM_BUDGET per tile (one buffer per tile here,
+    // vs two in merge_mini_sc, so this tolerates a slightly larger tile — but we
+    // keep the same budget constant for a simple, predictable footprint).
+    let avg_calls_per_col =
+        std::cmp::max(1u64, total_items / std::cmp::max(1, total_columns) as u64);
+    let columns_per_tile = std::cmp::max(
+        1usize,
+        std::cmp::min(
+            total_columns.max(1),
+            (TILE_RAM_BUDGET_BYTES / (avg_calls_per_col * item_width as u64)) as usize,
+        ),
+    );
+
+    let tile_starts: Vec<usize> = (0..total_columns).step_by(columns_per_tile).collect();
+
+    let final_offsets_ref = &final_offsets;
+    let chunk_offsets_ref = &chunk_offsets;
+    let chunk_files_ref = &chunk_files;
+    let dest_ref = &dest_file;
+
+    tile_starts
+        .par_iter()
+        .try_for_each(|&tile_start_col| -> Result<(), ConversionError> {
+            let tile_end_col = std::cmp::min(tile_start_col + columns_per_tile, total_columns);
+            let tile_n_cols = tile_end_col - tile_start_col;
+            let tile_start_item = final_offsets_ref[tile_start_col] as usize;
+            let tile_end_item = final_offsets_ref[tile_end_col] as usize;
+            let tile_total_items = tile_end_item - tile_start_item;
+
+            if tile_total_items == 0 {
+                return Ok(());
+            }
+
+            let mut tile_buffer = vec![0u8; tile_total_items * item_width];
+
+            // per-column write head (offset within this tile buffer, in items)
+            let mut tile_write_heads = vec![0usize; tile_n_cols];
+            #[allow(clippy::needless_range_loop)]
+            for i in 0..tile_n_cols {
+                let col = tile_start_col + i;
+                tile_write_heads[i] = (final_offsets_ref[col] as usize) - tile_start_item;
+            }
+
+            // gather from chunks
+            for chunk_id in 0..num_chunks {
+                let chunk_start_item = chunk_offsets_ref[chunk_id][tile_start_col] as usize;
+                let chunk_end_item = chunk_offsets_ref[chunk_id][tile_end_col] as usize;
+                let chunk_items_to_read = chunk_end_item - chunk_start_item;
+
+                if chunk_items_to_read == 0 {
+                    continue;
+                }
+
+                let mut chunk_bytes = vec![0u8; chunk_items_to_read * item_width];
+                let byte_offset = (chunk_start_item * item_width) as u64;
+                chunk_files_ref[chunk_id]
+                    .read_exact_at(&mut chunk_bytes, byte_offset)
+                    .map_err(|e| ConversionError::Io {
+                        context: "pread chunk field".into(),
+                        source: e,
+                    })?;
+
+                let mut local_chunk_cursor = 0usize;
+                #[allow(clippy::needless_range_loop)]
+                for i in 0..tile_n_cols {
+                    let col = tile_start_col + i;
+                    let calls = ram_ledger[chunk_id][col] as usize;
+                    if calls == 0 {
+                        continue;
+                    }
+
+                    let dest_start = tile_write_heads[i] * item_width;
+                    let src_start = local_chunk_cursor * item_width;
+                    tile_buffer[dest_start..dest_start + calls * item_width]
+                        .copy_from_slice(&chunk_bytes[src_start..src_start + calls * item_width]);
+
+                    tile_write_heads[i] += calls;
+                    local_chunk_cursor += calls;
+                }
+            }
+
+            let tile_byte_offset = (tile_start_item * item_width) as u64;
+            dest_ref
+                .write_all_at(&tile_buffer, tile_byte_offset)
+                .map_err(|e| ConversionError::Io {
+                    context: "pwrite field values.bin".into(),
+                    source: e,
+                })?;
+            Ok(())
+        })?;
+
+    // Drop file handles to flush metadata before cleanup
+    drop(chunk_files);
+    drop(dest_file);
+
+    for c in 0..num_chunks {
+        let _ = std::fs::remove_file(layout::chunk_field(output_dir_path, c, field_ix));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     // Test loops mirror the (column, chunk) ledger structure with explicit indices,
@@ -433,6 +616,65 @@ mod tests {
         assert_eq!(final_pos, vec![100, 200, 400, 300, 500, 600]);
         assert_eq!(final_key, vec![1, 2, 4, 3, 5, 6]);
         assert_eq!(final_off, vec![0u64, 3, 6]);
+    }
+
+    // Helper: stage one chunk's field values (raw i32 bytes) to disk in the
+    // layout merge_var_key_field_values expects.
+    fn write_chunk_field_file(dir: &Path, chunk_id: usize, field_ix: usize, values: &[i32]) {
+        let mut f = File::create(layout::chunk_field(dir, chunk_id, field_ix)).unwrap();
+        f.write_all(bytemuck::cast_slice(values)).unwrap();
+    }
+
+    fn read_i32_bin(path: &Path) -> Vec<i32> {
+        let bytes = std::fs::read(path).unwrap();
+        bytes
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+
+    // Field values must interleave IDENTICALLY to the keys given the same
+    // ledger — mirrors test_merge_multi_chunk_interleave's scenario exactly,
+    // but for a single field's per-chunk staged i32 values instead of pos/key.
+    #[test]
+    fn test_merge_var_key_field_values_multi_chunk_interleave() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+
+        // 2 samples x 1 ploidy = 2 columns. 2 chunks.
+        // Chunk 0: col0=2 calls (10, 20), col1=1 call (30)  -> [10, 20, 30]
+        // Chunk 1: col0=1 call (40),      col1=2 calls (50, 60) -> [40, 50, 60]
+        // Expected final column-major order:
+        //   col0: chunk0 (10, 20) + chunk1 (40)      -> 10, 20, 40
+        //   col1: chunk0 (30)     + chunk1 (50, 60)  -> 30, 50, 60
+        // -> [10, 20, 40, 30, 50, 60]
+        let ram_ledger = vec![vec![2u32, 1], vec![1u32, 2]];
+        write_chunk_field_file(dir, 0, 0, &[10, 20, 30]);
+        write_chunk_field_file(dir, 1, 0, &[40, 50, 60]);
+
+        let dest = dir.join("fields").join("DP").join("var_key_snp");
+        std::fs::create_dir_all(&dest).unwrap();
+        let dest_values_bin = dest.join("values.bin");
+
+        merge_var_key_field_values(
+            dir.to_str().unwrap(),
+            2,
+            2,
+            1,
+            &ram_ledger,
+            0,
+            4,
+            &dest_values_bin,
+        )
+        .unwrap();
+
+        let final_values = read_i32_bin(&dest_values_bin);
+        assert_eq!(final_values, vec![10, 20, 40, 30, 50, 60]);
+        assert_eq!(final_values.len() * 4, 6 * 4); // total_calls(6) * item_width(4)
+
+        // Phase C cleanup: per-chunk field files must be gone.
+        assert!(!layout::chunk_field(dir, 0, 0).exists());
+        assert!(!layout::chunk_field(dir, 1, 0).exists());
     }
 
     proptest! {
