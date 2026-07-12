@@ -325,6 +325,49 @@ pub fn process_chromosome(
             .join(chrom)
             .join(spec.subdir);
         let ledger = std::mem::take(dense_ledgers.get_mut(spec.class));
+
+        // Dense field values are staged 1:1 with dense variants under this
+        // class, so they need only chunk-order concatenation (no ledger-driven
+        // reordering). Merge every field FIRST (borrowing the ledger) — the
+        // per-chunk field files (chunk_{c}_finfo{i}.bin / chunk_{c}_fformat{j}.bin)
+        // are disjoint from the pos/key/geno files merge_dense_class consumes
+        // right after, so ordering between the two doesn't matter for correctness.
+        let sub_label = spec.subdir.replace('/', "_");
+        let mut info_ix = 0usize;
+        let mut format_ix = 0usize;
+        for field in fields.iter() {
+            let (prefix, field_ix) = match field.category {
+                crate::field::FieldCategory::Info => {
+                    let ix = info_ix;
+                    info_ix += 1;
+                    ("finfo", ix)
+                }
+                crate::field::FieldCategory::Format => {
+                    let ix = format_ix;
+                    format_ix += 1;
+                    ("fformat", ix)
+                }
+            };
+            let dest_dir = std::path::Path::new(base_out_dir)
+                .join(chrom)
+                .join("fields")
+                .join(&field.name)
+                .join(&sub_label);
+            fs::create_dir_all(&dest_dir).map_err(|e| ConversionError::Io {
+                context: format!("create_dir_all {:?}", dest_dir),
+                source: e,
+            })?;
+            let dest_values_bin = dest_dir.join("values.bin");
+            crate::dense_merge::merge_dense_field_values(
+                dir.to_str().unwrap(),
+                num_chunks,
+                &ledger,
+                prefix,
+                field_ix,
+                &dest_values_bin,
+            )?;
+        }
+
         crate::dense_merge::merge_dense_class(
             num_chunks,
             samples.len(),
