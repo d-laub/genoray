@@ -33,6 +33,7 @@ pub mod merge;
 pub mod meta;
 #[cfg(feature = "conversion")]
 pub mod monitor;
+pub mod mutcat;
 #[cfg(feature = "conversion")]
 pub mod normalize;
 pub mod nrvk;
@@ -44,6 +45,7 @@ pub mod orchestrator;
 // itself has zero htslib dependency (pure numpy/pyo3 glue). Stays ungated as
 // shared infra, same reasoning as `streams` above.
 pub mod py_convert;
+pub mod py_mutcat;
 pub mod py_query;
 pub mod py_query_batch;
 pub mod py_query_decode;
@@ -91,7 +93,7 @@ fn index_vcf(path: String) -> PyResult<()> {
 #[cfg(feature = "conversion")]
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (vcf_path, reference_path, chroms, output_dir, samples, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false))]
+#[pyo3(signature = (vcf_path, reference_path, chroms, output_dir, samples, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false, signatures=false))]
 fn run_conversion_pipeline(
     py: Python,
     vcf_path: String,
@@ -104,6 +106,7 @@ fn run_conversion_pipeline(
     max_threads: Option<usize>,  // accepts an optional integer from Python
     long_allele_capacity: usize, // default 8MB — old 100MB rarely flushed mid-run, blocking executor at finalize
     skip_out_of_scope: bool,
+    signatures: bool,
 ) -> PyResult<usize> {
     let sample_refs: Vec<&str> = samples.iter().map(|s| s.as_str()).collect();
 
@@ -171,6 +174,7 @@ fn run_conversion_pipeline(
                         long_allele_capacity,
                         skip_out_of_scope,
                         processing_threads,
+                        signatures,
                     )
                 })
                 .collect::<Vec<_>>()

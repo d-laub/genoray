@@ -135,7 +135,11 @@ pub fn classify_variant(ilen: i32, alt_allele: &[u8], bank: &mut LongAlleleTable
 
 // The core Dense-to-Sparse Matrix Transposer.
 // Flips Row-Major VCF data into Column-Major (Sample-Major) Sparse Tensors.
-pub fn dense2sparse_vk(chunk: &DenseChunk, bank: &mut LongAlleleTableWriter) -> SparseChunk {
+pub fn dense2sparse_vk(
+    chunk: &DenseChunk,
+    bank: &mut LongAlleleTableWriter,
+    sidecar_bits_enabled: bool,
+) -> SparseChunk {
     let (v_variants, num_samples, ploidy) = chunk.genos.shape;
     let columns = num_samples * ploidy;
 
@@ -174,7 +178,15 @@ pub fn dense2sparse_vk(chunk: &DenseChunk, bank: &mut LongAlleleTableWriter) -> 
         };
         let x = chunk.genos.popcount_plane(v);
 
-        match choose_representation(class, num_samples, ploidy, x) {
+        let sidecar_bits = if sidecar_bits_enabled {
+            match class {
+                Class::Snp => crate::cost_model::SIDECAR_BITS_SNP,
+                Class::Indel => crate::cost_model::SIDECAR_BITS_INDEL,
+            }
+        } else {
+            0
+        };
+        match choose_representation(class, num_samples, ploidy, x, sidecar_bits) {
             Representation::VarKey => routes.push(Route::VarKey(vk)),
             Representation::Dense => {
                 let sub = dense.get_mut(dclass);
@@ -527,7 +539,7 @@ mod tests {
         // Zero variants, just shape edge case.
         let chunk = build_test_chunk(0, 2, 2, &[], &[], &[]);
         let mut bank = make_bank();
-        let sparse = dense2sparse_vk(&chunk, &mut bank);
+        let sparse = dense2sparse_vk(&chunk, &mut bank, false);
         let snp = sparse.streams.get(StreamTag::VarKeySnp);
         let indel = sparse.streams.get(StreamTag::VarKeyIndel);
         assert_eq!(snp.call_positions.len(), 0);
@@ -558,7 +570,7 @@ mod tests {
 
         let chunk = build_test_chunk(n_variants, n_samples, ploidy, &refs, &alts, &bit_pattern);
         let mut bank = make_bank();
-        let sparse = dense2sparse_vk(&chunk, &mut bank);
+        let sparse = dense2sparse_vk(&chunk, &mut bank, false);
         let snp = sparse.streams.get(StreamTag::VarKeySnp);
         let indel = sparse.streams.get(StreamTag::VarKeyIndel);
 
@@ -594,7 +606,7 @@ mod tests {
         let chunk = build_test_chunk(3, 1, 2, &refs, &alts, &bit_pattern);
 
         let mut bank = make_bank();
-        let sparse = dense2sparse_vk(&chunk, &mut bank);
+        let sparse = dense2sparse_vk(&chunk, &mut bank, false);
         let snp = sparse.streams.get(StreamTag::VarKeySnp);
         let indel = sparse.streams.get(StreamTag::VarKeyIndel);
 
@@ -630,7 +642,7 @@ mod tests {
         let chunk = build_test_chunk(1, 2, 2, &refs, &alts, &bits);
 
         let mut bank = make_bank();
-        let sparse = dense2sparse_vk(&chunk, &mut bank);
+        let sparse = dense2sparse_vk(&chunk, &mut bank, false);
 
         // var_key snp stream is empty (variant went dense)
         let snp = sparse.streams.get(StreamTag::VarKeySnp);
@@ -660,7 +672,7 @@ mod tests {
         let chunk = build_test_chunk(1, n, 2, &refs, &alts, &bits);
 
         let mut bank = make_bank();
-        let sparse = dense2sparse_vk(&chunk, &mut bank);
+        let sparse = dense2sparse_vk(&chunk, &mut bank, false);
         assert_eq!(
             sparse
                 .streams
@@ -697,7 +709,7 @@ mod tests {
             let chunk = build_test_chunk(n_variants, n_samples, ploidy, &refs, &alts, &bit_pattern);
 
             let mut bank = make_bank();
-            let sparse = dense2sparse_vk(&chunk, &mut bank);
+            let sparse = dense2sparse_vk(&chunk, &mut bank, false);
             let snp = sparse.streams.get(StreamTag::VarKeySnp);
             let indel = sparse.streams.get(StreamTag::VarKeyIndel);
 
@@ -734,7 +746,7 @@ mod tests {
             let chunk = build_test_chunk(n_variants, n_samples, ploidy, &refs, &alts, &bit_pattern);
 
             let mut bank = make_bank();
-            let sparse = dense2sparse_vk(&chunk, &mut bank);
+            let sparse = dense2sparse_vk(&chunk, &mut bank, false);
             let snp = sparse.streams.get(StreamTag::VarKeySnp);
 
             let np = n_samples * ploidy;
@@ -784,7 +796,7 @@ mod tests {
             let chunk = build_test_chunk(n_variants, n_samples, ploidy, &refs, &alts, &bits);
 
             let mut bank = make_bank();
-            let sparse = dense2sparse_vk(&chunk, &mut bank);
+            let sparse = dense2sparse_vk(&chunk, &mut bank, false);
 
             let vk_calls: usize = sparse.streams.get(StreamTag::VarKeySnp)
                 .sample_lengths.iter().map(|&c| c as usize).sum::<usize>()

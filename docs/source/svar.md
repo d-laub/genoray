@@ -85,3 +85,15 @@ svar_plain = svar_with.with_fields(False)
 ```
 
 There's a lot more that can be done with `SparseVar`; this documentation will be expanded as time permits.
+
+## Mutational signatures (SBS-96 / DBS-78 / ID-83)
+
+`SparseVar` and its next-gen successor `SparseVar2` both support COSMIC-style
+mutation catalogue annotation and signature refitting via
+`annotate_mutations`, `mutation_matrix`, and `assign_signatures`
+(`SparseVar2` can also classify during conversion with
+`SparseVar2.from_vcf(..., signatures=True)`). This isn't narrated here yet —
+see the `genoray-api` skill (`skills/genoray-api/SKILL.md`, "Mutation
+catalogues" and "SparseVar2 — quick reference → Mutational signatures"
+sections) or the method docstrings in `genoray/_svar/_annotate.py` (v1) and
+`genoray/_svar2_mutcat.py` (SVAR2) for the full workflow.

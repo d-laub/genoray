@@ -66,6 +66,50 @@ pub fn copy_bits(dst: &mut [u8], dst_bit: usize, src: &[u8], src_bit: usize, n: 
     }
 }
 
+/// Call `f(k)` for every set bit `k` in `0..n` of the contiguous bit-window
+/// `[start_bit, start_bit + n)` of `buf`, in ascending `k`. `k` is the offset
+/// *within the window*, so a hap-major row `[hap * n_dense, +n_dense)` yields
+/// exactly the carried dense-variant columns.
+///
+/// Whole-byte body scan (skipping zero bytes, then iterating each nonzero
+/// byte's set bits via `trailing_zeros`) replaces the per-column `get_bit`
+/// call — one branch + one shift per *carried* variant instead of per variant.
+/// Head/tail handle the unaligned ends bit-by-bit, mirroring `copy_bits`.
+#[inline]
+pub fn for_each_set_bit(buf: &[u8], start_bit: usize, n: usize, mut f: impl FnMut(usize)) {
+    if n == 0 {
+        return;
+    }
+    let mut i = 0usize;
+    // Head: bit-by-bit until the source cursor is byte-aligned.
+    while i < n && (start_bit + i) & 7 != 0 {
+        if get_bit(buf, start_bit + i) {
+            f(i);
+        }
+        i += 1;
+    }
+    // Body: whole bytes; skip zero bytes, expand set bits of nonzero ones.
+    while i + 8 <= n {
+        let byte = buf[(start_bit + i) >> 3];
+        if byte != 0 {
+            let mut m = byte;
+            while m != 0 {
+                let b = m.trailing_zeros() as usize;
+                f(i + b);
+                m &= m - 1; // clear lowest set bit
+            }
+        }
+        i += 8;
+    }
+    // Tail: remaining < 8 bits, unaligned again.
+    while i < n {
+        if get_bit(buf, start_bit + i) {
+            f(i);
+        }
+        i += 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -81,6 +125,32 @@ mod tests {
         assert!(get_bit(&b, 0) && get_bit(&b, 7) && get_bit(&b, 8) && get_bit(&b, 15));
         assert!(!get_bit(&b, 1));
         assert_eq!(b, vec![0b1000_0001u8, 0b1000_0001u8]);
+    }
+
+    #[test]
+    fn for_each_set_bit_matches_get_bit_over_windows() {
+        // A pseudo-random byte buffer; check the set-bit scan against a
+        // per-bit get_bit oracle for several unaligned window offsets/lengths.
+        let mut buf = vec![0u8; 40];
+        let mut x = 0x1234_5678u32;
+        for b in buf.iter_mut() {
+            x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+            *b = (x >> 16) as u8;
+        }
+        let total = buf.len() * 8;
+        for &(start, n) in &[
+            (0usize, 0usize),
+            (0, 1),
+            (3, 5),
+            (7, 20),
+            (1, 250),
+            (5, total - 5),
+        ] {
+            let mut got = Vec::new();
+            for_each_set_bit(&buf, start, n, |k| got.push(k));
+            let want: Vec<usize> = (0..n).filter(|&k| get_bit(&buf, start + k)).collect();
+            assert_eq!(got, want, "start={start} n={n}");
+        }
     }
 
     #[test]
