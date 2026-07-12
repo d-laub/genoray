@@ -21,7 +21,7 @@
   share a common offset-derivation + tile-gather implementation. Field output
   is byte-identical to before. Internal-only (no public API change) —
   finalize's own instruction count drops ~13% (callgrind Ir, small workload)
-  and peak RSS on a 200-sample/50k-record conversion drops ~7% (498 MiB →
+  and peak RSS on a 200-sample/50k-record conversion drops ~7% (~487 MiB →
   ~452 MiB); end-to-end wall time is unchanged since conversion remains
   reader/htslib-bound, not finalize-bound.
 

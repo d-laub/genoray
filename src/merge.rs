@@ -78,8 +78,11 @@ fn gather_columns(
 ) -> Result<(), ConversionError> {
     let total_items: u64 = final_offsets[total_columns];
 
-    // Adaptive tile size: target TILE_RAM_BUDGET per tile, summed across all
-    // payload buffers live at once (e.g. pos + key for merge_mini_sc).
+    // Adaptive tile size: target TILE_RAM_BUDGET per tile. Payloads are
+    // gathered sequentially below (one tile_buffer live at a time), but we
+    // size against the sum of all payload item widths (e.g. pos + key for
+    // merge_mini_sc) as a conservative bound that keeps peak tile RAM under
+    // budget even if the gather were made concurrent.
     let bytes_per_item: u64 = payloads.iter().map(|p| p.item_width as u64).sum();
     let avg_calls_per_col =
         std::cmp::max(1u64, total_items / std::cmp::max(1, total_columns) as u64);
