@@ -1,9 +1,11 @@
 use crate::error::ConversionError;
+use crate::field::{FieldCategory, FieldSpec, HtslibType};
 use crate::normalize::atomize_record;
-use crate::types::{BitGrid3, DenseChunk};
+use crate::types::{BitGrid3, DenseChunk, StagedColumn};
 use rayon::prelude::*;
 use rust_htslib::bcf::record::Record;
 use rust_htslib::bcf::{IndexedReader, Read};
+use rust_htslib::errors::Error as HtslibError;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::sync::Arc;
@@ -17,6 +19,14 @@ struct PendingAtom {
     source_alt_index: u16,
     gt: Arc<Vec<i32>>, // len = num_samples * ploidy; allele index per column (-1 = missing)
     seq: u64,          // stable tiebreak for equal positions
+
+    // Resolved field values for THIS atom (already indexed by source_alt_index
+    // where the underlying VCF field is Number=A). Populated in
+    // `decompose_current_record`, gathered into `DenseChunk::{info,format}_staged`
+    // in `read_next_chunk`'s sequential metadata pass. Empty when no fields of
+    // that category were requested.
+    info_vals: Vec<f64>,   // len == VcfChunkReader::info_fields.len()
+    format_vals: Vec<f64>, // len == VcfChunkReader::format_fields.len() * num_samples, field-major then sample: field*num_samples + sample
 }
 
 impl PartialEq for PendingAtom {
@@ -125,6 +135,133 @@ fn pack_presence_par(
     });
 }
 
+// The sentinel a resolved field value falls back to when htslib reports it
+// missing and the spec has no explicit `default`: htslib's own missing-int
+// encoding for Int/Flag columns, NaN for Float columns (mirrors htslib's
+// float-missing encoding, which is itself a NaN bit pattern).
+fn sentinel_default(spec: &FieldSpec) -> f64 {
+    spec.default.unwrap_or(if spec.stage_is_float() {
+        f64::from(f32::NAN)
+    } else {
+        i32::MIN as f64
+    })
+}
+
+// htslib missing-value detection on an already-widened f64: floats use NaN
+// (covers both htslib's MISSING and VECTOR_END float encodings, which are
+// distinct NaN bit patterns); ints use MISSING (i32::MIN) or VECTOR_END
+// (i32::MIN + 1) — the round-trip through f64 is exact for both since they're
+// in i32 range.
+fn is_htslib_missing(raw_val: f64, is_float: bool) -> bool {
+    if is_float {
+        raw_val.is_nan()
+    } else {
+        let iv = raw_val as i32;
+        iv == i32::MIN || iv == i32::MIN + 1
+    }
+}
+
+// Resolve one atom's value from a record-level raw buffer (already widened to
+// f64): `None` (field absent from the record/sample) or an out-of-range
+// Number=A index falls back to the spec's sentinel/default; a length-1 buffer
+// is a Number=1 scalar, otherwise indexed by `source_alt_index` (Number=A).
+fn resolve_scalar(vals: Option<&[f64]>, source_alt_index: u16, spec: &FieldSpec) -> f64 {
+    let default_val = sentinel_default(spec);
+    let Some(vals) = vals else {
+        return default_val;
+    };
+    if vals.is_empty() {
+        return default_val;
+    }
+    let raw_val = if vals.len() == 1 {
+        vals[0]
+    } else {
+        match vals.get(source_alt_index as usize) {
+            Some(&v) => v,
+            None => return default_val,
+        }
+    };
+    if is_htslib_missing(raw_val, spec.stage_is_float()) {
+        default_val
+    } else {
+        raw_val
+    }
+}
+
+// Decode one INFO field for the CURRENT record, once. `Ok(None)` means the
+// field is absent from this record (a normal, expected occurrence — NOT an
+// error); a genuine htslib read failure (bad type, corrupt buffer) surfaces
+// as `ConversionError::Input`, matching the GT-decode error style.
+fn decode_info_raw(record: &Record, spec: &FieldSpec) -> Result<Option<Vec<f64>>, ConversionError> {
+    let pos = record.pos();
+    match spec.htype {
+        HtslibType::Flag => {
+            // A Flag is never "missing": absent ⇒ false ⇒ 0.0.
+            let present = record.info(spec.name.as_bytes()).flag().map_err(|e| {
+                ConversionError::Input(format!(
+                    "Failed to read INFO/{} flag at pos {pos}: {e}",
+                    spec.name
+                ))
+            })?;
+            Ok(Some(vec![if present { 1.0 } else { 0.0 }]))
+        }
+        HtslibType::Int => match record.info(spec.name.as_bytes()).integer() {
+            Ok(Some(buf)) => Ok(Some(buf.iter().map(|&v| v as f64).collect())),
+            Ok(None) => Ok(None),
+            Err(e) => Err(ConversionError::Input(format!(
+                "Failed to read INFO/{} at pos {pos}: {e}",
+                spec.name
+            ))),
+        },
+        HtslibType::Float => match record.info(spec.name.as_bytes()).float() {
+            Ok(Some(buf)) => Ok(Some(buf.iter().map(|&v| v as f64).collect())),
+            Ok(None) => Ok(None),
+            Err(e) => Err(ConversionError::Input(format!(
+                "Failed to read INFO/{} at pos {pos}: {e}",
+                spec.name
+            ))),
+        },
+    }
+}
+
+// Decode one FORMAT field for the CURRENT record, once, for every VCF sample
+// in the header (not just the selected ones — matches the GT-decode idiom,
+// which indexes into the full per-header-sample buffer via
+// `self.sample_indices`). `Ok(None)` means the field is absent from this
+// record for all samples (htslib reports this as `BcfMissingTag`, a normal,
+// expected per-record occurrence, NOT an error). Any other htslib error is a
+// genuine read failure and surfaces as `ConversionError::Input`.
+//
+// FORMAT Flag is not valid VCF (Flag is INFO-only); defensively treated as Int.
+fn decode_format_raw(
+    record: &Record,
+    spec: &FieldSpec,
+) -> Result<Option<Vec<Vec<f64>>>, ConversionError> {
+    let pos = record.pos();
+    let result = match spec.htype {
+        HtslibType::Float => record.format(spec.name.as_bytes()).float().map(|bb| {
+            bb.iter()
+                .map(|s| s.iter().map(|&v| v as f64).collect())
+                .collect::<Vec<Vec<f64>>>()
+        }),
+        HtslibType::Int | HtslibType::Flag => {
+            record.format(spec.name.as_bytes()).integer().map(|bb| {
+                bb.iter()
+                    .map(|s| s.iter().map(|&v| v as f64).collect())
+                    .collect::<Vec<Vec<f64>>>()
+            })
+        }
+    };
+    match result {
+        Ok(v) => Ok(Some(v)),
+        Err(HtslibError::BcfMissingTag { .. }) => Ok(None),
+        Err(e) => Err(ConversionError::Input(format!(
+            "Failed to read FORMAT/{} at pos {pos}: {e}",
+            spec.name
+        ))),
+    }
+}
+
 pub struct VcfChunkReader {
     inner_reader: IndexedReader,
     num_samples: usize,
@@ -140,6 +277,13 @@ pub struct VcfChunkReader {
     skip_out_of_scope: bool,
     // Running count of out-of-scope ALTs dropped across this contig.
     dropped_out_of_scope: u64,
+
+    // Requested field specs, partitioned by category (order preserved within
+    // each partition). Index i into `info_fields`/`format_fields` matches
+    // index i into `PendingAtom::info_vals`/`format_vals` and
+    // `DenseChunk::info_staged`/`format_staged`.
+    info_fields: Vec<FieldSpec>,
+    format_fields: Vec<FieldSpec>,
 
     // Reorder state, persisted across read_next_chunk calls.
     record: Record,
@@ -191,6 +335,7 @@ pub(crate) fn load_contig_seq(fasta_path: &str, chrom: &str) -> Result<Vec<u8>, 
 
 impl VcfChunkReader {
     // opens the file, applies the sample filter at the C-level, and jumps to the chromosome.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         vcf_path: &str,
         fasta_path: Option<&str>,
@@ -199,6 +344,7 @@ impl VcfChunkReader {
         htslib_threads: usize,
         ploidy: usize,
         skip_out_of_scope: bool,
+        fields: &[FieldSpec],
     ) -> Result<Self, ConversionError> {
         // A wrong VCF path reaches Rust when the file was removed after Python's
         // upstream indexing/open; surface it as FileNotFoundError, not a ".tbi?" Input.
@@ -253,6 +399,17 @@ impl VcfChunkReader {
 
         let record = reader.empty_record();
 
+        let info_fields: Vec<FieldSpec> = fields
+            .iter()
+            .filter(|f| f.category == FieldCategory::Info)
+            .cloned()
+            .collect();
+        let format_fields: Vec<FieldSpec> = fields
+            .iter()
+            .filter(|f| f.category == FieldCategory::Format)
+            .cloned()
+            .collect();
+
         Ok(Self {
             inner_reader: reader,
             num_samples: samples.len(),
@@ -262,6 +419,8 @@ impl VcfChunkReader {
             has_reference,
             skip_out_of_scope,
             dropped_out_of_scope: 0,
+            info_fields,
+            format_fields,
             record,
             heap: BinaryHeap::new(),
             frontier: 0,
@@ -335,6 +494,20 @@ impl VcfChunkReader {
         )?;
         self.dropped_out_of_scope += dropped as u64;
 
+        // Decode each requested field's raw buffer ONCE for this record (position-
+        // independent of atomize_record's per-ALT split); per-atom resolution below
+        // only differs in which `source_alt_index` a Number=A buffer is indexed by.
+        let info_raw: Vec<Option<Vec<f64>>> = self
+            .info_fields
+            .iter()
+            .map(|spec| decode_info_raw(&self.record, spec))
+            .collect::<Result<_, _>>()?;
+        let format_raw: Vec<Option<Vec<Vec<f64>>>> = self
+            .format_fields
+            .iter()
+            .map(|spec| decode_format_raw(&self.record, spec))
+            .collect::<Result<_, _>>()?;
+
         for atom in atoms {
             // Left-align only when a reference is available; otherwise store the atom
             // at its as-given (right-trimmed) position.
@@ -343,6 +516,22 @@ impl VcfChunkReader {
             } else {
                 atom
             };
+
+            let info_vals: Vec<f64> = self
+                .info_fields
+                .iter()
+                .zip(info_raw.iter())
+                .map(|(spec, raw)| resolve_scalar(raw.as_deref(), atom.source_alt_index, spec))
+                .collect();
+
+            let mut format_vals = Vec::with_capacity(self.format_fields.len() * self.num_samples);
+            for (spec, raw) in self.format_fields.iter().zip(format_raw.iter()) {
+                for &vcf_idx in &self.sample_indices {
+                    let sample_vals = raw.as_ref().map(|v| v[vcf_idx].as_slice());
+                    format_vals.push(resolve_scalar(sample_vals, atom.source_alt_index, spec));
+                }
+            }
+
             let seq = self.next_seq;
             self.next_seq += 1;
             self.heap.push(Reverse(PendingAtom {
@@ -352,6 +541,8 @@ impl VcfChunkReader {
                 source_alt_index: atom.source_alt_index,
                 gt: Arc::clone(&gt),
                 seq,
+                info_vals,
+                format_vals,
             }));
         }
         Ok(())
@@ -427,6 +618,18 @@ impl VcfChunkReader {
         alt_offsets.push(0u32);
         let mut genos = BitGrid3::zeros(v, self.num_samples, self.ploidy);
 
+        let num_samples = self.num_samples;
+        let mut info_staged: Vec<StagedColumn> = self
+            .info_fields
+            .iter()
+            .map(|spec| StagedColumn::with_capacity(spec.stage_is_float(), v))
+            .collect();
+        let mut format_staged: Vec<StagedColumn> = self
+            .format_fields
+            .iter()
+            .map(|spec| StagedColumn::with_capacity(spec.stage_is_float(), v * num_samples))
+            .collect();
+
         // Sequential metadata pass (cheap, ordering-preserving).
         let mut off = 0u32;
         for a in atoms.iter() {
@@ -435,6 +638,15 @@ impl VcfChunkReader {
             alt.extend_from_slice(&a.alt);
             off += a.alt.len() as u32;
             alt_offsets.push(off);
+
+            for (i, col) in info_staged.iter_mut().enumerate() {
+                col.push_f64(a.info_vals[i]);
+            }
+            for (j, col) in format_staged.iter_mut().enumerate() {
+                for s in 0..num_samples {
+                    col.push_f64(a.format_vals[j * num_samples + s]);
+                }
+            }
         }
 
         // Presence packing: parallel over word-aligned variant blocks when a
@@ -455,6 +667,8 @@ impl VcfChunkReader {
             alt,
             alt_offsets,
             genos,
+            info_staged,
+            format_staged,
         }))
     }
 }
@@ -485,6 +699,8 @@ mod tests {
             source_alt_index: src,
             gt: std::sync::Arc::new(gt),
             seq: 0,
+            info_vals: Vec::new(),
+            format_vals: Vec::new(),
         }
     }
 

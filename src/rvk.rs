@@ -340,6 +340,8 @@ mod tests {
             alt: alt_buf,
             alt_offsets,
             genos,
+            info_staged: Vec::new(),
+            format_staged: Vec::new(),
         }
     }
 

@@ -92,6 +92,32 @@ impl BitGrid3 {
     }
 }
 
+// A single staged INFO/FORMAT field column, monomorphic per column so the hot
+// reader path never boxes/dyn-dispatches per value. `Int` also carries Flag
+// columns (staged as 0/1). Values are always produced from `f64` (the common
+// currency `FieldSpec` resolution works in) and narrowed on push.
+pub enum StagedColumn {
+    Int(Vec<i32>),
+    Float(Vec<f32>),
+}
+
+impl StagedColumn {
+    pub fn with_capacity(is_float: bool, n: usize) -> Self {
+        if is_float {
+            StagedColumn::Float(Vec::with_capacity(n))
+        } else {
+            StagedColumn::Int(Vec::with_capacity(n))
+        }
+    }
+
+    pub fn push_f64(&mut self, v: f64) {
+        match self {
+            StagedColumn::Int(x) => x.push(v as i32),
+            StagedColumn::Float(x) => x.push(v as f32),
+        }
+    }
+}
+
 // Defines DenseChunk and SparseChunk structs. All other files import from here.
 
 // The struct produced by the VCF Reader and consumed by the Compute Thread (variant key)
@@ -108,6 +134,15 @@ pub struct DenseChunk {
 
     // Dense Genotype Tensor - Shape (Variants, Samples, Ploidy), bit-packed
     pub genos: BitGrid3, // (V, S, P)
+
+    // Staged INFO/FORMAT field columns, one per requested `FieldSpec`, in the
+    // same relative order as they appear (filtered by category) in the
+    // `fields` slice passed to `VcfChunkReader::new`. Empty when no fields
+    // were requested. `info_staged[i].len() == v`;
+    // `format_staged[j].len() == v * num_samples`, laid out variant-major
+    // then sample-minor: index `variant * num_samples + sample`.
+    pub info_staged: Vec<StagedColumn>,
+    pub format_staged: Vec<StagedColumn>,
 }
 
 // One position-sorted sub-stream of calls with byte-erased keys (`key_bytes`

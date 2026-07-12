@@ -57,7 +57,6 @@ pub fn process_chromosome(
     signatures: bool,
     fields: &[crate::field::FieldSpec],
 ) -> Result<u64, ConversionError> {
-    let _ = fields; // unused until Task 5 wires field extraction into the pipeline
     // Directory Formatting: svar2/{contig}/var_key/{snp,indel}
     let paths = crate::layout::ContigPaths::new(base_out_dir, chrom);
 
@@ -147,6 +146,7 @@ pub fn process_chromosome(
             // Convert references into owned Strings that can safely live forever in the thread
             let s_owned: Vec<String> = samples.iter().map(|&s| s.to_string()).collect();
             let pool = Arc::clone(&processing_pool);
+            let fields_owned: Vec<crate::field::FieldSpec> = fields.to_vec();
 
             move || -> Result<u64, ConversionError> {
                 // passing the thread budget down to HTSLib
@@ -159,6 +159,7 @@ pub fn process_chromosome(
                     htslib_threads,
                     ploidy,
                     skip_out_of_scope,
+                    &fields_owned,
                 )?;
                 let mut chunk_id = 0;
                 while let Some(dense_chunk) =

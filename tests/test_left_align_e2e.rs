@@ -32,6 +32,7 @@ fn drain(bcf: &Path, fasta: &Path, chrom: &str, samples: &[&str]) -> Vec<(u32, i
         1,
         2,
         false,
+        &[],
     )
     .unwrap();
     let mut out = Vec::new();
@@ -241,6 +242,7 @@ fn left_shifts_stay_sorted_across_chunk_boundaries() {
         1,
         2,
         false,
+        &[],
     )
     .unwrap();
     let mut positions = Vec::new();
@@ -307,6 +309,7 @@ proptest! {
             1,
             2,
             false,
+            &[],
         )
         .unwrap();
         let mut positions = Vec::new();

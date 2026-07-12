@@ -79,6 +79,8 @@ mod tests {
             alt: b"C".to_vec(),
             alt_offsets: vec![0, 1],
             genos,
+            info_staged: Vec::new(),
+            format_staged: Vec::new(),
         }
     }
 
