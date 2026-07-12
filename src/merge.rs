@@ -1,6 +1,5 @@
 use crate::error::ConversionError;
 use crate::layout;
-use bytemuck;
 use ndarray::Array1;
 use ndarray_npy::write_npy;
 use rayon::prelude::*;
@@ -12,6 +11,174 @@ use std::path::Path;
 // budget caps a tile at ~32M items. Workers run in parallel via rayon — peak
 // process RAM = TILE_RAM_BUDGET × rayon_threads.
 const TILE_RAM_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Phase A (shared): derive global per-column offsets and per-chunk local
+/// offsets from the RAM Ledger. Both `merge_mini_sc` and
+/// `merge_var_key_field_values` need the identical column-major schedule —
+/// field values are staged 1:1 with calls, so the same reordering applies
+/// regardless of per-item byte width.
+///
+/// Returns `(final_offsets, chunk_offsets)`:
+/// - `final_offsets[col]` is the global item index where column `col` starts
+///   (length `total_columns + 1`, monotonically increasing).
+/// - `chunk_offsets[chunk_id][col]` is the local item index within
+///   `chunk_id`'s own stream where column `col` starts.
+fn derive_offsets(
+    num_chunks: usize,
+    total_columns: usize,
+    ram_ledger: &[Vec<u32>],
+) -> (Vec<u64>, Vec<Vec<u32>>) {
+    let mut final_offsets = vec![0u64; total_columns + 1];
+    let mut chunk_offsets = vec![vec![0u32; total_columns + 1]; num_chunks];
+
+    for col in 0..total_columns {
+        let mut col_total = 0u64;
+
+        for chunk_id in 0..num_chunks {
+            let calls = ram_ledger[chunk_id][col];
+            chunk_offsets[chunk_id][col + 1] = chunk_offsets[chunk_id][col] + calls;
+            col_total += calls as u64;
+        }
+        final_offsets[col + 1] = final_offsets[col] + col_total;
+    }
+
+    (final_offsets, chunk_offsets)
+}
+
+/// One byte-payload stream sharing the offset/tile schedule computed by
+/// `derive_offsets`: per-chunk source files (opened once, read via stateless
+/// `pread`) and the pre-sized destination file (written via `pwrite`).
+struct Payload<'a> {
+    /// Byte width of one item in this stream (e.g. 4 for positions/staged
+    /// i32 field values, `key_bytes` for the allele-key stream).
+    item_width: usize,
+    chunk_files: &'a [File],
+    dest: &'a File,
+}
+
+/// Phase B (shared): adaptive-tile, parallel pread→interleave→pwrite gather.
+///
+/// Each rayon worker owns one tile (a contiguous run of columns). For every
+/// payload it allocates one `Vec<u8>` sized `tile_items * item_width`, reads
+/// each chunk's contributing slice via positional reads, scatters bytes
+/// column-major into the tile buffer via per-column write heads (tracked in
+/// items, applied in bytes), then `pwrite`s the assembled tile to its
+/// pre-computed byte range in the payload's destination file.
+///
+/// Per-column write heads depend only on `final_offsets`/`ram_ledger` (not on
+/// any payload's data), so they are identical across payloads for the same
+/// tile — computed once per tile and reused (cloned) for each payload.
+fn gather_columns(
+    total_columns: usize,
+    num_chunks: usize,
+    ram_ledger: &[Vec<u32>],
+    final_offsets: &[u64],
+    chunk_offsets: &[Vec<u32>],
+    payloads: &[Payload],
+) -> Result<(), ConversionError> {
+    let total_items: u64 = final_offsets[total_columns];
+
+    // Adaptive tile size: target TILE_RAM_BUDGET per tile, summed across all
+    // payload buffers live at once (e.g. pos + key for merge_mini_sc).
+    let bytes_per_item: u64 = payloads.iter().map(|p| p.item_width as u64).sum();
+    let avg_calls_per_col =
+        std::cmp::max(1u64, total_items / std::cmp::max(1, total_columns) as u64);
+    let columns_per_tile = std::cmp::max(
+        1usize,
+        std::cmp::min(
+            total_columns.max(1),
+            (TILE_RAM_BUDGET_BYTES / (avg_calls_per_col * bytes_per_item)) as usize,
+        ),
+    );
+
+    // Tile start columns — independent work units, parallelized across rayon.
+    let tile_starts: Vec<usize> = (0..total_columns).step_by(columns_per_tile).collect();
+
+    tile_starts
+        .par_iter()
+        .try_for_each(|&tile_start_col| -> Result<(), ConversionError> {
+            let tile_end_col = std::cmp::min(tile_start_col + columns_per_tile, total_columns);
+            let tile_n_cols = tile_end_col - tile_start_col;
+            let tile_start_item = final_offsets[tile_start_col] as usize;
+            let tile_end_item = final_offsets[tile_end_col] as usize;
+            let tile_total_items = tile_end_item - tile_start_item;
+
+            if tile_total_items == 0 {
+                return Ok(());
+            }
+
+            // per-column write head (offset within this tile buffer, in items).
+            // Identical for every payload — computed once, cloned per payload below.
+            let mut tile_write_heads_base = vec![0usize; tile_n_cols];
+            #[allow(clippy::needless_range_loop)]
+            for i in 0..tile_n_cols {
+                let col = tile_start_col + i;
+                tile_write_heads_base[i] = (final_offsets[col] as usize) - tile_start_item;
+            }
+
+            for payload in payloads {
+                let item_width = payload.item_width;
+                let mut tile_buffer = vec![0u8; tile_total_items * item_width];
+                let mut tile_write_heads = tile_write_heads_base.clone();
+
+                // gather from chunks
+                for chunk_id in 0..num_chunks {
+                    let chunk_start_item = chunk_offsets[chunk_id][tile_start_col] as usize;
+                    let chunk_end_item = chunk_offsets[chunk_id][tile_end_col] as usize;
+                    let chunk_items_to_read = chunk_end_item - chunk_start_item;
+
+                    if chunk_items_to_read == 0 {
+                        continue;
+                    }
+
+                    // Stateless positional read — multiple workers can read the
+                    // same File concurrently without locking or seek contention.
+                    let mut chunk_bytes = vec![0u8; chunk_items_to_read * item_width];
+                    let byte_offset = (chunk_start_item * item_width) as u64;
+                    payload.chunk_files[chunk_id]
+                        .read_exact_at(&mut chunk_bytes, byte_offset)
+                        .map_err(|e| ConversionError::Io {
+                            context: "pread chunk payload".into(),
+                            source: e,
+                        })?;
+
+                    // stitch this chunk's block into the main Tile buffer
+                    let mut local_chunk_cursor = 0usize;
+                    #[allow(clippy::needless_range_loop)]
+                    for i in 0..tile_n_cols {
+                        let col = tile_start_col + i;
+                        let calls = ram_ledger[chunk_id][col] as usize;
+                        if calls == 0 {
+                            continue;
+                        }
+
+                        let dest_start = tile_write_heads[i] * item_width;
+                        let src_start = local_chunk_cursor * item_width;
+                        tile_buffer[dest_start..dest_start + calls * item_width].copy_from_slice(
+                            &chunk_bytes[src_start..src_start + calls * item_width],
+                        );
+
+                        tile_write_heads[i] += calls;
+                        local_chunk_cursor += calls;
+                    }
+                }
+
+                // pwrite the assembled tile to its known byte range in the
+                // destination file. Tiles are disjoint by construction
+                // (final_offsets is monotonically increasing), so concurrent
+                // write_all_at calls touch non-overlapping regions.
+                let tile_byte_offset = (tile_start_item * item_width) as u64;
+                payload
+                    .dest
+                    .write_all_at(&tile_buffer, tile_byte_offset)
+                    .map_err(|e| ConversionError::Io {
+                        context: "pwrite payload".into(),
+                        source: e,
+                    })?;
+            }
+            Ok(())
+        })
+}
 
 /// Performs the Tile-Based Interleaving Merge.
 ///
@@ -37,19 +204,7 @@ pub fn merge_mini_sc(
     println!("Phase A -> Executing In-Memory Metadata Pass");
 
     // pre-compute global offsets and local chunk offsets using the RAM Ledger
-    let mut final_offsets = vec![0u64; total_columns + 1];
-    let mut chunk_offsets = vec![vec![0u32; total_columns + 1]; num_chunks];
-
-    for col in 0..total_columns {
-        let mut col_total = 0u64;
-
-        for chunk_id in 0..num_chunks {
-            let calls = ram_ledger[chunk_id][col];
-            chunk_offsets[chunk_id][col + 1] = chunk_offsets[chunk_id][col] + calls;
-            col_total += calls as u64;
-        }
-        final_offsets[col + 1] = final_offsets[col] + col_total;
-    }
+    let (final_offsets, chunk_offsets) = derive_offsets(num_chunks, total_columns, &ram_ledger);
 
     // save the global offsets array immediately
     let offsets_array = Array1::from_vec(final_offsets.clone());
@@ -95,167 +250,53 @@ pub fn merge_mini_sc(
         })?;
 
     // Open every chunk's pos/key file exactly once; pread() is stateless and
-    // safe to call concurrently from multiple rayon workers.
-    let chunk_files: Vec<(File, File)> = (0..num_chunks)
-        .map(|c| -> Result<(File, File), ConversionError> {
-            let pf = File::open(layout::chunk_pos(output_dir_path, c)).map_err(|e| {
-                ConversionError::Io {
-                    context: format!("opening chunk_{c}_pos.bin"),
-                    source: e,
-                }
-            })?;
-            let kf = File::open(layout::chunk_key(output_dir_path, c)).map_err(|e| {
-                ConversionError::Io {
-                    context: format!("opening chunk_{c}_key.bin"),
-                    source: e,
-                }
-            })?;
-            Ok((pf, kf))
+    // safe to call concurrently from multiple rayon workers. Split into two
+    // parallel Vec<File> so each stream becomes its own gather_columns Payload.
+    let pos_chunk_files: Vec<File> = (0..num_chunks)
+        .map(|c| -> Result<File, ConversionError> {
+            File::open(layout::chunk_pos(output_dir_path, c)).map_err(|e| ConversionError::Io {
+                context: format!("opening chunk_{c}_pos.bin"),
+                source: e,
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    let key_chunk_files: Vec<File> = (0..num_chunks)
+        .map(|c| -> Result<File, ConversionError> {
+            File::open(layout::chunk_key(output_dir_path, c)).map_err(|e| ConversionError::Io {
+                context: format!("opening chunk_{c}_key.bin"),
+                source: e,
+            })
         })
         .collect::<Result<_, _>>()?;
 
-    // Adaptive tile size: target TILE_RAM_BUDGET per tile.
-    // pos buffer (u32) + key buffer (key_bytes-wide) → (pos_size + key_bytes) bytes per item.
-    let bytes_per_item = (pos_size + key_bytes) as u64;
-    let avg_calls_per_col =
-        std::cmp::max(1u64, total_items / std::cmp::max(1, total_columns) as u64);
-    let columns_per_tile = std::cmp::max(
-        1usize,
-        std::cmp::min(
-            total_columns.max(1),
-            (TILE_RAM_BUDGET_BYTES / (avg_calls_per_col * bytes_per_item)) as usize,
-        ),
-    );
     println!(
-        "Tile size: {} columns ({} items, ~{} MB per tile)",
-        columns_per_tile,
-        columns_per_tile as u64 * avg_calls_per_col,
-        (columns_per_tile as u64 * avg_calls_per_col * bytes_per_item) / (1024 * 1024),
+        "Tile size target: {} MB per tile (adaptive; computed inside gather_columns)",
+        TILE_RAM_BUDGET_BYTES / (1024 * 1024),
     );
 
-    // Tile start columns — independent work units, parallelized across rayon.
-    let tile_starts: Vec<usize> = (0..total_columns).step_by(columns_per_tile).collect();
-
-    // All shared state below is read-only or via &File pwrite, which is Sync.
-    let final_offsets_ref = &final_offsets;
-    let chunk_offsets_ref = &chunk_offsets;
-    let ram_ledger_ref = &ram_ledger;
-    let chunk_files_ref = &chunk_files;
-    let final_pos_ref = &final_pos_file;
-    let final_key_ref = &final_key_file;
-
-    tile_starts
-        .par_iter()
-        .try_for_each(|&tile_start_col| -> Result<(), ConversionError> {
-            let tile_end_col = std::cmp::min(tile_start_col + columns_per_tile, total_columns);
-            let tile_n_cols = tile_end_col - tile_start_col;
-            let tile_start_item = final_offsets_ref[tile_start_col] as usize;
-            let tile_end_item = final_offsets_ref[tile_end_col] as usize;
-            let tile_total_items = tile_end_item - tile_start_item;
-
-            if tile_total_items == 0 {
-                return Ok(());
-            }
-
-            let mut tile_pos_buffer = vec![0u32; tile_total_items];
-            let mut tile_key_buffer = vec![0u8; tile_total_items * key_bytes];
-
-            // per-column write head (offset within this tile buffer)
-            let mut tile_write_heads = vec![0usize; tile_n_cols];
-            // index loop: `i` indexes tile_write_heads while `col` offsets into the global ledger.
-            #[allow(clippy::needless_range_loop)]
-            for i in 0..tile_n_cols {
-                let col = tile_start_col + i;
-                tile_write_heads[i] = (final_offsets_ref[col] as usize) - tile_start_item;
-            }
-
-            // gather from chunks
-            for chunk_id in 0..num_chunks {
-                let chunk_start_item = chunk_offsets_ref[chunk_id][tile_start_col] as usize;
-                let chunk_end_item = chunk_offsets_ref[chunk_id][tile_end_col] as usize;
-                let chunk_items_to_read = chunk_end_item - chunk_start_item;
-
-                if chunk_items_to_read == 0 {
-                    continue;
-                }
-
-                // Stateless positional reads — multiple workers can read the same File
-                // concurrently without locking or seek-state contention.
-                let mut chunk_pos_bytes = vec![0u8; chunk_items_to_read * pos_size];
-                let mut chunk_key_bytes = vec![0u8; chunk_items_to_read * key_bytes];
-                let pos_byte_offset = (chunk_start_item * pos_size) as u64;
-                let key_byte_offset = (chunk_start_item * key_bytes) as u64;
-                chunk_files_ref[chunk_id]
-                    .0
-                    .read_exact_at(&mut chunk_pos_bytes, pos_byte_offset)
-                    .map_err(|e| ConversionError::Io {
-                        context: "pread chunk pos".into(),
-                        source: e,
-                    })?;
-                chunk_files_ref[chunk_id]
-                    .1
-                    .read_exact_at(&mut chunk_key_bytes, key_byte_offset)
-                    .map_err(|e| ConversionError::Io {
-                        context: "pread chunk key".into(),
-                        source: e,
-                    })?;
-
-                // zero-copy cast back to typed slice (positions only — keys stay raw bytes)
-                let chunk_pos_u32: &[u32] = bytemuck::cast_slice(&chunk_pos_bytes);
-
-                // stitch this chunk's block into the main Tile buffer
-                let mut local_chunk_cursor = 0usize;
-                // index loop: `i` indexes tile-local write heads while `col` offsets the ledger.
-                #[allow(clippy::needless_range_loop)]
-                for i in 0..tile_n_cols {
-                    let col = tile_start_col + i;
-                    let calls = ram_ledger_ref[chunk_id][col] as usize;
-                    if calls == 0 {
-                        continue;
-                    }
-
-                    let dest_start = tile_write_heads[i];
-                    let dest_end = dest_start + calls;
-
-                    tile_pos_buffer[dest_start..dest_end].copy_from_slice(
-                        &chunk_pos_u32[local_chunk_cursor..local_chunk_cursor + calls],
-                    );
-
-                    let key_dest_start = dest_start * key_bytes;
-                    let key_src_start = local_chunk_cursor * key_bytes;
-                    tile_key_buffer[key_dest_start..key_dest_start + calls * key_bytes]
-                        .copy_from_slice(
-                            &chunk_key_bytes[key_src_start..key_src_start + calls * key_bytes],
-                        );
-
-                    tile_write_heads[i] += calls;
-                    local_chunk_cursor += calls;
-                }
-            }
-
-            // pwrite the assembled tile to its known byte range in the final files.
-            // Tiles are disjoint by construction (final_offsets is monotonically increasing),
-            // so concurrent write_all_at calls touch non-overlapping regions.
-            let tile_pos_byte_offset = (tile_start_item * pos_size) as u64;
-            let tile_key_byte_offset = (tile_start_item * key_bytes) as u64;
-            let tile_pos_bytes: &[u8] = bytemuck::cast_slice(&tile_pos_buffer);
-            final_pos_ref
-                .write_all_at(tile_pos_bytes, tile_pos_byte_offset)
-                .map_err(|e| ConversionError::Io {
-                    context: "pwrite positions.bin".into(),
-                    source: e,
-                })?;
-            final_key_ref
-                .write_all_at(&tile_key_buffer, tile_key_byte_offset)
-                .map_err(|e| ConversionError::Io {
-                    context: "pwrite alleles.bin".into(),
-                    source: e,
-                })?;
-            Ok(())
-        })?;
+    gather_columns(
+        total_columns,
+        num_chunks,
+        &ram_ledger,
+        &final_offsets,
+        &chunk_offsets,
+        &[
+            Payload {
+                item_width: pos_size,
+                chunk_files: &pos_chunk_files,
+                dest: &final_pos_file,
+            },
+            Payload {
+                item_width: key_bytes,
+                chunk_files: &key_chunk_files,
+                dest: &final_key_file,
+            },
+        ],
+    )?;
 
     // Drop file handles to flush metadata before cleanup
-    drop(chunk_files);
+    drop(pos_chunk_files);
+    drop(key_chunk_files);
     drop(final_pos_file);
     drop(final_key_file);
 
@@ -279,11 +320,11 @@ pub fn merge_mini_sc(
 /// 1:1 with calls, so the identical column-major reordering applies; only the
 /// per-item width differs.
 ///
-/// This performs its own Phase A (offsets) + Phase B (parallel tile gather) local
-/// to this one field stream, mirroring `merge_mini_sc`'s tile arithmetic exactly
-/// but for a single flat byte buffer (no separate pos/key arrays, and no
-/// `offsets.npy` — the offsets already written by `merge_mini_sc` for this stream
-/// apply unchanged to every field, since fields share the same per-call ordering).
+/// This calls the same `derive_offsets` (Phase A) + `gather_columns` (Phase B)
+/// helpers `merge_mini_sc` uses, with a single `Payload` for the flat byte
+/// buffer (no separate pos/key arrays, and no `offsets.npy` — the offsets
+/// already written by `merge_mini_sc` for this stream apply unchanged to every
+/// field, since fields share the same per-call ordering).
 ///
 /// The caller is responsible for creating `dest_values_bin`'s parent directory
 /// before calling this function (this function does not call `create_dir_all`).
@@ -304,22 +345,11 @@ pub fn merge_var_key_field_values(
     let output_dir_path = Path::new(output_dir);
     let total_columns = num_samples * ploidy;
 
-    // Phase A: derive global per-column offsets + per-chunk local offsets from
-    // the RAM Ledger. Identical arithmetic to merge_mini_sc — deliberately NOT
-    // shared as a helper to keep the working pos/key merge untouched; see the
-    // task report for the "replicate vs refactor" tradeoff.
-    let mut final_offsets = vec![0u64; total_columns + 1];
-    let mut chunk_offsets = vec![vec![0u32; total_columns + 1]; num_chunks];
-
-    for col in 0..total_columns {
-        let mut col_total = 0u64;
-        for chunk_id in 0..num_chunks {
-            let calls = ram_ledger[chunk_id][col];
-            chunk_offsets[chunk_id][col + 1] = chunk_offsets[chunk_id][col] + calls;
-            col_total += calls as u64;
-        }
-        final_offsets[col + 1] = final_offsets[col] + col_total;
-    }
+    // Phase A (shared): derive global per-column offsets + per-chunk local
+    // offsets from the RAM Ledger. Identical schedule merge_mini_sc uses for
+    // the pos/key streams — field values are staged 1:1 with calls, so the
+    // same column-major reordering applies.
+    let (final_offsets, chunk_offsets) = derive_offsets(num_chunks, total_columns, ram_ledger);
 
     let total_items: u64 = final_offsets[total_columns];
     let total_bytes: u64 = total_items * item_width as u64;
@@ -350,96 +380,19 @@ pub fn merge_var_key_field_values(
         })
         .collect::<Result<_, _>>()?;
 
-    // Adaptive tile size: target TILE_RAM_BUDGET per tile (one buffer per tile here,
-    // vs two in merge_mini_sc, so this tolerates a slightly larger tile — but we
-    // keep the same budget constant for a simple, predictable footprint).
-    let avg_calls_per_col =
-        std::cmp::max(1u64, total_items / std::cmp::max(1, total_columns) as u64);
-    let columns_per_tile = std::cmp::max(
-        1usize,
-        std::cmp::min(
-            total_columns.max(1),
-            (TILE_RAM_BUDGET_BYTES / (avg_calls_per_col * item_width as u64)) as usize,
-        ),
-    );
-
-    let tile_starts: Vec<usize> = (0..total_columns).step_by(columns_per_tile).collect();
-
-    let final_offsets_ref = &final_offsets;
-    let chunk_offsets_ref = &chunk_offsets;
-    let chunk_files_ref = &chunk_files;
-    let dest_ref = &dest_file;
-
-    tile_starts
-        .par_iter()
-        .try_for_each(|&tile_start_col| -> Result<(), ConversionError> {
-            let tile_end_col = std::cmp::min(tile_start_col + columns_per_tile, total_columns);
-            let tile_n_cols = tile_end_col - tile_start_col;
-            let tile_start_item = final_offsets_ref[tile_start_col] as usize;
-            let tile_end_item = final_offsets_ref[tile_end_col] as usize;
-            let tile_total_items = tile_end_item - tile_start_item;
-
-            if tile_total_items == 0 {
-                return Ok(());
-            }
-
-            let mut tile_buffer = vec![0u8; tile_total_items * item_width];
-
-            // per-column write head (offset within this tile buffer, in items)
-            let mut tile_write_heads = vec![0usize; tile_n_cols];
-            #[allow(clippy::needless_range_loop)]
-            for i in 0..tile_n_cols {
-                let col = tile_start_col + i;
-                tile_write_heads[i] = (final_offsets_ref[col] as usize) - tile_start_item;
-            }
-
-            // gather from chunks
-            for chunk_id in 0..num_chunks {
-                let chunk_start_item = chunk_offsets_ref[chunk_id][tile_start_col] as usize;
-                let chunk_end_item = chunk_offsets_ref[chunk_id][tile_end_col] as usize;
-                let chunk_items_to_read = chunk_end_item - chunk_start_item;
-
-                if chunk_items_to_read == 0 {
-                    continue;
-                }
-
-                let mut chunk_bytes = vec![0u8; chunk_items_to_read * item_width];
-                let byte_offset = (chunk_start_item * item_width) as u64;
-                chunk_files_ref[chunk_id]
-                    .read_exact_at(&mut chunk_bytes, byte_offset)
-                    .map_err(|e| ConversionError::Io {
-                        context: "pread chunk field".into(),
-                        source: e,
-                    })?;
-
-                let mut local_chunk_cursor = 0usize;
-                #[allow(clippy::needless_range_loop)]
-                for i in 0..tile_n_cols {
-                    let col = tile_start_col + i;
-                    let calls = ram_ledger[chunk_id][col] as usize;
-                    if calls == 0 {
-                        continue;
-                    }
-
-                    let dest_start = tile_write_heads[i] * item_width;
-                    let src_start = local_chunk_cursor * item_width;
-                    tile_buffer[dest_start..dest_start + calls * item_width]
-                        .copy_from_slice(&chunk_bytes[src_start..src_start + calls * item_width]);
-
-                    tile_write_heads[i] += calls;
-                    local_chunk_cursor += calls;
-                }
-            }
-
-            let tile_byte_offset = (tile_start_item * item_width) as u64;
-            dest_ref
-                .write_all_at(&tile_buffer, tile_byte_offset)
-                .map_err(|e| ConversionError::Io {
-                    context: "pwrite field values.bin".into(),
-                    source: e,
-                })?;
-            Ok(())
-        })?;
+    // Phase B (shared): parallel tile gather — a single byte-payload stream.
+    gather_columns(
+        total_columns,
+        num_chunks,
+        ram_ledger,
+        &final_offsets,
+        &chunk_offsets,
+        &[Payload {
+            item_width,
+            chunk_files: &chunk_files,
+            dest: &dest_file,
+        }],
+    )?;
 
     // Drop file handles to flush metadata before cleanup
     drop(chunk_files);
@@ -486,6 +439,16 @@ mod tests {
     fn read_offsets_npy(path: &Path) -> Vec<u64> {
         let arr: ndarray::Array1<u64> = ndarray_npy::read_npy(path).unwrap();
         arr.to_vec()
+    }
+
+    #[test]
+    fn derive_offsets_matches_inline() {
+        // 2 chunks, 3 columns
+        let ledger = vec![vec![2u32, 0, 1], vec![1u32, 3, 0]];
+        let (final_offsets, chunk_offsets) = derive_offsets(2, 3, &ledger);
+        assert_eq!(final_offsets, vec![0, 3, 6, 7]); // col totals 3,3,1
+        assert_eq!(chunk_offsets[0], vec![0, 2, 2, 3]);
+        assert_eq!(chunk_offsets[1], vec![0, 1, 4, 4]);
     }
 
     // Single chunk passthrough: with one chunk the final files should byte-equal
