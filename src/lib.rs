@@ -209,7 +209,6 @@ fn run_conversion_pipeline(
         &chroms,
         &fields,
     )?;
-    let _ = &resolved_fields; // consumed by write_meta in the next task
 
     // All contigs converted — write the top-level meta.json describing the cohort.
     crate::meta::write_meta(
@@ -218,6 +217,7 @@ fn run_conversion_pipeline(
         &samples,
         &chroms,
         ploidy,
+        &resolved_fields,
     )
     .map_err(|e| pyo3::exceptions::PyOSError::new_err(format!("failed to write meta.json: {e}")))?;
 

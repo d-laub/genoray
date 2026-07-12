@@ -63,6 +63,34 @@ impl StorageDtype {
             _ => return None,
         })
     }
+
+    /// Lowercase on-disk/`meta.json` name. `Auto` never reaches here in
+    /// practice (finalize always resolves it to a concrete dtype first), but
+    /// maps to `"auto"` rather than panicking so this stays a total function.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StorageDtype::Auto => "auto",
+            StorageDtype::Bool => "bool",
+            StorageDtype::I8 => "i8",
+            StorageDtype::U8 => "u8",
+            StorageDtype::I16 => "i16",
+            StorageDtype::U16 => "u16",
+            StorageDtype::I32 => "i32",
+            StorageDtype::U32 => "u32",
+            StorageDtype::F16 => "f16",
+            StorageDtype::F32 => "f32",
+        }
+    }
+}
+
+impl FieldCategory {
+    /// Lowercase on-disk/`meta.json` name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FieldCategory::Info => "info",
+            FieldCategory::Format => "format",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
