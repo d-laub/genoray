@@ -204,9 +204,11 @@ fn run_conversion_pipeline(
 
     // All contigs staged — resolve each field's global on-disk dtype and
     // rewrite its staged values.bin files to that width.
-    let resolved_fields =
-        crate::field_finalize::finalize_fields(std::path::Path::new(&output_dir), &chroms, &fields)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    let resolved_fields = crate::field_finalize::finalize_fields(
+        std::path::Path::new(&output_dir),
+        &chroms,
+        &fields,
+    )?;
     let _ = &resolved_fields; // consumed by write_meta in the next task
 
     // All contigs converted — write the top-level meta.json describing the cohort.

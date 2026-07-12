@@ -613,6 +613,57 @@ mod tests {
     }
 
     #[test]
+    fn auto_int_negative_min_narrows_to_signed_i8() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        // min=-5, max=100, no missing: -5..100 fits i8's -128..=127 range, and
+        // a negative min forces the Signed branch (unsigned_fits requires
+        // min >= 0).
+        write_i32_field(root, "chr1", "SC", "var_key_snp", &[-5, 0, 100]);
+
+        let contigs = vec!["chr1".to_string()];
+        let field = int_field("SC", StorageDtype::Auto, None);
+        let resolved = finalize_fields(root, &contigs, &[field]).unwrap();
+
+        assert!(
+            matches!(resolved[0].dtype, StorageDtype::I8),
+            "expected I8 (signed), got {:?}",
+            resolved[0].dtype
+        );
+
+        let path = root.join("chr1/fields/SC/var_key_snp/values.bin");
+        let bytes = read_values_bin(&path);
+        let decoded: Vec<i8> = bytes.iter().map(|&b| b as i8).collect();
+        assert_eq!(decoded, vec![-5i8, 0, 100]);
+    }
+
+    #[test]
+    fn auto_int_negative_min_out_of_i8_range_bumps_to_signed_i16() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        // min=-200 doesn't fit i8 (-128..=127), forcing a bump to i16.
+        write_i32_field(root, "chr1", "SC2", "var_key_snp", &[-200, 0, 100]);
+
+        let contigs = vec!["chr1".to_string()];
+        let field = int_field("SC2", StorageDtype::Auto, None);
+        let resolved = finalize_fields(root, &contigs, &[field]).unwrap();
+
+        assert!(
+            matches!(resolved[0].dtype, StorageDtype::I16),
+            "expected I16 (signed), got {:?}",
+            resolved[0].dtype
+        );
+
+        let path = root.join("chr1/fields/SC2/var_key_snp/values.bin");
+        let bytes = read_values_bin(&path);
+        let decoded: Vec<i16> = bytes
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        assert_eq!(decoded, vec![-200i16, 0, 100]);
+    }
+
+    #[test]
     fn default_set_values_treated_as_non_missing() {
         let tmp = tempdir().unwrap();
         let root = tmp.path();
