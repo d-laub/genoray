@@ -15,6 +15,15 @@
   genotype-aligned — values at non-carrier genotypes are dropped, not stored
   independently. Write-only in this release; a query/decode API for stored
   fields is deferred to a follow-up.
+- SVAR2 field write internals: the finalize pass streams staged values
+  through `chunks_exact` (no intermediate `Vec<f64>` materialization) and
+  runs in parallel across fields/files; the var_key and pos/key merges now
+  share a common offset-derivation + tile-gather implementation. Field output
+  is byte-identical to before. Internal-only (no public API change) —
+  finalize's own instruction count drops ~13% (callgrind Ir, small workload)
+  and peak RSS on a 200-sample/50k-record conversion drops ~7% (498 MiB →
+  ~452 MiB); end-to-end wall time is unchanged since conversion remains
+  reader/htslib-bound, not finalize-bound.
 
 ### BREAKING CHANGES
 
