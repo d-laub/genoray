@@ -55,7 +55,9 @@ pub fn process_chromosome(
     skip_out_of_scope: bool,
     processing_threads: usize,
     signatures: bool,
+    fields: &[crate::field::FieldSpec],
 ) -> Result<u64, ConversionError> {
+    let _ = fields; // unused until Task 5 wires field extraction into the pipeline
     // Directory Formatting: svar2/{contig}/var_key/{snp,indel}
     let paths = crate::layout::ContigPaths::new(base_out_dir, chrom);
 

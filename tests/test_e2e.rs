@@ -100,6 +100,7 @@ fn test_e2e_normalized_bcf_pipeline() {
         false,
         1,     // processing_threads
         false, // signatures
+        &[],   // fields
     )
     .expect("process_chromosome should succeed");
 
@@ -190,6 +191,7 @@ fn test_e2e_max_del_postpass() {
         false,
         1,     // processing_threads
         false, // signatures
+        &[],   // fields
     )
     .expect("conversion");
 
@@ -264,6 +266,7 @@ fn test_e2e_dense_snp_roundtrip() {
         false,
         1,     // processing_threads
         false, // signatures
+        &[],   // fields
     )
     .expect("conversion");
 
@@ -337,6 +340,7 @@ fn test_e2e_mutation_conservation() {
         false,
         1,     // processing_threads
         false, // signatures
+        &[],   // fields
     )
     .expect("process_chromosome should succeed");
 
@@ -439,6 +443,7 @@ fn test_missing_chrom_returns_err() {
         false,
         1,     // processing_threads
         false, // signatures
+        &[],   // fields
     );
 
     assert!(matches!(
