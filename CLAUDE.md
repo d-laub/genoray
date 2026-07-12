@@ -65,7 +65,14 @@ and must be kept in sync.
 
 ### Commit convention
 
-All commits must follow [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `chore:`, etc.). Version bumps are managed by `commitizen` (`cz bump`).
+All commits must follow [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `chore:`, etc.).
+
+Version bumps and `CHANGELOG.md` generation are handled automatically in CI by
+the release workflow (`.github/workflows/release.yaml`), which runs `commitizen`
+and commits the result as the GitHub Actions bot. **Do not bump the version or
+regenerate the changelog by hand** — accumulate human-readable entries under the
+`## Unreleased` heading in `CHANGELOG.md` and let the release workflow cut the
+versioned section. Use `pixi run bump-dry` only to preview locally.
 
 ## Skills
 

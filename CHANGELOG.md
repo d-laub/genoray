@@ -7,206 +7,28 @@
   Rust with a per-record sidecar and streaming count matrix. `from_vcf` gains a
   `signatures=` flag to classify during the write (factored into the cost model).
 
-## 3.0.0 (2026-07-10)
+### BREAKING CHANGES
 
-### BREAKING CHANGE
-
-- genoray.exprs.symbolic_ilen and genoray.exprs.IndexSchema
-are renamed to _symbolic_ilen and _IndexSchema. They were internal
-index-build helpers that were accidentally un-underscored; the public
-exprs surface is now exactly the documented predicates (is_snp, is_indel,
-is_biallelic, is_symbolic, is_breakend, is_imprecise) plus ILEN.
-- the third tuple element is now a uint32 variant-index array
-(matching PGEN), not an n_extension_vars count.
-- VCF filtering uses genoray.Filter(record=, expr=). The
-pl_filter= kwarg and the (filter, pl_filter) tuple API are removed.
-- VCF now doubles the per-variant memory estimate when a sample
-sorter is active, matching PGEN. Chunk-sizing only; no output change.
-- Phantom mode empty() drops the VCF-only phasing argument;
-pass effective ploidy (ploidy + phasing) instead. Uniform across VCF/PGEN.
-- gather_haps_readbound(reader, region_starts, orig_samples,
-vk_snp_range, vk_indel_range, dense_snp_range, dense_indel_range, ploidy) is now
-gather_haps_readbound(reader, &HapRanges::new(...)). Downstream gvl updated in
-lockstep (svar2-m6b-kernel).
-
-### Feat
-
-- **cli**: collapse svar2 write flags to --skip-symbolics-and-breakends
-- **api**: drop the Reader type alias (no shared protocol)
-- **svar2**: privatize raw-dict FFI methods (overlap_batch/find_ranges/gather_ranges)
-- **svar2**: rename SparseVar2.samples to available_samples
-- **vcf**: replace paired (filter, pl_filter) with a Filter value object
-- **modes**: add phantom-mode factories for array and tuple modes
-- **error**: add Input/MissingFile categories and PyErr mapping
-- **build**: add opt-in abi3 cargo feature for release wheels
-- **budget**: plan a processing-thread count from idle cores
-- **py**: find_ranges dict exposes dense_snp_range/dense_indel_range
-- **query**: gather_ranges_readbound + gather_haps_readbound + BatchResultSplit
-- **query**: find_ranges emits per-class dense_snp_range/dense_indel_range
-- **query**: conversion feature gates htslib; query core builds --no-default-features
-- **svar2**: SparseVar2 find/gather/read_ranges with samples= and out=
-- **svar2**: PyContigReader find/gather/read_ranges numpy bindings
-- **svar2**: add find_ranges/gather_ranges/read_ranges query core
-- **cli**: default 'write' to SVAR2, add 'write svar1' for SVAR 1.0
-- **svar2**: SparseVar2.from_vcf wrapper (optional reference, auto-index, skip count)
-- **svar2**: add index_vcf PyO3 helper to build a .csi index
-- **svar2**: optional reference + skip/count plumbing through conversion pipeline
-- **svar2**: opt-in skip + count for out-of-scope ALTs in atomize_record
-- **svar2**: SparseVar2.decode Ragged record + region_counts (M6c)
-- **svar2**: PyContigReader.region_counts decode-free count (M6c)
-- **svar2**: PyContigReader.decode_batch flat variant materialization (M6c)
-- **svar2**: SparseVar2.overlap_batch raw two-channel query (M6b)
-- **svar2**: PyContigReader.overlap_batch raw two-channel numpy method
-- **svar2**: raw LUT accessors for M6b two-channel exposure
-- **svar2**: mix _BatchQueryMixin/_DecodeMixin into SparseVar2 for M6 fan-out
-- **svar2**: stub owned py_query_batch/decode modules for M6 fan-out
-- **svar2**: add SparseVar2 Python skeleton reading meta.json (M6a)
-- **svar2**: expose PyContigReader over ContigReader::open (M6a)
-- **svar2**: add rust-numpy dep and Rust->numpy conversion helpers (M6a)
-- **query**: add batched two-channel overlap_batch spine
-- **spine**: add reader-free KeyRef gather + merge algorithms
-- **svar2-codec**: add snp_code_to_key uniform-key re-expansion
-- **svar-2**: wire max_del post-pass into orchestrator + e2e round-trip
-- **svar-2**: max_del post-pass producer (var_key per-column + dense scalar)
-- **svar-2**: add max_del post-pass path helpers to layout
-- **svar-2**: expose rvk::deletion_len decoder for max_del post-pass
-- **svar-2**: validate REF + left-align atoms in the reader (M2b)
-- **svar-2**: thread reference FASTA through reader/orchestrator/pyo3; widen reorder bound (M2b)
-- **svar-2**: left_align repeat roll with equivalence proptest (M2b)
-- **svar-2**: add L_MAX, ref-mismatch errors, validate_ref (M2b)
-- overlap_sample unions sub-streams into per-hap QueryResult
-- ContigReader opens and mmaps SVAR2 contig sidecars
-- gather_run and kway_merge query primitives
-- query module scaffold with mmap sidecar loaders
-- layout path helpers for max_del.npy and dense/max_del.npy
-- rvk query-side decode seam (decode_key, deletion_len, snp helpers)
-- **svar-2**: overlap_range resolver with edge-case tests
-- **svar-2**: SearchTree upper_bound
-- **svar-2**: SearchTree construction and lower_bound
-- **svar-2**: search.rs scaffold with block-scan primitives
-- **svar-2**: write top-level meta.json after all contigs convert
-- **svar-2**: add write_meta helper + FORMAT_VERSION (meta.json writer)
-- **svar-2**: rename final_* sidecars to spec base names (positions/alleles/offsets/genotypes)
-- **svar-2**: orchestrator drives dense merge; dense e2e round-trip
-- **svar-2**: route variants dense vs var_key by cost model
-- **svar-2**: rectangular dense merge (concat + bit-transpose + snp pack)
-- **svar-2**: executor returns Phase1Output with dense ledgers
-- **svar-2**: writer emits dense per-chunk pos/key/geno files
-- **svar-2**: dense on-disk path helpers (dirs, geno, final)
-- **svar-2**: dense class registry + empty dense chunk payload
-- **svar-2**: LSB-first bit-slice helpers for dense matrix
-- **svar-2**: BitGrid3::popcount_plane for allele-count routing
-- **svar-2**: cost model for per-variant dense/sparse routing
-- **svar-2**: atomize + reorder in the reader; accept un-normalized VCFs
-- **svar-2**: normalize.rs — biallelic split + atomization core
-- **svar-2**: bounded Result-based error path at pipeline boundaries
-- **svar-2**: add StreamTag registry (streams.rs) for tag-routed sub-streams
-- **svar-2**: split var_key conversion into 2-bit SNP + 32-bit indel streams
-- **svar-2**: add SNP/indel variant classifier (VarKey)
-- **svar-2**: add 2-bit SNP codec helpers (encode/pack/unpack)
-- **svar-2**: main-thread orchestration, parallel merge, PEXT encoder, monitoring
+- `Phantom` mode `empty()` classmethods now take a uniform
+  `empty(n_samples, ploidy, n_variants)` signature on both VCF and PGEN
+  backends. VCF's former 4th `phasing` argument is removed; pass the effective
+  ploidy (`ploidy + phasing`) instead.
+- VCF chunk-size memory estimates now double when a sample subset/reorder is
+  active, matching PGEN. This only affects internal chunk sizing (more
+  conservative memory use), never returned data.
+- VCF filtering now uses a single `genoray.Filter(record=, expr=)` value object.
+  The `pl_filter=` constructor kwarg and the `(filter, pl_filter)` tuple
+  getter/setter are removed. Migrate `VCF(p, filter=fn, pl_filter=expr)` to
+  `VCF(p, filter=Filter(record=fn, expr=expr))`.
+- `VCF._chunk_ranges_with_length` now yields `(data, end, chunk_idxs)` (a
+  `uint32` variant-index array) as its third tuple element instead of an
+  `n_extension_vars` count, matching `PGEN._chunk_ranges_with_length`.
 
 ### Fix
 
-- **error**: align exception-type mapping to the documented contract
-- **ffi**: make bundle_from_dict fallible (KeyError/TypeError not panic)
-- **query**: thread io::Result through sidecar loaders and LUT open
-- **merge**: return ConversionError from merge/dense-merge/pack paths
-- **writer**: return ConversionError::Io from writer threads
-- **vcf**: surface reader errors as typed ValueError instead of WorkerPanicked
-- correct Genos16 TypeGuard, PGEN log backend name, orphaned docstring
-- **nrvk**: correct 31-bit capacity message; drop redundant mask
-- **pgen**: guard __del__ against double-closing shared reader
-- **svar**: accept bare-str sample in read_ranges_with_length
-- **vcf**: apply filter on no-index Genos*Dosages read path
-- **py**: declare samples on _BatchQueryMixin so the mixin type-checks
-- **svar2**: guard find_ranges(out=) against dtype mismatch too
-- **types**: repair the pyrefly type-check gate (path + error triage)
-- **cli**: update direct write() callers to write_svar1 after write became an App
-- write .svar output atomically in write_view via sibling staging dir
-- write .svar output atomically in from_pgen via sibling staging dir
-- write .svar output atomically in from_vcf via sibling staging dir
-- write .gvi index files atomically via sibling tmp
-- add atomic sibling-tmp write helpers
-- **query**: make var_key and dense channels exact on spanning deletions
-- **svar-2**: debug_assert half-open query precondition in overlap_range
-- **svar-2**: assert dense_ledger cardinality matches num_chunks in merge
-- **svar-2**: keep DecodedKey/decode_key local to test_e2e per task scope
-- **svar-2**: join all pipeline threads on error path to prevent sampler/executor leak
-- **rust**: make conversion crate compile and build as genoray._core
-- **rvk**: remove stray closing brace in encode_alt_inline
-
-### Refactor
-
-- **exprs**: privatize symbolic_ilen and IndexSchema
-- **utils**: table-driven np_to_pl_dtype, typed variant_file_type
-- **var-ranges**: extract shared _var_end_expr, drop name shadowing
-- **utils**: split _utils.py into _io/_contigs/_genos by domain
-- **mutcat**: split _mutcat.py into codebook/classify/count package
-- **mutcat**: relocate scalar classifier oracles to tests
-- **svar2**: TypedDict the batch-query dict contracts
-- **utils**: import DTYPE TypeVar from _types instead of redefining
-- **mutcat**: own the Kind Literal in the codebook module
-- **mutcat**: SENTINELS dict -> Sentinel IntEnum
-- **svar2-codec**: name the payload bit-shift layout constants
-- **rust**: add StreamTag::class() bridge to cost_model::Class
-- **rust**: unify DenseMap/StreamMap behind EnumKey/EnumMap
-- **query**: finish (usize,usize) -> Range<usize> in gather/oracle
-- **vcf**: yield chunk_idxs from _chunk_ranges_with_length
-- **vcf**: move _oxbow_reader out of the get_record_info overloads
-- **vcf**: merge _ext_genos/_ext_genos_dosages into _ext_with_length
-- **query**: compute _mem_per_variant via nbytes_per_variant
-- **query**: share contig-normalize and empty-result helpers
-- **query**: replace mode issubclass ladders with dispatch dicts
-- **vcf**: extract _extract_dosage helper for the 5 dosage sites
-- **vcf**: define modes via factory and unify empty() to 3-arg
-- **pgen**: define phantom modes via the shared factory
-- **query**: factor PresenceBitWriter::reserve_row; drop redundant path
-- **query**: gather_haps_readbound takes a HapRanges params struct
-- **query**: group oracle-only entry points under query::oracle
-- **query**: use Range<usize> for internal half-open ranges
-- **query**: DenseUnion src uses DenseClass + dense_view accessor
-- **query**: extract gather_vk for the var_key snp+indel merge
-- **query**: extract PresenceBitWriter for CSR presence bitmasks
-- **query**: split query.rs into query/ module (pure code motion)
-- **svar**: converge sample validation onto _resolve_sample_idxs
-- **svar**: extract _write_from_reader from from_vcf/from_pgen
-- split _svar.py into _svar/ package
-- drop bare annotations shadowing SparseVar cached_property
-- drop obsolete allow(dead_code) on PyContigReader::inner
-- remove unused is_dtype and POLARS_V_IDX_TYPE
-- remove dead src/utils.rs (never compiled, unused macros)
-- **vcf_reader**: extract pack helpers, thread processing pool (still sequential)
-- **vcf_reader**: Rc→Arc on PendingAtom.gt for cross-thread sharing
-- **query**: re-express overlap_sample on the uniform-key spine
-- **svar2-codec**: move indel decode + DEL/lookup encode lanes into the crate
-- **svar2-codec**: move inline indel encoder (PEXT/SWAR) into the crate
-- **svar2-codec**: move SNP 2-bit code + pack/unpack into the crate
-- **svar2-codec**: move key-layout constants + BASES into the crate
-- **svar-2**: clarify reorder memory-bound comment; name missing contig in FASTA error (M2b)
-- **svar-2**: route pack_snp_key_file through layout::alleles; propagate meta serialize error
-- **svar-2**: relocate long-allele LUT to shared per-contig indel dir
-- **svar-2**: debug_assert non-empty REF/ALT; document reorder-buffer memory bound
-- **svar-2**: extract BCF test harness into tests/common/mod.rs and drop obsolete panic tests
-- **svar-2**: LongAlleleReader::get_allele uses pread + &self
-- **svar-2**: move process_chromosome into orchestrator.rs; slim lib.rs
-- **svar-2**: route sub-streams by StreamTag with byte-erased keys
-- **svar-2**: de-generify merge over runtime key_bytes
-- **svar-2**: centralize on-disk layout in layout.rs
-- **svar-2**: extract /proc monitoring into monitor.rs
-- **svar-2**: extract testable plan_thread_budget into budget.rs
-- **svar-2**: delete dead commented code, stray checkpoints, and write-only num_variants
-- **svar-2**: generalize tile merge over key element width
-
-### Perf
-
-- **contigs**: precompute name_to_index, drop O(n^2) remapper build
-- **vcf_reader**: parallel presence packing over word-aligned variant blocks
-- **budget**: raise htslib decode-thread cap 4→8 for idle-core workloads
-- **convert**: reader-bound VCF→SVAR2 — raw GT decode + per-word bit pack
-- **query**: block-copy dense-SNP presence via per-query threshold
-- **bits**: byte-batch copy_bits body, was per-bit
-- **query**: gather_haps_readbound asm fix — kill skip/take waste, elide bounds checks, inline the per-hap merge (byte-identical)
+- **vcf**: apply configured `filter` on `VCF.read(..., mode=Genos*Dosages)` when no
+  `.gvi` index is loaded, matching the genotype-only and dosage-only modes
+  (previously the filter was silently ignored on this path).
 
 ## 2.15.0 (2026-06-30)
 
