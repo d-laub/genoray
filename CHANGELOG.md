@@ -6,6 +6,15 @@
   for COSMIC mutational-signature workflows (SBS96/ID83/DBS78), implemented in
   Rust with a per-record sidecar and streaming count matrix. `from_vcf` gains a
   `signatures=` flag to classify during the write (factored into the cost model).
+- `SparseVar2.from_vcf` can extract scalar-numeric INFO/FORMAT fields into the
+  store via new `info_fields=`/`format_fields=` kwargs and `InfoField`/
+  `FormatField` config types (`genoray.InfoField`, `genoray.FormatField`).
+  Scoped to `Integer`/`Float`/`Flag` header types with `Number ∈ {1, A}` (plus
+  `Flag`'s `Number=0`); integer widths are losslessly auto-narrowed to the
+  observed range by default, `f16` is opt-in and lossy. FORMAT storage is
+  genotype-aligned — values at non-carrier genotypes are dropped, not stored
+  independently. Write-only in this release; a query/decode API for stored
+  fields is deferred to a follow-up.
 
 ### BREAKING CHANGES
 

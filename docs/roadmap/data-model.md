@@ -214,38 +214,80 @@ svar2/
     │   ├── snp/
     │   │   ├── positions.bin       # sidecar SNP-variant positions (sorted), u32 LE
     │   │   ├── alleles.bin         # 2-bit packed keys, one per SNP variant (no LUT), u8
-    │   │   ├── {field}.npy         # per-variant INFO/FORMAT fields
     │   │   └── genotypes.bin       # 1-bit (sample, ploid, snp_variant) matrix, C-order, u8
     │   └── indel/
     │       ├── positions.bin       # u32 LE
     │       ├── alleles.bin         # 32-bit keys, one per indel variant (points into shared LUT), u32 LE
-    │       ├── {field}.npy
     │       └── genotypes.bin       # 1-bit (sample, ploid, indel_variant) matrix, C-order, u8
     ├── pointer/                    # = SVAR 1.0 representation (longer-term, M11)
     │   ├── snp/
     │   │   ├── positions.npy
     │   │   ├── alleles.npy         # 2-bit packed variant table (no LUT)
-    │   │   ├── {field}.npy
     │   │   ├── pointers.npy        # u32/u64 pointers into the SNP variant table
     │   │   └── offsets.npy         # per (sample, ploid) ragged offsets into pointers
     │   └── indel/
     │       ├── positions.npy
     │       ├── alleles.npy         # 32-bit variant table (points into shared LUT)
-    │       ├── {field}.npy
     │       ├── pointers.npy
     │       └── offsets.npy
-    └── var_key/
-        ├── snp/
-        │   ├── positions.bin       # per-call SNP positions (sorted within each hap), u32 LE
-        │   ├── alleles.bin         # 2-bit packed ALT, 4 calls/byte (uint8), no LUT
-        │   ├── offsets.npy         # per (sample, ploid) ragged offsets into snp calls, u64
-        │   └── {field}.npy         # per-call INFO/FORMAT for SNP calls
-        └── indel/
-            ├── positions.bin       # per-call indel positions (sorted within each hap), u32 LE
-            ├── alleles.bin         # 32-bit keys, one per call (ragged, points into shared LUT), u32 LE
-            ├── offsets.npy         # per (sample, ploid) ragged offsets into alleles, u64
-            └── {field}.npy
+    ├── var_key/
+    │   ├── snp/
+    │   │   ├── positions.bin       # per-call SNP positions (sorted within each hap), u32 LE
+    │   │   ├── alleles.bin         # 2-bit packed ALT, 4 calls/byte (uint8), no LUT
+    │   │   └── offsets.npy         # per (sample, ploid) ragged offsets into snp calls, u64
+    │   └── indel/
+    │       ├── positions.bin       # per-call indel positions (sorted within each hap), u32 LE
+    │       ├── alleles.bin         # 32-bit keys, one per call (ragged, points into shared LUT), u32 LE
+    │       └── offsets.npy         # per (sample, ploid) ragged offsets into alleles, u64
+    └── fields/                     # INFO/FORMAT field values (see below); only present
+        └── {name}/                 # when `from_vcf(info_fields=, format_fields=)` is used
+            ├── var_key_snp/values.bin
+            ├── var_key_indel/values.bin
+            ├── dense_snp/values.bin
+            └── dense_indel/values.bin       # only the subs with records for this contig exist
 ```
+
+### INFO/FORMAT field storage
+
+`from_vcf(info_fields=, format_fields=)` extracts scalar-numeric INFO
+(per-variant) and FORMAT (per-call) fields, genotype-aligned to whichever
+representation (`var_key`/`dense`) each variant already routed to — see
+`docs/superpowers/specs/2026-07-11-svar2-info-format-fields-write-design.md`
+for the full design. Each requested field gets its own
+`{contig}/fields/{name}/{sub}/values.bin`, where `sub ∈ {var_key_snp,
+var_key_indel, dense_snp, dense_indel}` (only the subs that actually had
+records for that contig/representation are written). `values.bin` is a raw
+little-endian array in the field's resolved storage dtype:
+
+- **var_key**: one value per call (INFO values duplicated across a variant's
+  calls; FORMAT values one per carrier call) — parallel to that sub's
+  `offsets.npy`-indexed call stream.
+- **dense INFO**: one value per dense variant, parallel to `positions.bin`.
+- **dense FORMAT**: a full `n_samples`-long per-sample column per dense
+  variant (`n_samples · n_dense_variants` total); non-carrier sample slots
+  hold the field's `default`/sentinel, keeping FORMAT read semantics uniform
+  with var_key.
+
+No offsets are needed for field arrays — each is a fixed stride derived from
+the existing `n_samples`/variant-count/call-count already implied by the
+representation's genotype arrays.
+
+Each requested field's resolved dtype/category/default is recorded in the
+top-level `meta.json` under a `"fields"` array, one entry per field:
+
+```json
+"fields": [
+  {"name": "DS", "category": "format", "dtype": "f32", "default": 0.0},
+  {"name": "AC", "category": "info",   "dtype": "u8",  "default": null}
+]
+```
+
+`category` is `"info"` or `"format"`; `dtype` is the resolved (never `"auto"`)
+storage dtype string (e.g. `"f32"`, `"u8"`); `default` is the configured
+missing-fill value, or `null` when unset (falls back to the dtype's reserved
+sentinel). Note: as of this writing there is no reader/query API for these
+field values yet — writing is implemented, decode/output is a separate,
+deferred spec.
 
 `meta.json` carries the format version (so `SparseVar2` can negotiate), sample list,
 contig list, and ploidy. The per-stream maximum deletion length needed for overlap
