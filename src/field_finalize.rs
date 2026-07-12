@@ -23,6 +23,7 @@
 
 use crate::error::ConversionError;
 use crate::field::{FieldCategory, FieldSpec, HtslibType, StorageDtype};
+use rayon::prelude::*;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -73,6 +74,21 @@ impl ScanStats {
             self.max = v;
         }
     }
+
+    /// Fold `other` (e.g. another file's stats) into `self`. Associative and
+    /// commutative — safe to use as a rayon reduction: `min`/`max` combine via
+    /// plain comparison (both start at +-infinity so an empty side is a
+    /// no-op), `has_missing`/`any_values` combine via `||`.
+    fn merge(&mut self, other: ScanStats) {
+        if other.min < self.min {
+            self.min = other.min;
+        }
+        if other.max > self.max {
+            self.max = other.max;
+        }
+        self.has_missing |= other.has_missing;
+        self.any_values |= other.any_values;
+    }
 }
 
 fn bad(msg: impl Into<String>) -> ConversionError {
@@ -87,7 +103,7 @@ pub fn finalize_fields(
     fields: &[FieldSpec],
 ) -> Result<Vec<ResolvedField>, ConversionError> {
     fields
-        .iter()
+        .par_iter()
         .map(|field| finalize_one(output_dir, contigs, field))
         .collect()
 }
@@ -100,9 +116,9 @@ fn finalize_one(
     let files = field_files(output_dir, contigs, field.category.as_str(), &field.name);
     let stats = scan(&files, field)?;
     let dtype = resolve_dtype(field, &stats)?;
-    for path in &files {
-        rewrite_file(path, field, dtype)?;
-    }
+    files
+        .par_iter()
+        .try_for_each(|path| rewrite_file(path, field, dtype))?;
     Ok(ResolvedField {
         name: field.name.clone(),
         category: field.category,
@@ -133,10 +149,9 @@ fn field_files(output_dir: &Path, contigs: &[String], category: &str, name: &str
     out
 }
 
-/// Read a staged `values.bin` as `f64` (exact for both `i32` and `f32`
-/// staged domains), decoding each 4-byte little-endian element per
-/// `is_float`.
-fn read_staged(path: &Path, is_float: bool) -> Result<Vec<f64>, ConversionError> {
+/// Read a staged `values.bin`'s raw bytes, validating the length is a whole
+/// number of 4-byte native-width (`i32`/`f32`) elements.
+fn read_staged_bytes(path: &Path) -> Result<Vec<u8>, ConversionError> {
     let bytes = std::fs::read(path).map_err(|e| ConversionError::Io {
         context: format!("reading {}", path.display()),
         source: e,
@@ -148,17 +163,17 @@ fn read_staged(path: &Path, is_float: bool) -> Result<Vec<f64>, ConversionError>
             bytes.len()
         )));
     }
-    Ok(bytes
-        .chunks_exact(4)
-        .map(|c| {
-            let arr: [u8; 4] = c.try_into().unwrap();
-            if is_float {
-                f32::from_le_bytes(arr) as f64
-            } else {
-                i32::from_le_bytes(arr) as f64
-            }
-        })
-        .collect())
+    Ok(bytes)
+}
+
+/// Decode one staged 4-byte little-endian element (exact as `f64` for both
+/// the `i32` and `f32` staged domains) per `is_float`.
+fn decode_elem(chunk: [u8; 4], is_float: bool) -> f64 {
+    if is_float {
+        f32::from_le_bytes(chunk) as f64
+    } else {
+        i32::from_le_bytes(chunk) as f64
+    }
 }
 
 /// `true` iff a staged element `v` represents the staged missing sentinel.
@@ -173,23 +188,43 @@ fn is_staged_missing(v: f64, is_float: bool) -> bool {
     }
 }
 
+/// Scan one file's staged bytes into `ScanStats`, decoding each 4-byte
+/// element inline via `chunks_exact` — no intermediate `Vec<f64>`.
+fn scan_file(
+    path: &Path,
+    is_float: bool,
+    treat_missing: bool,
+) -> Result<ScanStats, ConversionError> {
+    let bytes = read_staged_bytes(path)?;
+    let mut stats = ScanStats::empty();
+    for chunk in bytes.chunks_exact(4) {
+        let arr: [u8; 4] = chunk.try_into().unwrap();
+        let v = decode_elem(arr, is_float);
+        if treat_missing && is_staged_missing(v, is_float) {
+            stats.has_missing = true;
+        } else {
+            stats.observe(v);
+        }
+    }
+    Ok(stats)
+}
+
 fn scan(files: &[PathBuf], field: &FieldSpec) -> Result<ScanStats, ConversionError> {
     let is_float = field.stage_is_float();
     // A `default` was already substituted at staging time, so nothing in
     // the data can be the staged sentinel; treat nothing as missing (the
     // default value itself still flows into min/max via `observe`).
     let treat_missing = field.default.is_none();
-    let mut stats = ScanStats::empty();
-    for path in files {
-        for v in read_staged(path, is_float)? {
-            if treat_missing && is_staged_missing(v, is_float) {
-                stats.has_missing = true;
-            } else {
-                stats.observe(v);
-            }
-        }
-    }
-    Ok(stats)
+    // `ScanStats::merge` is associative/commutative (min/max via comparison,
+    // has_missing/any_values via `||`), so a parallel map+reduce over files
+    // is deterministic regardless of thread scheduling order.
+    files
+        .par_iter()
+        .map(|path| scan_file(path, is_float, treat_missing))
+        .try_reduce(ScanStats::empty, |mut a, b| {
+            a.merge(b);
+            Ok(a)
+        })
 }
 
 fn unsigned_bound(width: u32) -> u64 {
@@ -363,11 +398,14 @@ fn rewrite_file(
 ) -> Result<(), ConversionError> {
     let is_float = field.stage_is_float();
     let treat_missing = field.default.is_none();
-    let values = read_staged(path, is_float)?;
+    let bytes = read_staged_bytes(path)?;
 
     let width = dtype.width_bytes().unwrap_or(4);
-    let mut out = Vec::with_capacity(values.len() * width);
-    for v in values {
+    let n_elems = bytes.len() / 4;
+    let mut out = Vec::with_capacity(n_elems * width);
+    for chunk in bytes.chunks_exact(4) {
+        let arr: [u8; 4] = chunk.try_into().unwrap();
+        let v = decode_elem(arr, is_float);
         let is_missing = treat_missing && is_staged_missing(v, is_float);
         encode(&mut out, dtype, v, is_missing);
     }
