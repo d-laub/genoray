@@ -695,6 +695,32 @@ mod tests {
     }
 
     #[test]
+    fn finalize_auto_narrow_byte_golden() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // i32 staged values incl. one MISSING sentinel; auto -> narrow.
+        write_i32_field(root, "chr1", "AC", "var_key_snp", &[0, 5, 127, i32::MIN, 3]);
+        let field = int_field("AC", StorageDtype::Auto, None);
+        let resolved = finalize_fields(root, &[String::from("chr1")], &[field]).unwrap();
+        let path = root
+            .join("chr1")
+            .join("fields")
+            .join("info")
+            .join("AC")
+            .join("var_key_snp")
+            .join("values.bin");
+        let got = read_values_bin(&path);
+        // Captured from a run on pre-refactor code (`cargo test --no-default-features
+        // --features conversion --lib field_finalize::tests::finalize_auto_narrow_byte_golden
+        // -- --nocapture`): values [0, 5, 127, i32::MIN, 3], no default => MIN is
+        // the staged-missing sentinel. max=127 with has_missing=true still fits
+        // u8 (0..=254 usable, sentinel reserved at 255) => resolves to U8, with
+        // the sentinel remapped to u8::MAX=255.
+        assert_eq!(resolved[0].dtype, StorageDtype::U8);
+        assert_eq!(got, vec![0u8, 5, 127, 255, 3]);
+    }
+
+    #[test]
     fn explicit_f32_rewrites_in_place_byte_identical() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
