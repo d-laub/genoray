@@ -186,6 +186,7 @@ pub fn build_contig(
         false,
         1,     // processing_threads
         false, // signatures
+        &[],   // fields
     )
     .expect("process_chromosome should succeed");
     write_max_del_fixture(&out.join(chrom), samples.len(), ploidy, records);

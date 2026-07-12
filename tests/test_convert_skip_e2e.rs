@@ -53,6 +53,7 @@ fn convert(
         skip,
         1,     // processing_threads
         false, // signatures
+        &[],   // fields
     )
 }
 

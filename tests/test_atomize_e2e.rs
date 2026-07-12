@@ -27,6 +27,7 @@ fn drain_reader(
         1,
         ploidy,
         false,
+        &[],
     )
     .unwrap();
     let columns = samples.len() * ploidy;

@@ -100,6 +100,7 @@ fn test_e2e_normalized_bcf_pipeline() {
         false,
         1,     // processing_threads
         false, // signatures
+        &[],   // fields
     )
     .expect("process_chromosome should succeed");
 
@@ -190,6 +191,7 @@ fn test_e2e_max_del_postpass() {
         false,
         1,     // processing_threads
         false, // signatures
+        &[],   // fields
     )
     .expect("conversion");
 
@@ -264,6 +266,7 @@ fn test_e2e_dense_snp_roundtrip() {
         false,
         1,     // processing_threads
         false, // signatures
+        &[],   // fields
     )
     .expect("conversion");
 
@@ -337,6 +340,7 @@ fn test_e2e_mutation_conservation() {
         false,
         1,     // processing_threads
         false, // signatures
+        &[],   // fields
     )
     .expect("process_chromosome should succeed");
 
@@ -369,6 +373,322 @@ fn test_e2e_mutation_conservation() {
     );
 }
 
+// Task 4: INFO/FORMAT field extraction into DenseChunk. Builds a DEDICATED
+// small BCF (not the shared SynthRecord/build_bcf_with_index helper, which
+// has no INFO/FORMAT beyond GT) with an INFO/AC (Number=1, Integer) and a
+// FORMAT/DS (Number=1, Float) field over 2 samples, 3 strictly-increasing
+// biallelic SNP positions (no indels ⇒ atom order == record order, so
+// per-variant assertions stay stable). AC is left unset on the last record to
+// exercise the missing → sentinel path (no `default` set on the FieldSpec).
+#[test]
+fn test_reader_extracts_info_format_fields() {
+    use genoray_core::field::{FieldCategory, FieldSpec, HtslibType, StorageDtype};
+    use genoray_core::types::StagedColumn;
+    use rust_htslib::bcf::record::GenotypeAllele;
+    use rust_htslib::bcf::{Format as BcfFormat, Header, Writer};
+
+    let tmp = tempdir().unwrap();
+    let bcf_path = tmp.path().join("fields.bcf");
+
+    let samples = ["S0", "S1"];
+    let num_samples = samples.len();
+    let ploidy = 2;
+
+    // (pos, ref, alt, ac (None = leave INFO/AC unset), ds per sample, gt per hap)
+    #[allow(clippy::type_complexity)]
+    let records: Vec<(i64, &[u8], &[u8], Option<i32>, [f32; 2], [i32; 4])> = vec![
+        (100, b"A", b"C", Some(5), [0.1, 0.2], [1, 0, 0, 1]),
+        (200, b"G", b"T", Some(7), [0.3, 0.4], [0, 1, 1, 0]),
+        (300, b"C", b"A", None, [0.5, 0.6], [1, 1, 0, 0]),
+    ];
+
+    {
+        let mut header = Header::new();
+        header.push_record(b"##contig=<ID=chr1,length=10000>");
+        header.push_record(b"##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">");
+        header.push_record(b"##INFO=<ID=AC,Number=1,Type=Integer,Description=\"Allele count\">");
+        header.push_record(b"##FORMAT=<ID=DS,Number=1,Type=Float,Description=\"Dosage\">");
+        for s in &samples {
+            header.push_sample(s.as_bytes());
+        }
+
+        let mut writer =
+            Writer::from_path(&bcf_path, &header, false, BcfFormat::Bcf).expect("open BCF writer");
+        for (pos, r, a, ac, ds, gt) in &records {
+            let mut record = writer.empty_record();
+            record.set_rid(Some(0));
+            record.set_pos(*pos);
+            record.set_alleles(&[r, a]).expect("set alleles");
+            let gt_alleles: Vec<GenotypeAllele> =
+                gt.iter().map(|&i| GenotypeAllele::Phased(i)).collect();
+            record.push_genotypes(&gt_alleles).expect("push genotypes");
+            if let Some(ac) = ac {
+                record.push_info_integer(b"AC", &[*ac]).expect("push AC");
+            }
+            record.push_format_float(b"DS", ds).expect("push DS");
+            writer.write(&record).expect("write record");
+        }
+    }
+    rust_htslib::bcf::index::build(&bcf_path, None, 0, rust_htslib::bcf::index::Type::Csi(14))
+        .expect("build BCF index");
+
+    let info = vec![FieldSpec {
+        name: "AC".to_string(),
+        category: FieldCategory::Info,
+        htype: HtslibType::Int,
+        dtype: StorageDtype::Auto,
+        default: None,
+    }];
+    let fmt = vec![FieldSpec {
+        name: "DS".to_string(),
+        category: FieldCategory::Format,
+        htype: HtslibType::Float,
+        dtype: StorageDtype::Auto,
+        default: None,
+    }];
+    let mut all = info.clone();
+    all.extend(fmt.clone());
+
+    let sample_refs: Vec<&str> = samples.to_vec();
+    // fasta_path = None: skip validate_ref/left_align, so positions stay put
+    // and atom order == record order (all SNPs, no atomize splitting).
+    let mut reader = VcfChunkReader::new(
+        bcf_path.to_str().unwrap(),
+        None,
+        "chr1",
+        &sample_refs,
+        1,
+        ploidy,
+        false,
+        &all,
+    )
+    .unwrap();
+    let chunk = reader
+        .read_next_chunk(100, 0, None)
+        .expect("chunk should succeed")
+        .expect("chunk should succeed");
+
+    assert_eq!(chunk.pos, vec![100, 200, 300]);
+
+    let ds = match &chunk.format_staged[0] {
+        StagedColumn::Float(v) => v,
+        _ => panic!("DS should stage as Float"),
+    };
+    assert_eq!(ds.len(), chunk.pos.len() * num_samples);
+    // variant 0 (pos 100), sample 1 (S1) → index 0*2 + 1
+    assert!((ds[1] - 0.2).abs() < 1e-6);
+    // variant 1 (pos 200), sample 0 (S0) → index 1*2 + 0
+    assert!((ds[2] - 0.3).abs() < 1e-6);
+    // variant 2 (pos 300), sample 1 (S1) → index 2*2 + 1
+    assert!((ds[5] - 0.6).abs() < 1e-6);
+
+    let ac = match &chunk.info_staged[0] {
+        StagedColumn::Int(v) => v,
+        _ => panic!("AC should stage as Int"),
+    };
+    assert_eq!(ac.len(), chunk.pos.len());
+    assert_eq!(ac[0], 5);
+    assert_eq!(ac[1], 7);
+    assert_eq!(ac[2], i32::MIN, "missing AC (no default) → sentinel");
+}
+
+// Regression (Task 4 code review, Critical): `resolve_scalar` must index a
+// Number=A htslib buffer by `source_alt_index - 1` (0-based per-ALT), not
+// `source_alt_index` directly (1-based). Biallelic records can't catch this —
+// a single-ALT Number=A buffer has length 1 and hits the `vals.len() == 1`
+// scalar branch regardless of index. Only a MULTIALLELIC record exercises the
+// `vals.get(idx)` arm: on unpatched code ALT1 (source_alt_index=1) reads
+// ALT2's slot and ALT2 (source_alt_index=2) reads out of bounds → sentinel.
+//
+// Builds one low-pos biallelic SNP (ordering sanity) then a 2-ALT record
+// ref="A", alt=["C","G"] with INFO/AC=[10,20] (Number=A Integer) and
+// FORMAT/DS Number=A Float, sample-major per htslib layout:
+// sample0=[0.1(ALT_C), 0.2(ALT_G)], sample1=[0.3(ALT_C), 0.4(ALT_G)] →
+// push_format_float(&[0.1, 0.2, 0.3, 0.4]). `atomize_record` pushes ALTs in
+// order (C=source_alt_index 1, G=source_alt_index 2) and the reorder heap
+// tiebreaks equal positions by insertion sequence, so the multiallelic
+// record's two atoms come out ALT-C then ALT-G. fasta_path=None skips
+// left-align, so positions/ordering stay exactly as written.
+#[test]
+fn test_reader_extracts_multiallelic_number_a_fields() {
+    use genoray_core::field::{FieldCategory, FieldSpec, HtslibType, StorageDtype};
+    use genoray_core::types::StagedColumn;
+    use rust_htslib::bcf::record::GenotypeAllele;
+    use rust_htslib::bcf::{Format as BcfFormat, Header, Writer};
+
+    let tmp = tempdir().unwrap();
+    let bcf_path = tmp.path().join("multiallelic_fields.bcf");
+
+    let samples = ["S0", "S1"];
+    let num_samples = samples.len();
+    let ploidy = 2;
+
+    {
+        let mut header = Header::new();
+        header.push_record(b"##contig=<ID=chr1,length=10000>");
+        header.push_record(b"##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">");
+        header.push_record(b"##INFO=<ID=AC,Number=A,Type=Integer,Description=\"Allele count\">");
+        header.push_record(b"##FORMAT=<ID=DS,Number=A,Type=Float,Description=\"Dosage\">");
+        for s in &samples {
+            header.push_sample(s.as_bytes());
+        }
+
+        let mut writer =
+            Writer::from_path(&bcf_path, &header, false, BcfFormat::Bcf).expect("open BCF writer");
+
+        // Record 0: biallelic SNP at a lower pos, ordering sanity only.
+        {
+            let mut record = writer.empty_record();
+            record.set_rid(Some(0));
+            record.set_pos(50);
+            record.set_alleles(&[b"T", b"A"]).expect("set alleles");
+            let gt_alleles = vec![
+                GenotypeAllele::Phased(1),
+                GenotypeAllele::Phased(0),
+                GenotypeAllele::Phased(0),
+                GenotypeAllele::Phased(0),
+            ];
+            record.push_genotypes(&gt_alleles).expect("push genotypes");
+            record.push_info_integer(b"AC", &[1]).expect("push AC");
+            record
+                .push_format_float(b"DS", &[0.9, 0.9])
+                .expect("push DS");
+            writer.write(&record).expect("write record");
+        }
+
+        // Record 1: MULTIALLELIC SNP, ref="A", alt=["C","G"].
+        {
+            let mut record = writer.empty_record();
+            record.set_rid(Some(0));
+            record.set_pos(200);
+            record
+                .set_alleles(&[b"A", b"C", b"G"])
+                .expect("set alleles");
+            // S0: hap0=ALT1(C), hap1=ALT2(G); S1: hom ref.
+            let gt_alleles = vec![
+                GenotypeAllele::Phased(1),
+                GenotypeAllele::Phased(2),
+                GenotypeAllele::Phased(0),
+                GenotypeAllele::Phased(0),
+            ];
+            record.push_genotypes(&gt_alleles).expect("push genotypes");
+            record.push_info_integer(b"AC", &[10, 20]).expect("push AC");
+            // Number=A, 2 samples, sample-major: [s0_altC, s0_altG, s1_altC, s1_altG].
+            record
+                .push_format_float(b"DS", &[0.1, 0.2, 0.3, 0.4])
+                .expect("push DS");
+            writer.write(&record).expect("write record");
+        }
+    }
+    rust_htslib::bcf::index::build(&bcf_path, None, 0, rust_htslib::bcf::index::Type::Csi(14))
+        .expect("build BCF index");
+
+    let info = vec![FieldSpec {
+        name: "AC".to_string(),
+        category: FieldCategory::Info,
+        htype: HtslibType::Int,
+        dtype: StorageDtype::Auto,
+        default: None,
+    }];
+    let fmt = vec![FieldSpec {
+        name: "DS".to_string(),
+        category: FieldCategory::Format,
+        htype: HtslibType::Float,
+        dtype: StorageDtype::Auto,
+        default: None,
+    }];
+    let mut all = info.clone();
+    all.extend(fmt.clone());
+
+    let sample_refs: Vec<&str> = samples.to_vec();
+    let mut reader = VcfChunkReader::new(
+        bcf_path.to_str().unwrap(),
+        None,
+        "chr1",
+        &sample_refs,
+        1,
+        ploidy,
+        false,
+        &all,
+    )
+    .unwrap();
+    let chunk = reader
+        .read_next_chunk(100, 0, None)
+        .expect("chunk should succeed")
+        .expect("chunk should succeed");
+
+    // 3 atoms total: 1 (pos 50) + 2 (pos 200, the multiallelic split).
+    assert_eq!(chunk.pos, vec![50, 200, 200]);
+    assert_eq!(chunk.ilens, vec![0, 0, 0], "all SNPs, no ilen shift");
+
+    // Identify the two multiallelic atoms by pos, then confirm which is which
+    // via their actual ALT bytes (don't just assume emission order) — this is
+    // the "non-vacuous" check: it fails loudly if atomize/heap ordering ever
+    // changes instead of silently comparing the wrong atom.
+    let multi_idxs: Vec<usize> = chunk
+        .pos
+        .iter()
+        .enumerate()
+        .filter(|&(_, &p)| p == 200)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(multi_idxs.len(), 2, "expected exactly 2 split atoms @200");
+    let atom_alt = |i: usize| -> Vec<u8> {
+        let start = chunk.alt_offsets[i] as usize;
+        let end = chunk.alt_offsets[i + 1] as usize;
+        chunk.alt[start..end].to_vec()
+    };
+    let idx_c = *multi_idxs
+        .iter()
+        .find(|&&i| atom_alt(i) == b"C")
+        .expect("an atom with ALT=C must exist");
+    let idx_g = *multi_idxs
+        .iter()
+        .find(|&&i| atom_alt(i) == b"G")
+        .expect("an atom with ALT=G must exist");
+    assert_ne!(idx_c, idx_g);
+
+    let ac = match &chunk.info_staged[0] {
+        StagedColumn::Int(v) => v,
+        _ => panic!("AC should stage as Int"),
+    };
+    assert_eq!(ac.len(), chunk.pos.len());
+    assert_eq!(
+        ac[idx_c], 10,
+        "ALT=C (source_alt_index=1) must read AC[0]=10, not AC[1]=20"
+    );
+    assert_eq!(
+        ac[idx_g], 20,
+        "ALT=G (source_alt_index=2) must read AC[1]=20, not out-of-bounds/sentinel"
+    );
+
+    let ds = match &chunk.format_staged[0] {
+        StagedColumn::Float(v) => v,
+        _ => panic!("DS should stage as Float"),
+    };
+    assert_eq!(ds.len(), chunk.pos.len() * num_samples);
+    assert!(
+        (ds[idx_c * num_samples] - 0.1).abs() < 1e-6,
+        "ALT=C sample0 DS should be 0.1, got {}",
+        ds[idx_c * num_samples]
+    );
+    assert!(
+        (ds[idx_c * num_samples + 1] - 0.3).abs() < 1e-6,
+        "ALT=C sample1 DS should be 0.3, got {}",
+        ds[idx_c * num_samples + 1]
+    );
+    assert!(
+        (ds[idx_g * num_samples] - 0.2).abs() < 1e-6,
+        "ALT=G sample0 DS should be 0.2, got {}",
+        ds[idx_g * num_samples]
+    );
+    assert!(
+        (ds[idx_g * num_samples + 1] - 0.4).abs() < 1e-6,
+        "ALT=G sample1 DS should be 0.4, got {}",
+        ds[idx_g * num_samples + 1]
+    );
+}
+
 // Sanity: a clean, properly atomized DEL (alt_len=1) passes the reader.
 #[test]
 fn test_reader_accepts_pure_del() {
@@ -393,6 +713,7 @@ fn test_reader_accepts_pure_del() {
         1,
         2,
         false,
+        &[],
     )
     .unwrap();
     let chunk = reader
@@ -439,6 +760,7 @@ fn test_missing_chrom_returns_err() {
         false,
         1,     // processing_threads
         false, // signatures
+        &[],   // fields
     );
 
     assert!(matches!(
@@ -463,6 +785,7 @@ fn test_missing_vcf_returns_missing_file() {
         1,
         2,
         false,
+        &[],
     );
 
     assert!(matches!(

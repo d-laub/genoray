@@ -55,6 +55,7 @@ pub fn process_chromosome(
     skip_out_of_scope: bool,
     processing_threads: usize,
     signatures: bool,
+    fields: &[crate::field::FieldSpec],
 ) -> Result<u64, ConversionError> {
     // Directory Formatting: svar2/{contig}/var_key/{snp,indel}
     let paths = crate::layout::ContigPaths::new(base_out_dir, chrom);
@@ -145,6 +146,7 @@ pub fn process_chromosome(
             // Convert references into owned Strings that can safely live forever in the thread
             let s_owned: Vec<String> = samples.iter().map(|&s| s.to_string()).collect();
             let pool = Arc::clone(&processing_pool);
+            let fields_owned: Vec<crate::field::FieldSpec> = fields.to_vec();
 
             move || -> Result<u64, ConversionError> {
                 // passing the thread budget down to HTSLib
@@ -157,6 +159,7 @@ pub fn process_chromosome(
                     htslib_threads,
                     ploidy,
                     skip_out_of_scope,
+                    &fields_owned,
                 )?;
                 let mut chunk_id = 0;
                 while let Some(dense_chunk) =
@@ -171,12 +174,13 @@ pub fn process_chromosome(
         .expect("spawn reader");
 
     // Step 2 -> The Executor
+    let fields_exec: Vec<crate::field::FieldSpec> = fields.to_vec();
     let executor_thread = thread::Builder::new()
         .name(format!("exec-{}", chrom))
         .spawn({
             move || {
                 let bank = LongAlleleTableWriter::new(tx_long, long_allele_capacity);
-                executor::run_compute_engine(rx_dense, tx_sparse, bank, signatures)
+                executor::run_compute_engine(rx_dense, tx_sparse, bank, signatures, &fields_exec)
             }
         })
         .expect("spawn executor");
@@ -269,6 +273,38 @@ pub fn process_chromosome(
     let mut ledgers = ledgers; // make mutable to move rows out
     for spec in &REGISTRY {
         let dir = stream_dirs.get(spec.tag).clone();
+
+        // Var_key field values are staged 1:1 with calls, so they share the
+        // ledger's column-major reordering with the pos/key streams merged
+        // below. Merge every field FIRST (borrowing the ledger) — merge_mini_sc
+        // moves the ledger out right after, and the two merges touch disjoint
+        // per-chunk files (chunk_{c}_field*.bin vs chunk_{c}_pos/key.bin), so
+        // ordering between them doesn't matter for correctness.
+        let sub_label = spec.subdir.replace('/', "_");
+        for (field_ix, field) in fields.iter().enumerate() {
+            let dest_dir = std::path::Path::new(base_out_dir)
+                .join(chrom)
+                .join("fields")
+                .join(field.category.as_str())
+                .join(&field.name)
+                .join(&sub_label);
+            fs::create_dir_all(&dest_dir).map_err(|e| ConversionError::Io {
+                context: format!("create_dir_all {:?}", dest_dir),
+                source: e,
+            })?;
+            let dest_values_bin = dest_dir.join("values.bin");
+            merge::merge_var_key_field_values(
+                dir.to_str().unwrap(),
+                num_chunks,
+                samples.len(),
+                ploidy,
+                ledgers.get(spec.tag),
+                field_ix,
+                4, // staged width (i32/f32); narrowed to final dtype at finalize (Task 9)
+                &dest_values_bin,
+            )?;
+        }
+
         let ledger = std::mem::take(ledgers.get_mut(spec.tag));
         merge::merge_mini_sc(
             spec.key_bytes,
@@ -290,6 +326,50 @@ pub fn process_chromosome(
             .join(chrom)
             .join(spec.subdir);
         let ledger = std::mem::take(dense_ledgers.get_mut(spec.class));
+
+        // Dense field values are staged 1:1 with dense variants under this
+        // class, so they need only chunk-order concatenation (no ledger-driven
+        // reordering). Merge every field FIRST (borrowing the ledger) — the
+        // per-chunk field files (chunk_{c}_finfo{i}.bin / chunk_{c}_fformat{j}.bin)
+        // are disjoint from the pos/key/geno files merge_dense_class consumes
+        // right after, so ordering between the two doesn't matter for correctness.
+        let sub_label = spec.subdir.replace('/', "_");
+        let mut info_ix = 0usize;
+        let mut format_ix = 0usize;
+        for field in fields.iter() {
+            let field_ix = match field.category {
+                crate::field::FieldCategory::Info => {
+                    let ix = info_ix;
+                    info_ix += 1;
+                    ix
+                }
+                crate::field::FieldCategory::Format => {
+                    let ix = format_ix;
+                    format_ix += 1;
+                    ix
+                }
+            };
+            let dest_dir = std::path::Path::new(base_out_dir)
+                .join(chrom)
+                .join("fields")
+                .join(field.category.as_str())
+                .join(&field.name)
+                .join(&sub_label);
+            fs::create_dir_all(&dest_dir).map_err(|e| ConversionError::Io {
+                context: format!("create_dir_all {:?}", dest_dir),
+                source: e,
+            })?;
+            let dest_values_bin = dest_dir.join("values.bin");
+            crate::dense_merge::merge_dense_field_values(
+                dir.to_str().unwrap(),
+                num_chunks,
+                &ledger,
+                field.category,
+                field_ix,
+                &dest_values_bin,
+            )?;
+        }
+
         crate::dense_merge::merge_dense_class(
             num_chunks,
             samples.len(),

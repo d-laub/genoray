@@ -2,13 +2,20 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from natsort import natsorted
 
 import genoray._core as _core
 from genoray._svar2_batch import _BatchQueryMixin
 from genoray._svar2_decode import _DecodeMixin
+from genoray._svar2_fields import _resolve_fields
 from genoray._svar2_mutcat import _MutcatMixin
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from genoray._svar2_fields import FormatField, InfoField
 
 
 def _ensure_bgzipped(source: Path) -> None:
@@ -71,6 +78,8 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         overwrite: bool = False,
         long_allele_capacity: int = 8 * 1024 * 1024,
         signatures: bool = False,
+        info_fields: Sequence[str | InfoField] | None = None,
+        format_fields: Sequence[str | FormatField] | None = None,
     ) -> int:
         """Convert a bgzipped VCF or BCF to an SVAR2 store.
 
@@ -84,6 +93,15 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         signatures: if True, classify SBS96/ID83 codes during the write and
         store the mutcat sidecar (factored into the dense/var_key cost model).
         Requires a reference; raises if `no_reference=True`.
+
+        info_fields, format_fields: scalar-numeric (Integer/Float, and Flag for
+        INFO) header fields to carry through to the SVAR2 store. Each entry is
+        either a bare field name (dtype auto-narrowed from the header, no
+        default fill) or an :class:`InfoField`/:class:`FormatField` spec
+        (explicit `dtype`/`default`). `default` fills VCF-missing entries;
+        otherwise a reserved sentinel/NaN is written. FORMAT fields are
+        genotype-aligned: non-carrier values are dropped for var_key-routed
+        variants.
         """
         from cyvcf2 import VCF as _CyVCF
 
@@ -113,6 +131,9 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             raise ValueError(f"No variants found in {source}.")
 
         reference_path = None if no_reference else str(reference)
+        flds = _resolve_fields(str(source), info_fields, format_fields)
+        info = [t for t in flds if t[1] == "info"]
+        format_ = [t for t in flds if t[1] == "format"]
         return _core.run_conversion_pipeline(
             str(source),
             reference_path,
@@ -125,4 +146,6 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             long_allele_capacity,
             skip_out_of_scope,
             signatures,
+            info,
+            format_,
         )

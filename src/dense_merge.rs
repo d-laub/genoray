@@ -10,7 +10,7 @@ use crate::layout;
 use crate::rvk::pack_snp_keys;
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub fn merge_dense_class(
     num_chunks: usize,
@@ -97,6 +97,63 @@ pub fn merge_dense_class(
     Ok(())
 }
 
+/// Concatenate one dense field's per-chunk `chunk_{c}_{finfo|fformat}{field_ix}.bin`
+/// files, in chunk order, into `dest_values_bin`.
+///
+/// Dense field values are staged 1:1 with dense variants (no ragged ledger, no
+/// transpose — an INFO value is one value per dense variant; a FORMAT value is
+/// `n_dense_variants[c] * num_samples` values, variant-major), so this mirrors
+/// `merge_dense_class`'s positions/keys concat exactly: a pure chunk-order byte
+/// concatenation reproduces the final layout. Chunks with `dense_ledger[c] == 0`
+/// wrote no per-chunk field file (Task 7) and are skipped here too.
+///
+/// `category` selects which per-chunk file family to read: `FieldCategory::Info`
+/// for INFO fields (`layout::chunk_field_info`) or `FieldCategory::Format` for
+/// FORMAT fields (`layout::chunk_field_format`). `field_ix` is the per-category
+/// (INFO-only or FORMAT-only) field index Task 7 staged under.
+///
+/// The caller is responsible for creating `dest_values_bin`'s parent directory
+/// before calling this function (this function does not call `create_dir_all`),
+/// mirroring `merge::merge_var_key_field_values`'s contract.
+///
+/// On success, the consumed per-chunk field files are removed.
+pub fn merge_dense_field_values(
+    output_dir: &str,
+    num_chunks: usize,
+    dense_ledger: &[u32],
+    category: crate::field::FieldCategory,
+    field_ix: usize,
+    dest_values_bin: &Path,
+) -> Result<(), ConversionError> {
+    debug_assert_eq!(
+        dense_ledger.len(),
+        num_chunks,
+        "dense_ledger must have exactly one row per chunk"
+    );
+    let dir = Path::new(output_dir);
+    let mut values: Vec<u8> = Vec::new();
+    let mut consumed: Vec<PathBuf> = Vec::new();
+    for (c, &count) in dense_ledger.iter().enumerate().take(num_chunks) {
+        if count == 0 {
+            continue;
+        }
+        let path = match category {
+            crate::field::FieldCategory::Info => layout::chunk_field_info(dir, c, field_ix),
+            crate::field::FieldCategory::Format => layout::chunk_field_format(dir, c, field_ix),
+        };
+        values.extend_from_slice(&fs::read(&path).map_err(|e| ConversionError::Io {
+            context: format!("reading {}", path.display()),
+            source: e,
+        })?);
+        consumed.push(path);
+    }
+    write_all(dest_values_bin, &values)?;
+    for path in consumed {
+        let _ = fs::remove_file(path);
+    }
+    Ok(())
+}
+
 fn write_all(path: &Path, bytes: &[u8]) -> Result<(), ConversionError> {
     let mut f = fs::File::create(path).map_err(|e| ConversionError::Io {
         context: format!("creating {}", path.display()),
@@ -117,6 +174,7 @@ fn write_all(path: &Path, bytes: &[u8]) -> Result<(), ConversionError> {
 mod tests {
     use super::*;
     use crate::bits::{get_bit, set_bit};
+    use crate::field::FieldCategory;
     use tempfile::tempdir;
 
     // Build a hap-major block (np rows × v_c cols) from a bool matrix
@@ -217,5 +275,101 @@ mod tests {
         merge_dense_class(1, 1, 1, 1, true, dir.to_str().unwrap(), vec![5]).unwrap();
         // pack_snp_keys([1,2,3,0,1]) == [0x39, 0x01] (see rvk.rs test)
         assert_eq!(fs::read(layout::alleles(dir)).unwrap(), vec![0x39u8, 0x01]);
+    }
+
+    fn read_i32(path: &Path) -> Vec<i32> {
+        let bytes = fs::read(path).unwrap();
+        bytes
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+
+    fn read_f32(path: &Path) -> Vec<f32> {
+        let bytes = fs::read(path).unwrap();
+        bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+
+    #[test]
+    fn test_merge_dense_field_values_finfo_skips_empty_chunk() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        // chunk0: 2 dense variants -> finfo0 = [10, 20] (i32)
+        write_all(
+            &layout::chunk_field_info(dir, 0, 0),
+            bytemuck::cast_slice(&[10i32, 20]),
+        )
+        .unwrap();
+        // chunk1: 1 dense variant -> finfo0 = [30] (i32)
+        write_all(
+            &layout::chunk_field_info(dir, 1, 0),
+            bytemuck::cast_slice(&[30i32]),
+        )
+        .unwrap();
+        // chunk2: 0 dense variants -> Task 7 wrote NO finfo file for it.
+        let dense_ledger = vec![2u32, 1, 0];
+        let dest = dir
+            .join("fields")
+            .join("DP")
+            .join("dense_snp")
+            .join("values.bin");
+        fs::create_dir_all(dest.parent().unwrap()).unwrap();
+
+        merge_dense_field_values(
+            dir.to_str().unwrap(),
+            3,
+            &dense_ledger,
+            FieldCategory::Info,
+            0,
+            &dest,
+        )
+        .unwrap();
+
+        assert_eq!(read_i32(&dest), vec![10, 20, 30]);
+        // Consumed per-chunk field files are removed.
+        assert!(!layout::chunk_field_info(dir, 0, 0).exists());
+        assert!(!layout::chunk_field_info(dir, 1, 0).exists());
+    }
+
+    #[test]
+    fn test_merge_dense_field_values_fformat_concat() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        // num_samples=2, variant-major. chunk0: 1 dense variant -> 2 values.
+        write_all(
+            &layout::chunk_field_format(dir, 0, 1),
+            bytemuck::cast_slice(&[1.0f32, 2.0]),
+        )
+        .unwrap();
+        // chunk1: 2 dense variants -> 4 values.
+        write_all(
+            &layout::chunk_field_format(dir, 1, 1),
+            bytemuck::cast_slice(&[3.0f32, 4.0, 5.0, 6.0]),
+        )
+        .unwrap();
+        let dense_ledger = vec![1u32, 2];
+        let dest = dir
+            .join("fields")
+            .join("DS")
+            .join("dense_indel")
+            .join("values.bin");
+        fs::create_dir_all(dest.parent().unwrap()).unwrap();
+
+        merge_dense_field_values(
+            dir.to_str().unwrap(),
+            2,
+            &dense_ledger,
+            FieldCategory::Format,
+            1,
+            &dest,
+        )
+        .unwrap();
+
+        assert_eq!(read_f32(&dest), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert!(!layout::chunk_field_format(dir, 0, 1).exists());
+        assert!(!layout::chunk_field_format(dir, 1, 1).exists());
     }
 }

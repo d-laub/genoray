@@ -24,13 +24,14 @@ pub fn run_compute_engine(
     tx_sparse: Sender<SparseChunk>,
     mut bank: LongAlleleTableWriter,
     sidecar_bits_enabled: bool,
+    fields: &[crate::field::FieldSpec],
 ) -> Phase1Output {
     let mut var_key_ledgers: StreamMap<Vec<Vec<u32>>> =
         StreamMap::from_fn(|_| Vec::with_capacity(10_000));
     let mut dense_ledgers: DenseMap<Vec<u32>> = DenseMap::from_fn(|_| Vec::with_capacity(10_000));
 
     while let Ok(chunk) = rx_dense.recv() {
-        let sparse_chunk = dense2sparse_vk(&chunk, &mut bank, sidecar_bits_enabled);
+        let sparse_chunk = dense2sparse_vk(&chunk, &mut bank, sidecar_bits_enabled, fields);
 
         for (tag, sub) in sparse_chunk.streams.iter() {
             var_key_ledgers
@@ -79,6 +80,8 @@ mod tests {
             alt: b"C".to_vec(),
             alt_offsets: vec![0, 1],
             genos,
+            info_staged: Vec::new(),
+            format_staged: Vec::new(),
         }
     }
 
@@ -91,7 +94,7 @@ mod tests {
         drop(tx_d);
 
         let bank = crate::nrvk::LongAlleleTableWriter::new(tx_l, 1 << 16);
-        let out = run_compute_engine(rx_d, tx_s, bank, false);
+        let out = run_compute_engine(rx_d, tx_s, bank, false, &[]);
 
         // one chunk processed → one ledger row per stream and per dense class
         assert_eq!(out.var_key_ledgers.get(StreamTag::VarKeySnp).len(), 1);

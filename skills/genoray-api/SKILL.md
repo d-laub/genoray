@@ -17,7 +17,8 @@ description: Use when writing or modifying Python code that imports `genoray` to
 - `genoray.VCF` — VCF/BCF reader
 - `genoray.Filter` — VCF filter value object bundling a cyvcf2 record predicate (`record`) with its matching `.gvi` polars expression (`expr`)
 - `genoray.SparseVar` — sparse `.svar` reader/writer
-- `genoray.SparseVar2` — next-gen sparse variant store (VCF/BCF → SVAR2 conversion via `from_vcf`; range queries via `decode`/`region_counts`/`read_ranges`; mutational-signature support (SBS96/DBS78/ID83) via `annotate_mutations`/`mutation_matrix`/`assign_signatures`, or classify during the write with `from_vcf(signatures=True)`)
+- `genoray.SparseVar2` — next-gen sparse variant store (VCF/BCF → SVAR2 conversion via `from_vcf`; range queries via `decode`/`region_counts`/`read_ranges`; mutational-signature support (SBS96/DBS78/ID83) via `annotate_mutations`/`mutation_matrix`/`assign_signatures`, or classify during the write with `from_vcf(signatures=True)`; scalar-numeric INFO/FORMAT field extraction during the write via `from_vcf(info_fields=, format_fields=)`)
+- `genoray.InfoField` / `genoray.FormatField` — frozen dataclasses (`name`, `dtype=None`, `default=None`) configuring a single INFO/FORMAT field for `SparseVar2.from_vcf`; a bare `str` name uses inferred defaults instead
 - `genoray.exprs` — polars filter expressions for `.gvi` indexes
 - `genoray.cosmic_signatures` — fetch/cache COSMIC reference signatures
 - `genoray.fit_signatures` — sparse forward-selection signature refit
@@ -35,7 +36,8 @@ Prefer reading these over guessing:
 - `genoray/_vcf.py` — `VCF` class: constructor, `read`, `chunk`, mode constants near the top of the class; `get_record_info(contig=None, start=None, end=None, fields=None, info=None, lazy=False)` — non-FORMAT record-level fields (including INFO) for a range or the whole file, returns `pl.DataFrame` (or `pl.LazyFrame` when `lazy=True`)
 - `genoray/_pgen.py` — `PGEN` class: constructor, `read`, `chunk`, `read_ranges`, `chunk_ranges`, mode constants near the top of the class
 - `genoray/_svar.py` — `SparseVar`: `__init__`, `from_vcf`, `from_pgen`, `read_ranges`, `read_ranges_with_length(contig, starts=0, ends=POS_MAX, samples=None)` (length-guaranteed range read; returns the same type as `read_ranges` — a `Ragged` or fields-augmented record), `with_fields`, `annotate_mutations`, `mutation_matrix`, `assign_signatures`, `annotate_with_gtf(gtf, level_filter=1, write_back=True, *, strand_encoding=None, codon_null_token=None)` (GTF CDS annotation entry point, returns `pl.DataFrame` with `varID`/`gene_id`/`strand`/`codon_pos`), `cache_afs()` (computes and persists an `AF` column to the `.gvi` index; returns `None`)
-- `genoray/_svar2.py` — `SparseVar2`: `__init__`, `from_vcf` (VCF/BCF → SVAR2 conversion entry point, `signatures=` classifies during the write); `n_samples`/`available_samples`/`contigs`/`ploidy` metadata. Read/query methods live in the mixins: `genoray/_svar2_decode.py` (`decode`, `region_counts`), `genoray/_svar2_batch.py` (public `read_ranges`; internal gvl-only `_overlap_batch`/`_find_ranges`/`_gather_ranges`), and `genoray/_svar2_mutcat.py` (`annotate_mutations`, `mutation_matrix`, `assign_signatures` — COSMIC mutational-signature workflow, mirroring `SparseVar`'s but backed by a per-contig Rust sidecar instead of a `.gvi`-attached field)
+- `genoray/_svar2.py` — `SparseVar2`: `__init__`, `from_vcf` (VCF/BCF → SVAR2 conversion entry point, `signatures=` classifies during the write, `info_fields=`/`format_fields=` extract scalar-numeric fields during the write); `n_samples`/`available_samples`/`contigs`/`ploidy` metadata. Read/query methods live in the mixins: `genoray/_svar2_decode.py` (`decode`, `region_counts`), `genoray/_svar2_batch.py` (public `read_ranges`; internal gvl-only `_overlap_batch`/`_find_ranges`/`_gather_ranges`), and `genoray/_svar2_mutcat.py` (`annotate_mutations`, `mutation_matrix`, `assign_signatures` — COSMIC mutational-signature workflow, mirroring `SparseVar`'s but backed by a per-contig Rust sidecar instead of a `.gvi`-attached field)
+- `genoray/_svar2_fields.py` — `InfoField`/`FormatField` dataclasses + `FieldDtype` and the header/dtype validation used by `from_vcf(info_fields=, format_fields=)` (no public read-side API yet)
 - `genoray/_cli/__main__.py` — the `genoray` CLI (`index`, `write` / `write svar1`, `view`)
 - `genoray/_signatures.py` — `cosmic_signatures`, `fit_signatures`
 - `genoray/_reference.py` — `Reference`: `from_path`, `fetch`, `contig_array`
@@ -244,7 +246,7 @@ dropped = SparseVar2.from_vcf(
 dropped = SparseVar2.from_vcf("out.svar2", "file.vcf.gz", no_reference=True)
 ```
 
-Signature: `from_vcf(out, source, reference=None, *, no_reference=False, skip_out_of_scope=False, ploidy=2, chunk_size=25_000, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False) -> int`
+Signature: `from_vcf(out, source, reference=None, *, no_reference=False, skip_out_of_scope=False, ploidy=2, chunk_size=25_000, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False, info_fields=None, format_fields=None) -> int`
 
 - `source` — a bgzipped VCF (`.vcf.gz`) or BCF (`.bcf`). **VCF/BCF only** — no PGEN
   source yet (roadmap M7). Auto-indexes (`.csi`) if no `.csi`/`.tbi` is found.
@@ -268,6 +270,51 @@ Signature: `from_vcf(out, source, reference=None, *, no_reference=False, skip_ou
   `mutcat` sidecar yet (unlike `SparseVar.annotate_mutations`/
   `mutation_matrix`, below) — this flag only controls whether the sidecar is
   written.
+- `info_fields=`/`format_fields=` — `Sequence[str | InfoField]` /
+  `Sequence[str | FormatField]`, `None` by default. Extracts **scalar-numeric**
+  INFO/FORMAT fields into the store during the write:
+
+  ```python
+  from genoray import SparseVar2, InfoField, FormatField
+
+  SparseVar2.from_vcf(
+      "out.svar2", "file.vcf.gz", "ref.fa",
+      info_fields=["AC", InfoField("AF", dtype="f16")],
+      format_fields=[FormatField("DS", default=0.0)],
+  )
+  ```
+
+  - **Scope: scalar-numeric only.** Header `Type` must be `Integer`, `Float`,
+    or `Flag`; `Number` must be `1`, biallelic-split `A`, or `0` (`Flag`,
+    INFO-only). Anything else (`Number=R`/`G`/`.`, `String`/`Character`
+    fields) raises `ValueError` at config time, before conversion starts. A
+    bare `str` name uses inferred defaults (`dtype=None`, no `default`); pass
+    an `InfoField`/`FormatField` to override.
+  - **`dtype`** (`FieldDtype = Literal["bool","i8","u8","i16","u16","i32","u32","f16","f32"]`):
+    `None` (default) auto-resolves — `Integer`/`Flag` are **losslessly
+    auto-narrowed** to the smallest width fitting the observed global range
+    (plus a reserved missing sentinel); `Float` always resolves to `f32`
+    (never silently downcast). An explicit `dtype` is validated at
+    conversion time against both the header type (e.g. `Float` cannot target
+    an int width) and the observed range — overflow, or `f16`'s ~65504
+    range, raises `ValueError`. `f16` is the only lossy option and must be
+    requested explicitly.
+  - **`default`** — the value written for VCF-missing entries; otherwise a
+    reserved sentinel at the extreme of the chosen width (`INT*_MIN` for
+    signed widths, `u*::MAX` for unsigned widths — auto-narrowing prefers
+    unsigned when the observed range is non-negative — and `NaN` for float
+    widths). `Flag` fields are never missing (absent ⇒ `false`/`0`).
+  - **FORMAT is genotype-aligned, not independently lossless**: a FORMAT
+    value is stored only where the genotype has a call — one value per
+    carrier call in var_key-routed variants, or a full dense per-sample
+    column (non-carrier slots filled with `default`/sentinel) in
+    dense-routed variants. Non-carrier FORMAT values (e.g. an imputed
+    dosage at a ref/ref genotype) are **dropped by design** in this version;
+    an independent lossless FORMAT stream is deferred to a future spec.
+  - **No read path yet** — this only controls what gets written. Querying
+    stored field values back out (a decode/query API) is not implemented;
+    see `meta.json`'s `"fields"` array and `docs/roadmap/data-model.md` for
+    the on-disk layout if you need to inspect values directly.
 
 ### Range queries
 

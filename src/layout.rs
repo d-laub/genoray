@@ -115,6 +115,15 @@ pub fn offsets(dir: &Path) -> PathBuf {
 pub fn chunk_geno(dir: &Path, chunk_id: usize) -> PathBuf {
     dir.join(format!("chunk_{}_geno.bin", chunk_id))
 }
+pub fn chunk_field(dir: &Path, chunk_id: usize, field_ix: usize) -> PathBuf {
+    dir.join(format!("chunk_{}_field{}.bin", chunk_id, field_ix))
+}
+pub fn chunk_field_info(dir: &Path, chunk_id: usize, field_ix: usize) -> PathBuf {
+    dir.join(format!("chunk_{}_finfo{}.bin", chunk_id, field_ix))
+}
+pub fn chunk_field_format(dir: &Path, chunk_id: usize, field_ix: usize) -> PathBuf {
+    dir.join(format!("chunk_{}_fformat{}.bin", chunk_id, field_ix))
+}
 pub fn genotypes(dir: &Path) -> PathBuf {
     dir.join("genotypes.bin")
 }
@@ -186,6 +195,24 @@ mod tests {
         assert_eq!(
             genotypes(dir),
             Path::new("/out/chr1/dense/snp/genotypes.bin")
+        );
+    }
+
+    #[test]
+    fn test_chunk_field_names() {
+        let dir = Path::new("/out/chr1/var_key/snp");
+        assert_eq!(
+            chunk_field(dir, 3, 0),
+            Path::new("/out/chr1/var_key/snp/chunk_3_field0.bin")
+        );
+        let dense_dir = Path::new("/out/chr1/dense/snp");
+        assert_eq!(
+            chunk_field_info(dense_dir, 3, 1),
+            Path::new("/out/chr1/dense/snp/chunk_3_finfo1.bin")
+        );
+        assert_eq!(
+            chunk_field_format(dense_dir, 3, 2),
+            Path::new("/out/chr1/dense/snp/chunk_3_fformat2.bin")
         );
     }
 

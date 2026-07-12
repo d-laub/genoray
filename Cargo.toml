@@ -10,6 +10,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 bytemuck = "1.25.0"
 crossbeam-channel = "0.5.15"
+half = "2"
 memmap2 = "0.9.10"
 ndarray = "0.17.2"
 ndarray-npy = "0.10.0"

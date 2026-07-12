@@ -1,4 +1,5 @@
 // src/lib.rs
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 #[cfg(feature = "conversion")]
 use rayon::prelude::*;
@@ -24,6 +25,9 @@ mod enum_map;
 pub mod error;
 #[cfg(feature = "conversion")]
 pub mod executor;
+pub mod field;
+#[cfg(feature = "conversion")]
+pub mod field_finalize;
 pub mod layout;
 #[cfg(feature = "conversion")]
 pub mod max_del;
@@ -92,8 +96,9 @@ fn index_vcf(path: String) -> PyResult<()> {
 //The Python Wrapper and resource allocator
 #[cfg(feature = "conversion")]
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
 #[pyfunction]
-#[pyo3(signature = (vcf_path, reference_path, chroms, output_dir, samples, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false, signatures=false))]
+#[pyo3(signature = (vcf_path, reference_path, chroms, output_dir, samples, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false, signatures=false, info_fields=Vec::new(), format_fields=Vec::new()))]
 fn run_conversion_pipeline(
     py: Python,
     vcf_path: String,
@@ -107,8 +112,15 @@ fn run_conversion_pipeline(
     long_allele_capacity: usize, // default 8MB — old 100MB rarely flushed mid-run, blocking executor at finalize
     skip_out_of_scope: bool,
     signatures: bool,
+    info_fields: Vec<(String, String, String, Option<String>, Option<f64>)>,
+    format_fields: Vec<(String, String, String, Option<String>, Option<f64>)>,
 ) -> PyResult<usize> {
     let sample_refs: Vec<&str> = samples.iter().map(|s| s.as_str()).collect();
+
+    let mut raw = info_fields;
+    raw.extend(format_fields);
+    let fields =
+        crate::field::parse_manifest(raw).map_err(|e| PyValueError::new_err(e.to_string()))?;
 
     let results: Vec<Result<u64, crate::error::ConversionError>> = py.detach(|| {
         // Step 1 -> HW discovery/override and budgeting
@@ -175,6 +187,7 @@ fn run_conversion_pipeline(
                         skip_out_of_scope,
                         processing_threads,
                         signatures,
+                        &fields,
                     )
                 })
                 .collect::<Vec<_>>()
@@ -189,6 +202,14 @@ fn run_conversion_pipeline(
         total_dropped += r?; // ConversionError -> PyErr via From (category-aware)
     }
 
+    // All contigs staged — resolve each field's global on-disk dtype and
+    // rewrite its staged values.bin files to that width.
+    let resolved_fields = crate::field_finalize::finalize_fields(
+        std::path::Path::new(&output_dir),
+        &chroms,
+        &fields,
+    )?;
+
     // All contigs converted — write the top-level meta.json describing the cohort.
     crate::meta::write_meta(
         std::path::Path::new(&output_dir),
@@ -196,6 +217,7 @@ fn run_conversion_pipeline(
         &samples,
         &chroms,
         ploidy,
+        &resolved_fields,
     )
     .map_err(|e| pyo3::exceptions::PyOSError::new_err(format!("failed to write meta.json: {e}")))?;
 

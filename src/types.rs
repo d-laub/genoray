@@ -92,6 +92,32 @@ impl BitGrid3 {
     }
 }
 
+// A single staged INFO/FORMAT field column, monomorphic per column so the hot
+// reader path never boxes/dyn-dispatches per value. `Int` also carries Flag
+// columns (staged as 0/1). Values are always produced from `f64` (the common
+// currency `FieldSpec` resolution works in) and narrowed on push.
+pub enum StagedColumn {
+    Int(Vec<i32>),
+    Float(Vec<f32>),
+}
+
+impl StagedColumn {
+    pub fn with_capacity(is_float: bool, n: usize) -> Self {
+        if is_float {
+            StagedColumn::Float(Vec::with_capacity(n))
+        } else {
+            StagedColumn::Int(Vec::with_capacity(n))
+        }
+    }
+
+    pub fn push_f64(&mut self, v: f64) {
+        match self {
+            StagedColumn::Int(x) => x.push(v as i32),
+            StagedColumn::Float(x) => x.push(v as f32),
+        }
+    }
+}
+
 // Defines DenseChunk and SparseChunk structs. All other files import from here.
 
 // The struct produced by the VCF Reader and consumed by the Compute Thread (variant key)
@@ -108,6 +134,15 @@ pub struct DenseChunk {
 
     // Dense Genotype Tensor - Shape (Variants, Samples, Ploidy), bit-packed
     pub genos: BitGrid3, // (V, S, P)
+
+    // Staged INFO/FORMAT field columns, one per requested `FieldSpec`, in the
+    // same relative order as they appear (filtered by category) in the
+    // `fields` slice passed to `VcfChunkReader::new`. Empty when no fields
+    // were requested. `info_staged[i].len() == v`;
+    // `format_staged[j].len() == v * num_samples`, laid out variant-major
+    // then sample-minor: index `variant * num_samples + sample`.
+    pub info_staged: Vec<StagedColumn>,
+    pub format_staged: Vec<StagedColumn>,
 }
 
 // One position-sorted sub-stream of calls with byte-erased keys (`key_bytes`
@@ -120,6 +155,12 @@ pub struct SparseSubStream {
     // Calls per (sample, ploid) in THIS sub-stream. Length == samples * ploidy.
     pub sample_lengths: Vec<u32>,
     pub key_bytes: usize,
+    // Genotype-aligned (Option A) per-call field values: one `StagedColumn`
+    // per field in FLAT `fields` order (INFO and FORMAT interleaved as they
+    // appear in the `fields` slice passed to `dense2sparse_vk`), each pushed
+    // in lockstep with `push_call` — `field_calls[i].len() ==
+    // call_positions.len()`. Empty when no fields were requested.
+    pub field_calls: Vec<StagedColumn>,
 }
 
 impl SparseSubStream {
@@ -129,6 +170,7 @@ impl SparseSubStream {
             call_keys: Vec::with_capacity(nnz * key_bytes),
             sample_lengths: Vec::with_capacity(columns),
             key_bytes,
+            field_calls: Vec::new(),
         }
     }
     #[inline(always)]
@@ -150,6 +192,14 @@ pub struct DenseSubChunk {
     // Hap-major bit block, shape (S, P, n_dense_variants), variant fastest.
     // Bit (hap h, dense col d) at flat index h*n_dense_variants + d.
     pub geno_bits: Vec<u8>,
+    // Genotype-aligned (Option A) dense field columns. `field_info[i]` is one
+    // per INFO field, `len() == n_dense_variants`. `field_format[j]` is one
+    // per FORMAT field, a FULL per-sample column: `len() == n_dense_variants
+    // * num_samples`; carrier samples get the read value, non-carrier
+    // samples get the field's default/sentinel. Both empty when no fields
+    // were requested.
+    pub field_info: Vec<StagedColumn>,
+    pub field_format: Vec<StagedColumn>,
 }
 
 impl DenseSubChunk {
@@ -160,6 +210,8 @@ impl DenseSubChunk {
             positions: Vec::new(),
             keys: Vec::new(),
             geno_bits: Vec::new(),
+            field_info: Vec::new(),
+            field_format: Vec::new(),
         }
     }
 }
