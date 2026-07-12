@@ -693,4 +693,30 @@ mod tests {
         assert!(matches!(resolved[0].dtype, StorageDtype::U8));
         assert_eq!(resolved[0].default, Some(0.0));
     }
+
+    #[test]
+    fn explicit_f32_rewrites_in_place_byte_identical() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let contig = "chr1";
+        let vals: [f32; 4] = [0.5, -1.25, 0.0, 3.5];
+        // stage under one var_key sub label
+        write_f32_field(root, contig, "DS", "var_key_snp", &vals);
+        let path = root
+            .join(contig)
+            .join("fields")
+            .join("format")
+            .join("DS")
+            .join("var_key_snp")
+            .join("values.bin");
+        let before = read_values_bin(&path);
+
+        let field = float_field("DS", StorageDtype::F32, None);
+        let resolved = finalize_fields(root, &[contig.to_string()], &[field]).unwrap();
+
+        assert_eq!(resolved[0].dtype, StorageDtype::F32);
+        let after = read_values_bin(&path);
+        // f32 staged -> f32 resolved: rewrite must reproduce the same 16 bytes.
+        assert_eq!(before, after, "f32->f32 finalize must be byte-identical");
+    }
 }
