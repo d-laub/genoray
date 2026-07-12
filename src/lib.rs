@@ -24,6 +24,7 @@ mod enum_map;
 pub mod error;
 #[cfg(feature = "conversion")]
 pub mod executor;
+pub mod field;
 pub mod layout;
 #[cfg(feature = "conversion")]
 pub mod max_del;
