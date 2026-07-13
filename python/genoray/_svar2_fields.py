@@ -124,6 +124,10 @@ NP_DTYPE: dict[str, np.dtype] = {
 }
 
 
+#: numpy dtype -> the `meta.json` storage-dtype string the Rust side expects.
+_META_DTYPE: dict[np.dtype, str] = {v: k for k, v in NP_DTYPE.items()}
+
+
 @dataclass(frozen=True)
 class StoredField:
     """A field present in a finished SVAR2 store, as declared by ``meta.json``.
