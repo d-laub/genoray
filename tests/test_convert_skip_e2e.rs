@@ -41,14 +41,16 @@ fn convert(
     build_fasta_with_index(&bcf.with_extension("fa"), "chr1", 1000, &recs);
     let sample_refs: Vec<&str> = samples.to_vec();
     process_chromosome(
-        bcf.to_str().unwrap(),
+        genoray_core::orchestrator::SourceSpec::Vcf {
+            vcf_path: bcf.to_str().unwrap().to_string(),
+            htslib_threads: 1,
+        },
         fasta,
         "chr1",
         out.to_str().unwrap(),
         &sample_refs,
         25_000,
         2,
-        1,
         8 * 1024 * 1024,
         skip,
         1,     // processing_threads

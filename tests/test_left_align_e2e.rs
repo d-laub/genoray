@@ -4,7 +4,8 @@
 mod common;
 
 use common::{SynthRecord, build_bcf_with_index};
-use genoray_core::vcf_reader::VcfChunkReader;
+use genoray_core::chunk_assembler::ChunkAssembler;
+use genoray_core::vcf_reader::VcfRecordSource;
 use proptest::prelude::*;
 use std::io::Write;
 use std::path::Path;
@@ -24,13 +25,13 @@ fn write_ref(fasta_path: &Path, chrom: &str, seq: &[u8]) {
 }
 
 fn drain(bcf: &Path, fasta: &Path, chrom: &str, samples: &[&str]) -> Vec<(u32, i32)> {
-    let mut reader = VcfChunkReader::new(
-        bcf.to_str().unwrap(),
+    let source = VcfRecordSource::new(bcf.to_str().unwrap(), chrom, samples, 1, 2, &[]).unwrap();
+    let mut reader = ChunkAssembler::new(
+        Box::new(source),
+        samples.len(),
+        2,
         Some(fasta.to_str().unwrap()),
         chrom,
-        samples,
-        1,
-        2,
         false,
         &[],
     )
@@ -234,13 +235,13 @@ fn left_shifts_stay_sorted_across_chunk_boundaries() {
     build_bcf_with_index(&bcf, "chr1", REF_SEQ.len() as u64, &samples, &records);
 
     // chunk_size = 1 forces every atom into its own chunk.
-    let mut reader = VcfChunkReader::new(
-        bcf.to_str().unwrap(),
+    let source = VcfRecordSource::new(bcf.to_str().unwrap(), "chr1", &samples, 1, 2, &[]).unwrap();
+    let mut reader = ChunkAssembler::new(
+        Box::new(source),
+        samples.len(),
+        2,
         Some(fasta.to_str().unwrap()),
         "chr1",
-        &samples,
-        1,
-        2,
         false,
         &[],
     )
@@ -301,13 +302,14 @@ proptest! {
             .collect();
         build_bcf_with_index(&bcf, "chr1", seed.len() as u64, &samples, &synth);
 
-        let mut reader = VcfChunkReader::new(
-            bcf.to_str().unwrap(),
+        let source =
+            VcfRecordSource::new(bcf.to_str().unwrap(), "chr1", &samples, 1, 2, &[]).unwrap();
+        let mut reader = ChunkAssembler::new(
+            Box::new(source),
+            samples.len(),
+            2,
             Some(fasta.to_str().unwrap()),
             "chr1",
-            &samples,
-            1,
-            2,
             false,
             &[],
         )

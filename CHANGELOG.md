@@ -2,6 +2,19 @@
 
 ### Added
 
+- `SparseVar2.from_pgen` converts a PLINK2 PGEN (`.pgen`/`.pvar`/`.psam`) to an
+  SVAR2 store through the same normalization, atom, and merge spine as
+  `from_vcf`. Diploid-only (no `ploidy=` kwarg); dosages, INFO/FORMAT fields,
+  and sample subsetting are out of scope for this entry point. Verified
+  byte-for-byte equivalent to `from_vcf` on a 3202-sample/1,001,385-variant
+  germline cohort (chr21, symbolics filtered so both backends see the same
+  variant set); on that cohort `from_pgen` converts in **152.7s** vs
+  `from_vcf`'s **547.0s** (**3.6× faster**, confirming the reader-not-the-
+  bottleneck hypothesis), at the cost of **~2.1× peak RSS** (1065 MiB vs
+  497 MiB) — see the benchmark notes in
+  `docs/superpowers/specs/2026-07-12-pgen-to-svar2-design.md` for the full
+  methodology, the `.pvar`-skip and OpenMP-oversubscription findings, and
+  follow-ups.
 - `SparseVar2.annotate_mutations`, `mutation_matrix`, and `assign_signatures`
   for COSMIC mutational-signature workflows (SBS96/ID83/DBS78), implemented in
   Rust with a per-record sidecar and streaming count matrix. `from_vcf` gains a
@@ -61,11 +74,26 @@
   `uint32` variant-index array) as its third tuple element instead of an
   `n_extension_vars` count, matching `PGEN._chunk_ranges_with_length`.
 
+### Perf
+
+- Conversion reader staging memory no longer scales with `chunk_size`:
+  presence bits are packed in word-aligned windows and each atom's per-column
+  genotype vector is dropped as soon as its bits are set, bounding reader
+  memory at `window * n_samples * ploidy * 4` bytes instead of
+  `chunk_size * n_samples * ploidy * 4`. Output is bit-identical. Benefits
+  both `from_vcf` and `from_pgen`.
+
 ### Fix
 
 - **vcf**: apply configured `filter` on `VCF.read(..., mode=Genos*Dosages)` when no
   `.gvi` index is loaded, matching the genotype-only and dosage-only modes
   (previously the filter was silently ignored on this path).
+- **svar2**: `SparseVar2.from_pgen` no longer silently corrupts every variant
+  after the first monomorphic site (`.pvar` ALT `.`, which plink2 routinely
+  emits for real cohorts). A null ALT was propagating as NaN into a `uintp`
+  cumulative-sum array, corrupting `allele_idx_offsets` file-wide; the Rust
+  `.pvar` reader also no longer treats a bare `.` ALT as a literal one-character
+  allele.
 
 ## 2.15.0 (2026-06-30)
 

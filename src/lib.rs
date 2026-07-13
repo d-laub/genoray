@@ -17,6 +17,8 @@ pub fn bits_get_bit(bytes: &[u8], i: usize) -> bool {
 }
 #[cfg(feature = "conversion")]
 pub mod budget;
+#[cfg(feature = "conversion")]
+pub mod chunk_assembler;
 pub mod cost_model;
 pub mod dense;
 #[cfg(feature = "conversion")]
@@ -43,6 +45,10 @@ pub mod normalize;
 pub mod nrvk;
 #[cfg(feature = "conversion")]
 pub mod orchestrator;
+#[cfg(feature = "conversion")]
+pub mod pgen_reader;
+#[cfg(feature = "conversion")]
+pub mod pvar;
 // NOTE: `py_convert` is *not* conversion-only despite being in the original gate
 // list: query-core `py_query_batch.rs`/`py_query_decode.rs`/`py_query_ranges.rs`
 // import its numpy-array conversion helpers unconditionally, and py_convert.rs
@@ -55,6 +61,8 @@ pub mod py_query_batch;
 pub mod py_query_decode;
 pub mod py_query_ranges;
 pub mod query;
+#[cfg(feature = "conversion")]
+pub mod record_source;
 pub mod rvk;
 pub mod search;
 pub mod spine;
@@ -175,14 +183,16 @@ fn run_conversion_pipeline(
                 .map(|chrom| {
                     println!("==> Processing {}", chrom);
                     orchestrator::process_chromosome(
-                        &vcf_path,
+                        orchestrator::SourceSpec::Vcf {
+                            vcf_path: vcf_path.clone(),
+                            htslib_threads,
+                        },
                         fasta_ref,
                         chrom,
                         &output_dir,
                         &sample_refs,
                         chunk_size,
                         ploidy,
-                        htslib_threads,
                         long_allele_capacity,
                         skip_out_of_scope,
                         processing_threads,
@@ -224,10 +234,135 @@ fn run_conversion_pipeline(
     Ok(total_dropped as usize)
 }
 
+/// Convert a PLINK2 PGEN to an SVAR2 store.
+///
+/// `contig_ranges[i]` is the half-open `[var_start, var_end)` variant index range
+/// of `chroms[i]` within the `.pvar`. `pgen_readers[i]` is a distinct
+/// `pgenlib.PgenReader` for `chroms[i]` -- readers seek independently, so contigs
+/// must not share one.
+#[cfg(feature = "conversion")]
+#[allow(clippy::too_many_arguments)]
+#[pyfunction]
+#[pyo3(signature = (pgen_path, pvar_path, reference_path, chroms, contig_ranges, output_dir, samples, chunk_size, max_threads, long_allele_capacity, skip_out_of_scope, signatures, pgen_readers))]
+fn run_pgen_conversion_pipeline(
+    py: Python,
+    pgen_path: String,
+    pvar_path: String,
+    reference_path: Option<String>,
+    chroms: Vec<String>,
+    contig_ranges: Vec<(usize, usize)>,
+    output_dir: String,
+    samples: Vec<String>,
+    chunk_size: usize,
+    max_threads: Option<usize>,
+    long_allele_capacity: usize,
+    skip_out_of_scope: bool,
+    signatures: bool,
+    pgen_readers: Vec<Py<PyAny>>,
+) -> PyResult<usize> {
+    if chroms.len() != contig_ranges.len() || chroms.len() != pgen_readers.len() {
+        return Err(PyValueError::new_err(
+            "chroms, contig_ranges, and pgen_readers must be the same length",
+        ));
+    }
+    let sample_refs: Vec<&str> = samples.iter().map(|s| s.as_str()).collect();
+    // PGEN is diploid-only.
+    let ploidy = 2usize;
+    // PGEN carries no FORMAT, and .pvar INFO extraction is out of scope.
+    let fields: Vec<crate::field::FieldSpec> = Vec::new();
+
+    // Pair each contig with its own reader BEFORE detaching, so the Py handles move
+    // into the worker threads (Py<PyAny> is Send; PyAny is not).
+    let jobs: Vec<(String, (usize, usize), Py<PyAny>)> = chroms
+        .iter()
+        .cloned()
+        .zip(contig_ranges.iter().copied())
+        .zip(pgen_readers)
+        .map(|((c, r), rd)| (c, r, rd))
+        .collect();
+
+    let results: Vec<Result<u64, crate::error::ConversionError>> = py.detach(|| {
+        let available_cores = match max_threads {
+            Some(t) if t > 0 => t,
+            _ => std::thread::available_parallelism().unwrap().get(),
+        };
+        let plan = crate::budget::plan_thread_budget(available_cores, jobs.len());
+        let concurrent_chroms = plan.concurrent_chroms;
+        let processing_threads = plan.processing_threads;
+        println!(
+            "Pipeline Config (PGEN): {} concurrent chromosomes | {} processing threads each.",
+            concurrent_chroms, processing_threads
+        );
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(concurrent_chroms)
+            .thread_name(|i| format!("chrom-{}", i))
+            .build()
+            .expect("build chrom pool");
+
+        pool.install(|| {
+            jobs.into_par_iter()
+                .map(|(chrom, (lo, hi), reader)| {
+                    orchestrator::process_chromosome(
+                        orchestrator::SourceSpec::Pgen {
+                            pgen_path: pgen_path.clone(),
+                            pvar_path: pvar_path.clone(),
+                            var_start: lo,
+                            var_end: hi,
+                            reader,
+                        },
+                        reference_path.as_deref(),
+                        &chrom,
+                        &output_dir,
+                        &sample_refs,
+                        chunk_size,
+                        ploidy,
+                        long_allele_capacity,
+                        skip_out_of_scope,
+                        processing_threads,
+                        signatures,
+                        &fields,
+                    )
+                })
+                .collect()
+        })
+    });
+
+    let mut dropped = 0u64;
+    for r in results {
+        dropped += r?;
+    }
+
+    // All contigs staged — resolve each field's global on-disk dtype (no-op:
+    // PGEN carries no fields) and rewrite its staged values.bin files to that
+    // width, then write the top-level meta.json describing the cohort. Mirrors
+    // the tail of `run_conversion_pipeline` -- without this, `SparseVar2(out)`
+    // has no `meta.json` to load.
+    let resolved_fields = crate::field_finalize::finalize_fields(
+        std::path::Path::new(&output_dir),
+        &chroms,
+        &fields,
+    )?;
+
+    crate::meta::write_meta(
+        std::path::Path::new(&output_dir),
+        crate::meta::FORMAT_VERSION,
+        &samples,
+        &chroms,
+        ploidy,
+        &resolved_fields,
+    )
+    .map_err(|e| pyo3::exceptions::PyOSError::new_err(format!("failed to write meta.json: {e}")))?;
+
+    Ok(dropped as usize)
+}
+
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "conversion")]
     m.add_function(wrap_pyfunction!(run_conversion_pipeline, m)?)?;
+    #[cfg(feature = "conversion")]
+    m.add_function(wrap_pyfunction!(run_pgen_conversion_pipeline, m)?)?;
     #[cfg(feature = "conversion")]
     m.add_function(wrap_pyfunction!(index_vcf, m)?)?;
     m.add_class::<crate::py_query::PyContigReader>()?;

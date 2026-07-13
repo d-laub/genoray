@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
+import numpy as np
 from natsort import natsorted
 
 import genoray._core as _core
@@ -19,6 +20,8 @@ from genoray._svar2_mutcat import _MutcatMixin
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+
+    from numpy.typing import NDArray
 
     from genoray._svar2_fields import FormatField, InfoField
 
@@ -171,3 +174,230 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             info,
             format_,
         )
+
+    @classmethod
+    def from_pgen(
+        cls,
+        out: str | Path,
+        source: str | Path,
+        reference: str | Path | None = None,
+        *,
+        no_reference: bool = False,
+        skip_out_of_scope: bool = False,
+        chunk_size: int | None = None,
+        threads: int | None = None,
+        overwrite: bool = False,
+        long_allele_capacity: int = 8 * 1024 * 1024,
+        signatures: bool = False,
+    ) -> int:
+        """Convert a PLINK2 PGEN to an SVAR2 store.
+
+        Genotypes are read through the ``pgenlib`` package; variant metadata comes
+        from the sibling ``.pvar``/``.pvar.zst`` and sample names from the ``.psam``.
+
+        Exactly one of `reference` or `no_reference=True` is required, with the same
+        meaning as :meth:`from_vcf`: with a reference, indels are validated against
+        and left-aligned to the FASTA; with `no_reference`, both are skipped and the
+        input is trusted to be already normalized. Returns the number of
+        out-of-scope (symbolic/breakend) ALTs dropped (0 unless `skip_out_of_scope`).
+
+        PGEN is diploid, so there is no `ploidy` parameter.
+
+        chunk_size: variants per conversion chunk. Defaults to a value derived from
+        a memory budget, since a packed dense chunk costs
+        ``chunk_size * n_samples * 2 / 8`` bytes.
+
+        Not supported (and silently ignored rather than errored, where noted):
+
+        - **Dosages.** SVAR2 stores no dosages; a ``.pgen`` dosage track is ignored
+          and hardcalls are read as usual.
+        - **INFO/FORMAT fields.** PGEN has no FORMAT; ``.pvar`` INFO extraction is
+          not implemented.
+        - **Sample subsetting.** All samples in the ``.psam`` are converted, matching
+          :meth:`from_vcf`.
+
+        Haplotype resolution for *unphased* heterozygotes follows the allele-code
+        order ``pgenlib`` returns — the same caveat :meth:`from_vcf` carries for
+        unphased ``GT``.
+        """
+        from genoray._pgen import _read_psam
+
+        out = Path(out)
+        source = Path(source)
+
+        if (reference is None) == (not no_reference):
+            raise ValueError(
+                "provide exactly one of `reference` (a FASTA path) or "
+                "`no_reference=True`"
+            )
+        if signatures and no_reference:
+            raise ValueError("signatures=True requires a reference (not no_reference).")
+        if out.exists() and not overwrite:
+            raise FileExistsError(
+                f"Output path {out} already exists. Use overwrite=True to overwrite."
+            )
+        if source.suffix != ".pgen":
+            raise ValueError(f"Expected a .pgen file, got {source}")
+        if not source.exists():
+            raise FileNotFoundError(source)
+
+        pvar = _find_pvar(source)
+        psam = source.with_suffix(".psam")
+        if not psam.exists():
+            raise FileNotFoundError(psam)
+        out.parent.mkdir(parents=True, exist_ok=True)
+
+        samples = cast("list[str]", _read_psam(psam).tolist())
+        n_samples = len(samples)
+        if n_samples == 0:
+            raise ValueError(f"No samples found in {psam}.")
+
+        contigs, ranges, allele_idx_offsets = _pvar_contig_ranges(pvar)
+        if not contigs:
+            raise ValueError(f"No variants found in {pvar}.")
+
+        if chunk_size is None:
+            chunk_size = _auto_chunk_size(n_samples)
+
+        import pgenlib
+
+        # One reader per contig: readers seek independently, so concurrent contigs
+        # must not share one. `allele_idx_offsets` is required (not just used) once
+        # any variant in the file is multiallelic -- it is a file-wide array, so
+        # every contig's reader is constructed with the same one.
+        readers = [
+            pgenlib.PgenReader(
+                bytes(source), n_samples, allele_idx_offsets=allele_idx_offsets
+            )
+            for _ in contigs
+        ]
+
+        return _core.run_pgen_conversion_pipeline(
+            str(source),
+            str(pvar),
+            None if no_reference else str(reference),
+            contigs,
+            ranges,
+            str(out),
+            samples,
+            chunk_size,
+            threads,
+            long_allele_capacity,
+            skip_out_of_scope,
+            signatures,
+            readers,
+        )
+
+
+def _find_pvar(pgen: Path) -> Path:
+    """Locate the `.pvar` / `.pvar.zst` sibling of `pgen`."""
+    for suffix in (".pvar", ".pvar.zst"):
+        cand = pgen.with_suffix(suffix)
+        if cand.exists():
+            return cand
+    raise FileNotFoundError(
+        f"No .pvar or .pvar.zst found next to {pgen}. "
+        f"Looked for {pgen.with_suffix('.pvar')} and {pgen.with_suffix('.pvar.zst')}."
+    )
+
+
+def _pvar_contig_ranges(
+    pvar: Path,
+) -> tuple[list[str], list[tuple[int, int]], NDArray[np.uintp]]:
+    """Contigs in `.pvar` file order, each one's half-open `[lo, hi)` variant
+    index range, and the file-wide `allele_idx_offsets` array `pgenlib.PgenReader`
+    requires once any variant in the file is multiallelic.
+
+    `allele_idx_offsets` has length `n_variants + 1`: `offsets[0] = 0` and
+    `offsets[i+1] = offsets[i] + 1 + n_alts(i)`, where `n_alts(i)` is the number of
+    comma-separated ALT tokens of variant `i` -- including a variant whose ALT is
+    the bare `.` sentinel (no ALT observed), which still counts as 1 token/2 total
+    alleles, matching `pgenlib`'s on-disk model (see the comment at its
+    computation below). It is a single, file-wide array -- every per-contig reader
+    is constructed with the same one, not a per-contig slice.
+
+    Raises if a contig's variants are not contiguous -- SVAR2 converts one contig at
+    a time from a variant index range, which requires the `.pvar` to be grouped by
+    contig (as plink2 always writes it).
+    """
+    import polars as pl
+
+    from genoray._pgen import _scan_pvar
+
+    df = _scan_pvar(pvar).select("#CHROM", "ALT").with_row_index("vidx").collect()
+
+    # `_scan_pvar` opens the .pvar with `null_values="."`, so a monomorphic
+    # variant's ALT ('.' -- no alternate allele observed) reads as a polars
+    # null, and `.list.len()` on a null is null. Left un-guarded, `.to_numpy()`
+    # would upcast to float64 (NaN for that slot) and
+    # `np.cumsum(..., out=<uintp>)` would silently reinterpret that NaN as a
+    # huge garbage integer -- for that variant *and every one after it*, since
+    # cumsum is prefix-summed.
+    #
+    # The count to fill in is 1, not 0: `pgenlib`'s on-disk `allele_idx_offsets`
+    # model reserves a minimum of 2 allele slots (REF + one ALT slot) per
+    # variant, even when plink2 has no observed ALT to report -- the ALT
+    # column's bare '.' is a *display* convention for "no ALT was observed",
+    # not "no ALT slot exists". Verified directly against `pgenlib`: building
+    # `allele_idx_offsets` with a 0-count (1 total allele) for a '.'-ALT
+    # variant makes `PgenReader.read_alleles_range` segfault on every
+    # multiallelic variant after it (offsets one short of what the file
+    # actually stores); a 1-count (2 total alleles, matching every other
+    # biallelic row) reads correctly and matches the VCF-derived genotypes.
+    # (Rust's `PvarReader` separately empties `alts` for a '.' ALT -- that's
+    # about which alleles the *conversion spine* atomizes, an independent
+    # question from what `pgenlib` needs to step through the file.)
+    n_alts_col = df["ALT"].str.split(",").list.len().fill_null(1)
+    if n_alts_col.null_count():  # pragma: no cover - defensive, should be unreachable
+        raise ValueError(
+            f"Could not determine the ALT-allele count for every variant in {pvar}; "
+            "expected only null ALTs (from the '.' monomorphic sentinel) to be null "
+            "here, but some remained null after filling."
+        )
+    n_alts = n_alts_col.to_numpy()
+    if n_alts.dtype.kind not in "iu" or (n_alts < 0).any():
+        raise ValueError(
+            f"Computed a negative or non-integer ALT-allele count while parsing {pvar} "
+            f"(dtype={n_alts.dtype}); this indicates a malformed ALT column."
+        )
+    allele_idx_offsets = np.empty(len(n_alts) + 1, dtype=np.uintp)
+    allele_idx_offsets[0] = 0
+    np.cumsum(n_alts + 1, out=allele_idx_offsets[1:])
+
+    grouped = (
+        df.lazy()
+        .group_by("#CHROM", maintain_order=True)
+        .agg(
+            pl.col("vidx").min().alias("lo"),
+            pl.col("vidx").max().alias("hi"),
+            pl.len().alias("n"),
+        )
+        .collect()
+    )
+    contigs: list[str] = []
+    ranges: list[tuple[int, int]] = []
+    for chrom, lo, hi, n in grouped.iter_rows():
+        if hi - lo + 1 != n:
+            raise ValueError(
+                f"Contig {chrom!r} is not contiguous in {pvar} "
+                f"(spans indices {lo}..{hi} but has {n} variants). "
+                "SVAR2 requires a .pvar grouped by contig."
+            )
+        contigs.append(str(chrom))
+        ranges.append((int(lo), int(hi) + 1))
+    return contigs, ranges, allele_idx_offsets
+
+
+# Target byte size of one packed dense chunk (chunk_size * n_samples * ploidy / 8).
+_DENSE_CHUNK_TARGET_BYTES = 256 * 1024 * 1024
+
+
+def _auto_chunk_size(n_samples: int, ploidy: int = 2) -> int:
+    """Variants per chunk, derived from a memory budget rather than a fixed count.
+
+    A packed dense chunk costs `chunk_size * n_samples * ploidy / 8` bytes, so a
+    fixed 25k chunk that is fine at 200 samples is not at 500k.
+    """
+    bits_per_variant = n_samples * ploidy
+    by_budget = (_DENSE_CHUNK_TARGET_BYTES * 8) // max(bits_per_variant, 1)
+    return max(1024, min(25_000, int(by_budget)))
