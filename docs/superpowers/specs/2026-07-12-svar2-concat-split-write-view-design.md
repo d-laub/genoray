@@ -130,19 +130,36 @@ def write_view(
 
 Signature mirrors `SparseVar.write_view`; the only addition is **`reroute`**.
 
-**Implementation strategy.** A thin Python shim (mirroring `from_vcf`) that
-normalizes/validates inputs and calls a new Rust pyfunction (working name
-`run_view_pipeline` / `process_chromosome_svar2`). Per contig, the Rust side:
+**Implementation strategy — the "coarse seam" (settled after code investigation).**
+A code map of `src/` (2026-07-12) established two facts that reshaped the
+original "one code path" idea:
 
-1. Resolves kept variant indices from `regions` (`regions_overlap` semantics
-   identical to SVAR1: `pos` / `record` / `variant`).
-2. Reads the source's four sub-streams back into `SparseChunk`: `var_key` calls
-   filtered to kept haplotypes ∩ region (already sample-major per-call); dense
-   variants in-region expanded to per-hap calls for kept haplotypes.
-3. Routes each variant to an output representation (see `reroute` below) and
-   hands `SparseChunk`(s) to the **existing** `merge_mini_sc` + writer, which
-   re-derive `max_del`, the search tree, offsets, and field sidecars.
-4. Writes `meta.json` with the subset `samples`/`contigs`.
+1. There is **no read-back-to-sparse API** — the reader is hap-major/column-CSR
+   and surfaces decoded calls or packed keys, never the variant-major,
+   whole-cohort shape the writer ingests.
+2. The cost model (`choose_representation`) is reachable **only inside**
+   `dense2sparse_vk` (`src/rvk.rs`), which routes a *variant-major dense grid*.
+
+Therefore `reroute=True` and a hypothetical `reroute=False` are **not** one
+parameterized path — they are two different implementations. Per the
+measure-first decision (below), **only `reroute=True` is built now**, via the
+**coarse seam**: a new Rust `RecordSource` for an svar2 store (a
+`SourceSpec::Svar2` variant) that re-emits the region+sample subset as
+variant-major records, fed into the **entire existing conversion pipeline**
+(`ChunkAssembler` → `dense2sparse_vk` → cost model → `merge_mini_sc` /
+`merge_dense_class` → `run_io_writer` → `write_max_del` → field/signature
+finalize) **unchanged**. The dense grid is the natural place to recount
+carriers for re-routing, so this "round-trip" is not wasteful; and it yields the
+strong oracle — **byte-parity with `from_vcf` on the same subset**. The Python
+side is a thin shim (mirroring `from_vcf`) that validates inputs and calls a new
+`#[cfg(feature="conversion")]` pyfunction registered in `_core`.
+
+The svar2 `RecordSource` is expected to run under the **`no_reference` path**
+(the store is already normalized/left-aligned, so re-validation/left-alignment
+is skipped) and reconstruct records from the store's decoded `ilen`/`alt` — so
+`write_view` needs **no FASTA** for the geometry. *(Confirming this — vs. needing
+a reference to reconstruct REF for `RawRecord` — is an explicit early Rust task
+in the plan.)*
 
 **`reroute` semantics** (only meaningful when subsetting samples — region-only
 leaves `x_calls` unchanged, so routing is stable and output is byte-comparable
@@ -150,11 +167,12 @@ to the source on those contigs):
 
 - `True` — recompute each variant's subset carrier count `x'` and call
   `choose_representation(x')`. Size-optimal; byte-comparable to a fresh
-  `from_vcf` on the same region+sample subset.
-- `False` — keep each variant's **source** representation; still drop MAC=0
-  variants and rebuild streams. Correct, avoids dense↔var_key data movement,
-  possibly size-suboptimal.
-- `"auto"` — resolves to the default chosen by the measurement spike below.
+  `from_vcf` on the same region+sample subset. **This is the only mode built now.**
+- `"auto"` — resolves to `True`.
+- `False` — **raises `NotImplementedError`** for now. It would require a separate
+  array-slicing implementation (preserve source representation, no cost-model
+  re-run); it is built later **only if** the measurement spike shows re-routing
+  materially changes output size. See the measurement decision rule below.
 
 **Semantics mirrored from SVAR1 `write_view`:**
 
@@ -170,11 +188,13 @@ to the source on those contigs):
   recompute the signatures sidecar on the subset during the rewrite; otherwise
   the output has no mutcat. Explicitly requesting the mutcat field without
   `reference=` raises.
-- **`reference` is otherwise not required** (keys are portable; no re-validation
-  or left-alignment on a view).
+- **`reference` is otherwise not required** (the `no_reference` re-conversion
+  path skips REF-validation/left-alignment; keys/ilen come from the store's
+  decoded records — pending confirmation of the REF-reconstruction task).
 - **Fields**: `None` = carry all `fields` from the source manifest except
-  mutcat; `[]` = none; the sidecar values are sliced/re-emitted parallel to the
-  new sub-stream record order.
+  mutcat; `[]` = none. The coarse seam re-emits field values through the
+  existing per-field finalize/merge machinery (`merge_var_key_field_values` /
+  `merge_dense_field_values` / `finalize_fields`), re-derived for the subset.
 - **Fast path**: a region that covers all variants on a contig **and** keeps all
   samples degenerates to a Component-A directory copy of that contig (no
   rewrite) — the SVAR2 analogue of SVAR1's `_covers_all_variants`.
@@ -198,8 +218,9 @@ def view_svar1(...):  # the current `@app.command def view` body, verbatim
     ...
 ```
 
-- `genoray view` → SVAR2 (`SparseVar2.write_view`). Adds `--reroute/--no-reroute`
-  (tri-state incl. `auto`; default `auto`) and `--reference`.
+- `genoray view` → SVAR2 (`SparseVar2.write_view`). Adds `--reference` and a
+  `--reroute/--no-reroute` flag (default `auto`→`True`); `--no-reroute` currently
+  errors with the same `NotImplementedError` message as the API.
 - `genoray view svar1` → the existing SVAR1 logic, moved unchanged (same flags:
   `-r/-R/-s/-S/-f`, `--merge-overlapping`, `--regions-overlap`, `--overwrite`,
   `-@`, `--progress`). No `--reroute`.
@@ -216,10 +237,11 @@ genoray split  SRC OUT            [--contigs chr1,chr2] [--mode ...] [--overwrit
 `genoray split` with `--contigs` → `subset_contigs` into one store at `OUT`;
 without `--contigs` → `split_by_contig` exploding into `OUT/{contig}.svar2`.
 
-## Measurement spike — sets the `"auto"` default
+## Measurement spike — decides whether `reroute=False` is ever worth building
 
-Runs **before finalizing the default**, on the real chr21 data (see
-`data/README.md` for input + reference paths).
+Per the measure-first decision, `reroute=True` ships now regardless; this spike
+decides whether the *separate* `reroute=False` array-slicing implementation is
+worth building later. Runs on the real chr21 data (see `data/README.md`).
 
 1. Build SVAR2 stores from `data/chr21.bcf` (germline, ref
    `/carter/users/dlaub/data/1kGP/GRCh38_full_analysis_set_plus_decoy_hla.fa`)
@@ -230,13 +252,15 @@ Runs **before finalizing the default**, on the real chr21 data (see
    (keep 10 / 50 / 100 / 500 of the >1k samples), recount each variant's carrier
    count `x'` in the subset and compare `choose_representation(x')` to its source
    representation. Report **% of variants that flip** and the **total on-disk
-   size delta** (reroute vs no-reroute), per subset size, germline vs somatic.
-3. **Decision rule.** A carrier recount over dense variants is needed regardless
-   (to drop MAC=0). If flips are rare **and** the size delta is small
-   (≈ <1–2 %) across subset sizes, `"auto"` → `reroute=False` (avoids
-   dense↔var_key movement for near-zero size cost). If flips or size delta are
-   material, `"auto"` → `reroute=True`. Both modes ship regardless; only the
-   default is chosen here.
+   size delta** (reroute vs preserve-source-representation), per subset size,
+   germline vs somatic.
+3. **Decision rule.** If flips are rare **and** the size delta is small
+   (≈ <1–2 %) across subset sizes (the working hypothesis), `reroute=False` is
+   **not worth building** — `reroute=True` stays the sole mode and the
+   `NotImplementedError` is permanent (documented as "re-routing is
+   near-optimal; source-preservation buys nothing measurable"). If flips or size
+   delta are material, file a follow-up to build the `reroute=False` slice path.
+   Either way this spike does **not** block shipping `reroute=True`.
 
 ## Testing strategy
 
