@@ -17,6 +17,7 @@ from genoray._svar2_fields import (
     _resolve_read_fields,
 )
 from genoray._svar2_mutcat import _MutcatMixin
+from genoray._svar2_ops import Mode, _load_meta, _write_store
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -87,6 +88,27 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         ``FORMAT/DP``.
         """
         return SparseVar2(self.path, fields=fields)
+
+    def subset_contigs(
+        self,
+        output: str | Path,
+        contigs: str | Sequence[str],
+        *,
+        mode: Mode = "copy",
+        overwrite: bool = False,
+    ) -> None:
+        """Write a new SVAR2 store containing only `contigs` (metadata + file copy)."""
+        output = Path(output)
+        wanted = [contigs] if isinstance(contigs, str) else list(contigs)
+        missing = [c for c in wanted if c not in self.contigs]
+        if missing:
+            raise ValueError(f"contigs not in store: {missing}")
+        if output.resolve() == self.path.resolve():
+            raise ValueError("cannot write a subset in place (output == source)")
+        kept = [c for c in self.contigs if c in set(wanted)]  # preserve source order
+        meta = _load_meta(self.path)
+        meta["contigs"] = kept
+        _write_store(output, {c: self.path for c in kept}, meta, mode, overwrite)
 
     @classmethod
     def from_vcf(
