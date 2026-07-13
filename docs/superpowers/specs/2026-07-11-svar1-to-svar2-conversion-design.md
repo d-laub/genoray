@@ -1,5 +1,12 @@
 # SVAR1 → SVAR2 conversion (`SparseVar2.from_svar1`)
 
+> **SUPERSEDED (2026-07-13)** by
+> [`2026-07-13-svar1-to-svar2-conversion-design.md`](2026-07-13-svar1-to-svar2-conversion-design.md).
+> Both blocking specs have since landed (PR #100 write, PR #101 read), and
+> PR #102 (`from_pgen`) introduced a `RecordSource` extension seam that makes the
+> "enter at the `SparseChunk` seam" path and the new `arrow-rs` crate proposed
+> below obsolete. Kept for history; do not implement from this doc.
+
 Status: **PARTIAL DRAFT — blocked.** The architecture below (native Rust
 pipeline, entry seam, normalization contract, scope guards) is settled. The
 **field carry-through** (dosages and any other INFO/FORMAT fields) is

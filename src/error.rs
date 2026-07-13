@@ -10,6 +10,15 @@ pub enum ConversionError {
     /// A required input file (index, FASTA) is absent.
     #[error("required file not found: {path}")]
     MissingFile { path: String },
+    /// A requested contig has no entry at all in a VCF/BCF header. Distinct
+    /// from `Input` so callers that need to distinguish "this specific,
+    /// structural condition" (e.g. `vcf_list_reader`'s per-file
+    /// skip-and-hom-ref-fill branch for a file whose header lacks the
+    /// contig) can match on a variant instead of grepping the message —
+    /// rewording the message would otherwise silently break that control
+    /// flow.
+    #[error("Chromosome '{chrom}' not found in VCF header")]
+    ContigNotInHeader { chrom: String },
     #[error("I/O error at {context}: {source}")]
     Io {
         context: String,
@@ -45,6 +54,7 @@ impl From<ConversionError> for pyo3::PyErr {
         let msg = e.to_string();
         match e {
             ConversionError::Input(_) => PyValueError::new_err(msg),
+            ConversionError::ContigNotInHeader { .. } => PyValueError::new_err(msg),
             ConversionError::MissingFile { .. } => PyFileNotFoundError::new_err(msg),
             ConversionError::Io { .. }
             | ConversionError::Npy { .. }

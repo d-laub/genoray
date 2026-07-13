@@ -2,7 +2,7 @@
 use crossbeam_channel::bounded;
 use std::fs;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 
 use crate::enum_map::EnumKey;
@@ -70,6 +70,64 @@ pub enum SourceSpec {
         regions: Vec<(u32, u32)>,
         overlap_mode: crate::svar2_source::OverlapMode,
     },
+    /// `SparseVar2.from_vcf_list`: N single-sample VCFs with possibly disjoint
+    /// site lists, k-way merged into ONE record stream (`VcfListRecordSource`).
+    /// `vcf_paths[i]` is parallel to `process_chromosome`'s `samples` slice --
+    /// column `i`'s sample is `samples[i]`, read from `vcf_paths[i]`.
+    VcfList {
+        vcf_paths: Vec<String>,
+        /// Small per-file HTSlib decompression thread count (e.g. `1`) -- N
+        /// files are open concurrently per contig, unlike the single-file
+        /// `Vcf` variant.
+        htslib_threads: usize,
+    },
+    Svar1 {
+        svar1_dir: String,
+        contig_start: usize,
+        n_local: usize,
+        pos: Vec<u32>,
+        ref_bytes: Vec<u8>,
+        ref_offsets: Vec<i64>,
+        alt_bytes: Vec<u8>,
+        alt_offsets: Vec<i64>,
+        format_fields: Vec<crate::field::FieldSpec>,
+        format_src_dtypes: Vec<String>,
+    },
+}
+
+/// Wraps `VcfListRecordSource`, mirroring its running `dropped_out_of_scope()`
+/// count into a shared cell on every call. Needed because ownership of the
+/// concrete source moves into `Box<dyn RecordSource + Send>` for
+/// `ChunkAssembler`, so it's otherwise unreachable after construction --
+/// unlike `ChunkAssembler` itself (which re-atomizes the already-atomic merged
+/// stream and reports 0 additional drops), the REAL out-of-scope drops for
+/// this source happen inside the per-file atomization stage during the merge,
+/// so that count must be surfaced too.
+struct VcfListDroppedProxy {
+    inner: crate::vcf_list_reader::VcfListRecordSource,
+    dropped_out: Arc<AtomicU64>,
+}
+
+impl crate::record_source::RecordSource for VcfListDroppedProxy {
+    fn next_record(&mut self) -> Result<Option<crate::record_source::RawRecord>, ConversionError> {
+        let rec = self.inner.next_record()?;
+        // `dropped_out_of_scope()` sums over every `FileCursor` (O(N) in the
+        // file count) -- reading it on EVERY merged record made this an
+        // O(N * records) scan on the pipeline's hot path (e.g. N=1000 files
+        // and 5M merged records ⇒ 5e9 strided loads). The count only needs
+        // to be correct by the time the caller (`process_chromosome`'s
+        // reader thread) reads `vcf_list_dropped` after its `while let
+        // Some(dense_chunk) = reader.read_next_chunk(...)` loop exits --
+        // which happens only once the underlying source (and therefore this
+        // proxy) has returned `None` at least once. So it's enough to
+        // refresh the stored total on that one EOF transition instead of
+        // every record.
+        if rec.is_none() {
+            self.dropped_out
+                .store(self.inner.dropped_out_of_scope(), Ordering::Relaxed);
+        }
+        Ok(rec)
+    }
 }
 
 //The rust pipeline (Per chromosome conversion from Dense to Sparse)
@@ -181,6 +239,9 @@ pub fn process_chromosome(
             move || -> Result<u64, ConversionError> {
                 // passing the thread budget down to HTSLib
                 let s_refs: Vec<&str> = s_owned.iter().map(|s| s.as_str()).collect();
+                // Only populated (and only meaningful) for `SourceSpec::VcfList`;
+                // stays 0 for the other variants.
+                let vcf_list_dropped = Arc::new(AtomicU64::new(0));
                 let src: Box<dyn crate::record_source::RecordSource + Send> = match source {
                     SourceSpec::Vcf {
                         vcf_path,
@@ -220,6 +281,54 @@ pub fn process_chromosome(
                         &regions,
                         overlap_mode,
                     )?),
+                    SourceSpec::VcfList {
+                        vcf_paths,
+                        htslib_threads,
+                    } => {
+                        let ref_seq_opt: Option<Vec<u8>> = match fasta.as_deref() {
+                            Some(f) => Some(crate::vcf_reader::load_contig_seq(f, &chr)?),
+                            None => None,
+                        };
+                        let vcf_list = crate::vcf_list_reader::VcfListRecordSource::new(
+                            &vcf_paths,
+                            &s_refs,
+                            &chr,
+                            ref_seq_opt.as_deref(),
+                            ploidy,
+                            htslib_threads,
+                            skip_out_of_scope,
+                            &fields_owned,
+                        )?;
+                        Box::new(VcfListDroppedProxy {
+                            inner: vcf_list,
+                            dropped_out: Arc::clone(&vcf_list_dropped),
+                        })
+                    }
+                    SourceSpec::Svar1 {
+                        svar1_dir,
+                        contig_start,
+                        n_local,
+                        pos,
+                        ref_bytes,
+                        ref_offsets,
+                        alt_bytes,
+                        alt_offsets,
+                        format_fields,
+                        format_src_dtypes,
+                    } => Box::new(crate::svar1_reader::Svar1RecordSource::new(
+                        &svar1_dir,
+                        contig_start,
+                        n_local,
+                        s_refs.len(),
+                        ploidy,
+                        pos,
+                        ref_bytes,
+                        ref_offsets,
+                        alt_bytes,
+                        alt_offsets,
+                        &format_fields,
+                        &format_src_dtypes,
+                    )?),
                 };
                 let mut reader = crate::chunk_assembler::ChunkAssembler::new(
                     src,
@@ -237,7 +346,7 @@ pub fn process_chromosome(
                     tx_dense.send(dense_chunk).unwrap();
                     chunk_id += 1;
                 }
-                Ok(reader.dropped_out_of_scope())
+                Ok(reader.dropped_out_of_scope() + vcf_list_dropped.load(Ordering::Relaxed))
             }
         })
         .expect("spawn reader");
@@ -476,4 +585,118 @@ pub fn process_chromosome(
     println!("[{}] Pipeline Execution Finished Successfully.", chrom);
 
     Ok(dropped)
+}
+
+/// `SparseVar2.from_vcf_list`: build ONE SVAR2 store from N single-sample VCFs
+/// with possibly disjoint site lists. `vcf_paths[i]`'s sample is `samples[i]`.
+///
+/// MVP concurrency: contigs are processed SEQUENTIALLY (a plain loop, no rayon
+/// pool) -- this bounds open file descriptors to roughly N (one per input
+/// file) rather than N * concurrent_chroms. Cross-contig parallelism is
+/// explicit future work. Mirrors `run_conversion_pipeline`
+/// (`src/lib.rs`)'s hardware-budget derivation, `parse_manifest`,
+/// `finalize_fields`, and `write_meta` tail, minus the rayon dispatch.
+///
+/// Returns the total number of out-of-scope (symbolic/breakend) ALTs dropped
+/// across every input file and contig.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
+pub fn run_vcf_list(
+    vcf_paths: &[String],
+    reference_path: Option<&str>,
+    chroms: &[String],
+    output_dir: &str,
+    samples: &[String],
+    chunk_size: usize,
+    ploidy: usize,
+    max_threads: Option<usize>,
+    long_allele_capacity: usize,
+    skip_out_of_scope: bool,
+    signatures: bool,
+    info_fields: Vec<(String, String, String, Option<String>, Option<f64>)>,
+    format_fields: Vec<(String, String, String, Option<String>, Option<f64>)>,
+) -> Result<u64, ConversionError> {
+    // Each open input file uses its own small, fixed HTSlib thread allocation
+    // (there are N files open at once per contig, unlike the single-file
+    // `Vcf` path) -- the hardware budget below only sizes `processing_threads`.
+    const VCF_LIST_HTSLIB_THREADS: usize = 1;
+
+    let sample_refs: Vec<&str> = samples.iter().map(|s| s.as_str()).collect();
+
+    let mut raw = info_fields;
+    raw.extend(format_fields);
+    let fields = crate::field::parse_manifest(raw)?;
+
+    let available_cores = match max_threads {
+        Some(t) if t > 0 => {
+            println!("Notice: Using user-provided thread limit: {}", t);
+            t
+        }
+        _ => {
+            let detected = std::thread::available_parallelism().unwrap().get();
+            println!(
+                "Notice: No thread limit provided. Hardware Detected: {} cores.",
+                detected
+            );
+            detected
+        }
+    };
+    // concurrent_chroms is forced to 1 (sequential loop below) regardless of
+    // what the plan suggests -- only `processing_threads` is consumed here.
+    let plan = crate::budget::plan_thread_budget(available_cores, 1);
+    let processing_threads = plan.processing_threads;
+    println!(
+        "Pipeline Config (from_vcf_list): {} contigs sequentially | {} HTSlib decompression \
+         threads per file ({} files open at once) | {} processing threads.",
+        chroms.len(),
+        VCF_LIST_HTSLIB_THREADS,
+        vcf_paths.len(),
+        processing_threads,
+    );
+
+    let fasta_ref = reference_path;
+    let mut total_dropped: u64 = 0;
+    for chrom in chroms {
+        println!("==> Processing {}", chrom);
+        let dropped = process_chromosome(
+            SourceSpec::VcfList {
+                vcf_paths: vcf_paths.to_vec(),
+                htslib_threads: VCF_LIST_HTSLIB_THREADS,
+            },
+            fasta_ref,
+            chrom,
+            output_dir,
+            &sample_refs,
+            chunk_size,
+            ploidy,
+            long_allele_capacity,
+            skip_out_of_scope,
+            processing_threads,
+            signatures,
+            &fields,
+        )?;
+        total_dropped += dropped;
+    }
+    println!("Cohort Processing Complete.");
+
+    // All contigs staged — resolve each field's global on-disk dtype and
+    // rewrite its staged values.bin files to that width.
+    let resolved_fields =
+        crate::field_finalize::finalize_fields(std::path::Path::new(output_dir), chroms, &fields)?;
+
+    // All contigs converted — write the top-level meta.json describing the cohort.
+    crate::meta::write_meta(
+        std::path::Path::new(output_dir),
+        crate::meta::FORMAT_VERSION,
+        samples,
+        chroms,
+        ploidy,
+        &resolved_fields,
+    )
+    .map_err(|e| ConversionError::Io {
+        context: format!("write meta.json under {output_dir}"),
+        source: e,
+    })?;
+
+    Ok(total_dropped)
 }

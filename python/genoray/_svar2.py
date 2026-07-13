@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 import numpy as np
+import polars as pl
 from natsort import natsorted
 
 import genoray._core as _core
+from genoray._contigs import _MITO_ALIASES
 from genoray._svar2_batch import _BatchQueryMixin
 from genoray._svar2_decode import _DecodeMixin
 from genoray._svar2_fields import (
@@ -27,6 +30,56 @@ if TYPE_CHECKING:
     from genoray._svar2_fields import FormatField, InfoField
 
 
+def _resolve_vcf_sources(sources: "str | Path | Sequence[str | Path]") -> list[Path]:
+    """Resolve `sources` (as accepted by :meth:`SparseVar2.from_vcf_list`) to a
+    concrete, ordered list of VCF/BCF paths.
+
+    `sources` may be:
+
+    - a `Sequence` (list/tuple, not `str`/`Path`) of file paths, taken as-is
+      and in the given order.
+    - a single directory `Path`: every `*.vcf.gz` then every `*.bcf` directly
+      inside it (non-recursive), each group name-sorted (`natsort`).
+    - a single file `Path` ending in `.vcf.gz` or `.bcf`: that one file.
+    - any other single file `Path`: treated as a manifest -- one path per
+      line, blank lines and `#`-prefixed comment lines skipped, relative
+      entries resolved against the manifest's parent directory.
+    """
+    if isinstance(sources, (str, Path)):
+        path = Path(sources)
+        if path.is_dir():
+            paths = natsorted(path.glob("*.vcf.gz")) + natsorted(path.glob("*.bcf"))
+        elif path.name.endswith(".vcf.gz") or path.suffix == ".bcf":
+            paths = [path]
+        elif path.suffix == ".vcf":
+            # Without this, a bare `.vcf` single-path `sources` falls into the
+            # manifest branch below: every `##`/`#CHROM` header line reads as
+            # a `#`-comment (skipped), then every data line is treated as a
+            # *path* -- producing a bewildering downstream error far from the
+            # real problem. `_ensure_bgzipped` always raises here (this
+            # branch is reached only when the suffix is exactly `.vcf`, which
+            # is neither `.bcf` nor `.vcf.gz`); the `paths = []` afterward is
+            # unreachable but keeps this branch's static type honest.
+            _ensure_bgzipped(path)
+            paths = cast("list[Path]", [])
+        else:
+            paths = []
+            for line in path.read_text().splitlines():
+                entry = line.strip()
+                if not entry or entry.startswith("#"):
+                    continue
+                entry_path = Path(entry)
+                if not entry_path.is_absolute():
+                    entry_path = path.parent / entry_path
+                paths.append(entry_path)
+    else:
+        paths = [Path(s) for s in sources]
+
+    if not paths:
+        raise ValueError(f"no VCF/BCF files found in {sources}")
+    return paths
+
+
 def _ensure_bgzipped(source: Path) -> None:
     """Reject a plain (uncompressed) VCF — it can't be tabix/csi-indexed."""
     is_bcf = source.suffix == ".bcf"
@@ -44,6 +97,114 @@ def _ensure_index(source: Path) -> None:
     if csi.exists() or tbi.exists():
         return
     _core.index_vcf(str(source))
+
+
+def _canonical_contig_id(name: str) -> str:
+    """The `chr`-prefix-insensitive, mito-alias-aware identity that
+    :class:`genoray._contigs.ContigNormalizer` treats as "the same contig" --
+    used here only to *detect* (not resolve) a cohort mixing `chr1`/`1`-style
+    naming across input files, mirroring `ContigNormalizer`'s own rule
+    (`contig_map`'s `chr`-stripping and `_MITO_ALIASES` grouping).
+    """
+    if name in _MITO_ALIASES:
+        return "MT"
+    return name[3:] if name.startswith("chr") else name
+
+
+def _check_consistent_contig_naming(
+    per_file_contigs: "list[tuple[Path, set[str]]]",
+) -> None:
+    """Raise if the cohort mixes naming schemes for the same logical contig
+    across input files (e.g. file A calls it ``chr1``, file B calls it ``1``).
+
+    `from_vcf_list`'s native k-way merge (`VcfListRecordSource`) matches
+    contigs by exact per-file string, not through `ContigNormalizer` -- each
+    contig name is opened literally against every file's own header. A cohort
+    that mixes naming schemes would otherwise silently produce two separate
+    entries in the union contig list (e.g. ``["1", "chr1", ...]``); each
+    "contig" then converts using only the files whose spelling matches, with
+    every other file's column filled hom-ref via the existing
+    contig-missing-from-header skip -- with no error and no warning.
+    `from_vcf` cannot have this bug structurally (one file, one scheme); this
+    entry point can, because it merges N independently-produced files.
+    """
+    spellings: dict[str, dict[str, list[Path]]] = {}
+    for path, contigs in per_file_contigs:
+        for c in contigs:
+            spellings.setdefault(_canonical_contig_id(c), {}).setdefault(c, []).append(
+                path
+            )
+
+    conflicts = {k: v for k, v in spellings.items() if len(v) > 1}
+    if not conflicts:
+        return
+
+    lines: list[str] = []
+    for canonical, by_spelling in sorted(conflicts.items()):
+        for spelling, paths in sorted(by_spelling.items()):
+            names = ", ".join(str(p) for p in paths)
+            lines.append(f"  {spelling!r} (contig {canonical!r}): {names}")
+    raise ValueError(
+        "from_vcf_list: inconsistent contig naming across input files -- the "
+        "same contig is spelled differently in different files (e.g. 'chr1' "
+        "vs '1'). The native k-way merge matches contigs by an exact "
+        "per-file string, so a mixed cohort would silently be treated as if "
+        "these were different contigs, filling every file that uses the "
+        "OTHER spelling hom-ref with no error. Conflicting spellings:\n"
+        + "\n".join(lines)
+        + "\nNormalize contig names across all inputs first (e.g. `bcftools "
+        "annotate --rename-chrs`) before calling from_vcf_list."
+    )
+
+
+# Rough per-file FD cost of `from_vcf_list` opening N single-sample VCFs
+# concurrently: one for the data file, one for its .tbi/.csi index (htslib's
+# `IndexedReader` holds both). `_FD_SAFETY_MARGIN` covers stdio, the output
+# writer/monitor threads' files, and other process-wide overhead.
+_FD_PER_INPUT_FILE = 2
+_FD_SAFETY_MARGIN = 64
+
+
+def _check_fd_budget(n_files: int) -> None:
+    """Guard against FD exhaustion before opening `n_files` inputs concurrently
+    (`from_vcf_list` holds one `IndexedReader` per file per contig -- see
+    `VcfListRecordSource`), and raise an error that actually names the real
+    problem.
+
+    Without this, hitting a common soft `RLIMIT_NOFILE` (e.g. 1024) at large
+    N surfaces as htslib's *"Failed to open VCF/BCF index ... (is there a
+    .tbi or .csi file?)"* for some arbitrary file near the ceiling -- sending
+    users to debug a nonexistent indexing problem instead of the real
+    open-file limit. There is no batched/hierarchical merge to fall back on
+    (explicit future work); the only fix at this entry point is raising the
+    ulimit.
+    """
+    import resource
+
+    needed = n_files * _FD_PER_INPUT_FILE + _FD_SAFETY_MARGIN
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft >= needed:
+        return
+
+    # Try to raise the soft limit toward the hard ceiling ourselves first --
+    # cheap, and transparent whenever the hard limit already allows it.
+    if hard == resource.RLIM_INFINITY or hard >= needed:
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (needed, hard))
+            return
+        except (ValueError, OSError):
+            pass
+
+    hard_str = "unlimited" if hard == resource.RLIM_INFINITY else str(hard)
+    raise ValueError(
+        f"from_vcf_list needs to open {n_files} input files concurrently "
+        f"(~{needed} file descriptors, including index files and process "
+        f"overhead), but the current open-file limit is {soft} (hard limit "
+        f"{hard_str}). Raise it before retrying, e.g. `ulimit -n {needed}` "
+        "(or higher, up to the hard limit) in the shell that launches this "
+        "process. from_vcf_list does not batch the merge hierarchically to "
+        "work around this ceiling -- see its docstring."
+    )
 
 
 class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
@@ -478,6 +639,274 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             readers,
         )
 
+    @classmethod
+    def from_vcf_list(
+        cls,
+        out: str | Path,
+        sources: "str | Path | Sequence[str | Path]",
+        reference: str | Path | None = None,
+        *,
+        no_reference: bool = False,
+        skip_out_of_scope: bool = False,
+        ploidy: int = 2,
+        chunk_size: int = 25_000,
+        threads: int | None = None,
+        overwrite: bool = False,
+        long_allele_capacity: int = 8 * 1024 * 1024,
+        signatures: bool = False,
+        info_fields: "Sequence[str | InfoField] | None" = None,
+        format_fields: "Sequence[str | FormatField] | None" = None,
+    ) -> int:
+        """Build one SVAR2 store from many **single-sample** VCFs/BCFs via a
+        native k-way merge (no `bcftools merge`, no intermediate multi-sample
+        VCF).
+
+        Each file in `sources` must have exactly one sample column; that
+        sample becomes one sample in the resulting store, named after its
+        VCF header sample name (duplicates across files are rejected). A
+        site present in some input files but absent from another is filled
+        **hom-ref (`0`)** for the samples that lack it. An in-file `./.`
+        (missing) call is *not* separately preserved once merged: SVAR2's
+        sparse layout stores only ALT-carrying entries, so a missing hap and
+        a hom-ref hap both produce zero entries and are indistinguishable
+        through `decode` or `region_counts`. (The `-1` missing sentinel is a
+        dense `genoray.VCF`/`genoray.PGEN` convention; it is not part of
+        SVAR2's decode.)
+        The merge is join-on-atom: files are merged one contig at a time by
+        walking each file's already-sorted record stream in lockstep, so a
+        variant is one shared row in the output store iff its normalized
+        (pos, ref, alt) atom matches exactly across files, not merely its
+        position.
+
+        `sources` accepts three forms (resolved by module-level
+        `_resolve_vcf_sources`):
+
+        - a `Sequence` of paths -- explicit, in the given order.
+        - a single directory `Path` -- every `*.vcf.gz` then every `*.bcf`
+          directly inside it (non-recursive), each group name-sorted.
+        - a single file `Path` -- if it ends in `.vcf.gz`/`.bcf`, that one
+          file; otherwise treated as a manifest (one path per line, blank
+          and `#`-comment lines skipped, relative entries resolved against
+          the manifest's directory).
+
+        As with :meth:`from_vcf`, each input VCF's records must already be
+        position-sorted per contig; an unsorted file raises `ValueError`
+        naming the offending file and positions rather than silently
+        corrupting the k-way merge.
+
+        Every input file must also use the **same contig naming scheme**
+        (e.g. all `chr1`-style or all `1`-style) -- the merge matches contigs
+        by an exact per-file string, so a cohort mixing schemes raises
+        `ValueError` up front (naming the conflicting files/spellings)
+        instead of silently producing a half-hom-ref-filled store.
+
+        Opens all `N` input files concurrently (one file descriptor per file,
+        per contig); at large `N` (roughly `N > (RLIMIT_NOFILE - 64) / 2`)
+        this raises `ValueError` with the `ulimit -n` remedy rather than
+        htslib's more confusing "no index?" error. There is no batched/
+        hierarchical merge to fall back on for very large cohorts (future
+        work) -- raise the open-file limit instead.
+
+        Exactly one of `reference` or `no_reference=True` is required, with the
+        same semantics as :meth:`from_vcf`: with a reference, atoms are
+        validated against it and left-aligned before merging; with
+        `no_reference`, both are skipped and each atom's REF is reconstructed
+        from its own record's REF bytes. **Caveat specific to this method:**
+        because merging is a per-contig k-way join on normalized (pos, ref,
+        alt) atoms across *independently produced* files, skipping
+        left-alignment under `no_reference` means a shared site only joins
+        into one output row if every input file already represents it
+        identically (e.g. all inputs came from the same caller, or were all
+        already run through `bcftools norm` against the same reference). Two
+        files encoding the same indel differently (different anchor base,
+        different padding) will NOT join under `no_reference` -- they surface
+        as two separate variants in the output store instead of one shared
+        row, silently. `signatures=True` requires a reference (not
+        `no_reference`).
+
+        `info_fields`/`format_fields`: same declaration API as :meth:`from_vcf`
+        (resolved against the FIRST file in `sources`' header). INFO fields
+        merge **first-carrier-wins**: when a site is shared across files, the
+        value comes from the lowest-numbered (earliest in `sources` order)
+        file that carries the atom, not the last or the max. FORMAT fields
+        remain per-sample, exactly as in `from_vcf`: each sample gets its own
+        file's value, and a sample that doesn't carry the atom gets the
+        field's default.
+
+        Returns the number of out-of-scope (symbolic/breakend) ALTs dropped
+        (0 unless `skip_out_of_scope`).
+        """
+        from cyvcf2 import VCF as _CyVCF
+
+        out = Path(out)
+
+        if (reference is None) == (not no_reference):
+            raise ValueError(
+                "provide exactly one of `reference` (a FASTA path) or "
+                "`no_reference=True`"
+            )
+        if signatures and no_reference:
+            raise ValueError("signatures=True requires a reference (not no_reference).")
+        if out.exists() and not overwrite:
+            raise FileExistsError(
+                f"Output path {out} already exists. Use overwrite=True to overwrite."
+            )
+
+        paths = _resolve_vcf_sources(sources)
+        _check_fd_budget(len(paths))
+        out.parent.mkdir(parents=True, exist_ok=True)
+
+        samples: list[str] = []
+        per_file_contigs: list[tuple[Path, set[str]]] = []
+        contig_set: set[str] = set()
+        for path in paths:
+            _ensure_bgzipped(path)
+            _ensure_index(path)
+            v = _CyVCF(str(path))
+            if len(v.samples) != 1:
+                raise ValueError(
+                    f"{path} is not single-sample (has {len(v.samples)} samples)"
+                )
+            samples.append(v.samples[0])
+            file_contigs = {c for c in v.seqnames if next(v(c), None) is not None}
+            per_file_contigs.append((path, file_contigs))
+            contig_set.update(file_contigs)
+
+        _check_consistent_contig_naming(per_file_contigs)
+
+        sample_counts = Counter(samples)
+        dupes = sorted(s for s, n in sample_counts.items() if n > 1)
+        if dupes:
+            raise ValueError(f"duplicate sample names across inputs: {dupes}")
+
+        contigs = natsorted(contig_set)
+        if not contigs:
+            raise ValueError("No variants found in any input.")
+
+        # Field specs are resolved against the FIRST file's header -- every
+        # input is single-sample and expected to share a header schema (same
+        # assumption the reference/samples handling already makes).
+        flds = _resolve_fields(str(paths[0]), info_fields, format_fields)
+        info = [t for t in flds if t[1] == "info"]
+        format_ = [t for t in flds if t[1] == "format"]
+
+        return _core.run_vcf_list_conversion_pipeline(
+            [str(p) for p in paths],
+            None if no_reference else str(reference),
+            contigs,
+            str(out),
+            samples,
+            chunk_size,
+            ploidy,
+            threads,
+            long_allele_capacity,
+            skip_out_of_scope,
+            signatures,
+            info,
+            format_,
+        )
+
+    @classmethod
+    def from_svar1(
+        cls,
+        out: str | Path,
+        source: str | Path,
+        reference: str | Path | None = None,
+        *,
+        no_reference: bool = False,
+        skip_out_of_scope: bool = False,
+        chunk_size: int | None = None,
+        threads: int | None = None,
+        overwrite: bool = False,
+        long_allele_capacity: int = 8 * 1024 * 1024,
+        signatures: bool = False,
+    ) -> int:
+        """Convert a SVAR1 (``SparseVar``) store to an SVAR2 store natively.
+
+        Reads no VCF and no htslib: SVAR1 is already sparse, so this reconstructs
+        variant records from SVAR1's arrays and reuses the same conversion spine
+        as :meth:`from_vcf`.
+
+        Exactly one of `reference` or `no_reference=True` is required, same meaning
+        as :meth:`from_vcf`. `ploidy` is read from SVAR1's metadata. Returns the
+        number of out-of-scope (symbolic/breakend) ALTs dropped.
+
+        Only **biallelic** SVAR1 stores are supported (SVAR1's ``geno==1`` model);
+        multiallelic input raises. All SVAR1 FORMAT fields (e.g. ``dosages``) are
+        carried through; ``mutcat`` is dropped (pass `signatures=True` to recompute
+        signatures from the reference). Because SVAR1 discarded non-carrier FORMAT
+        values, a dense-routed variant's non-carrier cells are filled with the
+        field's default/missing sentinel — field output is byte-identical to
+        :meth:`from_vcf` only for var_key (carrier-only) routing.
+        """
+        from genoray._svar import SparseVar
+
+        out = Path(out)
+        source = Path(source)
+
+        if (reference is None) == (not no_reference):
+            raise ValueError(
+                "provide exactly one of `reference` (a FASTA path) or "
+                "`no_reference=True`"
+            )
+        if signatures and no_reference:
+            raise ValueError("signatures=True requires a reference (not no_reference).")
+        if out.exists() and not overwrite:
+            raise FileExistsError(
+                f"Output path {out} already exists. Use overwrite=True to overwrite."
+            )
+        if not source.exists():
+            raise FileNotFoundError(source)
+
+        sv1 = SparseVar(source)
+        if not sv1._is_biallelic:
+            raise ValueError(
+                "from_svar1 supports only biallelic SVAR1 stores; this store has "
+                "multiallelic variants. Re-create it biallelically first."
+            )
+        samples, ploidy, contigs, fields = _read_svar1_metadata(source)
+        n_samples = len(samples)
+        if n_samples == 0:
+            raise ValueError(f"No samples found in {source}.")
+
+        (
+            starts,
+            lens,
+            pos_pc,
+            ref_bytes_pc,
+            ref_off_pc,
+            alt_bytes_pc,
+            alt_off_pc,
+        ) = _svar1_index_arrays(source, contigs)
+        format_tuples, src_dtypes = _svar1_fields_manifest(fields)
+
+        if chunk_size is None:
+            chunk_size = _auto_chunk_size(n_samples, ploidy)
+
+        out.parent.mkdir(parents=True, exist_ok=True)
+        return _core.run_svar1_conversion_pipeline(
+            str(source),
+            None if no_reference else str(reference),
+            contigs,
+            starts,
+            lens,
+            str(out),
+            samples,
+            ploidy,
+            chunk_size,
+            threads,
+            long_allele_capacity,
+            skip_out_of_scope,
+            signatures,
+            pos_pc,
+            ref_bytes_pc,
+            ref_off_pc,
+            alt_bytes_pc,
+            alt_off_pc,
+            format_tuples,
+            src_dtypes,
+        )
+
 
 def _find_pvar(pgen: Path) -> Path:
     """Locate the `.pvar` / `.pvar.zst` sibling of `pgen`."""
@@ -576,6 +1005,108 @@ def _pvar_contig_ranges(
         contigs.append(str(chrom))
         ranges.append((int(lo), int(hi) + 1))
     return contigs, ranges, allele_idx_offsets
+
+
+def _read_svar1_metadata(
+    source: Path,
+) -> tuple[list[str], int, list[str], dict[str, str]]:
+    """(samples, ploidy, contigs, fields) from a SVAR1 metadata.json."""
+    meta = json.loads((source / "metadata.json").read_text())
+    return (
+        list(meta["samples"]),
+        int(meta["ploidy"]),
+        list(meta["contigs"]),
+        dict(meta.get("fields", {})),
+    )
+
+
+def _pack_strings(values: list[str]) -> tuple[bytes, "np.ndarray"]:
+    """Pack a list of ASCII allele strings into (concatenated bytes, i64 offsets)
+    with offsets length len(values)+1."""
+    encoded = [v.encode("ascii") for v in values]
+    offsets = np.zeros(len(encoded) + 1, dtype=np.int64)
+    np.cumsum([len(b) for b in encoded], out=offsets[1:])
+    return b"".join(encoded), offsets
+
+
+def _svar1_index_arrays(
+    source: Path, contigs: list[str]
+) -> tuple[
+    list[int],
+    list[int],
+    list["np.ndarray"],
+    list[bytes],
+    list["np.ndarray"],
+    list[bytes],
+    list["np.ndarray"],
+]:
+    """Per-contig POS(0-based)/REF/ALT arrays + global contig start/len ranges.
+
+    SVAR1's index.arrow is variant-major and contig-contiguous; POS is 1-based.
+    """
+    df = pl.read_ipc(source / "index.arrow", columns=["CHROM", "POS", "REF", "ALT"])
+    # Global contig_start/len offsets below are only correct if index.arrow's
+    # physical row order is contig-contiguous AND those runs appear in the same
+    # order as `contigs` (from metadata.json). Verify via run-length encoding of
+    # CHROM: a well-formed store has exactly one run per contig that has any rows,
+    # in `contigs` order. `contigs` is the source's full header contig dictionary,
+    # though, so it routinely includes contigs with zero surviving variants (no
+    # rows in index.arrow at all) -- those legitimately contribute no RLE run, so
+    # they're dropped from the expected side rather than required to match.
+    run_order = df["CHROM"].rle().struct.field("value").to_list()
+    present = set(df["CHROM"].unique().to_list())
+    expected_order = [c for c in contigs if c in present]
+    if run_order != expected_order:
+        raise ValueError(
+            f"{source / 'index.arrow'} is not contig-contiguous in the order given "
+            f"by metadata.json's contigs list, so SVAR1->SVAR2 conversion cannot "
+            f"safely assign global variant-id ranges per contig.\n"
+            f"Expected contig run order (metadata.contigs, dropping contigs with no "
+            f"rows in index.arrow): {expected_order}\n"
+            f"Actual CHROM run order (from index.arrow): {run_order}"
+        )
+    # ALT is comma-Utf8 on disk; biallelic => a single token per row.
+    starts: list[int] = []
+    lens: list[int] = []
+    pos_pc: list[np.ndarray] = []
+    ref_b: list[bytes] = []
+    ref_o: list[np.ndarray] = []
+    alt_b: list[bytes] = []
+    alt_o: list[np.ndarray] = []
+    cursor = 0
+    for c in contigs:
+        sub = df.filter(pl.col("CHROM") == c)
+        n = sub.height
+        starts.append(cursor)
+        lens.append(n)
+        cursor += n
+        pos_pc.append((sub["POS"].to_numpy().astype(np.int64) - 1).astype(np.uint32))
+        rb, ro = _pack_strings(sub["REF"].to_list())
+        ab, ao = _pack_strings(sub["ALT"].to_list())
+        ref_b.append(rb)
+        ref_o.append(ro)
+        alt_b.append(ab)
+        alt_o.append(ao)
+    return starts, lens, pos_pc, ref_b, ref_o, alt_b, alt_o
+
+
+def _svar1_fields_manifest(
+    fields: dict[str, str],
+) -> tuple[list[tuple[str, str, str, None, None]], list[str]]:
+    """Map SVAR1 metadata.fields -> (FORMAT FieldSpec tuples, source numpy dtypes).
+
+    Every SVAR1 custom field is FORMAT. `mutcat` is dropped (signature machinery).
+    htype is inferred from the numpy dtype; storage dtype is left None (Auto).
+    """
+    tuples: list[tuple[str, str, str, None, None]] = []
+    src_dtypes: list[str] = []
+    for name, np_dtype in fields.items():
+        if name == "mutcat":
+            continue
+        htype = "float" if np.dtype(np_dtype).kind == "f" else "int"
+        tuples.append((name, "format", htype, None, None))
+        src_dtypes.append(np_dtype)
+    return tuples, src_dtypes
 
 
 # Target byte size of one packed dense chunk (chunk_size * n_samples * ploidy / 8).
