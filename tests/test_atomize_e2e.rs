@@ -3,7 +3,8 @@
 mod common;
 
 use common::{SynthRecord, build_bcf_with_index, build_fasta_with_index};
-use genoray_core::vcf_reader::VcfChunkReader;
+use genoray_core::chunk_assembler::ChunkAssembler;
+use genoray_core::vcf_reader::VcfRecordSource;
 use std::path::Path;
 use tempfile::tempdir;
 
@@ -19,13 +20,14 @@ fn drain_reader(
     // Each test builds `bcf_path.with_extension("fa")` from its records *before* calling
     // drain_reader (see the per-test edit below); here we just point the reader at it.
     let fasta_path = bcf_path.with_extension("fa");
-    let mut reader = VcfChunkReader::new(
-        bcf_path.to_str().unwrap(),
+    let source =
+        VcfRecordSource::new(bcf_path.to_str().unwrap(), chrom, samples, 1, ploidy, &[]).unwrap();
+    let mut reader = ChunkAssembler::new(
+        Box::new(source),
+        samples.len(),
+        ploidy,
         Some(fasta_path.to_str().unwrap()),
         chrom,
-        samples,
-        1,
-        ploidy,
         false,
         &[],
     )

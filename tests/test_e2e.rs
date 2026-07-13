@@ -10,10 +10,11 @@ mod common;
 use common::{
     SynthRecord, build_bcf_with_index, build_fasta_with_index, read_offsets_npy, read_u32_bin,
 };
+use genoray_core::chunk_assembler::ChunkAssembler;
 use genoray_core::process_chromosome;
 use genoray_core::rvk::decode_alt_inline;
 use genoray_core::search::{SearchTree, overlap_range};
-use genoray_core::vcf_reader::VcfChunkReader;
+use genoray_core::vcf_reader::VcfRecordSource;
 
 use tempfile::tempdir;
 
@@ -452,13 +453,21 @@ fn test_reader_extracts_info_format_fields() {
     let sample_refs: Vec<&str> = samples.to_vec();
     // fasta_path = None: skip validate_ref/left_align, so positions stay put
     // and atom order == record order (all SNPs, no atomize splitting).
-    let mut reader = VcfChunkReader::new(
+    let source = VcfRecordSource::new(
         bcf_path.to_str().unwrap(),
-        None,
         "chr1",
         &sample_refs,
         1,
         ploidy,
+        &all,
+    )
+    .unwrap();
+    let mut reader = ChunkAssembler::new(
+        Box::new(source),
+        sample_refs.len(),
+        ploidy,
+        None,
+        "chr1",
         false,
         &all,
     )
@@ -601,13 +610,21 @@ fn test_reader_extracts_multiallelic_number_a_fields() {
     all.extend(fmt.clone());
 
     let sample_refs: Vec<&str> = samples.to_vec();
-    let mut reader = VcfChunkReader::new(
+    let source = VcfRecordSource::new(
         bcf_path.to_str().unwrap(),
-        None,
         "chr1",
         &sample_refs,
         1,
         ploidy,
+        &all,
+    )
+    .unwrap();
+    let mut reader = ChunkAssembler::new(
+        Box::new(source),
+        sample_refs.len(),
+        ploidy,
+        None,
+        "chr1",
         false,
         &all,
     )
@@ -705,13 +722,14 @@ fn test_reader_accepts_pure_del() {
     build_bcf_with_index(&bcf_path, "chr1", 10_000, &samples, &records);
     build_fasta_with_index(&bcf_path.with_extension("fa"), "chr1", 10_000, &records);
 
-    let mut reader = VcfChunkReader::new(
-        bcf_path.to_str().unwrap(),
+    let source =
+        VcfRecordSource::new(bcf_path.to_str().unwrap(), "chr1", &samples, 1, 2, &[]).unwrap();
+    let mut reader = ChunkAssembler::new(
+        Box::new(source),
+        samples.len(),
+        2,
         Some(bcf_path.with_extension("fa").to_str().unwrap()),
         "chr1",
-        &samples,
-        1,
-        2,
         false,
         &[],
     )
@@ -725,7 +743,7 @@ fn test_reader_accepts_pure_del() {
 }
 
 // Boundary error-handling: a chromosome absent from the VCF header must surface
-// as a typed `ConversionError::Input` (SP-3: `VcfChunkReader::new` now returns
+// as a typed `ConversionError::Input` (SP-3: `VcfRecordSource::new` now returns
 // `Result` instead of panicking on `name2rid`, so the reader thread's closure
 // propagates it and the join surfaces the real error, not a swallowed
 // `WorkerPanicked`).
@@ -777,16 +795,7 @@ fn test_missing_vcf_returns_missing_file() {
     let tmp = tempdir().unwrap();
     let missing_path = tmp.path().join("does_not_exist.vcf.gz");
 
-    let res = VcfChunkReader::new(
-        missing_path.to_str().unwrap(),
-        None,
-        "chr1",
-        &["s0"],
-        1,
-        2,
-        false,
-        &[],
-    );
+    let res = VcfRecordSource::new(missing_path.to_str().unwrap(), "chr1", &["s0"], 1, 2, &[]);
 
     assert!(matches!(
         res,

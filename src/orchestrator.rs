@@ -9,7 +9,6 @@ use crate::enum_map::EnumKey;
 use crate::error::ConversionError;
 use crate::nrvk::LongAlleleTableWriter;
 use crate::streams::{REGISTRY, StreamMap, StreamTag};
-use crate::vcf_reader::VcfChunkReader;
 use crate::{executor, merge, monitor, writer};
 
 /*
@@ -151,13 +150,20 @@ pub fn process_chromosome(
             move || -> Result<u64, ConversionError> {
                 // passing the thread budget down to HTSLib
                 let s_refs: Vec<&str> = s_owned.iter().map(|s| s.as_str()).collect();
-                let mut reader = VcfChunkReader::new(
+                let source = crate::vcf_reader::VcfRecordSource::new(
                     &vcf,
-                    fasta.as_deref(),
                     &chr,
                     &s_refs,
                     htslib_threads,
                     ploidy,
+                    &fields_owned,
+                )?;
+                let mut reader = crate::chunk_assembler::ChunkAssembler::new(
+                    Box::new(source),
+                    s_refs.len(),
+                    ploidy,
+                    fasta.as_deref(),
+                    &chr,
                     skip_out_of_scope,
                     &fields_owned,
                 )?;
