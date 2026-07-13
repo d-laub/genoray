@@ -215,3 +215,171 @@ fn vk_src_is_aligned_with_vk_and_survives_the_merge() {
     assert_eq!(reader.n_samples(), n_samples);
     assert_eq!(reader.ploidy(), ploidy);
 }
+
+// --- Task 8: `decode_hap_src` record-order + per-record provenance --------
+
+use genoray_core::query::gather::overlap_batch_src;
+use genoray_core::query::overlap_batch;
+
+/// A store with all four provenance classes present: a var_key SNP, a var_key
+/// indel, a dense SNP table (one fully-carried + one partially-carried
+/// record), and a dense indel table (two records). Modeled on `synth_reader`
+/// in `tests/test_readbound_gather.rs`, which already routes an AC=4 and an
+/// AC=2 SNP to Dense and two AC=3 indels to Dense; this fixture additionally
+/// adds an AC=1 indel so `var_key/indel` is exercised too — `synth_reader` has
+/// none. Per `cost_model::choose_representation` at n_samples=2/ploidy=2
+/// (np=4): AC=1 always stays `VarKey` for both classes; AC>=2 routes SNPs to
+/// `Dense` and AC>=2 routes indels to `Dense` too.
+fn field_provenance_reader(out: &std::path::Path) -> ContigReader {
+    let samples = ["S0", "S1"];
+    let records = vec![
+        // var_key/snp: AC=1 (S0,p0).
+        SynthRecord {
+            pos: 100,
+            ref_allele: b"A",
+            alts: vec![&b"C"[..]],
+            gt: vec![1, 0, 0, 0],
+        },
+        // var_key/indel: AC=1 (S1,p0). Insertion (ref "A" -> alt "AC"), ilen +1.
+        SynthRecord {
+            pos: 130,
+            ref_allele: b"A",
+            alts: vec![&b"AC"[..]],
+            gt: vec![0, 0, 1, 0],
+        },
+        // dense/snp: AC=4, all haps carry -> exercises an all-true presence row.
+        SynthRecord {
+            pos: 150,
+            ref_allele: b"A",
+            alts: vec![&b"C"[..]],
+            gt: vec![1, 1, 1, 1],
+        },
+        // dense/snp: AC=2, partial carriage -> exercises a mixed presence row.
+        // Different ALT than the pos-150 record so a wrong-allele bug would
+        // be caught by a decode-level comparison.
+        SynthRecord {
+            pos: 175,
+            ref_allele: b"A",
+            alts: vec![&b"G"[..]],
+            gt: vec![1, 1, 0, 0],
+        },
+        // dense/indel: AC=3, insertion.
+        SynthRecord {
+            pos: 200,
+            ref_allele: b"A",
+            alts: vec![&b"AT"[..]],
+            gt: vec![0, 1, 1, 1],
+        },
+        // dense/indel: AC=3, deletion.
+        SynthRecord {
+            pos: 300,
+            ref_allele: b"AT",
+            alts: vec![&b"A"[..]],
+            gt: vec![1, 1, 0, 1],
+        },
+    ];
+    build_contig(out, "chr1", &samples, 2, &records);
+    ContigReader::open(out.to_str().unwrap(), "chr1", 2, 2).unwrap()
+}
+
+/// `decode_hap_src` must emit exactly one provenance entry per decoded
+/// record, in the same order as `decode_hap`, and each entry must resolve
+/// back to the record that actually produced it — for var_key entries via the
+/// public `vk_snp_positions`/`vk_indel_positions` accessors, and for dense
+/// entries via this fixture's known (and asserted-monotonic-by-construction)
+/// per-class row order. A coverage guard fails loudly if any of the four
+/// provenance classes (var_key snp/indel, dense snp/indel) stops appearing.
+#[test]
+fn decode_hap_src_is_aligned_with_decoded_records() {
+    let tmp = tempdir().unwrap();
+    let out = tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let reader = field_provenance_reader(&out);
+    let n_samples = 2usize;
+    let ploidy = 2usize;
+    let regions = [(0u32, 1_000_000u32)];
+    let br = overlap_batch_src(&reader, &regions);
+
+    let snp_pos = reader.vk_snp_positions();
+    let indel_pos = reader.vk_indel_positions();
+
+    // Known dense per-class row -> position mapping for THIS fixture: both
+    // dense tables are built from records already given in increasing
+    // position order, and `SearchTree`/`overlap_range` require monotonic
+    // per-class positions, so row i is exactly the i-th dense record of that
+    // class in insertion order.
+    let dense_snp_expected = [150u32, 175u32];
+    let dense_indel_expected = [200u32, 300u32];
+
+    let (mut n_vk_snp, mut n_vk_indel, mut n_dense_snp, mut n_dense_indel) =
+        (0u32, 0u32, 0u32, 0u32);
+
+    for s in 0..n_samples {
+        for p in 0..ploidy {
+            let (hc, srcs) = br.decode_hap_src(&reader, 0, s, p);
+            assert_eq!(hc.positions.len(), srcs.len(), "one src per decoded record");
+            for (i, src) in srcs.iter().enumerate() {
+                let want_pos = hc.positions[i];
+                if !src.is_dense {
+                    let pos = if src.is_indel {
+                        n_vk_indel += 1;
+                        indel_pos[src.idx]
+                    } else {
+                        n_vk_snp += 1;
+                        snp_pos[src.idx]
+                    };
+                    assert_eq!(
+                        pos, want_pos,
+                        "var_key src[{i}] resolves to the wrong position"
+                    );
+                } else if src.is_indel {
+                    n_dense_indel += 1;
+                    assert_eq!(
+                        dense_indel_expected[src.idx], want_pos,
+                        "dense/indel src[{i}] resolves to the wrong row"
+                    );
+                } else {
+                    n_dense_snp += 1;
+                    assert_eq!(
+                        dense_snp_expected[src.idx], want_pos,
+                        "dense/snp src[{i}] resolves to the wrong row"
+                    );
+                }
+            }
+        }
+    }
+
+    assert!(n_vk_snp > 0, "fixture must exercise a var_key/snp record");
+    assert!(
+        n_vk_indel > 0,
+        "fixture must exercise a var_key/indel record"
+    );
+    assert!(n_dense_snp > 0, "fixture must exercise a dense/snp record");
+    assert!(
+        n_dense_indel > 0,
+        "fixture must exercise a dense/indel record"
+    );
+}
+
+/// `decode_hap_src` must return records in EXACTLY the order `decode_hap`
+/// does — otherwise field values would be attached to the wrong variants.
+#[test]
+fn decode_hap_src_matches_decode_hap_order() {
+    let tmp = tempdir().unwrap();
+    let out = tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let reader = field_provenance_reader(&out);
+    let regions = [(0u32, 1_000_000u32)];
+    let plain = overlap_batch(&reader, &regions);
+    let with_src = overlap_batch_src(&reader, &regions);
+    for s in 0..2 {
+        for p in 0..2 {
+            let a = plain.decode_hap(&reader, 0, s, p);
+            let (b, srcs) = with_src.decode_hap_src(&reader, 0, s, p);
+            assert_eq!(a.positions, b.positions);
+            assert_eq!(a.ilens, b.ilens);
+            assert_eq!(a.alts, b.alts);
+            assert_eq!(srcs.len(), b.positions.len());
+        }
+    }
+}

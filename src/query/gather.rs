@@ -80,6 +80,11 @@ pub struct BatchResult {
     /// Flat var_key channel; `vk_off` (len H+1, CSR) slices it per hap.
     pub vk: Vec<KeyRef>,
     pub vk_off: Vec<usize>,
+    /// Absolute var_key provenance per `vk` record, packed by
+    /// `spine::pack_vk_src` (bit 31 = sub-stream, bits 0..=30 = call index).
+    /// **Empty** unless produced by `overlap_batch_src` — the plain gather
+    /// does not pay for it.
+    pub vk_src: Vec<u32>,
     /// Shared dense union (uniform keys, position-sorted); decode-once.
     pub dense: Vec<KeyRef>,
     /// `[s, e)` into `dense` per region (len n_regions).
@@ -169,7 +174,27 @@ pub(crate) fn gather_vk<T: VkElem>(
 /// Batched multi-region × whole-cohort query. `regions` is a list of half-open
 /// `[q_start, q_end)`. Single-threaded; `rayon` over the H hap-slices and dense-
 /// window subsetting are M6b concerns (see the design spec's open questions).
+///
+/// The no-provenance, zero-cost path (`T = KeyRef`; byte-identical to before
+/// `overlap_batch_impl` was introduced — `vk_src` stays empty and `KeyRef::make`
+/// discards the provenance args, so `spine::pack_vk_src` never runs).
 pub fn overlap_batch(reader: &ContigReader, regions: &[(u32, u32)]) -> BatchResult {
+    overlap_batch_impl::<KeyRef>(reader, regions)
+}
+
+/// As `overlap_batch`, but additionally populates `vk_src` so a consumer can
+/// map each merged var_key record back to its `(sub-stream, absolute call
+/// index)` and index a `FieldView`. This is the entry point
+/// `decode_batch_fields` uses to read fields over the whole-cohort batch path.
+pub fn overlap_batch_src(reader: &ContigReader, regions: &[(u32, u32)]) -> BatchResult {
+    overlap_batch_impl::<SrcKeyRef>(reader, regions)
+}
+
+/// Shared body of `overlap_batch`/`overlap_batch_src`, generic over `T: VkElem`
+/// the same way `gather_haps_readbound_impl` is (see that function's doc
+/// comment). The only difference from the original monomorphic
+/// `overlap_batch` is `reader.vk_slice::<T>(...)` and the final `T::split(vk)`.
+fn overlap_batch_impl<T: VkElem>(reader: &ContigReader, regions: &[(u32, u32)]) -> BatchResult {
     let ploidy = reader.ploidy;
     let n_samples = reader.n_samples;
     let n_regions = regions.len();
@@ -181,7 +206,7 @@ pub fn overlap_batch(reader: &ContigReader, regions: &[(u32, u32)]) -> BatchResu
         .map(|&(qs, qe)| dense.overlap(qs, qe))
         .collect();
 
-    let mut vk: Vec<KeyRef> = Vec::new();
+    let mut vk: Vec<T> = Vec::new();
     let mut vk_off: Vec<usize> = vec![0];
     let mut presence = PresenceBitWriter::new();
 
@@ -192,7 +217,7 @@ pub fn overlap_batch(reader: &ContigReader, regions: &[(u32, u32)]) -> BatchResu
                 let col = s * ploidy + p;
 
                 // var_key channel slice for (region r, sample s, ploid p).
-                let slice = reader.vk_slice(col, s, p, qs, qe);
+                let slice: Vec<T> = reader.vk_slice(col, s, p, qs, qe);
                 vk.extend_from_slice(&slice);
                 vk_off.push(vk.len());
 
@@ -212,6 +237,9 @@ pub fn overlap_batch(reader: &ContigReader, regions: &[(u32, u32)]) -> BatchResu
     }
 
     let (dense_present, dense_present_off) = presence.into_parts();
+    // Project the generic element back into the frozen (vk, vk_src) contract
+    // — see `gather_haps_readbound_impl`'s identical final step.
+    let (vk, vk_src) = T::split(vk);
 
     BatchResult {
         n_regions,
@@ -219,6 +247,7 @@ pub fn overlap_batch(reader: &ContigReader, regions: &[(u32, u32)]) -> BatchResu
         ploidy,
         vk,
         vk_off,
+        vk_src,
         dense: dense.refs,
         dense_range: ranges,
         dense_present,
@@ -381,6 +410,7 @@ pub fn gather_ranges(reader: &ContigReader, rb: &RangesBundle) -> BatchResult {
         ploidy,
         vk,
         vk_off,
+        vk_src: Vec::new(),
         dense: dense.refs,
         dense_range: rb.dense_range.clone(),
         dense_present,
@@ -755,6 +785,109 @@ impl BatchResult {
     }
 }
 
+/// Where one decoded record came from, so a consumer can index a `FieldView`.
+/// var_key: `idx` is the absolute call index in `var_key/{snp,indel}`.
+/// dense: `idx` is the absolute dense variant row in `dense/{snp,indel}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordSrc {
+    pub is_dense: bool,
+    pub is_indel: bool,
+    pub idx: usize,
+}
+
+impl BatchResult {
+    /// As `decode_hap`, but also returns one `RecordSrc` per decoded record, in
+    /// the same order. Requires a `BatchResult` built by `overlap_batch_src`
+    /// (i.e. with `vk_src` populated); panics otherwise, since silently
+    /// returning wrong provenance would attach field values to the wrong
+    /// variants.
+    pub fn decode_hap_src(
+        &self,
+        reader: &ContigReader,
+        r: usize,
+        s: usize,
+        p: usize,
+    ) -> (HapCalls, Vec<RecordSrc>) {
+        assert_eq!(
+            self.vk_src.len(),
+            self.vk.len(),
+            "decode_hap_src requires a BatchResult from overlap_batch_src"
+        );
+        let h = (r * self.n_samples + s) * self.ploidy + p;
+
+        // var_key run for this hap, carrying provenance.
+        let (lo, hi) = (self.vk_off[h], self.vk_off[h + 1]);
+        let vk_run: Vec<(KeyRef, RecordSrc)> = (lo..hi)
+            .map(|i| {
+                let (is_indel, idx) = spine::unpack_vk_src(self.vk_src[i]);
+                (
+                    self.vk[i],
+                    RecordSrc {
+                        is_dense: false,
+                        is_indel,
+                        idx,
+                    },
+                )
+            })
+            .collect();
+
+        // Dense run: present entries of this region's window. `dense.src[j]`
+        // holds `(class, per-class row)` — the index a dense field's
+        // `values.bin` is aligned to (see `FieldView::value_at`/`format_at`).
+        // Rebuilding the union here mirrors `overlap_batch_src`'s inputs
+        // exactly (same reader, same deterministic sort), so `dense.refs[j]`
+        // is guaranteed identical to `self.dense[j]`.
+        let dense = reader.dense_union();
+        let (ds, de) = (self.dense_range[r].start, self.dense_range[r].end);
+        let bit0 = self.dense_present_off[h];
+        let mut dn_run: Vec<(KeyRef, RecordSrc)> = Vec::new();
+        for (k, j) in (ds..de).enumerate() {
+            if bits::get_bit(&self.dense_present, bit0 + k) {
+                let (class, dcol) = dense.src[j];
+                dn_run.push((
+                    self.dense[j],
+                    RecordSrc {
+                        is_dense: true,
+                        is_indel: matches!(class, crate::dense::DenseClass::Indel),
+                        idx: dcol,
+                    },
+                ));
+            }
+        }
+
+        // Merge by position with the SAME stable tie-break as `decode_hap`
+        // (`spine::merge_keys(vec![vk_slice, dn])`: earlier run — var_key —
+        // wins ties). This two-pointer merge reproduces that exactly (mirrors
+        // `merge_by_position`'s tie-break, as `gather_haps_readbound_impl`'s
+        // hand-inlined merge already does for the read-bound path).
+        let mut merged: Vec<(KeyRef, RecordSrc)> = Vec::with_capacity(vk_run.len() + dn_run.len());
+        let (mut a, mut b) = (0usize, 0usize);
+        while a < vk_run.len() && b < dn_run.len() {
+            if vk_run[a].0.position <= dn_run[b].0.position {
+                merged.push(vk_run[a]);
+                a += 1;
+            } else {
+                merged.push(dn_run[b]);
+                b += 1;
+            }
+        }
+        merged.extend_from_slice(&vk_run[a..]);
+        merged.extend_from_slice(&dn_run[b..]);
+
+        let lut = reader.lut.as_ref();
+        let mut hc = HapCalls::default();
+        let mut srcs = Vec::with_capacity(merged.len());
+        for (kr, src) in merged {
+            let c = decode_keyref(kr, lut);
+            hc.positions.push(c.position);
+            hc.ilens.push(c.ilen);
+            hc.alts.push(c.alt);
+            srcs.push(src);
+        }
+        (hc, srcs)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::sidecar::mmap_file;
@@ -777,6 +910,7 @@ mod tests {
                 key: 1 << PAYLOAD_TOP_SHIFT,
             }],
             vk_off: vec![0, 1, 1, 1, 1],
+            vk_src: vec![],
             dense: vec![],
             dense_range: vec![0..0],
             dense_present: vec![],

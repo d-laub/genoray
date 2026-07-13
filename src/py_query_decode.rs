@@ -56,6 +56,118 @@ impl PyContigReader {
         Ok(d)
     }
 
+    /// As `decode_batch`, plus one raw-bytes buffer per requested field, aligned
+    /// 1:1 with the decoded records. `fields` is `(category, name, dtype_str)`.
+    /// Values are returned as little-endian bytes + an itemsize; Python applies
+    /// the numpy dtype (same trick as `allele`), so Rust does no dtype dispatch.
+    #[pyo3(signature = (regions, fields, base_dir, contig))]
+    pub fn decode_batch_fields<'py>(
+        &self,
+        py: Python<'py>,
+        regions: Vec<(u32, u32)>,
+        fields: Vec<(String, String, String)>,
+        base_dir: &str,
+        contig: &str,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        use crate::field::StorageDtype;
+        use crate::layout::{ContigPaths, FieldSub};
+        use crate::query::{FieldView, gather::overlap_batch_src};
+
+        let br = overlap_batch_src(&self.inner, &regions);
+        let paths = ContigPaths::new(base_dir, contig);
+        let n_samples_cohort = self.inner.n_samples();
+
+        // Open the four sub-stream views per field up front.
+        struct OpenField {
+            key: String,
+            is_format: bool,
+            width: usize,
+            views: [FieldView; 4], // indexed by FieldSub::all() order
+        }
+        let mut open: Vec<OpenField> = Vec::with_capacity(fields.len());
+        for (category, name, dtype_str) in &fields {
+            let dtype = StorageDtype::from_meta_str(dtype_str).ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "field {name:?} has unresolved/unknown dtype {dtype_str:?}"
+                ))
+            })?;
+            let width = dtype
+                .width_bytes()
+                .expect("from_meta_str rejects unresolved dtypes");
+            let mut views = Vec::with_capacity(4);
+            for sub in FieldSub::all() {
+                views.push(
+                    FieldView::open(&paths, category, name, sub, dtype, n_samples_cohort)
+                        .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))?,
+                );
+            }
+            open.push(OpenField {
+                key: format!("{category}/{name}"),
+                is_format: category == "format",
+                width,
+                views: views.try_into().map_err(|_| ()).expect("exactly 4 subs"),
+            });
+        }
+
+        let mut pos: Vec<i32> = Vec::new();
+        let mut ilen: Vec<i32> = Vec::new();
+        let mut allele: Vec<u8> = Vec::new();
+        let mut str_off: Vec<i64> = vec![0];
+        let mut off: Vec<i64> = vec![0];
+        let mut fbytes: Vec<Vec<u8>> = vec![Vec::new(); open.len()];
+
+        for r in 0..br.n_regions {
+            for s in 0..br.n_samples {
+                for p in 0..br.ploidy {
+                    let (hc, srcs) = br.decode_hap_src(&self.inner, r, s, p);
+                    for (i, &src) in srcs.iter().enumerate() {
+                        pos.push(hc.positions[i] as i32);
+                        ilen.push(hc.ilens[i]);
+                        allele.extend_from_slice(&hc.alts[i]);
+                        str_off.push(allele.len() as i64);
+
+                        // FieldSub::all() order: VkSnp, VkIndel, DenseSnp, DenseIndel
+                        let sub_ix = match (src.is_dense, src.is_indel) {
+                            (false, false) => 0,
+                            (false, true) => 1,
+                            (true, false) => 2,
+                            (true, true) => 3,
+                        };
+                        for (fi, f) in open.iter().enumerate() {
+                            let view = &f.views[sub_ix];
+                            // Dense FORMAT strides by the ORIGINAL cohort sample
+                            // index. `s` here is already the cohort index because
+                            // `overlap_batch_src` runs over the whole cohort.
+                            let elem = if src.is_dense && f.is_format {
+                                view.bytes_at(src.idx * n_samples_cohort + s)
+                            } else {
+                                view.bytes_at(src.idx)
+                            };
+                            debug_assert_eq!(elem.len(), f.width);
+                            fbytes[fi].extend_from_slice(elem);
+                        }
+                    }
+                    off.push(pos.len() as i64);
+                }
+            }
+        }
+
+        let d = PyDict::new(py);
+        d.set_item("pos", i32_to_pyarray(py, &pos))?;
+        d.set_item("ilen", i32_to_pyarray(py, &ilen))?;
+        d.set_item("allele", u8_to_pyarray(py, &allele))?;
+        d.set_item("str_off", PyArray1::from_slice(py, &str_off))?;
+        d.set_item("off", PyArray1::from_slice(py, &off))?;
+        d.set_item("n_regions", br.n_regions)?;
+        d.set_item("n_samples", br.n_samples)?;
+        d.set_item("ploidy", br.ploidy)?;
+        for (fi, f) in open.iter().enumerate() {
+            d.set_item(format!("field_{}", f.key), u8_to_pyarray(py, &fbytes[fi]))?;
+            d.set_item(format!("field_itemsize_{}", f.key), f.width)?;
+        }
+        Ok(d)
+    }
+
     /// Per-hap variant count over `regions` WITHOUT decoding: var_key slice length
     /// (`vk_off` diff) + dense-present popcount. Flat length `H`, region-major hap
     /// order; the caller reshapes to `(n_regions, n_samples, ploidy)`. The simplified
