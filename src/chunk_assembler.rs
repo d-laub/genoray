@@ -160,7 +160,7 @@ fn is_htslib_missing(raw_val: f64, is_float: bool) -> bool {
 // `source_alt_index` is 1-based (ALT1 → 1, matching BCF GT allele codes; see
 // `normalize::atomize_record`), but htslib's Number=A buffer is 0-based
 // per-ALT (ALT1's value lives at `vals[0]`).
-fn resolve_scalar(vals: Option<&[f64]>, source_alt_index: u16, spec: &FieldSpec) -> f64 {
+pub(crate) fn resolve_scalar(vals: Option<&[f64]>, source_alt_index: u16, spec: &FieldSpec) -> f64 {
     let default_val = sentinel_default(spec);
     let Some(vals) = vals else {
         return default_val;
