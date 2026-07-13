@@ -55,6 +55,21 @@ pub enum SourceSpec {
         /// each concurrent contig needs its own -- never share one.
         reader: pyo3::Py<pyo3::PyAny>,
     },
+    /// A **finished** SVAR2 store, re-emitted as this contig's region+sample
+    /// subset (`Svar2Source`). Backs `SparseVar2.write_view`'s "coarse seam":
+    /// re-running the ordinary conversion pipeline over a synthetic source
+    /// rather than surgically rewriting sidecars.
+    Svar2 {
+        /// Path to the finished SVAR2 store being viewed.
+        store_path: String,
+        /// Original sample column indices (into the store's full cohort), in
+        /// the desired OUTPUT order.
+        samples_orig_idx: Vec<usize>,
+        /// 0-based half-open `[start, end)` regions to keep, already
+        /// narrowed to this contig.
+        regions: Vec<(u32, u32)>,
+        overlap_mode: crate::svar2_source::OverlapMode,
+    },
 }
 
 //The rust pipeline (Per chromosome conversion from Dense to Sparse)
@@ -191,6 +206,19 @@ pub fn process_chromosome(
                         var_end,
                         s_refs.len(),
                         chunk_size,
+                    )?),
+                    SourceSpec::Svar2 {
+                        store_path,
+                        samples_orig_idx,
+                        regions,
+                        overlap_mode,
+                    } => Box::new(crate::svar2_source::Svar2Source::new(
+                        &store_path,
+                        &chr,
+                        &samples_orig_idx,
+                        ploidy,
+                        &regions,
+                        overlap_mode,
                     )?),
                 };
                 let mut reader = crate::chunk_assembler::ChunkAssembler::new(
