@@ -708,7 +708,7 @@ pub fn gather_haps_readbound_src(reader: &ContigReader, rb: &HapRanges<'_>) -> B
 /// `BatchResultSplit::dense_*_range[q]`; `i` indexes into `out`.
 #[inline]
 pub fn dense_abs_row(on_disk: &Range<usize>, out: &Range<usize>, i: usize) -> usize {
-    debug_assert!(out.contains(&i), "i must index into the output window");
+    assert!(out.contains(&i), "i must index into the output window");
     on_disk.start + (i - out.start)
 }
 

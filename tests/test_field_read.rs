@@ -1,14 +1,17 @@
 //! Proves the field-read API is reachable from OUTSIDE the crate — the same way
 //! GenVarLoader consumes it (Cargo path-dep, `default-features = false`). This
 //! is the Milestone-1 acceptance test: everything gvl needs (`FieldView`,
-//! `FieldValue`, `vk_src` pack/unpack, `gather_haps_readbound_src`, and
-//! `dense_abs_row`) must be reachable via a short, stable `genoray_core::...`
-//! path without reaching into private modules.
+//! `FieldValue`, `vk_src` pack/unpack, `SrcKeyRef`/`VkElem`, `VK_SRC_INDEL_BIT`,
+//! `gather_haps_readbound_src`, and `dense_abs_row`) must be reachable via a
+//! short, stable `genoray_core::...` path without reaching into private
+//! modules.
 
 use genoray_core::field::StorageDtype;
 use genoray_core::layout::{ContigPaths, FieldSub};
 use genoray_core::query::gather::dense_abs_row;
-use genoray_core::query::{FieldValue, FieldView, pack_vk_src, unpack_vk_src};
+use genoray_core::query::{
+    FieldValue, FieldView, SrcKeyRef, VK_SRC_INDEL_BIT, VkElem, pack_vk_src, unpack_vk_src,
+};
 
 #[test]
 fn field_view_is_publicly_constructible() {
@@ -37,6 +40,29 @@ fn field_view_is_publicly_constructible() {
 fn vk_src_helpers_are_public() {
     let s = pack_vk_src(true, 42);
     assert_eq!(unpack_vk_src(s), (true, 42));
+}
+
+#[test]
+fn vk_src_tag_bit_value_is_pinned() {
+    // Pins the tag bit's actual VALUE — not just that pack/unpack agree with
+    // each other, which would still hold if both used a different bit.
+    assert_eq!(pack_vk_src(true, 3), VK_SRC_INDEL_BIT | 3);
+    assert_eq!(pack_vk_src(false, 3) & VK_SRC_INDEL_BIT, 0);
+}
+
+#[test]
+fn src_key_ref_and_vk_elem_are_publicly_usable() {
+    // `VkElem` must be in scope to call the trait method `make` on `SrcKeyRef`.
+    let indel_elem = SrcKeyRef::make(100, 0xAB, true, 3);
+    assert_eq!(indel_elem.key.position, 100);
+    assert_eq!(indel_elem.key.key, 0xAB);
+    assert_eq!(indel_elem.src, VK_SRC_INDEL_BIT | 3);
+    assert_eq!(indel_elem.position(), 100);
+    assert_eq!(unpack_vk_src(indel_elem.src), (true, 3));
+
+    let snp_elem = SrcKeyRef::make(200, 0xCD, false, 7);
+    assert_eq!(snp_elem.src & VK_SRC_INDEL_BIT, 0);
+    assert_eq!(unpack_vk_src(snp_elem.src), (false, 7));
 }
 
 #[test]
