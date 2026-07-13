@@ -641,6 +641,41 @@ pub fn run_view_pipeline(
     Ok(())
 }
 
+/// Per-variant routing/carrier stats for one finished SVAR2 contig, for the
+/// `reroute` measurement spike (`scripts/svar2_reroute_spike.py`). Returns four
+/// parallel 1-D arrays, one entry per variant: `is_indel` (u8 0/1), `src_dense`
+/// (u8 0/1 — 1 iff stored dense), `x_full` (u32 whole-cohort carrier haps), and
+/// `x_sub` (u32 carrier haps among `subset`). `subset` holds *original* sample
+/// column indices. No gather is performed — see `ContigReader::variant_stats`.
+#[cfg(feature = "conversion")]
+#[pyfunction]
+#[allow(clippy::type_complexity)]
+fn svar2_variant_stats<'py>(
+    py: Python<'py>,
+    store_path: String,
+    chrom: String,
+    subset: Vec<usize>,
+) -> PyResult<(
+    Bound<'py, numpy::PyArray1<u8>>,
+    Bound<'py, numpy::PyArray1<u8>>,
+    Bound<'py, numpy::PyArray1<u32>>,
+    Bound<'py, numpy::PyArray1<u32>>,
+)> {
+    let (samples, ploidy) =
+        read_store_meta(&store_path).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let reader = crate::query::ContigReader::open(&store_path, &chrom, samples.len(), ploidy)
+        .map_err(|e| PyValueError::new_err(format!("open {store_path}/{chrom}: {e}")))?;
+    let stats = reader.variant_stats(&subset);
+    let is_indel: Vec<u8> = stats.is_indel.iter().map(|&b| b as u8).collect();
+    let src_dense: Vec<u8> = stats.src_dense.iter().map(|&b| b as u8).collect();
+    Ok((
+        numpy::PyArray1::from_slice(py, &is_indel),
+        numpy::PyArray1::from_slice(py, &src_dense),
+        numpy::PyArray1::from_slice(py, &stats.x_full),
+        numpy::PyArray1::from_slice(py, &stats.x_sub),
+    ))
+}
+
 /// Convert N single-sample VCFs (with possibly disjoint site lists) into ONE
 /// SVAR2 store (`SparseVar2.from_vcf_list`). `vcf_paths[i]`'s sample is
 /// `samples[i]` -- the two lists are parallel, one file per sample. Contigs
@@ -841,6 +876,8 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run_pgen_conversion_pipeline, m)?)?;
     #[cfg(feature = "conversion")]
     m.add_function(wrap_pyfunction!(run_view_pipeline, m)?)?;
+    #[cfg(feature = "conversion")]
+    m.add_function(wrap_pyfunction!(svar2_variant_stats, m)?)?;
     #[cfg(feature = "conversion")]
     m.add_function(wrap_pyfunction!(run_vcf_list_conversion_pipeline, m)?)?;
     #[cfg(feature = "conversion")]

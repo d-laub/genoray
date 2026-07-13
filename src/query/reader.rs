@@ -362,3 +362,123 @@ impl ContigReader {
             .get_allele(row)
     }
 }
+
+/// Per-variant routing/carrier stats for the `reroute` measurement spike
+/// (`scripts/svar2_reroute_spike.py`). One entry per variant in the contig, in
+/// stream order (var_key SNP, var_key indel, dense SNP, dense indel — the exact
+/// order does not matter, the spike aggregates). `x_full` is the carrier-hap
+/// count over the whole cohort; `x_sub` over the requested sample subset only.
+pub struct VariantStats {
+    /// `false` = SNP, `true` = indel (from which physical stream the variant
+    /// lives in; never decoded from the key).
+    pub is_indel: Vec<bool>,
+    /// `true` iff the variant is stored in a `dense/*` table; `false` iff it is
+    /// in a `var_key/*` stream. This is the source store's routing decision.
+    pub src_dense: Vec<bool>,
+    /// Carrier haplotypes over the whole cohort.
+    pub x_full: Vec<u32>,
+    /// Carrier haplotypes among the subset samples only.
+    pub x_sub: Vec<u32>,
+}
+
+impl ContigReader {
+    /// Enumerate every variant's routing (`src_dense`) and carrier counts
+    /// (`x_full` whole-cohort, `x_sub` over `subset`) with **no gather**: a
+    /// var_key call belongs to exactly one hap-column (`sample * ploidy + p`),
+    /// so grouping the packed calls by `(pos, key)` counts carriers directly,
+    /// and a dense variant's carriers are a whole-cohort popcount of its
+    /// hap-major bit row. `subset` holds original sample indices; out-of-range
+    /// indices are ignored (they contribute to no column).
+    pub fn variant_stats(&self, subset: &[usize]) -> VariantStats {
+        use std::collections::HashMap;
+        let ploidy = self.ploidy;
+        let n_samples = self.n_samples;
+        let columns = n_samples * ploidy;
+
+        let mut in_sub = vec![false; n_samples];
+        for &s in subset {
+            if s < n_samples {
+                in_sub[s] = true;
+            }
+        }
+
+        let mut is_indel: Vec<bool> = Vec::new();
+        let mut src_dense: Vec<bool> = Vec::new();
+        let mut x_full: Vec<u32> = Vec::new();
+        let mut x_sub: Vec<u32> = Vec::new();
+
+        // var_key/snp: group the packed 2-bit-keyed calls by (pos, code).
+        {
+            let positions = self.vk_snp.positions();
+            let keys = as_bytes(&self.vk_snp.keys);
+            let mut map: HashMap<(u32, u8), (u32, u32)> = HashMap::new();
+            for c in 0..columns {
+                let is = in_sub[c / ploidy];
+                for i in self.vk_snp.column(c) {
+                    let key = (positions[i], rvk::unpack_snp_key_at(keys, i));
+                    let e = map.entry(key).or_insert((0, 0));
+                    e.0 += 1;
+                    e.1 += is as u32;
+                }
+            }
+            for (_, (xf, xs)) in map {
+                is_indel.push(false);
+                src_dense.push(false);
+                x_full.push(xf);
+                x_sub.push(xs);
+            }
+        }
+
+        // var_key/indel: uniform u32 keys, otherwise identical grouping.
+        {
+            let positions = self.vk_indel.positions();
+            let keys = as_u32(&self.vk_indel.keys);
+            let mut map: HashMap<(u32, u32), (u32, u32)> = HashMap::new();
+            for c in 0..columns {
+                let is = in_sub[c / ploidy];
+                for i in self.vk_indel.column(c) {
+                    let e = map.entry((positions[i], keys[i])).or_insert((0, 0));
+                    e.0 += 1;
+                    e.1 += is as u32;
+                }
+            }
+            for (_, (xf, xs)) in map {
+                is_indel.push(true);
+                src_dense.push(false);
+                x_full.push(xf);
+                x_sub.push(xs);
+            }
+        }
+
+        // dense tables: each column is already one distinct variant; carriers
+        // are a popcount over hap rows (whole-cohort) restricted to the subset.
+        for (dense, indel) in [(&self.dense_snp, false), (&self.dense_indel, true)] {
+            let Some(d) = dense else { continue };
+            let nd = d.n_dense_variants;
+            let mut xf = vec![0u32; nd];
+            let mut xs = vec![0u32; nd];
+            for (sample, &is) in in_sub.iter().enumerate() {
+                for p in 0..ploidy {
+                    let hap = sample * ploidy + p;
+                    d.for_each_carried(hap, |col| {
+                        xf[col] += 1;
+                        xs[col] += is as u32;
+                    });
+                }
+            }
+            for (&f, &s) in xf.iter().zip(xs.iter()) {
+                is_indel.push(indel);
+                src_dense.push(true);
+                x_full.push(f);
+                x_sub.push(s);
+            }
+        }
+
+        VariantStats {
+            is_indel,
+            src_dense,
+            x_full,
+            x_sub,
+        }
+    }
+}
