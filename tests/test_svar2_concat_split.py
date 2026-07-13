@@ -75,6 +75,24 @@ def test_concat_rejects_overlapping_contigs(two_contig_store, tmp_path):
         )
 
 
+def test_concat_refuses_output_aliasing_a_source(two_contig_store, tmp_path):
+    # The natural "merge B into A" idiom must not destroy A: concat's
+    # _write_store rmtree()s `output` before copying from the sources, so if
+    # `output` aliases a source, that source is deleted before it can be read.
+    a1 = tmp_path / "a1.svar2"
+    two_contig_store.subset_contigs(a1, "chr1", overwrite=True)
+    a2 = tmp_path / "a2.svar2"
+    two_contig_store.subset_contigs(a2, "chr2", overwrite=True)
+
+    with pytest.raises(ValueError, match="in place"):
+        SparseVar2.concat(a1, [a1, a2], overwrite=True)
+
+    # Regression guarantee: the source must survive the raise untouched.
+    assert a1.exists()
+    assert any(a1.iterdir())
+    assert SparseVar2(a1).contigs == ["chr1"]
+
+
 def test_concat_rejects_sample_mismatch(two_contig_store, tmp_path):
     # Split two_contig_store into single-contig stores, then rewrite one's
     # meta.json samples so the compatibility guard fires.

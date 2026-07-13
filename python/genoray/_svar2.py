@@ -136,6 +136,11 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         paths = [Path(s.path if isinstance(s, SparseVar2) else s) for s in sources]
         if not paths:
             raise ValueError("concat requires at least one source")
+        output = Path(output)
+        if any(output.resolve() == p.resolve() for p in paths):
+            raise ValueError(
+                "cannot write concat output in place (output == one of the sources)"
+            )
         metas = [_load_meta(p) for p in paths]
         _assert_concat_compatible(metas)
         contig_sources: dict[str, Path] = {}
