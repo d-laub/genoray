@@ -8,19 +8,30 @@ sole mode?
 
 ## TL;DR
 
-**Keep `reroute=False` raising `NotImplementedError`; `reroute=True` is the
-correct sole mode.** Sample-subsetting *does* materially change representation
-for small germline subsets (up to 17 % of variants flip; preserving the source
-routing would be up to **+6.6 %** larger on disk), but the size delta is
-**one-directional** — `reroute=True` picks the per-variant minimum, so it is
-always ≤ the source-preserving output and is *meaningfully smaller* for realistic
-germline sample subsets. A `reroute=False` (source-preserving) mode would
-therefore produce a **strictly equal-or-larger** store: it buys nothing on output
-size or correctness, only a potential conversion-speed shortcut. The genuine
-performance follow-up is **making the existing `reroute=True` path streaming**
-(see the eager-materialization benchmark,
-`2026-07-13-svar2-eager-materialization-benchmark.md`), not a second
-representation-preserving implementation.
+**Build `reroute=False` as a user-selectable mode — it is the right default for
+somatic / all-rare data and the low-memory path in general.** `reroute=False`
+preserves each variant's source representation by *array-slicing* the store's
+sidecars, so it never runs the cost model or the pipeline's dense-grid assembly.
+Two consequences the spike makes concrete:
+
+- **Somatic / all-rare: ~perfect.** ≤0.01 % of variants flip and the on-disk
+  size delta is ≤0.012 % — the source layout is already optimal for any subset,
+  so preservation costs nothing *and* skips the full re-conversion.
+- **Low memory.** Because it slices instead of re-converting, `reroute=False`
+  avoids the eager `Vec<RawRecord>` materialization that makes `reroute=True`
+  peak at O(variants × haps) (~31 GB for a whole-chr21 germline view — see
+  `2026-07-13-svar2-eager-materialization-benchmark.md`). Its footprint is ~O(the
+  sliced output). This barely moves unless the subset is *large* (e.g. splitting a
+  cohort by super-population), and large subsets are exactly where flips are
+  already near-zero.
+
+The only regime where `reroute=False` is measurably sub-optimal is **aggressive
+sample-subsetting of a moderate-cohort germline store** (down to ~10–100 of
+thousands of samples): there `reroute=True` re-routes ~5–17 % of variants and is
+up to ~6.6 % smaller. So `reroute=True` stays the size-optimal **default**, and
+`reroute=False` is the opt-in for users who are tolerant of a slightly
+sub-optimal layout, know their data is all-rare (somatic), or want the low-memory
+/ no-re-conversion path. `reroute="auto"` continues to resolve to `True`.
 
 ## Background
 
@@ -131,21 +142,28 @@ row, confirming the recount matches the store exactly.
   carrier haps (SNP); almost every variant is var_key at the full cohort and stays
   var_key in any subset, so re-routing changes nothing.
 
-**Why this does *not* justify building `reroute=False`.** The size delta is always
-≥ 0 and one-directional: `reroute=True` chooses the per-variant cheaper
-representation, so it is by construction never larger than the source-preserving
-output, and is up to 6.6 % smaller for small germline subsets. A source-preserving
-`reroute=False` mode would produce a strictly equal-or-larger store with identical
-decoded genotypes — no size or correctness win. Its only possible advantage is
-avoiding the cost-model recount + full re-conversion (a *speed* argument this spike
-does not measure).
+**The size delta is one-directional but that is not the whole story.** Yes,
+`reroute=True` picks the per-variant minimum, so it is never larger than the
+source-preserving output (up to 6.6 % smaller for small germline subsets). If
+output size were the only axis, `reroute=True` would dominate. But `reroute=False`
+wins on two other axes that matter to real users:
 
-**Decision.** `reroute=False` stays `NotImplementedError`. `reroute=True` is
-validated as the size-optimal sole mode. If a future need for a faster whole-store
-/ large-subset copy arises, the measured near-zero flip/delta in exactly those
-large-subset regimes means a fast path there would essentially reproduce
-`reroute=True`'s bytes anyway — so the higher-value performance work is the
-**streaming rewrite of the `reroute=True` `Svar2Source`** (its eager whole-contig
-`Vec<RawRecord>` materialization is the real scaling limit; see
-`2026-07-13-svar2-eager-materialization-benchmark.md`), not a second
-representation-preserving code path.
+- **Memory / speed.** It slices sidecars instead of re-converting, so it avoids
+  the eager materialization that dominates `reroute=True`'s footprint, and skips
+  the cost-model + dense-grid work entirely.
+- **Layout stability.** It preserves the source store's exact representation, which
+  some downstream consumers may rely on.
+
+And in the regime where it is used most naturally — somatic / all-rare data, or
+any coarse (large) subset — its output is within a fraction of a percent of
+`reroute=True` anyway.
+
+**Decision.** Implement `reroute=False` as a representation-preserving
+array-slicing path (a distinct implementation from the `reroute=True`
+re-conversion), and document its trade-off: recommended for somatic / all-rare
+stores and memory-constrained runs; `reroute=True` (the size-optimal re-router)
+stays the default and `"auto"` still resolves to it. `mutcat` still cannot be
+copied positionally under either mode (DBS adjacency), so it is recomputed from
+`reference` or omitted. A separate future lever remains streaming the
+`reroute=True` `Svar2Source` for users who need the re-router at cohort scale
+(see `2026-07-13-svar2-eager-materialization-benchmark.md`).
