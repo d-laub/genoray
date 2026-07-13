@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
@@ -8,6 +9,7 @@ import numpy as np
 from natsort import natsorted
 
 import genoray._core as _core
+from genoray._contigs import _MITO_ALIASES
 from genoray._svar2_batch import _BatchQueryMixin
 from genoray._svar2_decode import _DecodeMixin
 from genoray._svar2_fields import (
@@ -47,6 +49,17 @@ def _resolve_vcf_sources(sources: "str | Path | Sequence[str | Path]") -> list[P
             paths = natsorted(path.glob("*.vcf.gz")) + natsorted(path.glob("*.bcf"))
         elif path.name.endswith(".vcf.gz") or path.suffix == ".bcf":
             paths = [path]
+        elif path.suffix == ".vcf":
+            # Without this, a bare `.vcf` single-path `sources` falls into the
+            # manifest branch below: every `##`/`#CHROM` header line reads as
+            # a `#`-comment (skipped), then every data line is treated as a
+            # *path* -- producing a bewildering downstream error far from the
+            # real problem. `_ensure_bgzipped` always raises here (this
+            # branch is reached only when the suffix is exactly `.vcf`, which
+            # is neither `.bcf` nor `.vcf.gz`); the `paths = []` afterward is
+            # unreachable but keeps this branch's static type honest.
+            _ensure_bgzipped(path)
+            paths = cast("list[Path]", [])
         else:
             paths = []
             for line in path.read_text().splitlines():
@@ -82,6 +95,114 @@ def _ensure_index(source: Path) -> None:
     if csi.exists() or tbi.exists():
         return
     _core.index_vcf(str(source))
+
+
+def _canonical_contig_id(name: str) -> str:
+    """The `chr`-prefix-insensitive, mito-alias-aware identity that
+    :class:`genoray._contigs.ContigNormalizer` treats as "the same contig" --
+    used here only to *detect* (not resolve) a cohort mixing `chr1`/`1`-style
+    naming across input files, mirroring `ContigNormalizer`'s own rule
+    (`contig_map`'s `chr`-stripping and `_MITO_ALIASES` grouping).
+    """
+    if name in _MITO_ALIASES:
+        return "MT"
+    return name[3:] if name.startswith("chr") else name
+
+
+def _check_consistent_contig_naming(
+    per_file_contigs: "list[tuple[Path, set[str]]]",
+) -> None:
+    """Raise if the cohort mixes naming schemes for the same logical contig
+    across input files (e.g. file A calls it ``chr1``, file B calls it ``1``).
+
+    `from_vcf_list`'s native k-way merge (`VcfListRecordSource`) matches
+    contigs by exact per-file string, not through `ContigNormalizer` -- each
+    contig name is opened literally against every file's own header. A cohort
+    that mixes naming schemes would otherwise silently produce two separate
+    entries in the union contig list (e.g. ``["1", "chr1", ...]``); each
+    "contig" then converts using only the files whose spelling matches, with
+    every other file's column filled hom-ref via the existing
+    contig-missing-from-header skip -- with no error and no warning.
+    `from_vcf` cannot have this bug structurally (one file, one scheme); this
+    entry point can, because it merges N independently-produced files.
+    """
+    spellings: dict[str, dict[str, list[Path]]] = {}
+    for path, contigs in per_file_contigs:
+        for c in contigs:
+            spellings.setdefault(_canonical_contig_id(c), {}).setdefault(c, []).append(
+                path
+            )
+
+    conflicts = {k: v for k, v in spellings.items() if len(v) > 1}
+    if not conflicts:
+        return
+
+    lines: list[str] = []
+    for canonical, by_spelling in sorted(conflicts.items()):
+        for spelling, paths in sorted(by_spelling.items()):
+            names = ", ".join(str(p) for p in paths)
+            lines.append(f"  {spelling!r} (contig {canonical!r}): {names}")
+    raise ValueError(
+        "from_vcf_list: inconsistent contig naming across input files -- the "
+        "same contig is spelled differently in different files (e.g. 'chr1' "
+        "vs '1'). The native k-way merge matches contigs by an exact "
+        "per-file string, so a mixed cohort would silently be treated as if "
+        "these were different contigs, filling every file that uses the "
+        "OTHER spelling hom-ref with no error. Conflicting spellings:\n"
+        + "\n".join(lines)
+        + "\nNormalize contig names across all inputs first (e.g. `bcftools "
+        "annotate --rename-chrs`) before calling from_vcf_list."
+    )
+
+
+# Rough per-file FD cost of `from_vcf_list` opening N single-sample VCFs
+# concurrently: one for the data file, one for its .tbi/.csi index (htslib's
+# `IndexedReader` holds both). `_FD_SAFETY_MARGIN` covers stdio, the output
+# writer/monitor threads' files, and other process-wide overhead.
+_FD_PER_INPUT_FILE = 2
+_FD_SAFETY_MARGIN = 64
+
+
+def _check_fd_budget(n_files: int) -> None:
+    """Guard against FD exhaustion before opening `n_files` inputs concurrently
+    (`from_vcf_list` holds one `IndexedReader` per file per contig -- see
+    `VcfListRecordSource`), and raise an error that actually names the real
+    problem.
+
+    Without this, hitting a common soft `RLIMIT_NOFILE` (e.g. 1024) at large
+    N surfaces as htslib's *"Failed to open VCF/BCF index ... (is there a
+    .tbi or .csi file?)"* for some arbitrary file near the ceiling -- sending
+    users to debug a nonexistent indexing problem instead of the real
+    open-file limit. There is no batched/hierarchical merge to fall back on
+    (explicit future work); the only fix at this entry point is raising the
+    ulimit.
+    """
+    import resource
+
+    needed = n_files * _FD_PER_INPUT_FILE + _FD_SAFETY_MARGIN
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft >= needed:
+        return
+
+    # Try to raise the soft limit toward the hard ceiling ourselves first --
+    # cheap, and transparent whenever the hard limit already allows it.
+    if hard == resource.RLIM_INFINITY or hard >= needed:
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (needed, hard))
+            return
+        except (ValueError, OSError):
+            pass
+
+    hard_str = "unlimited" if hard == resource.RLIM_INFINITY else str(hard)
+    raise ValueError(
+        f"from_vcf_list needs to open {n_files} input files concurrently "
+        f"(~{needed} file descriptors, including index files and process "
+        f"overhead), but the current open-file limit is {soft} (hard limit "
+        f"{hard_str}). Raise it before retrying, e.g. `ulimit -n {needed}` "
+        "(or higher, up to the hard limit) in the shell that launches this "
+        "process. from_vcf_list does not batch the merge hierarchically to "
+        "work around this ceiling -- see its docstring."
+    )
 
 
 class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
@@ -378,8 +499,22 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
           the manifest's directory).
 
         As with :meth:`from_vcf`, each input VCF's records must already be
-        position-sorted per contig -- an unsorted file silently corrupts the
-        k-way merge.
+        position-sorted per contig; an unsorted file raises `ValueError`
+        naming the offending file and positions rather than silently
+        corrupting the k-way merge.
+
+        Every input file must also use the **same contig naming scheme**
+        (e.g. all `chr1`-style or all `1`-style) -- the merge matches contigs
+        by an exact per-file string, so a cohort mixing schemes raises
+        `ValueError` up front (naming the conflicting files/spellings)
+        instead of silently producing a half-hom-ref-filled store.
+
+        Opens all `N` input files concurrently (one file descriptor per file,
+        per contig); at large `N` (roughly `N > (RLIMIT_NOFILE - 64) / 2`)
+        this raises `ValueError` with the `ulimit -n` remedy rather than
+        htslib's more confusing "no index?" error. There is no batched/
+        hierarchical merge to fall back on for very large cohorts (future
+        work) -- raise the open-file limit instead.
 
         Exactly one of `reference` or `no_reference=True` is required, with the
         same semantics as :meth:`from_vcf`: with a reference, atoms are
@@ -427,9 +562,11 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             )
 
         paths = _resolve_vcf_sources(sources)
+        _check_fd_budget(len(paths))
         out.parent.mkdir(parents=True, exist_ok=True)
 
         samples: list[str] = []
+        per_file_contigs: list[tuple[Path, set[str]]] = []
         contig_set: set[str] = set()
         for path in paths:
             _ensure_bgzipped(path)
@@ -440,9 +577,14 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
                     f"{path} is not single-sample (has {len(v.samples)} samples)"
                 )
             samples.append(v.samples[0])
-            contig_set.update(c for c in v.seqnames if next(v(c), None) is not None)
+            file_contigs = {c for c in v.seqnames if next(v(c), None) is not None}
+            per_file_contigs.append((path, file_contigs))
+            contig_set.update(file_contigs)
 
-        dupes = sorted({s for s in samples if samples.count(s) > 1})
+        _check_consistent_contig_naming(per_file_contigs)
+
+        sample_counts = Counter(samples)
+        dupes = sorted(s for s, n in sample_counts.items() if n > 1)
         if dupes:
             raise ValueError(f"duplicate sample names across inputs: {dupes}")
 

@@ -396,7 +396,21 @@ multi-sample VCF.
   normalized `(pos, ref, alt)` atom matches exactly, not merely its position.
 - **Each input file's records must already be position-sorted** per contig
   (same assumption `from_vcf` makes for its single input) — an unsorted
-  file silently corrupts the k-way merge.
+  file raises `ValueError` naming the offending file and positions rather
+  than silently corrupting the k-way merge.
+- **Every input file must use the same contig naming scheme** (all
+  `chr1`-style or all `1`-style, not a mix) — the merge matches contigs by
+  an exact per-file string, so a cohort mixing schemes raises `ValueError`
+  up front (naming the conflicting files/spellings) instead of silently
+  producing a store where half the cohort's samples decode as all-zeros on
+  the "wrong-spelled" contigs.
+- **Opens all N input files concurrently** (one file descriptor per file per
+  contig) — at large N (roughly `N > (soft RLIMIT_NOFILE - 64) / 2`, often
+  around N ≈ 480 at a default 1024 soft limit) this raises `ValueError` with
+  the `ulimit -n` remedy instead of htslib's more confusing "is there a .tbi
+  or .csi file?" error for some arbitrary file near the ceiling. There is no
+  batched/hierarchical merge to fall back on for very large cohorts (future
+  work) — raise the open-file limit instead.
 - **`no_reference=True` is supported**, same as `from_vcf`/`from_pgen`: skips
   REF validation and left-alignment, reconstructing each atom's REF from the
   record's own REF bytes. The `reference`/`no_reference` exactly-one-of check

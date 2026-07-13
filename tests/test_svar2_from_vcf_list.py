@@ -34,6 +34,26 @@ def _ss(d: Path, name: str, sample: str, rows: str) -> Path:
     return gz
 
 
+def _ss_contig(d: Path, name: str, sample: str, contig: str, rows: str) -> Path:
+    """Like `_ss`, but the contig name (both header `##contig` line and each
+    data row's leading column) is a parameter -- for the mixed-naming-scheme
+    test, which needs one file spelling the same logical contig `chr1` and
+    another spelling it `1`."""
+    header = (
+        "##fileformat=VCFv4.2\n"
+        f"##contig=<ID={contig},length=40>\n"
+        '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n'
+        f"#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t{sample}\n"
+    )
+    plain = d / f"{name}.vcf"
+    plain.write_text(header + rows)
+    gz = d / f"{name}.vcf.gz"
+    with open(gz, "wb") as fh:
+        subprocess.run(["bgzip", "-c", str(plain)], check=True, stdout=fh)
+    subprocess.run(["bcftools", "index", str(gz)], check=True)
+    return gz
+
+
 def _ss_fields(d: Path, name: str, sample: str, rows: str) -> Path:
     """Like `_ss`, but the header also declares `INFO AF` (Number=A, Float)
     and `FORMAT DP` (Number=1, Integer), for the field-carry-through tests."""
@@ -457,3 +477,101 @@ def test_from_vcf_list_info_first_carrier(tmp_path: Path):
     assert lengths.tolist() == [1, 0, 0, 1]
     af = np.asarray(rag["AF"].data)
     np.testing.assert_allclose(af, np.array([0.1, 0.1], dtype=np.float32), atol=1e-6)
+
+
+def test_from_vcf_list_rejects_mixed_contig_naming(tmp_path: Path):
+    """I1 (final review): a cohort mixing UCSC-style (`chr1`) and
+    Ensembl-style (`1`) contig naming across files must raise a clear error
+    up front, not silently produce a half-hom-ref-filled store. The native
+    merge matches contigs by an exact per-file string (`VcfListRecordSource`
+    opens each file with ONE `chrom` literal), so without this check the two
+    naming schemes would union into two separate "contigs" (`chr1` and `1`),
+    each converting only the files using that spelling -- `decode("chr1",
+    ...)` would silently read back all-zeros for every file that used the
+    OTHER spelling, with no error and no warning.
+    """
+    a = _ss_contig(tmp_path, "a", "SA", "chr1", "chr1\t3\t.\tA\tG\t.\t.\t.\tGT\t1|0\n")
+    b = _ss_contig(tmp_path, "b", "SB", "1", "1\t3\t.\tA\tG\t.\t.\t.\tGT\t0|1\n")
+    with pytest.raises(ValueError, match="[Ii]nconsistent contig naming"):
+        SparseVar2.from_vcf_list(tmp_path / "s", [a, b], no_reference=True, threads=1)
+
+
+def test_from_vcf_list_rejects_bare_uncompressed_vcf_source(tmp_path: Path):
+    """M3 (final review): a plain (uncompressed) `.vcf` handed as the single
+    `sources` path must be rejected outright with the same `_ensure_bgzipped`
+    message used elsewhere -- NOT silently fall into `_resolve_vcf_sources`'s
+    manifest branch, where every `##`/`#CHROM` header line reads as a
+    `#`-comment (skipped) and every data line is then treated as a bogus
+    input *path*, producing a bewildering downstream error far from the real
+    problem.
+    """
+    ref = _write_ref(tmp_path)
+    plain = tmp_path / "cohort.vcf"
+    plain.write_text(
+        "##fileformat=VCFv4.2\n"
+        "##contig=<ID=chr1,length=40>\n"
+        '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n'
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSA\n"
+        "chr1\t3\t.\tA\tG\t.\t.\t.\tGT\t1|0\n"
+    )
+    with pytest.raises(ValueError, match="bgzip"):
+        SparseVar2.from_vcf_list(tmp_path / "s", plain, ref, threads=1)
+
+
+def test_from_vcf_list_rejects_signatures_with_no_reference(tmp_path: Path):
+    """M6 (final review): pins the existing `signatures=True` +
+    `no_reference=True` guard for `from_vcf_list` specifically (the guard
+    itself predates this review; only the pinning test was missing)."""
+    a = _ss(tmp_path, "a", "SA", "chr1\t3\t.\tA\tG\t.\t.\t.\tGT\t1|0\n")
+    with pytest.raises(ValueError, match="signatures"):
+        SparseVar2.from_vcf_list(
+            tmp_path / "s", [a], no_reference=True, signatures=True, threads=1
+        )
+
+
+def test_check_fd_budget_raises_actionable_error_when_limit_too_low(monkeypatch):
+    """I3 (final review): at large N, opening every input file concurrently
+    can exhaust the process's open-file limit; `_check_fd_budget` must catch
+    this up front with a clear, actionable (`ulimit -n ...`) error instead of
+    letting htslib's confusing "is there a .tbi or .csi file?" message reach
+    the user for some arbitrary file near the ceiling.
+
+    Exercised directly against `_check_fd_budget` (rather than actually
+    opening 1000+ files, which would be slow and environment-dependent);
+    `resource.setrlimit` is monkeypatched to fail so the "raise it ourselves"
+    fast path is also forced to fall through to the error.
+    """
+    import resource
+
+    from genoray._svar2 import _check_fd_budget
+
+    monkeypatch.setattr(resource, "getrlimit", lambda which: (256, 256))
+
+    def _raise(which, limits):
+        raise OSError("simulated: cannot raise rlimit")
+
+    monkeypatch.setattr(resource, "setrlimit", _raise)
+
+    with pytest.raises(ValueError, match="ulimit -n"):
+        _check_fd_budget(1000)
+
+
+def test_check_fd_budget_raises_soft_limit_when_hard_limit_allows(monkeypatch):
+    """I3 (final review): when the HARD limit already permits it, `_check_fd_
+    budget` should transparently raise the soft limit itself rather than
+    erroring -- this is the "and/or raise the soft limit toward the hard
+    limit if that's clean" half of the fix."""
+    import resource
+
+    from genoray._svar2 import _check_fd_budget
+
+    monkeypatch.setattr(resource, "getrlimit", lambda which: (256, 4096))
+    raised: dict[str, tuple[int, int]] = {}
+
+    def _setrlimit(which, limits):
+        raised["limits"] = limits
+
+    monkeypatch.setattr(resource, "setrlimit", _setrlimit)
+
+    _check_fd_budget(1000)  # must not raise
+    assert raised["limits"][0] >= 1000 * 2 + 64
