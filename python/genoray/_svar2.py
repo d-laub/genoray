@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import numpy as np
 from natsort import natsorted
@@ -154,6 +154,111 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             {c: contig_sources[c] for c in merged_contigs},
             meta,
             mode,
+            overwrite,
+        )
+
+    def write_view(
+        self,
+        regions: "str | tuple[str, int, int] | Path | object",
+        samples: "str | Sequence[str] | Path",
+        output: str | Path,
+        fields: "Sequence[str] | None" = None,
+        reference: str | Path | None = None,
+        *,
+        merge_overlapping: bool = False,
+        regions_overlap: "Literal['pos', 'record', 'variant']" = "pos",
+        reroute: "Literal['auto', True]" = "auto",
+        overwrite: bool = False,
+        threads: int | None = None,
+        progress: bool = False,
+    ) -> None:
+        """Write a region/sample subset of this store to `output` by re-running
+        the ordinary conversion pipeline over the finished store's own records
+        (rather than re-reading the original VCF/PGEN).
+
+        `regions`/`samples` accept the same inputs as the query methods (region
+        string, `(chrom, start, end)` tuple, BED path, or a samples sequence /
+        path to a sample list). `regions_overlap` controls how a variant's span
+        is matched against the requested regions (`"pos"`/`"record"`/`"variant"`
+        — see `_normalize_regions`/`_resolve_kept_rows`); `merge_overlapping`
+        silently merges overlapping input regions instead of raising.
+
+        `fields` defaults to none carried through: field carry-through is not
+        yet implemented on this path, and the backend raises `ValueError` if
+        any (non-`mutcat`) field is requested. `"mutcat"` is always excluded —
+        pass `reference=` to recompute it instead of copying (unimplemented;
+        currently only affects `mutcat` filtering, since the backend does not
+        yet recompute anything from `reference`).
+
+        `reroute` selects the output representation: `"auto"` (equivalent to
+        `True`) reruns the full var_key/dense routing cost model on the
+        subset, which is the only mode currently implemented.
+        `reroute=False` (byte-preserving passthrough of each variant's
+        original representation) is NOT implemented and raises
+        `NotImplementedError`.
+
+        `progress` is accepted for interface parity with other long-running
+        entry points but is currently a no-op (no progress bar is shown).
+
+        Raises `FileExistsError` if `output` exists and `overwrite=False`, and
+        `ValueError` if `output` resolves to this store's own path (writing a
+        view in place is not supported).
+        """
+        from genoray._contigs import ContigNormalizer
+        from genoray._svar._regions import (
+            _normalize_regions,
+            _normalize_samples,
+            _validate_fields,
+        )
+
+        output = Path(output)
+        if reroute == "auto":
+            reroute = True
+        if reroute is not True:
+            raise NotImplementedError(
+                "reroute=False (preserve source representation) is not "
+                "implemented; only reroute=True is supported (see the "
+                "concat/split/write-view design doc)."
+            )
+        if fields is not None and "mutcat" in fields and reference is None:
+            raise ValueError(
+                "'mutcat' cannot be copied through write_view; pass "
+                "reference= to recompute it."
+            )
+        if output.exists() and not overwrite:
+            raise FileExistsError(f"{output} exists; pass overwrite=True")
+        if output.resolve() == self.path.resolve():
+            raise ValueError(
+                "output resolves to the same path as the source; cannot "
+                "write a view in place"
+            )
+        cnorm = ContigNormalizer(self.contigs)
+        regions_df = _normalize_regions(regions, cnorm)
+        caller_samples = _normalize_samples(samples, self.available_samples)
+        if not caller_samples:
+            raise ValueError("write_view requires at least one sample")
+        fields_to_write = [
+            f
+            for f in _validate_fields(
+                fields, cast("dict[str, Any]", self.available_fields)
+            )
+            if f != "mutcat"
+        ]
+        region_tuples = [
+            (row["chrom"], int(row["start"]), int(row["end"]))
+            for row in regions_df.iter_rows(named=True)
+        ]
+        _core.run_view_pipeline(
+            str(self.path),
+            str(output),
+            self.contigs,
+            caller_samples,
+            region_tuples,
+            regions_overlap,
+            merge_overlapping,
+            fields_to_write,
+            str(reference) if reference is not None else None,
+            threads,
             overwrite,
         )
 
