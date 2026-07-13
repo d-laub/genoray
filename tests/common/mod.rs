@@ -174,14 +174,16 @@ pub fn build_contig(
     // left-align repeat condition, so positions stay put and the oracle holds.
     build_fasta_with_index(&fasta, chrom, 1_000_000, records);
     process_chromosome(
-        bcf.to_str().unwrap(),
+        genoray_core::orchestrator::SourceSpec::Vcf {
+            vcf_path: bcf.to_str().unwrap().to_string(),
+            htslib_threads: 1,
+        },
         Some(fasta.to_str().unwrap()),
         chrom,
         out.to_str().unwrap(),
         samples,
         1000, // chunk_size
         ploidy,
-        1,    // htslib_threads
         4096, // long_allele_capacity
         false,
         1,     // processing_threads

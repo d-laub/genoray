@@ -39,17 +39,34 @@ parallel memory architecture.
 
 */
 
+/// Which backend a contig's records come from. Everything downstream of
+/// `ChunkAssembler` is identical for both.
+pub enum SourceSpec {
+    Vcf {
+        vcf_path: String,
+        htslib_threads: usize,
+    },
+    Pgen {
+        pgen_path: String,
+        pvar_path: String,
+        var_start: usize,
+        var_end: usize,
+        /// A `pgenlib.PgenReader` for THIS contig. Readers seek independently, so
+        /// each concurrent contig needs its own -- never share one.
+        reader: pyo3::Py<pyo3::PyAny>,
+    },
+}
+
 //The rust pipeline (Per chromosome conversion from Dense to Sparse)
 #[allow(clippy::too_many_arguments)]
 pub fn process_chromosome(
-    vcf_path: &str,
+    source: SourceSpec,
     fasta_path: Option<&str>,
     chrom: &str,
     base_out_dir: &str,
     samples: &[&str],
     chunk_size: usize,
     ploidy: usize,
-    htslib_threads: usize,
     long_allele_capacity: usize,
     skip_out_of_scope: bool,
     processing_threads: usize,
@@ -139,7 +156,6 @@ pub fn process_chromosome(
     let reader_thread = thread::Builder::new()
         .name(format!("read-{}", chrom))
         .spawn({
-            let vcf = vcf_path.to_string();
             let fasta = fasta_path.map(|s| s.to_string());
             let chr = chrom.to_string();
             // Convert references into owned Strings that can safely live forever in the thread
@@ -150,16 +166,35 @@ pub fn process_chromosome(
             move || -> Result<u64, ConversionError> {
                 // passing the thread budget down to HTSLib
                 let s_refs: Vec<&str> = s_owned.iter().map(|s| s.as_str()).collect();
-                let source = crate::vcf_reader::VcfRecordSource::new(
-                    &vcf,
-                    &chr,
-                    &s_refs,
-                    htslib_threads,
-                    ploidy,
-                    &fields_owned,
-                )?;
+                let src: Box<dyn crate::record_source::RecordSource + Send> = match source {
+                    SourceSpec::Vcf {
+                        vcf_path,
+                        htslib_threads,
+                    } => Box::new(crate::vcf_reader::VcfRecordSource::new(
+                        &vcf_path,
+                        &chr,
+                        &s_refs,
+                        htslib_threads,
+                        ploidy,
+                        &fields_owned,
+                    )?),
+                    SourceSpec::Pgen {
+                        pgen_path: _,
+                        pvar_path,
+                        var_start,
+                        var_end,
+                        reader,
+                    } => Box::new(crate::pgen_reader::PgenRecordSource::new(
+                        reader,
+                        &pvar_path,
+                        var_start,
+                        var_end,
+                        s_refs.len(),
+                        chunk_size,
+                    )?),
+                };
                 let mut reader = crate::chunk_assembler::ChunkAssembler::new(
-                    Box::new(source),
+                    src,
                     s_refs.len(),
                     ploidy,
                     fasta.as_deref(),

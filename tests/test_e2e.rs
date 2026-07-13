@@ -89,14 +89,16 @@ fn test_e2e_normalized_bcf_pipeline() {
     std::fs::create_dir_all(&out_dir).unwrap();
 
     process_chromosome(
-        bcf_path.to_str().unwrap(),
+        genoray_core::orchestrator::SourceSpec::Vcf {
+            vcf_path: bcf_path.to_str().unwrap().to_string(),
+            htslib_threads: 1,
+        },
         Some(bcf_path.with_extension("fa").to_str().unwrap()),
         "chr1",
         out_dir.to_str().unwrap(),
         &samples,
         100,  // chunk_size
         2,    // ploidy
-        1,    // htslib_threads
         4096, // long_allele_capacity
         false,
         1,     // processing_threads
@@ -180,14 +182,16 @@ fn test_e2e_max_del_postpass() {
     let out_dir = tmp.path().join("out");
     std::fs::create_dir_all(&out_dir).unwrap();
     process_chromosome(
-        bcf_path.to_str().unwrap(),
+        genoray_core::orchestrator::SourceSpec::Vcf {
+            vcf_path: bcf_path.to_str().unwrap().to_string(),
+            htslib_threads: 1,
+        },
         Some(bcf_path.with_extension("fa").to_str().unwrap()),
         "chr1",
         out_dir.to_str().unwrap(),
         &samples,
         100,
         2,
-        1,
         4096,
         false,
         1,     // processing_threads
@@ -255,14 +259,16 @@ fn test_e2e_dense_snp_roundtrip() {
     let out_dir = tmp.path().join("out");
     std::fs::create_dir_all(&out_dir).unwrap();
     process_chromosome(
-        bcf_path.to_str().unwrap(),
+        genoray_core::orchestrator::SourceSpec::Vcf {
+            vcf_path: bcf_path.to_str().unwrap().to_string(),
+            htslib_threads: 1,
+        },
         Some(bcf_path.with_extension("fa").to_str().unwrap()),
         "chr1",
         out_dir.to_str().unwrap(),
         &samples,
         100,
         2,
-        1,
         4096,
         false,
         1,     // processing_threads
@@ -329,14 +335,16 @@ fn test_e2e_mutation_conservation() {
     std::fs::create_dir_all(&out_dir).unwrap();
 
     process_chromosome(
-        bcf_path.to_str().unwrap(),
+        genoray_core::orchestrator::SourceSpec::Vcf {
+            vcf_path: bcf_path.to_str().unwrap().to_string(),
+            htslib_threads: 1,
+        },
         Some(bcf_path.with_extension("fa").to_str().unwrap()),
         "chr1",
         out_dir.to_str().unwrap(),
         &samples,
         100,
         2,
-        1,
         4096,
         false,
         1,     // processing_threads
@@ -766,14 +774,16 @@ fn test_missing_chrom_returns_err() {
     std::fs::create_dir_all(&out_dir).unwrap();
 
     let res = genoray_core::orchestrator::process_chromosome(
-        bcf_path.to_str().unwrap(),
+        genoray_core::orchestrator::SourceSpec::Vcf {
+            vcf_path: bcf_path.to_str().unwrap().to_string(),
+            htslib_threads: 1,
+        },
         Some(bcf_path.with_extension("fa").to_str().unwrap()),
         "chrZ",
         out_dir.to_str().unwrap(),
         &["s0"],
         1000,
         2,
-        1,
         1 << 20,
         false,
         1,     // processing_threads
