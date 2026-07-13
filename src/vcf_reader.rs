@@ -164,9 +164,12 @@ impl VcfRecordSource {
 
         let header = reader.header().clone();
 
-        let rid = header.name2rid(chrom.as_bytes()).map_err(|_| {
-            ConversionError::Input(format!("Chromosome '{chrom}' not found in VCF header"))
-        })?;
+        let rid =
+            header
+                .name2rid(chrom.as_bytes())
+                .map_err(|_| ConversionError::ContigNotInHeader {
+                    chrom: chrom.to_string(),
+                })?;
 
         reader
             .fetch(rid, 0, None)

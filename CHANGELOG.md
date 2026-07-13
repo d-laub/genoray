@@ -2,6 +2,26 @@
 
 ### Added
 
+- Added `SparseVar2.from_vcf_list` to build **one** SVAR2 store from many
+  **single-sample** VCFs/BCFs via a native k-way merge (no `bcftools merge`,
+  no intermediate multi-sample VCF). `sources` accepts an explicit
+  `Sequence` of paths, a directory (all `*.vcf.gz` then all `*.bcf`), or a
+  manifest file. A site present in some inputs but absent from another fills
+  **hom-ref (`0`)** for the samples that lack it. `reference`/
+  `no_reference` are supported with the same semantics as `from_vcf`
+  (skipping left-alignment under `no_reference` means a site shared across
+  files only joins into one output row if every file already represents it
+  identically — same caller, or all already `bcftools norm`'d against the
+  same reference). `info_fields=`/`format_fields=` are also supported:
+  **INFO** merges first-carrier-wins (the earliest-in-`sources` file
+  carrying a shared atom supplies the value), while **FORMAT** stays
+  per-sample (each carrier keeps its own file's value; a non-carrier gets
+  the field's default), matching `from_vcf`. Every input file must already
+  be position-sorted per contig and use a consistent contig naming scheme
+  across the cohort (both are validated up front, raising `ValueError`
+  rather than silently corrupting the merge); opening very large cohorts
+  (roughly N > 500) may require raising the process's open-file limit,
+  which `from_vcf_list` detects and reports with the `ulimit -n` remedy.
 - `SparseVar2.from_pgen` converts a PLINK2 PGEN (`.pgen`/`.pvar`/`.psam`) to an
   SVAR2 store through the same normalization, atom, and merge spine as
   `from_vcf`. Diploid-only (no `ploidy=` kwarg); dosages, INFO/FORMAT fields,

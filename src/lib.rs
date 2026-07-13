@@ -76,6 +76,8 @@ pub mod spine;
 pub mod streams;
 pub mod types;
 #[cfg(feature = "conversion")]
+pub mod vcf_list_reader;
+#[cfg(feature = "conversion")]
 pub mod vcf_reader;
 #[cfg(feature = "conversion")]
 pub mod writer;
@@ -359,6 +361,52 @@ fn run_pgen_conversion_pipeline(
     Ok(dropped as usize)
 }
 
+/// Convert N single-sample VCFs (with possibly disjoint site lists) into ONE
+/// SVAR2 store (`SparseVar2.from_vcf_list`). `vcf_paths[i]`'s sample is
+/// `samples[i]` -- the two lists are parallel, one file per sample. Contigs
+/// run sequentially (see `orchestrator::run_vcf_list`'s docs); `signatures`
+/// requires a reference (validated Python-side).
+#[cfg(feature = "conversion")]
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
+#[pyfunction]
+#[pyo3(signature = (vcf_paths, reference_path, chroms, output_dir, samples, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false, signatures=false, info_fields=Vec::new(), format_fields=Vec::new()))]
+fn run_vcf_list_conversion_pipeline(
+    py: Python,
+    vcf_paths: Vec<String>,
+    reference_path: Option<String>,
+    chroms: Vec<String>,
+    output_dir: String,
+    samples: Vec<String>,
+    chunk_size: usize,
+    ploidy: usize,
+    max_threads: Option<usize>,
+    long_allele_capacity: usize,
+    skip_out_of_scope: bool,
+    signatures: bool,
+    info_fields: Vec<(String, String, String, Option<String>, Option<f64>)>,
+    format_fields: Vec<(String, String, String, Option<String>, Option<f64>)>,
+) -> PyResult<usize> {
+    let dropped: u64 = py.detach(|| {
+        orchestrator::run_vcf_list(
+            &vcf_paths,
+            reference_path.as_deref(),
+            &chroms,
+            &output_dir,
+            &samples,
+            chunk_size,
+            ploidy,
+            max_threads,
+            long_allele_capacity,
+            skip_out_of_scope,
+            signatures,
+            info_fields,
+            format_fields,
+        )
+    })?;
+    Ok(dropped as usize)
+}
+
 /// Convert a SVAR1 (`SparseVar`) store to an SVAR2 store natively (no htslib).
 ///
 /// Per-contig `POS`/`REF`/`ALT` come from Python (it reads `index.arrow` via
@@ -511,6 +559,8 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run_conversion_pipeline, m)?)?;
     #[cfg(feature = "conversion")]
     m.add_function(wrap_pyfunction!(run_pgen_conversion_pipeline, m)?)?;
+    #[cfg(feature = "conversion")]
+    m.add_function(wrap_pyfunction!(run_vcf_list_conversion_pipeline, m)?)?;
     #[cfg(feature = "conversion")]
     m.add_function(wrap_pyfunction!(run_svar1_conversion_pipeline, m)?)?;
     #[cfg(feature = "conversion")]

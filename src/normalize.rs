@@ -150,6 +150,63 @@ pub fn left_align(mut atom: Atom, ref_seq: &[u8], l_max: u32) -> Atom {
     }
 }
 
+/// One biallelic atom in ordinary VCF REF/ALT form (not the internal anchor-only
+/// [`Atom`] encoding), ready to place in a `RawRecord`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BiallelicRecord {
+    /// 0-based start position of the record.
+    pub pos: u32,
+    /// REF bytes, reconstructed from the reference (or the source record's REF).
+    pub reference: Vec<u8>,
+    /// ALT bytes.
+    pub alt: Vec<u8>,
+    /// 1-based index into the ORIGINAL record's ALTs, for genotype remapping.
+    pub source_alt_index: u16,
+}
+
+/// Atomize `(pos, ref_allele, alts)` into biallelic VCF-form records.
+///
+/// When `ref_seq` is `Some`, each atom is left-aligned and its REF bytes are read from
+/// `ref_seq[pos .. pos + ref_len]`. When `None` (no-reference mode), no left-alignment
+/// happens and REF bytes come from the record's own REF slice at the atom's offset.
+/// `ref_len = alt.len() as i32 - ilen` (so a DEL, with `ilen < 0`, grows the REF).
+///
+/// Returns `(records, dropped_out_of_scope)`, matching [`atomize_record`]'s drop count.
+pub fn atomize_to_vcf_biallelic(
+    pos: u32,
+    ref_allele: &[u8],
+    alts: &[&[u8]],
+    ref_seq: Option<&[u8]>,
+    skip_out_of_scope: bool,
+) -> Result<(Vec<BiallelicRecord>, u32), NormalizeError> {
+    let mut atoms = Vec::new();
+    let dropped = atomize_record(pos, ref_allele, alts, &mut atoms, skip_out_of_scope)?;
+    let mut out = Vec::with_capacity(atoms.len());
+    for atom in atoms {
+        let atom = match ref_seq {
+            Some(rs) => left_align(atom, rs, L_MAX),
+            None => atom,
+        };
+        let ref_len = (atom.alt.len() as i32 - atom.ilen) as usize;
+        let reference = match ref_seq {
+            Some(rs) => rs[atom.pos as usize..atom.pos as usize + ref_len].to_vec(),
+            None => {
+                // No left-align, so atom.pos >= pos and the atom's REF span lies within
+                // the record's own REF.
+                let off = (atom.pos - pos) as usize;
+                ref_allele[off..off + ref_len].to_vec()
+            }
+        };
+        out.push(BiallelicRecord {
+            pos: atom.pos,
+            reference,
+            alt: atom.alt,
+            source_alt_index: atom.source_alt_index,
+        });
+    }
+    Ok((out, dropped))
+}
+
 #[inline]
 fn is_symbolic(alt: &[u8]) -> bool {
     alt.first() == Some(&b'<') || alt.contains(&b'[') || alt.contains(&b']')
@@ -531,6 +588,56 @@ mod tests {
             prop_assert_eq!(&again.pos, &aligned.pos);
             prop_assert_eq!(&again.alt, &aligned.alt);
         }
+    }
+
+    #[test]
+    fn biallelic_snp_from_ref() {
+        // ref_seq "ACAGT..."; POS 2 (0-based) is 'A'->'G' SNP
+        let ref_seq = b"ACAGTACATG";
+        let (recs, dropped) =
+            atomize_to_vcf_biallelic(2, b"A", &[b"G".as_ref()], Some(ref_seq), false).unwrap();
+        assert_eq!(dropped, 0);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].pos, 2);
+        assert_eq!(recs[0].reference, b"A");
+        assert_eq!(recs[0].alt, b"G");
+        assert_eq!(recs[0].source_alt_index, 1);
+    }
+
+    #[test]
+    fn biallelic_deletion_ref_bytes_reconstructed() {
+        // Anchored DEL: REF "CAT" ALT "C" at POS 6 (0-based). ref_len = 1 - (-2) = 3.
+        let ref_seq = b"ACAGTACATGGG";
+        let (recs, _) =
+            atomize_to_vcf_biallelic(6, b"CAT", &[b"C".as_ref()], Some(ref_seq), false).unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].reference, b"CAT"); // anchor + deleted bases
+        assert_eq!(recs[0].alt, b"C");
+    }
+
+    #[test]
+    fn biallelic_multiallelic_splits_with_alt_indices() {
+        let ref_seq = b"ACAGTACATG";
+        let (recs, _) = atomize_to_vcf_biallelic(
+            2,
+            b"A",
+            &[b"G".as_ref(), b"T".as_ref()],
+            Some(ref_seq),
+            false,
+        )
+        .unwrap();
+        assert_eq!(recs.len(), 2);
+        assert_eq!(recs[0].source_alt_index, 1);
+        assert_eq!(recs[1].source_alt_index, 2);
+    }
+
+    #[test]
+    fn biallelic_no_reference_uses_record_ref() {
+        // No ref_seq: REF bytes come from the record's own REF, no left-align.
+        let (recs, _) = atomize_to_vcf_biallelic(6, b"CAT", &[b"C".as_ref()], None, false).unwrap();
+        assert_eq!(recs[0].pos, 6);
+        assert_eq!(recs[0].reference, b"CAT");
+        assert_eq!(recs[0].alt, b"C");
     }
 
     proptest! {
