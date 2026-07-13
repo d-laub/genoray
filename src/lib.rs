@@ -46,6 +46,8 @@ pub mod nrvk;
 #[cfg(feature = "conversion")]
 pub mod orchestrator;
 #[cfg(feature = "conversion")]
+pub mod pgen_reader;
+#[cfg(feature = "conversion")]
 pub mod pvar;
 // NOTE: `py_convert` is *not* conversion-only despite being in the original gate
 // list: query-core `py_query_batch.rs`/`py_query_decode.rs`/`py_query_ranges.rs`
