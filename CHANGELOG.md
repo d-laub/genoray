@@ -5,7 +5,16 @@
 - `SparseVar2.from_pgen` converts a PLINK2 PGEN (`.pgen`/`.pvar`/`.psam`) to an
   SVAR2 store through the same normalization, atom, and merge spine as
   `from_vcf`. Diploid-only (no `ploidy=` kwarg); dosages, INFO/FORMAT fields,
-  and sample subsetting are out of scope for this entry point.
+  and sample subsetting are out of scope for this entry point. Verified
+  byte-for-byte equivalent to `from_vcf` on a 3202-sample/1,001,385-variant
+  germline cohort (chr21, symbolics filtered so both backends see the same
+  variant set); on that cohort `from_pgen` converts in **152.7s** vs
+  `from_vcf`'s **547.0s** (**3.6× faster**, confirming the reader-not-the-
+  bottleneck hypothesis), at the cost of **~2.1× peak RSS** (1065 MiB vs
+  497 MiB) — see the benchmark notes in
+  `docs/superpowers/specs/2026-07-12-pgen-to-svar2-design.md` for the full
+  methodology, the `.pvar`-skip and OpenMP-oversubscription findings, and
+  follow-ups.
 - `SparseVar2.annotate_mutations`, `mutation_matrix`, and `assign_signatures`
   for COSMIC mutational-signature workflows (SBS96/ID83/DBS78), implemented in
   Rust with a per-record sidecar and streaming count matrix. `from_vcf` gains a

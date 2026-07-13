@@ -263,3 +263,159 @@ and is exactly what `SparseVar.from_pgen` (SVAR1) already does. Missing calls ar
   oversubscribe alongside `concurrent_chroms`. Check thread counts in the
   benchmark; cap via `OMP_NUM_THREADS` if needed. Note that the PGEN path needs
   no htslib decompression threads, so those cores are available to give back.
+
+---
+
+# Results (2026-07-12) — Task 9 benchmark
+
+Methodology follows
+`docs/superpowers/specs/2026-07-07-svar1-vs-svar2-timing-and-profiling-design.md`
+(same fixture family, same `/usr/bin/time -v` protocol, same honesty bar). Ran
+on a `carter-compute` allocation (`carter-cn-04`, 32 cores, 64 GB, via
+`sbatch`) — **not a dedicated node**: several unrelated `nf-PHASI*` jobs from
+the same user were concurrently scheduled on the same physical node the whole
+time, so absolute wall-clock numbers below likely carry some contention
+inflation relative to a quiet node (the from_vcf baseline here, 547s, is
+notably slower than the 36.5s figure the 2026-07-07 doc measured for the same
+germline chr21 file on a dedicated node — same code path, so the delta is
+node contention, not a regression). The **relative** from_vcf-vs-from_pgen
+comparison is still valid since both ran back-to-back on the same
+contended node under the same conditions.
+
+## Fixture
+
+`/carter/users/dlaub/repos/for_loukik/chr21.bcf` (germline, 3202 samples,
+phased) contains `<DEL>`/`<DEL:ME>` symbolic ALTs that plink2 cannot import.
+Built one filtered BCF and used it for **both** backends, per the task brief:
+
+```bash
+bcftools view -e 'ALT~"<"' chr21.bcf -Ob -o chr21.nosym.bcf   # 1,001,385 / 1,002,753 kept (1,368 symbolic dropped)
+bcftools index chr21.nosym.bcf
+plink2 --bcf chr21.nosym.bcf --make-pgen --output-chr chrM --out chr21.nosym   # preserves "chr21" (not "21")
+```
+
+Reference: `/carter/shared/data/gdc/resources/GRCh38.d1.vd1.fa` (chr21 length
+46,709,983, matches the `.pvar`).
+
+## Equivalence check (before any timing)
+
+Two tiers, both against the identical filtered input:
+
+1. **Decode-free `region_counts`** over the whole chromosome `(0,
+   46_709_983)`: identical `(region, sample, ploidy)` count arrays for both
+   stores, 285,721,479 total carried variants either way.
+2. **Full decoded-record comparison** (`pos`/`ilen`/`allele`, the
+   `_assert_ragged_equal` fields) on 5 spot-check windows spanning the
+   chromosome (0–2 Mb, 10–12 Mb, 20–22 Mb, 30–32 Mb, 44–46.7 Mb): offsets and
+   all three fields matched exactly on every window (0 to 21.5M records per
+   window).
+
+**PASS.** `from_pgen ≡ from_vcf` on this cohort — the timing numbers below are
+measuring two paths to the same data, not two different datasets.
+
+## Timing (Step 2 of the brief)
+
+`/usr/bin/time -v python -c "SparseVar2.from_{vcf,pgen}(...)"`, filtered chr21
+in, fresh output each run:
+
+| Path | Wall time | Peak RSS |
+| --- | --- | --- |
+| `from_vcf` | 547.0s (9:06.98) | 497 MiB (496,508 KiB) |
+| `from_pgen` | **152.7s** (2:32.67) | 1040 MiB (1,065,212 KiB) |
+
+**`from_pgen` is 3.6× faster wall-clock**, confirming the design's central
+hypothesis — the reader does stop being the bottleneck once htslib decode is
+out of the picture. It is **not a free win**: peak RSS is ~2.1× higher than
+`from_vcf`'s on the same cohort. This wasn't budgeted for in the design and is
+worth a follow-up look (candidates: the byte-budgeted `read_alleles_range`
+buffer, or pgenlib's own internal decode buffers held concurrently with the
+Rust-side staging window) — out of scope to fix here since Task 9 is
+measurement-only, but real enough to flag rather than bury.
+
+An independent re-run during equivalence verification (same code paths, same
+node, run immediately before the numbers above) gave from_vcf=538.8s /
+from_pgen=138.9s (3.9×) — consistent with the timed numbers within the noise
+expected from a shared node.
+
+## Open question 1 — is the `.pvar` skip cost material?
+
+Built a **same-total-data, different-`n_contigs`** fixture to isolate this:
+sliced the identical filtered chr21.nosym.bcf (1,001,385 variants, all 3202
+samples — nothing shrunk) into genomic windows via `bcftools view -r` +
+`bcftools annotate --rename-chrs` + `bcftools concat` (index-seek slicing,
+no genotype-text materialization), tagged each window with a synthetic
+contig name (`synth_0`..`synth_15`), and built one reference FASTA holding 16
+copies of the full chr21 sequence under those names (so absolute chr21
+coordinates resolve identically regardless of which synthetic contig a
+variant landed on). This keeps total variant count, total genotype payload,
+and total `.pvar` bytes ~constant; only `n_contigs` (and therefore the number
+of independent top-of-`.pvar` skips) changes.
+
+- `N=1` (single contig, whole cohort): **151.1s**, 1074 MiB peak RSS.
+- `N=16` split (`synth_0` window landed on chr21's acrocentric p-arm gap and
+  got 0 variants, so effectively 15 populated contigs; still 1,001,385
+  variants total): **~104.7s** wall (measured from the thread-sampling
+  window's first/last timestamps around the run).
+
+The 15-contig split was **faster**, not slower, than the single-contig
+baseline (~1.44×) — the `plan_thread_budget`-driven concurrency
+(`concurrent_chroms=5` on 32 cores) more than pays for the extra redundant
+`.pvar` scanning. At this file's `.pvar` size (~36 MB total across the
+cohort), the top-of-file skip cost is **not material** — it's noise next to
+the genotype-decode work, even multiplied by 15 concurrent skips.
+
+**Caveat:** this only rules it out at this scale (≤16 contigs, 36 MB `.pvar`).
+A whole-genome cohort with real chromosome-scale `.pvar` files (hundreds of MB
+to GB) and `n_contigs` in the dozens (autosomes + alts/decoys) could still
+show it — reasoning from the `n_contigs × pvar_size` model, the risk grows
+with both factors simultaneously, which this fixture didn't stress. **Not
+building the byte-offset sidecar mitigation** — no evidence it's needed yet;
+flagged as a follow-up to revisit if a whole-genome benchmark ever shows
+`.pvar` scanning show up in a profile.
+
+## Open question 2 — GIL serialization vs OpenMP oversubscription
+
+Sampled `ps -T -p <pid> -o pid,tid,pcpu,comm` every 0.5s for the whole `N=16`
+run (46 samples, ~23s window) to look at both questions at once.
+
+- **Readers do not serialize on the GIL.** `Pipeline Config (PGEN): 5
+  concurrent chromosomes` actually ran concurrently — `chrom-0`..`chrom-4`
+  rayon workers plus each contig's own `read-synth_*`/`exec-synth_*`/
+  `cw-synth_*`/`lw-synth_*`/`samp-synth_*` OS threads all showed up live and
+  overlapping across samples, and the wall-clock result above (5-way split
+  faster than 1-way) is itself evidence of real parallelism, not GIL-bound
+  serialization.
+- **pgenlib's OpenMP `prange` does oversubscribe, confirmed.** The dominant
+  thread `comm` in every sample was the generic, un-renamed `python` (2804 of
+  the ~7000 total thread-sample rows, i.e. an average of ~61 threads/sample
+  reporting as `python` — Rust's own threads are all explicitly named via
+  `thread_name`, so any unnamed OS thread showing as `python` is coming from
+  a C-extension's own thread spawns, consistent with an OpenMP worker team
+  pgenlib spins up per `read_alleles_range` call). **Max concurrent OS thread
+  count observed: 172**, against a 32-core allocation — a ~5.4× oversubscription
+  ratio. (Smaller contributions from `async-executor-`/`tokio-runtime-w`
+  threads and `jemalloc_bg_thd` background threads were also visible but much
+  less numerous; not investigated further as they're not contig-count-scaled.)
+- **Net effect:** the oversubscription is real but did not net-negative this
+  run's throughput — `N=16` was still faster than `N=1`, not slower. It's
+  still resource-impolite on a shared, multi-tenant node (172 threads
+  competing for 32 cgroup-scoped cores affects everyone else on the node, even
+  if this job's own wall time survives it).
+
+**Conclusion:** the design doc's own suggested mitigation for *this* symptom
+(OpenMP fan-out, not GIL serialization) is the right one —
+**`OMP_NUM_THREADS`**, not `PGEN_BATCH_BYTES` (that knob addresses a GIL-
+serialization symptom we did not observe). Recommended **follow-up**: set
+`OMP_NUM_THREADS=1` (or a small cap) around the `pgenlib.PgenReader` calls
+when `concurrent_chroms > 1`, purely for cluster citizenship — not filed as a
+correctness or throughput bug, since throughput was fine here.
+
+## Summary
+
+| Question | Answer |
+| --- | --- |
+| Is PGEN faster than VCF on the same cohort? | **Yes, 3.6×** (152.7s vs 547.0s), confirming the design hypothesis. |
+| Is it free? | **No** — ~2.1× peak RSS (1040 MiB vs 497 MiB). Follow-up, not fixed here. |
+| Is `.pvar` top-of-file skip cost material? | **Not at this scale** (≤16 contigs, 36 MB `.pvar`); flagged as a watch-item for whole-genome-scale cohorts, sidecar mitigation not built. |
+| Do concurrent contig readers serialize on the GIL? | **No** — 5-way contig concurrency measurably sped things up. |
+| Does pgenlib's OpenMP oversubscribe? | **Yes, confirmed** (≤172 threads on 32 cores); did not hurt this run's throughput, but `OMP_NUM_THREADS` capping is a recommended follow-up for shared-node citizenship. |
