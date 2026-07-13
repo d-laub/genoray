@@ -45,3 +45,10 @@ def test_subset_contigs_rejects_unknown(two_contig_store, tmp_path):
 def test_subset_contigs_refuses_in_place(two_contig_store):
     with pytest.raises(ValueError, match="in place"):
         two_contig_store.subset_contigs(two_contig_store.path, ["chr1"], overwrite=True)
+
+
+def test_split_by_contig_explodes(two_contig_store, tmp_path):
+    paths = two_contig_store.split_by_contig(tmp_path / "split", overwrite=True)
+    assert [p.name for p in paths] == ["chr1.svar2", "chr2.svar2"]
+    assert SparseVar2(paths[0]).contigs == ["chr1"]
+    assert SparseVar2(paths[1]).contigs == ["chr2"]

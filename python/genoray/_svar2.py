@@ -110,6 +110,19 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         meta["contigs"] = kept
         _write_store(output, {c: self.path for c in kept}, meta, mode, overwrite)
 
+    def split_by_contig(
+        self, out_dir: str | Path, *, mode: Mode = "copy", overwrite: bool = False
+    ) -> list[Path]:
+        """Explode into one single-contig store per contig at out_dir/{contig}.svar2."""
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        paths: list[Path] = []
+        for c in self.contigs:
+            p = out_dir / f"{c}.svar2"
+            self.subset_contigs(p, [c], mode=mode, overwrite=overwrite)
+            paths.append(p)
+        return paths
+
     @classmethod
     def from_vcf(
         cls,
