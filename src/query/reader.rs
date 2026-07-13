@@ -141,6 +141,8 @@ impl ContigReader {
                 |_| 0,
                 |_| true,
                 |i| rvk::snp_code_to_key(rvk::unpack_snp_key_at(keys, o0 + i)),
+                false,
+                o0,
                 &mut run,
             );
             runs.push(run);
@@ -162,6 +164,8 @@ impl ContigReader {
                 |i| rvk::deletion_len(keys[i]),
                 |_| true,
                 |i| keys[i],
+                true,
+                o0,
                 &mut run,
             );
             runs.push(run);

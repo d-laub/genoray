@@ -19,6 +19,76 @@ pub struct KeyRef {
     pub key: u32,
 }
 
+/// Bit 31 of a packed `vk_src`: 0 = `var_key/snp`, 1 = `var_key/indel`.
+pub const VK_SRC_INDEL_BIT: u32 = 1 << 31;
+
+/// Pack a var_key record's provenance: sub-stream tag in bit 31, absolute call
+/// index in bits 0..=30.
+///
+/// The assert is deliberate and load-bearing: a silent overflow here would
+/// return values from the WRONG record, which is far worse than a panic. It is
+/// unreachable on any real store (2^31 calls in a single contig sub-stream), and
+/// it never runs on the no-provenance path (`KeyRef::make` ignores its args).
+#[inline]
+pub fn pack_vk_src(is_indel: bool, call_idx: usize) -> u32 {
+    assert!(
+        call_idx < (1usize << 31),
+        "var_key call index {call_idx} exceeds the 2^31 vk_src ceiling"
+    );
+    (call_idx as u32) | if is_indel { VK_SRC_INDEL_BIT } else { 0 }
+}
+
+/// Inverse of [`pack_vk_src`]: `(is_indel, call_idx)`.
+#[inline]
+pub fn unpack_vk_src(src: u32) -> (bool, usize) {
+    (
+        src & VK_SRC_INDEL_BIT != 0,
+        (src & !VK_SRC_INDEL_BIT) as usize,
+    )
+}
+
+/// A `KeyRef` plus the provenance needed to index a field sidecar: which
+/// var_key sub-stream it came from and its absolute call index there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SrcKeyRef {
+    pub key: KeyRef,
+    /// Packed via [`pack_vk_src`].
+    pub src: u32,
+}
+
+/// The element type a var_key gather emits. Monomorphizing over this is what
+/// keeps the no-fields path zero-cost: `KeyRef::make` discards the provenance
+/// args, so the packing (and its assert) is dead code and compiles away.
+pub trait VkElem: Copy {
+    fn make(position: u32, key: u32, is_indel: bool, call_idx: usize) -> Self;
+    fn position(&self) -> u32;
+}
+
+impl VkElem for KeyRef {
+    #[inline]
+    fn make(position: u32, key: u32, _is_indel: bool, _call_idx: usize) -> Self {
+        KeyRef { position, key }
+    }
+    #[inline]
+    fn position(&self) -> u32 {
+        self.position
+    }
+}
+
+impl VkElem for SrcKeyRef {
+    #[inline]
+    fn make(position: u32, key: u32, is_indel: bool, call_idx: usize) -> Self {
+        SrcKeyRef {
+            key: KeyRef { position, key },
+            src: pack_vk_src(is_indel, call_idx),
+        }
+    }
+    #[inline]
+    fn position(&self) -> u32 {
+        self.key.position
+    }
+}
+
 /// Gathers `(position, key)` pairs from `positions` that TRULY overlap
 /// `[q_start, q_end)` (exact overlap: `pos < q_end && q_start < v_end`), among
 /// those `carried`. `overlap_range` only guarantees the right half (`pos <
@@ -27,7 +97,7 @@ pub struct KeyRef {
 /// later elements whose `v_end <= q_start` (they end before the query
 /// starts), so this checks the left half (`q_start < v_end`) per element.
 #[allow(clippy::too_many_arguments)]
-pub fn gather_keys(
+pub fn gather_keys<T: VkElem>(
     positions: &[u32],
     max_region_length: u32,
     q_start: u32,
@@ -35,7 +105,12 @@ pub fn gather_keys(
     del_len: impl Fn(usize) -> u32,
     carried: impl Fn(usize) -> bool,
     to_key: impl Fn(usize) -> u32,
-    out: &mut Vec<KeyRef>,
+    // Sub-stream tag for provenance (`false` = snp, `true` = indel).
+    is_indel: bool,
+    // Absolute index of `positions[0]` in the sub-stream's packed buffer, so
+    // the absolute call index of element `i` is `abs_base + i`.
+    abs_base: usize,
+    out: &mut Vec<T>,
 ) {
     if positions.is_empty() {
         return;
@@ -49,10 +124,7 @@ pub fn gather_keys(
     let (s_idx, e_idx) = overlap_range(&tree, &v_ends, max_region_length, q_start, q_end);
     for (i, &position) in positions.iter().enumerate().take(e_idx).skip(s_idx) {
         if carried(i) && q_start < v_ends[i] {
-            out.push(KeyRef {
-                position,
-                key: to_key(i),
-            });
+            out.push(T::make(position, to_key(i), is_indel, abs_base + i));
         }
     }
 }
@@ -63,8 +135,9 @@ pub fn gather_keys(
 ///
 /// `query::gather_haps_readbound` hand-inlines a 2-run (snp_run, indel_run)
 /// equivalent of this merge for allocation reasons — any change to this
-/// function's ordering or tie-break MUST be mirrored there.
-pub fn merge_keys(runs: Vec<Vec<KeyRef>>) -> Vec<KeyRef> {
+/// function's ordering or tie-break MUST be mirrored there. That twin now
+/// carries the same `VkElem` payload, so the mirroring covers `src` too.
+pub fn merge_by_position<T: VkElem>(runs: Vec<Vec<T>>) -> Vec<T> {
     let total: usize = runs.iter().map(|r| r.len()).sum();
     let mut heads = vec![0usize; runs.len()];
     let mut out = Vec::with_capacity(total);
@@ -76,7 +149,7 @@ pub fn merge_keys(runs: Vec<Vec<KeyRef>>) -> Vec<KeyRef> {
             }
             match best {
                 // Keep `best` on ties so the earlier run emits first (stable).
-                Some(b) if runs[b][heads[b]].position <= runs[r][heads[r]].position => {}
+                Some(b) if runs[b][heads[b]].position() <= runs[r][heads[r]].position() => {}
                 _ => best = Some(r),
             }
         }
@@ -85,6 +158,12 @@ pub fn merge_keys(runs: Vec<Vec<KeyRef>>) -> Vec<KeyRef> {
         heads[b] += 1;
     }
     out
+}
+
+/// Bare-`KeyRef` merge — the pre-existing signature, now a thin alias so every
+/// existing caller is untouched and provably unchanged.
+pub fn merge_keys(runs: Vec<Vec<KeyRef>>) -> Vec<KeyRef> {
+    merge_by_position(runs)
 }
 
 #[cfg(test)]
@@ -100,7 +179,7 @@ mod tests {
         // positions [10, 20, 30], v_end = pos + 1, max_del 0; query [15, 25):
         // only index 1 (pos 20) overlaps. to_key(i) = i as a marker key.
         let positions = [10u32, 20, 30];
-        let mut out = Vec::new();
+        let mut out: Vec<KeyRef> = Vec::new();
         gather_keys(
             &positions,
             0,
@@ -109,6 +188,8 @@ mod tests {
             |_| 0,
             |_| true,
             |i| i as u32,
+            false,
+            0,
             &mut out,
         );
         assert_eq!(out, vec![kr(20, 1)]);
@@ -120,7 +201,7 @@ mod tests {
         // only v0 (2..9) spans it. max_region_length 6 covers the deletion.
         let positions = [2u32, 10];
         let dels = [6u32, 0];
-        let mut out = Vec::new();
+        let mut out: Vec<KeyRef> = Vec::new();
         gather_keys(
             &positions,
             6,
@@ -129,6 +210,8 @@ mod tests {
             |i| dels[i],
             |_| true,
             |i| 100 + i as u32,
+            false,
+            0,
             &mut out,
         );
         assert_eq!(out, vec![kr(2, 100)]);
@@ -138,7 +221,7 @@ mod tests {
     fn test_gather_keys_carried_filter() {
         // Only even indices carried; query covers all.
         let positions = [10u32, 20, 30, 40];
-        let mut out = Vec::new();
+        let mut out: Vec<KeyRef> = Vec::new();
         gather_keys(
             &positions,
             0,
@@ -147,6 +230,8 @@ mod tests {
             |_| 0,
             |i| i % 2 == 0,
             |i| i as u32,
+            false,
+            0,
             &mut out,
         );
         assert_eq!(out, vec![kr(10, 0), kr(30, 2)]);
@@ -162,7 +247,7 @@ mod tests {
         // All carried; max_region_length 20 covers the deletion.
         let positions = [100u32, 105, 112];
         let del_len = [20u32, 0, 0];
-        let mut out = Vec::new();
+        let mut out: Vec<KeyRef> = Vec::new();
         gather_keys(
             &positions,
             20,
@@ -171,6 +256,8 @@ mod tests {
             |i| del_len[i],
             |_| true,
             |i| i as u32,
+            false,
+            0,
             &mut out,
         );
         assert_eq!(out, vec![kr(100, 0), kr(112, 2)]);
@@ -178,8 +265,8 @@ mod tests {
 
     #[test]
     fn test_gather_keys_empty_positions() {
-        let mut out = Vec::new();
-        gather_keys(&[], 0, 0, 100, |_| 0, |_| true, |_| 0, &mut out);
+        let mut out: Vec<KeyRef> = Vec::new();
+        gather_keys(&[], 0, 0, 100, |_| 0, |_| true, |_| 0, false, 0, &mut out);
         assert!(out.is_empty());
     }
 
@@ -200,5 +287,123 @@ mod tests {
     fn test_merge_keys_ties_keep_earlier_run_first() {
         let runs = vec![vec![kr(50, 111)], vec![kr(50, 222)]];
         assert_eq!(merge_keys(runs), vec![kr(50, 111), kr(50, 222)]);
+    }
+
+    #[test]
+    fn pack_unpack_vk_src_round_trips() {
+        assert_eq!(unpack_vk_src(pack_vk_src(false, 0)), (false, 0));
+        assert_eq!(unpack_vk_src(pack_vk_src(true, 0)), (true, 0));
+        assert_eq!(unpack_vk_src(pack_vk_src(false, 12345)), (false, 12345));
+        assert_eq!(
+            unpack_vk_src(pack_vk_src(true, (1 << 31) - 1)),
+            (true, (1 << 31) - 1)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds the 2^31 vk_src ceiling")]
+    fn pack_vk_src_asserts_on_overflow() {
+        pack_vk_src(false, 1 << 31);
+    }
+
+    #[test]
+    fn merge_by_position_carries_src_and_keeps_snp_tie_break() {
+        // snp run at positions 10, 20 (calls 0, 1); indel run at 10, 15 (calls 7, 8).
+        // Ties at position 10 must keep the SNP first (run 0 wins).
+        let snp: Vec<SrcKeyRef> = vec![
+            SrcKeyRef {
+                key: KeyRef {
+                    position: 10,
+                    key: 100,
+                },
+                src: pack_vk_src(false, 0),
+            },
+            SrcKeyRef {
+                key: KeyRef {
+                    position: 20,
+                    key: 200,
+                },
+                src: pack_vk_src(false, 1),
+            },
+        ];
+        let indel: Vec<SrcKeyRef> = vec![
+            SrcKeyRef {
+                key: KeyRef {
+                    position: 10,
+                    key: 300,
+                },
+                src: pack_vk_src(true, 7),
+            },
+            SrcKeyRef {
+                key: KeyRef {
+                    position: 15,
+                    key: 400,
+                },
+                src: pack_vk_src(true, 8),
+            },
+        ];
+        let out = merge_by_position(vec![snp, indel]);
+        let got: Vec<(u32, bool, usize)> = out
+            .iter()
+            .map(|e| {
+                let (is_indel, idx) = unpack_vk_src(e.src);
+                (e.key.position, is_indel, idx)
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (10, false, 0), // snp wins the tie
+                (10, true, 7),
+                (15, true, 8),
+                (20, false, 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_keys_is_unchanged_for_bare_keyrefs() {
+        let a = vec![
+            KeyRef {
+                position: 1,
+                key: 10,
+            },
+            KeyRef {
+                position: 5,
+                key: 50,
+            },
+        ];
+        let b = vec![
+            KeyRef {
+                position: 1,
+                key: 99,
+            },
+            KeyRef {
+                position: 3,
+                key: 30,
+            },
+        ];
+        let out = merge_keys(vec![a, b]);
+        assert_eq!(
+            out,
+            vec![
+                KeyRef {
+                    position: 1,
+                    key: 10
+                }, // stable: earlier run first
+                KeyRef {
+                    position: 1,
+                    key: 99
+                },
+                KeyRef {
+                    position: 3,
+                    key: 30
+                },
+                KeyRef {
+                    position: 5,
+                    key: 50
+                },
+            ]
+        );
     }
 }
