@@ -34,6 +34,7 @@ pub mod union;
 
 pub use crate::spine::KeyRef;
 pub use decode::{HapCalls, QueryResult};
+pub use field::{FieldValue, FieldView};
 pub use gather::{
     BatchResult, BatchResultSplit, HapRanges, RangesBundle, find_ranges, gather_haps_readbound,
     gather_ranges, overlap_batch, read_ranges,

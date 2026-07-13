@@ -53,7 +53,7 @@ impl FieldView {
         let values = mmap_file(&paths.field_values(category, name, sub))?;
         let width = dtype.width_bytes().ok_or_else(|| {
             std::io::Error::other(format!(
-                "field {name:?} has unresolved dtype {:?}; the store was never finalized",
+                "field {name:?} has unresolved dtype {}; the store was never finalized",
                 dtype.as_str()
             ))
         })?;
@@ -100,15 +100,7 @@ impl FieldView {
     /// provenance disagrees with the store — a bug, not bad input).
     #[inline]
     pub fn value_at(&self, i: usize) -> FieldValue {
-        let m = self
-            .values
-            .as_ref()
-            .expect("value_at on an empty field sub-stream");
-        let w = self
-            .dtype
-            .width_bytes()
-            .expect("open() rejected unresolved dtypes");
-        let b = &m[i * w..(i + 1) * w];
+        let b = self.bytes_at(i);
         match self.dtype {
             StorageDtype::Bool => FieldValue::Bool(b[0] != 0),
             StorageDtype::I8 => FieldValue::I8(b[0] as i8),
@@ -127,7 +119,7 @@ impl FieldView {
     /// `orig_sample` MUST be the original cohort sample index.
     #[inline]
     pub fn format_at(&self, dense_row: usize, orig_sample: usize) -> FieldValue {
-        debug_assert!(
+        assert!(
             orig_sample < self.n_samples,
             "orig_sample {orig_sample} >= cohort n_samples {}",
             self.n_samples
@@ -164,43 +156,257 @@ mod tests {
         fs::write(&p, bytes).unwrap();
     }
 
+    /// Covers all 9 storage dtypes. Each case includes a value that would
+    /// catch a width or signedness bug: a negative value for signed types
+    /// (would misread as huge-positive under an unsigned/wrong-width
+    /// interpretation), a value above the signed max for unsigned types
+    /// (would misread as negative under a signed interpretation), and a
+    /// value needing the full element width for 2- and 4-byte types (would
+    /// truncate/misalign under a narrower width). Missing-value sentinels
+    /// (`i*::MIN`, `u*::MAX`, `f32::NAN`) are included and must round-trip
+    /// untranslated.
     #[test]
     fn value_at_reads_each_dtype() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = ContigPaths::new(tmp.path().to_str().unwrap(), "chr1");
 
-        let vals: [i16; 3] = [-5, 0, 300];
+        // Bool: 1 byte, non-zero/zero.
+        {
+            let bytes = [1u8, 0u8];
+            write_field(&paths, "info", "BOOL", FieldSub::VkSnp, &bytes);
+            let v = FieldView::open(
+                &paths,
+                "info",
+                "BOOL",
+                FieldSub::VkSnp,
+                StorageDtype::Bool,
+                2,
+            )
+            .unwrap();
+            assert_eq!(v.len(), 2);
+            assert_eq!(v.value_at(0), FieldValue::Bool(true));
+            assert_eq!(v.value_at(1), FieldValue::Bool(false));
+        }
+
+        // I8: negative sentinel i8::MIN, plus a positive value.
+        {
+            let vals: [i8; 3] = [i8::MIN, 0, 100];
+            let bytes: Vec<u8> = vals.iter().map(|x| *x as u8).collect();
+            write_field(&paths, "info", "I8F", FieldSub::VkSnp, &bytes);
+            let v = FieldView::open(&paths, "info", "I8F", FieldSub::VkSnp, StorageDtype::I8, 2)
+                .unwrap();
+            assert_eq!(v.value_at(0), FieldValue::I8(i8::MIN));
+            assert_eq!(v.value_at(2), FieldValue::I8(100));
+        }
+
+        // U8: unsigned max sentinel (would read as -1 under a signed cast).
+        {
+            let vals: [u8; 3] = [u8::MAX, 0, 200];
+            write_field(&paths, "info", "U8F", FieldSub::VkSnp, &vals);
+            let v = FieldView::open(&paths, "info", "U8F", FieldSub::VkSnp, StorageDtype::U8, 2)
+                .unwrap();
+            assert_eq!(v.value_at(0), FieldValue::U8(u8::MAX));
+            assert_eq!(v.value_at(2), FieldValue::U8(200));
+        }
+
+        // I16: negative, a value needing 2 bytes, and i16::MIN sentinel.
+        {
+            let vals: [i16; 4] = [-5, 0, 300, i16::MIN];
+            write_field(
+                &paths,
+                "info",
+                "AC",
+                FieldSub::VkSnp,
+                bytemuck::cast_slice(&vals),
+            );
+            let v = FieldView::open(&paths, "info", "AC", FieldSub::VkSnp, StorageDtype::I16, 2)
+                .unwrap();
+            assert_eq!(v.len(), 4);
+            assert_eq!(v.value_at(0), FieldValue::I16(-5));
+            assert_eq!(v.value_at(2), FieldValue::I16(300));
+            assert_eq!(v.value_at(3), FieldValue::I16(i16::MIN));
+        }
+
+        // U16: value above i16::MAX (would read negative under a signed
+        // interpretation), plus u16::MAX sentinel.
+        {
+            let vals: [u16; 3] = [40_000, 0, u16::MAX];
+            write_field(
+                &paths,
+                "info",
+                "U16F",
+                FieldSub::VkSnp,
+                bytemuck::cast_slice(&vals),
+            );
+            let v = FieldView::open(
+                &paths,
+                "info",
+                "U16F",
+                FieldSub::VkSnp,
+                StorageDtype::U16,
+                2,
+            )
+            .unwrap();
+            assert_eq!(v.value_at(0), FieldValue::U16(40_000));
+            assert_eq!(v.value_at(2), FieldValue::U16(u16::MAX));
+        }
+
+        // I32: negative sentinel i32::MIN, plus a value needing >2 bytes.
+        {
+            let vals: [i32; 3] = [i32::MIN, 0, 100_000];
+            write_field(
+                &paths,
+                "info",
+                "I32F",
+                FieldSub::VkSnp,
+                bytemuck::cast_slice(&vals),
+            );
+            let v = FieldView::open(
+                &paths,
+                "info",
+                "I32F",
+                FieldSub::VkSnp,
+                StorageDtype::I32,
+                2,
+            )
+            .unwrap();
+            assert_eq!(v.value_at(0), FieldValue::I32(i32::MIN));
+            assert_eq!(v.value_at(2), FieldValue::I32(100_000));
+        }
+
+        // U32: unsigned max sentinel, plus a value needing >2 bytes.
+        {
+            let vals: [u32; 3] = [u32::MAX, 0, 100_000];
+            write_field(
+                &paths,
+                "info",
+                "U32F",
+                FieldSub::VkSnp,
+                bytemuck::cast_slice(&vals),
+            );
+            let v = FieldView::open(
+                &paths,
+                "info",
+                "U32F",
+                FieldSub::VkSnp,
+                StorageDtype::U32,
+                2,
+            )
+            .unwrap();
+            assert_eq!(v.value_at(0), FieldValue::U32(u32::MAX));
+            assert_eq!(v.value_at(2), FieldValue::U32(100_000));
+        }
+
+        // F16: negative and positive fractional values. Built via
+        // `to_le_bytes` (not `bytemuck::cast_slice`) since this repo does not
+        // enable `half`'s `bytemuck` feature.
+        {
+            let vals = [f16::from_f32(-3.5), f16::from_f32(1.5)];
+            let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+            write_field(&paths, "info", "F16F", FieldSub::VkSnp, &bytes);
+            let v = FieldView::open(
+                &paths,
+                "info",
+                "F16F",
+                FieldSub::VkSnp,
+                StorageDtype::F16,
+                2,
+            )
+            .unwrap();
+            assert_eq!(v.value_at(0), FieldValue::F16(f16::from_f32(-3.5)));
+            assert_eq!(v.value_at(1), FieldValue::F16(f16::from_f32(1.5)));
+        }
+
+        // F32: negative value and the NaN sentinel. `f32::NAN != f32::NAN`,
+        // so assert bit-identity via `is_nan()` rather than equality.
+        {
+            let vals: [f32; 3] = [0.5, -3.5, f32::NAN];
+            write_field(
+                &paths,
+                "info",
+                "AF",
+                FieldSub::DenseSnp,
+                bytemuck::cast_slice(&vals),
+            );
+            let v = FieldView::open(
+                &paths,
+                "info",
+                "AF",
+                FieldSub::DenseSnp,
+                StorageDtype::F32,
+                2,
+            )
+            .unwrap();
+            assert_eq!(v.value_at(0), FieldValue::F32(0.5));
+            assert_eq!(v.value_at(1), FieldValue::F32(-3.5));
+            match v.value_at(2) {
+                FieldValue::F32(x) => assert!(x.is_nan()),
+                other => panic!("expected FieldValue::F32(NaN), got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn open_rejects_auto_dtype() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = ContigPaths::new(tmp.path().to_str().unwrap(), "chr1");
+        let err = match FieldView::open(
+            &paths,
+            "info",
+            "UNRESOLVED",
+            FieldSub::VkSnp,
+            StorageDtype::Auto,
+            2,
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("expected Err for StorageDtype::Auto"),
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        // The (fixed) error message should render the dtype name plainly,
+        // not doubly-quoted via `{:?}` on an already-`&str` value.
+        assert!(err.to_string().contains("unresolved dtype auto"));
+        assert!(!err.to_string().contains("\"auto\""));
+    }
+
+    #[test]
+    fn as_slice_checks_dtype_width_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = ContigPaths::new(tmp.path().to_str().unwrap(), "chr1");
+        let vals: [i32; 3] = [1, -2, 3];
         write_field(
             &paths,
             "info",
-            "AC",
+            "SL",
             FieldSub::VkSnp,
             bytemuck::cast_slice(&vals),
         );
         let v =
-            FieldView::open(&paths, "info", "AC", FieldSub::VkSnp, StorageDtype::I16, 2).unwrap();
-        assert_eq!(v.len(), 3);
-        assert_eq!(v.value_at(0), FieldValue::I16(-5));
-        assert_eq!(v.value_at(2), FieldValue::I16(300));
+            FieldView::open(&paths, "info", "SL", FieldSub::VkSnp, StorageDtype::I32, 2).unwrap();
 
-        let f: [f32; 2] = [0.5, 1.25];
+        // Matching width/type: zero-copy slice round-trips the values.
+        assert_eq!(v.as_slice::<i32>(), Some(&vals[..]));
+
+        // Mismatched width (i32 stored as 4 bytes; i16 is 2 bytes): None,
+        // not a reinterpreted/garbage slice.
+        assert_eq!(v.as_slice::<i16>(), None);
+    }
+
+    #[test]
+    fn bytes_at_returns_raw_little_endian_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = ContigPaths::new(tmp.path().to_str().unwrap(), "chr1");
+        let vals: [i32; 2] = [1, -2];
         write_field(
             &paths,
             "info",
-            "AF",
-            FieldSub::DenseSnp,
-            bytemuck::cast_slice(&f),
+            "RB",
+            FieldSub::VkSnp,
+            bytemuck::cast_slice(&vals),
         );
-        let v = FieldView::open(
-            &paths,
-            "info",
-            "AF",
-            FieldSub::DenseSnp,
-            StorageDtype::F32,
-            2,
-        )
-        .unwrap();
-        assert_eq!(v.value_at(1), FieldValue::F32(1.25));
+        let v =
+            FieldView::open(&paths, "info", "RB", FieldSub::VkSnp, StorageDtype::I32, 2).unwrap();
+        assert_eq!(v.bytes_at(0), &1i32.to_le_bytes());
+        assert_eq!(v.bytes_at(1), &(-2i32).to_le_bytes());
     }
 
     #[test]
