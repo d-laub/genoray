@@ -6,6 +6,7 @@ dist/
 /wheelhouse/
 docs/build/
 data/*
+!data/README.md
 tests/data/*
 tmp/
 memray_flamegraphs/
