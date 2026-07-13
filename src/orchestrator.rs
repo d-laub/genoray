@@ -244,6 +244,7 @@ pub fn process_chromosome(
                             ploidy,
                             htslib_threads,
                             skip_out_of_scope,
+                            &fields_owned,
                         )?;
                         Box::new(VcfListDroppedProxy {
                             inner: vcf_list,

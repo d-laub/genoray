@@ -34,6 +34,26 @@ def _ss(d: Path, name: str, sample: str, rows: str) -> Path:
     return gz
 
 
+def _ss_fields(d: Path, name: str, sample: str, rows: str) -> Path:
+    """Like `_ss`, but the header also declares `INFO AF` (Number=A, Float)
+    and `FORMAT DP` (Number=1, Integer), for the field-carry-through tests."""
+    header = (
+        "##fileformat=VCFv4.2\n"
+        "##contig=<ID=chr1,length=40>\n"
+        '##INFO=<ID=AF,Number=A,Type=Float,Description="Allele frequency">\n'
+        '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n'
+        '##FORMAT=<ID=DP,Number=1,Type=Integer,Description="Depth">\n'
+        f"#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t{sample}\n"
+    )
+    plain = d / f"{name}.vcf"
+    plain.write_text(header + rows)
+    gz = d / f"{name}.vcf.gz"
+    with open(gz, "wb") as fh:
+        subprocess.run(["bgzip", "-c", str(plain)], check=True, stdout=fh)
+    subprocess.run(["bcftools", "index", str(gz)], check=True)
+    return gz
+
+
 def test_from_vcf_list_disjoint_sites_hom_ref_fill(tmp_path: Path):
     ref = _write_ref(tmp_path)
     a = _ss(tmp_path, "a", "SA", "chr1\t3\t.\tA\tG\t.\t.\t.\tGT\t1|0\n")
@@ -281,3 +301,81 @@ def test_from_vcf_list_missing_hap_is_unobservable_in_decode(tmp_path: Path):
     expected = np.array([[[1, 0], [1, 0]]])
     np.testing.assert_array_equal(oracle.region_counts("chr1", region), expected)
     np.testing.assert_array_equal(native.region_counts("chr1", region), expected)
+
+
+def test_from_vcf_list_format_field_per_sample(tmp_path: Path):
+    """FORMAT fields are per-sample: each carrier contributes its OWN file's
+    value at a shared site, not some other file's value or an aggregate."""
+    ref = _write_ref(tmp_path)
+    # SA is hom-alt (both haps carry) with DP=10; SB carries only hap1 with
+    # DP=20. SC carries nothing at this site at all -- a disjoint-site
+    # sample included to prove its presence doesn't perturb SA/SB's values
+    # (the non-carrier-gets-default value itself is asserted directly on the
+    # Rust `RawRecord` in
+    # `vcf_list_reader::tests::info_first_carrier_and_format_per_sample_with_non_carrier_default`,
+    # since `decode()` never emits a record for a (sample, ploid) cell that
+    # doesn't carry an ALT at all -- see
+    # `test_from_vcf_list_missing_hap_is_unobservable_in_decode` above for
+    # the same limitation on the genotype side).
+    a = _ss_fields(
+        tmp_path, "a", "SA", "chr1\t3\t.\tA\tG\t.\t.\tAF=0.5\tGT:DP\t1|1:10\n"
+    )
+    b = _ss_fields(
+        tmp_path, "b", "SB", "chr1\t3\t.\tA\tG\t.\t.\tAF=0.5\tGT:DP\t0|1:20\n"
+    )
+    # 0-based pos 5 ('A' in `_REF`), unrelated to SA/SB's shared pos2 site.
+    c = _ss_fields(
+        tmp_path, "c", "SC", "chr1\t6\t.\tA\tC\t.\t.\tAF=0.5\tGT:DP\t1|1:99\n"
+    )
+    out = tmp_path / "store"
+    dropped = SparseVar2.from_vcf_list(
+        out, [a, b, c], ref, threads=1, format_fields=["DP"]
+    )
+    assert dropped == 0
+
+    sv = SparseVar2(out).with_fields(["DP"])
+    rag = sv.decode("chr1", [(0, len(_REF))])
+
+    # Flat (R,S,P) cell order: SA_h0, SA_h1, SB_h0, SB_h1, SC_h0, SC_h1.
+    # SA carries both haps at pos2; SB only hap1; SC carries nothing there
+    # (its own site is pos5, a separate decoded record).
+    lengths = rag["pos"].lengths.reshape(-1)
+    assert lengths.tolist() == [1, 1, 0, 1, 1, 1]
+
+    dp = np.asarray(rag["DP"].data)
+    # Order follows the carrier cells above: SA_h0, SA_h1, SB_h1, SC_h0, SC_h1.
+    # Each carrier's DP is its OWN file's value -- if the merge instead took
+    # e.g. the first-carrier's value for every column (an INFO/FORMAT mixup),
+    # SB's and SC's DP would wrongly read back as 10.
+    assert dp.tolist() == [10, 10, 20, 99, 99]
+
+
+def test_from_vcf_list_info_first_carrier(tmp_path: Path):
+    """INFO fields merge first-carrier-wins: at a shared site, the value
+    comes from the LOWEST-numbered (earliest in `sources` order) file that
+    carries the atom -- proven here by giving the two files DIFFERENT AF
+    values, so taking the last carrier or e.g. their max would fail this."""
+    ref = _write_ref(tmp_path)
+    # A is FIRST in the list and carries AF=0.1; B is second and carries
+    # AF=0.9 at the SAME shared SNP.
+    a = _ss_fields(
+        tmp_path, "a", "SA", "chr1\t3\t.\tA\tG\t.\t.\tAF=0.1\tGT:DP\t1|0:1\n"
+    )
+    b = _ss_fields(
+        tmp_path, "b", "SB", "chr1\t3\t.\tA\tG\t.\t.\tAF=0.9\tGT:DP\t0|1:2\n"
+    )
+    out = tmp_path / "store"
+    dropped = SparseVar2.from_vcf_list(out, [a, b], ref, threads=1, info_fields=["AF"])
+    assert dropped == 0
+
+    sv = SparseVar2(out).with_fields(["AF"])
+    rag = sv.decode("chr1", [(0, len(_REF))])
+
+    # Both SA_h0 and SB_h1 carry the ONE shared merged record, so both must
+    # report the SAME first-carrier value (0.1) -- if the code instead
+    # resolved each column's INFO independently (treating it like a FORMAT
+    # field) SB's entry would wrongly read back as 0.9.
+    lengths = rag["pos"].lengths.reshape(-1)
+    assert lengths.tolist() == [1, 0, 0, 1]
+    af = np.asarray(rag["AF"].data)
+    np.testing.assert_allclose(af, np.array([0.1, 0.1], dtype=np.float32), atol=1e-6)

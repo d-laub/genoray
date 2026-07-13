@@ -8,10 +8,14 @@
 //! that atom filled hom-ref (`0`). This is a *reorder* merge, not a plain
 //! synchronized merge — a file can be several records "ahead" of another before
 //! it's safe to release the lowest-keyed atom, mirroring the reorder buffer in
-//! `chunk_assembler`. Genotypes only in this task; INFO/FORMAT fields are always
-//! emitted empty (Task 6 wires them through).
+//! `chunk_assembler`. INFO fields resolve first-carrier-wins (the lowest-numbered
+//! column carrying the atom supplies the value); FORMAT fields are per-sample,
+//! each carrier contributing its own file's value and non-carriers falling back
+//! to the field's default downstream.
 
+use crate::chunk_assembler::resolve_scalar;
 use crate::error::ConversionError;
+use crate::field::{FieldCategory, FieldSpec};
 use crate::normalize::{L_MAX, atomize_to_vcf_biallelic, validate_ref};
 use crate::record_source::{RawRecord, RecordSource};
 use crate::vcf_reader::VcfRecordSource;
@@ -28,6 +32,13 @@ struct NormAtom {
     /// Per-haplotype presence code, length `ploidy`: `-1` missing, `1` carries
     /// this atom's source ALT, `0` carries something else (incl. REF).
     ploid_codes: Vec<i32>,
+    /// This atom's INFO values, one per requested INFO `FieldSpec` (spec
+    /// order), already resolved via `resolve_scalar` against this file's raw
+    /// record buffer and this atom's `source_alt_index`.
+    info_vals: Vec<f64>,
+    /// This atom's FORMAT values for this file's single sample, one per
+    /// requested FORMAT `FieldSpec` (spec order), resolved the same way.
+    format_vals: Vec<f64>,
 }
 
 /// One per-file cursor: an (optional, if the contig is absent) VCF reader, a
@@ -55,6 +66,8 @@ impl FileCursor {
         ref_seq: Option<&[u8]>,
         ploidy: usize,
         skip_out_of_scope: bool,
+        info_specs: &[FieldSpec],
+        format_specs: &[FieldSpec],
     ) -> Result<Option<NormAtom>, ConversionError> {
         if self.buf.is_empty() && !self.eof {
             let vcf = self
@@ -104,12 +117,35 @@ impl FileCursor {
                             };
                         }
 
+                        // Resolve this atom's field values against THIS file's raw
+                        // record buffer now, while `rec.info_raw`/`rec.format_raw`
+                        // (and `br.source_alt_index`) are still in scope — the merge
+                        // heap only ever sees the pre-resolved scalars from here on.
+                        let info_vals: Vec<f64> = info_specs
+                            .iter()
+                            .zip(rec.info_raw.iter())
+                            .map(|(spec, raw)| {
+                                resolve_scalar(raw.as_deref(), br.source_alt_index, spec)
+                            })
+                            .collect();
+                        // Single sample per file ⇒ always inner index 0.
+                        let format_vals: Vec<f64> = format_specs
+                            .iter()
+                            .zip(rec.format_raw.iter())
+                            .map(|(spec, raw)| {
+                                let sample_vals = raw.as_ref().map(|v| v[0].as_slice());
+                                resolve_scalar(sample_vals, br.source_alt_index, spec)
+                            })
+                            .collect();
+
                         self.buf.push_back(NormAtom {
                             pos: br.pos,
                             ilen,
                             reference,
                             alt,
                             ploid_codes,
+                            info_vals,
+                            format_vals,
                         });
                     }
                 }
@@ -155,6 +191,8 @@ pub struct VcfListRecordSource {
     ploidy: usize,
     skip_out_of_scope: bool,
     num_samples: usize,
+    info_specs: Vec<FieldSpec>,
+    format_specs: Vec<FieldSpec>,
 }
 
 impl VcfListRecordSource {
@@ -162,6 +200,7 @@ impl VcfListRecordSource {
     /// whose merged column is `i`. `ref_seq` is the contig sequence (`None` ⇒
     /// no-reference mode). Files without `chrom` in their header are skipped
     /// (their column is filled hom-ref for every merged record).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         vcf_paths: &[String],
         samples: &[&str],
@@ -170,6 +209,7 @@ impl VcfListRecordSource {
         ploidy: usize,
         htslib_threads: usize,
         skip_out_of_scope: bool,
+        fields: &[FieldSpec],
     ) -> Result<Self, ConversionError> {
         if vcf_paths.len() != samples.len() {
             return Err(ConversionError::Input(format!(
@@ -182,7 +222,8 @@ impl VcfListRecordSource {
         let mut cursors = Vec::with_capacity(vcf_paths.len());
         for (col, (path, &sample)) in vcf_paths.iter().zip(samples.iter()).enumerate() {
             let single_sample = [sample];
-            match VcfRecordSource::new(path, chrom, &single_sample, htslib_threads, ploidy, &[]) {
+            match VcfRecordSource::new(path, chrom, &single_sample, htslib_threads, ploidy, fields)
+            {
                 Ok(vcf) => cursors.push(FileCursor {
                     vcf: Some(vcf),
                     buf: VecDeque::new(),
@@ -204,6 +245,16 @@ impl VcfListRecordSource {
                 Err(e) => return Err(e),
             }
         }
+        let info_specs: Vec<FieldSpec> = fields
+            .iter()
+            .filter(|f| f.category == FieldCategory::Info)
+            .cloned()
+            .collect();
+        let format_specs: Vec<FieldSpec> = fields
+            .iter()
+            .filter(|f| f.category == FieldCategory::Format)
+            .cloned()
+            .collect();
         Ok(Self {
             cursors,
             heap: BinaryHeap::new(),
@@ -211,6 +262,8 @@ impl VcfListRecordSource {
             ploidy,
             skip_out_of_scope,
             num_samples: vcf_paths.len(),
+            info_specs,
+            format_specs,
         })
     }
 
@@ -255,13 +308,37 @@ impl VcfListRecordSource {
             let base = col * self.ploidy;
             gt[base..base + self.ploidy].copy_from_slice(&atom.ploid_codes);
         }
+
+        // INFO: first-carrier wins. `group` is popped off the heap in
+        // ascending `(key, col)` order (see `HeapEntry`'s `Ord`), so
+        // `group[0]` is always the lowest-numbered column carrying this atom
+        // — the earliest file in list order — regardless of which column's
+        // atom happened to be on top of the heap.
+        let info_raw: Vec<Option<Vec<f64>>> = (0..self.info_specs.len())
+            .map(|i| Some(vec![group[0].1.info_vals[i]]))
+            .collect();
+
+        // FORMAT: per-sample. Each carrier column supplies its own file's
+        // value; a non-carrier column is left an empty buffer, which
+        // `resolve_scalar` downstream (in `ChunkAssembler`) resolves to the
+        // field's default — same contract as a record-absent field.
+        let format_raw: Vec<Option<Vec<Vec<f64>>>> = (0..self.format_specs.len())
+            .map(|j| {
+                let mut per_sample: Vec<Vec<f64>> = vec![Vec::new(); self.num_samples];
+                for (col, atom) in &group {
+                    per_sample[*col] = vec![atom.format_vals[j]];
+                }
+                Some(per_sample)
+            })
+            .collect();
+
         RawRecord {
             pos: key.0,
             reference,
             alts: vec![alt],
             gt,
-            info_raw: vec![],
-            format_raw: vec![],
+            info_raw,
+            format_raw,
         }
     }
 }
@@ -318,9 +395,13 @@ impl RecordSource for VcfListRecordSource {
             match advance_idx {
                 Some(i) => {
                     let ref_seq = self.ref_seq.as_deref();
-                    if let Some(atom) =
-                        self.cursors[i].advance(ref_seq, self.ploidy, self.skip_out_of_scope)?
-                    {
+                    if let Some(atom) = self.cursors[i].advance(
+                        ref_seq,
+                        self.ploidy,
+                        self.skip_out_of_scope,
+                        &self.info_specs,
+                        &self.format_specs,
+                    )? {
                         let key = (atom.pos, atom.ilen, atom.alt.clone());
                         let col = self.cursors[i].col;
                         self.heap.push(Reverse(HeapEntry { key, col, atom }));
@@ -457,7 +538,7 @@ mod tests {
         ];
         let samples = vec!["SA", "SB"];
         let mut src =
-            VcfListRecordSource::new(&paths, &samples, "chr1", Some(&ref_seq), 2, 1, false)
+            VcfListRecordSource::new(&paths, &samples, "chr1", Some(&ref_seq), 2, 1, false, &[])
                 .unwrap();
 
         let r1 = src.next_record().unwrap().unwrap();
@@ -510,7 +591,7 @@ mod tests {
         ];
         let samples = vec!["SA", "SB"];
         let mut src =
-            VcfListRecordSource::new(&paths, &samples, "chr1", Some(&ref_seq), 2, 1, false)
+            VcfListRecordSource::new(&paths, &samples, "chr1", Some(&ref_seq), 2, 1, false, &[])
                 .unwrap();
 
         let r1 = src.next_record().unwrap().unwrap();
@@ -542,7 +623,7 @@ mod tests {
         let paths = vec![a.to_str().unwrap().to_string()];
         let samples = vec!["SA"];
         let mut src =
-            VcfListRecordSource::new(&paths, &samples, "chr1", Some(&ref_seq), 2, 1, false)
+            VcfListRecordSource::new(&paths, &samples, "chr1", Some(&ref_seq), 2, 1, false, &[])
                 .unwrap();
 
         let r1 = src.next_record().unwrap().unwrap();
@@ -580,7 +661,7 @@ mod tests {
         let paths = vec![a.to_str().unwrap().to_string()];
         let samples = vec!["SA"];
         let mut src =
-            VcfListRecordSource::new(&paths, &samples, "chr1", Some(&ref_seq), 2, 1, false)
+            VcfListRecordSource::new(&paths, &samples, "chr1", Some(&ref_seq), 2, 1, false, &[])
                 .unwrap();
 
         let r1 = src.next_record().unwrap().unwrap();
@@ -635,7 +716,7 @@ mod tests {
         ];
         let samples = vec!["SA", "SB"];
         let mut src =
-            VcfListRecordSource::new(&paths, &samples, "chr1", Some(&ref_seq), 2, 1, false)
+            VcfListRecordSource::new(&paths, &samples, "chr1", Some(&ref_seq), 2, 1, false, &[])
                 .unwrap();
 
         let r1 = src.next_record().unwrap().unwrap();
@@ -737,7 +818,7 @@ mod tests {
         ];
         let samples = vec!["SA", "SB", "SC"];
         let mut src =
-            VcfListRecordSource::new(&paths, &samples, "chr1", Some(&ref_seq), 2, 1, false)
+            VcfListRecordSource::new(&paths, &samples, "chr1", Some(&ref_seq), 2, 1, false, &[])
                 .unwrap();
 
         // Record 1: pos 10 — SA + SC carry, SB filled hom-ref.
@@ -791,5 +872,170 @@ mod tests {
         // SC's early EOF didn't strand or truncate anything downstream.
         assert!(src.next_record().unwrap().is_none());
         assert_eq!(src.dropped_out_of_scope(), 0);
+    }
+
+    // Write a single-sample, CSI-indexed BCF declaring `INFO AF` (Number=A,
+    // Float) and `FORMAT GT:DP` (DP Number=1, Integer), with per-record
+    // AF/DP values supplied alongside the usual pos/REF/ALT/GT. Only used by
+    // the field-carry-through test below — every other test in this module
+    // has no fields declared at all.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::type_complexity)]
+    fn write_ss_vcf_with_fields(
+        dir: &Path,
+        name: &str,
+        chrom: &str,
+        chrom_len: u64,
+        sample: &str,
+        // (pos, ref, alts, gt, INFO AF, FORMAT DP)
+        records: &[(i64, &'static [u8], Vec<&'static [u8]>, Vec<i32>, f32, i32)],
+    ) -> PathBuf {
+        let path = dir.join(format!("{name}.bcf"));
+        let mut header = Header::new();
+        header.push_record(format!("##contig=<ID={chrom},length={chrom_len}>").as_bytes());
+        header.push_record(b"##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">");
+        header.push_record(b"##INFO=<ID=AF,Number=A,Type=Float,Description=\"Allele frequency\">");
+        header.push_record(b"##FORMAT=<ID=DP,Number=1,Type=Integer,Description=\"Depth\">");
+        header.push_sample(sample.as_bytes());
+        {
+            let mut writer =
+                Writer::from_path(&path, &header, false, Format::Bcf).expect("open BCF writer");
+            for (pos, r, alts, gt, af, dp) in records {
+                let mut record = writer.empty_record();
+                record.set_rid(Some(0));
+                record.set_pos(*pos);
+                let mut alleles: Vec<&[u8]> = Vec::with_capacity(1 + alts.len());
+                alleles.push(r);
+                alleles.extend(alts.iter().copied());
+                record.set_alleles(&alleles).expect("set alleles");
+                let gt_alleles: Vec<GenotypeAllele> = gt
+                    .iter()
+                    .map(|&g| {
+                        if g < 0 {
+                            GenotypeAllele::PhasedMissing
+                        } else {
+                            GenotypeAllele::Phased(g)
+                        }
+                    })
+                    .collect();
+                record.push_genotypes(&gt_alleles).expect("push genotypes");
+                record.push_info_float(b"AF", &[*af]).expect("push AF");
+                record.push_format_integer(b"DP", &[*dp]).expect("push DP");
+                writer.write(&record).expect("write record");
+            }
+        }
+        rust_htslib::bcf::index::build(&path, None, 0, rust_htslib::bcf::index::Type::Csi(14))
+            .expect("build BCF index");
+        path
+    }
+
+    #[test]
+    fn info_first_carrier_and_format_per_sample_with_non_carrier_default() {
+        // Two files: a shared SNP@pos2 that BOTH carry (proves INFO
+        // first-carrier-wins across two DIFFERENT AF values, and FORMAT
+        // per-sample carrying each file's own DP), plus a second SNP@pos20
+        // that ONLY file A carries (proves the non-carrier column's
+        // `format_raw` entry is the empty `vec![]` the design contract
+        // promises -- NOT file A's carrier value leaking across columns,
+        // and NOT some other placeholder).
+        //
+        // This is deliberately tested at the `RawRecord` layer rather than
+        // through `SparseVar2.decode()`: `decode()`'s Ragged output only
+        // ever emits ALT-carrying (sample, ploid) cells (see
+        // `test_from_vcf_list_missing_hap_is_unobservable_in_decode` for the
+        // analogous genotype-side limitation), so a non-carrier column's
+        // resolved value never surfaces through it -- the `RawRecord` this
+        // merge produces is the only place the empty-vs-populated buffer
+        // contract is directly observable.
+        let tmp = tempdir().unwrap();
+        let a = write_ss_vcf_with_fields(
+            tmp.path(),
+            "a",
+            "chr1",
+            100,
+            "SA",
+            &[
+                (2, b"A", vec![b"G"], vec![1, 0], 0.1, 10),  // shared w/ B
+                (20, b"A", vec![b"C"], vec![1, 1], 0.4, 77), // A-only
+            ],
+        );
+        let b = write_ss_vcf_with_fields(
+            tmp.path(),
+            "b",
+            "chr1",
+            100,
+            "SB",
+            &[(2, b"A", vec![b"G"], vec![0, 1], 0.9, 20)], // shared w/ A
+        );
+        let ref_seq = make_ref(tmp.path(), "chr1", 100, &[(2, b"A"), (20, b"A")]);
+
+        let paths = vec![
+            a.to_str().unwrap().to_string(),
+            b.to_str().unwrap().to_string(),
+        ];
+        let samples = vec!["SA", "SB"];
+        let fields = crate::field::parse_manifest(vec![
+            (
+                "AF".to_string(),
+                "info".to_string(),
+                "float".to_string(),
+                None,
+                None,
+            ),
+            (
+                "DP".to_string(),
+                "format".to_string(),
+                "int".to_string(),
+                None,
+                None,
+            ),
+        ])
+        .unwrap();
+        let mut src = VcfListRecordSource::new(
+            &paths,
+            &samples,
+            "chr1",
+            Some(&ref_seq),
+            2,
+            1,
+            false,
+            &fields,
+        )
+        .unwrap();
+
+        // pos2: both files carry it -- INFO first-carrier-wins picks SA's
+        // 0.1, NOT SB's 0.9 (nor e.g. their max/last). FORMAT is per-sample:
+        // SA's own DP (10) and SB's own DP (20), each in its own column.
+        let r1 = src.next_record().unwrap().unwrap();
+        assert_eq!(r1.pos, 2);
+        assert_eq!(
+            r1.info_raw,
+            // htslib stores AF as f32; the raw buffer is widened to f64
+            // verbatim (no rounding), so the expected value must go through
+            // the same f32 round-trip rather than a literal f64 `0.1`.
+            vec![Some(vec![0.1_f32 as f64])],
+            "INFO AF must be SA's (first-carrier/col0) value 0.1, not SB's 0.9"
+        );
+        assert_eq!(
+            r1.format_raw,
+            vec![Some(vec![vec![10.0], vec![20.0]])],
+            "FORMAT DP must be per-sample: SA's own 10, SB's own 20"
+        );
+
+        // pos20: only SA carries it -- SB's column is a non-member (not just
+        // a genotype non-carrier), so its FORMAT buffer must be the empty
+        // `vec![]` the design contract calls for (-> downstream default),
+        // not SA's 77 leaking across columns.
+        let r2 = src.next_record().unwrap().unwrap();
+        assert_eq!(r2.pos, 20);
+        assert_eq!(r2.info_raw, vec![Some(vec![0.4_f32 as f64])]);
+        assert_eq!(
+            r2.format_raw,
+            vec![Some(vec![vec![77.0], vec![]])],
+            "SB is not a member at pos20 -- its FORMAT DP buffer must be \
+             empty, not SA's carrier value"
+        );
+
+        assert!(src.next_record().unwrap().is_none());
     }
 }

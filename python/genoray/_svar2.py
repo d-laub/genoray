@@ -383,9 +383,15 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
 
         `reference` is **required** in the current implementation
         (`no_reference=True` is not yet supported here, unlike `from_vcf`).
-        `info_fields`/`format_fields` are accepted in the signature for
-        forward compatibility but are not yet wired through -- passing
-        either non-empty raises `NotImplementedError`.
+
+        `info_fields`/`format_fields`: same declaration API as :meth:`from_vcf`
+        (resolved against the FIRST file in `sources`' header). INFO fields
+        merge **first-carrier-wins**: when a site is shared across files, the
+        value comes from the lowest-numbered (earliest in `sources` order)
+        file that carries the atom, not the last or the max. FORMAT fields
+        remain per-sample, exactly as in `from_vcf`: each sample gets its own
+        file's value, and a sample that doesn't carry the atom gets the
+        field's default.
 
         Returns the number of out-of-scope (symbolic/breakend) ALTs dropped
         (0 unless `skip_out_of_scope`).
@@ -404,14 +410,6 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         if no_reference:
             raise NotImplementedError(
                 "no_reference is not yet supported by from_vcf_list; pass a reference"
-            )
-        if info_fields:
-            raise NotImplementedError(
-                "info_fields is not yet supported by from_vcf_list"
-            )
-        if format_fields:
-            raise NotImplementedError(
-                "format_fields is not yet supported by from_vcf_list"
             )
         if out.exists() and not overwrite:
             raise FileExistsError(
@@ -442,6 +440,13 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         if not contigs:
             raise ValueError("No variants found in any input.")
 
+        # Field specs are resolved against the FIRST file's header -- every
+        # input is single-sample and expected to share a header schema (same
+        # assumption the reference/samples handling already makes).
+        flds = _resolve_fields(str(paths[0]), info_fields, format_fields)
+        info = [t for t in flds if t[1] == "info"]
+        format_ = [t for t in flds if t[1] == "format"]
+
         return _core.run_vcf_list_conversion_pipeline(
             [str(p) for p in paths],
             None if no_reference else str(reference),
@@ -454,8 +459,8 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             long_allele_capacity,
             skip_out_of_scope,
             signatures,
-            [],
-            [],
+            info,
+            format_,
         )
 
 

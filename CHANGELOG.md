@@ -4,6 +4,14 @@
 
 - Added `SparseVar2.from_vcf_list` to build one store from many single-sample
   VCFs/BCFs via a native k-way merge (absent sites filled hom-ref).
+- `SparseVar2.from_vcf_list` now supports `info_fields=`/`format_fields=`
+  (previously reserved kwargs that raised `NotImplementedError` when passed
+  non-empty). Merge semantics account for there being N source columns per
+  site: **INFO fields merge first-carrier-wins** (the lowest-numbered/
+  earliest-in-`sources` file that carries a shared atom supplies its INFO
+  value), while **FORMAT fields stay per-sample** (each carrier contributes
+  its own file's value; a non-carrying sample gets the field's default),
+  exactly as in `from_vcf`.
 - `SparseVar2.from_pgen` converts a PLINK2 PGEN (`.pgen`/`.pvar`/`.psam`) to an
   SVAR2 store through the same normalization, atom, and merge spine as
   `from_vcf`. Diploid-only (no `ploidy=` kwarg); dosages, INFO/FORMAT fields,
