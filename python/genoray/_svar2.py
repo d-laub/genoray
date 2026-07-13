@@ -26,6 +26,45 @@ if TYPE_CHECKING:
     from genoray._svar2_fields import FormatField, InfoField
 
 
+def _resolve_vcf_sources(sources: "str | Path | Sequence[str | Path]") -> list[Path]:
+    """Resolve `sources` (as accepted by :meth:`SparseVar2.from_vcf_list`) to a
+    concrete, ordered list of VCF/BCF paths.
+
+    `sources` may be:
+
+    - a `Sequence` (list/tuple, not `str`/`Path`) of file paths, taken as-is
+      and in the given order.
+    - a single directory `Path`: every `*.vcf.gz` then every `*.bcf` directly
+      inside it (non-recursive), each group name-sorted (`natsort`).
+    - a single file `Path` ending in `.vcf.gz` or `.bcf`: that one file.
+    - any other single file `Path`: treated as a manifest -- one path per
+      line, blank lines and `#`-prefixed comment lines skipped, relative
+      entries resolved against the manifest's parent directory.
+    """
+    if isinstance(sources, (str, Path)):
+        path = Path(sources)
+        if path.is_dir():
+            paths = natsorted(path.glob("*.vcf.gz")) + natsorted(path.glob("*.bcf"))
+        elif path.name.endswith(".vcf.gz") or path.suffix == ".bcf":
+            paths = [path]
+        else:
+            paths = []
+            for line in path.read_text().splitlines():
+                entry = line.strip()
+                if not entry or entry.startswith("#"):
+                    continue
+                entry_path = Path(entry)
+                if not entry_path.is_absolute():
+                    entry_path = path.parent / entry_path
+                paths.append(entry_path)
+    else:
+        paths = [Path(s) for s in sources]
+
+    if not paths:
+        raise ValueError(f"no VCF/BCF files found in {sources}")
+    return paths
+
+
 def _ensure_bgzipped(source: Path) -> None:
     """Reject a plain (uncompressed) VCF — it can't be tabix/csi-indexed."""
     is_bcf = source.suffix == ".bcf"
@@ -286,6 +325,132 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             skip_out_of_scope,
             signatures,
             readers,
+        )
+
+    @classmethod
+    def from_vcf_list(
+        cls,
+        out: str | Path,
+        sources: "str | Path | Sequence[str | Path]",
+        reference: str | Path | None = None,
+        *,
+        no_reference: bool = False,
+        skip_out_of_scope: bool = False,
+        ploidy: int = 2,
+        chunk_size: int = 25_000,
+        threads: int | None = None,
+        overwrite: bool = False,
+        long_allele_capacity: int = 8 * 1024 * 1024,
+        signatures: bool = False,
+        info_fields: "Sequence[str | InfoField] | None" = None,
+        format_fields: "Sequence[str | FormatField] | None" = None,
+    ) -> int:
+        """Build one SVAR2 store from many **single-sample** VCFs/BCFs via a
+        native k-way merge (no `bcftools merge`, no intermediate multi-sample
+        VCF).
+
+        Each file in `sources` must have exactly one sample column; that
+        sample becomes one sample in the resulting store, named after its
+        VCF header sample name (duplicates across files are rejected). A
+        site present in some input files but absent from another is filled
+        **hom-ref (`0`)** for the samples that lack it -- this is distinct
+        from an in-file `./.` (missing) call, which decodes to `-1` as usual.
+        The merge is join-on-atom: files are merged one contig at a time by
+        walking each file's already-sorted record stream in lockstep, so a
+        variant is one shared row in the output store iff its normalized
+        (pos, ref, alt) atom matches exactly across files, not merely its
+        position.
+
+        `sources` accepts three forms (resolved by module-level
+        `_resolve_vcf_sources`):
+
+        - a `Sequence` of paths -- explicit, in the given order.
+        - a single directory `Path` -- every `*.vcf.gz` then every `*.bcf`
+          directly inside it (non-recursive), each group name-sorted.
+        - a single file `Path` -- if it ends in `.vcf.gz`/`.bcf`, that one
+          file; otherwise treated as a manifest (one path per line, blank
+          and `#`-comment lines skipped, relative entries resolved against
+          the manifest's directory).
+
+        As with :meth:`from_vcf`, each input VCF's records must already be
+        position-sorted per contig -- an unsorted file silently corrupts the
+        k-way merge.
+
+        `reference` is **required** in the current implementation
+        (`no_reference=True` is not yet supported here, unlike `from_vcf`).
+        `info_fields`/`format_fields` are accepted in the signature for
+        forward compatibility but are not yet wired through -- passing
+        either non-empty raises `NotImplementedError`.
+
+        Returns the number of out-of-scope (symbolic/breakend) ALTs dropped
+        (0 unless `skip_out_of_scope`).
+        """
+        from cyvcf2 import VCF as _CyVCF
+
+        out = Path(out)
+
+        if (reference is None) == (not no_reference):
+            raise ValueError(
+                "provide exactly one of `reference` (a FASTA path) or "
+                "`no_reference=True`"
+            )
+        if signatures and no_reference:
+            raise ValueError("signatures=True requires a reference (not no_reference).")
+        if no_reference:
+            raise NotImplementedError(
+                "no_reference is not yet supported by from_vcf_list; pass a reference"
+            )
+        if info_fields:
+            raise NotImplementedError(
+                "info_fields is not yet supported by from_vcf_list"
+            )
+        if format_fields:
+            raise NotImplementedError(
+                "format_fields is not yet supported by from_vcf_list"
+            )
+        if out.exists() and not overwrite:
+            raise FileExistsError(
+                f"Output path {out} already exists. Use overwrite=True to overwrite."
+            )
+
+        paths = _resolve_vcf_sources(sources)
+        out.parent.mkdir(parents=True, exist_ok=True)
+
+        samples: list[str] = []
+        contig_set: set[str] = set()
+        for path in paths:
+            _ensure_bgzipped(path)
+            _ensure_index(path)
+            v = _CyVCF(str(path))
+            if len(v.samples) != 1:
+                raise ValueError(
+                    f"{path} is not single-sample (has {len(v.samples)} samples)"
+                )
+            samples.append(v.samples[0])
+            contig_set.update(c for c in v.seqnames if next(v(c), None) is not None)
+
+        dupes = sorted({s for s in samples if samples.count(s) > 1})
+        if dupes:
+            raise ValueError(f"duplicate sample names across inputs: {dupes}")
+
+        contigs = natsorted(contig_set)
+        if not contigs:
+            raise ValueError("No variants found in any input.")
+
+        return _core.run_vcf_list_conversion_pipeline(
+            [str(p) for p in paths],
+            None if no_reference else str(reference),
+            contigs,
+            str(out),
+            samples,
+            chunk_size,
+            ploidy,
+            threads,
+            long_allele_capacity,
+            skip_out_of_scope,
+            signatures,
+            [],
+            [],
         )
 
 

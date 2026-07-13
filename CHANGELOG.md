@@ -2,6 +2,8 @@
 
 ### Added
 
+- Added `SparseVar2.from_vcf_list` to build one store from many single-sample
+  VCFs/BCFs via a native k-way merge (absent sites filled hom-ref).
 - `SparseVar2.from_pgen` converts a PLINK2 PGEN (`.pgen`/`.pvar`/`.psam`) to an
   SVAR2 store through the same normalization, atom, and merge spine as
   `from_vcf`. Diploid-only (no `ploidy=` kwarg); dosages, INFO/FORMAT fields,
