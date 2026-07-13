@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -41,3 +42,23 @@ def test_from_svar1_refuses_existing_out_without_overwrite(tmp_path: Path):
     out.mkdir()
     with pytest.raises(FileExistsError):
         SparseVar2.from_svar1(out, src, no_reference=True, threads=1)
+
+
+def test_from_svar1_rejects_index_contig_order_mismatch(tmp_path: Path):
+    """metadata.json's `contigs` must exactly match index.arrow's physical CHROM
+    run order -- a hand-edited/foreign store that disagrees (renamed, reordered,
+    or split contig) must raise loudly rather than silently mis-assign global
+    variant-id ranges.
+    """
+    src = _build_svar1(tmp_path)
+    meta_path = src / "metadata.json"
+    meta = json.loads(meta_path.read_text())
+    assert meta["contigs"] == ["chr1"]
+    # index.arrow's only CHROM run is still "chr1"; disagree with it by renaming.
+    meta["contigs"] = ["chr2"]
+    meta_path.write_text(json.dumps(meta))
+
+    with pytest.raises(ValueError, match="index.arrow"):
+        SparseVar2.from_svar1(
+            tmp_path / "out", src, no_reference=True, overwrite=True, threads=1
+        )

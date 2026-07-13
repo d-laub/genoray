@@ -528,6 +528,19 @@ def _svar1_index_arrays(
     SVAR1's index.arrow is variant-major and contig-contiguous; POS is 1-based.
     """
     df = pl.read_ipc(source / "index.arrow", columns=["CHROM", "POS", "REF", "ALT"])
+    # Global contig_start/len offsets below are only correct if index.arrow's
+    # physical row order is contig-contiguous AND those runs appear in the same
+    # order as `contigs` (from metadata.json). Verify via run-length encoding of
+    # CHROM: a well-formed store has exactly one run per contig, in `contigs` order.
+    run_order = df["CHROM"].rle().struct.field("value").to_list()
+    if run_order != contigs:
+        raise ValueError(
+            f"{source / 'index.arrow'} is not contig-contiguous in the order given "
+            f"by metadata.json's contigs list, so SVAR1->SVAR2 conversion cannot "
+            f"safely assign global variant-id ranges per contig.\n"
+            f"Expected contig run order (from metadata.contigs): {contigs}\n"
+            f"Actual CHROM run order (from index.arrow): {run_order}"
+        )
     # ALT is comma-Utf8 on disk; biallelic => a single token per row.
     starts: list[int] = []
     lens: list[int] = []
