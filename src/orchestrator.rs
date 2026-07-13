@@ -84,8 +84,21 @@ struct VcfListDroppedProxy {
 impl crate::record_source::RecordSource for VcfListDroppedProxy {
     fn next_record(&mut self) -> Result<Option<crate::record_source::RawRecord>, ConversionError> {
         let rec = self.inner.next_record()?;
-        self.dropped_out
-            .store(self.inner.dropped_out_of_scope(), Ordering::Relaxed);
+        // `dropped_out_of_scope()` sums over every `FileCursor` (O(N) in the
+        // file count) -- reading it on EVERY merged record made this an
+        // O(N * records) scan on the pipeline's hot path (e.g. N=1000 files
+        // and 5M merged records ⇒ 5e9 strided loads). The count only needs
+        // to be correct by the time the caller (`process_chromosome`'s
+        // reader thread) reads `vcf_list_dropped` after its `while let
+        // Some(dense_chunk) = reader.read_next_chunk(...)` loop exits --
+        // which happens only once the underlying source (and therefore this
+        // proxy) has returned `None` at least once. So it's enough to
+        // refresh the stored total on that one EOF transition instead of
+        // every record.
+        if rec.is_none() {
+            self.dropped_out
+                .store(self.inner.dropped_out_of_scope(), Ordering::Relaxed);
+        }
         Ok(rec)
     }
 }

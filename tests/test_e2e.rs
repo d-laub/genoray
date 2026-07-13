@@ -751,10 +751,11 @@ fn test_reader_accepts_pure_del() {
 }
 
 // Boundary error-handling: a chromosome absent from the VCF header must surface
-// as a typed `ConversionError::Input` (SP-3: `VcfRecordSource::new` now returns
+// as a typed `ConversionError` (SP-3: `VcfRecordSource::new` now returns
 // `Result` instead of panicking on `name2rid`, so the reader thread's closure
 // propagates it and the join surfaces the real error, not a swallowed
-// `WorkerPanicked`).
+// `WorkerPanicked`; SP-4 final review (M1) narrowed the variant from a generic
+// `Input(String)` to a structurally-matchable `ContigNotInHeader`).
 #[test]
 fn test_missing_chrom_returns_err() {
     let tmp = tempdir().unwrap();
@@ -791,9 +792,14 @@ fn test_missing_chrom_returns_err() {
         &[],   // fields
     );
 
+    // SP-4 final review (M1): a chromosome absent from the VCF header is a
+    // distinct, structurally-typed `ContigNotInHeader` -- not a generic
+    // `Input` string -- so callers (e.g. `vcf_list_reader`'s per-file
+    // skip-and-hom-ref-fill branch) can match on the variant instead of
+    // grepping the message.
     assert!(matches!(
         res,
-        Err(genoray_core::error::ConversionError::Input(_))
+        Err(genoray_core::error::ConversionError::ContigNotInHeader { .. })
     ));
 }
 

@@ -41,6 +41,26 @@ struct NormAtom {
     format_vals: Vec<f64>,
 }
 
+/// Reject a record whose position precedes the file's own last-read position.
+/// Factored out of `FileCursor::advance` so it's directly unit-testable: a
+/// real integration-level fixture would need a deliberately stale/mismatched
+/// index, since htslib's own CSI/tabix indexer refuses to build a valid index
+/// over genuinely unsorted records (`hts_idx_push` rejects them at build
+/// time) -- so a whole-file-unsorted BCF can't be constructed through the
+/// normal write+index helpers this test module otherwise uses.
+fn check_position_sorted(path: &str, prev: Option<u32>, pos: u32) -> Result<(), ConversionError> {
+    if let Some(prev) = prev
+        && pos < prev
+    {
+        return Err(ConversionError::Input(format!(
+            "{path}: records are not position-sorted (pos {pos} follows pos {prev}) -- \
+             from_vcf_list requires every input file's records to already be \
+             position-sorted per contig; sort it first (e.g. `bcftools sort`) and retry"
+        )));
+    }
+    Ok(())
+}
+
 /// One per-file cursor: an (optional, if the contig is absent) VCF reader, a
 /// small buffer of not-yet-emitted atoms decomposed from the last record it
 /// pulled, and the position of the last record it *read* (its "frontier" —
@@ -52,6 +72,10 @@ struct FileCursor {
     eof: bool,
     col: usize,
     dropped: u64,
+    /// This file's own path, kept only for error messages (unsorted-input
+    /// detection, cross-file REF disagreement) that need to name the
+    /// offending file.
+    path: String,
 }
 
 impl FileCursor {
@@ -79,6 +103,13 @@ impl FileCursor {
                     self.eof = true;
                 }
                 Some(rec) => {
+                    // The merge is correct only if every input is
+                    // position-sorted per contig -- one comparison per
+                    // record turns an unsorted file (which would otherwise
+                    // silently corrupt the k-way merge, poisoning the WHOLE
+                    // output store with no way to identify which of N files
+                    // was at fault) into a clear, named error instead.
+                    check_position_sorted(&self.path, self.frontier, rec.pos)?;
                     self.frontier = Some(rec.pos);
                     if let Some(rs) = ref_seq {
                         validate_ref(rec.pos, &rec.reference, rs)?;
@@ -231,8 +262,14 @@ impl VcfListRecordSource {
                     eof: false,
                     col,
                     dropped: 0,
+                    path: path.clone(),
                 }),
-                Err(ConversionError::Input(msg)) if msg.contains("not found in VCF header") => {
+                // This file's header simply doesn't declare `chrom` at all --
+                // matched on the typed variant (not a message substring, which
+                // would silently stop matching if `vcf_reader.rs`'s wording
+                // ever changed) -- skip it, filling its column hom-ref for
+                // every merged record on this contig.
+                Err(ConversionError::ContigNotInHeader { .. }) => {
                     cursors.push(FileCursor {
                         vcf: None,
                         buf: VecDeque::new(),
@@ -240,6 +277,7 @@ impl VcfListRecordSource {
                         eof: true,
                         col,
                         dropped: 0,
+                        path: path.clone(),
                     });
                 }
                 Err(e) => return Err(e),
@@ -286,21 +324,54 @@ impl VcfListRecordSource {
     // pairs: one biallelic record whose REF/ALT come from the first atom (they
     // agree by construction — same key), with every column not present in the
     // group left hom-ref (`0`, the `gt` vec's fill value).
-    fn build_record(&self, key: &(u32, i32, Vec<u8>), group: Vec<(usize, NormAtom)>) -> RawRecord {
+    fn build_record(
+        &self,
+        key: &(u32, i32, Vec<u8>),
+        group: Vec<(usize, NormAtom)>,
+    ) -> Result<RawRecord, ConversionError> {
         let reference = group[0].1.reference.clone();
-        // The merge key is `(pos, ilen, alt)` and excludes REF. When `ref_seq`
-        // is `Some`, `validate_ref` makes cross-file REF disagreement at the
-        // same key impossible; in no-reference mode there is no such check, so
-        // this just catches a mis-specified file list (e.g. two callers
-        // disagreeing about the REF at a position) in debug builds rather than
-        // silently taking `group[0]`'s REF for every column.
-        #[cfg(debug_assertions)]
-        for (_, atom) in &group {
-            debug_assert_eq!(
-                atom.reference, reference,
-                "cross-file REF disagreement at pos {} despite matching merge key {:?}",
-                key.0, key
-            );
+        // The merge key is `(pos, ilen, alt)` and excludes REF.
+        if self.ref_seq.is_some() {
+            // `validate_ref` ran for every atom against the SAME reference,
+            // so cross-file REF disagreement at a matching key is provably
+            // impossible here -- keep only a debug-build sanity net rather
+            // than paying a real check in release builds.
+            #[cfg(debug_assertions)]
+            for (_, atom) in &group {
+                debug_assert_eq!(
+                    atom.reference, reference,
+                    "cross-file REF disagreement at pos {} despite matching merge key {:?} \
+                     (unexpected: validate_ref should make this impossible when a reference \
+                     is supplied)",
+                    key.0, key
+                );
+            }
+        } else {
+            // No reference: `validate_ref` never ran, so two files CAN
+            // genuinely disagree about REF at the same `(pos, ilen, alt)`
+            // key. Silently taking `group[0]`'s REF (as a debug-only assert
+            // would let happen in release builds) would corrupt every other
+            // column's REF at this atom -- make it a real, named error in
+            // every build, not just a debug assertion.
+            for (col, atom) in &group {
+                if atom.reference != reference {
+                    return Err(ConversionError::Input(format!(
+                        "cross-file REF disagreement at pos {} (atom key {:?}): file {:?} \
+                         (column {}) has REF {:?} but file {:?} (column {}) has REF {:?} -- \
+                         no_reference mode has no reference to arbitrate which is correct; \
+                         supply a `reference` FASTA, or ensure every input file agrees on \
+                         REF at this position",
+                        key.0,
+                        key,
+                        self.cursors[group[0].0].path,
+                        group[0].0,
+                        String::from_utf8_lossy(&reference),
+                        self.cursors[*col].path,
+                        col,
+                        String::from_utf8_lossy(&atom.reference),
+                    )));
+                }
+            }
         }
         let alt = group[0].1.alt.clone();
         let mut gt = vec![0i32; self.num_samples * self.ploidy];
@@ -332,14 +403,14 @@ impl VcfListRecordSource {
             })
             .collect();
 
-        RawRecord {
+        Ok(RawRecord {
             pos: key.0,
             reference,
             alts: vec![alt],
             gt,
             info_raw,
             format_raw,
-        }
+        })
     }
 }
 
@@ -366,8 +437,8 @@ impl RecordSource for VcfListRecordSource {
                     }));
 
             if releasable {
-                return Ok(match self.heap.pop() {
-                    None => None,
+                return match self.heap.pop() {
+                    None => Ok(None),
                     Some(Reverse(top)) => {
                         let key = top.key.clone();
                         let mut group = vec![(top.col, top.atom)];
@@ -378,9 +449,9 @@ impl RecordSource for VcfListRecordSource {
                             let Reverse(next) = self.heap.pop().unwrap();
                             group.push((next.col, next.atom));
                         }
-                        Some(self.build_record(&key, group))
+                        self.build_record(&key, group).map(Some)
                     }
-                });
+                };
             }
 
             // Advance the live cursor with the smallest frontier; `None` (an
@@ -1037,5 +1108,164 @@ mod tests {
         );
 
         assert!(src.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn check_position_sorted_rejects_a_decrease() {
+        // Mirrors what `FileCursor::advance` feeds it: this file's own
+        // last-read position (20, its `frontier`) followed by a smaller one
+        // (5) -- the exact shape of an unsorted input file, unit-tested
+        // directly since htslib's own CSI/tabix indexer refuses to build a
+        // valid index over genuinely unsorted on-disk records (see the
+        // function's doc comment), so this can't be exercised end-to-end
+        // through the write+index test helpers above.
+        let err = check_position_sorted("bad.bcf", Some(20), 5).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bad.bcf"),
+            "error must name the offending file path, got: {msg}"
+        );
+        assert!(
+            msg.contains("20") && msg.contains('5'),
+            "error must name the offending positions, got: {msg}"
+        );
+        assert!(
+            msg.contains("sort"),
+            "error should point at a remedy (sorting), got: {msg}"
+        );
+    }
+
+    #[test]
+    fn check_position_sorted_accepts_ties_and_increases() {
+        // No prior frontier (first record of the file): always fine.
+        assert!(check_position_sorted("f.bcf", None, 5).is_ok());
+        // Equal position (multiple atoms/records can legitimately share a
+        // POS, e.g. a multiallelic split): not a decrease, so fine.
+        assert!(check_position_sorted("f.bcf", Some(5), 5).is_ok());
+        // Strictly increasing: the ordinary case.
+        assert!(check_position_sorted("f.bcf", Some(5), 6).is_ok());
+    }
+
+    #[test]
+    fn no_reference_cross_file_ref_disagreement_errors() {
+        // file A and B both claim a variant at the SAME (pos, ilen, alt) key
+        // ("A>G" at pos 2) but disagree about REF ("A" vs "C") -- with
+        // `ref_seq: None`, `validate_ref` never runs, so nothing upstream of
+        // `build_record` catches this. Must be a real `ConversionError` in
+        // every build (not merely a `debug_assert`), naming both files, both
+        // RE-Fs, and the position -- silently taking file A's REF for file
+        // B's column would otherwise corrupt file B's row with no signal.
+        let tmp = tempdir().unwrap();
+        let a = write_ss_vcf(
+            tmp.path(),
+            "a",
+            "chr1",
+            100,
+            "SA",
+            &[SsRec {
+                pos: 2,
+                r: b"A",
+                alts: vec![b"G"],
+                gt: vec![1, 0],
+            }],
+        );
+        let b = write_ss_vcf(
+            tmp.path(),
+            "b",
+            "chr1",
+            100,
+            "SB",
+            &[SsRec {
+                pos: 2,
+                r: b"C",
+                alts: vec![b"G"],
+                gt: vec![0, 1],
+            }],
+        );
+
+        let paths = vec![
+            a.to_str().unwrap().to_string(),
+            b.to_str().unwrap().to_string(),
+        ];
+        let samples = vec!["SA", "SB"];
+        // ref_seq: None -- no_reference mode, exercising the branch validate_ref
+        // never guards.
+        let mut src =
+            VcfListRecordSource::new(&paths, &samples, "chr1", None, 2, 1, false, &[]).unwrap();
+
+        // `RawRecord` isn't `Debug` (see `record_source.rs`), so `unwrap_err`
+        // isn't available on `Result<Option<RawRecord>, ConversionError>` --
+        // match it out instead.
+        let err = match src.next_record() {
+            Err(e) => e,
+            Ok(_) => panic!("expected an error, got Ok"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains(a.to_str().unwrap()) && msg.contains(b.to_str().unwrap()),
+            "error must name both conflicting files, got: {msg}"
+        );
+        assert!(
+            msg.to_uppercase().contains('A') && msg.contains('C'),
+            "error must name both conflicting REF bytes, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn contig_in_header_but_no_records_is_hom_ref_filled_not_errored() {
+        // The MOST common real shape for `from_vcf_list`'s inputs: N
+        // per-sample VCFs sharing one pipeline header (so every file's header
+        // declares every contig), where a given sample simply has no variant
+        // calls on this particular contig. This is a DIFFERENT code path
+        // than `file_without_contig_is_skipped` above (which omits the
+        // contig from the header entirely, failing at `name2rid`): here
+        // `name2rid` and `fetch` both succeed, and the FIRST `next_record()`
+        // call returns `None` immediately. Must still hom-ref-fill, not
+        // error.
+        let tmp = tempdir().unwrap();
+        let a = write_ss_vcf(
+            tmp.path(),
+            "a",
+            "chr1",
+            100,
+            "SA",
+            &[SsRec {
+                pos: 2,
+                r: b"A",
+                alts: vec![b"G"],
+                gt: vec![1, 0],
+            }],
+        );
+        // file B: header declares chr1 (shared pipeline header) but has ZERO
+        // records on it.
+        let b_path = tmp.path().join("b.bcf");
+        let mut header = Header::new();
+        header.push_record(b"##contig=<ID=chr1,length=100>");
+        header.push_record(b"##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">");
+        header.push_sample(b"SB");
+        {
+            let writer =
+                Writer::from_path(&b_path, &header, false, Format::Bcf).expect("open writer");
+            drop(writer); // no records written at all
+        }
+        rust_htslib::bcf::index::build(&b_path, None, 0, rust_htslib::bcf::index::Type::Csi(14))
+            .expect("build BCF index");
+
+        let ref_seq = make_ref(tmp.path(), "chr1", 100, &[(2, b"A")]);
+
+        let paths = vec![
+            a.to_str().unwrap().to_string(),
+            b_path.to_str().unwrap().to_string(),
+        ];
+        let samples = vec!["SA", "SB"];
+        let mut src =
+            VcfListRecordSource::new(&paths, &samples, "chr1", Some(&ref_seq), 2, 1, false, &[])
+                .unwrap();
+
+        let r1 = src.next_record().unwrap().unwrap();
+        assert_eq!(r1.pos, 2);
+        assert_eq!(r1.gt, vec![1, 0, /* SB, hom-ref filled */ 0, 0]);
+        assert!(src.next_record().unwrap().is_none());
+        assert_eq!(src.dropped_out_of_scope(), 0);
     }
 }
