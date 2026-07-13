@@ -446,12 +446,18 @@ fn decode_hap_src_pins_var_key_dense_position_tie() {
     assert_eq!(hc.alts[i1], b"C", "dense entry's ALT");
 }
 
-// --- Task 8 fix pass (Finding 3): pin `decode_batch_fields`'s emitted BYTES,
-// not just that it builds. `gather_field_bytes`/`OpenField` are plain Rust
-// (no `Python<'py>`), so this needs no GIL. -----------------------------
+// --- Task 8 fix pass (Finding 3, re-verified in fix pass 2 after Finding A/B):
+// pin `decode_batch_fields`'s emitted BYTES, not just that it builds.
+// `gather_batch_fields`/`OpenField` are plain Rust (no `Python<'py>`), so this
+// needs no GIL. `gather_batch_fields` now does the record decode AND the
+// per-field byte gather in a single `decode_hap_src` pass (fix pass 2,
+// Finding A), so this test also implicitly proves that single pass produces
+// bit-exact bytes (fix pass 2, Finding B) — the assertions below are
+// unchanged from before that restructuring, only the call site (`.fbytes`)
+// differs. ---------------------------------------------------------------
 
 use genoray_core::layout::{ContigPaths, FieldSub};
-use genoray_core::py_query_decode::{OpenField, gather_field_bytes};
+use genoray_core::py_query_decode::{OpenField, gather_batch_fields};
 
 fn write_field_i32(paths: &ContigPaths, category: &str, name: &str, sub: FieldSub, vals: &[i32]) {
     let p = paths.field_values(category, name, sub);
@@ -460,7 +466,7 @@ fn write_field_i32(paths: &ContigPaths, category: &str, name: &str, sub: FieldSu
     std::fs::write(&p, bytes).unwrap();
 }
 
-/// `decode_batch_fields`'s Rust core (`OpenField::open` + `gather_field_bytes`)
+/// `decode_batch_fields`'s Rust core (`OpenField::open` + `gather_batch_fields`)
 /// must gather the right byte for the right record — through all four
 /// provenance classes (var_key snp/indel, dense snp/indel) and through the
 /// dense-FORMAT `(row, orig_sample)` stride, which is the one bug class a
@@ -468,7 +474,7 @@ fn write_field_i32(paths: &ContigPaths, category: &str, name: &str, sub: FieldSu
 /// field, class-offset + index) so a wrong index reads a wrong-but-plausible
 /// value instead of accidentally still matching.
 #[test]
-fn gather_field_bytes_pins_bytes_per_class_and_dense_format_stride() {
+fn gather_batch_fields_pins_bytes_per_class_and_dense_format_stride() {
     let tmp = tempdir().unwrap();
     let out = tmp.path().join("out");
     std::fs::create_dir_all(&out).unwrap();
@@ -537,11 +543,12 @@ fn gather_field_bytes_pins_bytes_per_class_and_dense_format_stride() {
     let iv = OpenField::open(&paths, "info", "IV", "i32", n_samples).unwrap();
     let dp = OpenField::open(&paths, "format", "DP", "i32", n_samples).unwrap();
     let fields = vec![iv, dp];
-    let fbytes = gather_field_bytes(&reader, &br, &fields);
+    let decoded = gather_batch_fields(&reader, &br, &fields);
+    let fbytes = &decoded.fbytes;
     assert_eq!(fbytes.len(), 2);
 
     // Independently replicate the expected bytes via the SAME provenance
-    // (`decode_hap_src`) `gather_field_bytes` itself uses, but computing the
+    // (`decode_hap_src`) `gather_batch_fields` itself uses, but computing the
     // expected value here rather than calling into the code under test.
     let mut expect_iv: Vec<u8> = Vec::new();
     let mut expect_dp: Vec<u8> = Vec::new();

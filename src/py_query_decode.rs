@@ -12,7 +12,7 @@ use crate::layout::{ContigPaths, FieldSub};
 use crate::py_convert::{i32_to_pyarray, u8_to_pyarray};
 use crate::py_query::PyContigReader;
 use crate::query::gather::overlap_batch_src;
-use crate::query::{BatchResult, ContigReader, FieldValue, FieldView, overlap_batch};
+use crate::query::{BatchResult, ContigReader, FieldView, overlap_batch};
 
 /// The two legal field categories `decode_batch_fields` accepts. Parsing the
 /// caller-supplied `category: &str` into this enum up front means a typo (or
@@ -67,13 +67,17 @@ impl OpenFieldError {
 
 /// One requested field's four open sub-stream views (`FieldSub::all()` order:
 /// `VkSnp, VkIndel, DenseSnp, DenseIndel`), plus the metadata
-/// `gather_field_bytes` needs to select the right sub-stream and stride a
+/// `gather_batch_fields` needs to select the right sub-stream and stride a
 /// dense-FORMAT column correctly.
 pub struct OpenField {
     key: String,
     is_format: bool,
     width: usize,
     views: [FieldView; 4],
+    /// Cohort sample count, needed to compute the dense-FORMAT byte index
+    /// (`dense_row * n_samples_cohort + orig_sample`) without decoding through
+    /// `FieldView::format_at` (which returns a `FieldValue`, not raw bytes).
+    n_samples_cohort: usize,
 }
 
 impl OpenField {
@@ -112,62 +116,65 @@ impl OpenField {
             views: views
                 .try_into()
                 .unwrap_or_else(|_| unreachable!("FieldSub::all() always yields exactly 4")),
+            n_samples_cohort,
         })
     }
 }
 
-/// Reduce a `FieldView` element to its raw little-endian bytes, left-aligned
-/// in a fixed 4-byte buffer (callers slice to `width`). Round-trips bit-exact
-/// for every `StorageDtype`: every variant was itself decoded via
-/// `from_le_bytes` in `FieldView::value_at`, so re-encoding via `to_le_bytes`
-/// reverses that exactly — no arithmetic, so NaN/sentinel bit patterns survive
-/// untouched.
-fn field_value_le_bytes(v: FieldValue) -> [u8; 4] {
-    match v {
-        FieldValue::Bool(b) => [b as u8, 0, 0, 0],
-        FieldValue::I8(x) => [x as u8, 0, 0, 0],
-        FieldValue::U8(x) => [x, 0, 0, 0],
-        FieldValue::I16(x) => {
-            let b = x.to_le_bytes();
-            [b[0], b[1], 0, 0]
-        }
-        FieldValue::U16(x) => {
-            let b = x.to_le_bytes();
-            [b[0], b[1], 0, 0]
-        }
-        FieldValue::I32(x) => x.to_le_bytes(),
-        FieldValue::U32(x) => x.to_le_bytes(),
-        FieldValue::F16(x) => {
-            let b = x.to_le_bytes();
-            [b[0], b[1], 0, 0]
-        }
-        FieldValue::F32(x) => x.to_le_bytes(),
-    }
+/// Everything `decode_batch_fields` needs to marshal into a `PyDict`: the same
+/// flat record arrays `decode_batch` produces (`pos`/`ilen`/`allele`/`str_off`/
+/// `off`), plus one raw-bytes buffer per requested field — all built from a
+/// SINGLE per-hap decode pass (see `gather_batch_fields`).
+#[derive(Default)]
+pub struct DecodedFields {
+    pub pos: Vec<i32>,
+    pub ilen: Vec<i32>,
+    pub allele: Vec<u8>,
+    pub str_off: Vec<i64>,
+    pub off: Vec<i64>,
+    /// One entry per requested field, in request order.
+    pub fbytes: Vec<Vec<u8>>,
 }
 
-/// Gather one raw-bytes buffer per requested field, aligned 1:1 with `br`'s
-/// decoded records in exactly `decode_hap_src`'s record order (region-major
+/// Decode every hap in `br` EXACTLY ONCE (via `decode_hap_src`) and, from that
+/// single pass, produce both the flat record arrays (`decode_batch`'s shape)
+/// and one raw-bytes buffer per requested field, aligned 1:1 with the decoded
+/// records in exactly `decode_hap_src`'s order (region-major
 /// `h = (r*n_samples + s)*ploidy + p`, then per-hap merge order). Pure Rust —
 /// no `Python<'py>` in the signature — so this is directly unit-testable with
 /// no GIL. `br` MUST come from `overlap_batch_src` (asserted transitively by
 /// `decode_hap_src`).
 ///
-/// For a dense FORMAT field, the element is read via `FieldView::format_at`
-/// (dense row, ORIGINAL cohort sample index) rather than hand-deriving the
-/// `row * n_samples + sample` stride here — that formula has exactly one
-/// copy, in `FieldView::format_at` itself. Every other case (var_key, dense
-/// INFO) reads via `FieldView::value_at`, which `format_at` itself calls.
-pub fn gather_field_bytes(
+/// Each field element's bytes are copied VERBATIM via `FieldView::bytes_at`
+/// (never decoded to a `FieldValue` and re-encoded), so this is bit-exact for
+/// every `StorageDtype` including `Bool` (a decode/re-encode round trip would
+/// collapse any stored byte > 1 to `1`). For a dense FORMAT field, the index
+/// is `dense_row * n_samples_cohort + orig_sample` — the ONE place that
+/// formula appears in this file; it mirrors `FieldView::format_at`, which
+/// can't be reused directly here since it returns a decoded `FieldValue`
+/// rather than a byte slice.
+pub fn gather_batch_fields(
     reader: &ContigReader,
     br: &BatchResult,
     fields: &[OpenField],
-) -> Vec<Vec<u8>> {
-    let mut fbytes: Vec<Vec<u8>> = vec![Vec::new(); fields.len()];
+) -> DecodedFields {
+    let mut out = DecodedFields {
+        str_off: vec![0],
+        off: vec![0],
+        fbytes: vec![Vec::new(); fields.len()],
+        ..Default::default()
+    };
+
     for r in 0..br.n_regions {
         for s in 0..br.n_samples {
             for p in 0..br.ploidy {
-                let (_, srcs) = br.decode_hap_src(reader, r, s, p);
-                for src in srcs {
+                let (hc, srcs) = br.decode_hap_src(reader, r, s, p);
+                for (i, &src) in srcs.iter().enumerate() {
+                    out.pos.push(hc.positions[i] as i32);
+                    out.ilen.push(hc.ilens[i]);
+                    out.allele.extend_from_slice(&hc.alts[i]);
+                    out.str_off.push(out.allele.len() as i64);
+
                     // FieldSub::all() order: VkSnp, VkIndel, DenseSnp, DenseIndel
                     let sub_ix = match (src.is_dense, src.is_indel) {
                         (false, false) => 0,
@@ -180,19 +187,19 @@ pub fn gather_field_bytes(
                         // Dense FORMAT strides by the ORIGINAL cohort sample
                         // index. `s` here is already the cohort index because
                         // `overlap_batch_src` runs over the whole cohort.
-                        let value = if src.is_dense && f.is_format {
-                            view.format_at(src.idx, s)
+                        let idx = if src.is_dense && f.is_format {
+                            src.idx * f.n_samples_cohort + s
                         } else {
-                            view.value_at(src.idx)
+                            src.idx
                         };
-                        let bytes = field_value_le_bytes(value);
-                        fbytes[fi].extend_from_slice(&bytes[..f.width]);
+                        out.fbytes[fi].extend_from_slice(view.bytes_at(idx));
                     }
                 }
+                out.off.push(out.pos.len() as i64);
             }
         }
     }
-    fbytes
+    out
 }
 
 #[pymethods]
@@ -245,9 +252,10 @@ impl PyContigReader {
     /// Values are returned as little-endian bytes + an itemsize; Python applies
     /// the numpy dtype (same trick as `allele`), so Rust does no dtype dispatch.
     ///
-    /// Thin marshalling wrapper: `OpenField::open` + `gather_field_bytes` do the
-    /// actual work and are plain Rust (no `Python<'py>`), so they are covered by
-    /// a Rust-only test in `tests/test_field_provenance.rs` with no GIL needed.
+    /// Thin marshalling wrapper: `OpenField::open` + `gather_batch_fields` do the
+    /// actual work — a single per-hap decode pass via `decode_hap_src` — and are
+    /// plain Rust (no `Python<'py>`), so they are covered by a Rust-only test in
+    /// `tests/test_field_provenance.rs` with no GIL needed.
     #[pyo3(signature = (regions, fields, base_dir, contig))]
     pub fn decode_batch_fields<'py>(
         &self,
@@ -269,40 +277,25 @@ impl PyContigReader {
             );
         }
 
-        let mut pos: Vec<i32> = Vec::new();
-        let mut ilen: Vec<i32> = Vec::new();
-        let mut allele: Vec<u8> = Vec::new();
-        let mut str_off: Vec<i64> = vec![0];
-        let mut off: Vec<i64> = vec![0];
-
-        for r in 0..br.n_regions {
-            for s in 0..br.n_samples {
-                for p in 0..br.ploidy {
-                    let hc = br.decode_hap(&self.inner, r, s, p);
-                    for i in 0..hc.positions.len() {
-                        pos.push(hc.positions[i] as i32);
-                        ilen.push(hc.ilens[i]);
-                        allele.extend_from_slice(&hc.alts[i]);
-                        str_off.push(allele.len() as i64);
-                    }
-                    off.push(pos.len() as i64);
-                }
-            }
-        }
-
-        let fbytes = gather_field_bytes(&self.inner, &br, &open);
+        // Single pass: every hap is decoded exactly once via `decode_hap_src`,
+        // producing both the record arrays and the per-field bytes together
+        // (see `gather_batch_fields` — Task 8 fix pass, Finding A).
+        let decoded = gather_batch_fields(&self.inner, &br, &open);
 
         let d = PyDict::new(py);
-        d.set_item("pos", i32_to_pyarray(py, &pos))?;
-        d.set_item("ilen", i32_to_pyarray(py, &ilen))?;
-        d.set_item("allele", u8_to_pyarray(py, &allele))?;
-        d.set_item("str_off", PyArray1::from_slice(py, &str_off))?;
-        d.set_item("off", PyArray1::from_slice(py, &off))?;
+        d.set_item("pos", i32_to_pyarray(py, &decoded.pos))?;
+        d.set_item("ilen", i32_to_pyarray(py, &decoded.ilen))?;
+        d.set_item("allele", u8_to_pyarray(py, &decoded.allele))?;
+        d.set_item("str_off", PyArray1::from_slice(py, &decoded.str_off))?;
+        d.set_item("off", PyArray1::from_slice(py, &decoded.off))?;
         d.set_item("n_regions", br.n_regions)?;
         d.set_item("n_samples", br.n_samples)?;
         d.set_item("ploidy", br.ploidy)?;
         for (fi, f) in open.iter().enumerate() {
-            d.set_item(format!("field_{}", f.key), u8_to_pyarray(py, &fbytes[fi]))?;
+            d.set_item(
+                format!("field_{}", f.key),
+                u8_to_pyarray(py, &decoded.fbytes[fi]),
+            )?;
             d.set_item(format!("field_itemsize_{}", f.key), f.width)?;
         }
         Ok(d)
