@@ -113,9 +113,23 @@ def test_from_vcf_list_matches_bcftools_merge_oracle(tmp_path: Path):
     semantics) -> `from_vcf` must equal the native `from_vcf_list` k-way merge.
 
     Mix: a shared SNP (a+b, same site), a private INS (a only), a
-    multiallelic split (b only), an anchored DEL with a missing hap (c only)
-    -- and b's multiallelic site and c's DEL share POS 7 but differ in
-    ILEN/ALT, so they must NOT be spuriously joined.
+    multiallelic split (b only), an anchored DEL with a missing hap (c only),
+    and a cross-file join onto b's NON-FIRST ALT (d only) -- and b's
+    multiallelic site and c's DEL share POS 7 but differ in ILEN/ALT, so they
+    must NOT be spuriously joined.
+
+    The assertions are split into two kinds:
+
+    - ABSOLUTE: `dropped == 0`, the exact `region_counts` array, and the
+      exact total decoded-entry count. These are hand-derived from the
+      fixture below and pin *reality*, not merely oracle==native agreement --
+      without them, a shared-layer regression that dropped every record from
+      BOTH stores (oracle and native alike) would still pass the relative
+      checks vacuously (empty == empty).
+    - RELATIVE (oracle vs. native): region_counts, decoded pos/ilen/allele.
+      These catch anything the hand-derived numbers above wouldn't (e.g. a
+      difference in *which* records/positions appear despite the same total
+      counts).
     """
     ref = _write_ref(tmp_path)
     a = _ss(
@@ -138,7 +152,18 @@ def test_from_vcf_list_matches_bcftools_merge_oracle(tmp_path: Path):
         "SC",
         "chr1\t7\t.\tCAT\tC\t.\t.\t.\tGT\t1|.\n",  # anchored DEL + missing hap
     )
-    paths = [a, b, c]
+    d = _ss(
+        tmp_path,
+        "d",
+        "SD",
+        # Joins b's ALT index 2 (T), NOT index 1 (G) -- this is the only
+        # place in the whole test suite (Python or Rust) where a cross-file
+        # join lands on a non-first source ALT index, exercising the
+        # per-file local-ALT-index -> joined-record-slot remap across files
+        # rather than within one file.
+        "chr1\t7\t.\tC\tT\t.\t.\t.\tGT\t1|0\n",
+    )
+    paths = [a, b, c, d]
 
     # Oracle: bcftools merge -0 (missing genotypes -> 0/0, matching our
     # hom-ref-fill semantics) -> bgzip -> index -> from_vcf.
@@ -155,17 +180,50 @@ def test_from_vcf_list_matches_bcftools_merge_oracle(tmp_path: Path):
     from_vcf_out = tmp_path / "oracle"
     SparseVar2.from_vcf(from_vcf_out, merged, ref, threads=1)
     list_out = tmp_path / "list"
-    SparseVar2.from_vcf_list(list_out, paths, ref, threads=1)
+    dropped = SparseVar2.from_vcf_list(list_out, paths, ref, threads=1)
+    assert dropped == 0
 
     oracle, native = SparseVar2(from_vcf_out), SparseVar2(list_out)
-    assert oracle.available_samples == native.available_samples == ["SA", "SB", "SC"]
-
-    region = [(0, len(_REF))]
-    np.testing.assert_array_equal(
-        oracle.region_counts("chr1", region), native.region_counts("chr1", region)
+    assert (
+        oracle.available_samples == native.available_samples == ["SA", "SB", "SC", "SD"]
     )
 
+    region = [(0, len(_REF))]
+
+    # ABSOLUTE: hand-derived expected (region, sample, ploid) counts, so a
+    # shared-layer regression that zeroed BOTH stores can't pass vacuously.
+    # Per-hap ALT-carrier tally from the fixture above (5 distinct atoms:
+    # SNP@2, INS@11, C>G@6, C>T@6, DEL@6):
+    #   SA: hap0 <- SNP@2 (shared w/ SB),        hap1 <- private INS@11
+    #   SB: hap0 <- C>G@6 (ALT idx 1),            hap1 <- SNP@2 (shared w/ SA)
+    #       AND C>T@6 (ALT idx 2, joins d) -> 2 entries on hap1
+    #   SC: hap0 <- anchored DEL@6,               hap1 <- missing (unobservable
+    #       via decode/region_counts -- see
+    #       test_from_vcf_list_missing_hap_is_unobservable_in_decode)
+    #   SD: hap0 <- C>T@6 (ALT idx 1 locally, joins b's ALT idx 2),
+    #       hap1 <- hom-ref
+    expected_counts = np.array(
+        [
+            [
+                [1, 1],  # SA
+                [1, 2],  # SB
+                [1, 0],  # SC
+                [1, 0],  # SD
+            ]
+        ]
+    )
+    oracle_counts = oracle.region_counts("chr1", region)
+    native_counts = native.region_counts("chr1", region)
+    np.testing.assert_array_equal(oracle_counts, expected_counts)
+    # Sum of the per-hap tally above: 2 (SA) + 3 (SB) + 1 (SC) + 1 (SD) = 7
+    # total ALT-carrying (sample, ploid) entries across the 5 atoms.
+    assert int(oracle_counts.sum()) == 7
+
+    # RELATIVE: oracle vs. native must still agree exactly.
+    np.testing.assert_array_equal(oracle_counts, native_counts)
+
     ro, rl = oracle.decode("chr1", region), native.decode("chr1", region)
+    assert len(np.asarray(ro["pos"].data)) == 7
     for field in ("pos", "ilen"):
         np.testing.assert_array_equal(
             np.asarray(ro[field].data), np.asarray(rl[field].data)
@@ -174,3 +232,52 @@ def test_from_vcf_list_matches_bcftools_merge_oracle(tmp_path: Path):
     # deletions decode to an empty ALT (anchor base is implicit) on BOTH
     # sides, so a like-for-like comparison is still meaningful.
     assert ro["allele"].to_ak().tolist() == rl["allele"].to_ak().tolist()
+
+
+def test_from_vcf_list_missing_hap_is_unobservable_in_decode(tmp_path: Path):
+    """Documents a gap, doesn't close it: `_svar2.py`'s `from_vcf_list`
+    docstring says a within-file `./.` (missing) call decodes to `-1`,
+    *distinct* from a hom-ref fill (`0`) for a sample lacking a site
+    entirely. That `-1`/`0` distinction is real in the internal per-file
+    `ploid_codes`/`RawRecord.gt` representation (see
+    `src/vcf_list_reader.rs`), but neither `decode()` nor `region_counts()`
+    exposes it: the sparse layout only ever stores ALT-*carrying* entries, so
+    a missing hap and a hom-ref hap both decode to zero entries -- there is
+    no public API surface to tell them apart.
+
+    This test pins that non-distinction (both wind up indistinguishable, and
+    both equal between the bcftools-merge oracle and the native
+    `from_vcf_list` merge), rather than claiming to evidence the `-1` vs `0`
+    split -- no test in this suite currently observes that split through a
+    public method.
+    """
+    ref = _write_ref(tmp_path)
+    # SA: ordinary hom-ref hap (hap1) with no site at all.
+    a = _ss(tmp_path, "a", "SA", "chr1\t3\t.\tA\tG\t.\t.\t.\tGT\t1|0\n")
+    # SB: explicit missing hap (hap1) at the SAME site as SA's hom-ref hap.
+    b = _ss(tmp_path, "b", "SB", "chr1\t3\t.\tA\tG\t.\t.\t.\tGT\t1|.\n")
+    paths = [a, b]
+
+    merge = subprocess.run(
+        ["bcftools", "merge", "-0", *map(str, paths)],
+        check=True,
+        stdout=subprocess.PIPE,
+    )
+    merged = tmp_path / "merged.vcf.gz"
+    with open(merged, "wb") as fh:
+        subprocess.run(["bgzip", "-c"], input=merge.stdout, check=True, stdout=fh)
+    subprocess.run(["bcftools", "index", str(merged)], check=True)
+
+    from_vcf_out = tmp_path / "oracle"
+    SparseVar2.from_vcf(from_vcf_out, merged, ref, threads=1)
+    list_out = tmp_path / "list"
+    dropped = SparseVar2.from_vcf_list(list_out, paths, ref, threads=1)
+    assert dropped == 0
+
+    oracle, native = SparseVar2(from_vcf_out), SparseVar2(list_out)
+    region = [(0, len(_REF))]
+    # Both SA's hom-ref hap1 and SB's missing hap1 decode to 0 entries --
+    # indistinguishable from each other, and identical between oracle/native.
+    expected = np.array([[[1, 0], [1, 0]]])
+    np.testing.assert_array_equal(oracle.region_counts("chr1", region), expected)
+    np.testing.assert_array_equal(native.region_counts("chr1", region), expected)
