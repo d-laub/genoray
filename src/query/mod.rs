@@ -25,6 +25,7 @@
 //! [`oracle::gather_ranges_readbound`].
 
 pub mod decode;
+pub mod field;
 pub mod gather;
 pub mod oracle;
 pub mod reader;
