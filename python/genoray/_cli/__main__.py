@@ -9,6 +9,8 @@ from typing import Annotated, Any, Callable, Literal
 import polars as pl
 from cyclopts import App, Parameter, validators
 
+from genoray._svar2_ops import Mode
+
 app = App(
     help_on_error=True,
     version=f"[magenta]genoray[/magenta] {version('genoray')}",
@@ -399,7 +401,7 @@ def concat(
     out: Path,
     sources: list[Path],
     *,
-    mode: Literal["copy", "hardlink", "symlink", "move"] = "copy",
+    mode: Mode = "copy",
     overwrite: bool = False,
 ) -> None:
     """Concatenate disjoint-contig SVAR2 stores into one."""
@@ -414,7 +416,7 @@ def split(
     out: Path,
     *,
     contigs: Annotated[str | None, Parameter(name=["--contigs", "-c"])] = None,
-    mode: Literal["copy", "hardlink", "symlink", "move"] = "copy",
+    mode: Mode = "copy",
     overwrite: bool = False,
 ) -> None:
     """Split an SVAR2 store by contig.

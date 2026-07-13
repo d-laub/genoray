@@ -20,3 +20,12 @@ def test_cli_split_then_concat(tiny_svar2, tmp_path):
     assert set(SparseVar2(tmp_path / "m.svar2").contigs) == set(
         SparseVar2(tiny_svar2).contigs
     )
+
+
+def test_cli_split_with_contigs(tiny_svar2, tmp_path):
+    out = tmp_path / "chr1_only.svar2"
+    r = _run(["split", str(tiny_svar2), str(out), "--contigs", "chr1"])
+    assert r.returncode == 0, r.stderr
+    contigs = SparseVar2(out).contigs
+    assert contigs == ["chr1"]
+    assert "chr2" not in contigs
