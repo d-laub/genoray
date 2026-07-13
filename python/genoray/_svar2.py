@@ -353,8 +353,13 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         sample becomes one sample in the resulting store, named after its
         VCF header sample name (duplicates across files are rejected). A
         site present in some input files but absent from another is filled
-        **hom-ref (`0`)** for the samples that lack it -- this is distinct
-        from an in-file `./.` (missing) call, which decodes to `-1` as usual.
+        **hom-ref (`0`)** for the samples that lack it. An in-file `./.`
+        (missing) call is *not* separately preserved once merged: SVAR2's
+        sparse layout stores only ALT-carrying entries, so a missing hap and
+        a hom-ref hap both produce zero entries and are indistinguishable
+        through `decode` or `region_counts`. (The `-1` missing sentinel is a
+        dense `genoray.VCF`/`genoray.PGEN` convention; it is not part of
+        SVAR2's decode.)
         The merge is join-on-atom: files are merged one contig at a time by
         walking each file's already-sorted record stream in lockstep, so a
         variant is one shared row in the output store iff its normalized

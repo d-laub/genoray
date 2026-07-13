@@ -382,12 +382,18 @@ multi-sample VCF.
     else is a manifest (one path per line, blank/`#`-comment lines skipped,
     relative entries resolved against the manifest's parent directory).
   - Resolving to zero files raises `ValueError`.
-- **Absent site → hom-ref `0`; within-file `./.` → missing `-1`.** These are
-  distinct: a site called in file A but not present at all in file B fills
-  `0` (hom-ref) for B's sample at that site; a site present in B but called
-  `./.` there decodes to `-1` as usual. The merge is join-on-atom — a
-  variant is one shared row across files iff its normalized `(pos, ref,
-  alt)` atom matches exactly, not merely its position.
+- **Absent site → hom-ref `0`.** A site called in file A but not present at
+  all in file B fills `0` (hom-ref) for B's sample at that site.
+- **A within-file `./.` is not observable after the merge.** SVAR2's sparse
+  layout stores only ALT-carrying entries, so a missing hap and a hom-ref hap
+  both produce zero entries and cannot be told apart via `decode` or
+  `region_counts`. The `-1` missing sentinel is a dense
+  `genoray.VCF`/`genoray.PGEN` convention and is **not** part of SVAR2's
+  decode. (The distinction is real inside the merge, but it is discarded when
+  genotypes are packed into the sparse carrier bit-grid — this matches
+  `from_vcf`, so the two paths stay in parity.)
+- The merge is join-on-atom — a variant is one shared row across files iff its
+  normalized `(pos, ref, alt)` atom matches exactly, not merely its position.
 - **Each input file's records must already be position-sorted** per contig
   (same assumption `from_vcf` makes for its single input) — an unsorted
   file silently corrupts the k-way merge.
