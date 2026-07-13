@@ -29,6 +29,23 @@ def _ref(d: Path) -> Path:
     return ref
 
 
+def _pgen(d: Path, vcf: Path) -> Path:
+    subprocess.run(
+        [
+            "plink2",
+            "--make-pgen",
+            "--output-chr",
+            "chrM",
+            "--vcf",
+            str(vcf),
+            "--out",
+            str(d / "in"),
+        ],
+        check=True,
+    )
+    return d / "in.pgen"
+
+
 def _vcf(d: Path, *, symbolic: bool) -> Path:
     body = (
         "##fileformat=VCFv4.2\n"
@@ -147,6 +164,40 @@ def test_write_no_breakend_removed_from_svar2(tmp_path: Path):
     )
     assert r.returncode != 0
     assert "no-breakend" in (r.stdout + r.stderr).lower()
+
+
+def test_write_dispatches_pgen(tmp_path: Path):
+    """`genoray write` already advertises VCF/PGEN in its help; make it true."""
+    ref = _ref(tmp_path)
+    vcf = _vcf(tmp_path, symbolic=False)
+    pgen = _pgen(tmp_path, vcf)
+    out = tmp_path / "pgen.svar2"
+    r = _run(["write", str(pgen), str(out), "--reference", str(ref), "--threads", "1"])
+    assert r.returncode == 0, r.stderr
+    sv = SparseVar2(out)
+    assert sv.contigs == ["chr1"]
+
+
+def test_write_pgen_rejects_nondefault_ploidy(tmp_path: Path):
+    ref = _ref(tmp_path)
+    vcf = _vcf(tmp_path, symbolic=False)
+    pgen = _pgen(tmp_path, vcf)
+    out = tmp_path / "pgen_ploidy.svar2"
+    r = _run(
+        [
+            "write",
+            str(pgen),
+            str(out),
+            "--reference",
+            str(ref),
+            "--ploidy",
+            "1",
+            "--threads",
+            "1",
+        ]
+    )
+    assert r.returncode != 0
+    assert "diploid" in (r.stdout + r.stderr).lower()
 
 
 def test_write_svar1_still_works(tmp_path: Path):

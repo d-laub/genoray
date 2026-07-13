@@ -459,19 +459,23 @@ SVAR 1.0 behavior.
 genoray write file.vcf.gz out.svar2 --reference ref.fa
 genoray write file.vcf.gz out.svar2 --no-reference
 genoray write file.vcf.gz out.svar2 --reference ref.fa --skip-symbolics-and-breakends --threads 4
+genoray write file.pgen out.svar2 --reference ref.fa
 
 # SVAR 1.0 (previous default) — VCF or PGEN, dosages, --haploid, --max-mem
 genoray write svar1 file.vcf.gz out.svar --max-mem 4g --haploid
 ```
 
-- `genoray write` (SVAR2, thin wrapper over `SparseVar2.from_vcf`): `--reference`
-  XOR `--no-reference` (required), `--ploidy` (default 2), `--chunk-size`
-  (default 25000), `--threads`/`-@`, `--overwrite`, `--long-allele-capacity`
-  (advanced), and a single `--skip-symbolics-and-breakends` flag (maps to
+- `genoray write` (SVAR2, thin wrapper over `SparseVar2.from_vcf`/`from_pgen`):
+  dispatches on the `.pgen` suffix — a `.pgen` source calls `from_pgen`,
+  anything else calls `from_vcf`. `--reference` XOR `--no-reference`
+  (required), `--chunk-size` (default 25000 for VCF/BCF, memory-derived for
+  PGEN), `--threads`/`-@`, `--overwrite`, `--long-allele-capacity` (advanced),
+  and a single `--skip-symbolics-and-breakends` flag (maps to
   `skip_out_of_scope=`) — the SVAR2 core can't expand either symbolic ALTs
   (`<DEL>`, `<INS>`, …) or breakends into nucleotides, so they're dropped
   together; prints a `Dropped {n} out-of-scope (symbolic/breakend) ALT
-  alleles.` line when set. VCF/BCF source only.
+  alleles.` line when set. `--ploidy` (default 2) is VCF/BCF only — PGEN is
+  diploid, and passing a non-default `--ploidy` with a `.pgen` source raises.
 - `genoray write svar1`: unchanged SVAR 1.0 behavior — VCF or PGEN source,
   `--dosages`, `--max-mem`, `--haploid`, `--no-symbolic`/`--no-breakend`
   (independent flags here, unlike SVAR2).

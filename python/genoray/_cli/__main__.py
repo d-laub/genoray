@@ -59,7 +59,7 @@ def write_svar2(
         bool, Parameter(name="--no-reference", negative="")
     ] = False,
     ploidy: int = 2,
-    chunk_size: int = 25_000,
+    chunk_size: int | None = None,
     threads: Annotated[int | None, Parameter(name=["--threads", "-@"])] = None,
     long_allele_capacity: int = 8 * 1024 * 1024,
     overwrite: bool = False,
@@ -68,13 +68,14 @@ def write_svar2(
     ] = False,
 ) -> None:
     """
-    Convert a bgzipped VCF or BCF to an SVAR2 store (the default, better-across-the-board format).
+    Convert a bgzipped VCF, BCF, or PLINK2 PGEN to an SVAR2 store (the default, better-across-the-board format).
 
     Parameters
     ----------
     source
-        Path to a bgzipped VCF (``.vcf.gz``) or BCF (``.bcf``). Auto-indexed
-        (``.csi``) if no index is present.
+        Path to a bgzipped VCF (``.vcf.gz``), BCF (``.bcf``), or PLINK2 PGEN
+        (``.pgen``, with its ``.pvar``/``.pvar.zst`` and ``.psam`` siblings).
+        VCF/BCF inputs are auto-indexed (``.csi``) if no index is present.
     out
         Path to the output SVAR2 directory.
     reference
@@ -86,9 +87,10 @@ def write_svar2(
         already normalized. Use only for pre-normalized (e.g. ``bcftools norm``)
         inputs.
     ploidy
-        Ploidy of the samples. Default 2.
+        Ploidy of the samples. Default 2. VCF/BCF only — PGEN is diploid.
     chunk_size
-        Variants per conversion chunk. Default 25000.
+        Variants per conversion chunk. Defaults to 25000 for VCF/BCF, and to a
+        memory-derived value for PGEN.
     threads
         Number of threads. Defaults to all available cores.
     long_allele_capacity
@@ -105,18 +107,35 @@ def write_svar2(
     from genoray import SparseVar2
 
     skip_out_of_scope = skip_symbolics_and_breakends
-    dropped = SparseVar2.from_vcf(
-        out,
-        source,
-        reference,
-        no_reference=no_reference,
-        skip_out_of_scope=skip_out_of_scope,
-        ploidy=ploidy,
-        chunk_size=chunk_size,
-        threads=threads,
-        overwrite=overwrite,
-        long_allele_capacity=long_allele_capacity,
-    )
+    if source.suffix == ".pgen":
+        if ploidy != 2:
+            raise ValueError(
+                "PGEN is diploid; --ploidy is only meaningful for VCF/BCF sources."
+            )
+        dropped = SparseVar2.from_pgen(
+            out,
+            source,
+            reference,
+            no_reference=no_reference,
+            skip_out_of_scope=skip_out_of_scope,
+            chunk_size=chunk_size,
+            threads=threads,
+            overwrite=overwrite,
+            long_allele_capacity=long_allele_capacity,
+        )
+    else:
+        dropped = SparseVar2.from_vcf(
+            out,
+            source,
+            reference,
+            no_reference=no_reference,
+            skip_out_of_scope=skip_out_of_scope,
+            ploidy=ploidy,
+            chunk_size=chunk_size if chunk_size is not None else 25_000,
+            threads=threads,
+            overwrite=overwrite,
+            long_allele_capacity=long_allele_capacity,
+        )
     if skip_out_of_scope:
         print(f"Dropped {dropped} out-of-scope (symbolic/breakend) ALT alleles.")
 

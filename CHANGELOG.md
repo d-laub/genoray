@@ -46,6 +46,15 @@
   `uint32` variant-index array) as its third tuple element instead of an
   `n_extension_vars` count, matching `PGEN._chunk_ranges_with_length`.
 
+### Perf
+
+- Conversion reader staging memory no longer scales with `chunk_size`:
+  presence bits are packed in word-aligned windows and each atom's per-column
+  genotype vector is dropped as soon as its bits are set, bounding reader
+  memory at `window * n_samples * ploidy * 4` bytes instead of
+  `chunk_size * n_samples * ploidy * 4`. Output is bit-identical. Benefits
+  both `from_vcf` and `from_pgen`.
+
 ### Fix
 
 - **vcf**: apply configured `filter` on `VCF.read(..., mode=Genos*Dosages)` when no
