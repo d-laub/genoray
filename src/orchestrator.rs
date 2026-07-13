@@ -66,6 +66,18 @@ pub enum SourceSpec {
         /// `Vcf` variant.
         htslib_threads: usize,
     },
+    Svar1 {
+        svar1_dir: String,
+        contig_start: usize,
+        n_local: usize,
+        pos: Vec<u32>,
+        ref_bytes: Vec<u8>,
+        ref_offsets: Vec<i64>,
+        alt_bytes: Vec<u8>,
+        alt_offsets: Vec<i64>,
+        format_fields: Vec<crate::field::FieldSpec>,
+        format_src_dtypes: Vec<String>,
+    },
 }
 
 /// Wraps `VcfListRecordSource`, mirroring its running `dropped_out_of_scope()`
@@ -264,6 +276,31 @@ pub fn process_chromosome(
                             dropped_out: Arc::clone(&vcf_list_dropped),
                         })
                     }
+                    SourceSpec::Svar1 {
+                        svar1_dir,
+                        contig_start,
+                        n_local,
+                        pos,
+                        ref_bytes,
+                        ref_offsets,
+                        alt_bytes,
+                        alt_offsets,
+                        format_fields,
+                        format_src_dtypes,
+                    } => Box::new(crate::svar1_reader::Svar1RecordSource::new(
+                        &svar1_dir,
+                        contig_start,
+                        n_local,
+                        s_refs.len(),
+                        ploidy,
+                        pos,
+                        ref_bytes,
+                        ref_offsets,
+                        alt_bytes,
+                        alt_offsets,
+                        &format_fields,
+                        &format_src_dtypes,
+                    )?),
                 };
                 let mut reader = crate::chunk_assembler::ChunkAssembler::new(
                     src,
