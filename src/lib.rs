@@ -72,6 +72,8 @@ pub mod spine;
 // errant import), and streams.rs itself has zero htslib dependency. Gating it broke
 // the query-core build; it stays ungated as shared infra.
 pub mod streams;
+#[cfg(feature = "conversion")]
+pub mod svar2_source;
 pub mod types;
 #[cfg(feature = "conversion")]
 pub mod vcf_reader;
