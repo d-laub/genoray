@@ -28,6 +28,37 @@ impl MutcatSub {
     }
 }
 
+/// The four sub-streams a field sidecar mirrors. Same four directories as
+/// `MutcatSub`, but kept separate: field dirs live under `fields/{category}/`
+/// and gain no `has_ref` notion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldSub {
+    VkSnp,
+    VkIndel,
+    DenseSnp,
+    DenseIndel,
+}
+
+impl FieldSub {
+    pub fn dir_name(self) -> &'static str {
+        match self {
+            FieldSub::VkSnp => "var_key_snp",
+            FieldSub::VkIndel => "var_key_indel",
+            FieldSub::DenseSnp => "dense_snp",
+            FieldSub::DenseIndel => "dense_indel",
+        }
+    }
+    /// Every sub-stream, in a fixed order (for iteration at open/finalize time).
+    pub fn all() -> [FieldSub; 4] {
+        [
+            FieldSub::VkSnp,
+            FieldSub::VkIndel,
+            FieldSub::DenseSnp,
+            FieldSub::DenseIndel,
+        ]
+    }
+}
+
 pub struct ContigPaths {
     base_out_dir: String,
     chrom: String,
@@ -94,6 +125,18 @@ impl ContigPaths {
     /// Directory created before writing a sidecar sub-stream.
     pub fn mutcat_sub_dir(&self, sub: MutcatSub) -> PathBuf {
         self.mutcat_dir(sub)
+    }
+
+    /// `{out}/{contig}/fields/{category}/{name}/{sub}/values.bin`.
+    /// `category` is `"info"` or `"format"` (see `FieldCategory::as_str`).
+    pub fn field_values(&self, category: &str, name: &str, sub: FieldSub) -> PathBuf {
+        Path::new(&self.base_out_dir)
+            .join(&self.chrom)
+            .join("fields")
+            .join(category)
+            .join(name)
+            .join(sub.dir_name())
+            .join("values.bin")
     }
 }
 
@@ -242,6 +285,19 @@ mod tests {
         assert_eq!(
             dense_max_del(contig),
             Path::new("/out/chr1/dense/max_del.npy")
+        );
+    }
+
+    #[test]
+    fn test_field_values_paths() {
+        let paths = ContigPaths::new("/out", "chr1");
+        assert_eq!(
+            paths.field_values("format", "DS", FieldSub::VkSnp),
+            Path::new("/out/chr1/fields/format/DS/var_key_snp/values.bin")
+        );
+        assert_eq!(
+            paths.field_values("info", "AF", FieldSub::DenseIndel),
+            Path::new("/out/chr1/fields/info/AF/dense_indel/values.bin")
         );
     }
 

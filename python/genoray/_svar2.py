@@ -10,7 +10,12 @@ from natsort import natsorted
 import genoray._core as _core
 from genoray._svar2_batch import _BatchQueryMixin
 from genoray._svar2_decode import _DecodeMixin
-from genoray._svar2_fields import _resolve_fields
+from genoray._svar2_fields import (
+    StoredField,
+    _load_field_manifest,
+    _resolve_fields,
+    _resolve_read_fields,
+)
 from genoray._svar2_mutcat import _MutcatMixin
 
 if TYPE_CHECKING:
@@ -48,13 +53,21 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
     (raw two-channel result) and M6c (decoded ``seqpro.rag.Ragged``).
     """
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(
+        self, path: str | Path, *, fields: "Sequence[str] | None" = None
+    ) -> None:
         self.path = Path(path)
         meta = json.loads((self.path / "meta.json").read_text())
         self.format_version: int = meta["format_version"]
         self.available_samples: list[str] = list(meta["samples"])
         self.contigs: list[str] = list(meta["contigs"])
         self.ploidy: int = meta["ploidy"]
+        self.available_fields: dict[str, StoredField] = _load_field_manifest(meta)
+        #: The fields this reader decodes. Empty unless opted into via
+        #: ``fields=`` / :meth:`with_fields` — decoding a field costs extra I/O.
+        self._fields: list[StoredField] = _resolve_read_fields(
+            fields, self.available_fields
+        )
         self._readers: dict[str, _core.PyContigReader] = {
             contig: _core.PyContigReader(
                 str(self.path), contig, len(self.available_samples), self.ploidy
@@ -65,6 +78,15 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
     @property
     def n_samples(self) -> int:
         return len(self.available_samples)
+
+    def with_fields(self, fields: "Sequence[str]") -> "SparseVar2":
+        """A new reader over the same store that also decodes ``fields``.
+
+        Keys are those of :attr:`available_fields`: the bare field name when it
+        is unique across INFO/FORMAT, else bcftools-style ``INFO/DP`` /
+        ``FORMAT/DP``.
+        """
+        return SparseVar2(self.path, fields=fields)
 
     @classmethod
     def from_vcf(

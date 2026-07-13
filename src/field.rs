@@ -59,6 +59,16 @@ impl StorageDtype {
         })
     }
 
+    /// Parse a finalized `meta.json` `fields[].dtype` string. Returns `None` for
+    /// `"auto"` — finalize always resolves `Auto` to a concrete dtype, so `auto`
+    /// on disk means the store is corrupt or was never finalized.
+    pub fn from_meta_str(s: &str) -> Option<Self> {
+        match Self::parse(s) {
+            Some(Self::Auto) | None => None,
+            Some(d) => Some(d),
+        }
+    }
+
     /// Lowercase on-disk/`meta.json` name. `Auto` never reaches here in
     /// practice (finalize always resolves it to a concrete dtype first), but
     /// maps to `"auto"` rather than panicking so this stays a total function.
@@ -183,5 +193,18 @@ mod tests {
     fn parse_manifest_rejects_bad_category() {
         let raw = vec![("X".into(), "bogus".into(), "int".into(), None, None)];
         assert!(parse_manifest(raw).is_err());
+    }
+
+    #[test]
+    fn test_from_meta_str_rejects_auto() {
+        assert_eq!(StorageDtype::from_meta_str("f16"), Some(StorageDtype::F16));
+        assert_eq!(StorageDtype::from_meta_str("i8"), Some(StorageDtype::I8));
+        assert_eq!(
+            StorageDtype::from_meta_str("bool"),
+            Some(StorageDtype::Bool)
+        );
+        // `auto` is never a finalized on-disk dtype.
+        assert_eq!(StorageDtype::from_meta_str("auto"), None);
+        assert_eq!(StorageDtype::from_meta_str("nonsense"), None);
     }
 }

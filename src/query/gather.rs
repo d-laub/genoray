@@ -8,7 +8,7 @@ use std::ops::Range;
 
 use crate::bits;
 use crate::rvk;
-use crate::spine::{self, KeyRef};
+use crate::spine::{self, KeyRef, SrcKeyRef, VkElem};
 
 use super::decode::{HapCalls, decode_keyref};
 use super::reader::ContigReader;
@@ -80,6 +80,11 @@ pub struct BatchResult {
     /// Flat var_key channel; `vk_off` (len H+1, CSR) slices it per hap.
     pub vk: Vec<KeyRef>,
     pub vk_off: Vec<usize>,
+    /// Absolute var_key provenance per `vk` record, packed by
+    /// `spine::pack_vk_src` (bit 31 = sub-stream, bits 0..=30 = call index).
+    /// **Empty** unless produced by `overlap_batch_src` — the plain gather
+    /// does not pay for it.
+    pub vk_src: Vec<u32>,
     /// Shared dense union (uniform keys, position-sorted); decode-once.
     pub dense: Vec<KeyRef>,
     /// `[s, e)` into `dense` per region (len n_regions).
@@ -88,6 +93,12 @@ pub struct BatchResult {
     /// concatenated; `dense_present_off` (len H+1) holds BIT offsets.
     pub dense_present: Vec<u8>,
     pub dense_present_off: Vec<usize>,
+    /// Per-entry dense provenance, parallel to `dense`: `(is_indel, per-class
+    /// dense row)`. **Empty** unless produced by `overlap_batch_src` — the
+    /// plain path does not pay for it. Lets `decode_hap_src` resolve dense
+    /// provenance via an O(1) index into this vec instead of rebuilding the
+    /// whole-contig dense union.
+    pub dense_src: Vec<(bool, u32)>,
 }
 
 /// Read-bound analog of `BatchResult`: the var_key channel merged per hap (as
@@ -103,6 +114,11 @@ pub struct BatchResultSplit {
     /// Flat merged var_key channel (snp+indel per hap); `vk_off` (len H+1) slices it.
     pub vk: Vec<KeyRef>,
     pub vk_off: Vec<usize>,
+    /// Absolute var_key provenance per `vk` record, packed by
+    /// `spine::pack_vk_src` (bit 31 = sub-stream, bits 0..=30 = call index).
+    /// **Empty** unless produced by `gather_haps_readbound_src` — the plain
+    /// gather does not pay for it.
+    pub vk_src: Vec<u32>,
     /// Per-region `dense/snp` windows (uniform keys), concatenated.
     pub dense_snp: Vec<KeyRef>,
     /// `[s, e)` into `dense_snp` per region (len n_regions).
@@ -123,49 +139,91 @@ pub struct BatchResultSplit {
 /// This is the shared body the batch/ranges/read-bound gathers previously
 /// hand-inlined. `vk_slice` already performs the union+merge for a column; this
 /// wrapper is the seam the read-bound path replays from precomputed ranges.
-pub(crate) fn gather_vk(
+pub(crate) fn gather_vk<T: VkElem>(
     reader: &ContigReader,
     vk_snp_range: Range<usize>,
     vk_indel_range: Range<usize>,
     q_start: u32,
-) -> Vec<KeyRef> {
+) -> Vec<T> {
     let snp_positions = reader.vk_snp.positions();
     let snp_keys = as_bytes(&reader.vk_snp.keys);
     let indel_positions = reader.vk_indel.positions();
     let indel_keys = as_u32(&reader.vk_indel.keys);
 
     let (ss, se) = (vk_snp_range.start, vk_snp_range.end);
-    let mut snp_run: Vec<KeyRef> = Vec::new();
+    let mut snp_run: Vec<T> = Vec::new();
     for (j, &pos) in snp_positions.iter().enumerate().take(se).skip(ss) {
         if q_start < pos + 1 {
             // snp v_end = pos + 1
-            snp_run.push(KeyRef {
-                position: pos,
-                key: rvk::snp_code_to_key(rvk::unpack_snp_key_at(snp_keys, j)),
-            });
+            snp_run.push(T::make(
+                pos,
+                rvk::snp_code_to_key(rvk::unpack_snp_key_at(snp_keys, j)),
+                false,
+                j,
+            ));
         }
     }
 
     let (is_, ie_) = (vk_indel_range.start, vk_indel_range.end);
-    let mut indel_run: Vec<KeyRef> = Vec::new();
+    let mut indel_run: Vec<T> = Vec::new();
     for j in is_..ie_ {
         let pos = indel_positions[j];
         let v_end = pos + 1 + rvk::deletion_len(indel_keys[j]);
         if q_start < v_end {
-            indel_run.push(KeyRef {
-                position: pos,
-                key: indel_keys[j],
-            });
+            indel_run.push(T::make(pos, indel_keys[j], true, j));
         }
     }
 
-    spine::merge_keys(vec![snp_run, indel_run])
+    spine::merge_by_position(vec![snp_run, indel_run])
 }
 
 /// Batched multi-region × whole-cohort query. `regions` is a list of half-open
 /// `[q_start, q_end)`. Single-threaded; `rayon` over the H hap-slices and dense-
 /// window subsetting are M6b concerns (see the design spec's open questions).
+///
+/// The no-provenance, zero-cost path (`T = KeyRef`; byte-identical to before
+/// `overlap_batch_impl` was introduced — `vk_src` stays empty and `KeyRef::make`
+/// discards the provenance args, so `spine::pack_vk_src` never runs).
 pub fn overlap_batch(reader: &ContigReader, regions: &[(u32, u32)]) -> BatchResult {
+    overlap_batch_impl::<KeyRef>(reader, regions)
+}
+
+/// As `overlap_batch`, but additionally populates `vk_src` so a consumer can
+/// map each merged var_key record back to its `(sub-stream, absolute call
+/// index)` and index a `FieldView`. This is the entry point
+/// `decode_batch_fields` uses to read fields over the whole-cohort batch path.
+pub fn overlap_batch_src(reader: &ContigReader, regions: &[(u32, u32)]) -> BatchResult {
+    overlap_batch_impl::<SrcKeyRef>(reader, regions)
+}
+
+/// Local extension of `spine::VkElem` (kept in `gather.rs` rather than
+/// `spine.rs` since this is purely a gather-level concern): whether `T` is the
+/// provenance-carrying element type. Gates `BatchResult::dense_src`
+/// population the same way `T::split` gates `vk_src` — `KeyRef`'s impl is
+/// `false` so the plain `overlap_batch`/`gather_ranges` path never builds it,
+/// `SrcKeyRef`'s is `true` so `overlap_batch_src` does. Implementing a local
+/// trait for `spine`'s types is fine under the orphan rule (same crate).
+trait DenseSrcElem: VkElem {
+    const CARRIES_SRC: bool;
+}
+
+impl DenseSrcElem for KeyRef {
+    const CARRIES_SRC: bool = false;
+}
+
+impl DenseSrcElem for SrcKeyRef {
+    const CARRIES_SRC: bool = true;
+}
+
+/// Shared body of `overlap_batch`/`overlap_batch_src`, generic over `T: VkElem`
+/// the same way `gather_haps_readbound_impl` is (see that function's doc
+/// comment). The only difference from the original monomorphic
+/// `overlap_batch` is `reader.vk_slice::<T>(...)`, the final `T::split(vk)`,
+/// and (for `dense_src`) `T::CARRIES_SRC`.
+fn overlap_batch_impl<T: DenseSrcElem>(
+    reader: &ContigReader,
+    regions: &[(u32, u32)],
+) -> BatchResult {
     let ploidy = reader.ploidy;
     let n_samples = reader.n_samples;
     let n_regions = regions.len();
@@ -177,7 +235,7 @@ pub fn overlap_batch(reader: &ContigReader, regions: &[(u32, u32)]) -> BatchResu
         .map(|&(qs, qe)| dense.overlap(qs, qe))
         .collect();
 
-    let mut vk: Vec<KeyRef> = Vec::new();
+    let mut vk: Vec<T> = Vec::new();
     let mut vk_off: Vec<usize> = vec![0];
     let mut presence = PresenceBitWriter::new();
 
@@ -188,7 +246,7 @@ pub fn overlap_batch(reader: &ContigReader, regions: &[(u32, u32)]) -> BatchResu
                 let col = s * ploidy + p;
 
                 // var_key channel slice for (region r, sample s, ploid p).
-                let slice = reader.vk_slice(col, s, p, qs, qe);
+                let slice: Vec<T> = reader.vk_slice(col, s, p, qs, qe);
                 vk.extend_from_slice(&slice);
                 vk_off.push(vk.len());
 
@@ -208,6 +266,24 @@ pub fn overlap_batch(reader: &ContigReader, regions: &[(u32, u32)]) -> BatchResu
     }
 
     let (dense_present, dense_present_off) = presence.into_parts();
+    // Project the generic element back into the frozen (vk, vk_src) contract
+    // — see `gather_haps_readbound_impl`'s identical final step.
+    let (vk, vk_src) = T::split(vk);
+
+    // Capture dense provenance ONCE, here, where `dense` (the whole-contig
+    // union) is already built exactly once per query — this is what lets
+    // `decode_hap_src` avoid ever calling `dense_union()` itself. Only paid
+    // for on the provenance-carrying path (`T::CARRIES_SRC`); the plain path
+    // stays a `Vec::new()`.
+    let dense_src: Vec<(bool, u32)> = if T::CARRIES_SRC {
+        dense
+            .src
+            .iter()
+            .map(|&(class, col)| (matches!(class, crate::dense::DenseClass::Indel), col as u32))
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     BatchResult {
         n_regions,
@@ -215,10 +291,12 @@ pub fn overlap_batch(reader: &ContigReader, regions: &[(u32, u32)]) -> BatchResu
         ploidy,
         vk,
         vk_off,
+        vk_src,
         dense: dense.refs,
         dense_range: ranges,
         dense_present,
         dense_present_off,
+        dense_src,
     }
 }
 
@@ -377,10 +455,12 @@ pub fn gather_ranges(reader: &ContigReader, rb: &RangesBundle) -> BatchResult {
         ploidy,
         vk,
         vk_off,
+        vk_src: Vec::new(),
         dense: dense.refs,
         dense_range: rb.dense_range.clone(),
         dense_present,
         dense_present_off,
+        dense_src: Vec::new(),
     }
 }
 
@@ -451,8 +531,16 @@ impl<'a> HapRanges<'a> {
 /// length n_q) or per-(query,ploid) (`vk_*_range`, length n_q*ploidy, row =
 /// q*ploidy + p). Builds zero SearchTrees and never calls `dense_union()`.
 /// Returns a `BatchResultSplit` with `n_samples = 1`, hap index `q*ploidy + p`.
+///
+/// Generic over `T: VkElem`: `gather_haps_readbound` (`T = KeyRef`) is the
+/// no-provenance, zero-cost path (byte-identical to before this generic was
+/// introduced); `gather_haps_readbound_src` (`T = SrcKeyRef`) additionally
+/// populates `vk_src`.
 #[allow(clippy::needless_range_loop)]
-pub fn gather_haps_readbound(reader: &ContigReader, rb: &HapRanges<'_>) -> BatchResultSplit {
+fn gather_haps_readbound_impl<T: VkElem>(
+    reader: &ContigReader,
+    rb: &HapRanges<'_>,
+) -> BatchResultSplit {
     let region_starts = rb.region_starts;
     let orig_samples = rb.orig_samples;
     let vk_snp_range = rb.vk_snp_range;
@@ -508,7 +596,7 @@ pub fn gather_haps_readbound(reader: &ContigReader, rb: &HapRanges<'_>) -> Batch
         dense_indel_range_out.push(base..dense_indel.len());
     }
 
-    let mut vk: Vec<KeyRef> = Vec::new();
+    let mut vk: Vec<T> = Vec::new();
     let mut vk_off: Vec<usize> = vec![0];
     let mut snp_presence = PresenceBitWriter::new();
     let mut indel_presence = PresenceBitWriter::new();
@@ -542,50 +630,61 @@ pub fn gather_haps_readbound(reader: &ContigReader, rb: &HapRanges<'_>) -> Batch
             // recovers the absolute call index `unpack_snp_key_at` needs
             // against the (unsliced, 2-bit-packed) `snp_keys` buffer.
             // Capacity is pre-sized so the filter below never reallocs.
-            let mut snp_run: Vec<KeyRef> = Vec::with_capacity(ve.saturating_sub(vs));
+            let mut snp_run: Vec<T> = Vec::with_capacity(ve.saturating_sub(vs));
             for (k, &pos) in snp_positions[vs..ve].iter().enumerate() {
                 let j = vs + k;
                 if qs < pos + 1 {
-                    snp_run.push(KeyRef {
-                        position: pos,
-                        key: rvk::snp_code_to_key(rvk::unpack_snp_key_at(snp_keys, j)),
-                    });
+                    snp_run.push(T::make(
+                        pos,
+                        rvk::snp_code_to_key(rvk::unpack_snp_key_at(snp_keys, j)),
+                        false,
+                        j,
+                    ));
                 }
             }
             let (vis, vie) = (vk_indel_range[row].start, vk_indel_range[row].end);
             // Same slicing treatment: `indel_positions`/`indel_keys` are
             // both plain `&[u32]` in the same absolute index space, so a
             // paired slice iterator drops the per-element bounds checks
-            // that `indel_positions[j]`/`indel_keys[j]` incurred.
-            let mut indel_run: Vec<KeyRef> = Vec::with_capacity(vie.saturating_sub(vis));
-            for (&pos, &key) in indel_positions[vis..vie].iter().zip(&indel_keys[vis..vie]) {
+            // that `indel_positions[j]`/`indel_keys[j]` incurred. RE-ADD the
+            // absolute index the plain zip previously dropped: `T::make`
+            // needs the true absolute call index `vis + k` for provenance.
+            let mut indel_run: Vec<T> = Vec::with_capacity(vie.saturating_sub(vis));
+            for (k, (&pos, &key)) in indel_positions[vis..vie]
+                .iter()
+                .zip(&indel_keys[vis..vie])
+                .enumerate()
+            {
+                let j = vis + k;
                 let v_end = pos + 1 + rvk::deletion_len(key);
                 if qs < v_end {
-                    indel_run.push(KeyRef { position: pos, key });
+                    indel_run.push(T::make(pos, key, true, j));
                 }
             }
             // Specialized 2-way merge, provably byte-identical to
-            // `spine::merge_keys(vec![snp_run, indel_run])`: that generic
-            // k-way merge picks `best = Some(0)` (snp_run) on the first
-            // scan and only switches to run 1 (indel_run) when
-            // `!(snp_run[h0].position <= indel_run[h1].position)`, i.e.
+            // `spine::merge_by_position(vec![snp_run, indel_run])`: that
+            // generic k-way merge picks `best = Some(0)` (snp_run) on the
+            // first scan and only switches to run 1 (indel_run) when
+            // `!(snp_run[h0].position() <= indel_run[h1].position())`, i.e.
             // exactly the `<=` two-pointer comparison below (ties still
-            // favor snp_run).
+            // favor snp_run). The `VkElem` payload rides along unchanged, so
+            // this stays a mirror of the generic merge for `SrcKeyRef` as
+            // well as `KeyRef`.
             //
             // Task 3 (gather_vk extraction) benched routing this hap-major
             // loop through the shared `gather_vk` helper (which rebuilds
-            // `snp_run`/`indel_run` via `merge_keys` per call, like
+            // `snp_run`/`indel_run` via `merge_by_position` per call, like
             // `gather_ranges`/`gather_ranges_readbound` do). The readbound
             // test fixtures are too small (single-digit variant counts) for
             // a stable wall-clock signal, so the decision was made on
             // algorithmic grounds instead: unifying would reintroduce the
             // slicing/allocation costs this block was written to remove
             // (re-walking `snp_positions[0..vs]` per hap via `skip`, plus
-            // three extra allocations per hap from `merge_keys`'s
+            // three extra allocations per hap from `merge_by_position`'s
             // `vec![...]`/`heads`/`out`). This tuned merge is retained.
             let (mut si, mut ii) = (0usize, 0usize);
             while si < snp_run.len() && ii < indel_run.len() {
-                if snp_run[si].position <= indel_run[ii].position {
+                if snp_run[si].position() <= indel_run[ii].position() {
                     vk.push(snp_run[si]);
                     si += 1;
                 } else {
@@ -636,12 +735,18 @@ pub fn gather_haps_readbound(reader: &ContigReader, rb: &HapRanges<'_>) -> Batch
     let (dense_snp_present, dense_snp_present_off) = snp_presence.into_parts();
     let (dense_indel_present, dense_indel_present_off) = indel_presence.into_parts();
 
+    // Project the generic element back into the frozen (vk, vk_src) contract.
+    // For T = KeyRef this is a no-op move plus an empty `vk_src` alloc (which
+    // optimizes away); for T = SrcKeyRef it splits the payload apart.
+    let (vk, vk_src) = T::split(vk);
+
     BatchResultSplit {
         n_regions: n_q,
         n_samples: 1,
         ploidy,
         vk,
         vk_off,
+        vk_src,
         dense_snp,
         dense_snp_range: dense_snp_range_out,
         dense_snp_present,
@@ -651,6 +756,36 @@ pub fn gather_haps_readbound(reader: &ContigReader, rb: &HapRanges<'_>) -> Batch
         dense_indel_present,
         dense_indel_present_off,
     }
+}
+
+/// Flat per-query read-bound gather (see `gather_haps_readbound_impl`). Does
+/// NOT populate `vk_src` — the no-provenance path, byte-identical to
+/// pre-field behaviour and zero-cost (`KeyRef::make` discards the provenance
+/// args, so the packing in `spine::pack_vk_src` never runs).
+pub fn gather_haps_readbound(reader: &ContigReader, rb: &HapRanges<'_>) -> BatchResultSplit {
+    gather_haps_readbound_impl::<KeyRef>(reader, rb)
+}
+
+/// As `gather_haps_readbound`, but also populates `vk_src` so a consumer can
+/// map each merged var_key record back to its `(sub-stream, absolute call
+/// index)` and index a `FieldView`. This is the entry point gvl uses to read
+/// fields.
+pub fn gather_haps_readbound_src(reader: &ContigReader, rb: &HapRanges<'_>) -> BatchResultSplit {
+    gather_haps_readbound_impl::<SrcKeyRef>(reader, rb)
+}
+
+/// Absolute dense **variant row** for entry `i` of a `BatchResultSplit` dense
+/// window — the index a `dense_snp`/`dense_indel` field `values.bin` is aligned
+/// to (INFO: `value_at(row)`; FORMAT: `format_at(row, orig_sample)`).
+///
+/// Dense provenance needs no extra state: each per-region window is a contiguous
+/// copy of the on-disk slice, so the absolute row is pure arithmetic.
+/// `on_disk` is `HapRanges::dense_*_range[q]`; `out` is
+/// `BatchResultSplit::dense_*_range[q]`; `i` indexes into `out`.
+#[inline]
+pub fn dense_abs_row(on_disk: &Range<usize>, out: &Range<usize>, i: usize) -> usize {
+    assert!(out.contains(&i), "i must index into the output window");
+    on_disk.start + (i - out.start)
 }
 
 /// Fused search+gather: `find_ranges` then `gather_ranges` in one call. The
@@ -696,6 +831,111 @@ impl BatchResult {
     }
 }
 
+/// Where one decoded record came from, so a consumer can index a `FieldView`.
+/// var_key: `idx` is the absolute call index in `var_key/{snp,indel}`.
+/// dense: `idx` is the absolute dense variant row in `dense/{snp,indel}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordSrc {
+    pub is_dense: bool,
+    pub is_indel: bool,
+    pub idx: usize,
+}
+
+impl BatchResult {
+    /// As `decode_hap`, but also returns one `RecordSrc` per decoded record, in
+    /// the same order. Requires a `BatchResult` built by `overlap_batch_src`
+    /// (i.e. with `vk_src` populated); panics otherwise, since silently
+    /// returning wrong provenance would attach field values to the wrong
+    /// variants.
+    pub fn decode_hap_src(
+        &self,
+        reader: &ContigReader,
+        r: usize,
+        s: usize,
+        p: usize,
+    ) -> (HapCalls, Vec<RecordSrc>) {
+        assert_eq!(
+            self.vk_src.len(),
+            self.vk.len(),
+            "decode_hap_src requires a BatchResult from overlap_batch_src"
+        );
+        assert_eq!(
+            self.dense_src.len(),
+            self.dense.len(),
+            "decode_hap_src requires a BatchResult from overlap_batch_src"
+        );
+        let h = (r * self.n_samples + s) * self.ploidy + p;
+
+        // var_key run for this hap, carrying provenance.
+        let (lo, hi) = (self.vk_off[h], self.vk_off[h + 1]);
+        let vk_run: Vec<(KeyRef, RecordSrc)> = (lo..hi)
+            .map(|i| {
+                let (is_indel, idx) = spine::unpack_vk_src(self.vk_src[i]);
+                (
+                    self.vk[i],
+                    RecordSrc {
+                        is_dense: false,
+                        is_indel,
+                        idx,
+                    },
+                )
+            })
+            .collect();
+
+        // Dense run: present entries of this region's window. `self.dense_src[j]`
+        // already holds `(is_indel, per-class row)` — captured ONCE by
+        // `overlap_batch_src` — so this is a plain index, no `dense_union()`
+        // rebuild (that would be an O(contig) sort per call).
+        let (ds, de) = (self.dense_range[r].start, self.dense_range[r].end);
+        let bit0 = self.dense_present_off[h];
+        let mut dn_run: Vec<(KeyRef, RecordSrc)> = Vec::new();
+        for (k, j) in (ds..de).enumerate() {
+            if bits::get_bit(&self.dense_present, bit0 + k) {
+                let (is_indel, dcol) = self.dense_src[j];
+                dn_run.push((
+                    self.dense[j],
+                    RecordSrc {
+                        is_dense: true,
+                        is_indel,
+                        idx: dcol as usize,
+                    },
+                ));
+            }
+        }
+
+        // Merge by position with the SAME stable tie-break as `decode_hap`
+        // (`spine::merge_keys(vec![vk_slice, dn])`: earlier run — var_key —
+        // wins ties). This two-pointer merge reproduces that exactly (mirrors
+        // `merge_by_position`'s tie-break, as `gather_haps_readbound_impl`'s
+        // hand-inlined merge already does for the read-bound path).
+        let mut merged: Vec<(KeyRef, RecordSrc)> = Vec::with_capacity(vk_run.len() + dn_run.len());
+        let (mut a, mut b) = (0usize, 0usize);
+        while a < vk_run.len() && b < dn_run.len() {
+            if vk_run[a].0.position <= dn_run[b].0.position {
+                merged.push(vk_run[a]);
+                a += 1;
+            } else {
+                merged.push(dn_run[b]);
+                b += 1;
+            }
+        }
+        merged.extend_from_slice(&vk_run[a..]);
+        merged.extend_from_slice(&dn_run[b..]);
+
+        let lut = reader.lut.as_ref();
+        let mut hc = HapCalls::default();
+        let mut srcs = Vec::with_capacity(merged.len());
+        for (kr, src) in merged {
+            let c = decode_keyref(kr, lut);
+            hc.positions.push(c.position);
+            hc.ilens.push(c.ilen);
+            hc.alts.push(c.alt);
+            srcs.push(src);
+        }
+        (hc, srcs)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::sidecar::mmap_file;
@@ -718,10 +958,12 @@ mod tests {
                 key: 1 << PAYLOAD_TOP_SHIFT,
             }],
             vk_off: vec![0, 1, 1, 1, 1],
+            vk_src: vec![],
             dense: vec![],
             dense_range: vec![0..0],
             dense_present: vec![],
             dense_present_off: vec![0, 0, 0, 0, 0],
+            dense_src: vec![],
         };
         let h = br.n_regions * br.n_samples * br.ploidy;
         assert_eq!(br.vk_off.len(), h + 1);

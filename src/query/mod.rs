@@ -25,16 +25,18 @@
 //! [`oracle::gather_ranges_readbound`].
 
 pub mod decode;
+pub mod field;
 pub mod gather;
 pub mod oracle;
 pub mod reader;
 pub mod sidecar;
 pub mod union;
 
-pub use crate::spine::KeyRef;
+pub use crate::spine::{KeyRef, SrcKeyRef, VK_SRC_INDEL_BIT, VkElem, pack_vk_src, unpack_vk_src};
 pub use decode::{HapCalls, QueryResult};
+pub use field::{FieldValue, FieldView};
 pub use gather::{
-    BatchResult, BatchResultSplit, HapRanges, RangesBundle, find_ranges, gather_haps_readbound,
-    gather_ranges, overlap_batch, read_ranges,
+    BatchResult, BatchResultSplit, HapRanges, RangesBundle, dense_abs_row, find_ranges,
+    gather_haps_readbound, gather_haps_readbound_src, gather_ranges, overlap_batch, read_ranges,
 };
 pub use reader::ContigReader;
