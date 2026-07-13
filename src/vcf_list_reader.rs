@@ -171,11 +171,14 @@ impl VcfListRecordSource {
         htslib_threads: usize,
         skip_out_of_scope: bool,
     ) -> Result<Self, ConversionError> {
-        assert_eq!(
-            vcf_paths.len(),
-            samples.len(),
-            "vcf_paths and samples must be parallel (one sample per file)"
-        );
+        if vcf_paths.len() != samples.len() {
+            return Err(ConversionError::Input(format!(
+                "vcf_paths and samples must be parallel (one sample per file): \
+                 got {} paths and {} samples",
+                vcf_paths.len(),
+                samples.len()
+            )));
+        }
         let mut cursors = Vec::with_capacity(vcf_paths.len());
         for (col, (path, &sample)) in vcf_paths.iter().zip(samples.iter()).enumerate() {
             let single_sample = [sample];
@@ -217,12 +220,35 @@ impl VcfListRecordSource {
         self.cursors.iter().map(|c| c.dropped).sum()
     }
 
+    /// Number of atoms currently buffered in the merge heap. Test-only: used to
+    /// prove the streaming frontier release actually gates on the frontier
+    /// rather than buffering the whole contig before ever releasing a record
+    /// (see `streaming_release_before_full_drain`).
+    #[cfg(test)]
+    fn heap_len(&self) -> usize {
+        self.heap.len()
+    }
+
     // Build the merged `RawRecord` for a group of same-key `(col, NormAtom)`
     // pairs: one biallelic record whose REF/ALT come from the first atom (they
     // agree by construction — same key), with every column not present in the
     // group left hom-ref (`0`, the `gt` vec's fill value).
     fn build_record(&self, key: &(u32, i32, Vec<u8>), group: Vec<(usize, NormAtom)>) -> RawRecord {
         let reference = group[0].1.reference.clone();
+        // The merge key is `(pos, ilen, alt)` and excludes REF. When `ref_seq`
+        // is `Some`, `validate_ref` makes cross-file REF disagreement at the
+        // same key impossible; in no-reference mode there is no such check, so
+        // this just catches a mis-specified file list (e.g. two callers
+        // disagreeing about the REF at a position) in debug builds rather than
+        // silently taking `group[0]`'s REF for every column.
+        #[cfg(debug_assertions)]
+        for (_, atom) in &group {
+            debug_assert_eq!(
+                atom.reference, reference,
+                "cross-file REF disagreement at pos {} despite matching merge key {:?}",
+                key.0, key
+            );
+        }
         let alt = group[0].1.alt.clone();
         let mut gt = vec![0i32; self.num_samples * self.ploidy];
         for (col, atom) in &group {
@@ -259,7 +285,7 @@ impl RecordSource for VcfListRecordSource {
             let releasable = all_eof
                 || (all_started
                     && self.heap.peek().is_some_and(|Reverse(e)| {
-                        e.key.0 < min_started.unwrap().saturating_sub(L_MAX)
+                        min_started.is_some_and(|m| e.key.0 < m.saturating_sub(L_MAX))
                     }));
 
             if releasable {
@@ -616,5 +642,154 @@ mod tests {
         assert_eq!(r1.pos, 2);
         assert_eq!(r1.gt, vec![1, 0, /* SB, filled hom-ref */ 0, 0]);
         assert!(src.next_record().unwrap().is_none());
+    }
+
+    // Every other test in this file uses `chrom_len = 100` with variants at pos
+    // 2/6/10. Since `L_MAX = 1000`, the frontier gate
+    // (`min_started.saturating_sub(L_MAX)`) is *always* 0 for those tests, so
+    // `releasable`'s streaming branch never actually fires — every record ends
+    // up released through the `all_eof` drain instead. This test spreads sites
+    // out past `L_MAX` so the frontier gate is exercised for real, with a
+    // third file (SC) that hits EOF early while SA/SB are still mid-contig.
+    #[test]
+    fn streaming_release_before_full_drain() {
+        let tmp = tempdir().unwrap();
+        let chrom_len: usize = 5000;
+
+        // file A: pos 10, 1500, 4000 — all SNPs A>G.
+        let a = write_ss_vcf(
+            tmp.path(),
+            "a",
+            "chr1",
+            chrom_len as u64,
+            "SA",
+            &[
+                SsRec {
+                    pos: 10,
+                    r: b"A",
+                    alts: vec![b"G"],
+                    gt: vec![1, 0],
+                },
+                SsRec {
+                    pos: 1500,
+                    r: b"A",
+                    alts: vec![b"G"],
+                    gt: vec![1, 0],
+                },
+                SsRec {
+                    pos: 4000,
+                    r: b"A",
+                    alts: vec![b"G"],
+                    gt: vec![1, 0],
+                },
+            ],
+        );
+        // file B: pos 1500 (the SAME atom as A's, must merge into one record)
+        // and pos 4000 as a DEL — distinct `ilen` from A's pos-4000 SNP, so it
+        // must NOT merge with A's atom there.
+        let b = write_ss_vcf(
+            tmp.path(),
+            "b",
+            "chr1",
+            chrom_len as u64,
+            "SB",
+            &[
+                SsRec {
+                    pos: 1500,
+                    r: b"A",
+                    alts: vec![b"G"],
+                    gt: vec![0, 1],
+                },
+                SsRec {
+                    pos: 4000,
+                    r: b"AT",
+                    alts: vec![b"A"],
+                    gt: vec![0, 1],
+                },
+            ],
+        );
+        // file C: pos 10 only — hits EOF while A and B are still live, well
+        // before their pos-1500/4000 atoms have even been read.
+        let c = write_ss_vcf(
+            tmp.path(),
+            "c",
+            "chr1",
+            chrom_len as u64,
+            "SC",
+            &[SsRec {
+                pos: 10,
+                r: b"A",
+                alts: vec![b"G"],
+                gt: vec![1, 1],
+            }],
+        );
+        let ref_seq = make_ref(
+            tmp.path(),
+            "chr1",
+            chrom_len,
+            &[(10, b"A"), (1500, b"A"), (4000, b"AT")],
+        );
+
+        let paths = vec![
+            a.to_str().unwrap().to_string(),
+            b.to_str().unwrap().to_string(),
+            c.to_str().unwrap().to_string(),
+        ];
+        let samples = vec!["SA", "SB", "SC"];
+        let mut src =
+            VcfListRecordSource::new(&paths, &samples, "chr1", Some(&ref_seq), 2, 1, false)
+                .unwrap();
+
+        // Record 1: pos 10 — SA + SC carry, SB filled hom-ref.
+        let r1 = src.next_record().unwrap().unwrap();
+        assert_eq!(r1.pos, 10);
+        assert_eq!(r1.alts, vec![b"G".to_vec()]);
+        assert_eq!(r1.gt, vec![/* SA */ 1, 0, /* SB */ 0, 0, /* SC */ 1, 1]);
+
+        // Discriminator: this record can only have been released through the
+        // FRONTIER gate, not the `all_eof` drain — SA and SB are still live
+        // (only SC has hit EOF). If release instead required draining every
+        // cursor to EOF first (i.e. `releasable` degenerated to `all_eof`),
+        // every atom in the contig (6 total: SA@10/1500/4000, SB@1500/4000,
+        // SC@10) would already have been pulled from disk and sitting in the
+        // heap by the time the first record was released, leaving 4 behind
+        // after popping the pos-10 group. Under real streaming release, SA
+        // and SB haven't been read past pos 1500 yet — their pos-4000 atoms
+        // haven't even been fetched — so only the two pos-1500 atoms remain
+        // buffered.
+        assert_eq!(
+            src.heap_len(),
+            2,
+            "expected only the two pos-1500 atoms buffered right after the first \
+             release; a heap_len of 4 here means the whole contig was buffered \
+             before any release happened, i.e. the streaming frontier gate isn't \
+             actually gating anything"
+        );
+
+        // Record 2: pos 1500 — SA + SB merge into ONE record, SC hom-ref.
+        let r2 = src.next_record().unwrap().unwrap();
+        assert_eq!(r2.pos, 1500);
+        assert_eq!(r2.alts, vec![b"G".to_vec()]);
+        assert_eq!(r2.gt, vec![/* SA */ 1, 0, /* SB */ 0, 1, /* SC */ 0, 0]);
+
+        // Records 3 & 4: pos 4000 stays as TWO separate records — SB's DEL
+        // (ilen -1) sorts before SA's SNP (ilen 0) under the `(pos, ilen,
+        // alt)` key even though both are at the same position, exercising the
+        // full-key group-drain across columns.
+        let r3 = src.next_record().unwrap().unwrap();
+        assert_eq!(r3.pos, 4000);
+        assert_eq!(r3.reference, b"AT".to_vec());
+        assert_eq!(r3.alts, vec![b"A".to_vec()]);
+        assert_eq!(r3.gt, vec![/* SA */ 0, 0, /* SB */ 0, 1, /* SC */ 0, 0]);
+
+        let r4 = src.next_record().unwrap().unwrap();
+        assert_eq!(r4.pos, 4000);
+        assert_eq!(r4.reference, b"A".to_vec());
+        assert_eq!(r4.alts, vec![b"G".to_vec()]);
+        assert_eq!(r4.gt, vec![/* SA */ 1, 0, /* SB */ 0, 0, /* SC */ 0, 0]);
+
+        // SC's early EOF didn't strand or truncate anything downstream.
+        assert!(src.next_record().unwrap().is_none());
+        assert_eq!(src.dropped_out_of_scope(), 0);
     }
 }
