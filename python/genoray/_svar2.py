@@ -183,12 +183,15 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         — see `_normalize_regions`/`_resolve_kept_rows`); `merge_overlapping`
         silently merges overlapping input regions instead of raising.
 
-        `fields` defaults to none carried through: field carry-through is not
-        yet implemented on this path, and the backend raises `ValueError` if
-        any (non-`mutcat`) field is requested. `"mutcat"` is always excluded —
-        pass `reference=` to recompute it instead of copying (unimplemented;
-        currently only affects `mutcat` filtering, since the backend does not
-        yet recompute anything from `reference`).
+        `fields` defaults to `None`, meaning *no* fields are carried through
+        (genotypes only) — this always succeeds, even on a store that has
+        INFO/FORMAT fields (`available_fields` non-empty). Field
+        carry-through itself is not yet implemented on this path: passing
+        any non-empty `fields` (any field other than `"mutcat"`) makes the
+        backend raise `ValueError`. `"mutcat"` is always excluded from
+        `fields` — pass `reference=` to recompute it instead of copying
+        (unimplemented; currently only affects `mutcat` filtering, since the
+        backend does not yet recompute anything from `reference`).
 
         `reroute` selects the output representation: `"auto"` (equivalent to
         `True`) reruns the full var_key/dense routing cost model on the
@@ -237,13 +240,21 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         caller_samples = _normalize_samples(samples, self.available_samples)
         if not caller_samples:
             raise ValueError("write_view requires at least one sample")
-        fields_to_write = [
-            f
-            for f in _validate_fields(
-                fields, cast("dict[str, Any]", self.available_fields)
-            )
-            if f != "mutcat"
-        ]
+        if fields is None:
+            # `_validate_fields(None, available)` returns *all* available
+            # fields (its semantics for the read path), not "none" -- the
+            # write_view default must mean "genotypes only" so a plain
+            # `write_view(...)` call succeeds on any store, including one
+            # with INFO/FORMAT fields.
+            fields_to_write: list[str] = []
+        else:
+            fields_to_write = [
+                f
+                for f in _validate_fields(
+                    fields, cast("dict[str, Any]", self.available_fields)
+                )
+                if f != "mutcat"
+            ]
         region_tuples = [
             (row["chrom"], int(row["start"]), int(row["end"]))
             for row in regions_df.iter_rows(named=True)

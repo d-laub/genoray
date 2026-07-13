@@ -330,9 +330,11 @@ def view_svar2(
         Path to a file of sample names (one per line). Mutually exclusive with
         --samples.
     fields
-        Optional FORMAT fields to carry over. Not yet implemented on SVAR2:
-        leave unset (genotypes only); a non-empty value is rejected by the
-        backend.
+        Optional FORMAT fields to carry over. Defaults to unset, meaning no
+        fields are carried through (genotypes only) — this always succeeds,
+        even on a store that has INFO/FORMAT fields. Field carry-through
+        itself is not yet implemented on SVAR2: passing any non-empty value
+        is rejected by the backend with a `ValueError`.
     reference
         Optional path to a reference FASTA. Currently unused by the backend.
     merge_overlapping

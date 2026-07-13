@@ -553,8 +553,10 @@ mutually exclusive).
   `--regions`/`--regions-file` is omitted, "all variants" defaults to one
   region per contig (`SparseVar2.contigs`, since SVAR2 has no contig-length
   metadata) spanning `[0, 2**31 - 1)` — every real POS is smaller. `--fields`
-  defaults to `None` (genotypes only); field carry-through isn't implemented
-  yet and the backend rejects a non-empty value. `--reference` is accepted
+  defaults to `None`, meaning no fields are carried through (genotypes
+  only) — this always succeeds, even on a store that has INFO/FORMAT fields.
+  Field carry-through itself isn't implemented yet: the backend rejects any
+  non-empty `--fields` value with a `ValueError`. `--reference` is accepted
   but currently unused by the backend. `--reroute`/`--no-reroute` (default
   `--reroute`) maps to `write_view(reroute=)`; `--no-reroute` requests a
   byte-preserving passthrough that isn't implemented and raises

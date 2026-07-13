@@ -5,8 +5,10 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from vcfixture import Number, Seq, Type, VcfBuilder
 
 from genoray import SparseVar2
+from genoray._svar2_fields import InfoField
 
 
 def _dir_digest(root: Path) -> dict[str, str]:
@@ -84,3 +86,68 @@ def test_write_view_byte_parity_with_from_vcf(tmp_path):
     assert viewed_sv.available_samples == direct_sv.available_samples
     for c in direct_sv.contigs:
         assert _dir_digest(direct / c) == _dir_digest(viewed / c)
+
+
+def test_write_view_default_fields_is_genotypes_only(tmp_path):
+    """`write_view`'s default `fields=None` must mean "no fields" (genotypes
+    only), which must succeed on ANY store -- including one built with
+    `info_fields=`/`format_fields=`.
+
+    Regresses a bug where `write_view` computed `fields_to_write` via
+    `_validate_fields(fields, available)`, whose `None` semantics are "all
+    available fields" (the read-path convention), not "no fields". On a store
+    with a field present, that expanded the default to a non-empty list,
+    which the Rust backend rejects outright ("field carry-through is not yet
+    implemented for SVAR2 views") -- so a plain `write_view(...)` call with no
+    `fields=` argument hard-failed on any store with fields, contradicting the
+    documented "genotypes only" default.
+    """
+    doc = (
+        VcfBuilder(samples=["s1", "s2"], contigs=[("chr1", None)])
+        .fmt("GT")
+        .info("AF", Number.A, Type.FLOAT)
+        .record(
+            "chr1",
+            1000,
+            ref="A",
+            alt=[Seq("T")],
+            gt=["0|1", "1|1"],
+            info={"AF": [0.25]},
+        )
+    )
+    vcf = doc.write(tmp_path / "src.vcf.gz", bgzip=True, index=True)
+
+    src = tmp_path / "fields.svar2"
+    SparseVar2.from_vcf(
+        src,
+        vcf,
+        no_reference=True,
+        info_fields=[InfoField("AF", dtype="f32")],
+    )
+    sv = SparseVar2(src)
+    assert sv.available_fields  # sanity: the field is really there
+
+    # Default `fields=` -> genotypes only -> must succeed even though the
+    # source store has a field.
+    default_out = tmp_path / "default.svar2"
+    sv.write_view(
+        ("chr1", 0, 2000),
+        sv.available_samples,
+        default_out,
+        overwrite=True,
+    )
+    viewed = SparseVar2(default_out)
+    assert viewed.contigs == sv.contigs
+    assert viewed.available_samples == sv.available_samples
+
+    # Explicitly requesting the field is the documented not-yet-implemented
+    # path: it must still raise.
+    explicit_out = tmp_path / "explicit.svar2"
+    with pytest.raises(ValueError, match="field carry-through"):
+        sv.write_view(
+            ("chr1", 0, 2000),
+            sv.available_samples,
+            explicit_out,
+            fields=["AF"],
+            overwrite=True,
+        )
