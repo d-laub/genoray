@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from genoray import SparseVar2
@@ -105,3 +106,71 @@ def test_from_vcf_list_requires_reference(tmp_path: Path):
     a = _ss(tmp_path, "a", "SA", "chr1\t3\t.\tA\tG\t.\t.\t.\tGT\t1|0\n")
     with pytest.raises(ValueError, match="reference"):
         SparseVar2.from_vcf_list(tmp_path / "s", [a], threads=1)
+
+
+def test_from_vcf_list_matches_bcftools_merge_oracle(tmp_path: Path):
+    """Oracle parity: `bcftools merge -0` (missing -> hom-ref, exactly our
+    semantics) -> `from_vcf` must equal the native `from_vcf_list` k-way merge.
+
+    Mix: a shared SNP (a+b, same site), a private INS (a only), a
+    multiallelic split (b only), an anchored DEL with a missing hap (c only)
+    -- and b's multiallelic site and c's DEL share POS 7 but differ in
+    ILEN/ALT, so they must NOT be spuriously joined.
+    """
+    ref = _write_ref(tmp_path)
+    a = _ss(
+        tmp_path,
+        "a",
+        "SA",
+        "chr1\t3\t.\tA\tG\t.\t.\t.\tGT\t1|0\n"  # shared SNP
+        "chr1\t12\t.\tG\tGA\t.\t.\t.\tGT\t0|1\n",  # private INS
+    )
+    b = _ss(
+        tmp_path,
+        "b",
+        "SB",
+        "chr1\t3\t.\tA\tG\t.\t.\t.\tGT\t0|1\n"  # shared SNP
+        "chr1\t7\t.\tC\tG,T\t.\t.\t.\tGT\t1|2\n",  # multiallelic
+    )
+    c = _ss(
+        tmp_path,
+        "c",
+        "SC",
+        "chr1\t7\t.\tCAT\tC\t.\t.\t.\tGT\t1|.\n",  # anchored DEL + missing hap
+    )
+    paths = [a, b, c]
+
+    # Oracle: bcftools merge -0 (missing genotypes -> 0/0, matching our
+    # hom-ref-fill semantics) -> bgzip -> index -> from_vcf.
+    merge = subprocess.run(
+        ["bcftools", "merge", "-0", *map(str, paths)],
+        check=True,
+        stdout=subprocess.PIPE,
+    )
+    merged = tmp_path / "merged.vcf.gz"
+    with open(merged, "wb") as fh:
+        subprocess.run(["bgzip", "-c"], input=merge.stdout, check=True, stdout=fh)
+    subprocess.run(["bcftools", "index", str(merged)], check=True)
+
+    from_vcf_out = tmp_path / "oracle"
+    SparseVar2.from_vcf(from_vcf_out, merged, ref, threads=1)
+    list_out = tmp_path / "list"
+    SparseVar2.from_vcf_list(list_out, paths, ref, threads=1)
+
+    oracle, native = SparseVar2(from_vcf_out), SparseVar2(list_out)
+    assert oracle.available_samples == native.available_samples == ["SA", "SB", "SC"]
+
+    region = [(0, len(_REF))]
+    np.testing.assert_array_equal(
+        oracle.region_counts("chr1", region), native.region_counts("chr1", region)
+    )
+
+    ro, rl = oracle.decode("chr1", region), native.decode("chr1", region)
+    for field in ("pos", "ilen"):
+        np.testing.assert_array_equal(
+            np.asarray(ro[field].data), np.asarray(rl[field].data)
+        )
+    # allele: variable-length ALT bytes per (sample, ploid, variant); pure
+    # deletions decode to an empty ALT (anchor base is implicit) on BOTH
+    # sides, so a like-for-like comparison is still meaningful.
+    assert ro["allele"].to_ak().tolist() == rl["allele"].to_ak().tolist()
