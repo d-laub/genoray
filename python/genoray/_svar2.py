@@ -17,7 +17,7 @@ from genoray._svar2_fields import (
     _resolve_read_fields,
 )
 from genoray._svar2_mutcat import _MutcatMixin
-from genoray._svar2_ops import Mode, _load_meta, _write_store
+from genoray._svar2_ops import Mode, _assert_concat_compatible, _load_meta, _write_store
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -122,6 +122,40 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             self.subset_contigs(p, [c], mode=mode, overwrite=overwrite)
             paths.append(p)
         return paths
+
+    @classmethod
+    def concat(
+        cls,
+        output: str | Path,
+        sources: Sequence[str | Path | "SparseVar2"],
+        *,
+        mode: Mode = "copy",
+        overwrite: bool = False,
+    ) -> None:
+        """Concatenate disjoint-contig SVAR2 stores (identical samples/ploidy/fields) into one."""
+        paths = [Path(s.path if isinstance(s, SparseVar2) else s) for s in sources]
+        if not paths:
+            raise ValueError("concat requires at least one source")
+        metas = [_load_meta(p) for p in paths]
+        _assert_concat_compatible(metas)
+        contig_sources: dict[str, Path] = {}
+        for p, m in zip(paths, metas):
+            for c in m["contigs"]:
+                if c in contig_sources:
+                    raise ValueError(
+                        f"contig {c!r} appears in multiple sources; concat requires disjoint contigs"
+                    )
+                contig_sources[c] = p
+        merged_contigs = natsorted(contig_sources)
+        meta = dict(metas[0])
+        meta["contigs"] = merged_contigs
+        _write_store(
+            Path(output),
+            {c: contig_sources[c] for c in merged_contigs},
+            meta,
+            mode,
+            overwrite,
+        )
 
     @classmethod
     def from_vcf(

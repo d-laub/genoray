@@ -26,6 +26,17 @@ def _copy_contig_dir(src_dir: Path, dst_dir: Path, mode: Mode) -> None:
         raise ValueError(f"unknown mode {mode!r}")
 
 
+def _assert_concat_compatible(metas: list[dict]) -> None:
+    ref = metas[0]
+    for i, m in enumerate(metas[1:], start=1):
+        for key in ("samples", "ploidy", "format_version", "fields"):
+            if m.get(key) != ref.get(key):
+                raise ValueError(
+                    f"concat source #{i} differs from source #0 in {key!r}; "
+                    "all stores must share samples, ploidy, format_version, and fields"
+                )
+
+
 def _write_store(
     output: Path,
     contig_sources: dict[str, Path],

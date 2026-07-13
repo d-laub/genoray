@@ -1,4 +1,5 @@
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -52,3 +53,39 @@ def test_split_by_contig_explodes(two_contig_store, tmp_path):
     assert [p.name for p in paths] == ["chr1.svar2", "chr2.svar2"]
     assert SparseVar2(paths[0]).contigs == ["chr1"]
     assert SparseVar2(paths[1]).contigs == ["chr2"]
+
+
+def test_concat_roundtrip_from_split(two_contig_store, tmp_path):
+    parts = two_contig_store.split_by_contig(tmp_path / "parts", overwrite=True)
+    merged = tmp_path / "merged.svar2"
+    SparseVar2.concat(merged, parts, overwrite=True)
+    m = SparseVar2(merged)
+    assert m.contigs == two_contig_store.contigs  # natsorted; chr1,chr2
+    # per-contig bytes preserved through split->concat
+    for c in two_contig_store.contigs:
+        assert _dir_digest(two_contig_store.path / c) == _dir_digest(merged / c)
+
+
+def test_concat_rejects_overlapping_contigs(two_contig_store, tmp_path):
+    with pytest.raises(ValueError, match="multiple sources"):
+        SparseVar2.concat(
+            tmp_path / "x.svar2",
+            [two_contig_store.path, two_contig_store.path],
+            overwrite=True,
+        )
+
+
+def test_concat_rejects_sample_mismatch(two_contig_store, tmp_path):
+    # Split two_contig_store into single-contig stores, then rewrite one's
+    # meta.json samples so the compatibility guard fires.
+    a1 = tmp_path / "a1.svar2"
+    two_contig_store.subset_contigs(a1, "chr1", overwrite=True)
+    a2 = tmp_path / "a2.svar2"
+    two_contig_store.subset_contigs(a2, "chr2", overwrite=True)
+
+    meta = json.loads((a2 / "meta.json").read_text())
+    meta["samples"] = ["Z0", "Z1"]
+    (a2 / "meta.json").write_text(json.dumps(meta))
+
+    with pytest.raises(ValueError, match="samples"):
+        SparseVar2.concat(tmp_path / "bad.svar2", [a1, a2], overwrite=True)
