@@ -2,6 +2,10 @@
 
 ### Added
 
+- `SparseVar2.from_pgen` converts a PLINK2 PGEN (`.pgen`/`.pvar`/`.psam`) to an
+  SVAR2 store through the same normalization, atom, and merge spine as
+  `from_vcf`. Diploid-only (no `ploidy=` kwarg); dosages, INFO/FORMAT fields,
+  and sample subsetting are out of scope for this entry point.
 - `SparseVar2.annotate_mutations`, `mutation_matrix`, and `assign_signatures`
   for COSMIC mutational-signature workflows (SBS96/ID83/DBS78), implemented in
   Rust with a per-record sidecar and streaming count matrix. `from_vcf` gains a

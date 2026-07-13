@@ -332,6 +332,28 @@ fn run_pgen_conversion_pipeline(
     for r in results {
         dropped += r?;
     }
+
+    // All contigs staged — resolve each field's global on-disk dtype (no-op:
+    // PGEN carries no fields) and rewrite its staged values.bin files to that
+    // width, then write the top-level meta.json describing the cohort. Mirrors
+    // the tail of `run_conversion_pipeline` -- without this, `SparseVar2(out)`
+    // has no `meta.json` to load.
+    let resolved_fields = crate::field_finalize::finalize_fields(
+        std::path::Path::new(&output_dir),
+        &chroms,
+        &fields,
+    )?;
+
+    crate::meta::write_meta(
+        std::path::Path::new(&output_dir),
+        crate::meta::FORMAT_VERSION,
+        &samples,
+        &chroms,
+        ploidy,
+        &resolved_fields,
+    )
+    .map_err(|e| pyo3::exceptions::PyOSError::new_err(format!("failed to write meta.json: {e}")))?;
+
     Ok(dropped as usize)
 }
 
