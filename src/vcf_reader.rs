@@ -260,6 +260,68 @@ fn decode_format_raw(
     }
 }
 
+// An atom whose presence bits are already packed into the chunk's BitGrid. `gt`
+// and `source_alt_index` are dropped at that point, so per-chunk staging memory
+// no longer scales with `chunk_size * num_samples * ploidy`.
+struct AtomMeta {
+    pos: u32,
+    ilen: i32,
+    alt: Vec<u8>,
+    info_vals: Vec<f64>,
+    format_vals: Vec<f64>,
+}
+
+// Atoms buffered before their presence bits are flushed into the chunk's BitGrid.
+// Rounded UP to a multiple of the word-aligned block size `g = 64/gcd(columns,64)`
+// at call time, so every flush offset lands on a u64 boundary and
+// `pack_presence_par` keeps its word-disjoint invariant. 1024 keeps the window
+// above `PARALLEL_MIN_VARIANTS` (512) so parallel packing still engages.
+const PACK_WINDOW: usize = 1024;
+
+// Pack `buf`'s presence bits into `genos` starting at variant offset `v0`, then
+// move each atom's metadata into `metas`, dropping `gt`.
+//
+// `v0` MUST be a multiple of the word-aligned block size, so `v0 * columns` is a
+// multiple of 64 and the window owns a whole-word-aligned sub-slice of
+// `genos.words`. Only the FINAL window may have a length that is not a multiple of
+// that block size (its trailing partial word is not shared, because nothing is
+// packed after it).
+fn flush_window(
+    genos: &mut BitGrid3,
+    metas: &mut Vec<AtomMeta>,
+    buf: &mut Vec<PendingAtom>,
+    v0: usize,
+    columns: usize,
+    pool: Option<&rayon::ThreadPool>,
+) {
+    if buf.is_empty() {
+        return;
+    }
+    debug_assert_eq!((v0 * columns) % 64, 0, "flush offset must be word-aligned");
+    let word_base = (v0 * columns) / 64;
+    let n_words = (buf.len() * columns).div_ceil(64);
+    let words = &mut genos.words[word_base..word_base + n_words];
+
+    let parallel = matches!(pool, Some(p) if p.current_num_threads() >= 2)
+        && buf.len() >= PARALLEL_MIN_VARIANTS;
+    if parallel {
+        pack_presence_par(words, buf, columns, pool.unwrap());
+    } else {
+        pack_presence_seq(words, buf, columns);
+    }
+
+    metas.reserve(buf.len());
+    for a in buf.drain(..) {
+        metas.push(AtomMeta {
+            pos: a.pos,
+            ilen: a.ilen,
+            alt: a.alt,
+            info_vals: a.info_vals,
+            format_vals: a.format_vals,
+        });
+    }
+}
+
 pub struct VcfChunkReader {
     inner_reader: IndexedReader,
     num_samples: usize,
@@ -586,37 +648,58 @@ impl VcfChunkReader {
     }
 
     // Pull up to `chunk_size` atoms (already globally position-sorted) and pack them
-    // into a variant-major DenseChunk. `pool`, when present and the chunk is large
-    // enough, hosts parallel presence packing (word-aligned variant blocks);
-    // otherwise packing is sequential. Returns None once no atoms remain.
+    // into a variant-major DenseChunk. Presence bits are packed in windows of
+    // `PACK_WINDOW` atoms so the reader never holds more than one window's worth of
+    // per-column genotype vectors. `pool`, when present and the window is large
+    // enough, hosts parallel packing; otherwise packing is sequential. Output is
+    // bit-identical either way. Returns None once no atoms remain.
     pub fn read_next_chunk(
         &mut self,
         chunk_size: usize,
         chunk_id: usize,
         pool: Option<&rayon::ThreadPool>,
     ) -> Result<Option<DenseChunk>, ConversionError> {
-        let mut atoms: Vec<PendingAtom> = Vec::with_capacity(chunk_size);
-        while atoms.len() < chunk_size {
+        let columns = self.num_samples * self.ploidy;
+        // Word-aligned block size: `g` variants span exactly `columns/gcd` u64 words.
+        let g = 64 / gcd(columns, 64);
+        let window = PACK_WINDOW.div_ceil(g) * g;
+
+        // Allocate for the full chunk up front (packed size: chunk_size*columns bits),
+        // then shrink to the true variant count after EOF.
+        let mut genos = BitGrid3::zeros(chunk_size, self.num_samples, self.ploidy);
+        let mut metas: Vec<AtomMeta> = Vec::with_capacity(chunk_size);
+        let mut buf: Vec<PendingAtom> = Vec::with_capacity(window);
+        let mut v = 0usize;
+
+        while v + buf.len() < chunk_size {
             match self.next_atom()? {
-                Some(a) => atoms.push(a),
+                Some(a) => {
+                    buf.push(a);
+                    if buf.len() == window {
+                        flush_window(&mut genos, &mut metas, &mut buf, v, columns, pool);
+                        v += window;
+                    }
+                }
                 None => break,
             }
         }
-        if atoms.is_empty() {
-            return Ok(None);
+        if !buf.is_empty() {
+            let n = buf.len();
+            flush_window(&mut genos, &mut metas, &mut buf, v, columns, pool);
+            v += n;
         }
 
-        let v = atoms.len();
-        let columns = self.num_samples * self.ploidy;
+        if v == 0 {
+            return Ok(None);
+        }
+        genos.truncate_v(v);
 
+        let num_samples = self.num_samples;
         let mut pos = Vec::with_capacity(v);
         let mut ilens = Vec::with_capacity(v);
         let mut alt = Vec::with_capacity(v * 2);
         let mut alt_offsets = Vec::with_capacity(v + 1);
         alt_offsets.push(0u32);
-        let mut genos = BitGrid3::zeros(v, self.num_samples, self.ploidy);
-
-        let num_samples = self.num_samples;
         let mut info_staged: Vec<StagedColumn> = self
             .info_fields
             .iter()
@@ -630,7 +713,7 @@ impl VcfChunkReader {
 
         // Sequential metadata pass (cheap, ordering-preserving).
         let mut off = 0u32;
-        for a in atoms.iter() {
+        for a in metas.iter() {
             pos.push(a.pos);
             ilens.push(a.ilen);
             alt.extend_from_slice(&a.alt);
@@ -645,17 +728,6 @@ impl VcfChunkReader {
                     col.push_f64(a.format_vals[j * num_samples + s]);
                 }
             }
-        }
-
-        // Presence packing: parallel over word-aligned variant blocks when a
-        // multi-thread pool is available and the chunk is large enough to amortize
-        // the fan-out; identical output to the sequential path either way.
-        let parallel =
-            matches!(pool, Some(p) if p.current_num_threads() >= 2) && v >= PARALLEL_MIN_VARIANTS;
-        if parallel {
-            pack_presence_par(&mut genos.words, &atoms, columns, pool.unwrap());
-        } else {
-            pack_presence_seq(&mut genos.words, &atoms, columns);
         }
 
         Ok(Some(DenseChunk {
@@ -702,6 +774,19 @@ mod tests {
         }
     }
 
+    fn atom_at(gt: Vec<i32>, src: u16, pos: u32) -> PendingAtom {
+        PendingAtom {
+            pos,
+            ilen: 0,
+            alt: Vec::new(),
+            source_alt_index: src,
+            gt: std::sync::Arc::new(gt),
+            seq: pos as u64,
+            info_vals: Vec::new(),
+            format_vals: Vec::new(),
+        }
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(300))]
 
@@ -741,6 +826,58 @@ mod tests {
             pack_presence_par(&mut par.words, &atoms, columns, test_pool());
 
             prop_assert_eq!(seq.words, par.words, "columns={}, v={}", columns, v);
+        }
+    }
+
+    // Windowed packing must be bit-identical to packing the whole chunk at once.
+    // `flush_window` is only ever called at word-aligned variant offsets except
+    // for the final (partial) window, which nothing follows — mirror that here.
+    proptest! {
+        #[test]
+        fn windowed_pack_matches_full_pack(
+            n_samples in 1usize..9,
+            ploidy in 1usize..3,
+            srcs in prop::collection::vec(0u16..3u16, 1..200),
+        ) {
+            let columns = n_samples * ploidy;
+            let v = srcs.len();
+
+            // Deterministic gt: column c of variant i carries allele (i + c) % 3.
+            let atoms: Vec<PendingAtom> = srcs
+                .iter()
+                .enumerate()
+                .map(|(i, &src)| {
+                    let gt: Vec<i32> = (0..columns).map(|c| ((i + c) % 3) as i32).collect();
+                    atom_at(gt, src, i as u32)
+                })
+                .collect();
+
+            // Reference: one full-grid sequential pack.
+            let mut expect = BitGrid3::zeros(v, n_samples, ploidy);
+            pack_presence_seq(&mut expect.words, &atoms, columns);
+
+            // Windowed: flush every `window` atoms, where `window` is a multiple of
+            // the word-aligned block size `g`.
+            let g = 64 / gcd(columns, 64);
+            let window = 4 * g;
+            let mut got = BitGrid3::zeros(v, n_samples, ploidy);
+            let mut metas: Vec<AtomMeta> = Vec::new();
+            let mut buf: Vec<PendingAtom> = Vec::new();
+            let mut v0 = 0usize;
+            for a in atoms {
+                buf.push(a);
+                if buf.len() == window {
+                    let n = buf.len();
+                    flush_window(&mut got, &mut metas, &mut buf, v0, columns, Some(test_pool()));
+                    v0 += n;
+                }
+            }
+            if !buf.is_empty() {
+                flush_window(&mut got, &mut metas, &mut buf, v0, columns, Some(test_pool()));
+            }
+
+            prop_assert_eq!(got.words, expect.words);
+            prop_assert_eq!(metas.len(), v);
         }
     }
 }
