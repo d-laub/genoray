@@ -161,6 +161,15 @@ def test_decode_with_fields_shares_offsets_and_preserves_dtype(store_with_fields
     np.testing.assert_array_equal(af.offsets, pos.offsets)
     np.testing.assert_array_equal(ds.offsets, pos.offsets)
 
+    # `Ragged.offsets` is a property that returns the underlying offsets
+    # array by reference (no copy), so object identity here is meaningful:
+    # it pins the "one shared offsets object across pos/ilen/allele and
+    # every decoded field" contract that GenVarLoader relies on. A
+    # regression that defensively copies offsets per field would still pass
+    # the `assert_array_equal` checks above but MUST fail these.
+    assert af.offsets is pos.offsets
+    assert ds.offsets is pos.offsets
+
 
 def test_decode_rejects_unknown_field(store_with_fields):
     with pytest.raises(ValueError, match="NOPE"):
