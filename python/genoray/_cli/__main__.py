@@ -394,5 +394,47 @@ def view(
     )
 
 
+@app.command
+def concat(
+    out: Path,
+    sources: list[Path],
+    *,
+    mode: Literal["copy", "hardlink", "symlink", "move"] = "copy",
+    overwrite: bool = False,
+) -> None:
+    """Concatenate disjoint-contig SVAR2 stores into one."""
+    from genoray import SparseVar2
+
+    SparseVar2.concat(out, sources, mode=mode, overwrite=overwrite)
+
+
+@app.command
+def split(
+    source: Path,
+    out: Path,
+    *,
+    contigs: Annotated[str | None, Parameter(name=["--contigs", "-c"])] = None,
+    mode: Literal["copy", "hardlink", "symlink", "move"] = "copy",
+    overwrite: bool = False,
+) -> None:
+    """Split an SVAR2 store by contig.
+
+    With --contigs: subset into one store at OUT. Without: explode into
+    OUT/{contig}.svar2.
+    """
+    from genoray import SparseVar2
+
+    sv = SparseVar2(source)
+    if contigs is not None:
+        sv.subset_contigs(
+            out,
+            [c for c in contigs.split(",") if c],
+            mode=mode,
+            overwrite=overwrite,
+        )
+    else:
+        sv.split_by_contig(out, mode=mode, overwrite=overwrite)
+
+
 if __name__ == "__main__":
     app()
