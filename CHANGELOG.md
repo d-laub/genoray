@@ -85,6 +85,11 @@
 
 ### Fix
 
+- **svar**: `SparseVar._scan_index` now splits SVAR1's comma-joined on-disk
+  `ALT` instead of casting it, so `ALT` is a real `list[str]`. This repairs
+  `_is_biallelic` (and the guards depending on it, including
+  `SparseVar2.from_svar1`'s multiallelic rejection), which previously always
+  reported biallelic.
 - **vcf**: apply configured `filter` on `VCF.read(..., mode=Genos*Dosages)` when no
   `.gvi` index is loaded, matching the genotype-only and dosage-only modes
   (previously the filter was silently ignored on this path).

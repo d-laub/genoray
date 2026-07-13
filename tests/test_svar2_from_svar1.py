@@ -252,31 +252,6 @@ def _write_multiallelic_vcf(d: Path) -> Path:
     return gz
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "PRODUCTION BUG (not in from_svar1's own code): SparseVar._is_biallelic "
-        "(python/genoray/_svar/_core.py:149-155) can never observe a "
-        "multiallelic SVAR1 store. SVAR1's on-disk index.arrow always stores "
-        "ALT as a comma-joined Utf8 string (confirmed by the comment at "
-        "_svar2.py:551, 'ALT is comma-Utf8 on disk; biallelic => a single "
-        "token per row'), and elsewhere (_svar/_io.py:39,120) the code "
-        "correctly parses that with `.str.split(',')`. But `_is_biallelic`'s "
-        "own scan (`_scan_index`, _core.py:938-939) does "
-        "`pl.col('ALT').cast(pl.List(pl.Utf8))` -- a CAST, not a split -- so "
-        "a multi-token ALT string like 'G,T' becomes a 1-element list "
-        "(['G,T']) rather than a 2-element one. `list.len() == 1` is then "
-        "always true regardless of how many alleles the row actually has, so "
-        "`from_svar1`'s 'multiallelic input raises' guard "
-        "(genoray/_svar2.py:345-349) never fires for real-world multiallelic "
-        "SVAR1 stores built via the public `SparseVar.from_vcf` path -- "
-        "verified empirically below: a 2-ALT VCF row converts to SVAR1 fine "
-        "and `SparseVar(...)._is_biallelic` reports True. Left as strict "
-        "xfail (not weakened/deleted) so this documents the intended "
-        "behavior and starts failing loudly the moment `_is_biallelic` is "
-        "fixed to `.str.split(',')`."
-    ),
-)
 def test_from_svar1_rejects_multiallelic(tmp_path: Path):
     """`from_svar1` supports only SVAR1's biallelic (geno==1) model; a
     multiallelic SVAR1 store must raise rather than silently mis-convert.
@@ -287,10 +262,7 @@ def test_from_svar1_rejects_multiallelic(tmp_path: Path):
     v1_out = tmp_path / "multi.svar"
     v1 = _V1VCF(str(vcf))
     SparseVar.from_vcf(v1_out, v1, max_mem="10m", overwrite=True)
-    assert SparseVar(v1_out)._is_biallelic, (
-        "if this now reads False, _is_biallelic has been fixed -- promote "
-        "this test out of xfail"
-    )
+    assert not SparseVar(v1_out)._is_biallelic
 
     with pytest.raises(ValueError, match="biallelic"):
         SparseVar2.from_svar1(tmp_path / "out", v1_out, ref, threads=1)
