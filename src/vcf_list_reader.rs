@@ -189,16 +189,26 @@ impl FileCursor {
 /// Min-heap entry: ordered by the merge key `(pos, ilen, alt)` first, then by
 /// column — the column tiebreak only affects which of several same-key atoms
 /// is "on top" (irrelevant to correctness, but makes iteration order
-/// deterministic for tests).
+/// deterministic for tests). The key is read straight off the `atom` rather
+/// than stored alongside it: the atom already owns `pos`/`ilen`/`alt`, so a
+/// separate key would duplicate the (`alt`) allocation on every one of the
+/// millions of atoms pushed.
 struct HeapEntry {
-    key: (u32, i32, Vec<u8>),
     col: usize,
     atom: NormAtom,
 }
 
+impl HeapEntry {
+    /// The merge key `(pos, ilen, alt)` as borrowed fields — no allocation.
+    #[inline]
+    fn key(&self) -> (u32, i32, &[u8]) {
+        (self.atom.pos, self.atom.ilen, &self.atom.alt)
+    }
+}
+
 impl PartialEq for HeapEntry {
     fn eq(&self, other: &Self) -> bool {
-        self.key == other.key && self.col == other.col
+        self.key() == other.key() && self.col == other.col
     }
 }
 impl Eq for HeapEntry {}
@@ -209,7 +219,7 @@ impl PartialOrd for HeapEntry {
 }
 impl Ord for HeapEntry {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.key.cmp(&other.key).then(self.col.cmp(&other.col))
+        self.key().cmp(&other.key()).then(self.col.cmp(&other.col))
     }
 }
 
@@ -417,15 +427,41 @@ impl VcfListRecordSource {
 impl RecordSource for VcfListRecordSource {
     fn next_record(&mut self) -> Result<Option<RawRecord>, ConversionError> {
         loop {
-            let live_frontiers: Vec<Option<u32>> = self
-                .cursors
-                .iter()
-                .filter(|c| !c.eof)
-                .map(|c| c.frontier)
-                .collect();
-            let all_eof = live_frontiers.is_empty();
-            let all_started = live_frontiers.iter().all(|f| f.is_some());
-            let min_started = live_frontiers.iter().filter_map(|&f| f).min();
+            // One pass over the cursors computes every liveness aggregate AND
+            // the advance target at once. This inner `loop` runs once per atom
+            // read plus once per record emitted, so at N files it was
+            // O((atoms + records) * N) with a fresh `Vec<Option<u32>>`
+            // allocated every iteration (both the top-of-loop `live_frontiers`
+            // collect and the separate `min_by_key` argmin scan showed up as
+            // the dominant cost under `perf`). Fusing them keeps the algorithm
+            // O(N) per iteration but drops the per-iteration allocation and
+            // three of the four scans. (A frontier heap would make selection
+            // O(log N) — deferred; the constant-factor win here is the easy
+            // one and leaves behaviour identical.)
+            let mut any_live = false;
+            let mut all_started = true;
+            let mut min_started: Option<u32> = None;
+            // The live cursor with the smallest frontier, `None` (unstarted)
+            // sorting before every `Some(_)` — matches the old
+            // `min_by_key(|c| c.frontier)`, including its first-min-wins
+            // tiebreak (strict `<` keeps the earliest index on ties).
+            let mut advance_idx: Option<usize> = None;
+            let mut advance_key: Option<Option<u32>> = None;
+            for (i, c) in self.cursors.iter().enumerate() {
+                if c.eof {
+                    continue;
+                }
+                any_live = true;
+                match c.frontier {
+                    None => all_started = false,
+                    Some(f) => min_started = Some(min_started.map_or(f, |m| m.min(f))),
+                }
+                if advance_key.is_none_or(|best| c.frontier < best) {
+                    advance_key = Some(c.frontier);
+                    advance_idx = Some(i);
+                }
+            }
+            let all_eof = !any_live;
 
             // Unstarted cursors (`frontier == None`) must be read before anything
             // can release — otherwise a not-yet-opened file's first record could
@@ -433,36 +469,39 @@ impl RecordSource for VcfListRecordSource {
             let releasable = all_eof
                 || (all_started
                     && self.heap.peek().is_some_and(|Reverse(e)| {
-                        min_started.is_some_and(|m| e.key.0 < m.saturating_sub(L_MAX))
+                        min_started.is_some_and(|m| e.atom.pos < m.saturating_sub(L_MAX))
                     }));
 
             if releasable {
                 return match self.heap.pop() {
                     None => Ok(None),
                     Some(Reverse(top)) => {
-                        let key = top.key.clone();
                         let mut group = vec![(top.col, top.atom)];
+                        // Group-drain by the front atom's own key (borrowed, no
+                        // clone): pop every heap entry sharing `(pos, ilen,
+                        // alt)` with `group[0]`.
                         while let Some(Reverse(next)) = self.heap.peek() {
-                            if next.key != key {
+                            let g0 = &group[0].1;
+                            if next.atom.pos != g0.pos
+                                || next.atom.ilen != g0.ilen
+                                || next.atom.alt != g0.alt
+                            {
                                 break;
                             }
                             let Reverse(next) = self.heap.pop().unwrap();
                             group.push((next.col, next.atom));
                         }
+                        // Materialize the key once per released group (not once
+                        // per atom) for `build_record`'s pos/error-message use.
+                        let g0 = &group[0].1;
+                        let key = (g0.pos, g0.ilen, g0.alt.clone());
                         self.build_record(&key, group).map(Some)
                     }
                 };
             }
 
-            // Advance the live cursor with the smallest frontier; `None` (an
-            // unstarted cursor) sorts before every `Some(_)`.
-            let advance_idx = self
-                .cursors
-                .iter()
-                .enumerate()
-                .filter(|(_, c)| !c.eof)
-                .min_by_key(|(_, c)| c.frontier)
-                .map(|(i, _)| i);
+            // Advance the live cursor with the smallest frontier (computed in
+            // the single pass above).
             match advance_idx {
                 Some(i) => {
                     let ref_seq = self.ref_seq.as_deref();
@@ -473,9 +512,10 @@ impl RecordSource for VcfListRecordSource {
                         &self.info_specs,
                         &self.format_specs,
                     )? {
-                        let key = (atom.pos, atom.ilen, atom.alt.clone());
+                        // The heap orders by the atom's own `(pos, ilen, alt)`
+                        // (see `HeapEntry::key`) — no separate key to allocate.
                         let col = self.cursors[i].col;
-                        self.heap.push(Reverse(HeapEntry { key, col, atom }));
+                        self.heap.push(Reverse(HeapEntry { col, atom }));
                     }
                 }
                 // No live cursors: `all_eof` was already true above, which forces
