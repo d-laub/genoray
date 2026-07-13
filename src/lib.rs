@@ -74,6 +74,8 @@ pub mod spine;
 pub mod streams;
 pub mod types;
 #[cfg(feature = "conversion")]
+pub mod vcf_list_reader;
+#[cfg(feature = "conversion")]
 pub mod vcf_reader;
 #[cfg(feature = "conversion")]
 pub mod writer;
