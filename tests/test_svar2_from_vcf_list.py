@@ -128,6 +128,84 @@ def test_from_vcf_list_requires_reference(tmp_path: Path):
         SparseVar2.from_vcf_list(tmp_path / "s", [a], threads=1)
 
 
+def test_from_vcf_list_no_reference_snp_only(tmp_path):
+    # SNP-only single-sample VCFs, no reference. Should convert and hom-ref fill.
+    a = _ss(tmp_path, "a", "SA", "chr1\t3\t.\tA\tG\t.\t.\t.\tGT\t1|0\n")
+    b = _ss(tmp_path, "b", "SB", "chr1\t9\t.\tG\tT\t.\t.\t.\tGT\t0|1\n")
+    out = tmp_path / "s"
+    SparseVar2.from_vcf_list(out, [a, b], no_reference=True, threads=1)
+    sv = SparseVar2(out)
+    assert sv.available_samples == ["SA", "SB"]
+    assert sv.region_counts("chr1", [(0, 40)]).reshape(-1).tolist() == [1, 0, 0, 1]
+
+
+def test_from_vcf_list_no_reference_matches_bcftools_merge_oracle(tmp_path: Path):
+    """`no_reference` oracle parity, mirroring
+    `test_from_vcf_list_matches_bcftools_merge_oracle` but with `no_reference=True`
+    on both sides (`from_vcf` and `from_vcf_list`).
+
+    Under `no_reference`, atoms are NOT left-aligned -- cross-file joins only
+    line up when every input already agrees on how a shared site is
+    represented. So this fixture is restricted to SNPs (position + REF/ALT
+    bytes alone determine identity; there is no representational ambiguity
+    to normalize away), unlike the reference-bearing oracle test which also
+    covers indels/multiallelics.
+    """
+    a = _ss(
+        tmp_path,
+        "a",
+        "SA",
+        "chr1\t3\t.\tA\tG\t.\t.\t.\tGT\t1|0\n"  # shared SNP
+        "chr1\t12\t.\tG\tC\t.\t.\t.\tGT\t0|1\n",  # private SNP
+    )
+    b = _ss(
+        tmp_path,
+        "b",
+        "SB",
+        "chr1\t3\t.\tA\tG\t.\t.\t.\tGT\t0|1\n"  # shared SNP
+        "chr1\t9\t.\tG\tT\t.\t.\t.\tGT\t1|0\n",  # private SNP
+    )
+    paths = [a, b]
+
+    merge = subprocess.run(
+        ["bcftools", "merge", "-0", *map(str, paths)],
+        check=True,
+        stdout=subprocess.PIPE,
+    )
+    merged = tmp_path / "merged.vcf.gz"
+    with open(merged, "wb") as fh:
+        subprocess.run(["bgzip", "-c"], input=merge.stdout, check=True, stdout=fh)
+    subprocess.run(["bcftools", "index", str(merged)], check=True)
+
+    from_vcf_out = tmp_path / "oracle"
+    SparseVar2.from_vcf(from_vcf_out, merged, no_reference=True, threads=1)
+    list_out = tmp_path / "list"
+    dropped = SparseVar2.from_vcf_list(list_out, paths, no_reference=True, threads=1)
+    assert dropped == 0
+
+    oracle, native = SparseVar2(from_vcf_out), SparseVar2(list_out)
+    assert oracle.available_samples == native.available_samples == ["SA", "SB"]
+
+    region = [(0, len(_REF))]
+    # SA: hap0 <- shared SNP@2, hap1 <- private SNP@11
+    # SB: hap0 <- private SNP@8, hap1 <- shared SNP@2
+    expected_counts = np.array([[[1, 1], [1, 1]]])
+    oracle_counts = oracle.region_counts("chr1", region)
+    native_counts = native.region_counts("chr1", region)
+    np.testing.assert_array_equal(oracle_counts, expected_counts)
+    np.testing.assert_array_equal(oracle_counts, native_counts)
+
+    ro, rl = oracle.decode("chr1", region), native.decode("chr1", region)
+    # 4 ALT-carrying (sample, ploid) entries across the 3 distinct atoms (the
+    # shared SNP@2 is carried by both SA and SB), matching `expected_counts`.
+    assert len(np.asarray(ro["pos"].data)) == 4
+    for field in ("pos", "ilen"):
+        np.testing.assert_array_equal(
+            np.asarray(ro[field].data), np.asarray(rl[field].data)
+        )
+    assert ro["allele"].to_ak().tolist() == rl["allele"].to_ak().tolist()
+
+
 def test_from_vcf_list_matches_bcftools_merge_oracle(tmp_path: Path):
     """Oracle parity: `bcftools merge -0` (missing -> hom-ref, exactly our
     semantics) -> `from_vcf` must equal the native `from_vcf_list` k-way merge.

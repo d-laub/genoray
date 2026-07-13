@@ -17,7 +17,7 @@ description: Use when writing or modifying Python code that imports `genoray` to
 - `genoray.VCF` — VCF/BCF reader
 - `genoray.Filter` — VCF filter value object bundling a cyvcf2 record predicate (`record`) with its matching `.gvi` polars expression (`expr`)
 - `genoray.SparseVar` — sparse `.svar` reader/writer
-- `genoray.SparseVar2` — next-gen sparse variant store (VCF/BCF → SVAR2 conversion via `from_vcf`, PLINK2 PGEN → SVAR2 conversion via `from_pgen`, N single-sample VCFs/BCFs → one SVAR2 store via a native k-way merge in `from_vcf_list` (reference required for now, absent sites fill hom-ref); range queries via `decode`/`region_counts`/`read_ranges`; mutational-signature support (SBS96/DBS78/ID83) via `annotate_mutations`/`mutation_matrix`/`assign_signatures`, or classify during the write with `from_vcf(signatures=True)`/`from_pgen(signatures=True)`; scalar-numeric INFO/FORMAT field extraction during the write via `from_vcf(info_fields=, format_fields=)`/`from_vcf_list(info_fields=, format_fields=)` (`from_vcf_list` merges INFO first-carrier-wins, FORMAT per-sample) — not supported by `from_pgen` yet — read back opt-in via `fields=`/`with_fields`/`available_fields` and attached to `decode`'s result)
+- `genoray.SparseVar2` — next-gen sparse variant store (VCF/BCF → SVAR2 conversion via `from_vcf`, PLINK2 PGEN → SVAR2 conversion via `from_pgen`, N single-sample VCFs/BCFs → one SVAR2 store via a native k-way merge in `from_vcf_list` (`reference`/`no_reference` supported like `from_vcf`, absent sites fill hom-ref); range queries via `decode`/`region_counts`/`read_ranges`; mutational-signature support (SBS96/DBS78/ID83) via `annotate_mutations`/`mutation_matrix`/`assign_signatures`, or classify during the write with `from_vcf(signatures=True)`/`from_pgen(signatures=True)`; scalar-numeric INFO/FORMAT field extraction during the write via `from_vcf(info_fields=, format_fields=)`/`from_vcf_list(info_fields=, format_fields=)` (`from_vcf_list` merges INFO first-carrier-wins, FORMAT per-sample) — not supported by `from_pgen` yet — read back opt-in via `fields=`/`with_fields`/`available_fields` and attached to `decode`'s result)
 - `genoray.InfoField` / `genoray.FormatField` — frozen dataclasses (`name`, `dtype=None`, `default=None`) configuring a single INFO/FORMAT field for `SparseVar2.from_vcf`; a bare `str` name uses inferred defaults instead
 - `genoray.exprs` — polars filter expressions for `.gvi` indexes
 - `genoray.cosmic_signatures` — fetch/cache COSMIC reference signatures
@@ -36,7 +36,7 @@ Prefer reading these over guessing:
 - `genoray/_vcf.py` — `VCF` class: constructor, `read`, `chunk`, mode constants near the top of the class; `get_record_info(contig=None, start=None, end=None, fields=None, info=None, lazy=False)` — non-FORMAT record-level fields (including INFO) for a range or the whole file, returns `pl.DataFrame` (or `pl.LazyFrame` when `lazy=True`)
 - `genoray/_pgen.py` — `PGEN` class: constructor, `read`, `chunk`, `read_ranges`, `chunk_ranges`, mode constants near the top of the class
 - `genoray/_svar.py` — `SparseVar`: `__init__`, `from_vcf`, `from_pgen`, `read_ranges`, `read_ranges_with_length(contig, starts=0, ends=POS_MAX, samples=None)` (length-guaranteed range read; returns the same type as `read_ranges` — a `Ragged` or fields-augmented record), `with_fields`, `annotate_mutations`, `mutation_matrix`, `assign_signatures`, `annotate_with_gtf(gtf, level_filter=1, write_back=True, *, strand_encoding=None, codon_null_token=None)` (GTF CDS annotation entry point, returns `pl.DataFrame` with `varID`/`gene_id`/`strand`/`codon_pos`), `cache_afs()` (computes and persists an `AF` column to the `.gvi` index; returns `None`)
-- `genoray/_svar2.py` — `SparseVar2`: `__init__(path, *, fields=None)`, `with_fields(fields)` (new reader over the same store with those fields selected), `available_fields` (`dict[str, StoredField]`, set in `__init__`), `from_vcf` (VCF/BCF → SVAR2 conversion entry point, `signatures=` classifies during the write, `info_fields=`/`format_fields=` extract scalar-numeric fields during the write), `from_pgen` (PLINK2 PGEN → SVAR2 conversion entry point; diploid-only, no `ploidy=`/`info_fields=`/`format_fields=`), `from_vcf_list` (N single-sample VCFs/BCFs → one SVAR2 store via a native k-way merge; `sources` accepts a `Sequence`/directory/manifest, resolved by module-level `_resolve_vcf_sources`; reference required; `info_fields=`/`format_fields=` supported — INFO merges first-carrier-wins, FORMAT stays per-sample); `n_samples`/`available_samples`/`contigs`/`ploidy` metadata. Read/query methods live in the mixins: `genoray/_svar2_decode.py` (`decode` — attaches one `Ragged` per selected field, `region_counts`), `genoray/_svar2_batch.py` (public `read_ranges`; internal gvl-only `_overlap_batch`/`_find_ranges`/`_gather_ranges`), and `genoray/_svar2_mutcat.py` (`annotate_mutations`, `mutation_matrix`, `assign_signatures` — COSMIC mutational-signature workflow, mirroring `SparseVar`'s but backed by a per-contig Rust sidecar instead of a `.gvi`-attached field)
+- `genoray/_svar2.py` — `SparseVar2`: `__init__(path, *, fields=None)`, `with_fields(fields)` (new reader over the same store with those fields selected), `available_fields` (`dict[str, StoredField]`, set in `__init__`), `from_vcf` (VCF/BCF → SVAR2 conversion entry point, `signatures=` classifies during the write, `info_fields=`/`format_fields=` extract scalar-numeric fields during the write), `from_pgen` (PLINK2 PGEN → SVAR2 conversion entry point; diploid-only, no `ploidy=`/`info_fields=`/`format_fields=`), `from_vcf_list` (N single-sample VCFs/BCFs → one SVAR2 store via a native k-way merge; `sources` accepts a `Sequence`/directory/manifest, resolved by module-level `_resolve_vcf_sources`; `reference`/`no_reference` supported (no_reference skips left-alignment, so cross-file joins require pre-normalized inputs); `info_fields=`/`format_fields=` supported — INFO merges first-carrier-wins, FORMAT stays per-sample); `n_samples`/`available_samples`/`contigs`/`ploidy` metadata. Read/query methods live in the mixins: `genoray/_svar2_decode.py` (`decode` — attaches one `Ragged` per selected field, `region_counts`), `genoray/_svar2_batch.py` (public `read_ranges`; internal gvl-only `_overlap_batch`/`_find_ranges`/`_gather_ranges`), and `genoray/_svar2_mutcat.py` (`annotate_mutations`, `mutation_matrix`, `assign_signatures` — COSMIC mutational-signature workflow, mirroring `SparseVar`'s but backed by a per-contig Rust sidecar instead of a `.gvi`-attached field)
 - `genoray/_svar2_fields.py` — `InfoField`/`FormatField` dataclasses + `FieldDtype` and the header/dtype validation used by `from_vcf(info_fields=, format_fields=)`; `StoredField` (frozen dataclass: `name`, `category`, `dtype`, `default`, `key`) is the read-side manifest entry type returned by `SparseVar2.available_fields` — not exported at top-level `genoray`, only reached via that dict
 - `genoray/_cli/__main__.py` — the `genoray` CLI (`index`, `write` / `write svar1`, `view`)
 - `genoray/_signatures.py` — `cosmic_signatures`, `fit_signatures`
@@ -397,11 +397,22 @@ multi-sample VCF.
 - **Each input file's records must already be position-sorted** per contig
   (same assumption `from_vcf` makes for its single input) — an unsorted
   file silently corrupts the k-way merge.
-- **Reference is required for now** — `no_reference=True` raises
-  `NotImplementedError` (unlike `from_vcf`/`from_pgen`, where it's a
-  supported alternative to `reference=`). The `reference`/`no_reference`
-  exactly-one-of check and the `signatures`+`no_reference` incompatibility
-  are otherwise identical to `from_vcf`.
+- **`no_reference=True` is supported**, same as `from_vcf`/`from_pgen`: skips
+  REF validation and left-alignment, reconstructing each atom's REF from the
+  record's own REF bytes. The `reference`/`no_reference` exactly-one-of check
+  and the `signatures`+`no_reference` incompatibility are otherwise identical
+  to `from_vcf`.
+  - **Caveat specific to this entry point:** because the merge is a per-contig
+    k-way join keyed on each atom's normalized `(pos, ref, alt)`, skipping
+    left-alignment means a site shared across files only joins into one output
+    row if every input already represents it *identically* — same anchor base,
+    same padding (e.g. all files came from the same caller, or were all
+    already run through `bcftools norm` against the same reference). Two files
+    encoding the same indel with different normalization will **not** join
+    under `no_reference`: they silently become two separate variants in the
+    output store instead of one shared row. This is not a failure mode that
+    raises — verify upstream normalization is consistent before relying on
+    `no_reference` with `from_vcf_list`.
 - **`info_fields=`/`format_fields=`** — same declaration API as `from_vcf`
   (resolved against the FIRST file in `sources`'s header). Merge semantics
   differ from a single-file conversion because there are now N source

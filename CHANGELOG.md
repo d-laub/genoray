@@ -4,6 +4,16 @@
 
 - Added `SparseVar2.from_vcf_list` to build one store from many single-sample
   VCFs/BCFs via a native k-way merge (absent sites filled hom-ref).
+- `SparseVar2.from_vcf_list` now supports `no_reference=True` (previously it
+  raised `NotImplementedError`), matching `from_vcf`/`from_pgen`: REF
+  validation and left-alignment are skipped, and each atom's REF is
+  reconstructed from its own record's REF bytes. Because the merge is a
+  per-contig k-way join keyed on each atom's normalized `(pos, ref, alt)`,
+  skipping left-alignment means a site shared across input files only joins
+  into one output row if every file already represents it identically (same
+  caller, or all already `bcftools norm`'d against the same reference) —
+  differently-normalized indels across files will silently become separate
+  variants instead of one shared row under `no_reference`.
 - `SparseVar2.from_vcf_list` now supports `info_fields=`/`format_fields=`
   (previously reserved kwargs that raised `NotImplementedError` when passed
   non-empty). Merge semantics account for there being N source columns per

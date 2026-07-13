@@ -381,8 +381,22 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         position-sorted per contig -- an unsorted file silently corrupts the
         k-way merge.
 
-        `reference` is **required** in the current implementation
-        (`no_reference=True` is not yet supported here, unlike `from_vcf`).
+        Exactly one of `reference` or `no_reference=True` is required, with the
+        same semantics as :meth:`from_vcf`: with a reference, atoms are
+        validated against it and left-aligned before merging; with
+        `no_reference`, both are skipped and each atom's REF is reconstructed
+        from its own record's REF bytes. **Caveat specific to this method:**
+        because merging is a per-contig k-way join on normalized (pos, ref,
+        alt) atoms across *independently produced* files, skipping
+        left-alignment under `no_reference` means a shared site only joins
+        into one output row if every input file already represents it
+        identically (e.g. all inputs came from the same caller, or were all
+        already run through `bcftools norm` against the same reference). Two
+        files encoding the same indel differently (different anchor base,
+        different padding) will NOT join under `no_reference` -- they surface
+        as two separate variants in the output store instead of one shared
+        row, silently. `signatures=True` requires a reference (not
+        `no_reference`).
 
         `info_fields`/`format_fields`: same declaration API as :meth:`from_vcf`
         (resolved against the FIRST file in `sources`' header). INFO fields
@@ -407,10 +421,6 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             )
         if signatures and no_reference:
             raise ValueError("signatures=True requires a reference (not no_reference).")
-        if no_reference:
-            raise NotImplementedError(
-                "no_reference is not yet supported by from_vcf_list; pass a reference"
-            )
         if out.exists() and not overwrite:
             raise FileExistsError(
                 f"Output path {out} already exists. Use overwrite=True to overwrite."
