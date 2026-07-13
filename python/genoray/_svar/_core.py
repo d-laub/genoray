@@ -936,7 +936,7 @@ class SparseVar(SparseVarAnnotateMixin, Generic[_SRT]):
         schema = index.collect_schema()
 
         if schema["ALT"] == pl.Utf8:
-            index = index.with_columns(pl.col("ALT").cast(pl.List(pl.Utf8)))
+            index = index.with_columns(pl.col("ALT").str.split(","))
 
         _attrs: set[IntoExpr] = {"ALT"}
 

@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 import numpy as np
+import polars as pl
 from natsort import natsorted
 
 import genoray._core as _core
@@ -288,6 +289,107 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             readers,
         )
 
+    @classmethod
+    def from_svar1(
+        cls,
+        out: str | Path,
+        source: str | Path,
+        reference: str | Path | None = None,
+        *,
+        no_reference: bool = False,
+        skip_out_of_scope: bool = False,
+        chunk_size: int | None = None,
+        threads: int | None = None,
+        overwrite: bool = False,
+        long_allele_capacity: int = 8 * 1024 * 1024,
+        signatures: bool = False,
+    ) -> int:
+        """Convert a SVAR1 (``SparseVar``) store to an SVAR2 store natively.
+
+        Reads no VCF and no htslib: SVAR1 is already sparse, so this reconstructs
+        variant records from SVAR1's arrays and reuses the same conversion spine
+        as :meth:`from_vcf`.
+
+        Exactly one of `reference` or `no_reference=True` is required, same meaning
+        as :meth:`from_vcf`. `ploidy` is read from SVAR1's metadata. Returns the
+        number of out-of-scope (symbolic/breakend) ALTs dropped.
+
+        Only **biallelic** SVAR1 stores are supported (SVAR1's ``geno==1`` model);
+        multiallelic input raises. All SVAR1 FORMAT fields (e.g. ``dosages``) are
+        carried through; ``mutcat`` is dropped (pass `signatures=True` to recompute
+        signatures from the reference). Because SVAR1 discarded non-carrier FORMAT
+        values, a dense-routed variant's non-carrier cells are filled with the
+        field's default/missing sentinel — field output is byte-identical to
+        :meth:`from_vcf` only for var_key (carrier-only) routing.
+        """
+        from genoray._svar import SparseVar
+
+        out = Path(out)
+        source = Path(source)
+
+        if (reference is None) == (not no_reference):
+            raise ValueError(
+                "provide exactly one of `reference` (a FASTA path) or "
+                "`no_reference=True`"
+            )
+        if signatures and no_reference:
+            raise ValueError("signatures=True requires a reference (not no_reference).")
+        if out.exists() and not overwrite:
+            raise FileExistsError(
+                f"Output path {out} already exists. Use overwrite=True to overwrite."
+            )
+        if not source.exists():
+            raise FileNotFoundError(source)
+
+        sv1 = SparseVar(source)
+        if not sv1._is_biallelic:
+            raise ValueError(
+                "from_svar1 supports only biallelic SVAR1 stores; this store has "
+                "multiallelic variants. Re-create it biallelically first."
+            )
+        samples, ploidy, contigs, fields = _read_svar1_metadata(source)
+        n_samples = len(samples)
+        if n_samples == 0:
+            raise ValueError(f"No samples found in {source}.")
+
+        (
+            starts,
+            lens,
+            pos_pc,
+            ref_bytes_pc,
+            ref_off_pc,
+            alt_bytes_pc,
+            alt_off_pc,
+        ) = _svar1_index_arrays(source, contigs)
+        format_tuples, src_dtypes = _svar1_fields_manifest(fields)
+
+        if chunk_size is None:
+            chunk_size = _auto_chunk_size(n_samples, ploidy)
+
+        out.parent.mkdir(parents=True, exist_ok=True)
+        return _core.run_svar1_conversion_pipeline(
+            str(source),
+            None if no_reference else str(reference),
+            contigs,
+            starts,
+            lens,
+            str(out),
+            samples,
+            ploidy,
+            chunk_size,
+            threads,
+            long_allele_capacity,
+            skip_out_of_scope,
+            signatures,
+            pos_pc,
+            ref_bytes_pc,
+            ref_off_pc,
+            alt_bytes_pc,
+            alt_off_pc,
+            format_tuples,
+            src_dtypes,
+        )
+
 
 def _find_pvar(pgen: Path) -> Path:
     """Locate the `.pvar` / `.pvar.zst` sibling of `pgen`."""
@@ -386,6 +488,108 @@ def _pvar_contig_ranges(
         contigs.append(str(chrom))
         ranges.append((int(lo), int(hi) + 1))
     return contigs, ranges, allele_idx_offsets
+
+
+def _read_svar1_metadata(
+    source: Path,
+) -> tuple[list[str], int, list[str], dict[str, str]]:
+    """(samples, ploidy, contigs, fields) from a SVAR1 metadata.json."""
+    meta = json.loads((source / "metadata.json").read_text())
+    return (
+        list(meta["samples"]),
+        int(meta["ploidy"]),
+        list(meta["contigs"]),
+        dict(meta.get("fields", {})),
+    )
+
+
+def _pack_strings(values: list[str]) -> tuple[bytes, "np.ndarray"]:
+    """Pack a list of ASCII allele strings into (concatenated bytes, i64 offsets)
+    with offsets length len(values)+1."""
+    encoded = [v.encode("ascii") for v in values]
+    offsets = np.zeros(len(encoded) + 1, dtype=np.int64)
+    np.cumsum([len(b) for b in encoded], out=offsets[1:])
+    return b"".join(encoded), offsets
+
+
+def _svar1_index_arrays(
+    source: Path, contigs: list[str]
+) -> tuple[
+    list[int],
+    list[int],
+    list["np.ndarray"],
+    list[bytes],
+    list["np.ndarray"],
+    list[bytes],
+    list["np.ndarray"],
+]:
+    """Per-contig POS(0-based)/REF/ALT arrays + global contig start/len ranges.
+
+    SVAR1's index.arrow is variant-major and contig-contiguous; POS is 1-based.
+    """
+    df = pl.read_ipc(source / "index.arrow", columns=["CHROM", "POS", "REF", "ALT"])
+    # Global contig_start/len offsets below are only correct if index.arrow's
+    # physical row order is contig-contiguous AND those runs appear in the same
+    # order as `contigs` (from metadata.json). Verify via run-length encoding of
+    # CHROM: a well-formed store has exactly one run per contig that has any rows,
+    # in `contigs` order. `contigs` is the source's full header contig dictionary,
+    # though, so it routinely includes contigs with zero surviving variants (no
+    # rows in index.arrow at all) -- those legitimately contribute no RLE run, so
+    # they're dropped from the expected side rather than required to match.
+    run_order = df["CHROM"].rle().struct.field("value").to_list()
+    present = set(df["CHROM"].unique().to_list())
+    expected_order = [c for c in contigs if c in present]
+    if run_order != expected_order:
+        raise ValueError(
+            f"{source / 'index.arrow'} is not contig-contiguous in the order given "
+            f"by metadata.json's contigs list, so SVAR1->SVAR2 conversion cannot "
+            f"safely assign global variant-id ranges per contig.\n"
+            f"Expected contig run order (metadata.contigs, dropping contigs with no "
+            f"rows in index.arrow): {expected_order}\n"
+            f"Actual CHROM run order (from index.arrow): {run_order}"
+        )
+    # ALT is comma-Utf8 on disk; biallelic => a single token per row.
+    starts: list[int] = []
+    lens: list[int] = []
+    pos_pc: list[np.ndarray] = []
+    ref_b: list[bytes] = []
+    ref_o: list[np.ndarray] = []
+    alt_b: list[bytes] = []
+    alt_o: list[np.ndarray] = []
+    cursor = 0
+    for c in contigs:
+        sub = df.filter(pl.col("CHROM") == c)
+        n = sub.height
+        starts.append(cursor)
+        lens.append(n)
+        cursor += n
+        pos_pc.append((sub["POS"].to_numpy().astype(np.int64) - 1).astype(np.uint32))
+        rb, ro = _pack_strings(sub["REF"].to_list())
+        ab, ao = _pack_strings(sub["ALT"].to_list())
+        ref_b.append(rb)
+        ref_o.append(ro)
+        alt_b.append(ab)
+        alt_o.append(ao)
+    return starts, lens, pos_pc, ref_b, ref_o, alt_b, alt_o
+
+
+def _svar1_fields_manifest(
+    fields: dict[str, str],
+) -> tuple[list[tuple[str, str, str, None, None]], list[str]]:
+    """Map SVAR1 metadata.fields -> (FORMAT FieldSpec tuples, source numpy dtypes).
+
+    Every SVAR1 custom field is FORMAT. `mutcat` is dropped (signature machinery).
+    htype is inferred from the numpy dtype; storage dtype is left None (Auto).
+    """
+    tuples: list[tuple[str, str, str, None, None]] = []
+    src_dtypes: list[str] = []
+    for name, np_dtype in fields.items():
+        if name == "mutcat":
+            continue
+        htype = "float" if np.dtype(np_dtype).kind == "f" else "int"
+        tuples.append((name, "format", htype, None, None))
+        src_dtypes.append(np_dtype)
+    return tuples, src_dtypes
 
 
 # Target byte size of one packed dense chunk (chunk_size * n_samples * ploidy / 8).

@@ -55,6 +55,18 @@ pub enum SourceSpec {
         /// each concurrent contig needs its own -- never share one.
         reader: pyo3::Py<pyo3::PyAny>,
     },
+    Svar1 {
+        svar1_dir: String,
+        contig_start: usize,
+        n_local: usize,
+        pos: Vec<u32>,
+        ref_bytes: Vec<u8>,
+        ref_offsets: Vec<i64>,
+        alt_bytes: Vec<u8>,
+        alt_offsets: Vec<i64>,
+        format_fields: Vec<crate::field::FieldSpec>,
+        format_src_dtypes: Vec<String>,
+    },
 }
 
 //The rust pipeline (Per chromosome conversion from Dense to Sparse)
@@ -191,6 +203,31 @@ pub fn process_chromosome(
                         var_end,
                         s_refs.len(),
                         chunk_size,
+                    )?),
+                    SourceSpec::Svar1 {
+                        svar1_dir,
+                        contig_start,
+                        n_local,
+                        pos,
+                        ref_bytes,
+                        ref_offsets,
+                        alt_bytes,
+                        alt_offsets,
+                        format_fields,
+                        format_src_dtypes,
+                    } => Box::new(crate::svar1_reader::Svar1RecordSource::new(
+                        &svar1_dir,
+                        contig_start,
+                        n_local,
+                        s_refs.len(),
+                        ploidy,
+                        pos,
+                        ref_bytes,
+                        ref_offsets,
+                        alt_bytes,
+                        alt_offsets,
+                        &format_fields,
+                        &format_src_dtypes,
                     )?),
                 };
                 let mut reader = crate::chunk_assembler::ChunkAssembler::new(
