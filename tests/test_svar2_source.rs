@@ -74,22 +74,160 @@ fn emits_position_sorted_records_with_carrier_bits() {
     assert!(src.next_record().unwrap().is_none());
 }
 
+/// Drain a source into `(pos, gt)` pairs.
+fn drain(mut src: Svar2Source) -> Vec<(u32, Vec<i32>)> {
+    let mut out = Vec::new();
+    while let Some(r) = src.next_record().unwrap() {
+        out.push((r.pos, r.gt));
+    }
+    out
+}
+
 #[test]
-fn overlap_mode_pos_prunes_deletion_extent_hits_before_the_region() {
-    // A DEL@pos=5, ref len 4 (ilen=-3), spans [5, 9). Under `Pos` mode a query
-    // region starting after `pos` but still inside the deletion's extent (e.g.
-    // [7, 20)) must NOT see the call: `pos` (5) is outside `[7, 20)` even
-    // though the extent overlaps. Under `Record`/`Variant` mode it must.
+fn the_three_overlap_modes_are_distinguishable() {
+    // genoray's published contract (`python/genoray/_svar/_regions.py`):
+    //   pos     -> keep iff  q_start <= POS <  q_end
+    //   record  -> keep iff  q_start <= POS <  q_end + 1   (POS rule, end + 1)
+    //   variant -> keep iff the variant's *extent* overlaps [q_start, q_end)
+    //
+    // Fixture, queried over [7, 20):
+    //   DEL @5, REF len 4 (ilen -3) -> extent [5, 9): extent overlaps, POS does
+    //                                  not  => `Variant` only.
+    //   SNP @10                     -> inside on every rule => all three modes.
+    //   SNP @20  (POS == q_end)     -> POS hits only the widened `record`
+    //                                  window; its extent [20, 21) does not
+    //                                  touch [7, 20)  => `Record` only.
     let tmp = tempdir().unwrap();
     let out = tmp.path().join("out");
     std::fs::create_dir_all(&out).unwrap();
 
     let samples = ["S0"];
+    let records = vec![
+        SynthRecord {
+            pos: 5,
+            ref_allele: b"ATGC",
+            alts: vec![&b"A"[..]],
+            gt: vec![1, 1],
+        },
+        SynthRecord {
+            pos: 10,
+            ref_allele: b"A",
+            alts: vec![&b"C"[..]],
+            gt: vec![1, 0],
+        },
+        SynthRecord {
+            pos: 20,
+            ref_allele: b"A",
+            alts: vec![&b"G"[..]],
+            gt: vec![0, 1],
+        },
+    ];
+    build_contig(&out, "chr1", &samples, 2, &records);
+    write_meta(
+        &out,
+        FORMAT_VERSION,
+        &samples.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        &["chr1".to_string()],
+        2,
+        &[],
+    )
+    .unwrap();
+
+    let open =
+        |mode| Svar2Source::new(out.to_str().unwrap(), "chr1", &[0], 2, &[(7, 20)], mode).unwrap();
+
+    assert_eq!(
+        drain(open(OverlapMode::Pos)),
+        vec![(10, vec![1, 0])],
+        "`pos`: POS in [7, 20) only"
+    );
+    assert_eq!(
+        drain(open(OverlapMode::Record)),
+        vec![(10, vec![1, 0]), (20, vec![0, 1])],
+        "`record`: POS in [7, 21) — the POS == q_end variant is kept, the \
+         extent-only deletion is not"
+    );
+    assert_eq!(
+        drain(open(OverlapMode::Variant)),
+        vec![(5, vec![1, 1]), (10, vec![1, 0])],
+        "`variant`: extent overlap — the deletion is kept, the POS == q_end \
+         variant is not"
+    );
+}
+
+#[test]
+fn sample_subset_is_reordered_and_mac0_variants_drop_out() {
+    // Guards the `BatchResult::decode_hap` index contract: `s` indexes into the
+    // *subset* passed to `read_ranges`, not the original cohort. Selecting
+    // `[2, 0]` (reordered, and skipping S1) would scramble carriers under a
+    // subset/original mix-up.
+    let tmp = tempdir().unwrap();
+    let out = tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+
+    let samples = ["S0", "S1", "S2"];
+    let records = vec![
+        SynthRecord {
+            pos: 10,
+            ref_allele: b"A",
+            alts: vec![&b"C"[..]],
+            gt: vec![1, 0, 0, 0, 0, 1], // S0/hap0 and S2/hap1
+        },
+        SynthRecord {
+            pos: 12,
+            ref_allele: b"A",
+            alts: vec![&b"G"[..]],
+            gt: vec![0, 0, 1, 1, 0, 0], // S1 only -> MAC 0 in the subset
+        },
+        SynthRecord {
+            pos: 14,
+            ref_allele: b"A",
+            alts: vec![&b"T"[..]],
+            gt: vec![0, 1, 1, 0, 0, 0], // S0/hap1 (+ S1/hap0, not selected)
+        },
+    ];
+    build_contig(&out, "chr1", &samples, 2, &records);
+    write_meta(
+        &out,
+        FORMAT_VERSION,
+        &samples.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        &["chr1".to_string()],
+        2,
+        &[],
+    )
+    .unwrap();
+
+    // Output hap order: [S2/hap0, S2/hap1, S0/hap0, S0/hap1].
+    let src = Svar2Source::new(
+        out.to_str().unwrap(),
+        "chr1",
+        &[2, 0],
+        2,
+        &[(0, 40)],
+        OverlapMode::Pos,
+    )
+    .unwrap();
+    assert_eq!(
+        drain(src),
+        vec![(10, vec![0, 1, 1, 0]), (14, vec![0, 0, 0, 1])],
+        "pos 12 is S1-only -> MAC 0 in the subset -> dropped"
+    );
+}
+
+#[test]
+fn carrier_bits_or_across_overlapping_regions() {
+    // A variant seen through two overlapping regions is emitted once, with the
+    // carrier bits OR-ed (not duplicated, not last-write-wins).
+    let tmp = tempdir().unwrap();
+    let out = tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+
+    let samples = ["S0", "S1"];
     let records = vec![SynthRecord {
-        pos: 5,
-        ref_allele: b"ATGC",
-        alts: vec![&b"A"[..]],
-        gt: vec![1, 1],
+        pos: 10,
+        ref_allele: b"A",
+        alts: vec![&b"C"[..]],
+        gt: vec![1, 0, 0, 1],
     }];
     build_contig(&out, "chr1", &samples, 2, &records);
     write_meta(
@@ -102,28 +240,14 @@ fn overlap_mode_pos_prunes_deletion_extent_hits_before_the_region() {
     )
     .unwrap();
 
-    let mut pos_mode = Svar2Source::new(
+    let src = Svar2Source::new(
         out.to_str().unwrap(),
         "chr1",
-        &[0],
+        &[0, 1],
         2,
-        &[(7, 20)],
+        &[(5, 15), (8, 20)],
         OverlapMode::Pos,
     )
     .unwrap();
-    assert!(pos_mode.next_record().unwrap().is_none());
-
-    let mut record_mode = Svar2Source::new(
-        out.to_str().unwrap(),
-        "chr1",
-        &[0],
-        2,
-        &[(7, 20)],
-        OverlapMode::Record,
-    )
-    .unwrap();
-    let r = record_mode.next_record().unwrap().unwrap();
-    assert_eq!(r.pos, 5);
-    assert_eq!(r.gt, vec![1, 1]);
-    assert!(record_mode.next_record().unwrap().is_none());
+    assert_eq!(drain(src), vec![(10, vec![1, 0, 0, 1])]);
 }

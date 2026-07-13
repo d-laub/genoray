@@ -3,8 +3,9 @@
 //! This is the seam that lets `SparseVar2.write_view` re-emit a region+sample
 //! subset of an existing store by re-running the ordinary conversion pipeline
 //! (`process_chromosome` -> cost model -> merge -> writer) rather than by
-//! surgically rewriting sidecars. The store is read back per-hap through the
-//! normal query path (`query::oracle::overlap_sample`), the decoded calls are
+//! surgically rewriting sidecars. The store is read back through the normal
+//! batched query path (`query::read_ranges` + `BatchResult::decode_hap`, one
+//! gather for all (region, sample, hap) triples), the decoded calls are
 //! re-grouped variant-major, and each group is handed to the pipeline as a
 //! synthetic [`RawRecord`].
 //!
@@ -28,23 +29,33 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::error::ConversionError;
-use crate::query::ContigReader;
-use crate::query::oracle::overlap_sample;
+use crate::query::{ContigReader, read_ranges};
 use crate::record_source::{RawRecord, RecordSource};
 
 /// How a variant's overlap with a query region is judged.
 ///
 /// Mirrors genoray's established public `regions_overlap: "pos" | "record" |
-/// "variant"` contract (`python/genoray/_svar/_core.py`).
+/// "variant"` contract (`python/genoray/_svar/_regions.py`). Two of the three
+/// modes are **POS-membership** rules — only `variant` is an extent rule:
+///
+/// | mode      | keep iff                       |
+/// |-----------|--------------------------------|
+/// | `pos`     | `q_start <= POS < q_end`       |
+/// | `record`  | `q_start <= POS < q_end + 1`   |
+/// | `variant` | the variant's *extent* overlaps `[q_start, q_end)` |
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OverlapMode {
     /// Keep a call only if its POS lies in `[q_start, q_end)`. Deletions whose
     /// *extent* reaches into the region but whose POS lies before it are pruned.
     Pos,
-    /// Keep every call the reader returned for the region, i.e. any variant
-    /// whose extent overlaps it (deletions spanning the region start included).
+    /// Keep a call only if its POS lies in `[q_start, q_end + 1)` — i.e. `Pos`
+    /// with the region end widened by exactly one base, so a variant at
+    /// `POS == q_end` is kept. Still a POS rule: a deletion whose extent reaches
+    /// into the region but whose POS precedes `q_start` is pruned.
     Record,
-    /// Same keep-rule as [`OverlapMode::Record`] at this layer.
+    /// Keep every call whose *extent* overlaps `[q_start, q_end)` — i.e. every
+    /// call the reader returns, with no POS filter (deletions spanning the
+    /// region start included).
     Variant,
 }
 
@@ -96,14 +107,42 @@ impl Svar2Source {
         // POS, then a stable tiebreak among variants sharing a POS.
         let mut groups: BTreeMap<(u32, i32, Vec<u8>), Vec<bool>> = BTreeMap::new();
 
-        for (s_out, &s_orig) in sample_orig_idx.iter().enumerate() {
-            for &(q_start, q_end) in regions {
-                let res = overlap_sample(&reader, s_orig, q_start, q_end);
-                for (p, hc) in res.per_hap.iter().enumerate() {
+        // `Record` keeps variants at `POS == q_end`, so the *reader* window has
+        // to be widened by one base too — an extent-overlap query over
+        // `[q_start, q_end)` would never surface them. (`saturating_add` so a
+        // region ending at `u32::MAX` can't wrap; the keep-rule below is written
+        // inclusively for the same reason.)
+        let query_regions: Vec<(u32, u32)> = match overlap_mode {
+            OverlapMode::Record => regions
+                .iter()
+                .map(|&(qs, qe)| (qs, qe.saturating_add(1)))
+                .collect(),
+            OverlapMode::Pos | OverlapMode::Variant => regions.to_vec(),
+        };
+
+        // ONE batched gather for every (region, sample, hap): `find_ranges`
+        // builds the dense union + search tree once for the whole call, whereas
+        // the per-sample `oracle::overlap_sample` would rebuild both per
+        // (sample, region) — O(S * R * D log D) on a whole-contig view.
+        let batch = read_ranges(&reader, &query_regions, Some(sample_orig_idx));
+
+        // `BatchResult` hap index is `(r * n_samples + s) * ploidy + p` over the
+        // *selected* samples: `s` is the position within `sample_orig_idx`, not
+        // the original sample column (`find_ranges` resolves `sample_cols[s]` to
+        // the original column itself). So `s == s_out` here.
+        for (r, &(q_start, q_end)) in regions.iter().enumerate() {
+            for s_out in 0..sample_orig_idx.len() {
+                for p in 0..ploidy {
+                    let hc = batch.decode_hap(&reader, r, s_out, p);
                     let h_out = s_out * ploidy + p;
                     for i in 0..hc.positions.len() {
                         let pos = hc.positions[i];
-                        if overlap_mode == OverlapMode::Pos && !(q_start <= pos && pos < q_end) {
+                        let keep = match overlap_mode {
+                            OverlapMode::Pos => q_start <= pos && pos < q_end,
+                            OverlapMode::Record => q_start <= pos && pos <= q_end,
+                            OverlapMode::Variant => true,
+                        };
+                        if !keep {
                             continue;
                         }
                         groups
