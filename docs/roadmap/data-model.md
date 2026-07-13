@@ -415,11 +415,22 @@ SVAR2 is a **compute-oriented, derived format — not an archival format.**
 - **No sample appends.** You cannot add samples to an existing SVAR2 file. Adding
   samples changes per-variant allele frequencies, which changes cost-model decisions
   and can invalidate every LUT and variant table. Re-convert instead.
-- **Cheap merge/split by contig (M8).** Contigs are fully independent on disk, so
-  merging or splitting SVAR2 files along contig boundaries is a near-trivial file
-  operation.
-- **Cheap region subsetting (M9, non-MVP).** Subsetting by region introduces no new
-  variants and only shrinks variant tables, so it doesn't perturb the cost model.
+- **Cheap merge/split by contig (M8). Implemented.** Contigs are fully independent
+  on disk, so merging or splitting SVAR2 files along contig boundaries is a
+  near-trivial file operation — `SparseVar2.concat` (disjoint-contig merge),
+  `split_by_contig` (explode into one store per contig), and `subset_contigs`
+  (keep a named subset of contigs), plus the `genoray concat`/`genoray split`
+  CLI commands. All three are pure metadata rewrite + file copy/hardlink/
+  symlink/move; none re-run conversion or the cost model.
+- **Cheap region subsetting (M9). Implemented via re-conversion.** Subsetting by
+  region introduces no new variants and only shrinks variant tables, so it
+  doesn't perturb the cost model. `SparseVar2.write_view` (`genoray view`)
+  implements this by re-running the ordinary conversion pipeline over the
+  finished store's own records with `reroute=True` — sample-subset rerouting
+  is done. The representation-preserving fast path (`reroute=False`, a
+  byte-preserving passthrough of each variant's original representation) is
+  deferred: it depends on a measurement verdict (a spike scoped as a separate
+  task) that hasn't been run yet, and currently raises `NotImplementedError`.
 - **Bulk N-way merge is harder (M12).** A general merge of multiple SVAR2 files can
   change allele frequencies and must rebuild LUTs and variant tables — deferred.
 

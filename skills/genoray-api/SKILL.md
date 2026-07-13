@@ -483,6 +483,47 @@ act = sv.assign_signatures("SBS96")                  # mutation_matrix + fit_sig
   SVAR2 (unlike v1's `fields=["mutcat"]`) — only the aggregated
   `mutation_matrix` output is exposed.
 
+### Merge and split by contig
+
+SVAR2 contigs are fully independent on disk, so recombining or subsetting
+whole contigs is a cheap metadata-rewrite + file-copy operation — unlike
+`write_view` (see the CLI section below), none of these methods re-run
+conversion or the var_key/dense cost model.
+
+```python
+from genoray import SparseVar2
+
+sv = SparseVar2("out.svar2")
+sv.subset_contigs("chr1.svar2", "chr1")                # single contig
+sv.subset_contigs("subset.svar2", ["chr1", "chr2"])    # multiple, source order preserved
+paths = sv.split_by_contig("by_contig/")               # one store per contig, out_dir/{contig}.svar2
+
+SparseVar2.concat("merged.svar2", ["chr1.svar2", "chr2.svar2"])  # disjoint-contig merge
+```
+
+- `subset_contigs(output, contigs, *, mode="copy", overwrite=False) -> None` —
+  write a new store containing only `contigs` (a single contig name or a
+  sequence of names). Pure metadata rewrite + file copy of the kept contig
+  directories, preserving the source store's contig order. Raises
+  `ValueError` if any name isn't in `self.contigs`, or if `output` resolves
+  to this store's own path (in-place subsetting is rejected, mirroring
+  `write_view`'s in-place guard). Raises `FileExistsError` if `output`
+  exists and `overwrite=False`.
+- `split_by_contig(out_dir, *, mode="copy", overwrite=False) -> list[Path]` —
+  explode into one single-contig store per contig at
+  `out_dir/{contig}.svar2`; returns the output paths in `self.contigs`
+  order. Implemented as one `subset_contigs` call per contig.
+- `SparseVar2.concat(output, sources, *, mode="copy", overwrite=False) -> None`
+  (classmethod) — concatenate stores with **disjoint** contig sets into one.
+  `sources` is a sequence of paths (or `SparseVar2` instances); all sources
+  must agree on `samples`, `ploidy`, `format_version`, and `fields` —
+  disagreement on any of those, or a contig name appearing in more than one
+  source, raises `ValueError`. The merged contig list is `natsorted`,
+  independent of the order `sources` were passed in.
+- `mode` (all three methods) is the shared `Mode` literal —
+  `"copy"|"hardlink"|"symlink"|"move"` — controlling how each contig
+  directory is transplanted into the output store.
+
 ### Errors
 
 genoray raises standard Python builtins, by category:

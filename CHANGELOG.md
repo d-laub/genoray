@@ -56,6 +56,19 @@
   and peak RSS on a 200-sample/50k-record conversion drops ~7% (~487 MiB →
   ~452 MiB); end-to-end wall time is unchanged since conversion remains
   reader/htslib-bound, not finalize-bound.
+- `SparseVar2.concat` (classmethod), `subset_contigs`, and `split_by_contig` —
+  cheap merge/subset/split of SVAR2 stores along contig boundaries (pure
+  metadata rewrite + file copy/hardlink/symlink/move, no re-conversion).
+  `concat` requires disjoint contig sets and matching samples/ploidy/
+  format_version/fields across sources.
+- `SparseVar2.write_view` — write a region/sample subset of an SVAR2 store by
+  re-running the ordinary conversion pipeline over the finished store's own
+  records (`reroute=True`, the only implemented mode; `reroute=False` raises
+  `NotImplementedError`). Genotypes only for now — `fields=` defaults to none
+  and any non-empty selection raises `ValueError` (field carry-through is not
+  yet implemented).
+- `genoray concat` / `genoray split` CLI commands, thin wrappers over
+  `SparseVar2.concat`/`split_by_contig`/`subset_contigs`.
 
 ### BREAKING CHANGES
 
