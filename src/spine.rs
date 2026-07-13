@@ -62,6 +62,10 @@ pub struct SrcKeyRef {
 pub trait VkElem: Copy {
     fn make(position: u32, key: u32, is_indel: bool, call_idx: usize) -> Self;
     fn position(&self) -> u32;
+
+    /// Split a merged run into the frozen `(keys, src)` contract. `KeyRef`
+    /// yields an empty `src`; `SrcKeyRef` yields one entry per key.
+    fn split(v: Vec<Self>) -> (Vec<KeyRef>, Vec<u32>);
 }
 
 impl VkElem for KeyRef {
@@ -72,6 +76,10 @@ impl VkElem for KeyRef {
     #[inline]
     fn position(&self) -> u32 {
         self.position
+    }
+    #[inline]
+    fn split(v: Vec<Self>) -> (Vec<KeyRef>, Vec<u32>) {
+        (v, Vec::new())
     }
 }
 
@@ -86,6 +94,16 @@ impl VkElem for SrcKeyRef {
     #[inline]
     fn position(&self) -> u32 {
         self.key.position
+    }
+    #[inline]
+    fn split(v: Vec<Self>) -> (Vec<KeyRef>, Vec<u32>) {
+        let mut keys = Vec::with_capacity(v.len());
+        let mut src = Vec::with_capacity(v.len());
+        for e in v {
+            keys.push(e.key);
+            src.push(e.src);
+        }
+        (keys, src)
     }
 }
 

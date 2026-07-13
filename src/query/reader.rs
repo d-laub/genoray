@@ -92,6 +92,35 @@ impl ContigReader {
 }
 
 impl ContigReader {
+    /// Cohort size this reader was opened with. Part of the public read
+    /// surface a field-sidecar consumer needs alongside `vk_snp_positions` /
+    /// `vk_indel_positions` to resolve `vk_src` provenance back to a record.
+    pub fn n_samples(&self) -> usize {
+        self.n_samples
+    }
+
+    /// Ploidy this reader was opened with.
+    pub fn ploidy(&self) -> usize {
+        self.ploidy
+    }
+
+    /// All `var_key/snp` absolute positions, in on-disk (packed, column-CSR)
+    /// order. Index with the absolute call index unpacked from a `vk_src`
+    /// entry (`spine::unpack_vk_src`, `is_indel == false`) to recover the
+    /// record a merged `vk` entry came from.
+    pub fn vk_snp_positions(&self) -> &[u32] {
+        self.vk_snp.positions()
+    }
+
+    /// All `var_key/indel` absolute positions, in on-disk (packed,
+    /// column-CSR) order. Index with the absolute call index unpacked from a
+    /// `vk_src` entry (`spine::unpack_vk_src`, `is_indel == true`).
+    pub fn vk_indel_positions(&self) -> &[u32] {
+        self.vk_indel.positions()
+    }
+}
+
+impl ContigReader {
     /// Raw long-allele LUT for the M6b contract: all bytes + CSR row offsets.
     /// A contig with no LUT returns empty bytes and a single `[0]` offset (an
     /// empty CSR), so the numpy side never special-cases a missing file.
@@ -116,15 +145,18 @@ impl ContigReader {
 impl ContigReader {
     /// `var_key` channel for one flat hap-column over one region: `snp`+`indel`
     /// unioned, uniform keys (SNP re-expanded via `snp_code_to_key`), sorted.
-    pub(crate) fn vk_slice(
+    /// Generic over `T: VkElem` so the no-provenance (`KeyRef`) and
+    /// provenance-carrying (`SrcKeyRef`) callers share one body; `T = KeyRef`
+    /// is zero-cost (`KeyRef::make` discards the provenance args).
+    pub(crate) fn vk_slice<T: spine::VkElem>(
         &self,
         col: usize,
         sample: usize,
         p: usize,
         q_start: u32,
         q_end: u32,
-    ) -> Vec<KeyRef> {
-        let mut runs: Vec<Vec<KeyRef>> = Vec::with_capacity(2);
+    ) -> Vec<T> {
+        let mut runs: Vec<Vec<T>> = Vec::with_capacity(2);
 
         // var_key/snp: 2-bit codes, absolute index o0 + i into the packed buffer.
         {
@@ -132,7 +164,7 @@ impl ContigReader {
             let (o0, o1) = (vk_range.start, vk_range.end);
             let positions = &self.vk_snp.positions()[o0..o1];
             let keys = as_bytes(&self.vk_snp.keys);
-            let mut run = Vec::new();
+            let mut run: Vec<T> = Vec::new();
             spine::gather_keys(
                 positions,
                 0,
@@ -155,7 +187,7 @@ impl ContigReader {
             let positions = &self.vk_indel.positions()[o0..o1];
             let keys = &as_u32(&self.vk_indel.keys)[o0..o1];
             let max_del = self.vk_indel_max_del[[sample, p]];
-            let mut run = Vec::new();
+            let mut run: Vec<T> = Vec::new();
             spine::gather_keys(
                 positions,
                 max_del,
@@ -171,7 +203,7 @@ impl ContigReader {
             runs.push(run);
         }
 
-        spine::merge_keys(runs)
+        spine::merge_by_position(runs)
     }
 
     /// The dense variants in `union[s..e]` that `hap` carries and that TRULY

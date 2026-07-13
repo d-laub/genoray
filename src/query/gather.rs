@@ -8,7 +8,7 @@ use std::ops::Range;
 
 use crate::bits;
 use crate::rvk;
-use crate::spine::{self, KeyRef};
+use crate::spine::{self, KeyRef, SrcKeyRef, VkElem};
 
 use super::decode::{HapCalls, decode_keyref};
 use super::reader::ContigReader;
@@ -103,6 +103,11 @@ pub struct BatchResultSplit {
     /// Flat merged var_key channel (snp+indel per hap); `vk_off` (len H+1) slices it.
     pub vk: Vec<KeyRef>,
     pub vk_off: Vec<usize>,
+    /// Absolute var_key provenance per `vk` record, packed by
+    /// `spine::pack_vk_src` (bit 31 = sub-stream, bits 0..=30 = call index).
+    /// **Empty** unless produced by `gather_haps_readbound_src` — the plain
+    /// gather does not pay for it.
+    pub vk_src: Vec<u32>,
     /// Per-region `dense/snp` windows (uniform keys), concatenated.
     pub dense_snp: Vec<KeyRef>,
     /// `[s, e)` into `dense_snp` per region (len n_regions).
@@ -123,43 +128,42 @@ pub struct BatchResultSplit {
 /// This is the shared body the batch/ranges/read-bound gathers previously
 /// hand-inlined. `vk_slice` already performs the union+merge for a column; this
 /// wrapper is the seam the read-bound path replays from precomputed ranges.
-pub(crate) fn gather_vk(
+pub(crate) fn gather_vk<T: VkElem>(
     reader: &ContigReader,
     vk_snp_range: Range<usize>,
     vk_indel_range: Range<usize>,
     q_start: u32,
-) -> Vec<KeyRef> {
+) -> Vec<T> {
     let snp_positions = reader.vk_snp.positions();
     let snp_keys = as_bytes(&reader.vk_snp.keys);
     let indel_positions = reader.vk_indel.positions();
     let indel_keys = as_u32(&reader.vk_indel.keys);
 
     let (ss, se) = (vk_snp_range.start, vk_snp_range.end);
-    let mut snp_run: Vec<KeyRef> = Vec::new();
+    let mut snp_run: Vec<T> = Vec::new();
     for (j, &pos) in snp_positions.iter().enumerate().take(se).skip(ss) {
         if q_start < pos + 1 {
             // snp v_end = pos + 1
-            snp_run.push(KeyRef {
-                position: pos,
-                key: rvk::snp_code_to_key(rvk::unpack_snp_key_at(snp_keys, j)),
-            });
+            snp_run.push(T::make(
+                pos,
+                rvk::snp_code_to_key(rvk::unpack_snp_key_at(snp_keys, j)),
+                false,
+                j,
+            ));
         }
     }
 
     let (is_, ie_) = (vk_indel_range.start, vk_indel_range.end);
-    let mut indel_run: Vec<KeyRef> = Vec::new();
+    let mut indel_run: Vec<T> = Vec::new();
     for j in is_..ie_ {
         let pos = indel_positions[j];
         let v_end = pos + 1 + rvk::deletion_len(indel_keys[j]);
         if q_start < v_end {
-            indel_run.push(KeyRef {
-                position: pos,
-                key: indel_keys[j],
-            });
+            indel_run.push(T::make(pos, indel_keys[j], true, j));
         }
     }
 
-    spine::merge_keys(vec![snp_run, indel_run])
+    spine::merge_by_position(vec![snp_run, indel_run])
 }
 
 /// Batched multi-region × whole-cohort query. `regions` is a list of half-open
@@ -451,8 +455,16 @@ impl<'a> HapRanges<'a> {
 /// length n_q) or per-(query,ploid) (`vk_*_range`, length n_q*ploidy, row =
 /// q*ploidy + p). Builds zero SearchTrees and never calls `dense_union()`.
 /// Returns a `BatchResultSplit` with `n_samples = 1`, hap index `q*ploidy + p`.
+///
+/// Generic over `T: VkElem`: `gather_haps_readbound` (`T = KeyRef`) is the
+/// no-provenance, zero-cost path (byte-identical to before this generic was
+/// introduced); `gather_haps_readbound_src` (`T = SrcKeyRef`) additionally
+/// populates `vk_src`.
 #[allow(clippy::needless_range_loop)]
-pub fn gather_haps_readbound(reader: &ContigReader, rb: &HapRanges<'_>) -> BatchResultSplit {
+fn gather_haps_readbound_impl<T: VkElem>(
+    reader: &ContigReader,
+    rb: &HapRanges<'_>,
+) -> BatchResultSplit {
     let region_starts = rb.region_starts;
     let orig_samples = rb.orig_samples;
     let vk_snp_range = rb.vk_snp_range;
@@ -508,7 +520,7 @@ pub fn gather_haps_readbound(reader: &ContigReader, rb: &HapRanges<'_>) -> Batch
         dense_indel_range_out.push(base..dense_indel.len());
     }
 
-    let mut vk: Vec<KeyRef> = Vec::new();
+    let mut vk: Vec<T> = Vec::new();
     let mut vk_off: Vec<usize> = vec![0];
     let mut snp_presence = PresenceBitWriter::new();
     let mut indel_presence = PresenceBitWriter::new();
@@ -542,50 +554,61 @@ pub fn gather_haps_readbound(reader: &ContigReader, rb: &HapRanges<'_>) -> Batch
             // recovers the absolute call index `unpack_snp_key_at` needs
             // against the (unsliced, 2-bit-packed) `snp_keys` buffer.
             // Capacity is pre-sized so the filter below never reallocs.
-            let mut snp_run: Vec<KeyRef> = Vec::with_capacity(ve.saturating_sub(vs));
+            let mut snp_run: Vec<T> = Vec::with_capacity(ve.saturating_sub(vs));
             for (k, &pos) in snp_positions[vs..ve].iter().enumerate() {
                 let j = vs + k;
                 if qs < pos + 1 {
-                    snp_run.push(KeyRef {
-                        position: pos,
-                        key: rvk::snp_code_to_key(rvk::unpack_snp_key_at(snp_keys, j)),
-                    });
+                    snp_run.push(T::make(
+                        pos,
+                        rvk::snp_code_to_key(rvk::unpack_snp_key_at(snp_keys, j)),
+                        false,
+                        j,
+                    ));
                 }
             }
             let (vis, vie) = (vk_indel_range[row].start, vk_indel_range[row].end);
             // Same slicing treatment: `indel_positions`/`indel_keys` are
             // both plain `&[u32]` in the same absolute index space, so a
             // paired slice iterator drops the per-element bounds checks
-            // that `indel_positions[j]`/`indel_keys[j]` incurred.
-            let mut indel_run: Vec<KeyRef> = Vec::with_capacity(vie.saturating_sub(vis));
-            for (&pos, &key) in indel_positions[vis..vie].iter().zip(&indel_keys[vis..vie]) {
+            // that `indel_positions[j]`/`indel_keys[j]` incurred. RE-ADD the
+            // absolute index the plain zip previously dropped: `T::make`
+            // needs the true absolute call index `vis + k` for provenance.
+            let mut indel_run: Vec<T> = Vec::with_capacity(vie.saturating_sub(vis));
+            for (k, (&pos, &key)) in indel_positions[vis..vie]
+                .iter()
+                .zip(&indel_keys[vis..vie])
+                .enumerate()
+            {
+                let j = vis + k;
                 let v_end = pos + 1 + rvk::deletion_len(key);
                 if qs < v_end {
-                    indel_run.push(KeyRef { position: pos, key });
+                    indel_run.push(T::make(pos, key, true, j));
                 }
             }
             // Specialized 2-way merge, provably byte-identical to
-            // `spine::merge_keys(vec![snp_run, indel_run])`: that generic
-            // k-way merge picks `best = Some(0)` (snp_run) on the first
-            // scan and only switches to run 1 (indel_run) when
-            // `!(snp_run[h0].position <= indel_run[h1].position)`, i.e.
+            // `spine::merge_by_position(vec![snp_run, indel_run])`: that
+            // generic k-way merge picks `best = Some(0)` (snp_run) on the
+            // first scan and only switches to run 1 (indel_run) when
+            // `!(snp_run[h0].position() <= indel_run[h1].position())`, i.e.
             // exactly the `<=` two-pointer comparison below (ties still
-            // favor snp_run).
+            // favor snp_run). The `VkElem` payload rides along unchanged, so
+            // this stays a mirror of the generic merge for `SrcKeyRef` as
+            // well as `KeyRef`.
             //
             // Task 3 (gather_vk extraction) benched routing this hap-major
             // loop through the shared `gather_vk` helper (which rebuilds
-            // `snp_run`/`indel_run` via `merge_keys` per call, like
+            // `snp_run`/`indel_run` via `merge_by_position` per call, like
             // `gather_ranges`/`gather_ranges_readbound` do). The readbound
             // test fixtures are too small (single-digit variant counts) for
             // a stable wall-clock signal, so the decision was made on
             // algorithmic grounds instead: unifying would reintroduce the
             // slicing/allocation costs this block was written to remove
             // (re-walking `snp_positions[0..vs]` per hap via `skip`, plus
-            // three extra allocations per hap from `merge_keys`'s
+            // three extra allocations per hap from `merge_by_position`'s
             // `vec![...]`/`heads`/`out`). This tuned merge is retained.
             let (mut si, mut ii) = (0usize, 0usize);
             while si < snp_run.len() && ii < indel_run.len() {
-                if snp_run[si].position <= indel_run[ii].position {
+                if snp_run[si].position() <= indel_run[ii].position() {
                     vk.push(snp_run[si]);
                     si += 1;
                 } else {
@@ -636,12 +659,18 @@ pub fn gather_haps_readbound(reader: &ContigReader, rb: &HapRanges<'_>) -> Batch
     let (dense_snp_present, dense_snp_present_off) = snp_presence.into_parts();
     let (dense_indel_present, dense_indel_present_off) = indel_presence.into_parts();
 
+    // Project the generic element back into the frozen (vk, vk_src) contract.
+    // For T = KeyRef this is a no-op move plus an empty `vk_src` alloc (which
+    // optimizes away); for T = SrcKeyRef it splits the payload apart.
+    let (vk, vk_src) = T::split(vk);
+
     BatchResultSplit {
         n_regions: n_q,
         n_samples: 1,
         ploidy,
         vk,
         vk_off,
+        vk_src,
         dense_snp,
         dense_snp_range: dense_snp_range_out,
         dense_snp_present,
@@ -651,6 +680,22 @@ pub fn gather_haps_readbound(reader: &ContigReader, rb: &HapRanges<'_>) -> Batch
         dense_indel_present,
         dense_indel_present_off,
     }
+}
+
+/// Flat per-query read-bound gather (see `gather_haps_readbound_impl`). Does
+/// NOT populate `vk_src` — the no-provenance path, byte-identical to
+/// pre-field behaviour and zero-cost (`KeyRef::make` discards the provenance
+/// args, so the packing in `spine::pack_vk_src` never runs).
+pub fn gather_haps_readbound(reader: &ContigReader, rb: &HapRanges<'_>) -> BatchResultSplit {
+    gather_haps_readbound_impl::<KeyRef>(reader, rb)
+}
+
+/// As `gather_haps_readbound`, but also populates `vk_src` so a consumer can
+/// map each merged var_key record back to its `(sub-stream, absolute call
+/// index)` and index a `FieldView`. This is the entry point gvl uses to read
+/// fields.
+pub fn gather_haps_readbound_src(reader: &ContigReader, rb: &HapRanges<'_>) -> BatchResultSplit {
+    gather_haps_readbound_impl::<SrcKeyRef>(reader, rb)
 }
 
 /// Fused search+gather: `find_ranges` then `gather_ranges` in one call. The
