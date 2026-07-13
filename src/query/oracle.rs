@@ -191,6 +191,7 @@ pub fn gather_ranges_readbound(reader: &ContigReader, rb: &RangesBundle) -> Batc
         ploidy,
         vk,
         vk_off,
+        vk_src: Vec::new(),
         dense_snp,
         dense_snp_range,
         dense_snp_present,

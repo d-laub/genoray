@@ -17,7 +17,7 @@ description: Use when writing or modifying Python code that imports `genoray` to
 - `genoray.VCF` — VCF/BCF reader
 - `genoray.Filter` — VCF filter value object bundling a cyvcf2 record predicate (`record`) with its matching `.gvi` polars expression (`expr`)
 - `genoray.SparseVar` — sparse `.svar` reader/writer
-- `genoray.SparseVar2` — next-gen sparse variant store (VCF/BCF → SVAR2 conversion via `from_vcf`; range queries via `decode`/`region_counts`/`read_ranges`; mutational-signature support (SBS96/DBS78/ID83) via `annotate_mutations`/`mutation_matrix`/`assign_signatures`, or classify during the write with `from_vcf(signatures=True)`; scalar-numeric INFO/FORMAT field extraction during the write via `from_vcf(info_fields=, format_fields=)`)
+- `genoray.SparseVar2` — next-gen sparse variant store (VCF/BCF → SVAR2 conversion via `from_vcf`; range queries via `decode`/`region_counts`/`read_ranges`; mutational-signature support (SBS96/DBS78/ID83) via `annotate_mutations`/`mutation_matrix`/`assign_signatures`, or classify during the write with `from_vcf(signatures=True)`; scalar-numeric INFO/FORMAT field extraction during the write via `from_vcf(info_fields=, format_fields=)`, read back opt-in via `fields=`/`with_fields`/`available_fields` and attached to `decode`'s result)
 - `genoray.InfoField` / `genoray.FormatField` — frozen dataclasses (`name`, `dtype=None`, `default=None`) configuring a single INFO/FORMAT field for `SparseVar2.from_vcf`; a bare `str` name uses inferred defaults instead
 - `genoray.exprs` — polars filter expressions for `.gvi` indexes
 - `genoray.cosmic_signatures` — fetch/cache COSMIC reference signatures
@@ -36,8 +36,8 @@ Prefer reading these over guessing:
 - `genoray/_vcf.py` — `VCF` class: constructor, `read`, `chunk`, mode constants near the top of the class; `get_record_info(contig=None, start=None, end=None, fields=None, info=None, lazy=False)` — non-FORMAT record-level fields (including INFO) for a range or the whole file, returns `pl.DataFrame` (or `pl.LazyFrame` when `lazy=True`)
 - `genoray/_pgen.py` — `PGEN` class: constructor, `read`, `chunk`, `read_ranges`, `chunk_ranges`, mode constants near the top of the class
 - `genoray/_svar.py` — `SparseVar`: `__init__`, `from_vcf`, `from_pgen`, `read_ranges`, `read_ranges_with_length(contig, starts=0, ends=POS_MAX, samples=None)` (length-guaranteed range read; returns the same type as `read_ranges` — a `Ragged` or fields-augmented record), `with_fields`, `annotate_mutations`, `mutation_matrix`, `assign_signatures`, `annotate_with_gtf(gtf, level_filter=1, write_back=True, *, strand_encoding=None, codon_null_token=None)` (GTF CDS annotation entry point, returns `pl.DataFrame` with `varID`/`gene_id`/`strand`/`codon_pos`), `cache_afs()` (computes and persists an `AF` column to the `.gvi` index; returns `None`)
-- `genoray/_svar2.py` — `SparseVar2`: `__init__`, `from_vcf` (VCF/BCF → SVAR2 conversion entry point, `signatures=` classifies during the write, `info_fields=`/`format_fields=` extract scalar-numeric fields during the write); `n_samples`/`available_samples`/`contigs`/`ploidy` metadata. Read/query methods live in the mixins: `genoray/_svar2_decode.py` (`decode`, `region_counts`), `genoray/_svar2_batch.py` (public `read_ranges`; internal gvl-only `_overlap_batch`/`_find_ranges`/`_gather_ranges`), and `genoray/_svar2_mutcat.py` (`annotate_mutations`, `mutation_matrix`, `assign_signatures` — COSMIC mutational-signature workflow, mirroring `SparseVar`'s but backed by a per-contig Rust sidecar instead of a `.gvi`-attached field)
-- `genoray/_svar2_fields.py` — `InfoField`/`FormatField` dataclasses + `FieldDtype` and the header/dtype validation used by `from_vcf(info_fields=, format_fields=)` (no public read-side API yet)
+- `genoray/_svar2.py` — `SparseVar2`: `__init__(path, *, fields=None)`, `with_fields(fields)` (new reader over the same store with those fields selected), `available_fields` (`dict[str, StoredField]`, set in `__init__`), `from_vcf` (VCF/BCF → SVAR2 conversion entry point, `signatures=` classifies during the write, `info_fields=`/`format_fields=` extract scalar-numeric fields during the write); `n_samples`/`available_samples`/`contigs`/`ploidy` metadata. Read/query methods live in the mixins: `genoray/_svar2_decode.py` (`decode` — attaches one `Ragged` per selected field, `region_counts`), `genoray/_svar2_batch.py` (public `read_ranges`; internal gvl-only `_overlap_batch`/`_find_ranges`/`_gather_ranges`), and `genoray/_svar2_mutcat.py` (`annotate_mutations`, `mutation_matrix`, `assign_signatures` — COSMIC mutational-signature workflow, mirroring `SparseVar`'s but backed by a per-contig Rust sidecar instead of a `.gvi`-attached field)
+- `genoray/_svar2_fields.py` — `InfoField`/`FormatField` dataclasses + `FieldDtype` and the header/dtype validation used by `from_vcf(info_fields=, format_fields=)`; `StoredField` (frozen dataclass: `name`, `category`, `dtype`, `default`, `key`) is the read-side manifest entry type returned by `SparseVar2.available_fields` — not exported at top-level `genoray`, only reached via that dict
 - `genoray/_cli/__main__.py` — the `genoray` CLI (`index`, `write` / `write svar1`, `view`)
 - `genoray/_signatures.py` — `cosmic_signatures`, `fit_signatures`
 - `genoray/_reference.py` — `Reference`: `from_path`, `fetch`, `contig_array`
@@ -311,10 +311,9 @@ Signature: `from_vcf(out, source, reference=None, *, no_reference=False, skip_ou
     dense-routed variants. Non-carrier FORMAT values (e.g. an imputed
     dosage at a ref/ref genotype) are **dropped by design** in this version;
     an independent lossless FORMAT stream is deferred to a future spec.
-  - **No read path yet** — this only controls what gets written. Querying
-    stored field values back out (a decode/query API) is not implemented;
-    see `meta.json`'s `"fields"` array and `docs/roadmap/data-model.md` for
-    the on-disk layout if you need to inspect values directly.
+  - **Read path:** see "Reading INFO/FORMAT fields (SVAR2)" below —
+    `SparseVar2(path, fields=…)` / `.with_fields(…)` / `.available_fields`
+    opt into decoding these back out via `decode()`.
 
 ### Range queries
 
@@ -331,7 +330,9 @@ regions = [(0, 40), (1_000, 2_000)]   # 0-based half-open [start, end)
 
 # Analysis path — decode to a seqpro Ragged record (one call per contig)
 rag = sv.decode("chr1", regions)      # fields pos (i32), ilen (i32), allele (ALT bytes)
-                                      # shape (R, S, P, None); pure-DEL ALT is empty
+                                      # + one per selected field (see "Reading
+                                      # INFO/FORMAT fields" below); shape
+                                      # (R, S, P, None); pure-DEL ALT is empty
 
 # Decode-free per-(region, sample, ploid) variant count — replaces SVAR 1.0's var_ranges
 counts = sv.region_counts("chr1", regions)   # np.ndarray, shape (R, S, P)
@@ -362,6 +363,50 @@ scalars `n_regions`/`n_samples`/`ploidy`.
 the search/gather split used by a write-time overlap cache. They are **not**
 part of the public API, are not covered by semver, and may change or
 disappear without notice; don't call them from user code.
+
+### Reading INFO/FORMAT fields (SVAR2)
+
+Fields written by `from_vcf(info_fields=…, format_fields=…)` (above) are read
+back by opting in — they are **not** decoded by default (each one costs extra
+I/O).
+
+```python
+sv = SparseVar2("out.svar2")
+sv.available_fields                    # {"AF": StoredField(...), "DS": StoredField(...)}
+
+sv = sv.with_fields(["AF", "DS"])       # or SparseVar2("out.svar2", fields=["AF", "DS"])
+rag = sv.decode("chr1", [(0, 10_000)])
+rag["AF"]                              # Ragged, sharing offsets with pos/ilen/allele
+```
+
+- `SparseVar2(path, *, fields=None)` / `.with_fields(fields)` — `fields` is a
+  `Sequence[str]` of canonical keys (see `available_fields` below).
+  `with_fields` returns a **new** `SparseVar2` over the same store; it does
+  not mutate the original in place. `fields=None` (the constructor default)
+  selects nothing — fields are opt-in.
+- `available_fields -> dict[str, StoredField]` — every field declared in the
+  store's `meta.json`, keyed canonically: the bare field name when it is
+  unique across INFO and FORMAT, else bcftools-style `INFO/DP` / `FORMAT/DP`
+  when a name is used by both categories. `StoredField` (defined in
+  `genoray._svar2_fields`, not exported at top-level `genoray`) is a frozen
+  dataclass: `name`, `category` (`"info"`/`"format"`), `dtype` (`np.dtype`),
+  `default` (`float | None`), `key`.
+- `decode(contig, regions)` attaches one `Ragged` per selected field to the
+  returned record `Ragged`, alongside `pos`/`ilen`/`allele` — every one
+  sharing a single variant-axis offsets object, shape `(R, S, P, None)`.
+  Access a field's data via `rag["KEY"]` (`Ragged.__getitem__`), **not**
+  `rag.fields["KEY"]` — `Ragged.fields` is just the `list[str]` of field
+  names on the record.
+- **Dtype is preserved as stored.** SVAR2 losslessly auto-narrows integer
+  fields at write time, so e.g. an `AC` field may come back as `int8`;
+  nothing is widened on read.
+- **Missing values** are the field's `default` if one was set at write time,
+  else a reserved sentinel (`NaN` for floats, `iinfo.min`/`iinfo.max` for
+  ints) — returned as-is, never translated.
+- FORMAT fields are genotype-aligned (see `from_vcf`'s `format_fields=`
+  above) — `decode()` only ever emits carrier records, so the "non-carrier
+  values aren't stored" caveat from the write path is invisible on this
+  read surface.
 
 ### Mutational signatures (SBS96 / DBS78 / ID83)
 
@@ -755,6 +800,8 @@ plotting.
 | Calling `write_view` and expecting `mutcat` to be in the output | `write_view` **never** copies `mutcat` positionally (subsetting invalidates DBS adjacency codes). Pass `reference=` to `write_view` to recompute it on the subset, or call `annotate_mutations` on the output view yourself. Explicitly including `"mutcat"` in `fields=` without a `reference=` raises `ValueError`. |
 | Passing the source dataset directory as `output` to `write_view` (even with `overwrite=True`) | Raises `ValueError` — writing in place would delete the source before the view is written. Pass a different `output` path. |
 | Passing a FASTA path directly to `annotate_mutations` | Supported — it auto-wraps via `Reference.from_path` |
+| `rag.fields["AF"]` on a `SparseVar2.decode()` result | `Ragged.fields` is a `list[str]` of names, not a mapping; index the field itself with `rag["AF"]` |
+| Expecting `SparseVar2.decode()` to include INFO/FORMAT fields | Fields are opt-in — pass `fields=[...]` to `SparseVar2(...)` or call `.with_fields([...])` first |
 
 ## When this skill needs updating
 

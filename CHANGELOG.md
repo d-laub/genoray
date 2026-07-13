@@ -13,8 +13,27 @@
   `Flag`'s `Number=0`); integer widths are losslessly auto-narrowed to the
   observed range by default, `f16` is opt-in and lossy. FORMAT storage is
   genotype-aligned — values at non-carrier genotypes are dropped, not stored
-  independently. Write-only in this release; a query/decode API for stored
-  fields is deferred to a follow-up.
+  independently. A read/decode API for these stored fields is added below
+  (`SparseVar2.available_fields`/`with_fields`/`fields=`).
+- **SVAR2: read INFO/FORMAT fields.** `SparseVar2(path, fields=…)` /
+  `SparseVar2.with_fields(…)` / `SparseVar2.available_fields` opt a reader
+  into decoding fields written by `from_vcf(info_fields=, format_fields=)`;
+  fields are **not** decoded by default (each one costs extra I/O).
+  `SparseVar2.decode()` now attaches one `Ragged` per selected field to its
+  result, sharing the same variant-axis offsets object as `pos`/`ilen`/
+  `allele` (access via `rag["KEY"]`). Values come back in the dtype they are
+  stored as (no widening — an auto-narrowed field may be `int8`); missing
+  entries keep the store's `default` or its reserved sentinel
+  (`NaN`/`iinfo.min`/`iinfo.max`), returned as-is. Field keys are the bare
+  name when unique across INFO/FORMAT, else bcftools-style `INFO/DP` /
+  `FORMAT/DP` when a name is used by both categories. New `StoredField`
+  dataclass (`genoray._svar2_fields`) is the manifest entry type
+  `available_fields` returns.
+- **Public Rust read API** for consumers that do their own channel merge
+  (e.g. GenVarLoader): `query::FieldView` (mmap reader over a field's
+  `values.bin`), `vk_src` provenance on `BatchResult`/`BatchResultSplit` via
+  `query::gather_haps_readbound_src` / `query::overlap_batch_src`, plus
+  `query::dense_abs_row`.
 - SVAR2 field write internals: the finalize pass streams staged values
   through `chunks_exact` (no intermediate `Vec<f64>` materialization) and
   runs in parallel across fields/files; the var_key and pos/key merges now
