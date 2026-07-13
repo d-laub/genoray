@@ -254,6 +254,20 @@ fn field_provenance_reader(out: &std::path::Path) -> ContigReader {
             alts: vec![&b"C"[..]],
             gt: vec![1, 1, 1, 1],
         },
+        // var_key/snp tie-break probe: AC=1, at the SAME position (150) as the
+        // dense/snp record above, carried by the SAME hap (S0,p0 — the dense
+        // record's gt is all-1s, so it always carries too). A flipped
+        // `decode_hap_src` tie-break (`<=` -> `<` at the var_key/dense merge)
+        // would swap this pair's order — undetectable by
+        // `decode_hap_src_matches_decode_hap_order` without this collision,
+        // since every other position in this fixture is unique. Different ALT
+        // (T vs C) makes the two records distinguishable in `hc.alts`.
+        SynthRecord {
+            pos: 150,
+            ref_allele: b"A",
+            alts: vec![&b"T"[..]],
+            gt: vec![1, 0, 0, 0],
+        },
         // dense/snp: AC=2, partial carriage -> exercises a mixed presence row.
         // Different ALT than the pos-150 record so a wrong-allele bug would
         // be caught by a decode-level comparison.
@@ -382,4 +396,200 @@ fn decode_hap_src_matches_decode_hap_order() {
             assert_eq!(srcs.len(), b.positions.len());
         }
     }
+}
+
+/// Explicit pin for the var_key/dense position tie at hap (S0, p0): the
+/// var_key/snp AC=1 record (ALT `T`) and the dense/snp AC=4 record (ALT `C`)
+/// both sit at position 150 and are both carried by this hap (AC=4's gt is
+/// all-1s). Per the merge's documented contract (`decode_hap`'s
+/// `spine::merge_keys`, mirrored by `decode_hap_src`'s two-pointer merge),
+/// var_key must win the tie and come first.
+///
+/// `decode_hap_src_matches_decode_hap_order` above already catches a flipped
+/// tie-break generically (its `assert_eq!(a.alts, b.alts)` would fail, since
+/// `decode_hap` — untouched — still orders var_key first), but this test
+/// pins the expected order directly and verifies the fixture actually routed
+/// each AC to the class this test assumes, rather than assuming it.
+#[test]
+fn decode_hap_src_pins_var_key_dense_position_tie() {
+    let tmp = tempdir().unwrap();
+    let out = tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let reader = field_provenance_reader(&out);
+    let regions = [(0u32, 1_000_000u32)];
+    let br = overlap_batch_src(&reader, &regions);
+
+    // Class-routing guard: verify, don't assume.
+    assert!(
+        reader.vk_snp_positions().contains(&150),
+        "the AC=1 record at 150 must have routed to var_key/snp"
+    );
+
+    let (hc, srcs) = br.decode_hap_src(&reader, 0, 0, 0);
+    let at_150: Vec<usize> = hc
+        .positions
+        .iter()
+        .enumerate()
+        .filter(|&(_, &p)| p == 150)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        at_150.len(),
+        2,
+        "both records at position 150 must be carried by hap (S0,p0)"
+    );
+    let (i0, i1) = (at_150[0], at_150[1]);
+
+    assert!(!srcs[i0].is_dense, "var_key must win the position tie");
+    assert_eq!(hc.alts[i0], b"T", "var_key entry's ALT");
+    assert!(srcs[i1].is_dense, "dense must come second on the tie");
+    assert_eq!(hc.alts[i1], b"C", "dense entry's ALT");
+}
+
+// --- Task 8 fix pass (Finding 3): pin `decode_batch_fields`'s emitted BYTES,
+// not just that it builds. `gather_field_bytes`/`OpenField` are plain Rust
+// (no `Python<'py>`), so this needs no GIL. -----------------------------
+
+use genoray_core::layout::{ContigPaths, FieldSub};
+use genoray_core::py_query_decode::{OpenField, gather_field_bytes};
+
+fn write_field_i32(paths: &ContigPaths, category: &str, name: &str, sub: FieldSub, vals: &[i32]) {
+    let p = paths.field_values(category, name, sub);
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+    std::fs::write(&p, bytes).unwrap();
+}
+
+/// `decode_batch_fields`'s Rust core (`OpenField::open` + `gather_field_bytes`)
+/// must gather the right byte for the right record — through all four
+/// provenance classes (var_key snp/indel, dense snp/indel) and through the
+/// dense-FORMAT `(row, orig_sample)` stride, which is the one bug class a
+/// build-only smoke test cannot catch. Every written value is distinct (per
+/// field, class-offset + index) so a wrong index reads a wrong-but-plausible
+/// value instead of accidentally still matching.
+#[test]
+fn gather_field_bytes_pins_bytes_per_class_and_dense_format_stride() {
+    let tmp = tempdir().unwrap();
+    let out = tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let reader = field_provenance_reader(&out);
+    let n_samples = reader.n_samples();
+    assert_eq!(n_samples, 2, "fixture is a fixed 2-sample cohort");
+
+    // Per-class call/row counts — verified via the reader's own accessors for
+    // var_key, and via the already-pinned dense row layout
+    // (`decode_hap_src_is_aligned_with_decoded_records`'s
+    // `dense_snp_expected`/`dense_indel_expected`, unaffected by the Finding-2
+    // var_key addition above) for dense.
+    let n_vk_snp = reader.vk_snp_positions().len();
+    let n_vk_indel = reader.vk_indel_positions().len();
+    assert_eq!(n_vk_snp, 2, "var_key/snp: pos-100 and pos-150 AC=1 records");
+    assert_eq!(n_vk_indel, 1, "var_key/indel: the pos-130 AC=1 record");
+    let n_dense_snp = 2usize; // rows: pos150 (AC=4), pos175 (AC=2)
+    let n_dense_indel = 2usize; // rows: pos200 (AC=3 ins), pos300 (AC=3 del)
+
+    // --- INFO field "IV" (i32): one value per (class, call/row), disjoint
+    // ranges per class so a cross-class index bug reads an out-of-range value.
+    let vk_snp_iv: Vec<i32> = (0..n_vk_snp as i32).map(|i| 100 + i).collect();
+    let vk_indel_iv: Vec<i32> = (0..n_vk_indel as i32).map(|i| 200 + i).collect();
+    let dense_snp_iv: Vec<i32> = (0..n_dense_snp as i32).map(|i| 300 + i).collect();
+    let dense_indel_iv: Vec<i32> = (0..n_dense_indel as i32).map(|i| 400 + i).collect();
+
+    let paths = ContigPaths::new(out.to_str().unwrap(), "chr1");
+    write_field_i32(&paths, "info", "IV", FieldSub::VkSnp, &vk_snp_iv);
+    write_field_i32(&paths, "info", "IV", FieldSub::VkIndel, &vk_indel_iv);
+    write_field_i32(&paths, "info", "IV", FieldSub::DenseSnp, &dense_snp_iv);
+    write_field_i32(&paths, "info", "IV", FieldSub::DenseIndel, &dense_indel_iv);
+
+    // --- FORMAT field "DP" (i32): var_key is per-call (no sample stride, per
+    // the cost model: FORMAT is paid per carrier call in var_key); dense is
+    // per (row, orig_sample) — `value = 5000 + row*10 + sample`, so samples
+    // DIFFER at the same row. This is the assertion that catches a missing or
+    // wrong dense-FORMAT stride.
+    let vk_snp_dp: Vec<i32> = (0..n_vk_snp as i32).map(|i| 600 + i).collect();
+    let vk_indel_dp: Vec<i32> = (0..n_vk_indel as i32).map(|i| 700 + i).collect();
+    let mut dense_snp_dp: Vec<i32> = Vec::with_capacity(n_dense_snp * n_samples);
+    for row in 0..n_dense_snp {
+        for s in 0..n_samples {
+            dense_snp_dp.push((5000 + row * 10 + s) as i32);
+        }
+    }
+    let mut dense_indel_dp: Vec<i32> = Vec::with_capacity(n_dense_indel * n_samples);
+    for row in 0..n_dense_indel {
+        for s in 0..n_samples {
+            dense_indel_dp.push((8000 + row * 10 + s) as i32);
+        }
+    }
+    write_field_i32(&paths, "format", "DP", FieldSub::VkSnp, &vk_snp_dp);
+    write_field_i32(&paths, "format", "DP", FieldSub::VkIndel, &vk_indel_dp);
+    write_field_i32(&paths, "format", "DP", FieldSub::DenseSnp, &dense_snp_dp);
+    write_field_i32(
+        &paths,
+        "format",
+        "DP",
+        FieldSub::DenseIndel,
+        &dense_indel_dp,
+    );
+
+    let regions = [(0u32, 1_000_000u32)];
+    let br = overlap_batch_src(&reader, &regions);
+
+    let iv = OpenField::open(&paths, "info", "IV", "i32", n_samples).unwrap();
+    let dp = OpenField::open(&paths, "format", "DP", "i32", n_samples).unwrap();
+    let fields = vec![iv, dp];
+    let fbytes = gather_field_bytes(&reader, &br, &fields);
+    assert_eq!(fbytes.len(), 2);
+
+    // Independently replicate the expected bytes via the SAME provenance
+    // (`decode_hap_src`) `gather_field_bytes` itself uses, but computing the
+    // expected value here rather than calling into the code under test.
+    let mut expect_iv: Vec<u8> = Vec::new();
+    let mut expect_dp: Vec<u8> = Vec::new();
+    let mut n_records = 0usize;
+    for r in 0..br.n_regions {
+        for s in 0..br.n_samples {
+            for p in 0..br.ploidy {
+                let (_, srcs) = br.decode_hap_src(&reader, r, s, p);
+                for src in &srcs {
+                    n_records += 1;
+                    let iv_val = match (src.is_dense, src.is_indel) {
+                        (false, false) => vk_snp_iv[src.idx],
+                        (false, true) => vk_indel_iv[src.idx],
+                        (true, false) => dense_snp_iv[src.idx],
+                        (true, true) => dense_indel_iv[src.idx],
+                    };
+                    expect_iv.extend_from_slice(&iv_val.to_le_bytes());
+
+                    let dp_val = match (src.is_dense, src.is_indel) {
+                        (false, false) => vk_snp_dp[src.idx],
+                        (false, true) => vk_indel_dp[src.idx],
+                        // Dense: format_at(row, orig_sample) == row*n_samples + orig_sample.
+                        (true, false) => dense_snp_dp[src.idx * n_samples + s],
+                        (true, true) => dense_indel_dp[src.idx * n_samples + s],
+                    };
+                    expect_dp.extend_from_slice(&dp_val.to_le_bytes());
+                }
+            }
+        }
+    }
+
+    assert_eq!(fbytes[0], expect_iv, "INFO field bytes mismatch");
+    assert_eq!(fbytes[1], expect_dp, "FORMAT field bytes mismatch");
+    assert_eq!(
+        fbytes[0].len(),
+        n_records * 4,
+        "field_bytes.len() must equal n_records * itemsize"
+    );
+    assert_eq!(fbytes[1].len(), n_records * 4);
+
+    // Sanity: this fixture must actually exercise a dense record carried by
+    // BOTH samples with DIFFERING per-sample DP values (else the dense-FORMAT
+    // stride assertion above would pass vacuously). The AC=4 dense/snp record
+    // at row 0 (pos 150) is carried by every hap, so both s=0 and s=1 read it.
+    let row0 = 0usize;
+    assert_ne!(
+        dense_snp_dp[row0 * n_samples],
+        dense_snp_dp[row0 * n_samples + 1],
+        "row-0 DP must differ across samples for the stride test to be meaningful"
+    );
 }

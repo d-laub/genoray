@@ -93,6 +93,12 @@ pub struct BatchResult {
     /// concatenated; `dense_present_off` (len H+1) holds BIT offsets.
     pub dense_present: Vec<u8>,
     pub dense_present_off: Vec<usize>,
+    /// Per-entry dense provenance, parallel to `dense`: `(is_indel, per-class
+    /// dense row)`. **Empty** unless produced by `overlap_batch_src` — the
+    /// plain path does not pay for it. Lets `decode_hap_src` resolve dense
+    /// provenance via an O(1) index into this vec instead of rebuilding the
+    /// whole-contig dense union.
+    pub dense_src: Vec<(bool, u32)>,
 }
 
 /// Read-bound analog of `BatchResult`: the var_key channel merged per hap (as
@@ -190,11 +196,34 @@ pub fn overlap_batch_src(reader: &ContigReader, regions: &[(u32, u32)]) -> Batch
     overlap_batch_impl::<SrcKeyRef>(reader, regions)
 }
 
+/// Local extension of `spine::VkElem` (kept in `gather.rs` rather than
+/// `spine.rs` since this is purely a gather-level concern): whether `T` is the
+/// provenance-carrying element type. Gates `BatchResult::dense_src`
+/// population the same way `T::split` gates `vk_src` — `KeyRef`'s impl is
+/// `false` so the plain `overlap_batch`/`gather_ranges` path never builds it,
+/// `SrcKeyRef`'s is `true` so `overlap_batch_src` does. Implementing a local
+/// trait for `spine`'s types is fine under the orphan rule (same crate).
+trait DenseSrcElem: VkElem {
+    const CARRIES_SRC: bool;
+}
+
+impl DenseSrcElem for KeyRef {
+    const CARRIES_SRC: bool = false;
+}
+
+impl DenseSrcElem for SrcKeyRef {
+    const CARRIES_SRC: bool = true;
+}
+
 /// Shared body of `overlap_batch`/`overlap_batch_src`, generic over `T: VkElem`
 /// the same way `gather_haps_readbound_impl` is (see that function's doc
 /// comment). The only difference from the original monomorphic
-/// `overlap_batch` is `reader.vk_slice::<T>(...)` and the final `T::split(vk)`.
-fn overlap_batch_impl<T: VkElem>(reader: &ContigReader, regions: &[(u32, u32)]) -> BatchResult {
+/// `overlap_batch` is `reader.vk_slice::<T>(...)`, the final `T::split(vk)`,
+/// and (for `dense_src`) `T::CARRIES_SRC`.
+fn overlap_batch_impl<T: DenseSrcElem>(
+    reader: &ContigReader,
+    regions: &[(u32, u32)],
+) -> BatchResult {
     let ploidy = reader.ploidy;
     let n_samples = reader.n_samples;
     let n_regions = regions.len();
@@ -241,6 +270,21 @@ fn overlap_batch_impl<T: VkElem>(reader: &ContigReader, regions: &[(u32, u32)]) 
     // — see `gather_haps_readbound_impl`'s identical final step.
     let (vk, vk_src) = T::split(vk);
 
+    // Capture dense provenance ONCE, here, where `dense` (the whole-contig
+    // union) is already built exactly once per query — this is what lets
+    // `decode_hap_src` avoid ever calling `dense_union()` itself. Only paid
+    // for on the provenance-carrying path (`T::CARRIES_SRC`); the plain path
+    // stays a `Vec::new()`.
+    let dense_src: Vec<(bool, u32)> = if T::CARRIES_SRC {
+        dense
+            .src
+            .iter()
+            .map(|&(class, col)| (matches!(class, crate::dense::DenseClass::Indel), col as u32))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     BatchResult {
         n_regions,
         n_samples,
@@ -252,6 +296,7 @@ fn overlap_batch_impl<T: VkElem>(reader: &ContigReader, regions: &[(u32, u32)]) 
         dense_range: ranges,
         dense_present,
         dense_present_off,
+        dense_src,
     }
 }
 
@@ -415,6 +460,7 @@ pub fn gather_ranges(reader: &ContigReader, rb: &RangesBundle) -> BatchResult {
         dense_range: rb.dense_range.clone(),
         dense_present,
         dense_present_off,
+        dense_src: Vec::new(),
     }
 }
 
@@ -813,6 +859,11 @@ impl BatchResult {
             self.vk.len(),
             "decode_hap_src requires a BatchResult from overlap_batch_src"
         );
+        assert_eq!(
+            self.dense_src.len(),
+            self.dense.len(),
+            "decode_hap_src requires a BatchResult from overlap_batch_src"
+        );
         let h = (r * self.n_samples + s) * self.ploidy + p;
 
         // var_key run for this hap, carrying provenance.
@@ -831,25 +882,22 @@ impl BatchResult {
             })
             .collect();
 
-        // Dense run: present entries of this region's window. `dense.src[j]`
-        // holds `(class, per-class row)` — the index a dense field's
-        // `values.bin` is aligned to (see `FieldView::value_at`/`format_at`).
-        // Rebuilding the union here mirrors `overlap_batch_src`'s inputs
-        // exactly (same reader, same deterministic sort), so `dense.refs[j]`
-        // is guaranteed identical to `self.dense[j]`.
-        let dense = reader.dense_union();
+        // Dense run: present entries of this region's window. `self.dense_src[j]`
+        // already holds `(is_indel, per-class row)` — captured ONCE by
+        // `overlap_batch_src` — so this is a plain index, no `dense_union()`
+        // rebuild (that would be an O(contig) sort per call).
         let (ds, de) = (self.dense_range[r].start, self.dense_range[r].end);
         let bit0 = self.dense_present_off[h];
         let mut dn_run: Vec<(KeyRef, RecordSrc)> = Vec::new();
         for (k, j) in (ds..de).enumerate() {
             if bits::get_bit(&self.dense_present, bit0 + k) {
-                let (class, dcol) = dense.src[j];
+                let (is_indel, dcol) = self.dense_src[j];
                 dn_run.push((
                     self.dense[j],
                     RecordSrc {
                         is_dense: true,
-                        is_indel: matches!(class, crate::dense::DenseClass::Indel),
-                        idx: dcol,
+                        is_indel,
+                        idx: dcol as usize,
                     },
                 ));
             }
@@ -915,6 +963,7 @@ mod tests {
             dense_range: vec![0..0],
             dense_present: vec![],
             dense_present_off: vec![0, 0, 0, 0, 0],
+            dense_src: vec![],
         };
         let h = br.n_regions * br.n_samples * br.ploidy;
         assert_eq!(br.vk_off.len(), h + 1);
