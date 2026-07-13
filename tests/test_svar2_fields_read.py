@@ -171,6 +171,51 @@ def test_decode_with_fields_shares_offsets_and_preserves_dtype(store_with_fields
     assert ds.offsets is pos.offsets
 
 
+def test_decode_field_values_match_fixture(store_with_fields):
+    """Pin decoded field VALUES against what the fixture wrote.
+
+    The sibling test above (`..._shares_offsets_and_preserves_dtype`) checks
+    dtype/shape/offset-identity but never a concrete value, so it can't catch
+    a bug isolated to the Rust->Python FFI boundary (raw bytes ->
+    `u8_to_pyarray` -> `.view(dtype)` -> `Ragged`) — e.g. an endianness slip,
+    a wrong `.view(dtype)`, or a byte-length/offset misalignment. This test
+    independently pins expected values straight from the fixture's
+    `record(...)` call (not recomputed from the decode output).
+
+    Fixture ground truth (see `store_with_fields` above):
+      - genotypes: s1 = 0|1 (hap0 REF, hap1 ALT), s2 = 1|1 (hap0 ALT, hap1 ALT)
+      - INFO AF = 0.25 for the single variant -> every emitted record carries it
+      - FORMAT DS is per-sample: s1 wrote 0.4, s2 wrote 1.9
+
+    `decode()`'s carrier-only semantics (only ALT-carrying haplotypes emit a
+    record — see `_svar2_decode.py` sharing one offsets object across all
+    fields) mean s1-hap0 contributes ZERO records, while s1-hap1, s2-hap0,
+    s2-hap1 each contribute one. `Ragged.lengths` reshapes to `(R, S, P)` in
+    C order (`seqpro/rag/_core.py`), so the flat cell order is
+    (s1,h0), (s1,h1), (s2,h0), (s2,h1) — this is the same layout
+    `test_svar2_decode.py::test_decode_record_shape_and_counts` documents.
+    """
+    sv = store_with_fields.with_fields(["AF", "DS"])
+    rag = sv.decode("chr1", [(0, 1_000_000)])
+
+    # Per-(sample, ploid) record counts, flat row-major (R,S,P): only
+    # ALT-carrying haplotypes emit a record.
+    lengths = rag["pos"].lengths.reshape(-1)
+    assert lengths.tolist() == [0, 1, 1, 1]  # s1h0, s1h1, s2h0, s2h1
+
+    # INFO AF is per-variant: every one of the 3 emitted records carries the
+    # single value the fixture declared for this variant's only ALT allele.
+    af = np.asarray(rag["AF"].data)
+    np.testing.assert_array_equal(af, np.full(3, 0.25, dtype=np.float32))
+
+    # FORMAT DS is sample-aligned: s1's lone record (hap1) must carry s1's
+    # value (0.4); s2's two records (hap0, hap1) must both carry s2's value
+    # (1.9). A dropped sample-stride or byte-misalignment at the FFI
+    # boundary would surface here as a wrong/shifted value.
+    ds = np.asarray(rag["DS"].data)
+    np.testing.assert_array_equal(ds, np.array([0.4, 1.9, 1.9], dtype=np.float32))
+
+
 def test_decode_rejects_unknown_field(store_with_fields):
     with pytest.raises(ValueError, match="NOPE"):
         store_with_fields.with_fields(["NOPE"])
