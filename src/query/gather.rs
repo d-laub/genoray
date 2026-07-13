@@ -698,6 +698,20 @@ pub fn gather_haps_readbound_src(reader: &ContigReader, rb: &HapRanges<'_>) -> B
     gather_haps_readbound_impl::<SrcKeyRef>(reader, rb)
 }
 
+/// Absolute dense **variant row** for entry `i` of a `BatchResultSplit` dense
+/// window — the index a `dense_snp`/`dense_indel` field `values.bin` is aligned
+/// to (INFO: `value_at(row)`; FORMAT: `format_at(row, orig_sample)`).
+///
+/// Dense provenance needs no extra state: each per-region window is a contiguous
+/// copy of the on-disk slice, so the absolute row is pure arithmetic.
+/// `on_disk` is `HapRanges::dense_*_range[q]`; `out` is
+/// `BatchResultSplit::dense_*_range[q]`; `i` indexes into `out`.
+#[inline]
+pub fn dense_abs_row(on_disk: &Range<usize>, out: &Range<usize>, i: usize) -> usize {
+    debug_assert!(out.contains(&i), "i must index into the output window");
+    on_disk.start + (i - out.start)
+}
+
 /// Fused search+gather: `find_ranges` then `gather_ranges` in one call. The
 /// public/live-query analog of the split; byte-identical to `overlap_batch`
 /// when `samples = None`, and the parity oracle for sample subsetting.
