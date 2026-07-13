@@ -22,6 +22,7 @@ def test_view_single_region_single_sample(tmp_path: Path, tiny_svar: Path):
     r = _run(
         [
             "view",
+            "svar1",
             str(tiny_svar),
             str(out),
             "-r",
@@ -45,6 +46,7 @@ def test_view_bed_and_sample_file(tmp_path: Path, tiny_svar: Path):
     r = _run(
         [
             "view",
+            "svar1",
             str(tiny_svar),
             str(out),
             "-R",
@@ -63,6 +65,7 @@ def test_view_regions_comma_list(tmp_path: Path, tiny_svar: Path):
     r = _run(
         [
             "view",
+            "svar1",
             str(tiny_svar),
             str(out),
             "-r",
@@ -85,7 +88,7 @@ def test_view_regions_comma_list(tmp_path: Path, tiny_svar: Path):
 
 def test_view_no_args_errors(tmp_path: Path, tiny_svar: Path):
     out = tmp_path / "view.svar"
-    r = _run(["view", str(tiny_svar), str(out)])
+    r = _run(["view", "svar1", str(tiny_svar), str(out)])
     assert r.returncode != 0
     assert "at least one of" in (r.stderr + r.stdout).lower()
 
@@ -95,6 +98,7 @@ def test_view_regions_only_uses_all_samples(tmp_path: Path, tiny_svar: Path):
     r = _run(
         [
             "view",
+            "svar1",
             str(tiny_svar),
             str(out),
             "-r",
@@ -113,6 +117,7 @@ def test_view_samples_only_uses_all_variants(tmp_path: Path, tiny_svar: Path):
     r = _run(
         [
             "view",
+            "svar1",
             str(tiny_svar),
             str(out),
             "-s",
@@ -152,14 +157,18 @@ def test_view_missing_source_errors(tmp_path: Path):
 
 def test_view_missing_samples_file_errors(tmp_path: Path, tiny_svar: Path):
     out = tmp_path / "view.svar"
-    r = _run(["view", str(tiny_svar), str(out), "-S", str(tmp_path / "nope.txt")])
+    r = _run(
+        ["view", "svar1", str(tiny_svar), str(out), "-S", str(tmp_path / "nope.txt")]
+    )
     assert r.returncode != 0
     assert "does not exist" in (r.stderr + r.stdout).lower()
 
 
 def test_view_missing_regions_file_errors(tmp_path: Path, tiny_svar: Path):
     out = tmp_path / "view.svar"
-    r = _run(["view", str(tiny_svar), str(out), "-R", str(tmp_path / "nope.bed")])
+    r = _run(
+        ["view", "svar1", str(tiny_svar), str(out), "-R", str(tmp_path / "nope.bed")]
+    )
     assert r.returncode != 0
     assert "does not exist" in (r.stderr + r.stdout).lower()
 
@@ -175,7 +184,7 @@ def _dir_digest(root: Path) -> dict[str, bytes]:
 def test_view_progress_flag_byte_identical(tmp_path: Path, tiny_svar: Path):
     out_a = tmp_path / "a.svar"
     out_b = tmp_path / "b.svar"
-    base = ["view", str(tiny_svar)]
+    base = ["view", "svar1", str(tiny_svar)]
     region = ["-r", "chr1:1-100", "-s", "A"]
     r1 = _run([*base, str(out_a), *region])
     r2 = _run([*base, str(out_b), *region, "--progress"])

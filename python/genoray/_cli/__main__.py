@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from importlib.metadata import version
 from pathlib import Path
-from typing import Annotated, Any, Callable, Literal
+from typing import Annotated, Any, Callable, Literal, cast
 
 import polars as pl
 from cyclopts import App, Parameter, validators
@@ -262,8 +262,167 @@ def write_svar1(
         raise ValueError(f"Unsupported file type: {source}")
 
 
-@app.command
-def view(
+view = App(
+    name="view",
+    help="Write a region/sample subset of an SVAR2 store (SVAR1 via `view svar1`).",
+)
+app.command(view)
+
+
+@view.default
+def view_svar2(
+    source: Annotated[
+        Path,
+        Parameter(
+            validator=validators.Path(exists=True, dir_okay=True, file_okay=False)
+        ),
+    ],
+    out: Path,
+    *,
+    regions: Annotated[str | None, Parameter(name=["--regions", "-r"])] = None,
+    regions_file: Annotated[
+        Path | None,
+        Parameter(
+            name=["--regions-file", "-R"],
+            validator=validators.Path(exists=True, dir_okay=False, file_okay=True),
+        ),
+    ] = None,
+    samples: Annotated[str | None, Parameter(name=["--samples", "-s"])] = None,
+    samples_file: Annotated[
+        Path | None,
+        Parameter(
+            name=["--samples-file", "-S"],
+            validator=validators.Path(exists=True, dir_okay=False, file_okay=True),
+        ),
+    ] = None,
+    fields: Annotated[list[str] | None, Parameter(name=["--fields", "-f"])] = None,
+    reference: Annotated[Path | None, Parameter(name="--reference")] = None,
+    merge_overlapping: bool = False,
+    regions_overlap: Literal["pos", "record", "variant"] = "pos",
+    reroute: bool = True,
+    overwrite: bool = False,
+    threads: Annotated[int | None, Parameter(name=["--threads", "-@"])] = None,
+    progress: bool = False,
+) -> None:
+    """Write a region/sample subset of an SVAR2 store.
+
+    At least one of --regions/--regions-file or --samples/--samples-file is
+    required. The omitted side defaults to "all" (all samples or all variants,
+    the latter meaning one region per contig spanning that contig).
+
+    Parameters
+    ----------
+    source
+        Path to the input SVAR2 directory.
+    out
+        Path to the output SVAR2 directory.
+    regions
+        Inline region(s): a single ``chrom:start-end`` (1-based inclusive, bcftools
+        convention) or a comma-separated list, e.g. ``chr1:1-100,chr2:200-300``.
+        Mutually exclusive with --regions-file.
+    regions_file
+        Path to a BED file (0-based half-open) of regions. Mutually exclusive
+        with --regions.
+    samples
+        Comma-separated list of sample names to keep, e.g. ``A,B,C``. Mutually
+        exclusive with --samples-file.
+    samples_file
+        Path to a file of sample names (one per line). Mutually exclusive with
+        --samples.
+    fields
+        Optional FORMAT fields to carry over. Not yet implemented on SVAR2:
+        leave unset (genotypes only); a non-empty value is rejected by the
+        backend.
+    reference
+        Optional path to a reference FASTA. Currently unused by the backend.
+    merge_overlapping
+        If set, silently merge overlapping regions instead of raising.
+    regions_overlap
+        How variants are matched to regions: ``pos`` (default; match if the
+        variant POS falls in the range), ``record`` (match by VCF record extent),
+        or ``variant`` (match by full variant extent including ILEN).
+    reroute
+        Whether to rerun the var_key/dense routing cost model on the subset
+        (the only implemented mode). ``--no-reroute`` requests a
+        byte-preserving passthrough, which is not implemented and raises.
+    overwrite
+        Overwrite the output directory if it already exists.
+    threads
+        Number of threads. Defaults to all available CPUs.
+    progress
+        If set, show a phase-level progress bar while writing the view.
+    """
+    import polars as pl
+
+    from genoray import SparseVar2
+
+    from ._view_helpers import parse_regions_arg
+
+    # No-op guard
+    if (
+        regions is None
+        and regions_file is None
+        and samples is None
+        and samples_file is None
+    ):
+        raise ValueError(
+            "at least one of --regions/--regions-file or --samples/--samples-file is required"
+        )
+
+    # Mutex within each pair
+    if regions is not None and regions_file is not None:
+        raise ValueError("--regions and --regions-file are mutually exclusive")
+    if samples is not None and samples_file is not None:
+        raise ValueError("--samples and --samples-file are mutually exclusive")
+
+    sv = SparseVar2(source)
+
+    # Resolve regions arg
+    if regions is not None:
+        regions_arg: pl.DataFrame | Path = parse_regions_arg(regions)
+    elif regions_file is not None:
+        regions_arg = regions_file
+    else:
+        # "all variants" — SVAR2 has no contig-length metadata, so span each
+        # contig with [0, i32::MAX) (POS is i32; regions_overlap="pos" keeps
+        # every variant on that contig).
+        regions_arg = pl.DataFrame(
+            {"chrom": sv.contigs},
+            schema={"chrom": pl.Utf8},
+        ).select(
+            chrom=pl.col("chrom"),
+            start=pl.lit(0, dtype=pl.Int32),
+            end=pl.lit(2**31 - 1, dtype=pl.Int32),
+        )
+
+    # Resolve samples arg
+    if samples is not None:
+        samples_arg: list[str] | Path = [s for s in samples.split(",") if s]
+    elif samples_file is not None:
+        samples_arg = samples_file
+    else:
+        samples_arg = list(sv.available_samples)
+
+    sv.write_view(
+        regions=regions_arg,
+        samples=samples_arg,
+        output=out,
+        fields=fields,
+        reference=reference,
+        merge_overlapping=merge_overlapping,
+        regions_overlap=regions_overlap,
+        # `write_view`'s signature only documents `"auto"`/`True`, but its body
+        # explicitly handles any other value (e.g. `False` from `--no-reroute`)
+        # by raising `NotImplementedError` — cast to satisfy the narrow Literal.
+        reroute=cast("Literal['auto', True]", reroute),
+        overwrite=overwrite,
+        threads=threads,
+        progress=progress,
+    )
+
+
+@view.command(name="svar1")
+def view_svar1(
     source: Annotated[
         Path,
         Parameter(

@@ -59,6 +59,15 @@
 
 ### BREAKING CHANGES
 
+- **cli**: `genoray view` now targets SVAR2 stores (thin wrapper over
+  `SparseVar2.write_view`), mirroring the existing `write`/`write svar1`
+  App-group pattern. The previous SVAR 1.0 behavior moves to
+  `genoray view svar1` — unchanged otherwise. SVAR2's "all variants" default
+  spans each contig `[0, 2**31 - 1)` (SVAR2 has no contig-length metadata);
+  `--fields` defaults to none (field carry-through isn't implemented yet); a
+  new `--reroute`/`--no-reroute` flag (default `--reroute`) maps to
+  `write_view(reroute=)`, and `--no-reroute` raises `NotImplementedError`
+  (not yet implemented).
 - `Phantom` mode `empty()` classmethods now take a uniform
   `empty(n_samples, ploidy, n_variants)` signature on both VCF and PGEN
   backends. VCF's former 4th `phasing` argument is removed; pass the effective

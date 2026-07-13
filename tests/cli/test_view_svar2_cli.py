@@ -29,3 +29,33 @@ def test_cli_split_with_contigs(tiny_svar2, tmp_path):
     contigs = SparseVar2(out).contigs
     assert contigs == ["chr1"]
     assert "chr2" not in contigs
+
+
+def test_cli_view_svar2_region_subset(tiny_svar2, tmp_path):
+    # tiny_svar2 is a two-contig (chr1, chr2) store; chr1's variants sit at
+    # POS 1 and 3 (1-based). Restricting to chr1:1-40 should keep only chr1.
+    out = tmp_path / "v.svar2"
+    r = _run(["view", str(tiny_svar2), str(out), "-r", "chr1:1-40"])
+    assert r.returncode == 0, r.stderr
+    assert SparseVar2(out).contigs == ["chr1"]
+
+
+def test_cli_view_svar1_still_works(tiny_svar, tmp_path):
+    out = tmp_path / "v.svar"
+    r = _run(["view", "svar1", str(tiny_svar), str(out), "-r", "chr1:1-100"])
+    assert r.returncode == 0, r.stderr
+
+
+def test_cli_view_svar2_no_reroute_errors(tiny_svar2, tmp_path):
+    r = _run(
+        [
+            "view",
+            str(tiny_svar2),
+            str(tmp_path / "v.svar2"),
+            "-r",
+            "chr1:1-40",
+            "--no-reroute",
+        ]
+    )
+    assert r.returncode != 0
+    assert "reroute" in (r.stderr + r.stdout).lower()

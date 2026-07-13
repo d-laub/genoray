@@ -38,7 +38,7 @@ Prefer reading these over guessing:
 - `genoray/_svar.py` — `SparseVar`: `__init__`, `from_vcf`, `from_pgen`, `read_ranges`, `read_ranges_with_length(contig, starts=0, ends=POS_MAX, samples=None)` (length-guaranteed range read; returns the same type as `read_ranges` — a `Ragged` or fields-augmented record), `with_fields`, `annotate_mutations`, `mutation_matrix`, `assign_signatures`, `annotate_with_gtf(gtf, level_filter=1, write_back=True, *, strand_encoding=None, codon_null_token=None)` (GTF CDS annotation entry point, returns `pl.DataFrame` with `varID`/`gene_id`/`strand`/`codon_pos`), `cache_afs()` (computes and persists an `AF` column to the `.gvi` index; returns `None`)
 - `genoray/_svar2.py` — `SparseVar2`: `__init__(path, *, fields=None)`, `with_fields(fields)` (new reader over the same store with those fields selected), `available_fields` (`dict[str, StoredField]`, set in `__init__`), `from_vcf` (VCF/BCF → SVAR2 conversion entry point, `signatures=` classifies during the write, `info_fields=`/`format_fields=` extract scalar-numeric fields during the write), `from_pgen` (PLINK2 PGEN → SVAR2 conversion entry point; diploid-only, no `ploidy=`/`info_fields=`/`format_fields=`); `n_samples`/`available_samples`/`contigs`/`ploidy` metadata. Read/query methods live in the mixins: `genoray/_svar2_decode.py` (`decode` — attaches one `Ragged` per selected field, `region_counts`), `genoray/_svar2_batch.py` (public `read_ranges`; internal gvl-only `_overlap_batch`/`_find_ranges`/`_gather_ranges`), and `genoray/_svar2_mutcat.py` (`annotate_mutations`, `mutation_matrix`, `assign_signatures` — COSMIC mutational-signature workflow, mirroring `SparseVar`'s but backed by a per-contig Rust sidecar instead of a `.gvi`-attached field)
 - `genoray/_svar2_fields.py` — `InfoField`/`FormatField` dataclasses + `FieldDtype` and the header/dtype validation used by `from_vcf(info_fields=, format_fields=)`; `StoredField` (frozen dataclass: `name`, `category`, `dtype`, `default`, `key`) is the read-side manifest entry type returned by `SparseVar2.available_fields` — not exported at top-level `genoray`, only reached via that dict
-- `genoray/_cli/__main__.py` — the `genoray` CLI (`index`, `write` / `write svar1`, `view`)
+- `genoray/_cli/__main__.py` — the `genoray` CLI (`index`, `write` / `write svar1`, `view` / `view svar1`, `concat`, `split`)
 - `genoray/_signatures.py` — `cosmic_signatures`, `fit_signatures`
 - `genoray/_reference.py` — `Reference`: `from_path`, `fetch`, `contig_array`
 - `genoray/exprs.py` — the *complete* set of pre-built filter expressions (currently 7: `is_snp`, `is_indel`, `is_biallelic`, `is_symbolic`, `is_breakend`, `is_imprecise`, `ILEN`)
@@ -494,10 +494,14 @@ genoray raises standard Python builtins, by category:
 - `RuntimeError` — an internal genoray bug (a worker thread panicked); please
   report it.
 
-## CLI (`genoray write`)
+## CLI
 
-`genoray write` **defaults to SVAR2**; `genoray write svar1` runs the previous
-SVAR 1.0 behavior.
+`genoray write` and `genoray view` each **default to SVAR2**; the previous
+SVAR 1.0 behavior is available under the `svar1` subcommand of each
+(`write svar1`, `view svar1`). `genoray concat`/`genoray split` are SVAR2-only
+(no SVAR1 equivalent).
+
+### `genoray write`
 
 ```bash
 # SVAR2 (default) — reference required XOR --no-reference
@@ -524,6 +528,55 @@ genoray write svar1 file.vcf.gz out.svar --max-mem 4g --haploid
 - `genoray write svar1`: unchanged SVAR 1.0 behavior — VCF or PGEN source,
   `--dosages`, `--max-mem`, `--haploid`, `--no-symbolic`/`--no-breakend`
   (independent flags here, unlike SVAR2).
+
+### `genoray view`
+
+```bash
+# SVAR2 (default) — thin CLI over SparseVar2.write_view
+genoray view in.svar2 out.svar2 -r chr1:1-1000 -s A,B
+genoray view in.svar2 out.svar2 -r chr1:1-1000          # all samples
+genoray view in.svar2 out.svar2 -s A,B                  # all variants (one region per contig)
+genoray view in.svar2 out.svar2 -r chr1:1-1000 --no-reroute   # raises NotImplementedError
+
+# SVAR 1.0 (previous default) — unchanged SparseVar.write_view CLI
+genoray view svar1 in.svar out.svar -r chr1:1-1000 -s A,B --progress
+```
+
+Both subcommands share the same `-r/--regions`, `-R/--regions-file`,
+`-s/--samples`, `-S/--samples-file`, `-f/--fields`, `--merge-overlapping`,
+`--regions-overlap`, `--overwrite`, `-@/--threads`, `--progress` options and
+the same no-op guard (at least one of regions/samples is required) and mutex
+checks (`--regions`/`--regions-file` and `--samples`/`--samples-file` are each
+mutually exclusive).
+
+- `genoray view` (SVAR2, thin wrapper over `SparseVar2.write_view`): when
+  `--regions`/`--regions-file` is omitted, "all variants" defaults to one
+  region per contig (`SparseVar2.contigs`, since SVAR2 has no contig-length
+  metadata) spanning `[0, 2**31 - 1)` — every real POS is smaller. `--fields`
+  defaults to `None` (genotypes only); field carry-through isn't implemented
+  yet and the backend rejects a non-empty value. `--reference` is accepted
+  but currently unused by the backend. `--reroute`/`--no-reroute` (default
+  `--reroute`) maps to `write_view(reroute=)`; `--no-reroute` requests a
+  byte-preserving passthrough that isn't implemented and raises
+  `NotImplementedError` (nonzero exit, "reroute" in the message). `--progress`
+  is accepted for parity but is currently a no-op on this path (see below).
+- `genoray view svar1`: unchanged SVAR 1.0 behavior — "all variants" defaults
+  from `SparseVar`'s `_contig_stats` (`[0, pos_max + 1)` per contig); `--fields`
+  defaults to all available fields (use an explicit empty selection to carry
+  none); no `--reference`/`--reroute` options; `--progress` shows a real
+  phase-level bar (see below).
+
+### `genoray concat` / `genoray split`
+
+```bash
+genoray concat merged.svar2 part1.svar2 part2.svar2       # disjoint-contig merge
+genoray split in.svar2 out_dir/                           # explode into out_dir/{contig}.svar2
+genoray split in.svar2 subset.svar2 --contigs chr1,chr2    # subset into one store
+```
+
+Both accept `--mode` (`Literal["copy", "hardlink", "symlink", "move"]`, default
+`"copy"` — see `SparseVar2.concat`/`split_by_contig`/`subset_contigs`
+docstrings) and `--overwrite`.
 
 ## Filtering
 
@@ -652,15 +705,19 @@ When `True`, a phase-level `rich` progress bar is shown while the view is writte
 (one tick per major step: counting, genotypes, each carried field, the index
 build, and mutation annotation when `reference=` is given). It defaults to
 `False` — no bar and no overhead — so library and pipeline callers are
-unaffected. The `genoray view` CLI exposes the same option as `--progress`
+unaffected. The `genoray view svar1` CLI exposes the same option as `--progress`
 (also default off):
 
 ```bash
-genoray view in.svar out.svar -r chr1:1-1000 -s A,B --progress
+genoray view svar1 in.svar out.svar -r chr1:1-1000 -s A,B --progress
 ```
 
 The bar is cosmetic: output bytes, schema, and dtypes are identical whether or
 not it is enabled.
+
+`SparseVar2.write_view` also accepts `progress=`/`--progress` for interface
+parity, but it is currently a no-op there (no bar shown) — see the `genoray
+view` CLI section above.
 
 ### Atomic crash-safe writes
 
