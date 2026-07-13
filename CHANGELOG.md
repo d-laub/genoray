@@ -56,6 +56,16 @@
   and peak RSS on a 200-sample/50k-record conversion drops ~7% (~487 MiB →
   ~452 MiB); end-to-end wall time is unchanged since conversion remains
   reader/htslib-bound, not finalize-bound.
+- `SparseVar2.from_svar1` converts an existing SVAR1 (`SparseVar`) store to SVAR2
+  natively (no VCF re-read, no htslib), reusing the same conversion spine as
+  `from_vcf`/`from_pgen` via a new `Svar1RecordSource`. Biallelic-only (raises on
+  multiallelic input); `ploidy` is read from SVAR1 metadata (no kwarg). All SVAR1
+  FORMAT fields (e.g. `dosages`) are carried through keyed by their SVAR1 name;
+  `mutcat` is dropped (`signatures=True` recomputes signatures from the
+  reference). Genotype streams are byte-identical to `from_vcf` under matching
+  normalization; carried FORMAT field values match for var_key-routed variants,
+  while dense-routed non-carrier cells are the default/missing sentinel (SVAR1
+  discarded non-carrier FORMAT values).
 
 ### BREAKING CHANGES
 
