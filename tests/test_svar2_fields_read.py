@@ -54,3 +54,21 @@ def test_resolve_rejects_unknown_field():
 def test_no_fields_in_meta_is_empty_not_an_error():
     assert _load_field_manifest({}) == {}
     assert _load_field_manifest({"fields": []}) == {}
+
+
+def test_rejects_auto_dtype_in_meta():
+    meta = {
+        "fields": [{"name": "AF", "category": "info", "dtype": "auto", "default": None}]
+    }
+    with pytest.raises(ValueError, match="AF"):
+        _load_field_manifest(meta)
+
+
+def test_rejects_unknown_dtype_in_meta():
+    meta = {
+        "fields": [
+            {"name": "DP", "category": "format", "dtype": "bogus", "default": None}
+        ]
+    }
+    with pytest.raises(ValueError, match="DP"):
+        _load_field_manifest(meta)

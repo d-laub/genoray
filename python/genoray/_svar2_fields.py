@@ -153,6 +153,9 @@ def _load_field_manifest(meta: dict) -> dict[str, StoredField]:
     for e in entries:
         counts[e["name"]] = counts.get(e["name"], 0) + 1
 
+    # Invariant: a well-formed writer never emits duplicate (name, category)
+    # pairs, so `key` collisions here can't happen in practice. If they did,
+    # the later entry would silently overwrite the earlier one in `out`.
     out: dict[str, StoredField] = {}
     for e in entries:
         name = e["name"]
