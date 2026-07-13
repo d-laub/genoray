@@ -69,6 +69,12 @@
 - **vcf**: apply configured `filter` on `VCF.read(..., mode=Genos*Dosages)` when no
   `.gvi` index is loaded, matching the genotype-only and dosage-only modes
   (previously the filter was silently ignored on this path).
+- **svar2**: `SparseVar2.from_pgen` no longer silently corrupts every variant
+  after the first monomorphic site (`.pvar` ALT `.`, which plink2 routinely
+  emits for real cohorts). A null ALT was propagating as NaN into a `uintp`
+  cumulative-sum array, corrupting `allele_idx_offsets` file-wide; the Rust
+  `.pvar` reader also no longer treats a bare `.` ALT as a literal one-character
+  allele.
 
 ## 2.15.0 (2026-06-30)
 

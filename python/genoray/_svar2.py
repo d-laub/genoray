@@ -288,9 +288,11 @@ def _pvar_contig_ranges(
 
     `allele_idx_offsets` has length `n_variants + 1`: `offsets[0] = 0` and
     `offsets[i+1] = offsets[i] + 1 + n_alts(i)`, where `n_alts(i)` is the number of
-    comma-separated ALT alleles of variant `i`. It is a single, file-wide array --
-    every per-contig reader is constructed with the same one, not a per-contig
-    slice.
+    comma-separated ALT tokens of variant `i` -- including a variant whose ALT is
+    the bare `.` sentinel (no ALT observed), which still counts as 1 token/2 total
+    alleles, matching `pgenlib`'s on-disk model (see the comment at its
+    computation below). It is a single, file-wide array -- every per-contig reader
+    is constructed with the same one, not a per-contig slice.
 
     Raises if a contig's variants are not contiguous -- SVAR2 converts one contig at
     a time from a variant index range, which requires the `.pvar` to be grouped by
@@ -302,7 +304,40 @@ def _pvar_contig_ranges(
 
     df = _scan_pvar(pvar).select("#CHROM", "ALT").with_row_index("vidx").collect()
 
-    n_alts = df["ALT"].str.split(",").list.len().to_numpy()
+    # `_scan_pvar` opens the .pvar with `null_values="."`, so a monomorphic
+    # variant's ALT ('.' -- no alternate allele observed) reads as a polars
+    # null, and `.list.len()` on a null is null. Left un-guarded, `.to_numpy()`
+    # would upcast to float64 (NaN for that slot) and
+    # `np.cumsum(..., out=<uintp>)` would silently reinterpret that NaN as a
+    # huge garbage integer -- for that variant *and every one after it*, since
+    # cumsum is prefix-summed.
+    #
+    # The count to fill in is 1, not 0: `pgenlib`'s on-disk `allele_idx_offsets`
+    # model reserves a minimum of 2 allele slots (REF + one ALT slot) per
+    # variant, even when plink2 has no observed ALT to report -- the ALT
+    # column's bare '.' is a *display* convention for "no ALT was observed",
+    # not "no ALT slot exists". Verified directly against `pgenlib`: building
+    # `allele_idx_offsets` with a 0-count (1 total allele) for a '.'-ALT
+    # variant makes `PgenReader.read_alleles_range` segfault on every
+    # multiallelic variant after it (offsets one short of what the file
+    # actually stores); a 1-count (2 total alleles, matching every other
+    # biallelic row) reads correctly and matches the VCF-derived genotypes.
+    # (Rust's `PvarReader` separately empties `alts` for a '.' ALT -- that's
+    # about which alleles the *conversion spine* atomizes, an independent
+    # question from what `pgenlib` needs to step through the file.)
+    n_alts_col = df["ALT"].str.split(",").list.len().fill_null(1)
+    if n_alts_col.null_count():  # pragma: no cover - defensive, should be unreachable
+        raise ValueError(
+            f"Could not determine the ALT-allele count for every variant in {pvar}; "
+            "expected only null ALTs (from the '.' monomorphic sentinel) to be null "
+            "here, but some remained null after filling."
+        )
+    n_alts = n_alts_col.to_numpy()
+    if n_alts.dtype.kind not in "iu" or (n_alts < 0).any():
+        raise ValueError(
+            f"Computed a negative or non-integer ALT-allele count while parsing {pvar} "
+            f"(dtype={n_alts.dtype}); this indicates a malformed ALT column."
+        )
     allele_idx_offsets = np.empty(len(n_alts) + 1, dtype=np.uintp)
     allele_idx_offsets[0] = 0
     np.cumsum(n_alts + 1, out=allele_idx_offsets[1:])

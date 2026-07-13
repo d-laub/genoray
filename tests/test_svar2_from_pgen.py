@@ -201,6 +201,78 @@ def test_from_pgen_multi_contig(tmp_path):
         _assert_ragged_equal(b.decode(contig, regions), a.decode(contig, regions))
 
 
+# Same variants as `_VCF_BODY`, but with a monomorphic site (REF present, ALT
+# `.` -- no alternate allele) inserted *before* the real variants. plink2
+# writes such sites as a bare `.` ALT in the .pvar; the .pvar's ALT-derived
+# `allele_idx_offsets` must count this as 0 alt alleles for this variant
+# without corrupting every variant that follows it.
+_VCF_BODY_MONO = (
+    "##fileformat=VCFv4.2\n"
+    "##contig=<ID=chr1,length=40>\n"
+    '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n'
+    "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS0\tS1\n"
+    "chr1\t1\t.\tA\t.\t.\t.\t.\tGT\t0|0\t0|0\n"
+    "chr1\t3\t.\tA\tG\t.\t.\t.\tGT\t1|0\t0|0\n"
+    "chr1\t7\t.\tC\tCAT\t.\t.\t.\tGT\t0|1\t1|1\n"
+    "chr1\t12\t.\tGTA\tG,GT\t.\t.\t.\tGT\t1|2\t0|1\n"
+    "chr1\t20\t.\tT\tA\t.\t.\t.\tGT\t.|.\t1|0\n"
+)
+
+
+@pytest.fixture(scope="module")
+def sources_mono(tmp_path_factory) -> tuple[Path, Path, Path]:
+    """Same shape as `sources`, but the .pvar's first variant is monomorphic
+    (ALT '.') -- regression coverage for the allele_idx_offsets corruption bug."""
+    d = tmp_path_factory.mktemp("frompgen_mono")
+
+    ref = d / "ref.fa"
+    ref.write_text(f">chr1\n{_REF}\n")
+    subprocess.run(["samtools", "faidx", str(ref)], check=True)
+
+    plain = d / "in.vcf"
+    plain.write_text(_VCF_BODY_MONO)
+    gz = d / "in.vcf.gz"
+    with open(gz, "wb") as fh:
+        subprocess.run(["bgzip", "-c", str(plain)], check=True, stdout=fh)
+    subprocess.run(["bcftools", "index", str(gz)], check=True)
+
+    subprocess.run(
+        [
+            "plink2",
+            "--make-pgen",
+            "--output-chr",
+            "chrM",
+            "--vcf",
+            str(gz),
+            "--out",
+            str(d / "in"),
+        ],
+        check=True,
+    )
+    return ref, gz, d / "in.pgen"
+
+
+def test_from_pgen_monomorphic_site_matches_from_vcf(sources_mono, tmp_path):
+    """A plink2-emitted monomorphic .pvar row (ALT '.') must decode to zero alt
+    alleles, and must not corrupt allele_idx_offsets for the real variants that
+    follow it in the file."""
+    ref, vcf, pgen = sources_mono
+    from_vcf = tmp_path / "vcf.svar2"
+    from_pgen = tmp_path / "pgen.svar2"
+
+    SparseVar2.from_vcf(from_vcf, vcf, ref)
+    SparseVar2.from_pgen(from_pgen, pgen, ref)
+
+    a = SparseVar2(from_vcf)
+    b = SparseVar2(from_pgen)
+    assert a.n_samples == b.n_samples == 2
+
+    regions = [(0, len(_REF))]
+    ragged_vcf = a.decode("chr1", regions)
+    ragged_pgen = b.decode("chr1", regions)
+    _assert_ragged_equal(ragged_pgen, ragged_vcf)
+
+
 def test_from_pgen_missing_pvar_is_a_clear_error(sources, tmp_path):
     _, _, pgen = sources
     lonely = tmp_path / "lonely.pgen"

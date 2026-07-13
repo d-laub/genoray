@@ -16,7 +16,9 @@ pub struct PvarRecord {
     /// 0-based start position (`.pvar` POS is 1-based on disk).
     pub pos: u32,
     pub reference: Vec<u8>,
-    /// ALT alleles, comma-split. ALT1 is `alts[0]`.
+    /// ALT alleles, comma-split. ALT1 is `alts[0]`. Empty when the `.pvar` ALT
+    /// field is the bare `.` sentinel -- plink2's spelling of "no alternate
+    /// allele" for a monomorphic site (all samples are REF).
     pub alts: Vec<Vec<u8>>,
 }
 
@@ -168,14 +170,23 @@ impl PvarReader {
 
         let mut reference = cols[self.ref_col].as_bytes().to_vec();
         reference.make_ascii_uppercase();
-        let alts: Vec<Vec<u8>> = cols[self.alt_col]
-            .split(',')
-            .map(|a| {
-                let mut v = a.as_bytes().to_vec();
-                v.make_ascii_uppercase();
-                v
-            })
-            .collect();
+        // A bare `.` ALT means "no alternate allele" (monomorphic site), not a
+        // one-character allele literally spelled ".". Only the exact field
+        // value `.` is the sentinel -- a real allele can never contain a
+        // comma, so this can't misfire on a multiallelic ALT.
+        let alt_field = cols[self.alt_col];
+        let alts: Vec<Vec<u8>> = if alt_field == "." {
+            Vec::new()
+        } else {
+            alt_field
+                .split(',')
+                .map(|a| {
+                    let mut v = a.as_bytes().to_vec();
+                    v.make_ascii_uppercase();
+                    v
+                })
+                .collect()
+        };
 
         self.vidx += 1;
         Ok(Some(PvarRecord {
@@ -226,6 +237,44 @@ chr1\t12\t.\tGTA\tG,GT
         assert_eq!(v.pos, 11);
         assert_eq!(v.reference, b"GTA");
         assert_eq!(v.alts, vec![b"G".to_vec(), b"GT".to_vec()]);
+
+        assert!(r.next_variant().unwrap().is_none());
+    }
+
+    const BODY_WITH_MONO: &str = "\
+##fileformat=PVARv1.0
+#CHROM\tPOS\tID\tREF\tALT
+chr1\t3\t.\tA\tG
+chr1\t5\t.\tC\t.
+chr1\t7\t.\tC\tCAT
+";
+
+    #[test]
+    fn dot_alt_is_monomorphic_zero_alts() {
+        // plink2 emits a bare `.` ALT for a monomorphic site (REF present, no
+        // ALT observed). It must decode to zero alts, not the literal string
+        // ".", and must not disturb the rows around it.
+        let dir = write_tmp("mono.pvar", BODY_WITH_MONO);
+        let p = dir.path().join("mono.pvar");
+        let mut r = PvarReader::open(p.to_str().unwrap(), 0).unwrap();
+
+        let v = r.next_variant().unwrap().unwrap();
+        assert_eq!(v.pos, 2); // 1-based 3 -> 0-based 2
+        assert_eq!(v.reference, b"A");
+        assert_eq!(v.alts, vec![b"G".to_vec()]);
+
+        let v = r.next_variant().unwrap().unwrap();
+        assert_eq!(v.pos, 4); // 1-based 5 -> 0-based 4
+        assert_eq!(v.reference, b"C");
+        assert!(
+            v.alts.is_empty(),
+            "ALT '.' must decode to an empty alt list"
+        );
+
+        let v = r.next_variant().unwrap().unwrap();
+        assert_eq!(v.pos, 6);
+        assert_eq!(v.reference, b"C");
+        assert_eq!(v.alts, vec![b"CAT".to_vec()]);
 
         assert!(r.next_variant().unwrap().is_none());
     }
