@@ -45,6 +45,8 @@ pub mod normalize;
 pub mod nrvk;
 #[cfg(feature = "conversion")]
 pub mod orchestrator;
+#[cfg(feature = "conversion")]
+pub mod pvar;
 // NOTE: `py_convert` is *not* conversion-only despite being in the original gate
 // list: query-core `py_query_batch.rs`/`py_query_decode.rs`/`py_query_ranges.rs`
 // import its numpy-array conversion helpers unconditionally, and py_convert.rs
