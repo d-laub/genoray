@@ -69,10 +69,13 @@ All commits must follow [Conventional Commits](https://www.conventionalcommits.o
 
 Version bumps and `CHANGELOG.md` generation are handled automatically in CI by
 the release workflow (`.github/workflows/release.yaml`), which runs `commitizen`
-and commits the result as the GitHub Actions bot. **Do not bump the version or
-regenerate the changelog by hand** — accumulate human-readable entries under the
-`## Unreleased` heading in `CHANGELOG.md` and let the release workflow cut the
-versioned section. Use `pixi run bump-dry` only to preview locally.
+and commits the result as the GitHub Actions bot. **Never edit `CHANGELOG.md`
+directly** — `commitizen` owns the entire file and regenerates it from the
+Conventional Commit history, so any manual edits (including an `## Unreleased`
+section) will be clobbered or cause conflicts. Write good Conventional Commit
+messages (`feat:`, `fix:`, etc.) and let the release workflow cut the versioned
+section. Do not bump the version by hand either; use `pixi run bump-dry` only to
+preview locally.
 
 ## Skills
 
