@@ -32,7 +32,7 @@ pub fn annotate_contig(
             codes.push(code);
             refs.push(refc);
         }
-        write_sidecar(paths, MutcatSub::VkSnp, &codes, Some(&refs))?;
+        write_sidecar(paths, MutcatSub::VkSnp, &codes, Some(&refs), None)?;
     }
     // --- dense/snp (per variant) ---
     if let Some((positions, keys)) = reader.dense_snp_records() {
@@ -45,7 +45,7 @@ pub fn annotate_contig(
             codes.push(code);
             refs.push(refc);
         }
-        write_sidecar(paths, MutcatSub::DenseSnp, &codes, Some(&refs))?;
+        write_sidecar(paths, MutcatSub::DenseSnp, &codes, Some(&refs), None)?;
     }
     // --- var_key/indel + dense/indel (per record) ---
     annotate_indel(reader, paths, ref_seq, MutcatSub::VkIndel)?;
@@ -79,13 +79,13 @@ fn annotate_indel(
     let recs = reader.indel_records(sub); // Option<(&[u32] positions, &[u32] keys)>
     let (positions, keys) = match recs {
         Some(r) => r,
-        None => return write_sidecar(paths, sub, &[], None),
+        None => return write_sidecar(paths, sub, &[], None, None),
     };
     let mut codes = Vec::with_capacity(positions.len());
     for (i, &pos) in positions.iter().enumerate() {
         codes.push(indel_code(reader, ref_seq, pos, keys[i]));
     }
-    write_sidecar(paths, sub, &codes, None)
+    write_sidecar(paths, sub, &codes, None, None)
 }
 
 /// ID83 code for one indel record, reconstructing REF/ALT from key + reference.
