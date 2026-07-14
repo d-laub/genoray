@@ -34,9 +34,14 @@ ruff format genoray tests
 Release CI (`.github/workflows/release.yaml`) builds the Rust extension as
 portable wheels from an **isolated** pixi manifest at `ci/wheel/pixi.toml`
 (declares all four wheel platforms; the main `pixi.toml` stays at linux-64 +
-osx-arm64). Wheels use pyo3 abi3 (`maturin build --features abi3`) → one
-`cpXY-abi3` wheel per platform covers Python 3.10–3.13, then `auditwheel`
-(Linux) / `delocate` (macOS) repair them. The `abi3` cargo feature is opt-in
+osx-arm64). CI builds only **three** of them — linux-64, linux-aarch64, and
+osx-arm64. **No Intel-mac (osx-64) wheel is published**: macos-13 is GitHub's
+last Intel runner and is scarce enough to stall releases, so it was dropped
+from the build matrix. osx-64 stays declared in `ci/wheel/pixi.toml` so Intel-mac
+users can still run that build recipe locally (or install from the sdist). Wheels
+use pyo3 abi3 (`maturin build --features abi3`) → one `cpXY-abi3` wheel per
+platform covers Python 3.10–3.13, then `auditwheel` (Linux) / `delocate` (macOS)
+repair them. The `abi3` cargo feature is opt-in
 only at wheel-build time so lint hooks and the Rust test suite are unaffected.
 Toolchain pins (`rust`, `clangdev=18`) are duplicated between the two manifests
 and must be kept in sync.
