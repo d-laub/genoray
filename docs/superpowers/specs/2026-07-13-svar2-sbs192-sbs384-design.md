@@ -182,6 +182,30 @@ Count (`src/mutcat/count.rs`, `src/py_mutcat.rs`):
   than returning zeros when strand was not annotated.
 - DBS78 pairing and ID83 counting are unchanged.
 
+## Backward compatibility (no change to existing layout or cost)
+
+Adding this feature does **not** change how SBS96/DBS78/ID83 are stored or
+counted:
+
+- `code.bin` stores **within-kind** codes as today: `sbs96_code` (0–95) for SNPs,
+  `id83_code` (0–82) for indels, sentinels 254/255. All fit `u8`. The SBS384 code
+  is never stored as a single value — SBS96 (`code.bin`, `u8`) and strand
+  (`strand.bin`, 2-bit) are stored separately. SBS96 does **not** need >8-bit
+  encoding.
+- The existing offsets (`SBS96=0, DBS78=96, ID83=174`) are unchanged; the SBS384
+  block is appended at 257. Offsets are applied only at count time when indexing
+  the `i64` accumulator, so widening `N_CODES` 257→641 affects only the transient
+  in-memory count matrix — never on-disk bytes, never a `u8`.
+- A sidecar annotated **without** a GTF is byte-for-byte identical to today.
+  `strand.bin` is purely additive and written only when `gtf=` is supplied.
+- Old sidecars remain valid under the new codebook (stored within-kind codes map
+  to identical unified indices). The `MUTCAT_VERSION` bump is a
+  **backward-compatible read**: SBS384 availability is gated on `strand.bin`
+  presence (`mutcat_strand`), not on version equality — no forced re-annotation.
+- Implementation note: the hard-coded `N_CODES == 257` asserts
+  (`src/mutcat/mod.rs` `code_space_matches_codebook`, `src/mutcat/count.rs`
+  `emit_snv_codes`) update to 641.
+
 ## Testing
 
 Rust:
