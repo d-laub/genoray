@@ -241,3 +241,25 @@ def test_write_time_signatures_match_posthoc(tmp_path: Path):
         assert ma.equals(mb), f"{kind} mismatch:\nwrite-time:\n{ma}\npost-hoc:\n{mb}"
         total = ma.select(sa.available_samples).sum().sum_horizontal().item()
         assert total > 0, f"{kind} matrix is unexpectedly all-zero"
+
+
+def test_annotate_accepts_strand_arrays_smoke(tmp_path: Path):
+    import numpy as np
+
+    ref = _write_ref(tmp_path)
+    vcf = _write_vcf(tmp_path, symbolic=False, indexed=True)
+    out = tmp_path / "store_strand_smoke.svar2"
+    SparseVar2.from_vcf(out, vcf, ref, threads=1)
+    sv2 = SparseVar2(out)
+    reader = sv2._readers["chr1"]
+    seq = Reference.from_path(ref).contig_array("chr1").astype(np.uint8, copy=False)
+    # Empty strand partition (all N) — just proves the 6-arg binding is callable.
+    reader.annotate_mutations(
+        str(out),
+        "chr1",
+        seq,
+        np.empty(0, np.int32),
+        np.empty(0, np.int32),
+        np.empty(0, np.uint8),
+    )
+    assert (out / "chr1" / "mutcat" / "var_key_snp" / "strand.bin").exists()
