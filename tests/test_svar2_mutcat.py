@@ -369,3 +369,68 @@ def test_sbs384_end_to_end(tmp_path: Path):
     # T / N / U (blocks 0, 2, 1), none Bidirectional (block 3).
     block_sums = v384.reshape(4, 96).sum(axis=1)
     assert block_sums.tolist() == [1, 1, 1, 0]  # [T, U, N, B]
+
+
+def test_sbs384_strand_correct_across_haplotype_columns(tmp_path: Path):
+    """Regression for the forward-only `StrandSweeper` cursor bug.
+
+    `var_key/snp` positions are sorted only WITHIN each (sample, ploid) CSR
+    column, not globally across columns: column order is (S0,hap0) then
+    (S0,hap1), so a variant on hap1 at a LOWER position than a variant on
+    hap0 makes the concatenated position stream non-monotonic. A forward-only
+    cursor can't rewind for the hap1 record and silently falls through to the
+    gap class (N) for it.
+
+    One sample, two het SNVs of opposite phase:
+      - POS=60 (0-based 59), A>C, GT=(1,0) -> ALT on hap0, in the - gene
+        [45,80] -> Untranscribed (U).
+      - POS=10 (0-based 9),  A>C, GT=(0,1) -> ALT on hap1, in the + gene
+        [1,40] -> Transcribed (T).
+    Concatenated var_key/snp positions are [60, 10] -- globally
+    non-monotonic, reproducing the bug. With the buggy cursor, hap1's POS=10
+    query (arriving after the cursor has already advanced past 60) resolves
+    to N instead of T, yielding block_sums [0, 1, 1, 0] instead of the
+    correct [1, 1, 0, 0].
+    """
+    ref = _write_parity_ref(tmp_path)
+    gtf = _write_strand_gtf(tmp_path)
+
+    vcf_path = tmp_path / "order_in.vcf"
+    h = pysam.VariantHeader()
+    h.add_line(f"##contig=<ID=chr1,length={len(_PARITY_SEQ)}>")
+    h.add_line('##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">')
+    h.add_sample("S0")
+    records = [
+        (9, "A", "C", (0, 1)),  # POS=10, ALT on hap1, + gene -> T
+        (59, "A", "C", (1, 0)),  # POS=60, ALT on hap0, - gene -> U
+    ]
+    with pysam.VariantFile(str(vcf_path), "w", header=h) as vf:
+        for start, refb, alt, gt in records:
+            r = h.new_record(contig="chr1", start=start, alleles=(refb, alt))
+            r.samples["S0"]["GT"] = gt
+            r.samples["S0"].phased = True
+            vf.write(r)
+    vcf_gz = tmp_path / "order_in.vcf.gz"
+    with open(vcf_gz, "wb") as fh:
+        subprocess.run(["bgzip", "-c", str(vcf_path)], check=True, stdout=fh)
+    subprocess.run(["bcftools", "index", str(vcf_gz)], check=True)
+
+    out = tmp_path / "store_order.svar2"
+    SparseVar2.from_vcf(out, vcf_gz, ref, threads=1)
+
+    sv2 = SparseVar2(out)
+    sv2.annotate_mutations(ref, gtf=gtf)
+    assert sv2._is_strand_annotated()
+
+    # Confirm both SNVs actually route through the var_key/snp (sparse)
+    # stream, i.e. this test exercises the CSR-column-boundary case.
+    assert (out / "chr1" / "mutcat" / "var_key_snp" / "strand.bin").exists()
+
+    v384 = sv2.mutation_matrix("SBS384", count="allele")["S0"].to_numpy()
+    block_sums = v384.reshape(4, 96).sum(axis=1)
+    assert block_sums.tolist() == [1, 1, 0, 0]  # [T, U, N, B]
+
+    # Conservation must still hold even when strand classification is wrong
+    # in isolation -- this alone would NOT have caught the bug.
+    v96 = sv2.mutation_matrix("SBS96", count="allele")["S0"].to_numpy()
+    assert np.array_equal(v384.reshape(4, 96).sum(axis=0), v96)

@@ -16,30 +16,38 @@ pub struct StrandIntervals<'a> {
     pub values: &'a [u8],
 }
 
-/// Two-pointer sweep over `StrandIntervals`. `class_at` must be called with
-/// non-decreasing `pos` (SVAR2 records are position-sorted per sub-stream);
-/// build a fresh sweeper per sub-stream so the cursor restarts.
+/// Order-independent lookup over `StrandIntervals` via binary search. `pos`
+/// queries may arrive in ANY order (var_key/snp positions are only sorted
+/// WITHIN each (sample, ploid) column of the CSR array, not globally across
+/// columns — see `src/rvk.rs` `call_positions` parity test), so this must not
+/// assume monotonicity.
 struct StrandSweeper<'a> {
     iv: &'a StrandIntervals<'a>,
-    cursor: usize,
 }
 
 impl<'a> StrandSweeper<'a> {
     fn new(iv: &'a StrandIntervals<'a>) -> Self {
-        Self { iv, cursor: 0 }
+        Self { iv }
     }
 
     /// Gene-coverage class at `pos`: interval `values` entry, or `0` (N) in a gap.
-    fn class_at(&mut self, pos: u32) -> u8 {
+    ///
+    /// Binary search over sorted, disjoint, half-open `[start, stop)`
+    /// intervals: find the last interval whose start is `<= pos`, then check
+    /// whether `pos` still falls before that interval's stop.
+    fn class_at(&self, pos: u32) -> u8 {
         let p = pos as i32;
-        while self.cursor < self.iv.starts.len() && self.iv.stops[self.cursor] <= p {
-            self.cursor += 1;
+        // number of interval starts <= p; candidate interval is idx-1
+        let idx = self.iv.starts.partition_point(|&s| s <= p);
+        if idx == 0 {
+            return 0; // before the first interval -> gap (N)
         }
-        if self.cursor < self.iv.starts.len() && self.iv.starts[self.cursor] <= p {
-            self.iv.values[self.cursor]
+        let i = idx - 1;
+        if self.iv.stops[i] > p {
+            self.iv.values[i]
         } else {
             0
-        }
+        } // inside -> value, else gap
     }
 }
 
@@ -65,12 +73,12 @@ pub fn annotate_contig(
         let mut refs = Vec::with_capacity(positions.len());
         let mut strands: Option<Vec<u8>> =
             strand.as_ref().map(|_| Vec::with_capacity(positions.len()));
-        let mut sweeper = strand.as_ref().map(StrandSweeper::new);
+        let sweeper = strand.as_ref().map(StrandSweeper::new);
         for (i, &pos) in positions.iter().enumerate() {
             let (code, refc) = snp_record(ref_seq, pos, snp_alt(keys, i));
             codes.push(code);
             refs.push(refc);
-            if let (Some(sw), Some(st)) = (sweeper.as_mut(), strands.as_mut()) {
+            if let (Some(sw), Some(st)) = (sweeper.as_ref(), strands.as_mut()) {
                 st.push(snp_strand_at(ref_seq, pos, sw.class_at(pos)));
             }
         }
@@ -90,12 +98,12 @@ pub fn annotate_contig(
         let mut refs = Vec::with_capacity(positions.len());
         let mut strands: Option<Vec<u8>> =
             strand.as_ref().map(|_| Vec::with_capacity(positions.len()));
-        let mut sweeper = strand.as_ref().map(StrandSweeper::new);
+        let sweeper = strand.as_ref().map(StrandSweeper::new);
         for (i, &pos) in positions.iter().enumerate() {
             let (code, refc) = snp_record(ref_seq, pos, snp_alt(keys, i));
             codes.push(code);
             refs.push(refc);
-            if let (Some(sw), Some(st)) = (sweeper.as_mut(), strands.as_mut()) {
+            if let (Some(sw), Some(st)) = (sweeper.as_ref(), strands.as_mut()) {
                 st.push(snp_strand_at(ref_seq, pos, sw.class_at(pos)));
             }
         }
@@ -208,18 +216,40 @@ mod tests {
 
     #[test]
     fn strand_sweeper_classifies_by_interval() {
-        // intervals: [10,20)->+only(1), [30,40)->both(3). queries must be non-decreasing.
+        // intervals: [10,20)->+only(1), [30,40)->both(3).
         let iv = StrandIntervals {
             starts: &[10, 30],
             stops: &[20, 40],
             values: &[1, 3],
         };
-        let mut sw = StrandSweeper::new(&iv);
+        let sw = StrandSweeper::new(&iv);
         assert_eq!(sw.class_at(5), 0); // gap before first -> N
         assert_eq!(sw.class_at(10), 1); // inclusive start
         assert_eq!(sw.class_at(19), 1); // inside
         assert_eq!(sw.class_at(20), 0); // exclusive stop -> gap
         assert_eq!(sw.class_at(35), 3); // inside second
         assert_eq!(sw.class_at(40), 0); // past all -> gap
+    }
+
+    // Pins the bug's mechanism: var_key/snp positions are only sorted WITHIN
+    // each (sample, ploid) CSR column, not globally across columns (see
+    // `src/rvk.rs` call_positions parity test, which asserts a decrease at a
+    // column boundary). The old forward-only cursor could not rewind after a
+    // high query and silently mis-resolved every subsequent lower query to
+    // the gap class (0). `class_at` must resolve correctly no matter the
+    // query order.
+    #[test]
+    fn strand_lookup_is_order_independent() {
+        let iv = StrandIntervals {
+            starts: &[10, 30],
+            stops: &[20, 40],
+            values: &[1, 3],
+        };
+        let sw = StrandSweeper::new(&iv);
+        assert_eq!(sw.class_at(35), 3); // high first
+        assert_eq!(sw.class_at(10), 1); // then low -> must still resolve (old cursor got this wrong)
+        assert_eq!(sw.class_at(19), 1);
+        assert_eq!(sw.class_at(25), 0); // gap between intervals
+        assert_eq!(sw.class_at(5), 0); // before all, after a high query
     }
 }
