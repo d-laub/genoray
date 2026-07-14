@@ -270,6 +270,119 @@ def test_reroute_false_carries_fields_matching_source(tmp_path):
         )
 
 
+def _per_sample_field(rag, key, n_regions, n_samples, ploidy):
+    """Group a decoded ragged FORMAT/INFO field's values by sample.
+
+    Decode lays a field out shape ``(R, S, P, variable)`` with a shared
+    variant-axis offsets object; ``rag[key].lengths`` is the ``(R, S, P)``
+    per-cell count (row-major) and ``rag[key].data`` is the flat concatenation
+    in that same ``(R, S, P)`` cell order. Returns ``{sample_index -> flat
+    array of that sample's values}`` (concatenated over regions then ploidy),
+    so a per-sample FORMAT value can be compared column-by-column across a
+    sample subset/reorder.
+    """
+    lengths = np.asarray(rag[key].lengths).reshape(n_regions, n_samples, ploidy)
+    data = np.asarray(rag[key].data)
+    offs = np.concatenate([[0], np.cumsum(lengths.reshape(-1))]).astype(np.int64)
+    out = {}
+    for s in range(n_samples):
+        chunks = []
+        for r in range(n_regions):
+            for p in range(ploidy):
+                k = r * n_samples * ploidy + s * ploidy + p
+                chunks.append(data[offs[k] : offs[k + 1]])
+        out[s] = np.concatenate(chunks) if chunks else np.array([], dtype=data.dtype)
+    return out
+
+
+def test_reroute_false_carries_format_field_under_sample_subset(tmp_path):
+    """FORMAT-field carry-through under a STRICT, REORDERED sample subset.
+
+    The risky new path in the slicer is the per-sample FORMAT re-stride: a
+    sample subset must select (and reorder) the correct sample columns of each
+    variant's stored FORMAT values. A full-coverage identity view is the
+    identity on that axis and wouldn't catch a mis-slice; INFO fields are
+    per-variant so they're insensitive to sample slicing. So: 4 samples with
+    DISTINCT per-sample DP values, viewed at a non-prefix, reordered subset
+    ``["S2", "S0"]``, decoded and compared column-by-column against the SOURCE
+    decode sliced to those same source columns [2, 0] in that order.
+
+    Two variants exercise both representations the slicer must re-stride:
+    an all-carrier SNP (routes dense -> column select) and a single-carrier
+    SNP on S2 (routes var_key -> carrier filter). DP uses a narrow u16 dtype.
+    """
+    doc = (
+        VcfBuilder(samples=["S0", "S1", "S2", "S3"], contigs=[("chr1", 100_000)])
+        .fmt("GT")
+        .fmt("DP", Number.ONE, Type.INTEGER)
+        .record(
+            "chr1",
+            100,
+            ref="A",
+            alt=[Seq("G")],
+            gt=["0|1", "0|1", "0|1", "0|1"],  # every sample carries -> dense
+            DP=[[11], [22], [33], [44]],  # DISTINCT per sample
+        )
+        .record(
+            "chr1",
+            200,
+            ref="C",
+            alt=[Seq("T")],
+            gt=["0|0", "0|0", "0|1", "0|0"],  # only S2 carries -> var_key
+            DP=[[15], [25], [35], [45]],  # DISTINCT per sample
+        )
+    )
+    vcf = doc.write(tmp_path / "dp.vcf.gz", bgzip=True, index=True)
+
+    src_path = tmp_path / "src.svar2"
+    SparseVar2.from_vcf(
+        src_path,
+        vcf,
+        no_reference=True,
+        format_fields=[FormatField("DP", dtype="u16")],
+    )
+    src = SparseVar2(src_path)
+
+    subset = ["S2", "S0"]  # non-prefix + reordered
+    subset_src_idx = [src.available_samples.index(s) for s in subset]  # [2, 0]
+
+    out = tmp_path / "out.svar2"
+    src.write_view(
+        ("chr1", 0, 100_000),
+        subset,
+        out,
+        fields=["DP"],
+        reroute=False,
+        overwrite=True,
+    )
+    viewed = SparseVar2(out)
+    assert viewed.available_samples == subset  # subset order preserved on disk
+
+    regions = [(0, 100_000)]
+    src_dec = src.with_fields(["DP"]).decode("chr1", regions)
+    out_dec = viewed.with_fields(["DP"]).decode("chr1", regions)
+
+    src_dp = _per_sample_field(src_dec, "DP", len(regions), src.n_samples, src.ploidy)
+    out_dp = _per_sample_field(
+        out_dec, "DP", len(regions), viewed.n_samples, viewed.ploidy
+    )
+
+    # Non-vacuity: the source samples we compare against actually carry
+    # DISTINCT DP values, so selecting the wrong source column would change
+    # the expected array. (S2 carries both variants -> [33, 35]; S0 the first
+    # only -> [11]; they must differ.)
+    assert not np.array_equal(src_dp[2], src_dp[0])
+    assert src_dp[2].tolist() == [33, 35]
+    assert src_dp[0].tolist() == [11]
+
+    # The real check: view sample i must equal SOURCE column subset_src_idx[i].
+    for view_i, src_i in enumerate(subset_src_idx):
+        np.testing.assert_array_equal(out_dp[view_i], src_dp[src_i])
+
+    # And dtype is preserved (narrow u16 byte-copy).
+    assert np.asarray(out_dec["DP"].data).dtype == np.uint16
+
+
 def test_reroute_false_preserves_representation(svar2_store, tmp_path):
     """A source-dense variant stays dense under reroute=False (unlike
     reroute=True, which may re-route it under the subset's own cost model)."""
