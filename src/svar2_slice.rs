@@ -35,7 +35,7 @@ use std::ops::Range;
 use std::path::Path;
 
 use ndarray::Array1;
-use ndarray_npy::write_npy;
+use ndarray_npy::{read_npy, write_npy};
 
 use crate::bits::set_bit;
 use crate::cost_model::{
@@ -50,7 +50,7 @@ use crate::query::field::FieldView;
 use crate::query::sidecar::{DenseView, as_bytes, as_u32};
 use crate::rvk::{deletion_len, pack_snp_keys, unpack_snp_key_at};
 use crate::svar2_view::{OverlapMode, keeps, query_window, read_n_samples};
-use svar2_codec::{PAYLOAD_TOP_SHIFT, snp_code_to_key};
+use svar2_codec::{DecodedKey, PAYLOAD_TOP_SHIFT, decode_key, encode_lookup, snp_code_to_key};
 
 /// Which on-disk stream each variant lands in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -597,7 +597,7 @@ fn slice_genos_inner(
     );
 
     // ---- route ----
-    let plan = route(
+    let mut plan = route(
         routing,
         vk_snp_g,
         vk_indel_g,
@@ -629,6 +629,26 @@ fn slice_genos_inner(
     let n_dense_indel = plan.d_indel.len();
     let n_variants = distinct_vk_snp.len() + distinct_vk_indel.len() + n_dense_snp + n_dense_indel;
 
+    // ---- shared indel long-allele LUT: rebuilt with ONLY the rows the output
+    // still references, renumbering the surviving `Lookup` keys in `plan`'s
+    // indel streams IN PLACE. Must run before the indel emits below, since it
+    // rewrites the keys those emits serialize. ----
+    let src_paths = ContigPaths::new(src_store, chrom);
+    let mut vk_indel_keys: Vec<u32> = plan.vk_indel.iter().map(|&(_, _, _, k)| k).collect();
+    let mut d_indel_keys: Vec<u32> = plan.d_indel.iter().map(|(_, _, k, _)| *k).collect();
+    compact_lut(
+        &src_paths,
+        &out_paths,
+        &mut vk_indel_keys,
+        &mut d_indel_keys,
+    )?;
+    for (e, k) in plan.vk_indel.iter_mut().zip(&vk_indel_keys) {
+        e.3 = *k;
+    }
+    for (e, k) in plan.d_indel.iter_mut().zip(&d_indel_keys) {
+        e.2 = *k;
+    }
+
     // ---- emit ----
     let vk_snp_src = emit_var_key(&out_paths.var_key_snp_dir(), &plan.vk_snp, true, n_cols_out)?;
     let vk_indel_src = emit_var_key(
@@ -644,19 +664,6 @@ fn slice_genos_inner(
         false,
         n_cols_out,
     )?;
-
-    // ---- shared indel long-allele LUT: copied verbatim (row indices in the
-    // sliced indel keys point into it unchanged; a subset can only leave rows
-    // unreferenced, never invalidate one). ----
-    let src_paths = ContigPaths::new(src_store, chrom);
-    create_dir(&out_paths.shared_indel_dir())?;
-    if src_paths.long_alleles_bin().exists() {
-        copy_file(&src_paths.long_alleles_bin(), &out_paths.long_alleles_bin())?;
-        copy_file(
-            &src_paths.long_allele_offsets(),
-            &out_paths.long_allele_offsets(),
-        )?;
-    }
 
     // ---- max_del: recomputed over the OUTPUT's own (already-written) indel
     // key streams, not copied — the subset's per-column/per-contig maxima are
@@ -1230,12 +1237,72 @@ fn write_offsets(path: &Path, offsets: &[u64]) -> Result<(), ConversionError> {
     })
 }
 
-fn copy_file(src: &Path, dst: &Path) -> Result<(), ConversionError> {
-    fs::copy(src, dst).map_err(|e| ConversionError::Io {
-        context: format!("copying {} -> {}", src.display(), dst.display()),
+/// Rebuild the shared indel long-allele LUT with ONLY the rows the sliced
+/// output still references, renumbering the surviving `Lookup` keys in place.
+///
+/// Correct because an indel key is either self-contained (`Inline` / `PureDel`)
+/// or a `Lookup { row }` into this contig's LUT — so collecting every row a
+/// `Lookup` key in the OUTPUT still references, rebuilding the table from just
+/// those rows, and remapping every such key together is closed over the
+/// output's entire key set: nothing else in the store points into the LUT.
+///
+/// Rebuilds in ASCENDING source-row order — this is what makes full coverage
+/// (every source row referenced) compact to a byte-identical no-op, which is
+/// what keeps the shipped byte-parity identity test valid.
+fn compact_lut(
+    src_paths: &ContigPaths,
+    out_paths: &ContigPaths,
+    vk_indel_keys: &mut [u32],
+    dense_indel_keys: &mut [u32],
+) -> Result<(), ConversionError> {
+    create_dir(&out_paths.shared_indel_dir())?;
+    if !src_paths.long_alleles_bin().exists() {
+        return Ok(());
+    }
+
+    // 1. Which source rows does the output still reference?
+    let mut referenced: Vec<u32> = Vec::new();
+    for &k in vk_indel_keys.iter().chain(dense_indel_keys.iter()) {
+        if let DecodedKey::Lookup { row } = decode_key(k) {
+            referenced.push(row);
+        }
+    }
+    referenced.sort_unstable();
+    referenced.dedup();
+
+    // 2. Read the source LUT: a flat byte blob + u64 CSR offsets.
+    let src_bytes = fs::read(src_paths.long_alleles_bin()).map_err(|e| ConversionError::Io {
+        context: format!("reading {}", src_paths.long_alleles_bin().display()),
         source: e,
     })?;
-    Ok(())
+    let src_offsets: Array1<u64> =
+        read_npy(src_paths.long_allele_offsets()).map_err(|source| ConversionError::ReadNpy {
+            path: src_paths.long_allele_offsets().display().to_string(),
+            source,
+        })?;
+
+    // 3. Rebuild in ascending source-row order, remembering each surviving
+    //    row's new index.
+    let mut new_bytes: Vec<u8> = Vec::new();
+    let mut new_offsets: Vec<u64> = vec![0];
+    let mut remap: HashMap<u32, u32> = HashMap::with_capacity(referenced.len());
+    for (new_row, &old_row) in referenced.iter().enumerate() {
+        let s = src_offsets[old_row as usize] as usize;
+        let e = src_offsets[old_row as usize + 1] as usize;
+        new_bytes.extend_from_slice(&src_bytes[s..e]);
+        new_offsets.push(new_bytes.len() as u64);
+        remap.insert(old_row, new_row as u32);
+    }
+
+    // 4. Renumber every Lookup key in the OUTPUT streams to point at its new row.
+    for k in vk_indel_keys.iter_mut().chain(dense_indel_keys.iter_mut()) {
+        if let DecodedKey::Lookup { row } = decode_key(*k) {
+            *k = encode_lookup(remap[&row]);
+        }
+    }
+
+    write_bytes(&out_paths.long_alleles_bin(), &new_bytes)?;
+    write_offsets(&out_paths.long_allele_offsets(), &new_offsets)
 }
 
 #[cfg(test)]

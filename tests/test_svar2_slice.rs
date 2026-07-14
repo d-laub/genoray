@@ -298,6 +298,155 @@ fn slice_variant_mode_excludes_non_overlapping_indel_in_widened_window() {
     );
 }
 
+// ---- LUT compaction (Task 5) ----
+
+/// Three long-insertion (LUT-spilling, >13bp ALT) indels, one per sample, each
+/// carried on that sample's hap0 only. Positions are 20 apart with single-base
+/// REF anchors, so no record's REF span touches another's -- no left-align
+/// interaction. Used by the LUT-compaction tests: keeping one sample leaves
+/// exactly one of the three source LUT rows referenced.
+fn fixture_long_allele_records() -> Vec<SynthRecord<'static>> {
+    vec![
+        SynthRecord {
+            pos: 10,
+            ref_allele: b"A",
+            alts: vec![&b"ACGTACGTACGTACGT"[..]], // 16bp INS -> source LUT row 0
+            gt: vec![1, 0, 0, 0, 0, 0],           // S0 hap0
+        },
+        SynthRecord {
+            pos: 30,
+            ref_allele: b"A",
+            alts: vec![&b"TTTTTTTTTTTTTTTT"[..]], // 16bp INS -> source LUT row 1
+            gt: vec![0, 0, 1, 0, 0, 0],           // S1 hap0
+        },
+        SynthRecord {
+            pos: 50,
+            ref_allele: b"A",
+            alts: vec![&b"GGGGGGGGGGGGGGGG"[..]], // 16bp INS -> source LUT row 2
+            gt: vec![0, 0, 0, 0, 1, 0],           // S2 hap0
+        },
+    ]
+}
+
+fn build_long_allele_fixture_store(dir: &Path, samples: &[&str]) {
+    std::fs::create_dir_all(dir).unwrap();
+    let records = fixture_long_allele_records();
+    build_contig(dir, "chr1", samples, 2, &records);
+    // See `build_fixture_store`'s comment: undo `build_contig`'s deliberately
+    // conservative `max_del` fixture overwrite with the real routing-aware scan.
+    genoray_core::max_del::write_max_del(&dir.join("chr1"), samples.len(), 2).unwrap();
+    write_meta(
+        dir,
+        FORMAT_VERSION,
+        &samples.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        &["chr1".to_string()],
+        2,
+        &[],
+    )
+    .unwrap();
+}
+
+/// Number of rows in the contig's shared indel long-allele LUT (CSR offsets
+/// array length - 1), or 0 if the store has no LUT at all.
+fn lut_row_count(store: &Path, chrom: &str) -> usize {
+    let paths = ContigPaths::new(store.to_str().unwrap(), chrom);
+    if !paths.long_allele_offsets().exists() {
+        return 0;
+    }
+    let offsets: ndarray::Array1<u64> = ndarray_npy::read_npy(paths.long_allele_offsets()).unwrap();
+    offsets.len() - 1
+}
+
+/// A subset that references only some long alleles must drop the unreferenced
+/// LUT rows and renumber the surviving `Lookup` keys.
+#[test]
+fn lut_is_compacted_and_keys_renumbered() {
+    let tmp = tempdir().unwrap();
+    let src = tmp.path().join("src");
+    let samples = ["S0", "S1", "S2"];
+    build_long_allele_fixture_store(&src, &samples);
+
+    // Sanity: 3 source records, each spilling its own LUT row.
+    assert_eq!(lut_row_count(&src, "chr1"), 3);
+
+    let out = tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+
+    // Keep sample 1 (original index 1) only -> only the pos=30 insertion (source
+    // LUT row 1) is still referenced; rows 0 and 2 must be dropped.
+    slice_contig_genos(
+        src.to_str().unwrap(),
+        out.to_str().unwrap(),
+        "chr1",
+        &[1],
+        2,
+        &[(0, u32::MAX)],
+        OverlapMode::Variant,
+        Routing::Preserve,
+    )
+    .unwrap();
+
+    assert_eq!(
+        lut_row_count(&out, "chr1"),
+        1,
+        "compaction must drop the two LUT rows sample 1 never references"
+    );
+
+    // ...and the surviving call still decodes correctly through the renumbered
+    // key: same result as querying the source directly, and specifically S1's
+    // actual long ALT (not some other row's bytes).
+    let src_reader = ContigReader::open(src.to_str().unwrap(), "chr1", samples.len(), 2).unwrap();
+    let out_reader = ContigReader::open(out.to_str().unwrap(), "chr1", 1, 2).unwrap();
+    let want = overlap_sample(&src_reader, 1, 0, u32::MAX);
+    let got = overlap_sample(&out_reader, 0, 0, u32::MAX);
+    assert_eq!(
+        got, want,
+        "the surviving indel must decode identically through its renumbered LUT key"
+    );
+    assert_eq!(
+        got.per_hap[0].alts,
+        vec![b"TTTTTTTTTTTTTTTT".to_vec()],
+        "sanity: decodes to sample 1's actual long ALT, not a stale/wrong row"
+    );
+}
+
+/// Full coverage references every LUT row, so compaction is the IDENTITY --
+/// this is what keeps the byte-parity identity test (`slice_full_coverage_is_
+/// byte_identical_genos`) valid in general, not just for the 1-row fixture it
+/// happens to use today.
+#[test]
+fn lut_compaction_is_identity_at_full_coverage() {
+    let tmp = tempdir().unwrap();
+    let src = tmp.path().join("src");
+    let samples = ["S0", "S1", "S2"];
+    build_long_allele_fixture_store(&src, &samples);
+
+    let out = tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    slice_contig_genos(
+        src.to_str().unwrap(),
+        out.to_str().unwrap(),
+        "chr1",
+        &(0..samples.len()).collect::<Vec<_>>(),
+        2,
+        &[(0, u32::MAX)],
+        OverlapMode::Variant,
+        Routing::Preserve,
+    )
+    .unwrap();
+
+    for rel in ["indel/long_alleles.bin", "indel/long_allele_offsets.npy"] {
+        let rel = Path::new("chr1").join(rel);
+        let rel = rel.to_str().unwrap();
+        assert_eq!(
+            read_if_exists(&src, rel),
+            read_if_exists(&out, rel),
+            "{rel}: full coverage must compact to byte-identical output (ascending \
+             source-row order makes compaction a no-op)"
+        );
+    }
+}
+
 // ---- Field slicing (Task 2) ----
 
 fn write_field_f32(paths: &ContigPaths, name: &str, sub: FieldSub, vals: &[f32]) {
