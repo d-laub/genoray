@@ -75,6 +75,8 @@ pub mod spine;
 // the query-core build; it stays ungated as shared infra.
 pub mod streams;
 #[cfg(feature = "conversion")]
+pub mod svar2_slice;
+#[cfg(feature = "conversion")]
 pub mod svar2_source;
 pub mod types;
 #[cfg(feature = "conversion")]
