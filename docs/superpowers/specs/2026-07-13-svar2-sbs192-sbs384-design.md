@@ -77,12 +77,14 @@ On `SparseVar2` (`python/genoray/_svar2_mutcat.py`, `_MutcatMixin`):
 - `assign_signatures(kind, ...)`
   - `"SBS192"`/`"SBS384"` → `NotImplementedError` (see refit scope above).
 
-Write-time path:
+Write-time path (unchanged):
 
-- `SparseVar2.from_vcf(..., signatures=True, gtf=None)` and
-  `from_pgen(..., signatures=True, gtf=None)` — `gtf=` threaded through
-  (`src/lib.rs` → `orchestrator.rs`) so strand can be annotated during
-  conversion. When `gtf=None`, write-time annotation is strand-free as today.
+- `SparseVar2.from_vcf(..., signatures=True)` / `from_pgen(...)` continue to
+  write **strand-free** sidecars (SBS96/DBS78/ID83) exactly as today. There is
+  no `gtf=` kwarg on the conversion path. To obtain SBS192/384, call
+  `annotate_mutations(reference, gtf=...)` once after conversion — it overwrites
+  the sidecars, adding `strand.bin`. This keeps GTF parsing entirely in Python
+  (via `seqpro`) and leaves the deep Rust conversion pipeline untouched.
 
 ## GTF → strand intervals (Python side)
 
@@ -231,7 +233,8 @@ Python:
 
 - Update `skills/genoray-api/SKILL.md` — the svar2 signatures section: add
   SBS192/384, the `annotate_mutations(gtf=...)` kwarg, the strand rule and
-  category definitions, the `from_vcf(gtf=...)` kwarg, and the
+  category definitions, the note that write-time `signatures=True` stays
+  strand-free (use post-hoc `annotate_mutations(gtf=...)`), and the
   refit-not-supported note. Clarify that the existing "no SBS-192" limitation
   note applies to **v1 `SparseVar`** only.
 - Add a `CHANGELOG.md` Unreleased → Added entry.
@@ -240,6 +243,10 @@ Python:
 
 - v1 `SparseVar` strand-resolved catalogs (unchanged; keeps its documented
   no-strand limitation).
+- Write-time strand annotation via `from_vcf`/`from_pgen`/`from_vcf_list`
+  (`signatures=True` stays strand-free; SBS192/384 comes from a post-hoc
+  `annotate_mutations(reference, gtf=...)`). Deferred to avoid threading a GTF
+  through the Rust conversion pipeline for a one-FASTA-reload saving.
 - SBS288 (`96 × {T,U,N}`), SBS1536/SBS6144, replication strand bias.
 - A dedicated strand-asymmetry statistical test helper (users compute it from
   the returned matrix). Possible future work.
