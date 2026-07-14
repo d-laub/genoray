@@ -28,7 +28,13 @@ pub mod error;
 #[cfg(feature = "conversion")]
 pub mod executor;
 pub mod field;
-#[cfg(feature = "conversion")]
+// NOTE: `field_finalize` is *not* conversion-only despite housing the write-path
+// `finalize_fields` scan/rewrite code: query-core `field.rs::encode_scalar` (the
+// SVAR2 decode non-carrier fill, used by gvl with `default-features = false`) calls
+// its `encode`/`is_staged_missing` to stay byte-identical to the finalize path, and
+// the module has zero htslib dependency (only `error`/`field`/rayon/std). Gating it
+// broke the query-core build; it stays ungated as shared infra, same reasoning as
+// `py_convert` and `streams` below.
 pub mod field_finalize;
 pub mod layout;
 #[cfg(feature = "conversion")]

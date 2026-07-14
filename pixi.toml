@@ -94,6 +94,12 @@ lint = "prek run --all-files --show-diff-on-failure"
 # _Py_Dealloc`); `--features conversion` keeps rust-htslib for the e2e tests.
 # Runs in `lint` (no editable-wheel build, full Rust + htslib toolchain).
 test-rust = "cargo test --no-default-features --features conversion"
+# Query-core build guard: compile with NO features (no conversion, no
+# extension-module) — exactly how gvl links `genoray_core` (`default-features =
+# false`). test-rust always keeps `conversion` on, so without this a query-core
+# regression (e.g. an ungated module referencing a conversion-gated one) ships
+# green and only breaks downstream. See the `field_finalize` NOTE in lib.rs.
+check-core = "cargo check --no-default-features"
 
 [feature.doc.dependencies]
 sphinx = "*"
