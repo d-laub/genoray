@@ -50,8 +50,10 @@ jobs:
             platform: linux-aarch64
           - runner: macos-14
             platform: osx-arm64
-          - runner: macos-13
-            platform: osx-64
+          # No osx-64 (Intel mac): macos-13 is GitHub's last Intel runner and is now
+          # scarce enough to stall releases for tens of minutes. We no longer ship an
+          # Intel-mac wheel; those users build from the sdist (the ci/wheel/pixi.toml
+          # osx-64 recipe still works when run locally on an Intel mac).
     steps:
       - name: Check out release tag
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
