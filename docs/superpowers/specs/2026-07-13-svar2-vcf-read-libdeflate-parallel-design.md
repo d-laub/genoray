@@ -199,7 +199,7 @@ actually exists to provide. Oracles were re-baselined to the current environment
 builds against libdeflate (`libdeflate-sys` 1.25.2, statically linked; 21
 `libdeflate_*` symbols in `_core.so`, no dynamic dep). Byte-identical output
 (differential gate). Speedups at `threads=32`:
-- germline chr21: 36.25s → 26.25s (**−27%**)
+- germline chr21: 36.25s → 26.25s (**−28%**)
 - gdc chr21:      1016.7s → 636s (**−37%**)
 
 **Stage 0 wheels (Task 3, no change needed).** `libdeflate-sys` compiles and
