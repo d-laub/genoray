@@ -643,6 +643,225 @@ pub fn run_view_pipeline(
     Ok(())
 }
 
+/// Write a region/sample subset of a finished SVAR2 store by DIRECTLY slicing
+/// its finished sidecars (`svar2_slice::slice_contig`) — the `reroute=False`
+/// path — instead of re-running the conversion pipeline over a synthetic source
+/// (`run_view_pipeline`, `reroute=True`). O(output) memory, no cost model.
+///
+/// Unlike `run_view_pipeline` this carries INFO/FORMAT fields (the slicer
+/// byte-copies each field's `values.bin` at the source dtype) and recomputes
+/// the mutcat sidecar from `reference` when given, so the output is a fully
+/// self-describing store. Fields are the store's finalized specs as
+/// `(name, category, dtype, default)`; `dtype` must be a concrete finalized
+/// dtype (never `"auto"`).
+///
+/// # Why `reference` is used here (and not in `run_view_pipeline`)
+///
+/// The slicer copies genotype/field bytes verbatim, so no FASTA is needed for
+/// them. `reference` is used ONLY to recompute the mutcat (mutational-signature)
+/// sidecar over the sliced output, matching `from_vcf(signatures=True)`: mutcat
+/// presence is detected purely from the on-disk `mutcat/*/code.bin` sidecar, so
+/// this stamps nothing into `meta.json`. If `reference` is `None`, mutcat is
+/// skipped entirely.
+#[cfg(feature = "conversion")]
+#[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
+#[pyfunction]
+#[pyo3(signature = (store_path, out_dir, contigs, samples, regions, regions_overlap, merge_overlapping, fields, reference=None, overwrite=false))]
+pub fn run_slice_view(
+    py: Python,
+    store_path: String,
+    out_dir: String,
+    contigs: Vec<String>,
+    samples: Vec<String>,
+    regions: Vec<(String, u32, u32)>,
+    regions_overlap: String,
+    merge_overlapping: bool,
+    fields: Vec<(String, String, String, Option<f64>)>,
+    reference: Option<String>,
+    overwrite: bool,
+) -> PyResult<()> {
+    use crate::error::ConversionError;
+    use crate::field::{FieldCategory, FieldSpec, HtslibType, StorageDtype};
+    use crate::field_finalize::ResolvedField;
+
+    // --- fail-fast band (mirrors run_view_pipeline): every raise here happens
+    // BEFORE the output dir is created, so a rejected request leaves no bytes. ---
+    let overlap_mode = match regions_overlap.as_str() {
+        "pos" => crate::svar2_source::OverlapMode::Pos,
+        "record" => crate::svar2_source::OverlapMode::Record,
+        "variant" => crate::svar2_source::OverlapMode::Variant,
+        other => {
+            return Err(ConversionError::Input(format!(
+                "regions_overlap must be one of 'pos', 'record', 'variant'; got {other:?}"
+            ))
+            .into());
+        }
+    };
+
+    // Reject a region naming a contig outside `contigs`.
+    let known: std::collections::HashSet<&str> = contigs.iter().map(|s| s.as_str()).collect();
+    for (chrom, _, _) in &regions {
+        if !known.contains(chrom.as_str()) {
+            return Err(ConversionError::Input(format!(
+                "region references unknown contig {chrom:?} (not in {contigs:?})"
+            ))
+            .into());
+        }
+    }
+
+    // Group regions per contig, preserving `contigs`' order; only contigs with
+    // >=1 region are written.
+    let mut by_contig: std::collections::HashMap<&str, Vec<(u32, u32)>> =
+        std::collections::HashMap::new();
+    for (chrom, start, end) in &regions {
+        by_contig
+            .entry(chrom.as_str())
+            .or_default()
+            .push((*start, *end));
+    }
+    let out_contigs: Vec<String> = contigs
+        .iter()
+        .filter(|c| by_contig.contains_key(c.as_str()))
+        .cloned()
+        .collect();
+    if out_contigs.is_empty() {
+        return Err(ConversionError::Input("no regions selected any contig".to_string()).into());
+    }
+
+    // Source meta -> subset sample column indices + inherited ploidy.
+    let (src_samples, ploidy) = read_store_meta(&store_path)?;
+    let mut samples_orig_idx = Vec::with_capacity(samples.len());
+    for name in &samples {
+        let idx = src_samples.iter().position(|s| s == name).ok_or_else(|| {
+            ConversionError::Input(format!("sample {name:?} not found in {store_path}"))
+        })?;
+        samples_orig_idx.push(idx);
+    }
+    if samples_orig_idx.is_empty() {
+        return Err(
+            ConversionError::Input("write_view requires at least one sample".to_string()).into(),
+        );
+    }
+
+    // Build the field specs (for the slicer) and resolved fields (for meta.json)
+    // from the SAME tuples. The slicer byte-copies at the source dtype, so meta
+    // records exactly the requested subset at that dtype -- do NOT re-finalize
+    // (finalize could re-narrow the dtype and corrupt the copied provenance).
+    let mut fields_spec: Vec<FieldSpec> = Vec::with_capacity(fields.len());
+    let mut resolved_fields: Vec<ResolvedField> = Vec::with_capacity(fields.len());
+    for (name, category, dtype, default) in &fields {
+        let category = match category.as_str() {
+            "info" => FieldCategory::Info,
+            "format" => FieldCategory::Format,
+            other => {
+                return Err(ConversionError::Input(format!("bad field category {other:?}")).into());
+            }
+        };
+        let dtype = StorageDtype::from_meta_str(dtype).ok_or_else(|| {
+            ConversionError::Input(format!(
+                "field {name:?} has non-finalized/invalid dtype {dtype:?}; \
+                 a finalized store never stores \"auto\""
+            ))
+        })?;
+        // htype is only needed to satisfy `FieldSpec`; the slicer copies raw
+        // bytes and never reads it. Float dtypes -> Float, all else -> Int.
+        let htype = match dtype {
+            StorageDtype::F16 | StorageDtype::F32 => HtslibType::Float,
+            _ => HtslibType::Int,
+        };
+        fields_spec.push(FieldSpec {
+            name: name.clone(),
+            category,
+            htype,
+            dtype,
+            default: *default,
+        });
+        resolved_fields.push(ResolvedField {
+            name: name.clone(),
+            category,
+            dtype,
+            default: *default,
+        });
+    }
+
+    // Output dir: fail fast unless `overwrite`, then start from a clean slate.
+    let out_path = std::path::Path::new(&out_dir);
+    if out_path.exists() {
+        if !overwrite {
+            return Err(
+                ConversionError::Input(format!("{out_dir} exists; pass overwrite=True")).into(),
+            );
+        }
+        std::fs::remove_dir_all(out_path).map_err(|e| ConversionError::Io {
+            context: format!("remove_dir_all {out_dir}"),
+            source: e,
+        })?;
+    }
+    std::fs::create_dir_all(out_path).map_err(|e| ConversionError::Io {
+        context: format!("create_dir_all {out_dir}"),
+        source: e,
+    })?;
+
+    // --- per-contig slice (+ optional mutcat recompute) --- the slicer is
+    // O(output), so a sequential loop suffices; release the GIL for the pure
+    // Rust/IO work.
+    let n_subset = samples_orig_idx.len();
+    let result: Result<(), ConversionError> = py.detach(|| {
+        for chrom in &out_contigs {
+            let mut chrom_regions = by_contig.get(chrom.as_str()).cloned().unwrap_or_default();
+            if merge_overlapping {
+                chrom_regions = merge_regions(chrom_regions);
+            }
+            crate::svar2_slice::slice_contig(
+                &store_path,
+                &out_dir,
+                chrom,
+                &samples_orig_idx,
+                ploidy,
+                &chrom_regions,
+                overlap_mode,
+                &fields_spec,
+            )?;
+
+            // Mutcat is detected purely from `mutcat/*/code.bin` on disk (see
+            // Python's `_is_annotated`), so recompute it over the sliced output
+            // when a reference is given -- nothing is stamped into meta.json.
+            if let Some(fasta) = reference.as_deref() {
+                let ref_seq = crate::vcf_reader::load_contig_seq(fasta, chrom)?;
+                let reader = crate::query::ContigReader::open(&out_dir, chrom, n_subset, ploidy)
+                    .map_err(|e| ConversionError::Io {
+                        context: format!("{out_dir}/{chrom}"),
+                        source: e,
+                    })?;
+                let paths = crate::layout::ContigPaths::new(&out_dir, chrom);
+                crate::mutcat::annotate::annotate_contig(&reader, &paths, &ref_seq).map_err(
+                    |e| ConversionError::Io {
+                        context: format!("annotate mutcat {out_dir}/{chrom}"),
+                        source: e,
+                    },
+                )?;
+            }
+        }
+        Ok(())
+    });
+    result?;
+
+    // meta.json: subset samples, kept contigs, inherited ploidy, and the fields
+    // exactly as requested (source dtype -- see the no-finalize note above).
+    crate::meta::write_meta(
+        out_path,
+        crate::meta::FORMAT_VERSION,
+        &samples,
+        &out_contigs,
+        ploidy,
+        &resolved_fields,
+    )
+    .map_err(|e| pyo3::exceptions::PyOSError::new_err(format!("failed to write meta.json: {e}")))?;
+
+    Ok(())
+}
+
 /// Per-variant routing/carrier stats for one finished SVAR2 contig, for the
 /// `reroute` measurement spike (`scripts/svar2_reroute_spike.py`). Returns four
 /// parallel 1-D arrays, one entry per variant: `is_indel` (u8 0/1), `src_dense`
@@ -878,6 +1097,8 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run_pgen_conversion_pipeline, m)?)?;
     #[cfg(feature = "conversion")]
     m.add_function(wrap_pyfunction!(run_view_pipeline, m)?)?;
+    #[cfg(feature = "conversion")]
+    m.add_function(wrap_pyfunction!(run_slice_view, m)?)?;
     #[cfg(feature = "conversion")]
     m.add_function(wrap_pyfunction!(svar2_variant_stats, m)?)?;
     #[cfg(feature = "conversion")]

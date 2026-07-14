@@ -15,10 +15,13 @@ use common::{SynthRecord, build_contig};
 use genoray_core::field::{FieldCategory, FieldSpec, HtslibType, StorageDtype};
 use genoray_core::layout::{ContigPaths, FieldSub};
 use genoray_core::meta::{FORMAT_VERSION, write_meta};
+use genoray_core::mutcat::annotate::annotate_contig;
 use genoray_core::query::field::{FieldValue, FieldView};
 use genoray_core::query::{ContigReader, oracle::overlap_sample};
+use genoray_core::run_slice_view;
 use genoray_core::svar2_slice::{slice_contig, slice_contig_genos};
 use genoray_core::svar2_source::OverlapMode;
+use pyo3::Python;
 use std::path::Path;
 use tempfile::tempdir;
 
@@ -532,4 +535,173 @@ fn slice_fields_subset_decodes_equivalently() {
     )
     .unwrap();
     assert!(af_ds_out.is_empty(), "S0's dense SNP field drops out");
+}
+
+// ---- run_slice_view pyfunction (Task 3) ----
+
+/// Reconstruct the reference sequence exactly as `common::build_fasta_with_index`
+/// stamps it (an 'N' background with each record's REF written at its 0-based
+/// pos), so the ref the test annotates the SOURCE mutcat with agrees byte-for-
+/// byte with `src/in.fa` — the fasta `run_slice_view` loads for the OUTPUT.
+fn reconstruct_ref(records: &[SynthRecord], len: usize) -> Vec<u8> {
+    let mut seq = vec![b'N'; len];
+    for r in records {
+        let s = r.pos as usize;
+        seq[s..s + r.ref_allele.len()].copy_from_slice(r.ref_allele);
+    }
+    seq
+}
+
+/// Every full-coverage-identity sidecar `run_slice_view` must reproduce
+/// byte-for-byte: genotypes, LUT, max_del, the two fields' four subs each, and
+/// the mutcat code/ref sidecars.
+fn all_parity_rels() -> Vec<String> {
+    let mut rels: Vec<String> = [
+        "var_key/snp/positions.bin",
+        "var_key/snp/alleles.bin",
+        "var_key/snp/offsets.npy",
+        "var_key/indel/positions.bin",
+        "var_key/indel/alleles.bin",
+        "var_key/indel/offsets.npy",
+        "dense/snp/positions.bin",
+        "dense/snp/alleles.bin",
+        "dense/snp/genotypes.bin",
+        "dense/indel/positions.bin",
+        "dense/indel/alleles.bin",
+        "dense/indel/genotypes.bin",
+        "max_del.npy",
+        "dense/max_del.npy",
+        "indel/long_alleles.bin",
+        "indel/long_allele_offsets.npy",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    for (cat, name) in [("info", "AF"), ("format", "DP")] {
+        for sub in ["var_key_snp", "var_key_indel", "dense_snp", "dense_indel"] {
+            rels.push(format!("fields/{cat}/{name}/{sub}/values.bin"));
+        }
+    }
+    for sub in ["var_key_snp", "var_key_indel", "dense_snp", "dense_indel"] {
+        rels.push(format!("mutcat/{sub}/code.bin"));
+    }
+    for sub in ["var_key_snp", "dense_snp"] {
+        rels.push(format!("mutcat/{sub}/ref.bin"));
+    }
+    rels
+}
+
+#[test]
+fn run_slice_view_full_coverage_carries_genos_fields_and_mutcat() {
+    let tmp = tempdir().unwrap();
+    let src = tmp.path().join("src");
+    let samples = ["S0", "S1"];
+    build_fixture_store(&src, &samples); // genos + meta + max_del
+    let _ = synth_fields(&src, samples.len()); // AF (info/f32) + DP (format/i32)
+
+    // Annotate the SOURCE mutcat with a ref matching the fixture positions —
+    // the SAME sequence `src/in.fa` holds, so the OUTPUT (annotated by
+    // run_slice_view from that fasta) must produce byte-identical sidecars.
+    let ref_seq = reconstruct_ref(&fixture_records(), 1_000_000);
+    let src_reader = ContigReader::open(src.to_str().unwrap(), "chr1", samples.len(), 2).unwrap();
+    let src_paths = ContigPaths::new(src.to_str().unwrap(), "chr1");
+    annotate_contig(&src_reader, &src_paths, &ref_seq).unwrap();
+
+    let out = tmp.path().join("out");
+    let fasta = src.join("in.fa");
+    let field_tuples = vec![
+        (
+            "AF".to_string(),
+            "info".to_string(),
+            "f32".to_string(),
+            None,
+        ),
+        (
+            "DP".to_string(),
+            "format".to_string(),
+            "i32".to_string(),
+            None,
+        ),
+    ];
+
+    Python::attach(|py| {
+        run_slice_view(
+            py,
+            src.to_str().unwrap().to_string(),
+            out.to_str().unwrap().to_string(),
+            vec!["chr1".to_string()],
+            samples.iter().map(|s| s.to_string()).collect(),
+            vec![("chr1".to_string(), 0u32, u32::MAX)],
+            "variant".to_string(),
+            false,
+            field_tuples,
+            Some(fasta.to_str().unwrap().to_string()),
+            false,
+        )
+    })
+    .expect("run_slice_view should succeed");
+
+    // (a) meta.json: subset samples + the requested fields (name/category/dtype).
+    let meta: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("meta.json")).unwrap()).unwrap();
+    assert_eq!(meta["samples"], serde_json::json!(["S0", "S1"]));
+    assert_eq!(meta["contigs"], serde_json::json!(["chr1"]));
+    assert_eq!(meta["ploidy"], 2);
+    assert_eq!(
+        meta["fields"][0],
+        serde_json::json!({"name":"AF","category":"info","dtype":"f32","default":null})
+    );
+    assert_eq!(
+        meta["fields"][1],
+        serde_json::json!({"name":"DP","category":"format","dtype":"i32","default":null})
+    );
+
+    // (b)+(c) genotype/field/mutcat sidecars byte-identical (full-coverage identity).
+    for rel in all_parity_rels() {
+        let rel = format!("chr1/{rel}");
+        assert_eq!(
+            read_if_exists(&src, &rel),
+            read_if_exists(&out, &rel),
+            "{rel}"
+        );
+    }
+
+    // Non-vacuity guard: mutcat was actually written (so the parity above is not
+    // a None == None pass).
+    assert!(
+        out.join("chr1/mutcat/var_key_snp/code.bin").exists(),
+        "mutcat code.bin must be present in the output"
+    );
+}
+
+#[test]
+fn run_slice_view_without_reference_skips_mutcat() {
+    let tmp = tempdir().unwrap();
+    let src = tmp.path().join("src");
+    let samples = ["S0", "S1"];
+    build_fixture_store(&src, &samples);
+
+    let out = tmp.path().join("out");
+    Python::attach(|py| {
+        run_slice_view(
+            py,
+            src.to_str().unwrap().to_string(),
+            out.to_str().unwrap().to_string(),
+            vec!["chr1".to_string()],
+            samples.iter().map(|s| s.to_string()).collect(),
+            vec![("chr1".to_string(), 0u32, u32::MAX)],
+            "variant".to_string(),
+            false,
+            Vec::new(),
+            None, // no reference -> no mutcat
+            false,
+        )
+    })
+    .expect("run_slice_view should succeed without a reference");
+
+    assert!(out.join("meta.json").exists());
+    assert!(
+        !out.join("chr1/mutcat").exists(),
+        "no reference => mutcat must be skipped entirely"
+    );
 }
