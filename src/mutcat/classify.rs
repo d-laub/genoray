@@ -2,7 +2,7 @@
 //! python/genoray/_mutcat/classify.py. No I/O; operates on ASCII bytes +
 //! reference slices.
 
-use crate::mutcat::UNCLASSIFIED;
+use crate::mutcat::{STRAND_B, STRAND_N, STRAND_T, STRAND_U, UNCLASSIFIED};
 
 /// A=0 C=1 G=2 T=3, else -1 (N or non-ACGT).
 #[inline]
@@ -53,6 +53,33 @@ pub fn sbs96_code(five: u8, refb: u8, altb: u8, three: u8) -> u8 {
         return UNCLASSIFIED;
     }
     (sub as u8) * 16 + (ff as u8) * 4 + (tt as u8)
+}
+
+/// Transcriptional strand class for an SNV: `STRAND_{T,U,N,B}`.
+///
+/// `refb` is the uppercased reference base; `gene_class` is the position's gene
+/// coverage: `0`=no gene (N), `1`=+ strand only, `2`=− strand only, `3`=both (B).
+///
+/// SBS channels are pyrimidine-folded, so the strand of the pyrimidine of the
+/// ref/alt pair decides T vs U: the pyrimidine is on the `+` strand iff `refb`
+/// is C or T. A single-strand gene's coding strand is its own strand; the
+/// mutation is Untranscribed when the pyrimidine sits on that coding strand,
+/// Transcribed otherwise.
+#[inline]
+pub fn snp_strand(refb: u8, gene_class: u8) -> u8 {
+    match gene_class {
+        1 | 2 => {
+            let pyr_on_plus = refb == b'C' || refb == b'T';
+            let gene_on_plus = gene_class == 1;
+            if pyr_on_plus == gene_on_plus {
+                STRAND_U
+            } else {
+                STRAND_T
+            }
+        }
+        3 => STRAND_B,
+        _ => STRAND_N,
+    }
 }
 
 // ID83 lookup tables, built to match codebook.py ID83 order.
@@ -370,5 +397,22 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn snp_strand_matches_sigprofiler_examples() {
+        use crate::mutcat::{STRAND_B, STRAND_N, STRAND_T, STRAND_U};
+        // Gene on + strand (gene_class=1).
+        // A>T folds to T>A; ref base A is a purine (pyrimidine on -), so with the
+        // gene coding-strand = +, the pyrimidine is on the template = Transcribed.
+        assert_eq!(snp_strand(b'A', 1), STRAND_T);
+        // C>G; ref base C is a pyrimidine on + = coding strand = Untranscribed.
+        assert_eq!(snp_strand(b'C', 1), STRAND_U);
+        // Gene on - strand (gene_class=2): the assignments flip.
+        assert_eq!(snp_strand(b'A', 2), STRAND_U);
+        assert_eq!(snp_strand(b'C', 2), STRAND_T);
+        // Both strands -> B; no gene -> N (regardless of ref base).
+        assert_eq!(snp_strand(b'C', 3), STRAND_B);
+        assert_eq!(snp_strand(b'A', 0), STRAND_N);
     }
 }
