@@ -19,7 +19,7 @@ use genoray_core::mutcat::annotate::annotate_contig;
 use genoray_core::query::field::{FieldValue, FieldView};
 use genoray_core::query::{ContigReader, oracle::overlap_sample};
 use genoray_core::run_slice_view;
-use genoray_core::svar2_slice::{slice_contig, slice_contig_genos};
+use genoray_core::svar2_slice::{Routing, slice_contig, slice_contig_genos};
 use genoray_core::svar2_source::OverlapMode;
 use pyo3::Python;
 use std::path::Path;
@@ -118,6 +118,7 @@ fn slice_full_coverage_is_byte_identical_genos() {
         2,
         &[(0, u32::MAX)],
         OverlapMode::Variant,
+        Routing::Preserve,
     )
     .unwrap();
     assert_eq!(
@@ -173,6 +174,7 @@ fn slice_one_sample_subset_decodes_equivalently_to_the_source() {
         2,
         &[(0, u32::MAX)],
         OverlapMode::Variant,
+        Routing::Preserve,
     )
     .unwrap();
     assert_eq!(
@@ -264,6 +266,7 @@ fn slice_variant_mode_excludes_non_overlapping_indel_in_widened_window() {
         2,
         &[(34, 44)],
         OverlapMode::Variant,
+        Routing::Preserve,
     )
     .unwrap();
 
@@ -404,6 +407,7 @@ fn slice_fields_full_coverage_is_byte_identical() {
         &[(0, u32::MAX)],
         OverlapMode::Variant,
         &fields,
+        Routing::Preserve,
     )
     .unwrap();
 
@@ -440,6 +444,7 @@ fn slice_fields_subset_decodes_equivalently() {
         &[(0, u32::MAX)],
         OverlapMode::Variant,
         &fields,
+        Routing::Preserve,
     )
     .unwrap();
 
@@ -535,6 +540,86 @@ fn slice_fields_subset_decodes_equivalently() {
     )
     .unwrap();
     assert!(af_ds_out.is_empty(), "S0's dense SNP field drops out");
+}
+
+// ---- Routing::Preserve (Task 2): gather -> route -> emit must be byte-parity ----
+
+/// Every genotype + field sidecar `slice_contig` writes, relative to
+/// `{store}/chr1/` — the same rel list `slice_full_coverage_is_byte_identical_genos`
+/// and `slice_fields_full_coverage_is_byte_identical` check separately, combined,
+/// since `Routing::Preserve` must reproduce BOTH exactly.
+fn geno_and_field_parity_rels() -> Vec<String> {
+    let mut rels: Vec<String> = [
+        "var_key/snp/positions.bin",
+        "var_key/snp/alleles.bin",
+        "var_key/snp/offsets.npy",
+        "var_key/indel/positions.bin",
+        "var_key/indel/alleles.bin",
+        "var_key/indel/offsets.npy",
+        "dense/snp/positions.bin",
+        "dense/snp/alleles.bin",
+        "dense/snp/genotypes.bin",
+        "dense/indel/positions.bin",
+        "dense/indel/alleles.bin",
+        "dense/indel/genotypes.bin",
+        "max_del.npy",
+        "dense/max_del.npy",
+        "indel/long_alleles.bin",
+        "indel/long_allele_offsets.npy",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    for (cat, name) in [("info", "AF"), ("format", "DP")] {
+        for sub in ["var_key_snp", "var_key_indel", "dense_snp", "dense_indel"] {
+            rels.push(format!("fields/{cat}/{name}/{sub}/values.bin"));
+        }
+    }
+    rels
+}
+
+/// The whole point of Task 2: splitting the slicer into gather -> route -> emit
+/// must not move a single byte when `routing` is `Routing::Preserve` (every
+/// variant keeps its source stream). A full-coverage identity slice through the
+/// new two-phase entry point must reproduce the source's genotype AND field
+/// sidecars exactly.
+#[test]
+fn preserve_identity_slice_is_byte_parity() {
+    let tmp = tempdir().unwrap();
+    let src = tmp.path().join("src");
+    let samples = ["S0", "S1"];
+    build_fixture_store(&src, &samples);
+    let fields = synth_fields(&src, samples.len());
+
+    let out = tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+
+    let n = slice_contig(
+        src.to_str().unwrap(),
+        out.to_str().unwrap(),
+        "chr1",
+        &(0..samples.len()).collect::<Vec<_>>(),
+        2,
+        &[(0, u32::MAX)],
+        OverlapMode::Variant,
+        &fields,
+        Routing::Preserve,
+    )
+    .unwrap();
+    assert_eq!(
+        n, 5,
+        "all 5 fixture variants must survive a full-coverage Routing::Preserve slice"
+    );
+
+    for rel in geno_and_field_parity_rels() {
+        let rel = Path::new("chr1").join(rel);
+        let rel = rel.to_str().unwrap();
+        assert_eq!(
+            read_if_exists(&src, rel),
+            read_if_exists(&out, rel),
+            "{rel}"
+        );
+    }
 }
 
 // ---- run_slice_view pyfunction (Task 3) ----

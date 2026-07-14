@@ -838,6 +838,7 @@ pub fn run_slice_view(
                 &chrom_regions,
                 overlap_mode,
                 &fields_spec,
+                crate::svar2_slice::Routing::Preserve,
             )?;
 
             // Mutcat is detected purely from `mutcat/*/code.bin` on disk (see
