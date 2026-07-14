@@ -179,3 +179,50 @@ entry under `## Unreleased` (do not bump the version by hand). Update the roadma
   (MIT) is the only read-path code we may depend on directly.
 - **Executor transpose (~17%) is the next ceiling** and is explicitly out of scope —
   parallelizing it hits long-allele-bank determinism (byte-identical hazard).
+
+---
+
+## Outcome (execution, 2026-07-13)
+
+Executed on a dedicated `carter-compute` node against the full chr21 germline
+(1,001,385 variants) and gdc (4,525,689 variants, 16,007 samples) BCFs.
+
+**Correctness note.** The Jul-7 full-file oracle hashes drifted (an unrelated
+pixi-env/dependency change between Jul 7 and Jul 13 alters store serialization).
+The change was therefore gated **differentially**: the libdeflate build was proven
+byte-identical to the pre-change (zlib) build **in the same environment**,
+deterministically, on both full datasets — the guarantee the byte-identical rule
+actually exists to provide. Oracles were re-baselined to the current environment
+(pre-change == libdeflate), preserving the Jul-7 values as `*.jul7.hash`.
+
+**Stage 0 — libdeflate (shipped).** hts-sys `libdeflate` feature → vendored htslib
+builds against libdeflate (`libdeflate-sys` 1.25.2, statically linked; 21
+`libdeflate_*` symbols in `_core.so`, no dynamic dep). Byte-identical output
+(differential gate). Speedups at `threads=32`:
+- germline chr21: 36.25s → 26.25s (**−27%**)
+- gdc chr21:      1016.7s → 636s (**−37%**)
+
+**Stage 0 wheels (Task 3, no change needed).** `libdeflate-sys` compiles and
+statically embeds its own vendored libdeflate C — no system dependency. The
+linux-64 abi3 release wheel builds and `auditwheel repair` is a no-op (already
+manylinux_2_28, nothing bundled). No `ci/wheel/pixi.toml` change required; the
+other three platforms use the same static mechanism.
+
+**Stage 1 — htslib decode-thread re-sweep (inert).** Sweeping
+`MAX_HTSLIB_THREADS` ∈ {4,8,12,16} at fixed 32 cores (gdc slice) is flat within
+noise (20.4–21.4s), all byte-identical. Raising the cap is inert under libdeflate
+just as it was under zlib. `MAX_HTSLIB_THREADS` stays at 8; no code change.
+
+**Stage 2 — parallel BGZF frontend: NO-GO.** A `perf` profile of the libdeflate
+build (gdc slice) shows decompression is no longer dominant:
+`deflate_decompress_bmi2` ~15% + SIMD crc32 ~1.3%. The larger costs are now sparse
+packing (`dense2sparse_vk` ~16%) and single-threaded htslib record parsing
+(`next_record` + `bcf_get_format_values` ~23%). A parallel BGZF frontend
+accelerates only decompression — a ~16% ceiling — against high effort/risk (custom
+BGZF, byte-exact htslib feed, GPL boundary). Per the diminishing-returns stopping
+rule, the effort is complete at Stage 0/1. Task 5 was not executed.
+
+**Follow-up (out of scope here).** The profile also shows `blas_thread_server`
+~9% — idle OpenBLAS/OpenMP threads spinning (numpy/scipy import oversubscription).
+Capping `OPENBLAS_NUM_THREADS`/`OMP_NUM_THREADS` during conversion is a cheap
+independent win worth a separate look.
