@@ -1,22 +1,21 @@
-//! `slice_contig` / `slice_contig_genos`: the `reroute=False` direct
-//! array-slicer for one finished SVAR2 contig's sidecars.
+//! `slice_contig` / `slice_contig_genos`: the direct array-slicer for one
+//! finished SVAR2 contig's sidecars, backing BOTH `write_view` routings.
 //!
-//! Unlike `svar2_source::Svar2Source` (which re-runs the ordinary conversion
-//! pipeline over synthesized `RawRecord`s — `reroute=True`), this module reads
-//! a finished store's mmap'd sidecars directly and writes a region/sample
-//! subset as a new finished contig's sidecars: `var_key/{snp,indel}/*`,
-//! `dense/{snp,indel}/*`, the shared indel long-allele LUT, `max_del`, and
-//! (via `slice_contig`) each requested INFO/FORMAT field's `values.bin`.
-//! O(output) memory, no cost model, no pipeline re-run.
+//! This module reads a finished store's mmap'd sidecars directly and writes a
+//! region/sample subset as a new finished contig's sidecars:
+//! `var_key/{snp,indel}/*`, `dense/{snp,indel}/*`, the shared indel
+//! long-allele LUT, `max_del`, and (via `slice_contig`) each requested
+//! INFO/FORMAT field's `values.bin`. O(output) memory, no pipeline re-run.
+//! `reroute=True`/`reroute=False` are both routing policies within this same
+//! slicer (`Routing::Recompute` vs. `Routing::Preserve`, see below) rather
+//! than separate code paths — a synthetic-`RawRecord` pipeline re-run
+//! (`Svar2Source`) used to back `reroute=True`; it has been deleted in favor
+//! of routing here.
 //!
-//! Reuses `svar2_view::{query_window, keeps}` verbatim so `reroute=False`
-//! and `reroute=True` select the identical variant set — the query-window
-//! widening and per-mode keep predicate are the SAME code, not a re-derived
-//! copy of the semantics. The tree-narrowed windows come from
-//! `ContigReader::{vk_snp_overlap, vk_indel_overlap, dense_snp_overlap,
-//! dense_indel_overlap}` — the exact same per-region search `find_ranges`
-//! (the batched query path `Svar2Source` runs through) uses, so a call is
-//! windowed-in here iff it would be windowed-in there.
+//! Reuses `svar2_view::{query_window, keeps}` verbatim — the same
+//! query-window widening and per-mode keep predicate the whole-cohort query
+//! path (`ContigReader`/`read_ranges`) uses, not a re-derived copy of the
+//! semantics.
 //!
 //! Fields ride the SAME provenance the genotype gather already computes: the
 //! genotype pass records, per kept var_key call, its SOURCE call index, and

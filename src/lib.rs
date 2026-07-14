@@ -77,8 +77,6 @@ pub mod streams;
 #[cfg(feature = "conversion")]
 pub mod svar2_slice;
 #[cfg(feature = "conversion")]
-pub mod svar2_source;
-#[cfg(feature = "conversion")]
 pub mod svar2_view;
 pub mod types;
 #[cfg(feature = "conversion")]
@@ -367,11 +365,11 @@ fn run_pgen_conversion_pipeline(
     Ok(dropped as usize)
 }
 
-/// Read `{store_path}/meta.json` and return `(samples, ploidy)`. `run_view_pipeline`
+/// Read `{store_path}/meta.json` and return `(samples, ploidy)`. `run_slice_view`
 /// needs both: `samples` to map the caller's subset sample NAMES to original
 /// column indices (the per-contig sidecars are indexed by original column, not
-/// subset position), `ploidy` because `Svar2Source`/`ContigReader::open` must be
-/// opened with the store's actual ploidy.
+/// subset position), `ploidy` because `ContigReader::open` must be opened with
+/// the store's actual ploidy.
 #[cfg(feature = "conversion")]
 fn read_store_meta(
     store_path: &str,
@@ -406,11 +404,11 @@ fn read_store_meta(
 
 /// Merge overlapping/adjacent `[start, end)` regions on one contig.
 ///
-/// NOT a correctness requirement: `Svar2Source` already ORs carrier bits across
-/// overlapping regions via its internal `BTreeMap` (see `carrier_bits_or_across_
-/// overlapping_regions` in `tests/test_svar2_source.rs`), so duplicated/adjacent
-/// spans decode to the same result either way. This is purely an optimization
-/// to avoid redundant `read_ranges` work when `merge_overlapping = true`.
+/// NOT a correctness requirement: `svar2_slice::region_hits` already sorts and
+/// dedups the kept call/row indices across all of a variant's matching regions,
+/// so duplicated/adjacent spans decode to the same result either way. This is
+/// purely an optimization to avoid redundant search-tree work when
+/// `merge_overlapping = true`.
 #[cfg(feature = "conversion")]
 fn merge_regions(mut regions: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
     regions.sort_unstable();
@@ -427,237 +425,19 @@ fn merge_regions(mut regions: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
     merged
 }
 
-/// Write a region/sample subset of a finished SVAR2 store by re-running the
-/// ordinary conversion pipeline (`process_chromosome`) over a synthetic
-/// [`svar2_source::Svar2Source`] (`SourceSpec::Svar2`) instead of a VCF/PGEN
-/// reader. Backs `SparseVar2.write_view`'s "coarse seam" (see
-/// `docs/superpowers/specs/2026-07-12-svar2-concat-split-write-view-design.md`).
-///
-/// # `fasta_path` is HARDCODED to `None` below — do not change this
-///
-/// `Svar2Source::to_raw_record` fabricates REF bases (a deliberately mismatched
-/// base for SNPs, `b'N'` filler bytes for deletions) because a finished store
-/// keeps no REF bytes at all. That is safe **only** because `fasta_path = None`
-/// disables the two REF-bases-dependent normalization steps, `validate_ref` and
-/// `left_align`, in `ChunkAssembler::decompose_record` (both gated on
-/// `self.has_reference`) — a finished store is already atomic, biallelic, and
-/// left-aligned, and everything downstream (`classify_variant`/`pack_variant`)
-/// reads only `ilen`+`alt`, never REF bytes. Forwarding a real FASTA here would
-/// compare the synthetic REF against the real genome and fail or corrupt the
-/// run. `reference` is accepted only for **signature parity** with the Python
-/// shim (whose `reference=` recomputes the mutcat sidecar — a feature this MVP
-/// defers, hence `signatures = false` below too) and MUST NOT reach
-/// `process_chromosome`'s `fasta_path`.
-///
-/// # Fields
-///
-/// The MVP is genotypes-only: `Svar2Source` emits empty `info_raw`/`format_raw`,
-/// so INFO/FORMAT carry-through is impossible on this path. `fields` must
-/// therefore be empty, or this fails fast with `ValueError` before touching the
-/// filesystem, rather than silently dropping the requested fields.
-#[cfg(feature = "conversion")]
-#[allow(clippy::too_many_arguments)]
-#[pyfunction]
-#[pyo3(signature = (store_path, out_dir, contigs, samples, regions, regions_overlap, merge_overlapping, fields, reference=None, max_threads=None, overwrite=false))]
-pub fn run_view_pipeline(
-    py: Python,
-    store_path: String,
-    out_dir: String,
-    contigs: Vec<String>,
-    samples: Vec<String>,
-    regions: Vec<(String, u32, u32)>,
-    regions_overlap: String,
-    merge_overlapping: bool,
-    fields: Vec<String>,
-    reference: Option<String>,
-    max_threads: Option<usize>,
-    overwrite: bool,
-) -> PyResult<()> {
-    // `reference` is accepted only for signature parity with the Python shim;
-    // see the doc comment above for why it must never reach `process_chromosome`'s
-    // `fasta_path`.
-    let _ = reference;
-
-    if !fields.is_empty() {
-        return Err(crate::error::ConversionError::Input(
-            "field carry-through is not yet implemented for SVAR2 views".to_string(),
-        )
-        .into());
-    }
-
-    let overlap_mode = match regions_overlap.as_str() {
-        "pos" => crate::svar2_view::OverlapMode::Pos,
-        "record" => crate::svar2_view::OverlapMode::Record,
-        "variant" => crate::svar2_view::OverlapMode::Variant,
-        other => {
-            return Err(crate::error::ConversionError::Input(format!(
-                "regions_overlap must be one of 'pos', 'record', 'variant'; got {other:?}"
-            ))
-            .into());
-        }
-    };
-
-    // Fail fast on a region naming a contig outside `contigs` before touching
-    // the filesystem.
-    let known: std::collections::HashSet<&str> = contigs.iter().map(|s| s.as_str()).collect();
-    for (chrom, _, _) in &regions {
-        if !known.contains(chrom.as_str()) {
-            return Err(crate::error::ConversionError::Input(format!(
-                "region references unknown contig {chrom:?} (not in {contigs:?})"
-            ))
-            .into());
-        }
-    }
-
-    // Group regions per contig, preserving `contigs`' order. Only contigs with
-    // >=1 region are actually processed / written to the output.
-    let mut by_contig: std::collections::HashMap<&str, Vec<(u32, u32)>> =
-        std::collections::HashMap::new();
-    for (chrom, start, end) in &regions {
-        by_contig
-            .entry(chrom.as_str())
-            .or_default()
-            .push((*start, *end));
-    }
-    let out_contigs: Vec<String> = contigs
-        .iter()
-        .filter(|c| by_contig.contains_key(c.as_str()))
-        .cloned()
-        .collect();
-    if out_contigs.is_empty() {
-        return Err(crate::error::ConversionError::Input(
-            "no regions selected any contig".to_string(),
-        )
-        .into());
-    }
-
-    // Read the SOURCE store's meta.json to map subset sample NAMES -> original
-    // column indices, and to inherit ploidy (the per-contig sidecars are
-    // indexed by original column, not by subset position -- `Svar2Source`
-    // needs the original indices to resolve them).
-    let (src_samples, ploidy) = read_store_meta(&store_path)?;
-    let mut samples_orig_idx = Vec::with_capacity(samples.len());
-    for name in &samples {
-        let idx = src_samples.iter().position(|s| s == name).ok_or_else(|| {
-            crate::error::ConversionError::Input(format!(
-                "sample {name:?} not found in {store_path}"
-            ))
-        })?;
-        samples_orig_idx.push(idx);
-    }
-    if samples_orig_idx.is_empty() {
-        return Err(crate::error::ConversionError::Input(
-            "write_view requires at least one sample".to_string(),
-        )
-        .into());
-    }
-
-    // Output dir: fail fast unless `overwrite`, then start from a clean slate --
-    // a view re-derives every byte, so leftover contigs from a previous run at
-    // the same path must not survive (mirrors `_write_store`'s
-    // check-then-`rmtree` convention used by `subset_contigs`/`concat`/`split`).
-    let out_path = std::path::Path::new(&out_dir);
-    if out_path.exists() {
-        if !overwrite {
-            return Err(crate::error::ConversionError::Input(format!(
-                "{out_dir} exists; pass overwrite=True"
-            ))
-            .into());
-        }
-        std::fs::remove_dir_all(out_path).map_err(|e| crate::error::ConversionError::Io {
-            context: format!("remove_dir_all {out_dir}"),
-            source: e,
-        })?;
-    }
-    std::fs::create_dir_all(out_path).map_err(|e| crate::error::ConversionError::Io {
-        context: format!("create_dir_all {out_dir}"),
-        source: e,
-    })?;
-
-    let sample_refs: Vec<&str> = samples.iter().map(|s| s.as_str()).collect();
-    let fields_spec: Vec<crate::field::FieldSpec> = Vec::new();
-
-    let results: Vec<Result<u64, crate::error::ConversionError>> = py.detach(|| {
-        let available_cores = match max_threads {
-            Some(t) if t > 0 => t,
-            _ => std::thread::available_parallelism().unwrap().get(),
-        };
-        let plan = crate::budget::plan_thread_budget(available_cores, out_contigs.len());
-        let concurrent_chroms = plan.concurrent_chroms;
-        let processing_threads = plan.processing_threads;
-
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(concurrent_chroms)
-            .thread_name(|i| format!("view-{}", i))
-            .build()
-            .expect("build view pool");
-
-        pool.install(|| {
-            out_contigs
-                .par_iter()
-                .map(|chrom| {
-                    let mut chrom_regions =
-                        by_contig.get(chrom.as_str()).cloned().unwrap_or_default();
-                    if merge_overlapping {
-                        chrom_regions = merge_regions(chrom_regions);
-                    }
-                    orchestrator::process_chromosome(
-                        orchestrator::SourceSpec::Svar2 {
-                            store_path: store_path.clone(),
-                            samples_orig_idx: samples_orig_idx.clone(),
-                            regions: chrom_regions,
-                            overlap_mode,
-                        },
-                        None, // fasta_path -- SEE DOC COMMENT ABOVE. MUST STAY None.
-                        chrom,
-                        &out_dir,
-                        &sample_refs,
-                        25_000, // chunk_size -- same default as run_conversion_pipeline
-                        ploidy,
-                        8_388_608, // long_allele_capacity -- same default as run_conversion_pipeline
-                        true,      // skip_out_of_scope
-                        processing_threads,
-                        false, // signatures -- deferred; mutcat recompute is out of MVP scope
-                        &fields_spec,
-                    )
-                })
-                .collect::<Vec<_>>()
-        })
-    });
-
-    for r in results {
-        r?;
-    }
-
-    let resolved_fields =
-        crate::field_finalize::finalize_fields(out_path, &out_contigs, &fields_spec)?;
-
-    crate::meta::write_meta(
-        out_path,
-        crate::meta::FORMAT_VERSION,
-        &samples,
-        &out_contigs,
-        ploidy,
-        &resolved_fields,
-    )
-    .map_err(|e| pyo3::exceptions::PyOSError::new_err(format!("failed to write meta.json: {e}")))?;
-
-    Ok(())
-}
-
 /// Write a region/sample subset of a finished SVAR2 store by DIRECTLY slicing
-/// its finished sidecars (`svar2_slice::slice_contig`) — the `reroute=False`
-/// path — instead of re-running the conversion pipeline over a synthetic source
-/// (`run_view_pipeline`, `reroute=True`). O(output) memory, no cost model.
+/// its finished sidecars (`svar2_slice::slice_contig`). O(output) memory, no
+/// cost model, no pipeline re-run. `reroute` selects a routing policy within
+/// this same slicer rather than dispatching to a separate code path — see
+/// `svar2_slice::Routing` below.
 ///
-/// Unlike `run_view_pipeline` this carries INFO/FORMAT fields (the slicer
-/// byte-copies each field's `values.bin` at the source dtype) and recomputes
-/// the mutcat sidecar from `reference` when given, so the output is a fully
-/// self-describing store. Fields are the store's finalized specs as
-/// `(name, category, dtype, default)`; `dtype` must be a concrete finalized
-/// dtype (never `"auto"`).
+/// This carries INFO/FORMAT fields (the slicer byte-copies each field's
+/// `values.bin` at the source dtype) and recomputes the mutcat sidecar from
+/// `reference` when given, so the output is a fully self-describing store.
+/// Fields are the store's finalized specs as `(name, category, dtype,
+/// default)`; `dtype` must be a concrete finalized dtype (never `"auto"`).
 ///
-/// # Why `reference` is used here (and not in `run_view_pipeline`)
+/// # Why `reference` is used here
 ///
 /// The slicer copies genotype/field bytes verbatim, so no FASTA is needed for
 /// them. `reference` is used ONLY to recompute the mutcat (mutational-signature)
@@ -697,8 +477,8 @@ pub fn run_slice_view(
     use crate::field_finalize::ResolvedField;
     use crate::svar2_slice::Routing;
 
-    // --- fail-fast band (mirrors run_view_pipeline): every raise here happens
-    // BEFORE the output dir is created, so a rejected request leaves no bytes. ---
+    // --- fail-fast band: every raise here happens BEFORE the output dir is
+    // created, so a rejected request leaves no bytes. ---
     let overlap_mode = match regions_overlap.as_str() {
         "pos" => crate::svar2_view::OverlapMode::Pos,
         "record" => crate::svar2_view::OverlapMode::Record,
@@ -1183,8 +963,6 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run_conversion_pipeline, m)?)?;
     #[cfg(feature = "conversion")]
     m.add_function(wrap_pyfunction!(run_pgen_conversion_pipeline, m)?)?;
-    #[cfg(feature = "conversion")]
-    m.add_function(wrap_pyfunction!(run_view_pipeline, m)?)?;
     #[cfg(feature = "conversion")]
     m.add_function(wrap_pyfunction!(run_slice_view, m)?)?;
     #[cfg(feature = "conversion")]

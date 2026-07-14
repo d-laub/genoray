@@ -20,7 +20,7 @@ use genoray_core::query::field::{FieldValue, FieldView};
 use genoray_core::query::{ContigReader, oracle::overlap_sample};
 use genoray_core::run_slice_view;
 use genoray_core::svar2_slice::{Routing, slice_contig, slice_contig_genos};
-use genoray_core::svar2_source::OverlapMode;
+use genoray_core::svar2_view::OverlapMode;
 use pyo3::Python;
 use std::path::Path;
 use tempfile::{TempDir, tempdir};
@@ -295,6 +295,111 @@ fn slice_variant_mode_excludes_non_overlapping_indel_in_widened_window() {
     assert!(
         !hap0.positions.contains(&31),
         "interior non-overlapping DEL @31 must be excluded"
+    );
+}
+
+/// Ported from the deleted `tests/test_svar2_source.rs`
+/// (`the_three_overlap_modes_are_distinguishable`): the shared selection
+/// predicate this pins (`svar2_view::{query_window, keeps}`) survives in
+/// `svar2_view.rs` even though the pipeline-backed `Svar2Source` it used to
+/// be exercised through is gone -- this drives the SAME predicate through
+/// `slice_contig_genos` instead.
+///
+/// genoray's published contract (`python/genoray/_svar/_regions.py`):
+///   pos     -> keep iff  q_start <= POS <  q_end
+///   record  -> keep iff  q_start <= POS <  q_end + 1   (POS rule, end + 1)
+///   variant -> keep iff the variant's *extent* overlaps [q_start, q_end)
+///
+/// Fixture, queried over [7, 20):
+///   DEL @5, REF len 4 (ilen -3) -> extent [5, 9): extent overlaps, POS does
+///                                  not  => `Variant` only.
+///   SNP @10                     -> inside on every rule => all three modes.
+///   SNP @20  (POS == q_end)     -> POS hits only the widened `record`
+///                                  window; its extent [20, 21) does not
+///                                  touch [7, 20)  => `Record` only.
+#[test]
+fn the_three_overlap_modes_are_distinguishable() {
+    let tmp = tempdir().unwrap();
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+
+    let samples = ["S0"];
+    let records = vec![
+        SynthRecord {
+            pos: 5,
+            ref_allele: b"ATGC",
+            alts: vec![&b"A"[..]],
+            gt: vec![1, 1],
+        },
+        SynthRecord {
+            pos: 10,
+            ref_allele: b"A",
+            alts: vec![&b"C"[..]],
+            gt: vec![1, 0],
+        },
+        SynthRecord {
+            pos: 20,
+            ref_allele: b"A",
+            alts: vec![&b"G"[..]],
+            gt: vec![0, 1],
+        },
+    ];
+    build_contig(&src, "chr1", &samples, 2, &records);
+    write_meta(
+        &src,
+        FORMAT_VERSION,
+        &samples.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        &["chr1".to_string()],
+        2,
+        &[],
+    )
+    .unwrap();
+
+    // Drain a one-sample, ploidy-2 sliced output into its sorted, deduped set
+    // of surviving variant positions (a variant may appear on either hap
+    // depending which haplotype carries it).
+    let kept_positions = |mode: OverlapMode| -> Vec<u32> {
+        let out = tmp.path().join(format!("out_{mode:?}"));
+        std::fs::create_dir_all(&out).unwrap();
+        slice_contig_genos(
+            src.to_str().unwrap(),
+            out.to_str().unwrap(),
+            "chr1",
+            &[0],
+            2,
+            &[(7, 20)],
+            mode,
+            Routing::Preserve,
+        )
+        .unwrap();
+        let out_reader = ContigReader::open(out.to_str().unwrap(), "chr1", 1, 2).unwrap();
+        let calls = overlap_sample(&out_reader, 0, 0, u32::MAX);
+        let mut positions: Vec<u32> = calls
+            .per_hap
+            .iter()
+            .flat_map(|h| h.positions.iter().copied())
+            .collect();
+        positions.sort_unstable();
+        positions.dedup();
+        positions
+    };
+
+    assert_eq!(
+        kept_positions(OverlapMode::Pos),
+        vec![10],
+        "`pos`: POS in [7, 20) only"
+    );
+    assert_eq!(
+        kept_positions(OverlapMode::Record),
+        vec![10, 20],
+        "`record`: POS in [7, 21) — the POS == q_end variant is kept, the \
+         extent-only deletion is not"
+    );
+    assert_eq!(
+        kept_positions(OverlapMode::Variant),
+        vec![5, 10],
+        "`variant`: extent overlap — the deletion is kept, the POS == q_end \
+         variant is not"
     );
 }
 
