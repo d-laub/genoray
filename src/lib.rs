@@ -785,24 +785,19 @@ pub fn run_slice_view(
         });
     }
 
-    // Reference FASTA (if any): validate + fully load every out-contig's
-    // sequence UP FRONT, before any output byte is written. Without this, a
-    // missing/unreadable `reference` would only surface inside the per-contig
-    // loop below (mutcat recompute step), by which point earlier contigs'
-    // sidecars are already on disk -- a partially-written, unreadable store
-    // (sidecars present, meta.json absent) rather than a clean fail-fast raise.
-    // Reuse these loaded sequences in the loop instead of re-reading the FASTA.
-    let ref_seqs: Option<std::collections::HashMap<&str, Vec<u8>>> = match reference.as_deref() {
-        Some(fasta) => {
-            let mut m = std::collections::HashMap::with_capacity(out_contigs.len());
-            for chrom in &out_contigs {
-                let seq = crate::vcf_reader::load_contig_seq(fasta, chrom)?;
-                m.insert(chrom.as_str(), seq);
-            }
-            Some(m)
-        }
-        None => None,
-    };
+    // Reference FASTA (if any): validate the path is openable and contains
+    // every out-contig UP FRONT, before any output byte is written. Without
+    // this, a missing/unreadable `reference` would only surface inside the
+    // per-contig loop below (mutcat recompute step), by which point earlier
+    // contigs' sidecars are already on disk -- a partially-written, unreadable
+    // store (sidecars present, meta.json absent) rather than a clean fail-fast
+    // raise. This validation fetches NO sequence bytes (only faidx open +
+    // per-contig length lookups); the loop still loads each contig's sequence
+    // LAZILY, keeping peak memory at O(1 contig) rather than O(genome) -- the
+    // property `reroute=False` promises for whole-genome reference views.
+    if let Some(fasta) = reference.as_deref() {
+        crate::vcf_reader::validate_contigs_in_fasta(fasta, &out_contigs)?;
+    }
 
     // Output dir: fail fast unless `overwrite`, then start from a clean slate.
     let out_path = std::path::Path::new(&out_dir);
@@ -846,16 +841,18 @@ pub fn run_slice_view(
             // Mutcat is detected purely from `mutcat/*/code.bin` on disk (see
             // Python's `_is_annotated`), so recompute it over the sliced output
             // when a reference is given -- nothing is stamped into meta.json.
-            // `ref_seqs` was validated + fully loaded up front (see above), so
-            // this is a pure lookup, not a fallible FASTA read.
-            if let Some(ref_seq) = ref_seqs.as_ref().map(|m| &m[chrom.as_str()]) {
+            // The reference was validated up front (see the fail-fast band), so
+            // this loads lazily: peak O(1 contig) resident, one sequence at a
+            // time, dropped before the next contig.
+            if let Some(fasta) = reference.as_deref() {
+                let ref_seq = crate::vcf_reader::load_contig_seq(fasta, chrom)?;
                 let reader = crate::query::ContigReader::open(&out_dir, chrom, n_subset, ploidy)
                     .map_err(|e| ConversionError::Io {
                         context: format!("{out_dir}/{chrom}"),
                         source: e,
                     })?;
                 let paths = crate::layout::ContigPaths::new(&out_dir, chrom);
-                crate::mutcat::annotate::annotate_contig(&reader, &paths, ref_seq).map_err(
+                crate::mutcat::annotate::annotate_contig(&reader, &paths, &ref_seq).map_err(
                     |e| ConversionError::Io {
                         context: format!("annotate mutcat {out_dir}/{chrom}"),
                         source: e,

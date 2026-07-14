@@ -11,7 +11,7 @@
 
 mod common;
 
-use common::{SynthRecord, build_contig};
+use common::{SynthRecord, build_contig, build_fasta_with_index};
 use genoray_core::field::{FieldCategory, FieldSpec, HtslibType, StorageDtype};
 use genoray_core::layout::{ContigPaths, FieldSub};
 use genoray_core::meta::{FORMAT_VERSION, write_meta};
@@ -748,5 +748,52 @@ fn run_slice_view_bad_reference_fails_before_any_output() {
         !out.exists(),
         "fail-fast: out_dir must NOT be created when the reference is invalid \
          (got a partially-written store instead)"
+    );
+}
+
+/// A reference FASTA that EXISTS and is openable but is MISSING an out-contig
+/// must also be rejected up front, before any output byte — the up-front
+/// validation checks every out-contig's presence (via `fetch_seq_len`), not
+/// just that the path/faidx opens. Uses a fasta whose only contig is
+/// "chrOther", so requesting a view on "chr1" fails the per-contig existence
+/// check in the fail-fast band.
+#[test]
+fn run_slice_view_reference_missing_contig_fails_before_any_output() {
+    let tmp = tempdir().unwrap();
+    let src = tmp.path().join("src");
+    let samples = ["S0", "S1"];
+    build_fixture_store(&src, &samples);
+
+    // A real, openable FASTA (+ .fai) that simply lacks "chr1".
+    let other_fasta = tmp.path().join("other.fa");
+    build_fasta_with_index(&other_fasta, "chrOther", 1_000, &[]);
+
+    let out = tmp.path().join("out");
+    assert!(!out.exists(), "precondition: out_dir must not exist yet");
+
+    let result = Python::attach(|py| {
+        run_slice_view(
+            py,
+            src.to_str().unwrap().to_string(),
+            out.to_str().unwrap().to_string(),
+            vec!["chr1".to_string()],
+            samples.iter().map(|s| s.to_string()).collect(),
+            vec![("chr1".to_string(), 0u32, u32::MAX)],
+            "variant".to_string(),
+            false,
+            Vec::new(),
+            Some(other_fasta.to_str().unwrap().to_string()),
+            false,
+        )
+    });
+
+    assert!(
+        result.is_err(),
+        "a reference FASTA missing an out-contig must be rejected"
+    );
+    assert!(
+        !out.exists(),
+        "fail-fast: out_dir must NOT be created when the reference lacks an \
+         out-contig (got a partially-written store instead)"
     );
 }
