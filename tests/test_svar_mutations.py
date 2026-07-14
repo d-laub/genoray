@@ -653,7 +653,7 @@ def test_annotate_scope_persists_mutcat_contigs(tmp_path):
     with open(d / "metadata.json", "rb") as f:
         meta = SparseVarMetadata.model_validate_json(f.read())
     assert meta.mutcat_contigs == ["chr1"]
-    assert meta.mutcat_version == 3
+    assert meta.mutcat_version == 4
 
 
 def test_annotate_no_scope_persists_none(tmp_path):
