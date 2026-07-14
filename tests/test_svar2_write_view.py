@@ -7,6 +7,7 @@ import subprocess
 from pathlib import Path
 
 import numpy as np
+import polars as pl
 import pytest
 from vcfixture import Number, Seq, Type, VcfBuilder
 
@@ -144,11 +145,10 @@ def test_write_view_default_fields_is_genotypes_only(tmp_path):
     Regresses a bug where `write_view` computed `fields_to_write` via
     `_validate_fields(fields, available)`, whose `None` semantics are "all
     available fields" (the read-path convention), not "no fields". On a store
-    with a field present, that expanded the default to a non-empty list,
-    which the Rust backend rejects outright ("field carry-through is not yet
-    implemented for SVAR2 views") -- so a plain `write_view(...)` call with no
-    `fields=` argument hard-failed on any store with fields, contradicting the
-    documented "genotypes only" default.
+    with a field present, that expanded the default to a non-empty list --
+    so a plain `write_view(...)` call with no `fields=` argument carried an
+    unwanted field through, contradicting the documented "genotypes only"
+    default.
     """
     doc = (
         VcfBuilder(samples=["s1", "s2"], contigs=[("chr1", None)])
@@ -187,18 +187,20 @@ def test_write_view_default_fields_is_genotypes_only(tmp_path):
     viewed = SparseVar2(default_out)
     assert viewed.contigs == sv.contigs
     assert viewed.available_samples == sv.available_samples
+    assert not viewed.available_fields  # genotypes-only default carried nothing
 
-    # Explicitly requesting the field on the reroute=True (default "auto")
-    # path is the documented not-yet-implemented path: it must still raise.
+    # Explicitly requesting the field succeeds and carries it through: `AF`
+    # is INFO-only, so the default "auto" resolves to `reroute=True` here
+    # (no FORMAT field is at risk of a non-carrier value being dropped).
     explicit_out = tmp_path / "explicit.svar2"
-    with pytest.raises(ValueError, match="field carry-through"):
-        sv.write_view(
-            ("chr1", 0, 2000),
-            sv.available_samples,
-            explicit_out,
-            fields=["AF"],
-            overwrite=True,
-        )
+    sv.write_view(
+        ("chr1", 0, 2000),
+        sv.available_samples,
+        explicit_out,
+        fields=["AF"],
+        overwrite=True,
+    )
+    assert SparseVar2(explicit_out).available_fields
 
 
 def test_reroute_false_equivalent_to_true(svar2_store, tmp_path):
@@ -564,3 +566,184 @@ def test_reroute_false_lut_indels_decode(tmp_path):
     np.testing.assert_array_equal(
         np.asarray(src_dec["allele"].data), np.asarray(out_dec["allele"].data)
     )
+
+
+def _dense_flip_store(tmp_path: Path) -> SparseVar2:
+    """A store with ONE SNP that is dense at the full 3-sample population (S0,
+    S1 homozygous alt; S2 heterozygous -> 5/6 carrier haplotypes) but flips to
+    var_key when `reroute=True` recomputes the cost model over a 1-sample
+    subset containing only the heterozygous carrier S2 (1/2 carrier
+    haplotypes -- too sparse for dense to still win). Carries both an INFO
+    (`AF`) and a FORMAT (`DP`) field so the same store serves both `"auto"`
+    tests below. Confirmed empirically (not just by cost-model arithmetic):
+    `_core.svar2_variant_stats` reports `src_dense=1` at the 3-sample
+    population and `src_dense=0` after an `["S2"]`+`fields=["AF"]`+
+    `reroute="auto"` view.
+    """
+    ref_seq = _REF_SEQ * 3
+    ref = tmp_path / "ref.fa"
+    ref.write_text(f">chr1\n{ref_seq}\n")
+    subprocess.run(["samtools", "faidx", str(ref)], check=True)
+
+    doc = (
+        VcfBuilder(samples=["S0", "S1", "S2"], contigs=[("chr1", len(ref_seq))])
+        .info("AF", Number.A, Type.FLOAT)
+        .fmt("GT")
+        .fmt("DP", Number.ONE, Type.INTEGER)
+        .record(
+            "chr1",
+            3,
+            ref="A",
+            alt=[Seq("G")],
+            gt=["1|1", "1|1", "1|0"],
+            info={"AF": [0.5]},
+            DP=[[10], [20], [30]],
+        )
+    )
+    vcf = doc.write(tmp_path / "dense_flip.vcf.gz", bgzip=True, index=True)
+
+    src_path = tmp_path / "src.svar2"
+    SparseVar2.from_vcf(
+        src_path,
+        vcf,
+        str(ref),
+        info_fields=["AF"],
+        format_fields=["DP"],
+        threads=1,
+    )
+    src = SparseVar2(src_path)
+    _ii, sd_full, x_full, _xs = _core.svar2_variant_stats(
+        str(src_path), "chr1", [0, 1, 2]
+    )
+    assert int(sd_full[0]) == 1, "fixture must be dense at the full population"
+    assert int(x_full[0]) == 5, "fixture must have 5/6 carrier haplotypes"
+    return src
+
+
+def test_auto_resolves_to_preserve_when_format_carried(tmp_path):
+    """A dense->var_key flip stores one value per carrier CALL and has no slot
+    for a non-carrier sample's FORMAT value, so `reroute="auto"` must NOT
+    re-route when a FORMAT field is carried -- the source-dense variant must
+    stay dense even though a bare recompute over this 1-sample subset would
+    flip it (see `test_auto_reroutes_when_only_info_carried`)."""
+    src = _dense_flip_store(tmp_path)
+    out = tmp_path / "view.svar2"
+    src.write_view(
+        ("chr1", 0, len(_REF_SEQ) * 3),
+        ["S2"],
+        out,
+        fields=["DP"],  # a FORMAT field
+        reroute="auto",
+        overwrite=True,
+    )
+    assert SparseVar2(out).available_fields["DP"] is not None
+    _ii, sd_out, *_ = _core.svar2_variant_stats(str(out), "chr1", [0])
+    assert int(sd_out[0]) == 1, "auto must preserve (stay dense) when FORMAT is carried"
+
+
+def test_auto_reroutes_when_only_info_carried(tmp_path):
+    """The same fixture/subset as above, but with an INFO-only field: no
+    FORMAT fidelity risk, so `"auto"` takes the size-optimal re-route and the
+    dense source variant flips to var_key under the 1-sample subset."""
+    src = _dense_flip_store(tmp_path)
+    out = tmp_path / "view.svar2"
+    src.write_view(
+        ("chr1", 0, len(_REF_SEQ) * 3),
+        ["S2"],
+        out,
+        fields=["AF"],  # INFO only
+        reroute="auto",
+        overwrite=True,
+    )
+    assert SparseVar2(out).available_fields["AF"] is not None
+    _ii, sd_out, *_ = _core.svar2_variant_stats(str(out), "chr1", [0])
+    assert int(sd_out[0]) == 0, (
+        "auto must re-route (flip to var_key) when only INFO is carried"
+    )
+
+
+def test_reroute_true_now_carries_fields(tmp_path):
+    """Was: `ValueError('field carry-through is not yet implemented')` on the
+    `reroute=True` path -- Task 6/7 unify both routings onto the slicer, which
+    carries fields on both paths."""
+    vcf, ref = _fields_vcf_and_ref(tmp_path)
+    src_path = tmp_path / "src.svar2"
+    SparseVar2.from_vcf(
+        src_path, vcf, str(ref), info_fields=["AF"], format_fields=["DP"], threads=1
+    )
+    src = SparseVar2(src_path)
+
+    out = tmp_path / "view.svar2"
+    src.write_view(
+        ("chr1", 0, 40),
+        ["S0", "S1"],
+        out,
+        fields=["DP"],
+        reroute=True,
+        overwrite=True,
+    )
+    view = SparseVar2(out, fields=["DP"])
+    assert view.available_fields["DP"] is not None
+    dec = view.decode("chr1", [(0, 40)])
+    assert np.asarray(dec["DP"].data).size > 0
+
+
+def test_reroute_true_recomputes_mutcat(tmp_path):
+    """Was: `reference` silently discarded on `reroute=True` (mutcat was never
+    computed on that path). Now both routings recompute mutcat from
+    `reference` via the shared slicer."""
+    ref = tmp_path / "ref.fa"
+    ref.write_text(f">chr1\n{_REF_SEQ}\n")
+    subprocess.run(["samtools", "faidx", str(ref)], check=True)
+
+    doc = (
+        VcfBuilder(samples=["S0", "S1"], contigs=[("chr1", 40)])
+        .fmt("GT")
+        .record("chr1", 3, ref="A", alt=[Seq("G")], gt=["1|0", "0|0"])
+        .record("chr1", 20, ref="T", alt=[Seq("C")], gt=["0|1", "1|1"])
+    )
+    vcf = doc.write(tmp_path / "sig.vcf.gz", bgzip=True, index=True)
+
+    src_path = tmp_path / "src.svar2"
+    SparseVar2.from_vcf(src_path, vcf, str(ref), signatures=True, threads=1)
+    src = SparseVar2(src_path)
+    assert src._is_annotated()
+
+    out = tmp_path / "out.svar2"
+    src.write_view(
+        ("chr1", 0, 40),
+        src.available_samples,
+        out,
+        reference=str(ref),
+        reroute=True,
+        overwrite=True,
+    )
+    viewed = SparseVar2(out)
+    assert viewed._is_annotated()
+    code_bin = out / "chr1" / "mutcat" / "var_key_snp" / "code.bin"
+    assert code_bin.exists()
+    assert code_bin.stat().st_size > 0
+
+
+def test_threads_is_honored_and_output_is_invariant(tmp_path):
+    """`threads` now reaches `_core.run_slice_view`'s `max_threads` (was
+    accepted-and-ignored on the slice path). Slicing is per-contig and
+    independent, so the number of threads must never change a single output
+    byte."""
+    from tests.conftest import build_two_contig_svar2
+
+    sv = build_two_contig_svar2(tmp_path)
+    regions = pl.DataFrame({"chrom": sv.contigs}, schema={"chrom": pl.Utf8}).select(
+        chrom=pl.col("chrom"),
+        start=pl.lit(0, dtype=pl.Int32),
+        end=pl.lit(2**31 - 1, dtype=pl.Int32),
+    )
+
+    a = tmp_path / "a.svar2"
+    b = tmp_path / "b.svar2"
+    sv.write_view(regions, sv.available_samples, a, threads=1, overwrite=True)
+    sv.write_view(regions, sv.available_samples, b, threads=4, overwrite=True)
+
+    assert SparseVar2(a).contigs == SparseVar2(b).contigs == sv.contigs
+    for c in sv.contigs:
+        assert _dir_digest(a / c) == _dir_digest(b / c)

@@ -299,7 +299,7 @@ def view_svar2(
     reference: Annotated[Path | None, Parameter(name="--reference")] = None,
     merge_overlapping: bool = False,
     regions_overlap: Literal["pos", "record", "variant"] = "pos",
-    reroute: bool = True,
+    reroute: bool | None = None,
     overwrite: bool = False,
     threads: Annotated[int | None, Parameter(name=["--threads", "-@"])] = None,
     progress: bool = False,
@@ -330,16 +330,14 @@ def view_svar2(
         Path to a file of sample names (one per line). Mutually exclusive with
         --samples.
     fields
-        Optional FORMAT fields to carry over. Defaults to unset, meaning no
-        fields are carried through (genotypes only) — this always succeeds,
-        even on a store that has INFO/FORMAT fields. With ``reroute`` at its
-        default (``True``), field carry-through is not yet implemented:
-        passing any non-empty value is rejected by the backend with a
-        `ValueError`. ``--no-reroute`` DOES carry fields through.
+        Optional INFO/FORMAT fields to carry over. Defaults to unset, meaning
+        no fields are carried through (genotypes only) — this always
+        succeeds, even on a store that has INFO/FORMAT fields. Both
+        ``reroute`` and ``--no-reroute`` carry fields through.
     reference
-        Optional path to a reference FASTA. With ``--no-reroute``, recomputes
-        the ``mutcat`` mutational-signature sidecar for the output; otherwise
-        currently unused by the backend.
+        Optional path to a reference FASTA. Recomputes the ``mutcat``
+        mutational-signature sidecar for the output on both ``reroute`` and
+        ``--no-reroute``.
     merge_overlapping
         If set, silently merge overlapping regions instead of raising.
     regions_overlap
@@ -348,11 +346,16 @@ def view_svar2(
         or ``variant`` (match by full variant extent including ILEN).
     reroute
         Whether to rerun the var_key/dense routing cost model on the subset.
-        Default ``True`` reruns it (size-optimal, but rejects non-empty
-        ``fields``). ``--no-reroute`` instead directly slices each variant's
-        existing on-disk representation: representation-preserving, O(output)
-        memory, and carries INFO/FORMAT fields through natively — recommended
-        for somatic/rare-variant subsets or memory-constrained runs.
+        ``--reroute`` forces it on (size-optimal). ``--no-reroute`` forces it
+        off: directly slices each variant's existing on-disk representation
+        -- representation-preserving regardless of the subset's
+        sample/carrier counts -- recommended for somatic/rare-variant subsets
+        or memory-constrained runs. Omitting both flags (the default) is
+        ``"auto"``: resolves to ``--no-reroute``'s behavior when any FORMAT
+        field is carried, ``--reroute``'s otherwise -- a dense variant
+        re-routed to var_key has no slot for a non-carrier sample's FORMAT
+        value, so ``"auto"`` prefers fidelity whenever FORMAT is in play and
+        takes the size-optimal re-route otherwise.
     overwrite
         Overwrite the output directory if it already exists.
     threads
@@ -419,7 +422,7 @@ def view_svar2(
         reference=reference,
         merge_overlapping=merge_overlapping,
         regions_overlap=regions_overlap,
-        reroute=reroute,
+        reroute="auto" if reroute is None else reroute,
         overwrite=overwrite,
         threads=threads,
         progress=progress,

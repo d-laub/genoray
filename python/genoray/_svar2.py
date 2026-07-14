@@ -354,32 +354,38 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         always excluded from `fields` — pass `reference=` to recompute it
         instead of copying.
 
-        `reroute` selects the output representation and backend:
+        Both `reroute=True` and `reroute=False` go through the same slicer
+        backend, which carries `fields` and recomputes `mutcat` from
+        `reference` (when given) on either path:
 
-        - `"auto"` (default, equivalent to `True`) reruns the ordinary
-          conversion pipeline's var_key/dense routing cost model over the
+        - `reroute=True` reruns the var_key/dense routing cost model over the
           subset. This is *size-optimal* (each variant is re-routed to
           whichever representation is smaller for the subset's sample/carrier
-          counts), but does not yet carry INFO/FORMAT fields through: passing
-          any non-empty `fields` (anything other than `"mutcat"`) makes the
-          backend raise `ValueError`.
+          counts).
         - `reroute=False` directly slices each variant's *existing* on-disk
           representation (byte-copy, no cost model) — representation-
-          preserving and O(output) memory regardless of source size. It DOES
-          carry INFO/FORMAT fields through natively (at their stored dtypes),
-          and recomputes the `mutcat` mutational-signature sidecar from
-          `reference` when one is given. Recommended when the subset is
-          expected to route the same way as the source anyway (e.g. slicing
-          somatic/rare-variant cohorts, where nearly every variant is already
-          var_key-routed) or when the view must be produced under tight
-          memory constraints.
+          preserving regardless of the subset's sample/carrier counts.
+          Recommended when the subset is expected to route the same way as
+          the source anyway (e.g. slicing somatic/rare-variant cohorts, where
+          nearly every variant is already var_key-routed) or when the view
+          must be produced under tight memory constraints.
+        - `"auto"` (default) resolves to `False` when any FORMAT field is
+          carried (any entry of `fields` other than `"mutcat"` whose
+          `available_fields[...].category == "format"`), `True` otherwise. A
+          dense->var_key flip stores one value per *carrier call* and has no
+          slot for a non-carrier sample's FORMAT value, so re-routing a
+          source-dense variant under a FORMAT-carrying view would silently
+          drop that value; `"auto"` prefers fidelity in that case and takes
+          the size-optimal re-route otherwise (genotype-only / INFO-only
+          views, which have no per-sample slot to lose).
 
         `progress` is accepted for interface parity with other long-running
         entry points but is currently a no-op (no progress bar is shown).
-        `threads` is accepted on both paths for interface parity, but is
-        IGNORED when `reroute=False` (the slicer is a single-pass, O(output)
-        byte-copy — there is no parallel cost-model rerouting to spread
-        across threads).
+        `threads` caps the number of contigs sliced concurrently (autodetected
+        from available CPUs when `None`), same convention as `from_vcf`.
+        Peak memory is O(output size) **per in-flight contig** times
+        `threads`; with `reference=` given, each in-flight contig additionally
+        holds that contig's reference sequence in memory.
 
         Raises `FileExistsError` if `output` exists and `overwrite=False`, and
         `ValueError` if `output` resolves to this store's own path (writing a
@@ -393,9 +399,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         )
 
         output = Path(output)
-        if reroute == "auto":
-            reroute = True
-        if not isinstance(reroute, bool):
+        if reroute != "auto" and not isinstance(reroute, bool):
             raise ValueError(f"reroute must be 'auto', True, or False; got {reroute!r}")
         if fields is not None and "mutcat" in fields and reference is None:
             raise ValueError(
@@ -434,40 +438,37 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             for row in regions_df.iter_rows(named=True)
         ]
         reference_str = str(reference) if reference is not None else None
-        if reroute is True:
-            _core.run_view_pipeline(
-                str(self.path),
-                str(output),
-                self.contigs,
-                caller_samples,
-                region_tuples,
-                regions_overlap,
-                merge_overlapping,
-                fields_to_write,
-                reference_str,
-                threads,
-                overwrite,
+        if reroute == "auto":
+            # A dense->var_key flip stores one value per CARRIER CALL and has
+            # no slot for a non-carrier sample's FORMAT value, so re-routing a
+            # source-dense variant would silently drop it. Prefer fidelity
+            # (reroute=False, preserve each variant's source representation)
+            # when FORMAT is in play; take the size-optimal re-route otherwise
+            # -- that is also where the win is: genotype-only / INFO-only
+            # views have no per-sample slot to lose.
+            carries_format = any(
+                self.available_fields[key].category == "format"
+                for key in fields_to_write
             )
-        else:
-            field_tuples = [
-                (sf.name, sf.category, _META_DTYPE[sf.dtype], sf.default)
-                for sf in (self.available_fields[key] for key in fields_to_write)
-            ]
-            _core.run_slice_view(
-                str(self.path),
-                str(output),
-                self.contigs,
-                caller_samples,
-                region_tuples,
-                regions_overlap,
-                merge_overlapping,
-                field_tuples,
-                reference_str,
-                False,  # reroute: this branch is `write_view`'s reroute=False
-                # arm, so `run_slice_view`'s own routing is always Preserve here.
-                None,  # max_threads: not yet wired to `threads` (Task 7).
-                overwrite,
-            )
+            reroute = not carries_format
+        field_tuples = [
+            (sf.name, sf.category, _META_DTYPE[sf.dtype], sf.default)
+            for sf in (self.available_fields[key] for key in fields_to_write)
+        ]
+        _core.run_slice_view(
+            str(self.path),
+            str(output),
+            self.contigs,
+            caller_samples,
+            region_tuples,
+            regions_overlap,
+            merge_overlapping,
+            field_tuples,
+            reference_str,
+            reroute,
+            threads,
+            overwrite,
+        )
 
     @classmethod
     def from_vcf(

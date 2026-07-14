@@ -82,21 +82,27 @@
   `concat` requires disjoint contig sets and matching samples/ploidy/
   format_version/fields across sources.
 - `SparseVar2.write_view` — write a region/sample subset of an SVAR2 store.
-  `reroute="auto"`/`True` (default) re-runs the ordinary conversion pipeline's
-  var_key/dense cost model over the finished store's own records — size-
-  optimal, but genotypes only (`fields=` defaults to none and any non-empty
-  selection raises `ValueError`; field carry-through on this path remains a
-  follow-up).
-- `SparseVar2.write_view(reroute=False)` — a representation-preserving
-  array-slicer: subsets a finished SVAR2 store by slicing its `var_key`/dense
-  sidecars directly (no cost model, no conversion re-run), so memory is
-  O(output) regardless of source size. Preserves each variant's original
-  var_key/dense representation, carries INFO/FORMAT fields through natively
-  at their stored dtype, and recomputes `mutcat` from `reference=` on the
-  subset. Recommended for somatic/all-rare cohorts and memory-constrained
-  runs; `reroute=True` stays the size-optimal default and its output can be
-  up to ~6.6% smaller for aggressive germline sample-subsets. `genoray view
-  --no-reroute` maps to this path (previously raised `NotImplementedError`).
+  Both `reroute=True` and `reroute=False` now go through one shared slicer
+  backend (`_core.run_slice_view`), which carries `fields` and recomputes
+  `mutcat` from `reference=` on **either** path:
+  - `reroute=True` re-runs the ordinary conversion pipeline's var_key/dense
+    cost model over the subset — size-optimal (each variant re-routed to
+    whichever representation is smaller for the subset's sample/carrier
+    counts).
+  - `reroute=False` directly slices each variant's *existing* on-disk
+    representation (no cost model, byte-level slice) — representation-
+    preserving and O(output) memory regardless of source size. Recommended
+    for somatic/all-rare cohorts (nearly every variant is already
+    var_key-routed) or memory-constrained runs. `genoray view --no-reroute`
+    maps to this path.
+  - `reroute="auto"` (default) resolves to `False` when any FORMAT field is
+    carried, `True` otherwise: a dense→var_key flip stores one value per
+    *carrier call* and has no slot for a non-carrier sample's FORMAT value,
+    so `"auto"` prefers fidelity whenever FORMAT is in play and takes the
+    size-optimal re-route otherwise (genotype-only / INFO-only views have no
+    per-sample slot to lose).
+  - `threads` caps the number of contigs sliced concurrently (autodetected
+    when `None`), the same convention as `from_vcf`, on both paths.
 - `genoray concat` / `genoray split` CLI commands, thin wrappers over
   `SparseVar2.concat`/`split_by_contig`/`subset_contigs`.
 - `SparseVar2.from_svar1` converts an existing SVAR1 (`SparseVar`) store to SVAR2
@@ -117,10 +123,11 @@
   App-group pattern. The previous SVAR 1.0 behavior moves to
   `genoray view svar1` — unchanged otherwise. SVAR2's "all variants" default
   spans each contig `[0, 2**31 - 1)` (SVAR2 has no contig-length metadata);
-  `--fields` defaults to none; a new `--reroute`/`--no-reroute` flag (default
-  `--reroute`) maps to `write_view(reroute=)` — `--reroute` (default) is
-  genotypes-only (any non-empty `--fields` raises `ValueError`), while
-  `--no-reroute` carries `--fields` through natively and is low-memory.
+  `--fields` defaults to none; a new `--reroute`/`--no-reroute` flag maps to
+  `write_view(reroute=)`. Omitting both flags defaults to `"auto"` (resolves
+  to `--no-reroute`'s behavior when any FORMAT field is carried, to
+  `--reroute`'s otherwise — see `write_view` above); both flags carry
+  `--fields`/`--reference` through identically.
 - `Phantom` mode `empty()` classmethods now take a uniform
   `empty(n_samples, ploidy, n_variants)` signature on both VCF and PGEN
   backends. VCF's former 4th `phasing` argument is removed; pass the effective

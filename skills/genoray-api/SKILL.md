@@ -713,6 +713,7 @@ genoray view in.svar2 out.svar2 -r chr1:1-1000 -s A,B
 genoray view in.svar2 out.svar2 -r chr1:1-1000          # all samples
 genoray view in.svar2 out.svar2 -s A,B                  # all variants (one region per contig)
 genoray view in.svar2 out.svar2 -r chr1:1-1000 --no-reroute   # representation-preserving, low-memory view
+genoray view in.svar2 out.svar2 -r chr1:1-1000 --reroute      # force the size-optimal re-route
 
 # SVAR 1.0 (previous default) — unchanged SparseVar.write_view CLI
 genoray view svar1 in.svar out.svar -r chr1:1-1000 -s A,B --progress
@@ -731,29 +732,34 @@ mutually exclusive).
   metadata) spanning `[0, 2**31 - 1)` — every real POS is smaller. `--fields`
   defaults to `None`, meaning no fields are carried through (genotypes
   only) — this always succeeds, even on a store that has INFO/FORMAT fields.
-  `--reroute`/`--no-reroute` (default `--reroute`) maps to
-  `write_view(reroute=)` and selects both the output representation and
-  whether `--fields`/`--reference` do anything:
-  - `--reroute` (default, `reroute="auto"`/`True`) reruns the ordinary
-    conversion pipeline's var_key/dense cost model over the subset —
-    *size-optimal*, but genotypes only: the backend rejects any non-empty
-    `--fields` value with a `ValueError`, and `--reference` is accepted but
-    currently unused (no `mutcat` recompute on this path — a follow-up).
+  Both `--reroute` and `--no-reroute` go through the same slicer backend and
+  carry `--fields`/`--reference` identically — there is no longer a
+  fields-carrying vs. genotypes-only split between them:
+  - `--reroute` reruns the var_key/dense routing cost model over the subset —
+    *size-optimal* (each variant re-routed to whichever representation is
+    smaller for the subset's sample/carrier counts).
   - `--no-reroute` (`reroute=False`) slices each variant's *existing*
     on-disk representation directly (no cost model, byte-level slice) —
-    representation-preserving and low-memory (O(output), independent of
-    source size). It carries `--fields` through natively at their stored
-    dtype, and recomputes `mutcat` from `--reference` when one is given.
-    Recommended for somatic/all-rare cohorts or memory-constrained runs;
-    `--reroute` remains the size-optimal default and its output can be up
-    to ~6.6% smaller for aggressive germline sample-subsets. `-@/--threads`
-    is accepted for interface parity on both paths, but is IGNORED under
-    `--no-reroute` (single-pass slice, no parallel cost-model rerouting).
-  `--progress` is accepted for parity but is currently a no-op on this path
-  (see below). `write_view`'s underlying `reroute=` kwarg only accepts
-  `"auto"`, `True`, or `False` — any other value (e.g. `reroute=1`) raises
-  `ValueError` rather than silently falling through to the `reroute=False`
-  slicer.
+    representation-preserving regardless of the subset's sample/carrier
+    counts. Recommended for somatic/all-rare cohorts (nearly every variant
+    is already var_key-routed) or memory-constrained runs.
+  - Omitting both flags (the default) is `"auto"`: resolves to
+    `--no-reroute`'s behavior when any FORMAT field is carried, to
+    `--reroute`'s otherwise. WHY: a dense→var_key flip stores one value per
+    *carrier call* and has no slot for a non-carrier sample's FORMAT value,
+    so re-routing a source-dense variant under a FORMAT-carrying view would
+    silently drop it — `"auto"` prefers fidelity whenever FORMAT is in play
+    and takes the size-optimal re-route otherwise (genotype-only / INFO-only
+    views have no per-sample slot to lose).
+
+  Both `--reference` (recomputes `mutcat` from scratch on the subset) and
+  `-@/--threads` (caps contigs sliced concurrently; autodetected when
+  omitted) are real on both `--reroute` and `--no-reroute` — there is no
+  longer an "accepted but ignored/unused" caveat on either path. `--progress`
+  is accepted for parity but is currently a no-op on this path (see below).
+  `write_view`'s underlying `reroute=` kwarg only accepts `"auto"`, `True`,
+  or `False` — any other value (e.g. `reroute=1`) raises `ValueError` rather
+  than silently falling through to the `reroute=False` slicer.
 - `genoray view svar1`: unchanged SVAR 1.0 behavior — "all variants" defaults
   from `SparseVar`'s `_contig_stats` (`[0, pos_max + 1)` per contig); `--fields`
   defaults to all available fields (use an explicit empty selection to carry
@@ -960,9 +966,9 @@ Signature: `annotate_mutations(reference, *, contigs=None, write_back=True) -> N
   **Note:** `write_view` **never** copies `mutcat` positionally to the output
   (see below); pass `reference=` to `write_view` to recompute it on the subset,
   or call `annotate_mutations` on the output view yourself. (This is
-  `SparseVar`/v1 behavior; on `SparseVar2.write_view`, `reference=` genuinely
-  recomputes `mutcat` only on the `reroute=False` path — on the default
-  `reroute=True` path it is accepted but currently unused, a follow-up.)
+  `SparseVar`/v1 behavior; on `SparseVar2.write_view`, `reference=` recomputes
+  `mutcat` from scratch on the subset on **both** `reroute=True` and
+  `reroute=False`.)
 - `write_back=False` — the `mutcat` field lives only in memory
   (`svar.fields["mutcat"]`); reopening the file will NOT find it.
 - After the call, `svar.fields["mutcat"]` is populated regardless of
@@ -1087,7 +1093,8 @@ plotting.
 | Calling `mutation_matrix` without a `mutcat` field | Run `annotate_mutations` first, or open with `fields=["mutcat"]` |
 | Expecting `mutation_matrix` to auto-run annotation | It does not; call `annotate_mutations` separately |
 | Re-opening SparseVar and losing the `mutcat` field | Use `write_back=True` (default) in `annotate_mutations`; then open with `SparseVar(dir, fields=["mutcat"])` |
-| Calling `write_view` and expecting `mutcat` to be in the output | `write_view` **never** copies `mutcat` positionally (subsetting invalidates DBS adjacency codes). Pass `reference=` to `write_view` to recompute it on the subset, or call `annotate_mutations` on the output view yourself. Explicitly including `"mutcat"` in `fields=` without a `reference=` raises `ValueError`. On `SparseVar2.write_view`, `reference=` only recomputes `mutcat` when `reroute=False`; on the default `reroute=True` it's accepted but currently a no-op. |
+| Calling `write_view` and expecting `mutcat` to be in the output | `write_view` **never** copies `mutcat` positionally (subsetting invalidates DBS adjacency codes). Pass `reference=` to `write_view` to recompute it on the subset, or call `annotate_mutations` on the output view yourself. Explicitly including `"mutcat"` in `fields=` without a `reference=` raises `ValueError`. On `SparseVar2.write_view`, `reference=` recomputes `mutcat` from scratch on both `reroute=True` and `reroute=False`. |
+| Passing a FORMAT field in `fields=` to `SparseVar2.write_view(..., reroute=True)` and expecting it dropped/rejected | Both `reroute=True` and `reroute=False` carry `fields` through now (previously `reroute=True` raised `ValueError`). Watch the `reroute="auto"` default instead: it resolves to `reroute=False` whenever any FORMAT field is carried, because a dense→var_key flip has no slot for a non-carrier sample's FORMAT value. |
 | Passing the source dataset directory as `output` to `write_view` (even with `overwrite=True`) | Raises `ValueError` — writing in place would delete the source before the view is written. Pass a different `output` path. |
 | Passing a FASTA path directly to `annotate_mutations` | Supported — it auto-wraps via `Reference.from_path` |
 | `rag.fields["AF"]` on a `SparseVar2.decode()` result | `Ragged.fields` is a `list[str]` of names, not a mapping; index the field itself with `rag["AF"]` |
