@@ -263,3 +263,26 @@ def test_annotate_accepts_strand_arrays_smoke(tmp_path: Path):
         np.empty(0, np.uint8),
     )
     assert (out / "chr1" / "mutcat" / "var_key_snp" / "strand.bin").exists()
+
+
+def test_assign_signatures_rejects_strand_kinds(tmp_path: Path):
+    ref = _write_ref(tmp_path)
+    vcf = _write_vcf(tmp_path, symbolic=False, indexed=True)
+    out = tmp_path / "store_assign_strand.svar2"
+    SparseVar2.from_vcf(out, vcf, ref, threads=1)
+    sv2 = SparseVar2(out)
+    sv2.annotate_mutations(ref)  # no gtf
+    with pytest.raises(NotImplementedError, match="SBS192|SBS384|strand"):
+        sv2.assign_signatures("SBS384")
+
+
+def test_sbs384_requires_strand_annotation(tmp_path: Path):
+    ref = _write_ref(tmp_path)
+    vcf = _write_vcf(tmp_path, symbolic=False, indexed=True)
+    out = tmp_path / "store_no_strand.svar2"
+    SparseVar2.from_vcf(out, vcf, ref, threads=1)
+    sv2 = SparseVar2(out)
+    sv2.annotate_mutations(ref)  # no gtf -> no strand.bin
+    assert not sv2._is_strand_annotated()
+    with pytest.raises(ValueError, match="strand"):
+        sv2.mutation_matrix("SBS384")
