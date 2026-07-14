@@ -118,11 +118,21 @@ ID83: list[str] = _build_id83()
 
 assert len(SBS96) == 96 and len(DBS78) == 78 and len(ID83) == 83
 
+# ---- SBS-384 (transcriptional strand bias): SigProfiler [T, U, N, B] blocks ----
+# T=Transcribed, U=Untranscribed, N=Nontranscribed (intergenic), B=Bidirectional.
+# Label form "<strand>:<sbs96 label>", e.g. "T:A[C>A]A". SBS-192 is the {T,U} view
+# (SBS384[:192]); no separate stored range.
+_STRANDS = ["T", "U", "N", "B"]
+SBS384: list[str] = [f"{s}:{lbl}" for s in _STRANDS for lbl in SBS96]
+
+assert len(SBS384) == 384
+
 # ---- unified int16 code space ----
 SBS96_OFFSET = 0
 DBS78_OFFSET = SBS96_OFFSET + len(SBS96)  # 96
 ID83_OFFSET = DBS78_OFFSET + len(DBS78)  # 174
-N_CODES = ID83_OFFSET + len(ID83)  # 257
+SBS384_OFFSET = ID83_OFFSET + len(ID83)  # 257
+N_CODES = SBS384_OFFSET + len(SBS384)  # 641
 
 
 class Sentinel(IntEnum):
@@ -139,19 +149,31 @@ SBS96_INDEX = {lbl: SBS96_OFFSET + i for i, lbl in enumerate(SBS96)}
 DBS78_INDEX = {lbl: DBS78_OFFSET + i for i, lbl in enumerate(DBS78)}
 ID83_INDEX = {lbl: ID83_OFFSET + i for i, lbl in enumerate(ID83)}
 
-MUTCAT_VERSION = 3
+MUTCAT_VERSION = 4
 
-Kind = Literal["SBS96", "DBS78", "ID83"]
+Kind = Literal["SBS96", "DBS78", "ID83", "SBS192", "SBS384"]
 
-_LABELS: dict[str, list[str]] = {"SBS96": SBS96, "DBS78": DBS78, "ID83": ID83}
+_LABELS: dict[str, list[str]] = {
+    "SBS96": SBS96,
+    "DBS78": DBS78,
+    "ID83": ID83,
+    "SBS384": SBS384,
+    "SBS192": SBS384[:192],
+}
 
 
 def code_ranges() -> dict[Kind, tuple[int, int]]:
-    """Half-open ``[start, end)`` code range per matrix kind."""
+    """Half-open ``[start, end)`` code range per matrix kind.
+
+    ``SBS192`` is the {T, U} sub-view of the ``SBS384`` block, so its range is
+    the first 192 codes of that block.
+    """
     return {
         "SBS96": (SBS96_OFFSET, DBS78_OFFSET),
         "DBS78": (DBS78_OFFSET, ID83_OFFSET),
-        "ID83": (ID83_OFFSET, N_CODES),
+        "ID83": (ID83_OFFSET, SBS384_OFFSET),
+        "SBS384": (SBS384_OFFSET, N_CODES),
+        "SBS192": (SBS384_OFFSET, SBS384_OFFSET + 192),
     }
 
 

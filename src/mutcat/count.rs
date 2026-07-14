@@ -7,7 +7,9 @@ use crate::dense::DenseClass;
 use crate::layout::{ContigPaths, MutcatSub};
 use crate::mutcat::classify::dbs78_code;
 use crate::mutcat::sidecar::{MutcatView, open_sidecar};
-use crate::mutcat::{DBS78_OFFSET, ID83_OFFSET, N_CODES, SBS96_OFFSET, UNCLASSIFIED};
+use crate::mutcat::{
+    DBS78_OFFSET, ID83_OFFSET, N_CODES, SBS96_OFFSET, SBS384_OFFSET, STRAND_NA, UNCLASSIFIED,
+};
 use crate::query::ContigReader;
 use crate::query::sidecar::as_bytes;
 use svar2_codec::{decode_snp_2bit, unpack_snp_key_at};
@@ -16,9 +18,10 @@ use svar2_codec::{decode_snp_2bit, unpack_snp_key_at};
 #[derive(Debug, Clone, Copy)]
 pub struct SnvCall {
     pub pos: u32,
-    pub sbs: u8,   // SBS96 class-local index or sentinel
-    pub ref_i: u8, // 2-bit ref base code
-    pub alt_i: u8, // 2-bit alt base code
+    pub sbs: u8,    // SBS96 class-local index or sentinel
+    pub ref_i: u8,  // 2-bit ref base code
+    pub alt_i: u8,  // 2-bit alt base code
+    pub strand: u8, // STRAND_{T,U,N,B}, or STRAND_NA when no strand.bin
 }
 
 /// Emit one unified mutation code per SNV (SBS, or DBS once for an isolated
@@ -51,12 +54,18 @@ pub fn emit_snv_codes(snvs: &[SnvCall], out: &mut impl FnMut(usize)) {
         }
         if (v.sbs as usize) < 96 {
             out(SBS96_OFFSET + v.sbs as usize);
+            // Strand-resolved SBS384 (same SNV), only when the sidecar carried a
+            // strand stream. DBS-paired SNVs `continue` above, so they never reach
+            // here — SBS384 is emitted for exactly the SNVs that emit SBS96.
+            if v.strand != STRAND_NA {
+                out(SBS384_OFFSET + (v.strand as usize) * 96 + v.sbs as usize);
+            }
         }
         j += 1;
     }
     #[allow(clippy::assertions_on_constants)]
     {
-        debug_assert!(N_CODES == 257);
+        debug_assert!(N_CODES == 641);
     }
 }
 
@@ -157,6 +166,11 @@ fn count_column_into(
                 sbs: sidecars.vk_snp.code_at(abs_i),
                 ref_i: sidecars.vk_snp.ref_at(abs_i),
                 alt_i: unpack_snp_key_at(keys, abs_i),
+                strand: if sidecars.vk_snp.has_strand {
+                    sidecars.vk_snp.strand_at(abs_i)
+                } else {
+                    STRAND_NA
+                },
             });
         }
     }
@@ -171,6 +185,11 @@ fn count_column_into(
                 sbs: sidecars.dense_snp.code_at(dcol),
                 ref_i: sidecars.dense_snp.ref_at(dcol),
                 alt_i: unpack_snp_key_at(keys, dcol),
+                strand: if sidecars.dense_snp.has_strand {
+                    sidecars.dense_snp.strand_at(dcol)
+                } else {
+                    STRAND_NA
+                },
             });
         });
     }
@@ -278,7 +297,42 @@ mod tests {
             sbs: sbs96_code(b'A', ref_b, alt_b, b'A'), // dummy flanks for the test
             ref_i: svar2_codec::encode_snp_2bit(ref_b),
             alt_i: svar2_codec::encode_snp_2bit(alt_b),
+            strand: crate::mutcat::STRAND_NA,
         }
+    }
+
+    fn snv_strand(pos: u32, ref_b: u8, alt_b: u8, strand: u8) -> SnvCall {
+        SnvCall {
+            strand,
+            ..snv(pos, ref_b, alt_b)
+        }
+    }
+
+    #[test]
+    fn isolated_snv_emits_sbs96_and_sbs384_when_strand_annotated() {
+        use crate::mutcat::{SBS384_OFFSET, STRAND_U};
+        // Isolated C>A, no adjacent SNV -> SBS96. sbs code with dummy A_A flanks.
+        let sbs = {
+            use crate::mutcat::classify::sbs96_code;
+            sbs96_code(b'A', b'C', b'A', b'A') as usize
+        };
+        let snvs = [snv_strand(10, b'C', b'A', STRAND_U)];
+        let mut codes = vec![];
+        emit_snv_codes(&snvs, &mut |c| codes.push(c));
+        assert_eq!(
+            codes,
+            vec![sbs, SBS384_OFFSET + (STRAND_U as usize) * 96 + sbs]
+        );
+    }
+
+    #[test]
+    fn isolated_snv_emits_only_sbs96_when_not_strand_annotated() {
+        // strand == STRAND_NA (via `snv`) -> no SBS384 emission.
+        let snvs = [snv(10, b'C', b'A')];
+        let mut codes = vec![];
+        emit_snv_codes(&snvs, &mut |c| codes.push(c));
+        assert_eq!(codes.len(), 1);
+        assert!(codes[0] < DBS78_OFFSET);
     }
 
     #[test]

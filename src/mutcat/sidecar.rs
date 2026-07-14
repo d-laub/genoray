@@ -16,6 +16,7 @@ pub fn write_sidecar(
     sub: MutcatSub,
     codes: &[u8],
     ref_codes: Option<&[u8]>,
+    strand_codes: Option<&[u8]>,
 ) -> std::io::Result<()> {
     let dir = paths.mutcat_sub_dir(sub);
     fs::create_dir_all(&dir)?;
@@ -25,6 +26,13 @@ pub fn write_sidecar(
         debug_assert_eq!(refs.len(), codes.len());
         let packed = pack_snp_keys(refs);
         write_bytes(&paths.mutcat_ref(sub), &packed)?;
+    }
+    if sub.has_strand()
+        && let Some(strands) = strand_codes
+    {
+        debug_assert_eq!(strands.len(), codes.len());
+        let packed = pack_snp_keys(strands);
+        write_bytes(&paths.mutcat_strand(sub), &packed)?;
     }
     Ok(())
 }
@@ -38,7 +46,9 @@ fn write_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 pub struct MutcatView {
     code: Option<Mmap>,
     ref_packed: Option<Mmap>,
+    strand_packed: Option<Mmap>,
     pub n: usize,
+    pub has_strand: bool,
 }
 
 impl MutcatView {
@@ -59,6 +69,15 @@ impl MutcatView {
             .expect("ref_at on a stream with no ref.bin");
         unpack_snp_key_at(&m[..], i)
     }
+    /// 2-bit transcriptional-strand code at snp record `i` (`STRAND_{T,U,N,B}`),
+    /// or `STRAND_NA` if this sidecar has no strand stream (annotated without a GTF).
+    #[inline]
+    pub fn strand_at(&self, i: usize) -> u8 {
+        match &self.strand_packed {
+            Some(m) => unpack_snp_key_at(&m[..], i),
+            None => crate::mutcat::STRAND_NA,
+        }
+    }
 }
 
 pub fn open_sidecar(paths: &ContigPaths, sub: MutcatSub) -> std::io::Result<MutcatView> {
@@ -69,10 +88,18 @@ pub fn open_sidecar(paths: &ContigPaths, sub: MutcatSub) -> std::io::Result<Mutc
     } else {
         None
     };
+    let strand_packed = if sub.has_strand() {
+        mmap_file(&paths.mutcat_strand(sub))?
+    } else {
+        None
+    };
+    let has_strand = strand_packed.is_some();
     Ok(MutcatView {
         code,
         ref_packed,
+        strand_packed,
         n,
+        has_strand,
     })
 }
 
@@ -86,12 +113,37 @@ mod tests {
         let paths = ContigPaths::new(tmp.path().to_str().unwrap(), "chr1");
         let codes = [5u8, 95, 254, 0];
         let refs = [1u8, 3, 0, 2]; // C,G(→ codec 3),A,T
-        write_sidecar(&paths, MutcatSub::VkSnp, &codes, Some(&refs)).unwrap();
+        write_sidecar(&paths, MutcatSub::VkSnp, &codes, Some(&refs), None).unwrap();
         let v = open_sidecar(&paths, MutcatSub::VkSnp).unwrap();
         assert_eq!(v.n, 4);
+        assert!(!v.has_strand);
         for i in 0..4 {
             assert_eq!(v.code_at(i), codes[i]);
             assert_eq!(v.ref_at(i), refs[i]);
+            assert_eq!(v.strand_at(i), crate::mutcat::STRAND_NA);
+        }
+    }
+
+    #[test]
+    fn snp_sidecar_round_trips_strand() {
+        use crate::mutcat::{STRAND_B, STRAND_N, STRAND_T, STRAND_U};
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = ContigPaths::new(tmp.path().to_str().unwrap(), "chr1");
+        let codes = [5u8, 95, 254, 0];
+        let refs = [1u8, 3, 0, 2];
+        let strands = [STRAND_T, STRAND_U, STRAND_N, STRAND_B];
+        write_sidecar(
+            &paths,
+            MutcatSub::VkSnp,
+            &codes,
+            Some(&refs),
+            Some(&strands),
+        )
+        .unwrap();
+        let v = open_sidecar(&paths, MutcatSub::VkSnp).unwrap();
+        assert!(v.has_strand);
+        for (i, &want) in strands.iter().enumerate() {
+            assert_eq!(v.strand_at(i), want);
         }
     }
 
@@ -100,7 +152,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = ContigPaths::new(tmp.path().to_str().unwrap(), "chr1");
         let codes = [10u8, 82, 255];
-        write_sidecar(&paths, MutcatSub::VkIndel, &codes, None).unwrap();
+        write_sidecar(&paths, MutcatSub::VkIndel, &codes, None, None).unwrap();
         let v = open_sidecar(&paths, MutcatSub::VkIndel).unwrap();
         assert_eq!(v.n, 3);
         assert_eq!(v.code_at(1), 82);

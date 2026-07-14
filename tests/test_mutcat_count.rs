@@ -76,7 +76,7 @@ fn count_contig_pairs_adjacent_snvs_for_one_sample() {
     let paths = ContigPaths::new(out.to_str().unwrap(), "chr1");
     let codes = [UNCLASSIFIED, UNCLASSIFIED];
     let refs = [encode_snp_2bit(b'A'), encode_snp_2bit(b'C')];
-    write_sidecar(&paths, MutcatSub::VkSnp, &codes, Some(&refs)).unwrap();
+    write_sidecar(&paths, MutcatSub::VkSnp, &codes, Some(&refs), None).unwrap();
 
     let reader = ContigReader::open(out.to_str().unwrap(), "chr1", 1, 1).unwrap();
     let sidecars = Sidecars::open(&paths).unwrap();
@@ -168,6 +168,7 @@ fn count_is_thread_count_invariant() {
             MutcatSub::VkSnp,
             &vec![dummy_code; n_vk],
             Some(&vec![dummy_ref; n_vk]),
+            None,
         )
         .unwrap();
     }
@@ -188,6 +189,7 @@ fn count_is_thread_count_invariant() {
             MutcatSub::DenseSnp,
             &vec![dummy_code; n_dense],
             Some(&vec![dummy_ref; n_dense]),
+            None,
         )
         .unwrap();
     }

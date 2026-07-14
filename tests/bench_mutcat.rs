@@ -163,7 +163,7 @@ fn inject_sidecars(out: &std::path::Path, chrom: &str) {
         if n > 0 {
             let codes: Vec<u8> = (0..n).map(|i| (i % 96) as u8).collect();
             let refs: Vec<u8> = (0..n).map(|_| encode_snp_2bit(b'C')).collect();
-            write_sidecar(&paths, sub, &codes, Some(&refs)).unwrap();
+            write_sidecar(&paths, sub, &codes, Some(&refs), None).unwrap();
         }
     }
     for (sub, sub_dir) in [
@@ -180,7 +180,7 @@ fn inject_sidecars(out: &std::path::Path, chrom: &str) {
         };
         if n > 0 {
             let codes: Vec<u8> = (0..n).map(|i| (i % 83) as u8).collect();
-            write_sidecar(&paths, sub, &codes, None).unwrap();
+            write_sidecar(&paths, sub, &codes, None, None).unwrap();
         }
     }
 }

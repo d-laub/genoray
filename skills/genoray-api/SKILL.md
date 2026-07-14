@@ -594,17 +594,25 @@ df = sv.mutation_matrix("DBS78", count="sample")
 act = sv.assign_signatures("SBS96")                  # mutation_matrix + fit_signatures
 ```
 
-- `annotate_mutations(reference, *, contigs=None) -> None` — `reference` is a
-  `genoray.Reference` or a FASTA path; `contigs=None` (default) annotates every
-  contig. Unlike `SparseVar.annotate_mutations`, there is **no `write_back=`
-  toggle** — SVAR2 always persists the sidecar to disk.
+- `annotate_mutations(reference, *, gtf=None, contigs=None) -> None` —
+  `reference` is a `genoray.Reference` or a FASTA path; `contigs=None`
+  (default) annotates every contig. Unlike `SparseVar.annotate_mutations`,
+  there is **no `write_back=` toggle** — SVAR2 always persists the sidecar to
+  disk. `gtf=` optionally supplies a GTF/GFF gene model path; when given, each
+  SNV is additionally classified by transcriptional-strand class (from
+  `feature == "gene"` footprints) and persisted to a `strand.bin` sidecar,
+  which unlocks the `"SBS192"`/`"SBS384"` catalogs below.
 - `mutation_matrix(kind, *, count="allele"|"sample") -> pl.DataFrame` — a
   `MutationType` column (fixed COSMIC codebook order) plus one column per
-  sample. `kind ∈ {"SBS96", "DBS78", "ID83"}`. `count="allele"` counts every
-  non-ref allele copy; `count="sample"` counts each category at most once per
-  sample, OR-combined across contigs. **Raises `ValueError`** if called before
-  the store is annotated (no on-disk sidecar for every contig) — annotate
-  first, either via `annotate_mutations` or `from_vcf(..., signatures=True)`.
+  sample. `kind ∈ {"SBS96", "DBS78", "ID83", "SBS192", "SBS384"}`.
+  `count="allele"` counts every non-ref allele copy; `count="sample"` counts
+  each category at most once per sample, OR-combined across contigs. **Raises
+  `ValueError`** if called before the store is annotated (no on-disk sidecar
+  for every contig) — annotate first, either via `annotate_mutations` or
+  `from_vcf(..., signatures=True)`. `"SBS192"`/`"SBS384"` additionally require
+  strand annotation (`annotate_mutations(..., gtf=...)`) and raise
+  `ValueError` if the store lacks it. `assign_signatures` does **not** accept
+  `"SBS192"`/`"SBS384"` — see below.
 - `assign_signatures(kind, *, reference=None, count="allele", max_delta=0.01, min_activity=0.005, n_jobs=1, backend="loky") -> pl.DataFrame`
   — `mutation_matrix(kind, count=...)` then `genoray.fit_signatures(...)`.
   `reference` accepts a `pl.DataFrame`, a TSV path, or `None` (defaults to
@@ -617,6 +625,32 @@ act = sv.assign_signatures("SBS96")                  # mutation_matrix + fit_sig
 - No public read-side access to the raw per-genotype `mutcat` codes for
   SVAR2 (unlike v1's `fields=["mutcat"]`) — only the aggregated
   `mutation_matrix` output is exposed.
+
+### Strand-resolved catalogs (SBS192 / SBS384)
+
+`SparseVar2` also supports the transcriptional-strand-bias catalogs, which
+require a gene model (GTF) at annotation time:
+
+```python
+sv2.annotate_mutations(reference, gtf="gencode.v45.annotation.gtf.gz")
+sbs384 = sv2.mutation_matrix("SBS384")   # 384 rows: [T, U, N, B] x 96
+sbs192 = sv2.mutation_matrix("SBS192")   # 192 rows: the {T, U} sub-view = SBS384[:192]
+```
+
+- **SBS384** = 96 trinucleotide channels x 4 strand categories, SigProfiler
+  order `[T, U, N, B]`: **T**ranscribed, **U**ntranscribed, **N**ontranscribed
+  (intergenic), **B**idirectional (position covered by genes on both strands).
+- **SBS192** is the `{T, U}` sub-view (`SBS384[:192]`).
+- Strand rule (pyrimidine-folded): a genic SNV is Untranscribed iff the
+  pyrimidine of its ref/alt pair sits on the gene's coding strand, else
+  Transcribed. Gene footprints come from `feature == "gene"` rows (full gene
+  body); pre-filter the GTF to restrict biotypes.
+- Without a `gtf=`, `mutation_matrix("SBS192"/"SBS384")` raises. Write-time
+  `from_vcf(..., signatures=True)` stays strand-free; obtain strand catalogs via
+  a post-hoc `annotate_mutations(reference, gtf=...)`.
+- `assign_signatures("SBS192"/"SBS384")` raises `NotImplementedError`: COSMIC
+  publishes no strand-resolved reference set. Use `mutation_matrix` for
+  strand-bias analysis.
 
 ### Merge and split by contig
 
@@ -1032,7 +1066,9 @@ svar = genoray.SparseVar("out.svar", fields=["mutcat"])
 
 ### v1 scope limits (no strand-bias; calibrated against PCAWG/SigProfiler rules)
 
-- No strand-bias separation (no SBS-192 / transcriptional strand).
+- No strand-bias separation (SBS-192 / SBS-384) — v1 `SparseVar` only. Use
+  `SparseVar2.annotate_mutations(reference, gtf=...)` for transcriptional
+  strand-resolved catalogs.
 - DBS collapse applies only to **isolated adjacent pairs** on the same
   haplotype. Runs of ≥ 3 adjacent SNVs stay as individual SBS entries.
 - Indel channel (ID-83) bucketing follows PCAWG/SigProfiler published rules and

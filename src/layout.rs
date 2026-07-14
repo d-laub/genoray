@@ -26,6 +26,10 @@ impl MutcatSub {
     pub fn has_ref(self) -> bool {
         matches!(self, MutcatSub::VkSnp | MutcatSub::DenseSnp)
     }
+    /// SNP sub-streams also carry a 2-bit `strand.bin` when GTF-annotated.
+    pub fn has_strand(self) -> bool {
+        matches!(self, MutcatSub::VkSnp | MutcatSub::DenseSnp)
+    }
 }
 
 /// The four sub-streams a field sidecar mirrors. Same four directories as
@@ -121,6 +125,9 @@ impl ContigPaths {
     }
     pub fn mutcat_ref(&self, sub: MutcatSub) -> PathBuf {
         self.mutcat_dir(sub).join("ref.bin")
+    }
+    pub fn mutcat_strand(&self, sub: MutcatSub) -> PathBuf {
+        self.mutcat_dir(sub).join("strand.bin")
     }
     /// Directory created before writing a sidecar sub-stream.
     pub fn mutcat_sub_dir(&self, sub: MutcatSub) -> PathBuf {

@@ -700,11 +700,15 @@ pub fn run_slice_view(
                                     source: e,
                                 })?;
                         let paths = crate::layout::ContigPaths::new(&out_dir, chrom);
-                        crate::mutcat::annotate::annotate_contig(&reader, &paths, &ref_seq)
+                        // Views are strand-free (write_view takes no `gtf=`,
+                        // mirroring write-time `signatures=True`): no
+                        // StrandIntervals, so SBS192/384 are unavailable on a
+                        // sliced view, same as a `from_vcf(signatures=True)` store.
+                        crate::mutcat::annotate::annotate_contig(&reader, &paths, &ref_seq, None)
                             .map_err(|e| ConversionError::Io {
-                                context: format!("annotate mutcat {out_dir}/{chrom}"),
-                                source: e,
-                            })?;
+                            context: format!("annotate mutcat {out_dir}/{chrom}"),
+                            source: e,
+                        })?;
                     }
                     Ok(n)
                 })

@@ -953,7 +953,7 @@ fn run_slice_view_full_coverage_carries_genos_fields_and_mutcat() {
     let ref_seq = reconstruct_ref(&fixture_records(), 1_000_000);
     let src_reader = ContigReader::open(src.to_str().unwrap(), "chr1", samples.len(), 2).unwrap();
     let src_paths = ContigPaths::new(src.to_str().unwrap(), "chr1");
-    annotate_contig(&src_reader, &src_paths, &ref_seq).unwrap();
+    annotate_contig(&src_reader, &src_paths, &ref_seq, None).unwrap();
 
     let out = tmp.path().join("out");
     let fasta = src.join("in.fa");
