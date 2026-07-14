@@ -1,14 +1,16 @@
-"""Benchmark the eager `Vec<RawRecord>` materialization in `Svar2Source`.
+"""Benchmark `SparseVar2.write_view` peak memory vs. sample count.
 
-`SparseVar2.write_view` runs the coarse re-conversion seam: `Svar2Source::new`
-decodes the whole contig subset up front into an in-memory
-`BTreeMap<(pos,ilen,alt), Vec<bool>>` **and** a `Vec<RawRecord>` (each record's
-`gt` a `Vec<i32>` of length `n_samples * ploidy`), then drains it. For a
-whole-store copy (all samples, whole contig) that is O(n_variants * n_haps)
-resident — potentially tens of GB at cohort scale. This benchmark measures peak
-RSS and wall time as the sample count grows, to gate whether the eager path is
-safe to advertise for cohort-scale whole-store copies or needs a streaming
-rewrite first.
+HISTORY: this script originally gated the eager `Vec<RawRecord>` materialization
+in `Svar2Source` — the pipeline-backed `reroute=True` seam that decoded the whole
+contig subset up front (a `BTreeMap<(pos,ilen,alt), Vec<bool>>` **and** a
+`Vec<RawRecord>`, ~O(n_variants * n_haps) resident, tens of GB at cohort scale).
+That path has been **deleted**: `write_view` now routes both `reroute=True` and
+`reroute=False` through the array-slicer (`run_slice_view`), whose peak is
+O(output per contig). So this benchmark now measures the *slicer's* footprint, and
+the point is to confirm peak RSS is bounded by output size rather than linear in
+`k`. The `eager lower-bound` column is retained ONLY as a historical reference
+line (what the deleted eager path would have cost); it does not describe the
+current path.
 
 One measured point per process (so `ru_maxrss` is that run's peak). Driver mode
 (`--ks`) re-execs itself once per k as a subprocess and tabulates.
@@ -55,8 +57,11 @@ def _run_one(store: Path, k: int, out: Path, end: int, threads: int | None) -> d
     peak_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss  # Linux: KiB
     out_bytes = _dir_bytes(out)
     n_haps = k * int(meta["ploidy"])
-    # Lower-bound on the eager footprint: gt Vec<i32> + carrier Vec<bool> per
-    # variant, over every variant in the store (whole-contig view).
+    # Historical reference line only: what the DELETED eager Svar2Source path
+    # would have cost (gt Vec<i32> + carrier Vec<bool> per variant, over every
+    # variant in the store). The current slicer path does NOT materialize this;
+    # its peak is bounded by out_size_gb + a per-contig working set. Kept so the
+    # measured peak_rss can be read against the footprint that used to gate this.
     n_var = _variant_count(store, contig)
     eager_lb_gb = n_var * n_haps * (4 + 1) / 1e9
     return {
