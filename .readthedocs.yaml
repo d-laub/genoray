@@ -4,12 +4,21 @@ build:
   os: "ubuntu-22.04"
   tools:
     python: "3.12"
-
-python:
-  install:
-    - requirements: docs/requirements.txt
-    - method: pip
-      path: .
+  # Override the default install job. `pip install .` builds the `genoray._core`
+  # pyo3 extension via maturin (Rust is auto-bootstrapped by puccinialin). With
+  # default cargo features that pulls in rust-htslib -> hts-sys, which vendors
+  # htslib and runs bindgen; RTD's build image lacks the C headers bindgen needs
+  # ("fatal error: 'stddef.h' file not found"), so the wheel build fails.
+  #
+  # The docs only need `import genoray` to succeed for autodoc — they never call
+  # the VCF->svar2 conversion pipeline. So build the query-only core
+  # (--no-default-features --features extension-module): no `conversion` feature,
+  # no rust-htslib/htslib/bindgen, no C toolchain required.
+  jobs:
+    install:
+      - python -m pip install --upgrade --no-cache-dir pip
+      - python -m pip install --exists-action=w --no-cache-dir -r docs/requirements.txt
+      - MATURIN_PEP517_ARGS="--no-default-features --features extension-module" python -m pip install --no-cache-dir .
 
 sphinx:
   configuration: docs/source/conf.py
