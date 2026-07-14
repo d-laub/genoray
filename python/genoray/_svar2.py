@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from collections import Counter
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import numpy as np
 import polars as pl
@@ -14,12 +14,14 @@ from genoray._contigs import _MITO_ALIASES
 from genoray._svar2_batch import _BatchQueryMixin
 from genoray._svar2_decode import _DecodeMixin
 from genoray._svar2_fields import (
+    _META_DTYPE,
     StoredField,
     _load_field_manifest,
     _resolve_fields,
     _resolve_read_fields,
 )
 from genoray._svar2_mutcat import _MutcatMixin
+from genoray._svar2_ops import Mode, _assert_concat_compatible, _load_meta, _write_store
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -248,6 +250,225 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         ``FORMAT/DP``.
         """
         return SparseVar2(self.path, fields=fields)
+
+    def subset_contigs(
+        self,
+        output: str | Path,
+        contigs: str | Sequence[str],
+        *,
+        mode: Mode = "copy",
+        overwrite: bool = False,
+    ) -> None:
+        """Write a new SVAR2 store containing only `contigs` (metadata + file copy)."""
+        output = Path(output)
+        wanted = [contigs] if isinstance(contigs, str) else list(contigs)
+        missing = [c for c in wanted if c not in self.contigs]
+        if missing:
+            raise ValueError(f"contigs not in store: {missing}")
+        if output.resolve() == self.path.resolve():
+            raise ValueError("cannot write a subset in place (output == source)")
+        kept = [c for c in self.contigs if c in set(wanted)]  # preserve source order
+        meta = _load_meta(self.path)
+        meta["contigs"] = kept
+        _write_store(output, {c: self.path for c in kept}, meta, mode, overwrite)
+
+    def split_by_contig(
+        self, out_dir: str | Path, *, mode: Mode = "copy", overwrite: bool = False
+    ) -> list[Path]:
+        """Explode into one single-contig store per contig at out_dir/{contig}.svar2."""
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        paths: list[Path] = []
+        for c in self.contigs:
+            p = out_dir / f"{c}.svar2"
+            self.subset_contigs(p, [c], mode=mode, overwrite=overwrite)
+            paths.append(p)
+        return paths
+
+    @classmethod
+    def concat(
+        cls,
+        output: str | Path,
+        sources: Sequence[str | Path | "SparseVar2"],
+        *,
+        mode: Mode = "copy",
+        overwrite: bool = False,
+    ) -> None:
+        """Concatenate disjoint-contig SVAR2 stores (identical samples/ploidy/fields) into one."""
+        paths = [Path(s.path if isinstance(s, SparseVar2) else s) for s in sources]
+        if not paths:
+            raise ValueError("concat requires at least one source")
+        output = Path(output)
+        if any(output.resolve() == p.resolve() for p in paths):
+            raise ValueError(
+                "cannot write concat output in place (output == one of the sources)"
+            )
+        metas = [_load_meta(p) for p in paths]
+        _assert_concat_compatible(metas)
+        contig_sources: dict[str, Path] = {}
+        for p, m in zip(paths, metas):
+            for c in m["contigs"]:
+                if c in contig_sources:
+                    raise ValueError(
+                        f"contig {c!r} appears in multiple sources; concat requires disjoint contigs"
+                    )
+                contig_sources[c] = p
+        merged_contigs = natsorted(contig_sources)
+        meta = dict(metas[0])
+        meta["contigs"] = merged_contigs
+        _write_store(
+            Path(output),
+            {c: contig_sources[c] for c in merged_contigs},
+            meta,
+            mode,
+            overwrite,
+        )
+
+    def write_view(
+        self,
+        regions: "str | tuple[str, int, int] | Path | object",
+        samples: "str | Sequence[str] | Path",
+        output: str | Path,
+        fields: "Sequence[str] | None" = None,
+        reference: str | Path | None = None,
+        *,
+        merge_overlapping: bool = False,
+        regions_overlap: "Literal['pos', 'record', 'variant']" = "pos",
+        reroute: "bool | Literal['auto']" = "auto",
+        overwrite: bool = False,
+        threads: int | None = None,
+        progress: bool = False,
+    ) -> None:
+        """Write a region/sample subset of this store to `output`.
+
+        `regions`/`samples` accept the same inputs as the query methods (region
+        string, `(chrom, start, end)` tuple, BED path, or a samples sequence /
+        path to a sample list). `regions_overlap` controls how a variant's span
+        is matched against the requested regions (`"pos"`/`"record"`/`"variant"`
+        — see `_normalize_regions`/`_resolve_kept_rows`); `merge_overlapping`
+        silently merges overlapping input regions instead of raising.
+
+        `fields` defaults to `None`, meaning *no* fields are carried through
+        (genotypes only) — this always succeeds, even on a store that has
+        INFO/FORMAT fields (`available_fields` non-empty). `"mutcat"` is
+        always excluded from `fields` — pass `reference=` to recompute it
+        instead of copying.
+
+        Both `reroute=True` and `reroute=False` go through the same slicer
+        backend, which carries `fields` and recomputes `mutcat` from
+        `reference` (when given) on either path:
+
+        - `reroute=True` reruns the var_key/dense routing cost model over the
+          subset. This is *size-optimal* (each variant is re-routed to
+          whichever representation is smaller for the subset's sample/carrier
+          counts).
+        - `reroute=False` directly slices each variant's *existing* on-disk
+          representation (byte-copy, no cost model) — representation-
+          preserving regardless of the subset's sample/carrier counts.
+          Recommended when the subset is expected to route the same way as
+          the source anyway (e.g. slicing somatic/rare-variant cohorts, where
+          nearly every variant is already var_key-routed) or when the view
+          must be produced under tight memory constraints.
+        - `"auto"` (default) resolves to `False` when any FORMAT field is
+          carried (any entry of `fields` other than `"mutcat"` whose
+          `available_fields[...].category == "format"`), `True` otherwise. A
+          dense->var_key flip stores one value per *carrier call* and has no
+          slot for a non-carrier sample's FORMAT value, so re-routing a
+          source-dense variant under a FORMAT-carrying view would silently
+          drop that value; `"auto"` prefers fidelity in that case and takes
+          the size-optimal re-route otherwise (genotype-only / INFO-only
+          views, which have no per-sample slot to lose).
+
+        `progress` is accepted for interface parity with other long-running
+        entry points but is currently a no-op (no progress bar is shown).
+        `threads` caps the number of contigs sliced concurrently (autodetected
+        from available CPUs when `None`), same convention as `from_vcf`.
+        Peak memory is O(output size) **per in-flight contig** times
+        `threads`; with `reference=` given, each in-flight contig additionally
+        holds that contig's reference sequence in memory.
+
+        Raises `FileExistsError` if `output` exists and `overwrite=False`, and
+        `ValueError` if `output` resolves to this store's own path (writing a
+        view in place is not supported).
+        """
+        from genoray._contigs import ContigNormalizer
+        from genoray._svar._regions import (
+            _normalize_regions,
+            _normalize_samples,
+            _validate_fields,
+        )
+
+        output = Path(output)
+        if reroute != "auto" and not isinstance(reroute, bool):
+            raise ValueError(f"reroute must be 'auto', True, or False; got {reroute!r}")
+        if fields is not None and "mutcat" in fields and reference is None:
+            raise ValueError(
+                "'mutcat' cannot be copied through write_view; pass "
+                "reference= to recompute it."
+            )
+        if output.exists() and not overwrite:
+            raise FileExistsError(f"{output} exists; pass overwrite=True")
+        if output.resolve() == self.path.resolve():
+            raise ValueError(
+                "output resolves to the same path as the source; cannot "
+                "write a view in place"
+            )
+        cnorm = ContigNormalizer(self.contigs)
+        regions_df = _normalize_regions(regions, cnorm)
+        caller_samples = _normalize_samples(samples, self.available_samples)
+        if not caller_samples:
+            raise ValueError("write_view requires at least one sample")
+        if fields is None:
+            # `_validate_fields(None, available)` returns *all* available
+            # fields (its semantics for the read path), not "none" -- the
+            # write_view default must mean "genotypes only" so a plain
+            # `write_view(...)` call succeeds on any store, including one
+            # with INFO/FORMAT fields.
+            fields_to_write: list[str] = []
+        else:
+            fields_to_write = [
+                f
+                for f in _validate_fields(
+                    fields, cast("dict[str, Any]", self.available_fields)
+                )
+                if f != "mutcat"
+            ]
+        region_tuples = [
+            (row["chrom"], int(row["start"]), int(row["end"]))
+            for row in regions_df.iter_rows(named=True)
+        ]
+        reference_str = str(reference) if reference is not None else None
+        if reroute == "auto":
+            # A dense->var_key flip stores one value per CARRIER CALL and has
+            # no slot for a non-carrier sample's FORMAT value, so re-routing a
+            # source-dense variant would silently drop it. Prefer fidelity
+            # (reroute=False, preserve each variant's source representation)
+            # when FORMAT is in play; take the size-optimal re-route otherwise
+            # -- that is also where the win is: genotype-only / INFO-only
+            # views have no per-sample slot to lose.
+            carries_format = any(
+                self.available_fields[key].category == "format"
+                for key in fields_to_write
+            )
+            reroute = not carries_format
+        field_tuples = [
+            (sf.name, sf.category, _META_DTYPE[sf.dtype], sf.default)
+            for sf in (self.available_fields[key] for key in fields_to_write)
+        ]
+        _core.run_slice_view(
+            str(self.path),
+            str(output),
+            self.contigs,
+            caller_samples,
+            region_tuples,
+            regions_overlap,
+            merge_overlapping,
+            field_tuples,
+            reference_str,
+            reroute,
+            threads,
+            overwrite,
+        )
 
     @classmethod
     def from_vcf(

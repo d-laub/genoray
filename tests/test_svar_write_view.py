@@ -780,7 +780,7 @@ def test_write_view_never_materializes_full_index(monkeypatch, tmp_path: Path):
 
 
 def test_cli_view_default_does_not_materialize_index(monkeypatch, tmp_path: Path):
-    from genoray._cli.__main__ import view
+    from genoray._cli.__main__ import view_svar1
 
     monkeypatch.setattr(SparseVar, "index", property(_index_raises))
 
@@ -790,7 +790,7 @@ def test_cli_view_default_does_not_materialize_index(monkeypatch, tmp_path: Path
     sample = sv.available_samples[0]
 
     # Default regions (all variants) + a sample subset — the issue #73 shape.
-    view(
+    view_svar1(
         source=src,
         out=out,
         samples=sample,

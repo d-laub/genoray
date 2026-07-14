@@ -39,4 +39,4 @@ pub use gather::{
     BatchResult, BatchResultSplit, HapRanges, RangesBundle, dense_abs_row, find_ranges,
     gather_haps_readbound, gather_haps_readbound_src, gather_ranges, overlap_batch, read_ranges,
 };
-pub use reader::ContigReader;
+pub use reader::{ContigReader, VariantStats};

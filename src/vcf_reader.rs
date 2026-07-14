@@ -119,6 +119,39 @@ pub(crate) fn load_contig_seq(fasta_path: &str, chrom: &str) -> Result<Vec<u8>, 
     Ok(ref_seq)
 }
 
+/// Cheaply validate that `fasta_path` is openable and contains every contig in
+/// `chroms`, WITHOUT fetching any full sequence — opens the faidx once and
+/// checks each contig via `fetch_seq_len` (the same checks `load_contig_seq`
+/// runs before it fetches bytes). Used by `run_slice_view`'s fail-fast band so
+/// a bad `reference=` raises before any output byte is written, while the
+/// per-contig loop still loads each sequence lazily (peak O(1 contig), not
+/// O(genome)). Error variants/messages are byte-identical to `load_contig_seq`
+/// so the raise is indistinguishable from the loop's.
+pub(crate) fn validate_contigs_in_fasta(
+    fasta_path: &str,
+    chroms: &[String],
+) -> Result<(), ConversionError> {
+    if !std::path::Path::new(fasta_path).exists() {
+        return Err(ConversionError::MissingFile {
+            path: fasta_path.to_string(),
+        });
+    }
+    let fasta = rust_htslib::faidx::Reader::from_path(fasta_path).map_err(|e| {
+        ConversionError::Input(format!(
+            "Failed to open reference FASTA '{fasta_path}' (is there a .fai?): {e}"
+        ))
+    })?;
+    for chrom in chroms {
+        // u64::MAX == htslib's -1 for an unknown contig; no sequence is fetched.
+        if fasta.fetch_seq_len(chrom.as_str()) == u64::MAX {
+            return Err(ConversionError::Input(format!(
+                "Contig '{chrom}' not found in reference FASTA"
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub struct VcfRecordSource {
     inner_reader: IndexedReader,
     num_samples: usize,

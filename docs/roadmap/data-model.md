@@ -415,11 +415,44 @@ SVAR2 is a **compute-oriented, derived format — not an archival format.**
 - **No sample appends.** You cannot add samples to an existing SVAR2 file. Adding
   samples changes per-variant allele frequencies, which changes cost-model decisions
   and can invalidate every LUT and variant table. Re-convert instead.
-- **Cheap merge/split by contig (M8).** Contigs are fully independent on disk, so
-  merging or splitting SVAR2 files along contig boundaries is a near-trivial file
-  operation.
-- **Cheap region subsetting (M9, non-MVP).** Subsetting by region introduces no new
-  variants and only shrinks variant tables, so it doesn't perturb the cost model.
+- **Cheap merge/split by contig (M8). Implemented.** Contigs are fully independent
+  on disk, so merging or splitting SVAR2 files along contig boundaries is a
+  near-trivial file operation — `SparseVar2.concat` (disjoint-contig merge),
+  `split_by_contig` (explode into one store per contig), and `subset_contigs`
+  (keep a named subset of contigs), plus the `genoray concat`/`genoray split`
+  CLI commands. All three are pure metadata rewrite + file copy/hardlink/
+  symlink/move; none re-run conversion or the cost model.
+- **Cheap region subsetting (M9). Implemented: one slicer, two routing
+  policies.** Subsetting by region introduces no new variants and only
+  shrinks variant tables, so it doesn't perturb the cost model.
+  `SparseVar2.write_view` (`genoray view`) routes **both** `reroute=True` and
+  `reroute=False` through a single array-slicer (`run_slice_view`) that
+  gathers each variant's provenance, applies a routing policy, and emits the
+  output — there is no separate re-conversion backend anymore. The old
+  pipeline-backed path (`run_view_pipeline`, `Svar2Source`,
+  `SourceSpec::Svar2`) that used to back `reroute=True` has been **deleted**.
+  - `reroute=True` (`Routing::Recompute`) re-runs the var_key/dense cost
+    model over the subset — size-optimal, sample-subset rerouting included.
+  - `reroute=False` (`Routing::Preserve`) slices each variant's *existing*
+    on-disk representation directly (no cost model), so memory is O(output)
+    regardless of source size.
+  - `reroute="auto"` (the default) resolves to `False` when any FORMAT field
+    is carried, `True` otherwise: a dense→var_key flip stores one value per
+    *carrier call* and has no slot for a non-carrier sample's FORMAT value,
+    so re-routing a source-dense variant under a FORMAT-carrying view would
+    silently drop it. `"auto"` prefers fidelity whenever FORMAT is in play
+    and takes the size-optimal re-route otherwise.
+  - The measurement spike that originally gated the `reroute=False` path
+    (`docs/superpowers/notes/2026-07-12-svar2-reroute-measurement.md`)
+    returned a "build it" verdict — `reroute=False` output can be up to
+    ~6.6% larger than `reroute=True`'s for aggressive germline
+    sample-subsets, but is a clear win for somatic/all-rare cohorts and
+    memory-constrained runs.
+  - Both routings carry INFO/FORMAT fields through and recompute `mutcat`
+    from `reference=`; `threads` caps the number of contigs sliced
+    concurrently (autodetected when `None`) on both paths; and the
+    long-allele LUT is compacted to the subset's narrower carrier set when
+    slicing, rather than copied verbatim. None of this is deferred anymore.
 - **Bulk N-way merge is harder (M12).** A general merge of multiple SVAR2 files can
   change allele frequencies and must rebuild LUTs and variant tables — deferred.
 

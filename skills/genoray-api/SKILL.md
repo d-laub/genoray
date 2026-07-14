@@ -38,7 +38,7 @@ Prefer reading these over guessing:
 - `genoray/_svar.py` — `SparseVar`: `__init__`, `from_vcf`, `from_pgen`, `read_ranges`, `read_ranges_with_length(contig, starts=0, ends=POS_MAX, samples=None)` (length-guaranteed range read; returns the same type as `read_ranges` — a `Ragged` or fields-augmented record), `with_fields`, `annotate_mutations`, `mutation_matrix`, `assign_signatures`, `annotate_with_gtf(gtf, level_filter=1, write_back=True, *, strand_encoding=None, codon_null_token=None)` (GTF CDS annotation entry point, returns `pl.DataFrame` with `varID`/`gene_id`/`strand`/`codon_pos`), `cache_afs()` (computes and persists an `AF` column to the `.gvi` index; returns `None`)
 - `genoray/_svar2.py` — `SparseVar2`: `__init__(path, *, fields=None)`, `with_fields(fields)` (new reader over the same store with those fields selected), `available_fields` (`dict[str, StoredField]`, set in `__init__`), `from_vcf` (VCF/BCF → SVAR2 conversion entry point, `signatures=` classifies during the write, `info_fields=`/`format_fields=` extract scalar-numeric fields during the write), `from_pgen` (PLINK2 PGEN → SVAR2 conversion entry point; diploid-only, no `ploidy=`/`info_fields=`/`format_fields=`), `from_vcf_list` (N single-sample VCFs/BCFs → one SVAR2 store via a native k-way merge; `sources` accepts a `Sequence`/directory/manifest, resolved by module-level `_resolve_vcf_sources`; `reference`/`no_reference` supported (no_reference skips left-alignment, so cross-file joins require pre-normalized inputs); `info_fields=`/`format_fields=` supported — INFO merges first-carrier-wins, FORMAT stays per-sample), `from_svar1` (SVAR1 (`SparseVar`) → SVAR2 native migration entry point; reads no VCF/htslib, `ploidy` from SVAR1 metadata, biallelic SVAR1 only, no `info_fields=`/`format_fields=` — every SVAR1 FORMAT field carries through automatically, `mutcat` dropped); `n_samples`/`available_samples`/`contigs`/`ploidy` metadata. Read/query methods live in the mixins: `genoray/_svar2_decode.py` (`decode` — attaches one `Ragged` per selected field, `region_counts`), `genoray/_svar2_batch.py` (public `read_ranges`; internal gvl-only `_overlap_batch`/`_find_ranges`/`_gather_ranges`), and `genoray/_svar2_mutcat.py` (`annotate_mutations`, `mutation_matrix`, `assign_signatures` — COSMIC mutational-signature workflow, mirroring `SparseVar`'s but backed by a per-contig Rust sidecar instead of a `.gvi`-attached field)
 - `genoray/_svar2_fields.py` — `InfoField`/`FormatField` dataclasses + `FieldDtype` and the header/dtype validation used by `from_vcf(info_fields=, format_fields=)`; `StoredField` (frozen dataclass: `name`, `category`, `dtype`, `default`, `key`) is the read-side manifest entry type returned by `SparseVar2.available_fields` — not exported at top-level `genoray`, only reached via that dict
-- `genoray/_cli/__main__.py` — the `genoray` CLI (`index`, `write` / `write svar1`, `view`)
+- `genoray/_cli/__main__.py` — the `genoray` CLI (`index`, `write` / `write svar1`, `view` / `view svar1`, `concat`, `split`)
 - `genoray/_signatures.py` — `cosmic_signatures`, `fit_signatures`
 - `genoray/_reference.py` — `Reference`: `from_path`, `fetch`, `contig_array`
 - `genoray/exprs.py` — the *complete* set of pre-built filter expressions (currently 7: `is_snp`, `is_indel`, `is_biallelic`, `is_symbolic`, `is_breakend`, `is_imprecise`, `ILEN`)
@@ -652,6 +652,47 @@ sbs192 = sv2.mutation_matrix("SBS192")   # 192 rows: the {T, U} sub-view = SBS38
   publishes no strand-resolved reference set. Use `mutation_matrix` for
   strand-bias analysis.
 
+### Merge and split by contig
+
+SVAR2 contigs are fully independent on disk, so recombining or subsetting
+whole contigs is a cheap metadata-rewrite + file-copy operation — unlike
+`write_view` (see the CLI section below), none of these methods re-run
+conversion or the var_key/dense cost model.
+
+```python
+from genoray import SparseVar2
+
+sv = SparseVar2("out.svar2")
+sv.subset_contigs("chr1.svar2", "chr1")                # single contig
+sv.subset_contigs("subset.svar2", ["chr1", "chr2"])    # multiple, source order preserved
+paths = sv.split_by_contig("by_contig/")               # one store per contig, out_dir/{contig}.svar2
+
+SparseVar2.concat("merged.svar2", ["chr1.svar2", "chr2.svar2"])  # disjoint-contig merge
+```
+
+- `subset_contigs(output, contigs, *, mode="copy", overwrite=False) -> None` —
+  write a new store containing only `contigs` (a single contig name or a
+  sequence of names). Pure metadata rewrite + file copy of the kept contig
+  directories, preserving the source store's contig order. Raises
+  `ValueError` if any name isn't in `self.contigs`, or if `output` resolves
+  to this store's own path (in-place subsetting is rejected, mirroring
+  `write_view`'s in-place guard). Raises `FileExistsError` if `output`
+  exists and `overwrite=False`.
+- `split_by_contig(out_dir, *, mode="copy", overwrite=False) -> list[Path]` —
+  explode into one single-contig store per contig at
+  `out_dir/{contig}.svar2`; returns the output paths in `self.contigs`
+  order. Implemented as one `subset_contigs` call per contig.
+- `SparseVar2.concat(output, sources, *, mode="copy", overwrite=False) -> None`
+  (classmethod) — concatenate stores with **disjoint** contig sets into one.
+  `sources` is a sequence of paths (or `SparseVar2` instances); all sources
+  must agree on `samples`, `ploidy`, `format_version`, and `fields` —
+  disagreement on any of those, or a contig name appearing in more than one
+  source, raises `ValueError`. The merged contig list is `natsorted`,
+  independent of the order `sources` were passed in.
+- `mode` (all three methods) is the shared `Mode` literal —
+  `"copy"|"hardlink"|"symlink"|"move"` — controlling how each contig
+  directory is transplanted into the output store.
+
 ### Errors
 
 genoray raises standard Python builtins, by category:
@@ -663,10 +704,14 @@ genoray raises standard Python builtins, by category:
 - `RuntimeError` — an internal genoray bug (a worker thread panicked); please
   report it.
 
-## CLI (`genoray write`)
+## CLI
 
-`genoray write` **defaults to SVAR2**; `genoray write svar1` runs the previous
-SVAR 1.0 behavior.
+`genoray write` and `genoray view` each **default to SVAR2**; the previous
+SVAR 1.0 behavior is available under the `svar1` subcommand of each
+(`write svar1`, `view svar1`). `genoray concat`/`genoray split` are SVAR2-only
+(no SVAR1 equivalent).
+
+### `genoray write`
 
 ```bash
 # SVAR2 (default) — reference required XOR --no-reference
@@ -693,6 +738,79 @@ genoray write svar1 file.vcf.gz out.svar --max-mem 4g --haploid
 - `genoray write svar1`: unchanged SVAR 1.0 behavior — VCF or PGEN source,
   `--dosages`, `--max-mem`, `--haploid`, `--no-symbolic`/`--no-breakend`
   (independent flags here, unlike SVAR2).
+
+### `genoray view`
+
+```bash
+# SVAR2 (default) — thin CLI over SparseVar2.write_view
+genoray view in.svar2 out.svar2 -r chr1:1-1000 -s A,B
+genoray view in.svar2 out.svar2 -r chr1:1-1000          # all samples
+genoray view in.svar2 out.svar2 -s A,B                  # all variants (one region per contig)
+genoray view in.svar2 out.svar2 -r chr1:1-1000 --no-reroute   # representation-preserving, low-memory view
+genoray view in.svar2 out.svar2 -r chr1:1-1000 --reroute      # force the size-optimal re-route
+
+# SVAR 1.0 (previous default) — unchanged SparseVar.write_view CLI
+genoray view svar1 in.svar out.svar -r chr1:1-1000 -s A,B --progress
+```
+
+Both subcommands share the same `-r/--regions`, `-R/--regions-file`,
+`-s/--samples`, `-S/--samples-file`, `-f/--fields`, `--merge-overlapping`,
+`--regions-overlap`, `--overwrite`, `-@/--threads`, `--progress` options and
+the same no-op guard (at least one of regions/samples is required) and mutex
+checks (`--regions`/`--regions-file` and `--samples`/`--samples-file` are each
+mutually exclusive).
+
+- `genoray view` (SVAR2, thin wrapper over `SparseVar2.write_view`): when
+  `--regions`/`--regions-file` is omitted, "all variants" defaults to one
+  region per contig (`SparseVar2.contigs`, since SVAR2 has no contig-length
+  metadata) spanning `[0, 2**31 - 1)` — every real POS is smaller. `--fields`
+  defaults to `None`, meaning no fields are carried through (genotypes
+  only) — this always succeeds, even on a store that has INFO/FORMAT fields.
+  Both `--reroute` and `--no-reroute` go through the same slicer backend and
+  carry `--fields`/`--reference` identically — there is no longer a
+  fields-carrying vs. genotypes-only split between them:
+  - `--reroute` reruns the var_key/dense routing cost model over the subset —
+    *size-optimal* (each variant re-routed to whichever representation is
+    smaller for the subset's sample/carrier counts).
+  - `--no-reroute` (`reroute=False`) slices each variant's *existing*
+    on-disk representation directly (no cost model, byte-level slice) —
+    representation-preserving regardless of the subset's sample/carrier
+    counts. Recommended for somatic/all-rare cohorts (nearly every variant
+    is already var_key-routed) or memory-constrained runs.
+  - Omitting both flags (the default) is `"auto"`: resolves to
+    `--no-reroute`'s behavior when any FORMAT field is carried, to
+    `--reroute`'s otherwise. WHY: a dense→var_key flip stores one value per
+    *carrier call* and has no slot for a non-carrier sample's FORMAT value,
+    so re-routing a source-dense variant under a FORMAT-carrying view would
+    silently drop it — `"auto"` prefers fidelity whenever FORMAT is in play
+    and takes the size-optimal re-route otherwise (genotype-only / INFO-only
+    views have no per-sample slot to lose).
+
+  Both `--reference` (recomputes `mutcat` from scratch on the subset) and
+  `-@/--threads` (caps contigs sliced concurrently; autodetected when
+  omitted) are real on both `--reroute` and `--no-reroute` — there is no
+  longer an "accepted but ignored/unused" caveat on either path. `--progress`
+  is accepted for parity but is currently a no-op on this path (see below).
+  `write_view`'s underlying `reroute=` kwarg only accepts `"auto"`, `True`,
+  or `False` — any other value (e.g. `reroute=1`) raises `ValueError` rather
+  than silently falling through to the `reroute=False` slicer.
+- `genoray view svar1`: unchanged SVAR 1.0 behavior — "all variants" defaults
+  from `SparseVar`'s `_contig_stats` (`[0, pos_max + 1)` per contig); `--fields`
+  defaults to all available fields (use an explicit empty selection to carry
+  none); no `--reference`/`--reroute` options; `--progress` shows a real
+  phase-level bar (see below).
+
+### `genoray concat` / `genoray split`
+
+```bash
+genoray concat merged.svar2 part1.svar2 part2.svar2       # disjoint-contig merge
+genoray split in.svar2 out_dir/                           # explode into out_dir/{contig}.svar2
+genoray split in.svar2 subset.svar2 --contigs chr1,chr2    # subset into one store
+```
+
+Both accept `--mode` (`Literal["copy", "hardlink", "symlink", "move"]`, default
+`"copy"` — see `SparseVar2.concat`/`split_by_contig`/`subset_contigs`
+docstrings) and `--overwrite`.
 
 ## Filtering
 
@@ -821,15 +939,19 @@ When `True`, a phase-level `rich` progress bar is shown while the view is writte
 (one tick per major step: counting, genotypes, each carried field, the index
 build, and mutation annotation when `reference=` is given). It defaults to
 `False` — no bar and no overhead — so library and pipeline callers are
-unaffected. The `genoray view` CLI exposes the same option as `--progress`
+unaffected. The `genoray view svar1` CLI exposes the same option as `--progress`
 (also default off):
 
 ```bash
-genoray view in.svar out.svar -r chr1:1-1000 -s A,B --progress
+genoray view svar1 in.svar out.svar -r chr1:1-1000 -s A,B --progress
 ```
 
 The bar is cosmetic: output bytes, schema, and dtypes are identical whether or
 not it is enabled.
+
+`SparseVar2.write_view` also accepts `progress=`/`--progress` for interface
+parity, but it is currently a no-op there (no bar shown) — see the `genoray
+view` CLI section above.
 
 ### Atomic crash-safe writes
 
@@ -877,7 +999,10 @@ Signature: `annotate_mutations(reference, *, contigs=None, write_back=True) -> N
   that subsequent `SparseVar(dir, fields=["mutcat"])` opens will see the field.
   **Note:** `write_view` **never** copies `mutcat` positionally to the output
   (see below); pass `reference=` to `write_view` to recompute it on the subset,
-  or call `annotate_mutations` on the output view yourself.
+  or call `annotate_mutations` on the output view yourself. (This is
+  `SparseVar`/v1 behavior; on `SparseVar2.write_view`, `reference=` recomputes
+  `mutcat` from scratch on the subset on **both** `reroute=True` and
+  `reroute=False`.)
 - `write_back=False` — the `mutcat` field lives only in memory
   (`svar.fields["mutcat"]`); reopening the file will NOT find it.
 - After the call, `svar.fields["mutcat"]` is populated regardless of
@@ -1004,7 +1129,8 @@ plotting.
 | Calling `mutation_matrix` without a `mutcat` field | Run `annotate_mutations` first, or open with `fields=["mutcat"]` |
 | Expecting `mutation_matrix` to auto-run annotation | It does not; call `annotate_mutations` separately |
 | Re-opening SparseVar and losing the `mutcat` field | Use `write_back=True` (default) in `annotate_mutations`; then open with `SparseVar(dir, fields=["mutcat"])` |
-| Calling `write_view` and expecting `mutcat` to be in the output | `write_view` **never** copies `mutcat` positionally (subsetting invalidates DBS adjacency codes). Pass `reference=` to `write_view` to recompute it on the subset, or call `annotate_mutations` on the output view yourself. Explicitly including `"mutcat"` in `fields=` without a `reference=` raises `ValueError`. |
+| Calling `write_view` and expecting `mutcat` to be in the output | `write_view` **never** copies `mutcat` positionally (subsetting invalidates DBS adjacency codes). Pass `reference=` to `write_view` to recompute it on the subset, or call `annotate_mutations` on the output view yourself. Explicitly including `"mutcat"` in `fields=` without a `reference=` raises `ValueError`. On `SparseVar2.write_view`, `reference=` recomputes `mutcat` from scratch on both `reroute=True` and `reroute=False`. |
+| Passing a FORMAT field in `fields=` to `SparseVar2.write_view(..., reroute=True)` and expecting it dropped/rejected | Both `reroute=True` and `reroute=False` carry `fields` through now (previously `reroute=True` raised `ValueError`). Watch the `reroute="auto"` default instead: it resolves to `reroute=False` whenever any FORMAT field is carried, because a dense→var_key flip has no slot for a non-carrier sample's FORMAT value. |
 | Passing the source dataset directory as `output` to `write_view` (even with `overwrite=True`) | Raises `ValueError` — writing in place would delete the source before the view is written. Pass a different `output` path. |
 | Passing a FASTA path directly to `annotate_mutations` | Supported — it auto-wraps via `Reference.from_path` |
 | `rag.fields["AF"]` on a `SparseVar2.decode()` result | `Ragged.fields` is a `list[str]` of names, not a mapping; index the field itself with `rag["AF"]` |

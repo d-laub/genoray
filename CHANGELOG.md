@@ -83,6 +83,37 @@
   and peak RSS on a 200-sample/50k-record conversion drops ~7% (~487 MiB →
   ~452 MiB); end-to-end wall time is unchanged since conversion remains
   reader/htslib-bound, not finalize-bound.
+- `SparseVar2.concat` (classmethod), `subset_contigs`, and `split_by_contig` —
+  cheap merge/subset/split of SVAR2 stores along contig boundaries (pure
+  metadata rewrite + file copy/hardlink/symlink/move, no re-conversion).
+  `concat` requires disjoint contig sets and matching samples/ploidy/
+  format_version/fields across sources.
+- `SparseVar2.write_view` — write a region/sample subset of an SVAR2 store.
+  Both `reroute=True` and `reroute=False` now go through one shared slicer
+  backend (`_core.run_slice_view`), which carries `fields` and recomputes
+  `mutcat` from `reference=` on **either** path:
+  - `reroute=True` re-runs the ordinary conversion pipeline's var_key/dense
+    cost model over the subset — size-optimal (each variant re-routed to
+    whichever representation is smaller for the subset's sample/carrier
+    counts).
+  - `reroute=False` directly slices each variant's *existing* on-disk
+    representation (no cost model, byte-level slice) — representation-
+    preserving and O(output) memory regardless of source size. Recommended
+    for somatic/all-rare cohorts (nearly every variant is already
+    var_key-routed) or memory-constrained runs. `genoray view --no-reroute`
+    maps to this path.
+  - `reroute="auto"` (default) resolves to `False` when any FORMAT field is
+    carried, `True` otherwise: a dense→var_key flip stores one value per
+    *carrier call* and has no slot for a non-carrier sample's FORMAT value,
+    so `"auto"` prefers fidelity whenever FORMAT is in play and takes the
+    size-optimal re-route otherwise (genotype-only / INFO-only views have no
+    per-sample slot to lose).
+  - `threads` caps the number of contigs sliced concurrently (autodetected
+    when `None`), the same convention as `from_vcf`, on both paths.
+  - The long-allele LUT is compacted to the subset's narrower carrier set
+    when slicing, instead of copying each variant's LUT bytes verbatim.
+- `genoray concat` / `genoray split` CLI commands, thin wrappers over
+  `SparseVar2.concat`/`split_by_contig`/`subset_contigs`.
 - `SparseVar2.from_svar1` converts an existing SVAR1 (`SparseVar`) store to SVAR2
   natively (no VCF re-read, no htslib), reusing the same conversion spine as
   `from_vcf`/`from_pgen` via a new `Svar1RecordSource`. Biallelic-only (raises on
@@ -96,6 +127,16 @@
 
 ### BREAKING CHANGES
 
+- **cli**: `genoray view` now targets SVAR2 stores (thin wrapper over
+  `SparseVar2.write_view`), mirroring the existing `write`/`write svar1`
+  App-group pattern. The previous SVAR 1.0 behavior moves to
+  `genoray view svar1` — unchanged otherwise. SVAR2's "all variants" default
+  spans each contig `[0, 2**31 - 1)` (SVAR2 has no contig-length metadata);
+  `--fields` defaults to none; a new `--reroute`/`--no-reroute` flag maps to
+  `write_view(reroute=)`. Omitting both flags defaults to `"auto"` (resolves
+  to `--no-reroute`'s behavior when any FORMAT field is carried, to
+  `--reroute`'s otherwise — see `write_view` above); both flags carry
+  `--fields`/`--reference` through identically.
 - `Phantom` mode `empty()` classmethods now take a uniform
   `empty(n_samples, ploidy, n_variants)` signature on both VCF and PGEN
   backends. VCF's former 4th `phasing` argument is removed; pass the effective
@@ -139,6 +180,15 @@
   cumulative-sum array, corrupting `allele_idx_offsets` file-wide; the Rust
   `.pvar` reader also no longer treats a bare `.` ALT as a literal one-character
   allele.
+- **svar2**: `write_view(reroute=False, reference=...)` now validates the
+  reference FASTA up front, before any output byte is written. Previously a
+  missing/unreadable `reference` was only discovered mid-loop (the mutcat
+  recompute step, after that contig's sidecars were already on disk),
+  leaving a partially-written, unreadable output store instead of a clean
+  raise. Also hardened `write_view`'s `reroute` dispatch: a value that is
+  neither `"auto"`, `True`, nor `False` (e.g. `reroute=1`) now raises
+  `ValueError` instead of silently falling through to the `reroute=False`
+  slicer.
 
 ## 2.15.0 (2026-06-30)
 

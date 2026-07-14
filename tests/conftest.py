@@ -51,3 +51,34 @@ def svar2_store(tmp_path_factory) -> Path:
     )
     assert (out / "meta.json").exists(), "conversion did not finish"
     return out
+
+
+def build_two_contig_svar2(tmp_path):
+    """Build a 2-contig (chr1, chr2) svar2 store for concat/split tests."""
+    import subprocess
+    from pathlib import Path
+
+    from genoray import SparseVar2
+
+    d = Path(tmp_path)
+    ref = d / "ref.fa"
+    ref.write_text(">chr1\n" + _REF + "\n>chr2\n" + _REF + "\n")
+    subprocess.run(["samtools", "faidx", str(ref)], check=True)
+    vcf = d / "in.vcf"
+    vcf.write_text(
+        "##fileformat=VCFv4.2\n"
+        '##FILTER=<ID=PASS,Description="">\n'
+        "##contig=<ID=chr1,length=40>\n"
+        "##contig=<ID=chr2,length=40>\n"
+        '##FORMAT=<ID=GT,Number=1,Type=String,Description="">\n'
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS0\tS1\n"
+        "chr1\t3\t.\tA\tG\t.\t.\t.\tGT\t0|1\t1|1\n"
+        "chr1\t9\t.\tT\tC\t.\t.\t.\tGT\t1|0\t0|0\n"
+        "chr2\t5\t.\tT\tA\t.\t.\t.\tGT\t0|1\t0|1\n"
+    )
+    vcf_gz = d / "in.vcf.gz"
+    subprocess.run(f"bgzip -c {vcf} > {vcf_gz}", shell=True, check=True)
+    subprocess.run(["bcftools", "index", str(vcf_gz)], check=True)
+    out = d / "two.svar2"
+    SparseVar2.from_vcf(out, vcf_gz, ref, threads=1, overwrite=True)
+    return SparseVar2(out)

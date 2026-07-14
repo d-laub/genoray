@@ -9,6 +9,8 @@ from typing import Annotated, Any, Callable, Literal
 import polars as pl
 from cyclopts import App, Parameter, validators
 
+from genoray._svar2_ops import Mode
+
 app = App(
     help_on_error=True,
     version=f"[magenta]genoray[/magenta] {version('genoray')}",
@@ -260,8 +262,175 @@ def write_svar1(
         raise ValueError(f"Unsupported file type: {source}")
 
 
-@app.command
-def view(
+view = App(
+    name="view",
+    help="Write a region/sample subset of an SVAR2 store (SVAR1 via `view svar1`).",
+)
+app.command(view)
+
+
+@view.default
+def view_svar2(
+    source: Annotated[
+        Path,
+        Parameter(
+            validator=validators.Path(exists=True, dir_okay=True, file_okay=False)
+        ),
+    ],
+    out: Path,
+    *,
+    regions: Annotated[str | None, Parameter(name=["--regions", "-r"])] = None,
+    regions_file: Annotated[
+        Path | None,
+        Parameter(
+            name=["--regions-file", "-R"],
+            validator=validators.Path(exists=True, dir_okay=False, file_okay=True),
+        ),
+    ] = None,
+    samples: Annotated[str | None, Parameter(name=["--samples", "-s"])] = None,
+    samples_file: Annotated[
+        Path | None,
+        Parameter(
+            name=["--samples-file", "-S"],
+            validator=validators.Path(exists=True, dir_okay=False, file_okay=True),
+        ),
+    ] = None,
+    fields: Annotated[list[str] | None, Parameter(name=["--fields", "-f"])] = None,
+    reference: Annotated[Path | None, Parameter(name="--reference")] = None,
+    merge_overlapping: bool = False,
+    regions_overlap: Literal["pos", "record", "variant"] = "pos",
+    reroute: bool | None = None,
+    overwrite: bool = False,
+    threads: Annotated[int | None, Parameter(name=["--threads", "-@"])] = None,
+    progress: bool = False,
+) -> None:
+    """Write a region/sample subset of an SVAR2 store.
+
+    At least one of --regions/--regions-file or --samples/--samples-file is
+    required. The omitted side defaults to "all" (all samples or all variants,
+    the latter meaning one region per contig spanning that contig).
+
+    Parameters
+    ----------
+    source
+        Path to the input SVAR2 directory.
+    out
+        Path to the output SVAR2 directory.
+    regions
+        Inline region(s): a single ``chrom:start-end`` (1-based inclusive, bcftools
+        convention) or a comma-separated list, e.g. ``chr1:1-100,chr2:200-300``.
+        Mutually exclusive with --regions-file.
+    regions_file
+        Path to a BED file (0-based half-open) of regions. Mutually exclusive
+        with --regions.
+    samples
+        Comma-separated list of sample names to keep, e.g. ``A,B,C``. Mutually
+        exclusive with --samples-file.
+    samples_file
+        Path to a file of sample names (one per line). Mutually exclusive with
+        --samples.
+    fields
+        Optional INFO/FORMAT fields to carry over. Defaults to unset, meaning
+        no fields are carried through (genotypes only) — this always
+        succeeds, even on a store that has INFO/FORMAT fields. Both
+        ``reroute`` and ``--no-reroute`` carry fields through.
+    reference
+        Optional path to a reference FASTA. Recomputes the ``mutcat``
+        mutational-signature sidecar for the output on both ``reroute`` and
+        ``--no-reroute``.
+    merge_overlapping
+        If set, silently merge overlapping regions instead of raising.
+    regions_overlap
+        How variants are matched to regions: ``pos`` (default; match if the
+        variant POS falls in the range), ``record`` (match by VCF record extent),
+        or ``variant`` (match by full variant extent including ILEN).
+    reroute
+        Whether to rerun the var_key/dense routing cost model on the subset.
+        ``--reroute`` forces it on (size-optimal). ``--no-reroute`` forces it
+        off: directly slices each variant's existing on-disk representation
+        -- representation-preserving regardless of the subset's
+        sample/carrier counts -- recommended for somatic/rare-variant subsets
+        or memory-constrained runs. Omitting both flags (the default) is
+        ``"auto"``: resolves to ``--no-reroute``'s behavior when any FORMAT
+        field is carried, ``--reroute``'s otherwise -- a dense variant
+        re-routed to var_key has no slot for a non-carrier sample's FORMAT
+        value, so ``"auto"`` prefers fidelity whenever FORMAT is in play and
+        takes the size-optimal re-route otherwise.
+    overwrite
+        Overwrite the output directory if it already exists.
+    threads
+        Number of threads. Defaults to all available CPUs.
+    progress
+        If set, show a phase-level progress bar while writing the view.
+    """
+    import polars as pl
+
+    from genoray import SparseVar2
+
+    from ._view_helpers import parse_regions_arg
+
+    # No-op guard
+    if (
+        regions is None
+        and regions_file is None
+        and samples is None
+        and samples_file is None
+    ):
+        raise ValueError(
+            "at least one of --regions/--regions-file or --samples/--samples-file is required"
+        )
+
+    # Mutex within each pair
+    if regions is not None and regions_file is not None:
+        raise ValueError("--regions and --regions-file are mutually exclusive")
+    if samples is not None and samples_file is not None:
+        raise ValueError("--samples and --samples-file are mutually exclusive")
+
+    sv = SparseVar2(source)
+
+    # Resolve regions arg
+    if regions is not None:
+        regions_arg: pl.DataFrame | Path = parse_regions_arg(regions)
+    elif regions_file is not None:
+        regions_arg = regions_file
+    else:
+        # "all variants" — SVAR2 has no contig-length metadata, so span each
+        # contig with [0, i32::MAX) (POS is i32; regions_overlap="pos" keeps
+        # every variant on that contig).
+        regions_arg = pl.DataFrame(
+            {"chrom": sv.contigs},
+            schema={"chrom": pl.Utf8},
+        ).select(
+            chrom=pl.col("chrom"),
+            start=pl.lit(0, dtype=pl.Int32),
+            end=pl.lit(2**31 - 1, dtype=pl.Int32),
+        )
+
+    # Resolve samples arg
+    if samples is not None:
+        samples_arg: list[str] | Path = [s for s in samples.split(",") if s]
+    elif samples_file is not None:
+        samples_arg = samples_file
+    else:
+        samples_arg = list(sv.available_samples)
+
+    sv.write_view(
+        regions=regions_arg,
+        samples=samples_arg,
+        output=out,
+        fields=fields,
+        reference=reference,
+        merge_overlapping=merge_overlapping,
+        regions_overlap=regions_overlap,
+        reroute="auto" if reroute is None else reroute,
+        overwrite=overwrite,
+        threads=threads,
+        progress=progress,
+    )
+
+
+@view.command(name="svar1")
+def view_svar1(
     source: Annotated[
         Path,
         Parameter(
@@ -392,6 +561,48 @@ def view(
         threads=threads,
         progress=progress,
     )
+
+
+@app.command
+def concat(
+    out: Path,
+    sources: list[Path],
+    *,
+    mode: Mode = "copy",
+    overwrite: bool = False,
+) -> None:
+    """Concatenate disjoint-contig SVAR2 stores into one."""
+    from genoray import SparseVar2
+
+    SparseVar2.concat(out, sources, mode=mode, overwrite=overwrite)
+
+
+@app.command
+def split(
+    source: Path,
+    out: Path,
+    *,
+    contigs: Annotated[str | None, Parameter(name=["--contigs", "-c"])] = None,
+    mode: Mode = "copy",
+    overwrite: bool = False,
+) -> None:
+    """Split an SVAR2 store by contig.
+
+    With --contigs: subset into one store at OUT. Without: explode into
+    OUT/{contig}.svar2.
+    """
+    from genoray import SparseVar2
+
+    sv = SparseVar2(source)
+    if contigs is not None:
+        sv.subset_contigs(
+            out,
+            [c for c in contigs.split(",") if c],
+            mode=mode,
+            overwrite=overwrite,
+        )
+    else:
+        sv.split_by_contig(out, mode=mode, overwrite=overwrite)
 
 
 if __name__ == "__main__":
