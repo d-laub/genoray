@@ -41,5 +41,7 @@ jobs:
         with:
           pixi-version: v0.70.2
           environments: lint
+      - name: Cargo check (query-core, no conversion)
+        run: pixi run -e lint check-core
       - name: Cargo test
         run: pixi run -e lint test-rust
