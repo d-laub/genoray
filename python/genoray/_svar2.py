@@ -14,6 +14,7 @@ from genoray._contigs import _MITO_ALIASES
 from genoray._svar2_batch import _BatchQueryMixin
 from genoray._svar2_decode import _DecodeMixin
 from genoray._svar2_fields import (
+    _META_DTYPE,
     StoredField,
     _load_field_manifest,
     _resolve_fields,
@@ -333,14 +334,12 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         *,
         merge_overlapping: bool = False,
         regions_overlap: "Literal['pos', 'record', 'variant']" = "pos",
-        reroute: "Literal['auto', True]" = "auto",
+        reroute: "bool | Literal['auto']" = "auto",
         overwrite: bool = False,
         threads: int | None = None,
         progress: bool = False,
     ) -> None:
-        """Write a region/sample subset of this store to `output` by re-running
-        the ordinary conversion pipeline over the finished store's own records
-        (rather than re-reading the original VCF/PGEN).
+        """Write a region/sample subset of this store to `output`.
 
         `regions`/`samples` accept the same inputs as the query methods (region
         string, `(chrom, start, end)` tuple, BED path, or a samples sequence /
@@ -351,23 +350,34 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
 
         `fields` defaults to `None`, meaning *no* fields are carried through
         (genotypes only) — this always succeeds, even on a store that has
-        INFO/FORMAT fields (`available_fields` non-empty). Field
-        carry-through itself is not yet implemented on this path: passing
-        any non-empty `fields` (any field other than `"mutcat"`) makes the
-        backend raise `ValueError`. `"mutcat"` is always excluded from
-        `fields` — pass `reference=` to recompute it instead of copying
-        (unimplemented; currently only affects `mutcat` filtering, since the
-        backend does not yet recompute anything from `reference`).
+        INFO/FORMAT fields (`available_fields` non-empty). `"mutcat"` is
+        always excluded from `fields` — pass `reference=` to recompute it
+        instead of copying.
 
-        `reroute` selects the output representation: `"auto"` (equivalent to
-        `True`) reruns the full var_key/dense routing cost model on the
-        subset, which is the only mode currently implemented.
-        `reroute=False` (byte-preserving passthrough of each variant's
-        original representation) is NOT implemented and raises
-        `NotImplementedError`.
+        `reroute` selects the output representation and backend:
+
+        - `"auto"` (default, equivalent to `True`) reruns the ordinary
+          conversion pipeline's var_key/dense routing cost model over the
+          subset. This is *size-optimal* (each variant is re-routed to
+          whichever representation is smaller for the subset's sample/carrier
+          counts), but does not yet carry INFO/FORMAT fields through: passing
+          any non-empty `fields` (anything other than `"mutcat"`) makes the
+          backend raise `ValueError`.
+        - `reroute=False` directly slices each variant's *existing* on-disk
+          representation (byte-copy, no cost model) — representation-
+          preserving and O(output) memory regardless of source size. It DOES
+          carry INFO/FORMAT fields through natively (at their stored dtypes),
+          and recomputes the `mutcat` mutational-signature sidecar from
+          `reference` when one is given. Recommended when the subset is
+          expected to route the same way as the source anyway (e.g. slicing
+          somatic/rare-variant cohorts, where nearly every variant is already
+          var_key-routed) or when the view must be produced under tight
+          memory constraints.
 
         `progress` is accepted for interface parity with other long-running
         entry points but is currently a no-op (no progress bar is shown).
+        `reroute=False` does not accept `threads` (single-pass slice, no
+        parallel cost-model rerouting).
 
         Raises `FileExistsError` if `output` exists and `overwrite=False`, and
         `ValueError` if `output` resolves to this store's own path (writing a
@@ -383,12 +393,6 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         output = Path(output)
         if reroute == "auto":
             reroute = True
-        if reroute is not True:
-            raise NotImplementedError(
-                "reroute=False (preserve source representation) is not "
-                "implemented; only reroute=True is supported (see the "
-                "concat/split/write-view design doc)."
-            )
         if fields is not None and "mutcat" in fields and reference is None:
             raise ValueError(
                 "'mutcat' cannot be copied through write_view; pass "
@@ -425,19 +429,38 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             (row["chrom"], int(row["start"]), int(row["end"]))
             for row in regions_df.iter_rows(named=True)
         ]
-        _core.run_view_pipeline(
-            str(self.path),
-            str(output),
-            self.contigs,
-            caller_samples,
-            region_tuples,
-            regions_overlap,
-            merge_overlapping,
-            fields_to_write,
-            str(reference) if reference is not None else None,
-            threads,
-            overwrite,
-        )
+        reference_str = str(reference) if reference is not None else None
+        if reroute is True:
+            _core.run_view_pipeline(
+                str(self.path),
+                str(output),
+                self.contigs,
+                caller_samples,
+                region_tuples,
+                regions_overlap,
+                merge_overlapping,
+                fields_to_write,
+                reference_str,
+                threads,
+                overwrite,
+            )
+        else:
+            field_tuples = [
+                (sf.name, sf.category, _META_DTYPE[sf.dtype], sf.default)
+                for sf in (self.available_fields[key] for key in fields_to_write)
+            ]
+            _core.run_slice_view(
+                str(self.path),
+                str(output),
+                self.contigs,
+                caller_samples,
+                region_tuples,
+                regions_overlap,
+                merge_overlapping,
+                field_tuples,
+                reference_str,
+                overwrite,
+            )
 
     @classmethod
     def from_vcf(

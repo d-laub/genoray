@@ -46,16 +46,19 @@ def test_cli_view_svar1_still_works(tiny_svar, tmp_path):
     assert r.returncode == 0, r.stderr
 
 
-def test_cli_view_svar2_no_reroute_errors(tiny_svar2, tmp_path):
+def test_cli_view_svar2_no_reroute_succeeds(tiny_svar2, tmp_path):
+    """`--no-reroute` (reroute=False, the representation-preserving direct
+    slice) is now implemented and produces a readable store."""
+    out = tmp_path / "v.svar2"
     r = _run(
         [
             "view",
             str(tiny_svar2),
-            str(tmp_path / "v.svar2"),
+            str(out),
             "-r",
             "chr1:1-40",
             "--no-reroute",
         ]
     )
-    assert r.returncode != 0
-    assert "reroute" in (r.stderr + r.stdout).lower()
+    assert r.returncode == 0, r.stderr
+    assert SparseVar2(out).contigs == ["chr1"]
