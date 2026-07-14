@@ -34,7 +34,7 @@ use crate::layout::{self, ContigPaths};
 use crate::max_del;
 use crate::query::ContigReader;
 use crate::query::sidecar::{DenseView, as_bytes, as_u32};
-use crate::rvk::{pack_snp_keys, unpack_snp_key_at};
+use crate::rvk::{deletion_len, pack_snp_keys, unpack_snp_key_at};
 use crate::svar2_source::{OverlapMode, keeps, query_window, read_n_samples};
 
 /// Slice `{src_store}/{chrom}`'s genotype sidecars down to `sample_orig_idx`
@@ -193,21 +193,37 @@ pub fn slice_contig_genos(
 /// Region-overlap hit indices into `positions` (ascending, deduped): for each
 /// region, narrow via `overlap_range` (the tree-based windowed search over
 /// `query_regions[i]`'s widened bounds — identical to what `find_ranges` uses
-/// for this same region/column/class), then keep the calls `keeps` accepts
-/// against the ORIGINAL (unwidened) region bounds. Multiple regions may
-/// re-discover the same call; `dedup` after sorting collapses that (mirrors
+/// for this same region/column/class), then keep the calls that pass BOTH the
+/// `keeps` POS-precision filter (against the ORIGINAL, unwidened region bounds)
+/// AND the per-element left-extent re-check `q_start < v_end`. Multiple regions
+/// may re-discover the same call; `dedup` after sorting collapses that (mirrors
 /// `Svar2Source`'s carrier-bit OR across overlapping regions).
+///
+/// The extent re-check is load-bearing and CANNOT be dropped: `overlap_range`
+/// returns a contiguous SUPERSET `[s, e)` that trims only the first/last
+/// overlaps, so interior indel rows whose extent ends at/before `q_start`
+/// (v_ends is non-monotonic because deletion length varies) survive the window.
+/// The real query path filters them element-wise — var_key via
+/// `gather_vk`/`spine::gather_keys` (`q_start < v_end`, `gather.rs`/`spine.rs`),
+/// dense via the presence loop (`dense.v_ends[j] > qs`, `gather.rs`). Omitting
+/// it here would write indel calls `reroute=True` never emits — most visibly
+/// under `OverlapMode::Variant`, whose `keeps` returns `true` unconditionally,
+/// so this check is the ONLY thing excluding a `pos < q_start` non-overlapping
+/// deletion pulled into the window by a long-deletion `max_del` bound. SNP
+/// channels pass `v_end = pos + 1` (their window is already exact —
+/// `max_region_length = 0` — so the check is a no-op but keeps one code path).
 fn region_hits(
     positions: &[u32],
     regions: &[(u32, u32)],
     query_regions: &[(u32, u32)],
     overlap: OverlapMode,
     overlap_range: impl Fn(u32, u32) -> Range<usize>,
+    v_end_of: impl Fn(usize) -> u32,
 ) -> Vec<usize> {
     let mut hits: Vec<usize> = Vec::new();
     for (&(qs, qe), &(qsw, qew)) in regions.iter().zip(query_regions.iter()) {
         for i in overlap_range(qsw, qew) {
-            if keeps(overlap, qs, qe, positions[i]) {
+            if keeps(overlap, qs, qe, positions[i]) && qs < v_end_of(i) {
                 hits.push(i);
             }
         }
@@ -238,9 +254,16 @@ fn slice_var_key_snp(
     for &s_orig in sample_orig_idx {
         for p in 0..ploidy {
             let col_src = s_orig * ploidy + p;
-            let hits = region_hits(positions, regions, query_regions, overlap, |qsw, qew| {
-                reader.vk_snp_overlap(col_src, qsw, qew)
-            });
+            let hits = region_hits(
+                positions,
+                regions,
+                query_regions,
+                overlap,
+                |qsw, qew| reader.vk_snp_overlap(col_src, qsw, qew),
+                // SNP v_end = pos + 1 (no deletion); the exact window makes
+                // this a no-op, but keeps `region_hits` uniform.
+                |i| positions[i] + 1,
+            );
             for i in hits {
                 out_positions.push(positions[i]);
                 out_codes.push(unpack_snp_key_at(keys, i));
@@ -277,9 +300,17 @@ fn slice_var_key_indel(
             // max_del bound — `sample` here must be the ORIGINAL column
             // (`vk_indel_max_del` is indexed by the source cohort, not the
             // subset), mirroring `find_ranges`'s `orig_s` usage.
-            let hits = region_hits(positions, regions, query_regions, overlap, |qsw, qew| {
-                reader.vk_indel_overlap(col_src, s_orig, p, qsw, qew)
-            });
+            let hits = region_hits(
+                positions,
+                regions,
+                query_regions,
+                overlap,
+                |qsw, qew| reader.vk_indel_overlap(col_src, s_orig, p, qsw, qew),
+                // Indel v_end = pos + 1 + deletion_len(key) — the SAME formula
+                // `gather_vk`/`spine::gather_keys` use for the left-extent
+                // re-check.
+                |i| positions[i] + 1 + deletion_len(keys[i]),
+            );
             for i in hits {
                 out_positions.push(positions[i]);
                 out_keys.push(keys[i]);
@@ -320,7 +351,30 @@ fn slice_dense(
     let n_dense = d.n_dense_variants;
     let positions = d.positions();
 
-    let hits = region_hits(positions, regions, query_regions, overlap, overlap_range);
+    // `d.keys` is 2-bit-packed bytes for the SNP class but a raw `u32` LE
+    // array for indel — `as_u32` on the (generally non-multiple-of-4-byte)
+    // packed SNP buffer would trip bytemuck's size check, so each view is
+    // only materialized for its own class.
+    let keys_bytes: &[u8] = if is_snp { as_bytes(&d.keys) } else { &[] };
+    let keys_u32: &[u32] = if is_snp { &[] } else { as_u32(&d.keys) };
+
+    let hits = region_hits(
+        positions,
+        regions,
+        query_regions,
+        overlap,
+        overlap_range,
+        // Dense v_end: snp = pos + 1 (exact window, no-op); indel = pos + 1 +
+        // deletion_len(key) — the SAME formula the dense presence loop uses
+        // (`dense.v_ends[j] > qs`, `gather.rs`).
+        |i| {
+            if is_snp {
+                positions[i] + 1
+            } else {
+                positions[i] + 1 + deletion_len(keys_u32[i])
+            }
+        },
+    );
 
     let mut carried_by_subset = vec![false; n_dense];
     for &s_orig in sample_orig_idx {
@@ -329,13 +383,6 @@ fn slice_dense(
             d.for_each_carried(hap_src, |col| carried_by_subset[col] = true);
         }
     }
-
-    // `d.keys` is 2-bit-packed bytes for the SNP class but a raw `u32` LE
-    // array for indel — `as_u32` on the (generally non-multiple-of-4-byte)
-    // packed SNP buffer would trip bytemuck's size check, so each view is
-    // only materialized for its own class.
-    let keys_bytes: &[u8] = if is_snp { as_bytes(&d.keys) } else { &[] };
-    let keys_u32: &[u32] = if is_snp { &[] } else { as_u32(&d.keys) };
 
     let mut row_out_of_src: Vec<i64> = vec![-1; n_dense];
     let mut out_positions: Vec<u32> = Vec::new();

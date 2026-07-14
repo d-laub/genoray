@@ -185,3 +185,106 @@ fn slice_one_sample_subset_decodes_equivalently_to_the_source() {
     // vacuously-passing empty-vs-empty comparison).
     assert!(want.per_hap.iter().any(|hc| !hc.positions.is_empty()));
 }
+
+#[test]
+fn slice_variant_mode_excludes_non_overlapping_indel_in_widened_window() {
+    // Regression for the missing per-element left-extent re-check. The three
+    // records are all carried by S0/hap0, so they share var_key/indel column 0
+    // (positions ascending: 28, 31, 36):
+    //   D1 @28 DEL of 6 bases  -> extent [28, 35)  (truly overlaps [34, 44))
+    //   A  @31 DEL of 1 base   -> extent [31, 33)  (does NOT reach q_start=34)
+    //   D2 @36 DEL of 1 base   -> extent [36, 38)  (truly overlaps [34, 44))
+    //
+    // `overlap_range` already trims the first/last non-overlaps, so a boundary
+    // non-overlapper would never surface — the bug needs A INTERIOR between two
+    // true overlaps. Column 0's max_del of 6 (from D1) widens the search's left
+    // bound to 28, so `overlap_range` returns the contiguous window [D1, A, D2];
+    // its own forward/backward scans keep D1 and D2 (v_end > 34) as the window
+    // ends, leaving A interior (v_end 33 <= 34). `keeps(Variant, ...)` returns
+    // `true` for A, so the ONLY thing that excludes it is the per-element
+    // `q_start < v_end` re-check (34 < 33 is false) that `gather_vk` /
+    // `spine::gather_keys` apply on the real query path. Without it the slicer
+    // wrote A as an extra var_key indel call `reroute=True` never emits.
+    //
+    // The reference bases at 28..37 are laid out so the overlapping DEL REF
+    // stamps agree and no allele's anchor repeats at its end (no left-align
+    // shift): 28=C 29=G 30=T 31=C 32=G 33=T 34=G 35=A 36=A 37=T.
+    let tmp = tempdir().unwrap();
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let samples = ["S0"];
+    let records = vec![
+        SynthRecord {
+            pos: 28,
+            ref_allele: b"CGTCGTG", // 28..34; anchor C, last G -> no roll
+            alts: vec![&b"C"[..]],  // DEL, ilen = -6, v_end = 35
+            gt: vec![1, 0],
+        },
+        SynthRecord {
+            pos: 31,
+            ref_allele: b"CG",     // 31..32; consistent with D1's bases there
+            alts: vec![&b"C"[..]], // DEL, ilen = -1, v_end = 33
+            gt: vec![1, 0],
+        },
+        SynthRecord {
+            pos: 36,
+            ref_allele: b"AT",     // 36..37
+            alts: vec![&b"A"[..]], // DEL, ilen = -1, v_end = 38
+            gt: vec![1, 0],
+        },
+    ];
+    build_contig(&src, "chr1", &samples, 2, &records);
+    // Recompute the REAL (routing-aware) max_del over `build_contig`'s
+    // conservative fixture (both give col 0 max_del = 6, which widens the
+    // window's left bound to 28 so D1 — and thus interior A — enter it).
+    genoray_core::max_del::write_max_del(&src.join("chr1"), samples.len(), 2).unwrap();
+    write_meta(
+        &src,
+        FORMAT_VERSION,
+        &samples.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        &["chr1".to_string()],
+        2,
+        &[],
+    )
+    .unwrap();
+
+    let out = tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    slice_contig_genos(
+        src.to_str().unwrap(),
+        out.to_str().unwrap(),
+        "chr1",
+        &[0],
+        2,
+        &[(34, 44)],
+        OverlapMode::Variant,
+    )
+    .unwrap();
+
+    let src_reader = ContigReader::open(src.to_str().unwrap(), "chr1", samples.len(), 2).unwrap();
+    let out_reader = ContigReader::open(out.to_str().unwrap(), "chr1", 1, 2).unwrap();
+
+    // `overlap_sample` over the query region on the source is the reroute=True
+    // reference selection for `Variant` mode (same extent re-check via
+    // `spine::gather_keys`); the sliced store decoded over its whole extent
+    // must match it exactly.
+    let want = overlap_sample(&src_reader, 0, 34, 44);
+    let got = overlap_sample(&out_reader, 0, 0, u32::MAX);
+    assert_eq!(
+        got, want,
+        "sliced store must not contain the interior non-overlapping indel"
+    );
+
+    // Positive assertions pinning the mechanism: the two true-overlap DELs
+    // survive, the interior non-overlapping DEL @31 does not.
+    let hap0 = &got.per_hap[0];
+    assert_eq!(
+        hap0.positions,
+        vec![28, 36],
+        "only the two truly-overlapping DELs survive"
+    );
+    assert!(
+        !hap0.positions.contains(&31),
+        "interior non-overlapping DEL @31 must be excluded"
+    );
+}
