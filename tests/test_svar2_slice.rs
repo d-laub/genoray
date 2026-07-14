@@ -23,7 +23,7 @@ use genoray_core::svar2_slice::{Routing, slice_contig, slice_contig_genos};
 use genoray_core::svar2_source::OverlapMode;
 use pyo3::Python;
 use std::path::Path;
-use tempfile::tempdir;
+use tempfile::{TempDir, tempdir};
 
 /// Five records exercising every routing/LUT combination at n=2, ploidy=2
 /// (np=4): a rare (var_key) and common (dense, x=2) SNP carried by sample 0,
@@ -408,6 +408,9 @@ fn slice_fields_full_coverage_is_byte_identical() {
         OverlapMode::Variant,
         &fields,
         Routing::Preserve,
+        false, // sidecar_bits_enabled (ignored under Preserve)
+        0,     // info_bits (ignored under Preserve)
+        0,     // format_bits (ignored under Preserve)
     )
     .unwrap();
 
@@ -445,6 +448,9 @@ fn slice_fields_subset_decodes_equivalently() {
         OverlapMode::Variant,
         &fields,
         Routing::Preserve,
+        false, // sidecar_bits_enabled (ignored under Preserve)
+        0,     // info_bits (ignored under Preserve)
+        0,     // format_bits (ignored under Preserve)
     )
     .unwrap();
 
@@ -604,6 +610,9 @@ fn preserve_identity_slice_is_byte_parity() {
         OverlapMode::Variant,
         &fields,
         Routing::Preserve,
+        false, // sidecar_bits_enabled (ignored under Preserve)
+        0,     // info_bits (ignored under Preserve)
+        0,     // format_bits (ignored under Preserve)
     )
     .unwrap();
     assert_eq!(
@@ -881,4 +890,271 @@ fn run_slice_view_reference_missing_contig_fails_before_any_output() {
         "fail-fast: out_dir must NOT be created when the reference lacks an \
          out-contig (got a partially-written store instead)"
     );
+}
+
+// ---- Routing::Recompute (Task 3): the cost model re-runs on the subset ----
+
+/// The single SNP in every flip fixture below lives at this 0-based POS. Stored
+/// positions are the `SynthRecord.pos` verbatim (see the other tests), so this
+/// is exactly what `var_key/snp/positions.bin` / `dense/snp/positions.bin` hold.
+const SNP_POS: u32 = 100;
+
+/// A finished single-contig genotype store plus the metadata a subset slice
+/// needs (its own tempdir keeps the store alive for the test's lifetime).
+struct GenoFixture {
+    _tmp: TempDir,
+    path: String,
+    n_samples: usize,
+}
+
+/// Build a `chr1` store holding ONE biallelic SNP (`A>C` at [`SNP_POS`]) with
+/// the given flat genotype vector, routed by the REAL production cost model
+/// (`process_chromosome`, signatures off, no fields -> sidecar/info/format bits
+/// all 0). `gt` is `[s0p0, s0p1, s1p0, ...]`.
+fn build_geno_fixture(n_samples: usize, gt: Vec<i32>) -> GenoFixture {
+    assert_eq!(gt.len(), n_samples * 2, "gt must be n_samples * ploidy(2)");
+    let tmp = tempdir().unwrap();
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let sample_names: Vec<String> = (0..n_samples).map(|i| format!("S{i}")).collect();
+    let sample_refs: Vec<&str> = sample_names.iter().map(|s| s.as_str()).collect();
+
+    let records = vec![SynthRecord {
+        pos: SNP_POS as i64,
+        ref_allele: b"A",
+        alts: vec![&b"C"[..]],
+        gt,
+    }];
+    build_contig(&src, "chr1", &sample_refs, 2, &records);
+    // Undo `build_contig`'s conservative max_del fixture with the real value
+    // (irrelevant for a SNP-only store, but keeps the store production-shaped).
+    genoray_core::max_del::write_max_del(&src.join("chr1"), n_samples, 2).unwrap();
+    write_meta(
+        &src,
+        FORMAT_VERSION,
+        &sample_names,
+        &["chr1".to_string()],
+        2,
+        &[],
+    )
+    .unwrap();
+
+    GenoFixture {
+        path: src.to_str().unwrap().to_string(),
+        n_samples,
+        _tmp: tmp,
+    }
+}
+
+/// A SNP common enough in a large cohort to route DENSE at full size, but
+/// carried by sample 0 on exactly ONE hap (so a 1-sample `[0]` subset sees
+/// `x_sub = 1`). Additional carrier haps fill from hap index 2 onward.
+fn fixture_dense_snp_store(n_samples: usize, carrier_haps: usize) -> GenoFixture {
+    assert!(carrier_haps >= 1 && carrier_haps <= n_samples * 2);
+    let mut gt = vec![0i32; n_samples * 2];
+    gt[0] = 1; // sample 0, hap 0 -> the sole carrier hap of sample 0
+    for h in gt.iter_mut().take(carrier_haps + 1).skip(2) {
+        *h = 1;
+    }
+    // total carriers = 1 (hap0) + (carrier_haps + 1 - 2) = carrier_haps.
+    build_geno_fixture(n_samples, gt)
+}
+
+/// A SNP rare enough to route VAR_KEY at full size (3 carrier haps), all within
+/// samples 0 and 1: sample 0 both haps + sample 1 hap 0. A `[0, 1]` subset
+/// keeps all 3 carriers (`x_sub = 3`).
+fn fixture_var_key_snp_store(n_samples: usize) -> GenoFixture {
+    assert!(n_samples >= 2);
+    let mut gt = vec![0i32; n_samples * 2];
+    gt[0] = 1; // s0 hap0
+    gt[1] = 1; // s0 hap1
+    gt[2] = 1; // s1 hap0
+    build_geno_fixture(n_samples, gt)
+}
+
+fn snp_positions(store: &str, chrom: &str, stream: &str) -> Vec<u32> {
+    let p = Path::new(store)
+        .join(chrom)
+        .join(stream)
+        .join("snp")
+        .join("positions.bin");
+    if p.exists() {
+        common::read_u32_bin(&p)
+    } else {
+        Vec::new()
+    }
+}
+
+fn var_key_snp_positions(store: &str, chrom: &str) -> Vec<u32> {
+    snp_positions(store, chrom, "var_key")
+}
+
+fn dense_snp_positions(store: &str, chrom: &str) -> Vec<u32> {
+    snp_positions(store, chrom, "dense")
+}
+
+/// Decode-equivalence: for each output sample `s_out` (original column
+/// `orig[s_out]`), the sliced store must decode to exactly the calls the source
+/// yields for that original sample. Representation-agnostic (var_key vs dense),
+/// so it holds across a flip.
+fn assert_decode_matches_source(
+    src: &str,
+    src_n_samples: usize,
+    out: &str,
+    chrom: &str,
+    orig: &[usize],
+) {
+    let src_reader = ContigReader::open(src, chrom, src_n_samples, 2).unwrap();
+    let out_reader = ContigReader::open(out, chrom, orig.len(), 2).unwrap();
+    let mut carried_something = false;
+    for (s_out, &s_orig) in orig.iter().enumerate() {
+        let want = overlap_sample(&src_reader, s_orig, 0, u32::MAX);
+        let got = overlap_sample(&out_reader, s_out, 0, u32::MAX);
+        assert_eq!(got, want, "sample {s_out} (orig {s_orig}) decode mismatch");
+        carried_something |= want.per_hap.iter().any(|hc| !hc.positions.is_empty());
+    }
+    assert!(
+        carried_something,
+        "non-vacuity: the subset must genuinely carry the SNP"
+    );
+}
+
+/// A SNP carried by MANY haps of a large cohort routes DENSE at full size; a
+/// 1-sample subset in which it has a single carrier hap must flip dense ->
+/// var_key.
+///
+/// By-hand cost (SNP: `per_call = 32 + 2 + sidecar`, `sidecar = 0` genos-only;
+/// `dense = 32 + 2 + n*ploidy`; route Dense iff `dense < per_call * x`):
+///   source, n=200 ploidy=2 (np=400), x=180:
+///     dense = 32+2+400 = 434; var_key = 34*180 = 6120 -> 434 < 6120 -> DENSE.
+///   subset [0], n_sub=1 (np=2), x_sub=1:
+///     dense = 32+2+2 = 36; var_key = 34*1 = 34 -> 36 < 34 is false -> VAR_KEY.
+///   => the variant FLIPS dense -> var_key.
+#[test]
+fn recompute_flips_dense_to_var_key() {
+    let src = fixture_dense_snp_store(200, 180);
+    let out = tempdir().unwrap();
+    let outp = out.path().to_str().unwrap();
+
+    // Precondition: the source really routed this SNP dense.
+    assert!(dense_snp_positions(&src.path, "chr1").contains(&SNP_POS));
+    assert!(var_key_snp_positions(&src.path, "chr1").is_empty());
+
+    slice_contig_genos(
+        &src.path,
+        outp,
+        "chr1",
+        &[0],
+        2,
+        &[(0, u32::MAX)],
+        OverlapMode::Variant,
+        Routing::Recompute,
+    )
+    .unwrap();
+
+    assert!(
+        var_key_snp_positions(outp, "chr1").contains(&SNP_POS),
+        "flipped SNP must now live in var_key/snp"
+    );
+    assert!(
+        dense_snp_positions(outp, "chr1").is_empty(),
+        "dense/snp must be empty after the flip"
+    );
+    assert_decode_matches_source(&src.path, src.n_samples, outp, "chr1", &[0]);
+}
+
+/// A var_key SNP with few carriers at full size, all packed into a small subset,
+/// must flip var_key -> dense.
+///
+/// By-hand cost:
+///   source, n=100 ploidy=2 (np=200), x=3:
+///     dense = 32+2+200 = 234; var_key = 34*3 = 102 -> 234 < 102 false -> VAR_KEY.
+///   subset [0,1], n_sub=2 (np=4), x_sub=3:
+///     dense = 32+2+4 = 38; var_key = 34*3 = 102 -> 38 < 102 -> DENSE.
+///   => the variant FLIPS var_key -> dense.
+#[test]
+fn recompute_flips_var_key_to_dense() {
+    let src = fixture_var_key_snp_store(100);
+    let out = tempdir().unwrap();
+    let outp = out.path().to_str().unwrap();
+
+    // Precondition: the source really routed this SNP var_key.
+    assert!(var_key_snp_positions(&src.path, "chr1").contains(&SNP_POS));
+    assert!(dense_snp_positions(&src.path, "chr1").is_empty());
+
+    slice_contig_genos(
+        &src.path,
+        outp,
+        "chr1",
+        &[0, 1],
+        2,
+        &[(0, u32::MAX)],
+        OverlapMode::Variant,
+        Routing::Recompute,
+    )
+    .unwrap();
+
+    assert!(
+        dense_snp_positions(outp, "chr1").contains(&SNP_POS),
+        "flipped SNP must now live in dense/snp"
+    );
+    assert!(
+        var_key_snp_positions(outp, "chr1").is_empty(),
+        "var_key/snp must be empty after the flip"
+    );
+    assert_decode_matches_source(&src.path, src.n_samples, outp, "chr1", &[0, 1]);
+}
+
+/// Full coverage => every variant's `x_sub` equals its full-size `x`, and the
+/// cost terms match the source conversion's (genotype fixture built field-free:
+/// sidecar/info/format bits all 0), so `Routing::Recompute` produces ZERO flips.
+/// Zero flips => Recompute reproduces `Routing::Preserve`, which is byte-parity
+/// with the source. The strongest test in the suite: it pins that the Recompute
+/// route + `RoutePlan::sort` are a genuine no-op on the bytes when nothing moves.
+///
+/// Cost params passed as `(false, 0, 0)` to MATCH the source's field-free
+/// conversion — the AF/DP fields are synthesized post-hoc onto an already-routed
+/// store, so the genotype routing never accounted for their bits; feeding
+/// nonzero info/format bits here would flip variants and (correctly) break the
+/// byte-parity this test asserts.
+#[test]
+fn recompute_full_coverage_is_byte_parity() {
+    let tmp = tempdir().unwrap();
+    let src = tmp.path().join("src");
+    let samples = ["S0", "S1"];
+    build_fixture_store(&src, &samples);
+    let fields = synth_fields(&src, samples.len());
+
+    let out = tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+
+    let n = slice_contig(
+        src.to_str().unwrap(),
+        out.to_str().unwrap(),
+        "chr1",
+        &(0..samples.len()).collect::<Vec<_>>(),
+        2,
+        &[(0, u32::MAX)],
+        OverlapMode::Variant,
+        &fields,
+        Routing::Recompute,
+        false, // sidecar_bits_enabled: source was converted field/signature-free
+        0,     // info_bits: match the source conversion (fields added post-hoc)
+        0,     // format_bits: same
+    )
+    .unwrap();
+    assert_eq!(
+        n, 5,
+        "all 5 fixture variants must survive a full-coverage Routing::Recompute slice"
+    );
+
+    for rel in geno_and_field_parity_rels() {
+        let rel = Path::new("chr1").join(rel);
+        let rel = rel.to_str().unwrap();
+        assert_eq!(
+            read_if_exists(&src, rel),
+            read_if_exists(&out, rel),
+            "{rel}"
+        );
+    }
 }

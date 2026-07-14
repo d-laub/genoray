@@ -787,6 +787,25 @@ pub fn run_slice_view(
         });
     }
 
+    // Cost-model terms for `Routing::Recompute` (`reroute=True`), computed
+    // exactly as the production converter does (`src/rvk.rs:230-238`): the
+    // mutational-signature sidecar is on iff a reference was given, and
+    // `info_bits`/`format_bits` are the summed per-record field widths in bits.
+    // These are IGNORED under `Routing::Preserve` (today's only routing here),
+    // but computed real so the eventual `reroute=True` route matches a fresh
+    // `from_vcf` conversion's cost decisions.
+    let sidecar_bits_enabled = reference.is_some();
+    let info_bits: u64 = fields_spec
+        .iter()
+        .filter(|f| f.category == FieldCategory::Info)
+        .map(|f| f.dtype.width_bytes().unwrap_or(4) as u64 * 8)
+        .sum();
+    let format_bits: u64 = fields_spec
+        .iter()
+        .filter(|f| f.category == FieldCategory::Format)
+        .map(|f| f.dtype.width_bytes().unwrap_or(4) as u64 * 8)
+        .sum();
+
     // Reference FASTA (if any): validate the path is openable and contains
     // every out-contig UP FRONT, before any output byte is written. Without
     // this, a missing/unreadable `reference` would only surface inside the
@@ -839,6 +858,9 @@ pub fn run_slice_view(
                 overlap_mode,
                 &fields_spec,
                 crate::svar2_slice::Routing::Preserve,
+                sidecar_bits_enabled,
+                info_bits,
+                format_bits,
             )?;
 
             // Mutcat is detected purely from `mutcat/*/code.bin` on disk (see

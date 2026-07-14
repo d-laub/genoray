@@ -29,7 +29,7 @@
 //! Mutcat and the top-level `meta.json` are out of scope here (later tasks in
 //! the `write_view(reroute=False)` plan).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::ops::Range;
 use std::path::Path;
@@ -38,6 +38,9 @@ use ndarray::Array1;
 use ndarray_npy::write_npy;
 
 use crate::bits::set_bit;
+use crate::cost_model::{
+    Class, Representation, SIDECAR_BITS_INDEL, SIDECAR_BITS_SNP, choose_representation,
+};
 use crate::error::ConversionError;
 use crate::field::{FieldCategory, FieldSpec};
 use crate::layout::{self, ContigPaths, FieldSub};
@@ -64,7 +67,9 @@ enum CallSrc {
     /// Unflipped: a source var_key call index.
     VarKey { call: usize },
     /// Flipped dense -> var_key: source dense row + ORIGINAL sample column.
-    #[allow(dead_code)] // constructed starting Task 4
+    /// Constructed by `route_class` under `Routing::Recompute` (Task 3); the
+    /// field pass reading these fields (`slice_field_var_key`) lands in Task 4.
+    #[allow(dead_code)] // fields read starting Task 4 (field pass over flips)
     Dense { row: usize, s_orig: usize },
 }
 
@@ -75,7 +80,9 @@ enum RowSrc {
     /// Flipped var_key -> dense. `per_sample_call[s_out]` is a representative
     /// source var_key call for that output sample (any carrier call — see the
     /// key invariant), or `None` for a non-carrier (=> field sentinel).
-    #[allow(dead_code)] // constructed starting Task 4
+    /// Constructed by `route_class` under `Routing::Recompute` (Task 3); the
+    /// field pass reading these fields (`slice_field_dense`) lands in Task 4.
+    #[allow(dead_code)] // fields read starting Task 4 (field pass over flips)
     VarKey {
         per_sample_call: Vec<Option<usize>>,
         /// Any source call of this variant — INFO is per-variant, so any will do.
@@ -109,20 +116,32 @@ fn decode_snp_2bit_code(key: u32) -> u8 {
     ((key >> PAYLOAD_TOP_SHIFT) & 3) as u8
 }
 
-/// Route each class's gathered calls/rows to their OUTPUT stream. Under
-/// `Routing::Preserve` every variant keeps its source stream — the identity
-/// mapping that reproduces today's exact bytes. `Routing::Recompute` (re-run
-/// the cost model against the subset's carrier count, flipping some variants
-/// between streams) lands in Task 3; `n_samples_out`/`ploidy` are unused until
-/// then.
+/// Route each class's gathered calls/rows to their OUTPUT stream.
+///
+/// Under `Routing::Preserve` every variant keeps its source stream — the
+/// identity mapping that reproduces today's exact bytes.
+///
+/// Under `Routing::Recompute` (`reroute=True`) the cost model is re-run against
+/// the SUBSET's own carrier count (`route_class`), flipping variants between
+/// streams when the subset makes the other representation cheaper. The three
+/// cost terms mirror the production converter (`src/rvk.rs:230-270`):
+/// `sidecar_bits_enabled` resolves to the per-class mutational-signature cost
+/// (`SIDECAR_BITS_SNP`/`SIDECAR_BITS_INDEL`, or 0 when disabled); `info_bits` /
+/// `format_bits` are the summed per-record field widths. SNP and indel classes
+/// are routed independently — they never exchange variants.
+#[allow(clippy::too_many_arguments)]
 fn route(
     routing: Routing,
     vk_snp: Vec<GatheredCall>,
     vk_indel: Vec<GatheredCall>,
     d_snp: Vec<GatheredRow>,
     d_indel: Vec<GatheredRow>,
-    _n_samples_out: usize,
-    _ploidy: usize,
+    sample_orig_idx: &[usize],
+    n_subset: usize,
+    ploidy: usize,
+    sidecar_bits_enabled: bool,
+    info_bits: u64,
+    format_bits: u64,
 ) -> RoutePlan {
     match routing {
         Routing::Preserve => RoutePlan {
@@ -131,19 +150,218 @@ fn route(
             d_snp: preserve_rows(d_snp),
             d_indel: preserve_rows(d_indel),
         },
-        Routing::Recompute => todo!("Routing::Recompute lands in Task 3"),
+        Routing::Recompute => {
+            let (snp_sidecar, indel_sidecar) = if sidecar_bits_enabled {
+                (SIDECAR_BITS_SNP, SIDECAR_BITS_INDEL)
+            } else {
+                (0, 0)
+            };
+            let mut plan = RoutePlan::default();
+            route_class(
+                &mut plan,
+                Class::Snp,
+                vk_snp,
+                d_snp,
+                sample_orig_idx,
+                n_subset,
+                ploidy,
+                snp_sidecar,
+                info_bits,
+                format_bits,
+            );
+            route_class(
+                &mut plan,
+                Class::Indel,
+                vk_indel,
+                d_indel,
+                sample_orig_idx,
+                n_subset,
+                ploidy,
+                indel_sidecar,
+                info_bits,
+                format_bits,
+            );
+            plan.sort();
+            plan
+        }
+    }
+}
+
+/// Route one class (SNP or indel) under `Routing::Recompute`. The two classes
+/// never exchange variants, so each is routed with its own call/row streams and
+/// its own per-class `sidecar_bits`.
+///
+/// var_key variants are grouped by `(pos, key)` — one group is one variant's
+/// carrier calls WITHIN the subset, so `group.len()` is the subset carrier
+/// count `x_sub`. Dense rows already carry their subset popcount in
+/// `carriers_out`. Each variant's `x_sub` is fed to `choose_representation`; if
+/// the cheaper representation differs from the source stream the variant flips.
+///
+/// `x_sub` is always `> 0`: a var_key variant with no subset carriers has no
+/// gathered calls (never enters `by_variant`), and a dense row with no subset
+/// carriers was already dropped by `gather_dense`'s `carried_by_subset` filter.
+/// That preserves the existing MAC=0 drop under both routings.
+#[allow(clippy::too_many_arguments)]
+fn route_class(
+    plan: &mut RoutePlan,
+    class: Class,
+    calls: Vec<GatheredCall>,
+    rows: Vec<GatheredRow>,
+    sample_orig_idx: &[usize],
+    n_subset: usize,
+    ploidy: usize,
+    sidecar_bits: u64,
+    info_bits: u64,
+    format_bits: u64,
+) {
+    // 1. Group var_key calls by variant: one gathered call == one carrier hap.
+    let mut by_variant: HashMap<(u32, u32), Vec<GatheredCall>> = HashMap::new();
+    for c in calls {
+        by_variant.entry((c.pos, c.key)).or_default().push(c);
+    }
+
+    // 2. var_key variants: stay var_key, or flip to dense.
+    for ((pos, key), group) in by_variant {
+        let x_sub = group.len();
+        debug_assert!(x_sub > 0, "a grouped var_key variant has >= 1 carrier call");
+        match choose_representation(
+            class,
+            n_subset,
+            ploidy,
+            x_sub,
+            sidecar_bits,
+            info_bits,
+            format_bits,
+        ) {
+            Representation::VarKey => {
+                for c in group {
+                    plan.push_call(class, CallSrc::VarKey { call: c.src }, c.col_out, pos, key);
+                }
+            }
+            Representation::Dense => {
+                // Carriers by OUTPUT hap column; plus a representative source
+                // call per OUTPUT SAMPLE for the (Task 4) field pass — all
+                // carrier calls of a sample hold identical field bytes.
+                let mut carriers_out: Vec<usize> = group.iter().map(|c| c.col_out).collect();
+                carriers_out.sort_unstable();
+                let mut per_sample_call = vec![None; n_subset];
+                for c in &group {
+                    per_sample_call[c.col_out / ploidy].get_or_insert(c.src);
+                }
+                let info_call = group[0].src;
+                plan.push_row(
+                    class,
+                    RowSrc::VarKey {
+                        per_sample_call,
+                        info_call,
+                    },
+                    pos,
+                    key,
+                    carriers_out,
+                );
+            }
+        }
+    }
+
+    // 3. dense rows: stay dense, or flip to var_key.
+    for r in rows {
+        let x_sub = r.carriers_out.len(); // subset popcount of the row
+        debug_assert!(x_sub > 0, "a gathered dense row has >= 1 subset carrier");
+        match choose_representation(
+            class,
+            n_subset,
+            ploidy,
+            x_sub,
+            sidecar_bits,
+            info_bits,
+            format_bits,
+        ) {
+            Representation::Dense => {
+                plan.push_row(
+                    class,
+                    RowSrc::Dense { row: r.src },
+                    r.pos,
+                    r.key,
+                    r.carriers_out,
+                );
+            }
+            Representation::VarKey => {
+                for &col_out in &r.carriers_out {
+                    // The ORIGINAL sample column of this output hap, for the
+                    // (Task 4) field re-gather off the dense source row.
+                    let s_orig = sample_orig_idx[col_out / ploidy];
+                    plan.push_call(
+                        class,
+                        CallSrc::Dense { row: r.src, s_orig },
+                        col_out,
+                        r.pos,
+                        r.key,
+                    );
+                }
+            }
+        }
     }
 }
 
 /// The routed, emit-ready plan for all four sidecar classes: `(src, col_out,
-/// pos, key)` for var_key (already `(col_out, pos)`-ordered — the gather loop
-/// is column-major and `region_hits` sorts within a column) and `(src, pos,
-/// key, carriers_out)` for dense (already position-ascending).
+/// pos, key)` for var_key (must be `(col_out, pos, key)`-ordered for
+/// `emit_var_key`) and `(src, pos, key, carriers_out)` for dense (must be
+/// `(pos, key)`-ordered for `emit_dense`). Under `Routing::Preserve` the gather
+/// order already satisfies both; under `Routing::Recompute` flipped variants
+/// arrive out of order, so `sort` restores the required order.
+#[derive(Default)]
 struct RoutePlan {
     vk_snp: Vec<(CallSrc, usize, u32, u32)>,
     vk_indel: Vec<(CallSrc, usize, u32, u32)>,
     d_snp: Vec<(RowSrc, u32, u32, Vec<usize>)>,
     d_indel: Vec<(RowSrc, u32, u32, Vec<usize>)>,
+}
+
+impl RoutePlan {
+    /// Append one routed var_key call to its class stream.
+    fn push_call(&mut self, class: Class, src: CallSrc, col_out: usize, pos: u32, key: u32) {
+        match class {
+            Class::Snp => self.vk_snp.push((src, col_out, pos, key)),
+            Class::Indel => self.vk_indel.push((src, col_out, pos, key)),
+        }
+    }
+
+    /// Append one routed dense row to its class stream.
+    fn push_row(
+        &mut self,
+        class: Class,
+        src: RowSrc,
+        pos: u32,
+        key: u32,
+        carriers_out: Vec<usize>,
+    ) {
+        match class {
+            Class::Snp => self.d_snp.push((src, pos, key, carriers_out)),
+            Class::Indel => self.d_indel.push((src, pos, key, carriers_out)),
+        }
+    }
+
+    /// Restore the per-stream order `emit_var_key`/`emit_dense` require after a
+    /// `Routing::Recompute` flip inserted variants out of order: var_key by
+    /// `(col_out, pos, key)`, dense by `(pos, key)`.
+    ///
+    /// `sort_by_key` is stable, so entries sharing a full sort key keep their
+    /// insertion order. Same-position ties across DIFFERENT keys are ordered by
+    /// `key` here — the one place the byte layout can differ from a fresh
+    /// `from_vcf` conversion, which orders a position's variants by
+    /// `(pos, ilen, alt)` rather than by this uniform-key-space `key`. That is
+    /// precisely why `reroute=True` is verified by decode-equivalence +
+    /// routing-equality + output size (Tasks 3, 8), NOT by byte-parity against
+    /// `from_vcf`. This is not new in kind: the shipped `reroute=True` path also
+    /// re-orders (its `Svar2Source` emits from a `BTreeMap<(pos, ilen, alt), _>`).
+    fn sort(&mut self) {
+        for s in [&mut self.vk_snp, &mut self.vk_indel] {
+            s.sort_by_key(|&(_, col, pos, key)| (col, pos, key));
+        }
+        for s in [&mut self.d_snp, &mut self.d_indel] {
+            s.sort_by_key(|(_, pos, key, _)| (*pos, *key));
+        }
+    }
 }
 
 fn preserve_calls(gathered: Vec<GatheredCall>) -> Vec<(CallSrc, usize, u32, u32)> {
@@ -189,8 +407,13 @@ struct GenoProvenance {
 ///
 /// `routing` selects the output stream policy: `Routing::Preserve`
 /// (`reroute=False`) keeps every variant on its source stream;
-/// `Routing::Recompute` (`reroute=True`, Task 3) re-runs the cost model
-/// against the subset's own carrier count.
+/// `Routing::Recompute` (`reroute=True`) re-runs the cost model against the
+/// subset's own carrier count, so it needs the same cost terms the production
+/// converter uses: `sidecar_bits_enabled` (mutational-signature sidecar on, i.e.
+/// a reference was given), and `info_bits`/`format_bits` (the summed per-record
+/// storage widths of the INFO/FORMAT specs in `fields`, in bits). The caller
+/// computes them exactly as `src/rvk.rs:230-238` does. Under `Routing::Preserve`
+/// these three are ignored (the identity route is independent of cost).
 #[allow(clippy::too_many_arguments)]
 pub fn slice_contig(
     src_store: &str,
@@ -202,6 +425,9 @@ pub fn slice_contig(
     overlap: OverlapMode,
     fields: &[FieldSpec],
     routing: Routing,
+    sidecar_bits_enabled: bool,
+    info_bits: u64,
+    format_bits: u64,
 ) -> Result<usize, ConversionError> {
     let (prov, n_samples_orig) = slice_genos_inner(
         src_store,
@@ -212,6 +438,9 @@ pub fn slice_contig(
         regions,
         overlap,
         routing,
+        sidecar_bits_enabled,
+        info_bits,
+        format_bits,
     )?;
 
     if !fields.is_empty() {
@@ -231,6 +460,11 @@ pub fn slice_contig(
 
 /// Genotypes-only slice: [`slice_contig`] with no fields. Kept as a distinct
 /// entry point for genotype-only callers and the byte-parity tests.
+///
+/// Genotype-only implies no fields (`info_bits = format_bits = 0`) and no
+/// reference-derived sidecar (`sidecar_bits_enabled = false`) — those are the
+/// only cost terms `Routing::Recompute` needs, so they are fixed here rather
+/// than threaded (a genotype-only slice cannot carry field/sidecar costs).
 #[allow(clippy::too_many_arguments)]
 pub fn slice_contig_genos(
     src_store: &str,
@@ -251,6 +485,9 @@ pub fn slice_contig_genos(
         regions,
         overlap,
         routing,
+        false, // sidecar_bits_enabled: genotype-only => no reference sidecar
+        0,     // info_bits: no fields
+        0,     // format_bits: no fields
     )?;
     Ok(prov.n_variants)
 }
@@ -279,6 +516,9 @@ fn slice_genos_inner(
     regions: &[(u32, u32)],
     overlap: OverlapMode,
     routing: Routing,
+    sidecar_bits_enabled: bool,
+    info_bits: u64,
+    format_bits: u64,
 ) -> Result<(GenoProvenance, usize), ConversionError> {
     let n_samples_orig = read_n_samples(src_store)?;
     for &s in sample_orig_idx {
@@ -362,8 +602,12 @@ fn slice_genos_inner(
         vk_indel_g,
         d_snp_g,
         d_indel_g,
+        sample_orig_idx,
         sample_orig_idx.len(),
         ploidy,
+        sidecar_bits_enabled,
+        info_bits,
+        format_bits,
     );
 
     // ---- distinct variant count: var_key entries are per-carrier-call, so
