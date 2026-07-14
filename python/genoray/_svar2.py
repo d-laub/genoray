@@ -463,6 +463,9 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
                 merge_overlapping,
                 field_tuples,
                 reference_str,
+                False,  # reroute: this branch is `write_view`'s reroute=False
+                # arm, so `run_slice_view`'s own routing is always Preserve here.
+                None,  # max_threads: not yet wired to `threads` (Task 7).
                 overwrite,
             )
 

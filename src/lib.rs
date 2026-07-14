@@ -665,11 +665,18 @@ pub fn run_view_pipeline(
 /// presence is detected purely from the on-disk `mutcat/*/code.bin` sidecar, so
 /// this stamps nothing into `meta.json`. If `reference` is `None`, mutcat is
 /// skipped entirely.
+///
+/// `reroute` selects the slicer's own routing policy (`Routing::Recompute`
+/// re-runs the cost model on the subset and may flip a variant's stream;
+/// `Routing::Preserve`, the default, keeps each variant's source stream) — see
+/// `svar2_slice::Routing`. Contigs are sliced concurrently across a rayon pool
+/// sized by `max_threads` (`None` autodetects); slicing is independent per
+/// contig, so this changes wall time only, never a single output byte.
 #[cfg(feature = "conversion")]
 #[allow(clippy::type_complexity)]
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (store_path, out_dir, contigs, samples, regions, regions_overlap, merge_overlapping, fields, reference=None, overwrite=false))]
+#[pyo3(signature = (store_path, out_dir, contigs, samples, regions, regions_overlap, merge_overlapping, fields, reference=None, reroute=false, max_threads=None, overwrite=false))]
 pub fn run_slice_view(
     py: Python,
     store_path: String,
@@ -681,11 +688,14 @@ pub fn run_slice_view(
     merge_overlapping: bool,
     fields: Vec<(String, String, String, Option<f64>)>,
     reference: Option<String>,
+    reroute: bool,
+    max_threads: Option<usize>,
     overwrite: bool,
 ) -> PyResult<()> {
     use crate::error::ConversionError;
     use crate::field::{FieldCategory, FieldSpec, HtslibType, StorageDtype};
     use crate::field_finalize::ResolvedField;
+    use crate::svar2_slice::Routing;
 
     // --- fail-fast band (mirrors run_view_pipeline): every raise here happens
     // BEFORE the output dir is created, so a rejected request leaves no bytes. ---
@@ -787,13 +797,21 @@ pub fn run_slice_view(
         });
     }
 
+    // `reroute` selects the routing policy: `Recompute` re-runs the cost model
+    // on the subset (may flip a variant's stream), `Preserve` (default) keeps
+    // each variant's source stream.
+    let routing = if reroute {
+        Routing::Recompute
+    } else {
+        Routing::Preserve
+    };
+
     // Cost-model terms for `Routing::Recompute` (`reroute=True`), computed
     // exactly as the production converter does (`src/rvk.rs:230-238`): the
     // mutational-signature sidecar is on iff a reference was given, and
     // `info_bits`/`format_bits` are the summed per-record field widths in bits.
-    // These are IGNORED under `Routing::Preserve` (today's only routing here),
-    // but computed real so the eventual `reroute=True` route matches a fresh
-    // `from_vcf` conversion's cost decisions.
+    // These are IGNORED under `Routing::Preserve`, but computed unconditionally
+    // so the two routes cannot silently diverge.
     let sidecar_bits_enabled = reference.is_some();
     let info_bits: u64 = fields_spec
         .iter()
@@ -838,56 +856,84 @@ pub fn run_slice_view(
         source: e,
     })?;
 
-    // --- per-contig slice (+ optional mutcat recompute) --- the slicer is
-    // O(output), so a sequential loop suffices; release the GIL for the pure
-    // Rust/IO work.
+    // --- per-contig slice (+ optional mutcat recompute), sliced concurrently
+    // across contigs with rayon (Task 6) --- contigs are independent, so
+    // threading changes wall time only, never a single output byte (see
+    // `multi_contig_slice_is_thread_invariant`). The slicer spawns no threads
+    // of its own -- unlike `run_conversion`, there's no htslib-decode budget to
+    // split per contig, so this is a plain thread-count pool, NOT
+    // `budget::plan_thread_budget` (which splits htslib + pipeline threads the
+    // slicer doesn't have). Release the GIL for the pure Rust/IO work.
+    //
+    // Peak memory: O(output per contig) x concurrent contigs; with
+    // `reference=` each in-flight contig also holds that contig's reference
+    // sequence resident (~250 MB for chr1) for its mutcat recompute.
     let n_subset = samples_orig_idx.len();
-    let result: Result<(), ConversionError> = py.detach(|| {
-        for chrom in &out_contigs {
-            let mut chrom_regions = by_contig.get(chrom.as_str()).cloned().unwrap_or_default();
-            if merge_overlapping {
-                chrom_regions = merge_regions(chrom_regions);
-            }
-            crate::svar2_slice::slice_contig(
-                &store_path,
-                &out_dir,
-                chrom,
-                &samples_orig_idx,
-                ploidy,
-                &chrom_regions,
-                overlap_mode,
-                &fields_spec,
-                crate::svar2_slice::Routing::Preserve,
-                sidecar_bits_enabled,
-                info_bits,
-                format_bits,
-            )?;
+    let results: Vec<Result<usize, ConversionError>> = py.detach(|| {
+        let available_cores = match max_threads {
+            Some(t) if t > 0 => t,
+            _ => std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1),
+        };
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(available_cores.min(out_contigs.len()).max(1))
+            .thread_name(|i| format!("slice-{i}"))
+            .build()
+            .unwrap();
+        pool.install(|| {
+            out_contigs
+                .par_iter()
+                .map(|chrom| {
+                    let mut chrom_regions =
+                        by_contig.get(chrom.as_str()).cloned().unwrap_or_default();
+                    if merge_overlapping {
+                        chrom_regions = merge_regions(chrom_regions);
+                    }
+                    let n = crate::svar2_slice::slice_contig(
+                        &store_path,
+                        &out_dir,
+                        chrom,
+                        &samples_orig_idx,
+                        ploidy,
+                        &chrom_regions,
+                        overlap_mode,
+                        &fields_spec,
+                        routing,
+                        sidecar_bits_enabled,
+                        info_bits,
+                        format_bits,
+                    )?;
 
-            // Mutcat is detected purely from `mutcat/*/code.bin` on disk (see
-            // Python's `_is_annotated`), so recompute it over the sliced output
-            // when a reference is given -- nothing is stamped into meta.json.
-            // The reference was validated up front (see the fail-fast band), so
-            // this loads lazily: peak O(1 contig) resident, one sequence at a
-            // time, dropped before the next contig.
-            if let Some(fasta) = reference.as_deref() {
-                let ref_seq = crate::vcf_reader::load_contig_seq(fasta, chrom)?;
-                let reader = crate::query::ContigReader::open(&out_dir, chrom, n_subset, ploidy)
-                    .map_err(|e| ConversionError::Io {
-                        context: format!("{out_dir}/{chrom}"),
-                        source: e,
-                    })?;
-                let paths = crate::layout::ContigPaths::new(&out_dir, chrom);
-                crate::mutcat::annotate::annotate_contig(&reader, &paths, &ref_seq).map_err(
-                    |e| ConversionError::Io {
-                        context: format!("annotate mutcat {out_dir}/{chrom}"),
-                        source: e,
-                    },
-                )?;
-            }
-        }
-        Ok(())
+                    // Mutcat is detected purely from `mutcat/*/code.bin` on disk (see
+                    // Python's `_is_annotated`), so recompute it over the sliced output
+                    // when a reference is given -- nothing is stamped into meta.json.
+                    // The reference was validated up front (see the fail-fast band), so
+                    // this loads lazily: peak O(1 contig) resident PER IN-FLIGHT TASK,
+                    // dropped once that task's (single) contig is annotated.
+                    if let Some(fasta) = reference.as_deref() {
+                        let ref_seq = crate::vcf_reader::load_contig_seq(fasta, chrom)?;
+                        let reader =
+                            crate::query::ContigReader::open(&out_dir, chrom, n_subset, ploidy)
+                                .map_err(|e| ConversionError::Io {
+                                    context: format!("{out_dir}/{chrom}"),
+                                    source: e,
+                                })?;
+                        let paths = crate::layout::ContigPaths::new(&out_dir, chrom);
+                        crate::mutcat::annotate::annotate_contig(&reader, &paths, &ref_seq)
+                            .map_err(|e| ConversionError::Io {
+                                context: format!("annotate mutcat {out_dir}/{chrom}"),
+                                source: e,
+                            })?;
+                    }
+                    Ok(n)
+                })
+                .collect()
+        })
     });
-    result?;
+    for r in results {
+        r?;
+    }
 
     // meta.json: subset samples, kept contigs, inherited ploidy, and the fields
     // exactly as requested (source dtype -- see the no-finalize note above).

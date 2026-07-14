@@ -879,6 +879,8 @@ fn run_slice_view_full_coverage_carries_genos_fields_and_mutcat() {
             false,
             field_tuples,
             Some(fasta.to_str().unwrap().to_string()),
+            false, // reroute
+            None,  // max_threads
             false,
         )
     })
@@ -936,7 +938,9 @@ fn run_slice_view_without_reference_skips_mutcat() {
             "variant".to_string(),
             false,
             Vec::new(),
-            None, // no reference -> no mutcat
+            None,  // no reference -> no mutcat
+            false, // reroute
+            None,  // max_threads
             false,
         )
     })
@@ -979,6 +983,8 @@ fn run_slice_view_bad_reference_fails_before_any_output() {
             false,
             Vec::new(),
             Some(bad_fasta.to_str().unwrap().to_string()),
+            false, // reroute
+            None,  // max_threads
             false,
         )
     });
@@ -1026,6 +1032,8 @@ fn run_slice_view_reference_missing_contig_fails_before_any_output() {
             false,
             Vec::new(),
             Some(other_fasta.to_str().unwrap().to_string()),
+            false, // reroute
+            None,  // max_threads
             false,
         )
     });
@@ -1643,5 +1651,113 @@ fn flip_preserves_info_value_both_directions() {
         assert!(var_key_snp_positions(outp, "chr1").contains(&SNP_POS));
         let af = read_info_f32(outp, FieldSub::VkSnp, 1);
         assert_eq!(af, vec![AF_VALUE], "INFO unchanged across dense -> var_key");
+    }
+}
+
+// ---- Task 6: run_slice_view routes contigs through a rayon pool ----
+
+/// A store with `chroms.len()` independent single-contig fixtures (same 5-record
+/// shape as `fixture_records()` on each), so slicing them concurrently is
+/// meaningful (real per-contig work) but the contigs don't interact. Returns the
+/// owning `TempDir` (keeps the store alive) with the store rooted at
+/// `<tmp>/src`.
+fn fixture_multi_contig_store(chroms: &[&str]) -> TempDir {
+    let tmp = tempdir().unwrap();
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let samples = ["S0", "S1"];
+    let records = fixture_records();
+    for chrom in chroms {
+        build_contig(&src, chrom, &samples, 2, &records);
+    }
+    write_meta(
+        &src,
+        FORMAT_VERSION,
+        &samples.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        &chroms.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        2,
+        &[],
+    )
+    .unwrap();
+    tmp
+}
+
+/// Slice every contig of `src` (full coverage, all samples, no fields/reference)
+/// into `out`, using `threads` as `run_slice_view`'s `max_threads`.
+fn slice_all_contigs(src: &Path, out: &Path, threads: Option<usize>) {
+    let chroms = ["chr1", "chr2", "chr3"];
+    let regions: Vec<(String, u32, u32)> = chroms
+        .iter()
+        .map(|c| (c.to_string(), 0u32, u32::MAX))
+        .collect();
+    Python::attach(|py| {
+        run_slice_view(
+            py,
+            src.to_str().unwrap().to_string(),
+            out.to_str().unwrap().to_string(),
+            chroms.iter().map(|s| s.to_string()).collect(),
+            vec!["S0".to_string(), "S1".to_string()],
+            regions,
+            "variant".to_string(),
+            false,
+            Vec::new(),
+            None,  // reference
+            false, // reroute
+            threads,
+            false, // overwrite
+        )
+    })
+    .expect("run_slice_view should succeed");
+}
+
+/// Genotype/LUT sidecars that a full-coverage, no-field, no-reference slice
+/// writes (subset of `geno_and_field_parity_rels` with the `fields/*` entries
+/// dropped, since this fixture attaches none).
+fn geno_only_parity_rels() -> Vec<&'static str> {
+    vec![
+        "var_key/snp/positions.bin",
+        "var_key/snp/alleles.bin",
+        "var_key/snp/offsets.npy",
+        "var_key/indel/positions.bin",
+        "var_key/indel/alleles.bin",
+        "var_key/indel/offsets.npy",
+        "dense/snp/positions.bin",
+        "dense/snp/alleles.bin",
+        "dense/snp/genotypes.bin",
+        "dense/indel/positions.bin",
+        "dense/indel/alleles.bin",
+        "dense/indel/genotypes.bin",
+        "max_del.npy",
+        "dense/max_del.npy",
+        "indel/long_alleles.bin",
+        "indel/long_allele_offsets.npy",
+    ]
+}
+
+fn assert_sidecars_byte_equal(a: &Path, b: &Path, chrom: &str) {
+    for rel in geno_only_parity_rels() {
+        let rel = format!("{chrom}/{rel}");
+        assert_eq!(read_if_exists(a, &rel), read_if_exists(b, &rel), "{rel}");
+    }
+}
+
+/// Contigs are independent: threading changes wall time, never bytes. Slicing
+/// the same source with `max_threads=1` vs. `max_threads=4` must produce
+/// byte-identical output for every contig.
+#[test]
+fn multi_contig_slice_is_thread_invariant() {
+    let tmp = fixture_multi_contig_store(&["chr1", "chr2", "chr3"]);
+    let src = tmp.path().join("src");
+    let a = tempdir().unwrap();
+    let b = tempdir().unwrap();
+    // `run_slice_view` fail-fasts if `out_dir` already exists (see the
+    // fail-fast band), so each run gets a not-yet-created subdir of its own
+    // tempdir, matching every other `run_slice_view` test's `tmp/out` pattern.
+    let out_a = a.path().join("out");
+    let out_b = b.path().join("out");
+    slice_all_contigs(&src, &out_a, Some(1));
+    slice_all_contigs(&src, &out_b, Some(4));
+    for chrom in ["chr1", "chr2", "chr3"] {
+        assert_sidecars_byte_equal(&out_a, &out_b, chrom);
     }
 }
