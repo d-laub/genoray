@@ -120,7 +120,44 @@ see *Testing*.)
 (O(kept calls)), the kept dense bit rows (O(kept rows × n_subset haps) = the dense
 output itself), and a `(pos, key) → x_sub` map (O(distinct kept variants)). A
 var_key→dense flip produces one bit row; a dense→var_key flip produces ≤ `x_sub`
-calls. So `reroute=True` becomes **O(output)**, like `reroute=False`.
+calls. So `reroute=True` becomes **O(output per contig)**, like `reroute=False` —
+times the number of contigs sliced concurrently (§D2).
+
+### D2. Rayon across contigs; `threads` becomes a real argument
+
+The slicer is currently a serial per-contig loop, and the pipeline's thread pool goes
+away with the pipeline. So `run_slice_view` parallelizes **across contigs** with
+rayon, mirroring `run_conversion` (`src/lib.rs:141-190`):
+
+- Thread discovery / override follows the **same convention** as the `from_*` writers:
+  `max_threads: Option<usize>` → `Some(t) if t > 0` uses `t`, otherwise
+  `std::thread::available_parallelism()`, with the same `Notice:` lines.
+- **Do NOT reuse `budget::plan_thread_budget`.** It exists to split a core budget into
+  htslib decompression threads + pipeline threads *per chrom* — the slicer has
+  neither (no htslib reader in the hot path; the only htslib touch is the per-contig
+  faidx reference load for `mutcat`, which is serial and cheap). The slicer's pool is
+  simply `num_threads(min(available_cores, n_contigs))`, one contig per rayon task.
+- Contigs are independent by construction: each writes its own `{out}/{chrom}` tree,
+  and the `meta.json` tail already runs after the loop. Per-contig failures collect
+  into a `Vec<Result<…>>` and surface as they do in `run_conversion`.
+
+**Python surface — `threads` becomes real.** `write_view` already accepts
+`threads: int | None = None` but its docstring currently says it is "accepted on both
+paths for interface parity" and ignored on the slicer path
+(`python/genoray/_svar2.py:339,379-382`). That caveat is **deleted**: `threads` now
+means the same thing it means on `from_vcf` / `from_vcf_list` / `from_pgen` /
+`from_svar1` — the cap on concurrent contigs, `None` ⇒ autodetect. It threads through
+to `run_slice_view`'s `max_threads`, exactly as the writers thread it to
+`run_conversion`. The CLI `genoray view` already exposes `--threads` / `-@`
+(`python/genoray/_cli/__main__.py:304`) — it just stops being a no-op.
+
+**Memory consequence, and it must be documented.** Peak memory becomes
+**O(concurrent contigs × per-contig output)**, not O(output). With a `reference=` for
+`mutcat`, each in-flight contig also holds that contig's reference sequence (~250 MB
+for chr1). So a whole-genome view at high `threads` can hold several contig sequences
+at once. This is bounded and predictable — and `threads` is the knob that bounds it —
+but the `write_view` docstring MUST say so, because the headline claim of this design
+is "O(output)" and the honest claim is "O(output) per contig, times `threads`".
 
 ### D. LUT compaction (now load-bearing, not optional)
 
@@ -163,10 +200,10 @@ since "source" stops meaning anything once the `RecordSource` is gone. Update th
 - `fields=` / `reference=` resolution is unchanged (it already works for the slicer),
   and now applies to `reroute=True` as well — the `fields`→`ValueError` guard on the
   re-conversion path disappears with the path.
-- **`max_threads`**: the pipeline's thread pool goes away with it. Keep the kwarg
-  only if the slicer parallelizes across contigs (see *Testing*, benchmark gate);
-  otherwise remove it from `run_slice_view`'s surface rather than accept-and-ignore
-  it. Decide from the benchmark, not up front.
+- **`threads`** is now a real argument on both routings, with the `from_*` writers'
+  meaning and autodetect behavior (§D2). `run_slice_view` gains `max_threads:
+  Option<usize>`. The "accepted for interface parity but ignored" caveat in the
+  docstring is deleted.
 
 ## Semantics
 
@@ -188,11 +225,17 @@ Genotype-only and INFO-only views — which is where the ≤6.6 % size win actua
 — stay size-optimal. Views carrying FORMAT default to lossless. An explicit
 `reroute=True` still honors the request and performs the flip.
 
+**The CLI must adopt `"auto"` too.** `genoray view` currently declares
+`reroute: bool = True` (`python/genoray/_cli/__main__.py:302`), which would hard-code
+the re-router and route CLI users straight past the safety rule. It becomes
+`reroute: bool | Literal["auto"] = "auto"`, matching the Python default. `--reroute` /
+`--no-reroute` still force a routing explicitly.
+
 **This rule is only acceptable if it is documented.** It MUST appear, in the same PR,
 in: the `write_view` docstring (the `reroute` parameter), `skills/genoray-api/SKILL.md`,
-`CHANGELOG.md` (`## Unreleased`), and the `genoray view` CLI help for `--reroute` /
-`--no-reroute`. Each mention must state both halves — the resolution rule *and* the
-non-carrier-FORMAT loss it exists to avoid.
+`CHANGELOG.md` (`## Unreleased`), and the `genoray view` CLI help for `reroute`. Each
+mention must state both halves — the resolution rule *and* the non-carrier-FORMAT loss
+it exists to avoid.
 
 ### Other semantics (unchanged from the shipped slicer)
 
@@ -234,14 +277,16 @@ non-carrier-FORMAT loss it exists to avoid.
    preserved (slicer, `Preserve`); `"auto"` + genotypes-only or INFO-only ⇒ re-routed.
 7. **Overlap-mode parity.** `pos` / `record` / `variant` select the same variant set
    under both routings (shared predicate) — parametrized, as today.
-8. **Benchmark gate.** Rerun `scripts/svar2_eager_bench.py` against the new
+8. **`threads` parallelism.** A multi-contig view at `threads=1` and `threads=N`
+   produces byte-identical output (contigs are independent; only wall time differs).
+   `threads` is honored (not silently ignored) on both routings.
+9. **Benchmark gate.** Rerun `scripts/svar2_eager_bench.py` against the new
    `reroute=True` on `data/chr21.germline.svar2`. Expect peak RSS to collapse from
-   ~31 GB to O(output). Wall time should also drop (a gather beats a full
-   re-conversion), but the old path had `max_threads` pipeline parallelism and the
-   slicer is serial — **if wall time regresses, parallelize the slicer across contigs
-   with rayon** and only then decide whether `max_threads` stays on the API (§F).
-   Update the benchmark note with the new numbers and retire its "do not advertise
-   cohort-scale whole-store copies" gate.
+   ~31 GB to O(output) and wall time to drop (a gather beats a full re-conversion).
+   Because the benchmark is single-contig it isolates the slicer from the rayon win,
+   which is what we want here — add a multi-contig scaling check separately. Update
+   the benchmark note with the new numbers and **retire its "do not advertise
+   cohort-scale whole-store copies" gate**, which this design exists to lift.
 
 Rust unit tests for the route stage and the flip re-shaping; Python integration tests
 extend `tests/test_svar2_write_view.py`.
@@ -250,9 +295,11 @@ extend `tests/test_svar2_write_view.py`.
 
 The `write_view` / `genoray view` **signature** is unchanged. Behavior changes:
 `reroute=True` now carries `fields=` and honors `reference=` (both were errors /
-no-ops), and `"auto"` resolves per the rule above. Update in the same PR:
+no-ops), `threads` is honored on both routings instead of ignored on the slicer path,
+and `"auto"` resolves per the rule above. Update in the same PR:
 
-- `python/genoray/_svar2.py` — `write_view` docstring (`reroute`, `fields`, `reference`).
+- `python/genoray/_svar2.py` — `write_view` docstring (`reroute`, `fields`,
+  `reference`, `threads` — including the per-contig memory statement from §D2).
 - `skills/genoray-api/SKILL.md` — mandatory per CLAUDE.md (public-name semantics change).
 - `CHANGELOG.md` — `## Unreleased`.
 - `docs/roadmap/data-model.md` — M9.
@@ -263,7 +310,10 @@ no-ops), and `"auto"` resolves per the rule above. Update in the same PR:
 ## Non-goals / deferred
 
 - **Streaming anything.** There is nothing left to stream: the pipeline-backed view
-  path is gone and the slicer is already O(output).
+  path is gone, and the slicer's footprint is O(output per contig) × `threads` — set
+  `threads=1` for the tightest bound. A *within*-contig streaming slicer (bounding
+  peak below a single contig's output) is a separate, unmotivated change: the output
+  is what the caller asked to write to disk anyway.
 - **Non-scalar / String fields** — SVAR2 fields stay scalar-numeric + INFO Flag, as in
   `from_vcf`.
 - **A full-coverage fast path** — a whole-store, all-sample view still slices rather
