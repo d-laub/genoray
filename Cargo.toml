@@ -23,7 +23,10 @@ rayon = "1.11.0"
 # default-features = false drops bzip2/lzma/curl (and their system libs); htslib is
 # vendored by hts-sys and built with the conda C/C++ compilers. hts-sys forces
 # bindgen, so the build needs libclang (provided via pixi: clang/clangdev).
-rust-htslib = { version = "1.0", default-features = false, optional = true }
+# libdeflate: hts-sys builds vendored htslib against libdeflate (SIMD CRC + ~2x
+# faster inflate) instead of zlib — the BGZF decompression bottleneck for
+# VCF->SVAR2 conversion. See docs/superpowers/specs/2026-07-13-svar2-vcf-read-*.
+rust-htslib = { version = "1.0", default-features = false, features = ["libdeflate"], optional = true }
 serde_json = "1"
 svar2-codec = { path = "svar2-codec" }
 thiserror = "2"
