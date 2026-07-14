@@ -106,6 +106,8 @@
 
 ### Perf
 
+- perf(svar2): build vendored htslib against libdeflate (faster BGZF
+  decompression) for VCF→SVAR2 conversion. Output is byte-identical.
 - Conversion reader staging memory no longer scales with `chunk_size`:
   presence bits are packed in word-aligned windows and each atom's per-column
   genotype vector is dropped as soon as its bits are set, bounding reader
