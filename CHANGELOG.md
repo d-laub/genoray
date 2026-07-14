@@ -39,6 +39,13 @@
   for COSMIC mutational-signature workflows (SBS96/ID83/DBS78), implemented in
   Rust with a per-record sidecar and streaming count matrix. `from_vcf` gains a
   `signatures=` flag to classify during the write (factored into the cost model).
+- `SparseVar2.annotate_mutations` gains a `gtf=` argument that annotates each SNV
+  with its transcriptional strand class (stored in a 2-bit `strand.bin`
+  sidecar), enabling the strand-resolved `mutation_matrix("SBS192")` and
+  `mutation_matrix("SBS384")` catalogs (SigProfiler `[T, U, N, B]` order; SBS192
+  is the `{T, U}` view). Strand is computed from `feature == "gene"` footprints.
+  `assign_signatures` raises `NotImplementedError` for these kinds (no COSMIC
+  reference set). Write-time `from_vcf(signatures=True)` remains strand-free.
 - `SparseVar2.from_vcf` can extract scalar-numeric INFO/FORMAT fields into the
   store via new `info_fields=`/`format_fields=` kwargs and `InfoField`/
   `FormatField` config types (`genoray.InfoField`, `genoray.FormatField`).
