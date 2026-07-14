@@ -78,6 +78,8 @@ pub mod streams;
 pub mod svar2_slice;
 #[cfg(feature = "conversion")]
 pub mod svar2_source;
+#[cfg(feature = "conversion")]
+pub mod svar2_view;
 pub mod types;
 #[cfg(feature = "conversion")]
 pub mod vcf_list_reader;
@@ -484,9 +486,9 @@ pub fn run_view_pipeline(
     }
 
     let overlap_mode = match regions_overlap.as_str() {
-        "pos" => crate::svar2_source::OverlapMode::Pos,
-        "record" => crate::svar2_source::OverlapMode::Record,
-        "variant" => crate::svar2_source::OverlapMode::Variant,
+        "pos" => crate::svar2_view::OverlapMode::Pos,
+        "record" => crate::svar2_view::OverlapMode::Record,
+        "variant" => crate::svar2_view::OverlapMode::Variant,
         other => {
             return Err(crate::error::ConversionError::Input(format!(
                 "regions_overlap must be one of 'pos', 'record', 'variant'; got {other:?}"
@@ -688,9 +690,9 @@ pub fn run_slice_view(
     // --- fail-fast band (mirrors run_view_pipeline): every raise here happens
     // BEFORE the output dir is created, so a rejected request leaves no bytes. ---
     let overlap_mode = match regions_overlap.as_str() {
-        "pos" => crate::svar2_source::OverlapMode::Pos,
-        "record" => crate::svar2_source::OverlapMode::Record,
-        "variant" => crate::svar2_source::OverlapMode::Variant,
+        "pos" => crate::svar2_view::OverlapMode::Pos,
+        "record" => crate::svar2_view::OverlapMode::Record,
+        "variant" => crate::svar2_view::OverlapMode::Variant,
         other => {
             return Err(ConversionError::Input(format!(
                 "regions_overlap must be one of 'pos', 'record', 'variant'; got {other:?}"

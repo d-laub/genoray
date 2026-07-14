@@ -9,7 +9,7 @@
 //! (via `slice_contig`) each requested INFO/FORMAT field's `values.bin`.
 //! O(output) memory, no cost model, no pipeline re-run.
 //!
-//! Reuses `svar2_source::{query_window, keeps}` verbatim so `reroute=False`
+//! Reuses `svar2_view::{query_window, keeps}` verbatim so `reroute=False`
 //! and `reroute=True` select the identical variant set — the query-window
 //! widening and per-mode keep predicate are the SAME code, not a re-derived
 //! copy of the semantics. The tree-narrowed windows come from
@@ -46,7 +46,7 @@ use crate::query::ContigReader;
 use crate::query::field::FieldView;
 use crate::query::sidecar::{DenseView, as_bytes, as_u32};
 use crate::rvk::{deletion_len, pack_snp_keys, unpack_snp_key_at};
-use crate::svar2_source::{OverlapMode, keeps, query_window, read_n_samples};
+use crate::svar2_view::{OverlapMode, keeps, query_window, read_n_samples};
 
 /// SOURCE-index provenance from the genotype gather, consumed by the field
 /// pass so a field's `values.bin` is re-gathered in the exact output order the
@@ -139,7 +139,7 @@ pub fn slice_contig_genos(
 ///
 /// `overlap` and `regions` select calls with EXACTLY `Svar2Source`'s semantics
 /// (`query_window` widens the search window per mode, `keeps` applies the final
-/// POS-precision filter) — see `svar2_source::OverlapMode`.
+/// POS-precision filter) — see `svar2_view::OverlapMode`.
 fn slice_genos_inner(
     src_store: &str,
     out_store: &str,

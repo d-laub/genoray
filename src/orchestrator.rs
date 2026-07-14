@@ -68,7 +68,7 @@ pub enum SourceSpec {
         /// 0-based half-open `[start, end)` regions to keep, already
         /// narrowed to this contig.
         regions: Vec<(u32, u32)>,
-        overlap_mode: crate::svar2_source::OverlapMode,
+        overlap_mode: crate::svar2_view::OverlapMode,
     },
     /// `SparseVar2.from_vcf_list`: N single-sample VCFs with possibly disjoint
     /// site lists, k-way merged into ONE record stream (`VcfListRecordSource`).
