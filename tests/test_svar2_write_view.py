@@ -208,10 +208,10 @@ def test_reroute_false_equivalent_to_true(svar2_store, tmp_path):
     real sample subset (representation on disk may differ; decoded content
     must not).
 
-    NOTE: this compares genotypes only (`fields=None`). `reroute=True` rejects
-    non-empty `fields` (field carry-through is only implemented for
-    `reroute=False` -- see `test_reroute_false_carries_fields...` below), so a
-    fields= equivalence test isn't possible on the `reroute=True` side.
+    NOTE: this compares genotypes only (`fields=None`). Both `reroute=True` and
+    `reroute=False` carry fields through the shared slicer now; this test just
+    doesn't exercise that axis (see the field-carry-through tests elsewhere in
+    this module for that coverage).
     """
     sv = SparseVar2(svar2_store)
     contig = sv.contigs[0]

@@ -103,6 +103,8 @@
     per-sample slot to lose).
   - `threads` caps the number of contigs sliced concurrently (autodetected
     when `None`), the same convention as `from_vcf`, on both paths.
+  - The long-allele LUT is compacted to the subset's narrower carrier set
+    when slicing, instead of copying each variant's LUT bytes verbatim.
 - `genoray concat` / `genoray split` CLI commands, thin wrappers over
   `SparseVar2.concat`/`split_by_contig`/`subset_contigs`.
 - `SparseVar2.from_svar1` converts an existing SVAR1 (`SparseVar`) store to SVAR2

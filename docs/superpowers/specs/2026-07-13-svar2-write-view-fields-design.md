@@ -1,3 +1,8 @@
+> **SUPERSEDED** by `docs/superpowers/specs/2026-07-13-svar2-view-unify-routing-design.md`.
+> This plan carried fields through the `reroute=True` **re-conversion** path, which no
+> longer exists — `reroute=True` is now a routing policy inside the slicer, which
+> already carried fields. Never implemented. Kept for history.
+
 # SVAR2 `write_view` INFO/FORMAT field carry-through + signature recompute
 
 **Status:** design (brainstorm output)
