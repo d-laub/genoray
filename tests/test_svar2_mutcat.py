@@ -4,6 +4,7 @@ import json
 import subprocess
 from pathlib import Path
 
+import numpy as np
 import polars as pl
 import pysam
 import pytest
@@ -286,3 +287,85 @@ def test_sbs384_requires_strand_annotation(tmp_path: Path):
     assert not sv2._is_strand_annotated()
     with pytest.raises(ValueError, match="strand"):
         sv2.mutation_matrix("SBS384")
+
+
+# ---------------------------------------------------------------------------
+# Task 10: end-to-end SBS192/SBS384 parity test (integration gate)
+# ---------------------------------------------------------------------------
+
+
+def _write_strand_gtf(d: Path) -> Path:
+    """A GTF with a + gene [1,40], a - gene [45,80], and a 41-44 intergenic gap.
+
+    Positions (1-based) against _PARITY_SEQ:
+      POS=10 (ref A, purine) in + gene  -> Transcribed  (T)
+      POS=42 (ref G, purine) in the gap -> Nontranscribed(N)
+      POS=60 (ref A, purine) in - gene  -> Untranscribed (U)
+    """
+    gtf = d / "strand.gtf"
+    gtf.write_text(
+        'chr1\ttest\tgene\t1\t40\t.\t+\t.\tgene_id "P";\n'
+        'chr1\ttest\tgene\t45\t80\t.\t-\t.\tgene_id "M";\n'
+    )
+    return gtf
+
+
+def _write_strand_vcf(d: Path) -> Path:
+    vcf_path = d / "strand_in.vcf"
+    h = pysam.VariantHeader()
+    h.add_line(f"##contig=<ID=chr1,length={len(_PARITY_SEQ)}>")
+    h.add_line('##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">')
+    h.add_sample("S0")
+    # isolated het SNVs (>2bp apart so none pair into a DBS), all on S0.
+    records = [
+        (9, "A", "C", (0, 1)),  # POS=10 in + gene
+        (41, "G", "A", (0, 1)),  # POS=42 in the gap
+        (59, "A", "C", (0, 1)),  # POS=60 in - gene
+    ]
+    with pysam.VariantFile(str(vcf_path), "w", header=h) as vf:
+        for start, ref, alt, gt in records:
+            r = h.new_record(contig="chr1", start=start, alleles=(ref, alt))
+            r.samples["S0"]["GT"] = gt
+            r.samples["S0"].phased = True
+            vf.write(r)
+    vcf_gz = d / "strand_in.vcf.gz"
+    with open(vcf_gz, "wb") as fh:
+        subprocess.run(["bgzip", "-c", str(vcf_path)], check=True, stdout=fh)
+    subprocess.run(["bcftools", "index", str(vcf_gz)], check=True)
+    return vcf_gz
+
+
+def test_sbs384_end_to_end(tmp_path: Path):
+    ref = _write_parity_ref(tmp_path)
+    vcf = _write_strand_vcf(tmp_path)
+    gtf = _write_strand_gtf(tmp_path)
+    out = tmp_path / "store_strand.svar2"
+    SparseVar2.from_vcf(out, vcf, ref, threads=1)
+
+    sv2 = SparseVar2(out)
+    sv2.annotate_mutations(ref, gtf=gtf)
+    assert sv2._is_strand_annotated()
+    assert json.loads((out / "meta.json").read_text())["mutcat_strand"] is True
+
+    sbs96 = sv2.mutation_matrix("SBS96", count="allele")
+    sbs384 = sv2.mutation_matrix("SBS384", count="allele")
+    sbs192 = sv2.mutation_matrix("SBS192", count="allele")
+
+    assert sbs384.height == 384
+    assert sbs192.height == 192
+    assert sbs384["MutationType"].to_list()[:192] == sbs192["MutationType"].to_list()
+
+    v96 = sbs96["S0"].to_numpy()
+    v384 = sbs384["S0"].to_numpy()
+    v192 = sbs192["S0"].to_numpy()
+
+    # SBS192 is exactly the first 192 (T,U) rows of SBS384.
+    assert np.array_equal(v192, v384[:192])
+
+    # Conservation: SBS384 collapsed over the 4 strand blocks == SBS96.
+    assert np.array_equal(v384.reshape(4, 96).sum(axis=0), v96)
+
+    # Three isolated SNVs, one het copy each -> total 3, one per strand class
+    # T / N / U (blocks 0, 2, 1), none Bidirectional (block 3).
+    block_sums = v384.reshape(4, 96).sum(axis=1)
+    assert block_sums.tolist() == [1, 1, 1, 0]  # [T, U, N, B]
