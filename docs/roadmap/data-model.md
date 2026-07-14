@@ -422,15 +422,26 @@ SVAR2 is a **compute-oriented, derived format — not an archival format.**
   (keep a named subset of contigs), plus the `genoray concat`/`genoray split`
   CLI commands. All three are pure metadata rewrite + file copy/hardlink/
   symlink/move; none re-run conversion or the cost model.
-- **Cheap region subsetting (M9). Implemented via re-conversion.** Subsetting by
+- **Cheap region subsetting (M9). Implemented, two paths.** Subsetting by
   region introduces no new variants and only shrinks variant tables, so it
   doesn't perturb the cost model. `SparseVar2.write_view` (`genoray view`)
-  implements this by re-running the ordinary conversion pipeline over the
-  finished store's own records with `reroute=True` — sample-subset rerouting
-  is done. The representation-preserving fast path (`reroute=False`, a
-  byte-preserving passthrough of each variant's original representation) is
-  deferred: it depends on a measurement verdict (a spike scoped as a separate
-  task) that hasn't been run yet, and currently raises `NotImplementedError`.
+  offers both: `reroute=True` (default, `"auto"`) re-runs the ordinary
+  conversion pipeline over the finished store's own records — size-optimal,
+  sample-subset rerouting included. `reroute=False` is a representation-
+  preserving array-slicer: it slices each variant's *existing* var_key/dense
+  sidecar directly (no cost model, no conversion re-run), so memory is
+  O(output) regardless of source size; it carries INFO/FORMAT fields through
+  natively and recomputes `mutcat` from `reference=`. The measurement spike
+  that gated this path (`docs/superpowers/notes/2026-07-12-svar2-reroute-
+  measurement.md`) returned a "build it" verdict — `reroute=False` output can
+  be up to ~6.6% larger than `reroute=True`'s for aggressive germline
+  sample-subsets, but is a clear win for somatic/all-rare cohorts and
+  memory-constrained runs. Still **deferred**: LUT compaction (`reroute=False`
+  copies each variant's LUT bytes verbatim rather than repacking them for the
+  subset's narrower carrier set); `reroute=True` INFO/FORMAT field and
+  `mutcat` carry-through (the re-router still rejects non-empty `fields` and
+  ignores `reference=`); and a streaming (non-eager) `Svar2Source` for the
+  `reroute=True` path.
 - **Bulk N-way merge is harder (M12).** A general merge of multiple SVAR2 files can
   change allele frequencies and must rebuild LUTs and variant tables — deferred.
 
