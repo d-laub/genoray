@@ -546,7 +546,7 @@ pub fn process_chromosome(
             context: format!("open ContigReader for mutcat annotate {chrom}"),
             source: e,
         })?;
-        crate::mutcat::annotate::annotate_contig(&reader, &paths, &ref_seq).map_err(|e| {
+        crate::mutcat::annotate::annotate_contig(&reader, &paths, &ref_seq, None).map_err(|e| {
             ConversionError::Io {
                 context: format!("annotate mutcat {chrom}"),
                 source: e,

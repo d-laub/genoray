@@ -20,7 +20,7 @@ impl PyContigReader {
     ) -> PyResult<()> {
         let paths = ContigPaths::new(base_out_dir, chrom);
         let seq = ref_seq.as_slice()?;
-        annotate_contig(&self.inner, &paths, seq)
+        annotate_contig(&self.inner, &paths, seq, None)
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("annotate {chrom}: {e}")))?;
         Ok(())
     }
