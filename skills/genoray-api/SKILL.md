@@ -746,10 +746,14 @@ mutually exclusive).
     dtype, and recomputes `mutcat` from `--reference` when one is given.
     Recommended for somatic/all-rare cohorts or memory-constrained runs;
     `--reroute` remains the size-optimal default and its output can be up
-    to ~6.6% smaller for aggressive germline sample-subsets. `--no-reroute`
-    does not accept `--threads` (single-pass slice, no parallel rerouting).
+    to ~6.6% smaller for aggressive germline sample-subsets. `-@/--threads`
+    is accepted for interface parity on both paths, but is IGNORED under
+    `--no-reroute` (single-pass slice, no parallel cost-model rerouting).
   `--progress` is accepted for parity but is currently a no-op on this path
-  (see below).
+  (see below). `write_view`'s underlying `reroute=` kwarg only accepts
+  `"auto"`, `True`, or `False` — any other value (e.g. `reroute=1`) raises
+  `ValueError` rather than silently falling through to the `reroute=False`
+  slicer.
 - `genoray view svar1`: unchanged SVAR 1.0 behavior — "all variants" defaults
   from `SparseVar`'s `_contig_stats` (`[0, pos_max + 1)` per contig); `--fields`
   defaults to all available fields (use an explicit empty selection to carry

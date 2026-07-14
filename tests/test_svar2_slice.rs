@@ -705,3 +705,48 @@ fn run_slice_view_without_reference_skips_mutcat() {
         "no reference => mutcat must be skipped entirely"
     );
 }
+
+/// A nonexistent `reference` must be rejected in the fail-fast band, BEFORE
+/// any output byte is written — not discovered mid-loop (the mutcat-recompute
+/// step) after that contig's genotype/field sidecars are already on disk.
+/// Before the fix, `load_contig_seq` was only called inside the per-contig
+/// loop, AFTER `create_dir_all(out_dir)` and after `slice_contig` had already
+/// written chr1's sidecars — leaving a partially-written, unreadable store
+/// (sidecars present, `meta.json` absent) instead of a clean raise.
+#[test]
+fn run_slice_view_bad_reference_fails_before_any_output() {
+    let tmp = tempdir().unwrap();
+    let src = tmp.path().join("src");
+    let samples = ["S0", "S1"];
+    build_fixture_store(&src, &samples);
+
+    let out = tmp.path().join("out");
+    assert!(!out.exists(), "precondition: out_dir must not exist yet");
+
+    let bad_fasta = tmp.path().join("does-not-exist.fa");
+    let result = Python::attach(|py| {
+        run_slice_view(
+            py,
+            src.to_str().unwrap().to_string(),
+            out.to_str().unwrap().to_string(),
+            vec!["chr1".to_string()],
+            samples.iter().map(|s| s.to_string()).collect(),
+            vec![("chr1".to_string(), 0u32, u32::MAX)],
+            "variant".to_string(),
+            false,
+            Vec::new(),
+            Some(bad_fasta.to_str().unwrap().to_string()),
+            false,
+        )
+    });
+
+    assert!(
+        result.is_err(),
+        "a nonexistent reference FASTA must be rejected"
+    );
+    assert!(
+        !out.exists(),
+        "fail-fast: out_dir must NOT be created when the reference is invalid \
+         (got a partially-written store instead)"
+    );
+}

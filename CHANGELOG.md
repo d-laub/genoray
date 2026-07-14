@@ -161,6 +161,15 @@
   cumulative-sum array, corrupting `allele_idx_offsets` file-wide; the Rust
   `.pvar` reader also no longer treats a bare `.` ALT as a literal one-character
   allele.
+- **svar2**: `write_view(reroute=False, reference=...)` now validates the
+  reference FASTA up front, before any output byte is written. Previously a
+  missing/unreadable `reference` was only discovered mid-loop (the mutcat
+  recompute step, after that contig's sidecars were already on disk),
+  leaving a partially-written, unreadable output store instead of a clean
+  raise. Also hardened `write_view`'s `reroute` dispatch: a value that is
+  neither `"auto"`, `True`, nor `False` (e.g. `reroute=1`) now raises
+  `ValueError` instead of silently falling through to the `reroute=False`
+  slicer.
 
 ## 2.15.0 (2026-06-30)
 

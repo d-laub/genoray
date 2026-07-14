@@ -376,8 +376,10 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
 
         `progress` is accepted for interface parity with other long-running
         entry points but is currently a no-op (no progress bar is shown).
-        `reroute=False` does not accept `threads` (single-pass slice, no
-        parallel cost-model rerouting).
+        `threads` is accepted on both paths for interface parity, but is
+        IGNORED when `reroute=False` (the slicer is a single-pass, O(output)
+        byte-copy — there is no parallel cost-model rerouting to spread
+        across threads).
 
         Raises `FileExistsError` if `output` exists and `overwrite=False`, and
         `ValueError` if `output` resolves to this store's own path (writing a
@@ -393,6 +395,8 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         output = Path(output)
         if reroute == "auto":
             reroute = True
+        if not isinstance(reroute, bool):
+            raise ValueError(f"reroute must be 'auto', True, or False; got {reroute!r}")
         if fields is not None and "mutcat" in fields and reference is None:
             raise ValueError(
                 "'mutcat' cannot be copied through write_view; pass "

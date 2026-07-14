@@ -58,6 +58,37 @@ def test_write_view_self_overwrite_guard(svar2_store):
         )
 
 
+@pytest.mark.parametrize("bad_reroute", [1, 0, "false", "true", "False", None, "yes"])
+def test_write_view_rejects_invalid_reroute(svar2_store, tmp_path, bad_reroute):
+    """Only `"auto"`, `True`, and `False` are valid `reroute` values. Anything
+    else (e.g. `1`, `"false"`) must raise -- NOT silently fall through to the
+    `reroute=False` slicer, which is what a bare `if reroute is True: ... else:
+    ...` dispatch would otherwise do for any non-`True` value."""
+    sv = SparseVar2(svar2_store)
+    out = tmp_path / "v.svar2"
+    with pytest.raises(ValueError, match="reroute"):
+        sv.write_view(
+            (sv.contigs[0], 0, 40),
+            sv.available_samples,
+            out,
+            reroute=bad_reroute,
+        )
+    assert not out.exists()
+
+
+@pytest.mark.parametrize("reroute", ["auto", True, False])
+def test_write_view_accepts_valid_reroute_values(svar2_store, tmp_path, reroute):
+    sv = SparseVar2(svar2_store)
+    out = tmp_path / "v.svar2"
+    sv.write_view(
+        (sv.contigs[0], 0, 40),
+        sv.available_samples,
+        out,
+        reroute=reroute,
+    )
+    assert SparseVar2(out).available_samples == sv.available_samples
+
+
 def test_write_view_byte_parity_with_from_vcf(tmp_path):
     """reroute=True on a full region+all samples == a fresh from_vcf on the same input.
 
