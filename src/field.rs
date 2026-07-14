@@ -125,6 +125,29 @@ impl FieldSpec {
             i32::MIN as f64
         })
     }
+
+    /// Encode one scalar `v` into this (finalized) field's on-disk dtype bytes,
+    /// applying the EXACT same per-element narrowing and sentinel-remapping
+    /// `finalize_fields` uses — this delegates to `field_finalize::encode`
+    /// rather than duplicating the dtype match, so a var_key -> dense
+    /// non-carrier fill is byte-identical to what `rvk.rs`'s dense push (then
+    /// finalize) writes for a genuine dense non-carrier.
+    ///
+    /// `self.dtype` must be concrete (post-finalize); `StorageDtype::Auto`
+    /// panics inside `encode`, matching the rewrite path.
+    ///
+    /// A `v` equal to this field's staged missing sentinel is emitted as the
+    /// resolved dtype's own sentinel (`u*::MAX` / `i*::MIN` / `NaN`) IFF the
+    /// field has no `default` — identical to the finalize per-element rule
+    /// (`treat_missing = default.is_none()`). With a `default` set, `v` (the
+    /// default value) is encoded as an ordinary value.
+    pub fn encode_scalar(&self, v: f64) -> Vec<u8> {
+        let is_missing = self.default.is_none()
+            && crate::field_finalize::is_staged_missing(v, self.stage_is_float());
+        let mut out = Vec::with_capacity(self.dtype.width_bytes().unwrap_or(4));
+        crate::field_finalize::encode(&mut out, self.dtype, v, is_missing);
+        out
+    }
 }
 
 fn bad(ctx: &str) -> ConversionError {
@@ -187,6 +210,62 @@ mod tests {
         assert!(specs[0].stage_is_float());
         assert!(matches!(specs[1].dtype, StorageDtype::Auto));
         assert!(!specs[1].stage_is_float());
+    }
+
+    #[test]
+    fn encode_scalar_missing_matches_resolved_sentinel() {
+        // Integer FORMAT field, no default: encoding its missing sentinel must
+        // reproduce the resolved dtype's reserved sentinel (u16::MAX) — the
+        // EXACT byte pattern `field_finalize::encode` writes for a dense
+        // non-carrier (and hence what `rvk.rs`'s dense push -> finalize emits).
+        let dp = FieldSpec {
+            name: "DP".into(),
+            category: FieldCategory::Format,
+            htype: HtslibType::Int,
+            dtype: StorageDtype::U16,
+            default: None,
+        };
+        assert_eq!(
+            dp.encode_scalar(dp.missing_sentinel()),
+            u16::MAX.to_le_bytes().to_vec()
+        );
+
+        // Signed integer variant: i16::MIN.
+        let sc = FieldSpec {
+            name: "SC".into(),
+            category: FieldCategory::Info,
+            htype: HtslibType::Int,
+            dtype: StorageDtype::I16,
+            default: None,
+        };
+        assert_eq!(
+            sc.encode_scalar(sc.missing_sentinel()),
+            i16::MIN.to_le_bytes().to_vec()
+        );
+
+        // Float field, no default: the sentinel is NaN (bit-identity, so
+        // compare via `is_nan()` not `==`).
+        let af = FieldSpec {
+            name: "AF".into(),
+            category: FieldCategory::Info,
+            htype: HtslibType::Float,
+            dtype: StorageDtype::F32,
+            default: None,
+        };
+        let bytes = af.encode_scalar(af.missing_sentinel());
+        assert_eq!(bytes.len(), 4);
+        let x = f32::from_le_bytes(bytes.try_into().unwrap());
+        assert!(x.is_nan(), "float missing sentinel must be NaN");
+
+        // With a `default`, the value is encoded ordinarily (not as a sentinel).
+        let gq = FieldSpec {
+            name: "GQ".into(),
+            category: FieldCategory::Format,
+            htype: HtslibType::Int,
+            dtype: StorageDtype::U8,
+            default: Some(0.0),
+        };
+        assert_eq!(gq.encode_scalar(gq.missing_sentinel()), vec![0u8]);
     }
 
     #[test]

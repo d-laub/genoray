@@ -180,7 +180,7 @@ fn decode_elem(chunk: [u8; 4], is_float: bool) -> f64 {
 /// Only meaningful (and only ever actually observed) when the field has no
 /// `default` — a `default` means missing was already substituted at staging
 /// time, so no sentinel exists in the data regardless of what this returns.
-fn is_staged_missing(v: f64, is_float: bool) -> bool {
+pub(crate) fn is_staged_missing(v: f64, is_float: bool) -> bool {
     if is_float {
         v.is_nan()
     } else {
@@ -434,7 +434,7 @@ fn rewrite_file(
 /// sentinel encoding instead (`u*::MAX` for unsigned, `i*::MIN` for signed,
 /// `NaN` for float/`f16`) — only ever `true` when the field has no
 /// `default`, per the staging invariant.
-fn encode(out: &mut Vec<u8>, dtype: StorageDtype, v: f64, is_missing: bool) {
+pub(crate) fn encode(out: &mut Vec<u8>, dtype: StorageDtype, v: f64, is_missing: bool) {
     match dtype {
         StorageDtype::Bool => {
             out.push(if v != 0.0 { 1 } else { 0 });

@@ -1158,3 +1158,341 @@ fn recompute_full_coverage_is_byte_parity() {
         );
     }
 }
+
+// ---- Task 4: INFO/FORMAT fields across a representation flip ----
+//
+// Field values are synthesized POST-HOC onto an already-(genotype-)routed
+// store, at their FINAL on-disk dtype (the slice path never re-finalizes, it
+// copies source `values.bin` bytes verbatim for carriers and writes the field's
+// encoded missing sentinel for var_key -> dense non-carriers). So the source
+// genotype routing is field-free (`build_geno_fixture`), and the flip is forced
+// purely by the SUBSET's cost — the field bits are then fed to `Routing::Recompute`
+// (they only make the by-hand flip arithmetic below tighter, never reverse it).
+//
+// Two fields, exercising both categories and an integer + a float dtype:
+//   AF  = INFO,   f32  (per-variant: one value per call/row, flip-invariant)
+//   DP  = FORMAT, u16  (per-sample: dp_of_sample(s) = 100 + s)
+
+/// AF (INFO/f32) + DP (FORMAT/u16) specs, in a fixed order (AF first).
+fn flip_field_specs() -> Vec<FieldSpec> {
+    vec![
+        FieldSpec {
+            name: "AF".into(),
+            category: FieldCategory::Info,
+            htype: HtslibType::Float,
+            dtype: StorageDtype::F32,
+            default: None,
+        },
+        FieldSpec {
+            name: "DP".into(),
+            category: FieldCategory::Format,
+            htype: HtslibType::Int,
+            dtype: StorageDtype::U16,
+            default: None,
+        },
+    ]
+}
+
+/// The (info_bits, format_bits) the production converter would feed the cost
+/// model for these specs — summed per-record storage widths in bits, exactly
+/// as `src/rvk.rs:230-238` (`width_bytes * 8`, split by category).
+fn flip_field_cost_bits(specs: &[FieldSpec]) -> (u64, u64) {
+    let bits = |cat: FieldCategory| -> u64 {
+        specs
+            .iter()
+            .filter(|s| s.category == cat)
+            .map(|s| s.dtype.width_bytes().unwrap() as u64 * 8)
+            .sum()
+    };
+    (bits(FieldCategory::Info), bits(FieldCategory::Format))
+}
+
+const DP_BASE: u16 = 100;
+fn dp_of_sample(s: usize) -> u16 {
+    DP_BASE + s as u16
+}
+const AF_VALUE: f32 = 0.5;
+
+fn field_path(store: &str, cat: &str, name: &str, sub: FieldSub) -> std::path::PathBuf {
+    ContigPaths::new(store, "chr1").field_values(cat, name, sub)
+}
+
+fn write_field(store: &str, cat: &str, name: &str, sub: FieldSub, bytes: &[u8]) {
+    let p = field_path(store, cat, name, sub);
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(&p, bytes).unwrap();
+}
+
+/// Read the var_key/snp offsets and return, per var_key CALL index (in stored
+/// order), the SAMPLE that owns it (`column / ploidy`). Lets us synthesize
+/// per-sample FORMAT values that honor the key invariant (all of a sample's
+/// carrier calls hold identical bytes) regardless of the store's internal call
+/// order.
+fn vk_snp_call_owners(store: &str, ploidy: usize) -> Vec<usize> {
+    let off_path = Path::new(store)
+        .join("chr1")
+        .join("var_key")
+        .join("snp")
+        .join("offsets.npy");
+    let off: ndarray::Array1<u64> = ndarray_npy::read_npy(off_path).unwrap();
+    let mut owners = Vec::new();
+    for col in 0..off.len() - 1 {
+        let n = (off[col + 1] - off[col]) as usize;
+        for _ in 0..n {
+            owners.push(col / ploidy);
+        }
+    }
+    owners
+}
+
+/// Attach AF (INFO/f32) + DP (FORMAT/u16) sidecars to a var_key-routed SNP
+/// store. var_key/snp fields are one element per CALL: AF is the constant
+/// per-variant value; DP is the owning sample's value (identical across that
+/// sample's carrier calls, per the invariant).
+fn attach_var_key_fields(store: &str) -> Vec<FieldSpec> {
+    let owners = vk_snp_call_owners(store, 2);
+    assert!(
+        !owners.is_empty(),
+        "precondition: the SNP must be var_key-routed with >=1 call"
+    );
+    let af: Vec<u8> = owners.iter().flat_map(|_| AF_VALUE.to_le_bytes()).collect();
+    let dp: Vec<u8> = owners
+        .iter()
+        .flat_map(|&s| dp_of_sample(s).to_le_bytes())
+        .collect();
+    write_field(store, "info", "AF", FieldSub::VkSnp, &af);
+    write_field(store, "format", "DP", FieldSub::VkSnp, &dp);
+    flip_field_specs()
+}
+
+/// Attach AF (INFO/f32) + DP (FORMAT/u16) sidecars to a dense-routed SNP store.
+/// dense/snp INFO is one element per ROW (1 here); dense/snp FORMAT is
+/// variant-major `(row, sample)` -> `row * n_samples + sample`, so one row means
+/// exactly `dp_of_sample(s)` for every source sample `s`.
+fn attach_dense_fields(store: &str, n_samples: usize) -> Vec<FieldSpec> {
+    assert!(
+        dense_snp_positions(store, "chr1").contains(&SNP_POS),
+        "precondition: the SNP must be dense-routed (one dense row)"
+    );
+    write_field(
+        store,
+        "info",
+        "AF",
+        FieldSub::DenseSnp,
+        &AF_VALUE.to_le_bytes(),
+    );
+    let dp: Vec<u8> = (0..n_samples)
+        .flat_map(|s| dp_of_sample(s).to_le_bytes())
+        .collect();
+    write_field(store, "format", "DP", FieldSub::DenseSnp, &dp);
+    flip_field_specs()
+}
+
+/// Read a FORMAT (u16) sub-stream's elements in stored order.
+fn read_format_u16(store: &str, sub: FieldSub, n_sub: usize) -> Vec<u16> {
+    let paths = ContigPaths::new(store, "chr1");
+    let v = FieldView::open(&paths, "format", "DP", sub, StorageDtype::U16, n_sub).unwrap();
+    (0..v.len())
+        .map(|i| match v.value_at(i) {
+            FieldValue::U16(x) => x,
+            other => panic!("expected U16, got {other:?}"),
+        })
+        .collect()
+}
+
+/// Read an INFO (f32) sub-stream's elements in stored order.
+fn read_info_f32(store: &str, sub: FieldSub, n_sub: usize) -> Vec<f32> {
+    let paths = ContigPaths::new(store, "chr1");
+    let v = FieldView::open(&paths, "info", "AF", sub, StorageDtype::F32, n_sub).unwrap();
+    (0..v.len())
+        .map(|i| match v.value_at(i) {
+            FieldValue::F32(x) => x,
+            other => panic!("expected F32, got {other:?}"),
+        })
+        .collect()
+}
+
+/// The u16 missing sentinel `encode_scalar(missing_sentinel())` produces for DP
+/// — must equal what a real dense non-carrier fill resolves to (`u16::MAX`).
+fn dp_sentinel_u16() -> u16 {
+    let dp = &flip_field_specs()[1];
+    let bytes = dp.encode_scalar(dp.missing_sentinel());
+    u16::from_le_bytes(bytes.try_into().unwrap())
+}
+
+/// var_key -> dense: non-carrier output samples must read back the field's
+/// missing sentinel, exactly as `rvk.rs`'s dense push fills them; carrier output
+/// samples read their own stored value.
+///
+/// Fixture: 100-sample var_key SNP, carriers = sample 0 (both haps) + sample 1
+/// (hap 0). Subset {0, 1, 2}: n_sub = 3, x_sub = 3 (samples 0,1 carry; sample 2
+/// does NOT). By-hand cost (SNP key_bits=2; sidecar 0; info f32 = 32, format u16
+/// = 16; np = 6):
+///   dense    = 32 + 2 + 6 + 32 + 16*3 = 120
+///   var_key  = 3 * (34 + 32 + 16)      = 246
+///   120 < 246 -> DENSE => flips var_key -> dense.
+#[test]
+fn flip_var_key_to_dense_fills_non_carrier_format_with_sentinel() {
+    let src = fixture_var_key_snp_store(100);
+    let specs = attach_var_key_fields(&src.path);
+    let (info_bits, format_bits) = flip_field_cost_bits(&specs);
+
+    // Precondition: source really var_key-routed the SNP.
+    assert!(var_key_snp_positions(&src.path, "chr1").contains(&SNP_POS));
+    assert!(dense_snp_positions(&src.path, "chr1").is_empty());
+
+    let out = tempdir().unwrap();
+    let outp = out.path().to_str().unwrap();
+    slice_contig(
+        &src.path,
+        outp,
+        "chr1",
+        &[0, 1, 2],
+        2,
+        &[(0, u32::MAX)],
+        OverlapMode::Variant,
+        &specs,
+        Routing::Recompute,
+        false, // sidecar_bits_enabled
+        info_bits,
+        format_bits,
+    )
+    .unwrap();
+
+    // The flip happened.
+    assert!(
+        dense_snp_positions(outp, "chr1").contains(&SNP_POS),
+        "flipped SNP must now live in dense/snp"
+    );
+    assert!(
+        var_key_snp_positions(outp, "chr1").is_empty(),
+        "var_key/snp must be empty after the flip"
+    );
+
+    // dense FORMAT is variant-major over n_sub=3: [s0, s1, s2] for the one row.
+    let dp = read_format_u16(outp, FieldSub::DenseSnp, 3);
+    assert_eq!(dp.len(), 3, "one dense row * 3 subset samples");
+    assert_eq!(dp[0], dp_of_sample(0), "carrier sample 0 keeps its value");
+    assert_eq!(dp[1], dp_of_sample(1), "carrier sample 1 keeps its value");
+    assert_eq!(
+        dp[2],
+        dp_sentinel_u16(),
+        "sample 2 is a NON-carrier -> missing sentinel"
+    );
+    assert_eq!(dp_sentinel_u16(), u16::MAX, "u16 sentinel is u16::MAX");
+}
+
+/// dense -> var_key: carrier calls keep the sample's value; non-carrier values
+/// are DROPPED (var_key has no slot). Asserts the documented loss.
+///
+/// Fixture: 200-sample dense SNP (180 carrier haps at full size). Subset {0}:
+/// sample 0 carries hap 0 only -> n_sub = 1, x_sub = 1. By-hand cost (np = 2):
+///   dense    = 32 + 2 + 2 + 32 + 16*1 = 84
+///   var_key  = 1 * (34 + 32 + 16)     = 82
+///   84 < 82 is false -> VAR_KEY => flips dense -> var_key.
+#[test]
+fn flip_dense_to_var_key_keeps_carrier_format_and_drops_the_rest() {
+    let src = fixture_dense_snp_store(200, 180);
+    let specs = attach_dense_fields(&src.path, src.n_samples);
+    let (info_bits, format_bits) = flip_field_cost_bits(&specs);
+
+    // Precondition: source really dense-routed the SNP.
+    assert!(dense_snp_positions(&src.path, "chr1").contains(&SNP_POS));
+    assert!(var_key_snp_positions(&src.path, "chr1").is_empty());
+
+    let out = tempdir().unwrap();
+    let outp = out.path().to_str().unwrap();
+    slice_contig(
+        &src.path,
+        outp,
+        "chr1",
+        &[0],
+        2,
+        &[(0, u32::MAX)],
+        OverlapMode::Variant,
+        &specs,
+        Routing::Recompute,
+        false, // sidecar_bits_enabled
+        info_bits,
+        format_bits,
+    )
+    .unwrap();
+
+    // The flip happened.
+    assert!(
+        var_key_snp_positions(outp, "chr1").contains(&SNP_POS),
+        "flipped SNP must now live in var_key/snp"
+    );
+    assert!(
+        dense_snp_positions(outp, "chr1").is_empty(),
+        "dense/snp must be empty after the flip"
+    );
+
+    // Sample 0 carries on hap 0 only -> exactly ONE var_key call, holding sample
+    // 0's DP; the other 199 samples' dense FORMAT values have no var_key slot and
+    // are DROPPED (the documented loss).
+    let dp = read_format_u16(outp, FieldSub::VkSnp, 1);
+    assert_eq!(
+        dp,
+        vec![dp_of_sample(0)],
+        "only the carrier sample 0's value survives; the rest are dropped"
+    );
+}
+
+/// INFO is per-variant: a flip must not change its value in either direction.
+#[test]
+fn flip_preserves_info_value_both_directions() {
+    let (info_bits, format_bits) = flip_field_cost_bits(&flip_field_specs());
+
+    // var_key -> dense: INFO lands as one dense-row value, unchanged.
+    {
+        let src = fixture_var_key_snp_store(100);
+        let specs = attach_var_key_fields(&src.path);
+        let out = tempdir().unwrap();
+        let outp = out.path().to_str().unwrap();
+        slice_contig(
+            &src.path,
+            outp,
+            "chr1",
+            &[0, 1, 2],
+            2,
+            &[(0, u32::MAX)],
+            OverlapMode::Variant,
+            &specs,
+            Routing::Recompute,
+            false,
+            info_bits,
+            format_bits,
+        )
+        .unwrap();
+        assert!(dense_snp_positions(outp, "chr1").contains(&SNP_POS));
+        let af = read_info_f32(outp, FieldSub::DenseSnp, 3);
+        assert_eq!(af, vec![AF_VALUE], "INFO unchanged across var_key -> dense");
+    }
+
+    // dense -> var_key: INFO lands as one var_key-call value, unchanged.
+    {
+        let src = fixture_dense_snp_store(200, 180);
+        let specs = attach_dense_fields(&src.path, src.n_samples);
+        let out = tempdir().unwrap();
+        let outp = out.path().to_str().unwrap();
+        slice_contig(
+            &src.path,
+            outp,
+            "chr1",
+            &[0],
+            2,
+            &[(0, u32::MAX)],
+            OverlapMode::Variant,
+            &specs,
+            Routing::Recompute,
+            false,
+            info_bits,
+            format_bits,
+        )
+        .unwrap();
+        assert!(var_key_snp_positions(outp, "chr1").contains(&SNP_POS));
+        let af = read_info_f32(outp, FieldSub::VkSnp, 1);
+        assert_eq!(af, vec![AF_VALUE], "INFO unchanged across dense -> var_key");
+    }
+}

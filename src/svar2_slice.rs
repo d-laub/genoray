@@ -67,9 +67,9 @@ enum CallSrc {
     /// Unflipped: a source var_key call index.
     VarKey { call: usize },
     /// Flipped dense -> var_key: source dense row + ORIGINAL sample column.
-    /// Constructed by `route_class` under `Routing::Recompute` (Task 3); the
-    /// field pass reading these fields (`slice_field_var_key`) lands in Task 4.
-    #[allow(dead_code)] // fields read starting Task 4 (field pass over flips)
+    /// Constructed by `route_class` under `Routing::Recompute` (Task 3); read by
+    /// the field pass (`slice_field_var_key`) to re-gather the field value off
+    /// the source dense sub-stream.
     Dense { row: usize, s_orig: usize },
 }
 
@@ -80,9 +80,10 @@ enum RowSrc {
     /// Flipped var_key -> dense. `per_sample_call[s_out]` is a representative
     /// source var_key call for that output sample (any carrier call — see the
     /// key invariant), or `None` for a non-carrier (=> field sentinel).
-    /// Constructed by `route_class` under `Routing::Recompute` (Task 3); the
-    /// field pass reading these fields (`slice_field_dense`) lands in Task 4.
-    #[allow(dead_code)] // fields read starting Task 4 (field pass over flips)
+    /// Constructed by `route_class` under `Routing::Recompute` (Task 3); read by
+    /// the field pass (`slice_field_dense`) to re-gather each output sample's
+    /// value (or the field sentinel for a non-carrier) off the source var_key
+    /// sub-stream.
     VarKey {
         per_sample_call: Vec<Option<usize>>,
         /// Any source call of this variant — INFO is per-variant, so any will do.
@@ -1047,10 +1048,18 @@ fn open_source_field(
     }
 }
 
-/// One var_key field sub-stream: gather `view.bytes_at(src_call)` for each kept
-/// output call's provenance (output order), write the concatenation as the
-/// output `values.bin`. Every call is unflipped in this task (`Routing::Preserve`
-/// only) — the flipped `CallSrc::Dense` arm arrives in Task 4.
+/// One var_key field sub-stream: gather each kept output call's value (output
+/// order) and write the concatenation as the output `values.bin`.
+///
+/// An unflipped call (`CallSrc::VarKey`) reads the source's var_key sub of the
+/// same class. A call flipped from dense (`CallSrc::Dense`, `Routing::Recompute`)
+/// reads the source's DENSE sub of the same class instead — so both sub-streams
+/// may need to be open for one output stream. INFO is one element per source
+/// dense row; FORMAT reads the flipped sample's own value at
+/// `row * n_samples_orig + s_orig` (the source dense FORMAT `(row, sample)`
+/// layout). Per the key invariant, any carrier call of a sample holds that
+/// sample's value, so a dense -> var_key flip is lossless for the carrier it
+/// keeps.
 fn slice_field_var_key(
     src_paths: &ContigPaths,
     out_paths: &ContigPaths,
@@ -1060,26 +1069,59 @@ fn slice_field_var_key(
     src_calls: &[CallSrc],
     n_samples_orig: usize,
 ) -> Result<(), ConversionError> {
-    let Some(view) = open_source_field(src_paths, spec, sub, n_samples_orig)? else {
-        return Ok(());
+    let vk_view = open_source_field(src_paths, spec, sub, n_samples_orig)?;
+    // A flipped call reads from the DENSE sub of the same class.
+    let dense_sub = match sub {
+        FieldSub::VkSnp => FieldSub::DenseSnp,
+        FieldSub::VkIndel => FieldSub::DenseIndel,
+        _ => unreachable!("slice_field_var_key takes only var_key subs"),
     };
+    let d_view = open_source_field(src_paths, spec, dense_sub, n_samples_orig)?;
+    if vk_view.is_none() && d_view.is_none() {
+        return Ok(());
+    }
+
     let mut out = Vec::with_capacity(src_calls.len() * width);
     for src in src_calls {
-        match src {
-            CallSrc::VarKey { call } => out.extend_from_slice(view.bytes_at(*call)),
-            CallSrc::Dense { .. } => unreachable!("flipped calls arrive in Task 4"),
+        match *src {
+            CallSrc::VarKey { call } => {
+                let v = vk_view
+                    .as_ref()
+                    .expect("unflipped call needs the source var_key sub");
+                out.extend_from_slice(v.bytes_at(call));
+            }
+            CallSrc::Dense { row, s_orig } => {
+                let v = d_view
+                    .as_ref()
+                    .expect("flipped call needs the source dense sub");
+                match spec.category {
+                    // INFO is one element per dense ROW.
+                    FieldCategory::Info => out.extend_from_slice(v.bytes_at(row)),
+                    // FORMAT is (row, sample) -> the flipped sample's own value.
+                    FieldCategory::Format => {
+                        out.extend_from_slice(v.bytes_at(row * n_samples_orig + s_orig))
+                    }
+                }
+            }
         }
     }
     write_field_values(out_paths, spec, sub, &out)
 }
 
 /// One dense field sub-stream. INFO: one element per kept row. FORMAT: for each
-/// kept row, for each subset sample `s_out` (original column
-/// `sample_orig_idx[s_out]`), copy source element `row*n_samples_orig + orig`
-/// into new position `row_out*n_subset + s_out` — the re-stride `FieldView`'s
-/// `format_at` reads back on the query side. Every row is unflipped in this
-/// task (`Routing::Preserve` only) — the flipped `RowSrc::VarKey` arm arrives
-/// in Task 4.
+/// kept row, a full n_subset-wide column laid out `(row_out, s_out)` (the
+/// re-stride `FieldView::format_at` reads back on the query side).
+///
+/// An unflipped row (`RowSrc::Dense`) reads the source's dense sub of the same
+/// class: INFO at `row`, FORMAT at `row*n_samples_orig + orig` for each subset
+/// sample's ORIGINAL column. A row flipped from var_key (`RowSrc::VarKey`,
+/// `Routing::Recompute`) reads the source's VAR_KEY sub instead — so both
+/// sub-streams may need to be open for one output stream. INFO reads any call
+/// of the variant (`info_call` — INFO is per-variant). FORMAT emits the full
+/// subset column: a carrier sample reads its representative source call's value,
+/// a NON-carrier gets the field's missing sentinel — byte-identical to what
+/// `rvk.rs`'s dense push writes for a genuine dense non-carrier (via the shared
+/// `field_finalize` encoder in `FieldSpec::encode_scalar`).
 #[allow(clippy::too_many_arguments)]
 fn slice_field_dense(
     src_paths: &ContigPaths,
@@ -1091,30 +1133,61 @@ fn slice_field_dense(
     sample_orig_idx: &[usize],
     n_samples_orig: usize,
 ) -> Result<(), ConversionError> {
-    let Some(view) = open_source_field(src_paths, spec, sub, n_samples_orig)? else {
-        return Ok(());
+    let d_view = open_source_field(src_paths, spec, sub, n_samples_orig)?;
+    // A flipped row reads from the VAR_KEY sub of the same class.
+    let vk_sub = match sub {
+        FieldSub::DenseSnp => FieldSub::VkSnp,
+        FieldSub::DenseIndel => FieldSub::VkIndel,
+        _ => unreachable!("slice_field_dense takes only dense subs"),
     };
-    let mut out: Vec<u8> = Vec::new();
-    match spec.category {
-        FieldCategory::Info => {
-            out.reserve(src_rows.len() * width);
-            for src in src_rows {
-                match src {
-                    RowSrc::Dense { row } => out.extend_from_slice(view.bytes_at(*row)),
-                    RowSrc::VarKey { .. } => unreachable!("flipped rows arrive in Task 4"),
-                }
-            }
-        }
-        FieldCategory::Format => {
-            out.reserve(src_rows.len() * sample_orig_idx.len() * width);
-            for src in src_rows {
-                match src {
-                    RowSrc::Dense { row } => {
+    let vk_view = open_source_field(src_paths, spec, vk_sub, n_samples_orig)?;
+    if d_view.is_none() && vk_view.is_none() {
+        return Ok(());
+    }
+
+    // The field's missing value, encoded at its on-disk dtype — the same
+    // sentinel `rvk.rs`'s dense push writes for a dense non-carrier.
+    let sentinel = spec.encode_scalar(spec.missing_sentinel());
+
+    let n_out = match spec.category {
+        FieldCategory::Info => src_rows.len(),
+        FieldCategory::Format => src_rows.len() * sample_orig_idx.len(),
+    };
+    let mut out: Vec<u8> = Vec::with_capacity(n_out * width);
+    for src in src_rows {
+        match src {
+            RowSrc::Dense { row } => {
+                let v = d_view
+                    .as_ref()
+                    .expect("unflipped row needs the source dense sub");
+                match spec.category {
+                    FieldCategory::Info => out.extend_from_slice(v.bytes_at(*row)),
+                    FieldCategory::Format => {
                         for &orig in sample_orig_idx {
-                            out.extend_from_slice(view.bytes_at(row * n_samples_orig + orig));
+                            out.extend_from_slice(v.bytes_at(row * n_samples_orig + orig));
                         }
                     }
-                    RowSrc::VarKey { .. } => unreachable!("flipped rows arrive in Task 4"),
+                }
+            }
+            RowSrc::VarKey {
+                per_sample_call,
+                info_call,
+            } => {
+                let v = vk_view
+                    .as_ref()
+                    .expect("flipped row needs the source var_key sub");
+                match spec.category {
+                    // INFO: one element per row; any call of the variant carries it.
+                    FieldCategory::Info => out.extend_from_slice(v.bytes_at(*info_call)),
+                    // FORMAT: a full n_subset-wide column; NON-CARRIERS get the sentinel.
+                    FieldCategory::Format => {
+                        for call in per_sample_call {
+                            match call {
+                                Some(c) => out.extend_from_slice(v.bytes_at(*c)),
+                                None => out.extend_from_slice(&sentinel),
+                            }
+                        }
+                    }
                 }
             }
         }
