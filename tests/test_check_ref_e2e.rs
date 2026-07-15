@@ -106,3 +106,72 @@ fn ref_mismatch_excluded_under_x() {
         "clean SNPs still converted"
     );
 }
+
+use common::build_bcf_with_index as build_single;
+
+// Two single-sample files; file B carries a REF at pos 200 that disagrees with
+// the FASTA (which says "T"). Under x, B's bad record is dropped; the merge
+// still produces a store.
+#[test]
+fn vcf_list_ref_mismatch_excluded_under_x() {
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("store");
+    let fasta = tmp.path().join("in.fa");
+    build_fasta_with_index(&fasta, "chr1", 1000, &fasta_records());
+
+    let a = tmp.path().join("a.bcf");
+    let b = tmp.path().join("b.bcf");
+    build_single(
+        &a,
+        "chr1",
+        1000,
+        &["A"],
+        &[SynthRecord {
+            pos: 100,
+            ref_allele: b"A",
+            alts: vec![&b"C"[..]],
+            gt: vec![1, 0],
+        }],
+    );
+    build_single(
+        &b,
+        "chr1",
+        1000,
+        &["B"],
+        &[SynthRecord {
+            pos: 200,
+            ref_allele: b"G",
+            alts: vec![&b"GTTT"[..]],
+            gt: vec![1, 0],
+        }],
+    );
+
+    let dropped = genoray_core::orchestrator::run_vcf_list(
+        &[
+            a.to_str().unwrap().to_string(),
+            b.to_str().unwrap().to_string(),
+        ],
+        Some(fasta.to_str().unwrap()),
+        &["chr1".to_string()],
+        out.to_str().unwrap(),
+        &["A".to_string(), "B".to_string()],
+        25_000,
+        2,
+        Some(1),
+        8 * 1024 * 1024,
+        false,             // skip_out_of_scope
+        CheckRef::Exclude, // NEW
+        false,             // signatures
+        Vec::new(),        // info_fields
+        Vec::new(),        // format_fields
+    )
+    .unwrap();
+    assert_eq!(
+        dropped, 0,
+        "no out-of-scope ALTs; the REF-mismatch is excluded, not counted here"
+    );
+    assert!(
+        out.join("meta.json").exists(),
+        "merge completed despite the bad record"
+    );
+}

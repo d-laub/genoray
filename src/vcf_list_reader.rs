@@ -16,7 +16,7 @@
 use crate::chunk_assembler::resolve_scalar;
 use crate::error::ConversionError;
 use crate::field::{FieldCategory, FieldSpec};
-use crate::normalize::{L_MAX, atomize_to_vcf_biallelic, validate_ref};
+use crate::normalize::{L_MAX, atomize_to_vcf_biallelic};
 use crate::record_source::{RawRecord, RecordSource};
 use crate::vcf_reader::VcfRecordSource;
 use std::cmp::Reverse;
@@ -72,6 +72,9 @@ struct FileCursor {
     eof: bool,
     col: usize,
     dropped: u64,
+    /// Records excluded because their REF disagreed with the reference under
+    /// `CheckRef::Exclude`.
+    ref_excluded: u64,
     /// This file's own path, kept only for error messages (unsorted-input
     /// detection, cross-file REF disagreement) that need to name the
     /// offending file.
@@ -90,6 +93,7 @@ impl FileCursor {
         ref_seq: Option<&[u8]>,
         ploidy: usize,
         skip_out_of_scope: bool,
+        check_ref: crate::normalize::CheckRef,
         info_specs: &[FieldSpec],
         format_specs: &[FieldSpec],
     ) -> Result<Option<NormAtom>, ConversionError> {
@@ -112,7 +116,28 @@ impl FileCursor {
                     check_position_sorted(&self.path, self.frontier, rec.pos)?;
                     self.frontier = Some(rec.pos);
                     if let Some(rs) = ref_seq {
-                        validate_ref(rec.pos, &rec.reference, rs)?;
+                        match crate::normalize::apply_check_ref(
+                            check_ref,
+                            rec.pos,
+                            &rec.reference,
+                            rs,
+                        )? {
+                            crate::normalize::RefDecision::Keep => {}
+                            crate::normalize::RefDecision::Exclude(e) => {
+                                self.ref_excluded += 1;
+                                if self.ref_excluded == 1 {
+                                    println!(
+                                        "Notice: check_ref=x excluding record(s) in {} \
+                                         whose REF disagrees with the reference (first: {e}).",
+                                        self.path
+                                    );
+                                }
+                                // This record contributes no atoms; fall through to
+                                // the buffer pop, exactly like an all-`*`/dropped ALT
+                                // record — the caller re-advances.
+                                return Ok(self.buf.pop_front());
+                            }
+                        }
                     }
                     let alt_refs: Vec<&[u8]> = rec.alts.iter().map(|a| a.as_slice()).collect();
                     let (records, dropped) = atomize_to_vcf_biallelic(
@@ -231,6 +256,7 @@ pub struct VcfListRecordSource {
     ref_seq: Option<Vec<u8>>,
     ploidy: usize,
     skip_out_of_scope: bool,
+    check_ref: crate::normalize::CheckRef,
     num_samples: usize,
     info_specs: Vec<FieldSpec>,
     format_specs: Vec<FieldSpec>,
@@ -250,6 +276,7 @@ impl VcfListRecordSource {
         ploidy: usize,
         htslib_threads: usize,
         skip_out_of_scope: bool,
+        check_ref: crate::normalize::CheckRef,
         fields: &[FieldSpec],
     ) -> Result<Self, ConversionError> {
         if vcf_paths.len() != samples.len() {
@@ -272,6 +299,7 @@ impl VcfListRecordSource {
                     eof: false,
                     col,
                     dropped: 0,
+                    ref_excluded: 0,
                     path: path.clone(),
                 }),
                 // This file's header simply doesn't declare `chrom` at all --
@@ -287,6 +315,7 @@ impl VcfListRecordSource {
                         eof: true,
                         col,
                         dropped: 0,
+                        ref_excluded: 0,
                         path: path.clone(),
                     });
                 }
@@ -309,6 +338,7 @@ impl VcfListRecordSource {
             ref_seq: ref_seq.map(|s| s.to_vec()),
             ploidy,
             skip_out_of_scope,
+            check_ref,
             num_samples: vcf_paths.len(),
             info_specs,
             format_specs,
@@ -319,6 +349,12 @@ impl VcfListRecordSource {
     /// far. Valid after the read loop drains.
     pub fn dropped_out_of_scope(&self) -> u64 {
         self.cursors.iter().map(|c| c.dropped).sum()
+    }
+
+    /// Total REF-mismatch records excluded across every file so far
+    /// (`CheckRef::Exclude`). Valid after the read loop drains.
+    pub fn ref_excluded(&self) -> u64 {
+        self.cursors.iter().map(|c| c.ref_excluded).sum()
     }
 
     /// Number of atoms currently buffered in the merge heap. Test-only: used to
@@ -509,6 +545,7 @@ impl RecordSource for VcfListRecordSource {
                         ref_seq,
                         self.ploidy,
                         self.skip_out_of_scope,
+                        self.check_ref,
                         &self.info_specs,
                         &self.format_specs,
                     )? {
@@ -529,6 +566,7 @@ impl RecordSource for VcfListRecordSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::normalize::CheckRef;
     use rust_htslib::bcf::record::GenotypeAllele;
     use rust_htslib::bcf::{Format, Header, Writer};
     use std::path::{Path, PathBuf};
@@ -648,9 +686,18 @@ mod tests {
             b.to_str().unwrap().to_string(),
         ];
         let samples = vec!["SA", "SB"];
-        let mut src =
-            VcfListRecordSource::new(&paths, &samples, "chr1", Some(&ref_seq), 2, 1, false, &[])
-                .unwrap();
+        let mut src = VcfListRecordSource::new(
+            &paths,
+            &samples,
+            "chr1",
+            Some(&ref_seq),
+            2,
+            1,
+            false,
+            CheckRef::Error,
+            &[],
+        )
+        .unwrap();
 
         let r1 = src.next_record().unwrap().unwrap();
         assert_eq!(r1.pos, 2);
@@ -701,9 +748,18 @@ mod tests {
             b.to_str().unwrap().to_string(),
         ];
         let samples = vec!["SA", "SB"];
-        let mut src =
-            VcfListRecordSource::new(&paths, &samples, "chr1", Some(&ref_seq), 2, 1, false, &[])
-                .unwrap();
+        let mut src = VcfListRecordSource::new(
+            &paths,
+            &samples,
+            "chr1",
+            Some(&ref_seq),
+            2,
+            1,
+            false,
+            CheckRef::Error,
+            &[],
+        )
+        .unwrap();
 
         let r1 = src.next_record().unwrap().unwrap();
         assert_eq!(r1.pos, 2);
@@ -733,9 +789,18 @@ mod tests {
 
         let paths = vec![a.to_str().unwrap().to_string()];
         let samples = vec!["SA"];
-        let mut src =
-            VcfListRecordSource::new(&paths, &samples, "chr1", Some(&ref_seq), 2, 1, false, &[])
-                .unwrap();
+        let mut src = VcfListRecordSource::new(
+            &paths,
+            &samples,
+            "chr1",
+            Some(&ref_seq),
+            2,
+            1,
+            false,
+            CheckRef::Error,
+            &[],
+        )
+        .unwrap();
 
         let r1 = src.next_record().unwrap().unwrap();
         assert_eq!(r1.pos, 2);
@@ -771,9 +836,18 @@ mod tests {
 
         let paths = vec![a.to_str().unwrap().to_string()];
         let samples = vec!["SA"];
-        let mut src =
-            VcfListRecordSource::new(&paths, &samples, "chr1", Some(&ref_seq), 2, 1, false, &[])
-                .unwrap();
+        let mut src = VcfListRecordSource::new(
+            &paths,
+            &samples,
+            "chr1",
+            Some(&ref_seq),
+            2,
+            1,
+            false,
+            CheckRef::Error,
+            &[],
+        )
+        .unwrap();
 
         let r1 = src.next_record().unwrap().unwrap();
         assert_eq!(r1.pos, 2);
@@ -826,9 +900,18 @@ mod tests {
             b_path.to_str().unwrap().to_string(),
         ];
         let samples = vec!["SA", "SB"];
-        let mut src =
-            VcfListRecordSource::new(&paths, &samples, "chr1", Some(&ref_seq), 2, 1, false, &[])
-                .unwrap();
+        let mut src = VcfListRecordSource::new(
+            &paths,
+            &samples,
+            "chr1",
+            Some(&ref_seq),
+            2,
+            1,
+            false,
+            CheckRef::Error,
+            &[],
+        )
+        .unwrap();
 
         let r1 = src.next_record().unwrap().unwrap();
         assert_eq!(r1.pos, 2);
@@ -928,9 +1011,18 @@ mod tests {
             c.to_str().unwrap().to_string(),
         ];
         let samples = vec!["SA", "SB", "SC"];
-        let mut src =
-            VcfListRecordSource::new(&paths, &samples, "chr1", Some(&ref_seq), 2, 1, false, &[])
-                .unwrap();
+        let mut src = VcfListRecordSource::new(
+            &paths,
+            &samples,
+            "chr1",
+            Some(&ref_seq),
+            2,
+            1,
+            false,
+            CheckRef::Error,
+            &[],
+        )
+        .unwrap();
 
         // Record 1: pos 10 — SA + SC carry, SB filled hom-ref.
         let r1 = src.next_record().unwrap().unwrap();
@@ -1110,6 +1202,7 @@ mod tests {
             2,
             1,
             false,
+            CheckRef::Error,
             &fields,
         )
         .unwrap();
@@ -1230,8 +1323,18 @@ mod tests {
         let samples = vec!["SA", "SB"];
         // ref_seq: None -- no_reference mode, exercising the branch validate_ref
         // never guards.
-        let mut src =
-            VcfListRecordSource::new(&paths, &samples, "chr1", None, 2, 1, false, &[]).unwrap();
+        let mut src = VcfListRecordSource::new(
+            &paths,
+            &samples,
+            "chr1",
+            None,
+            2,
+            1,
+            false,
+            CheckRef::Error,
+            &[],
+        )
+        .unwrap();
 
         // `RawRecord` isn't `Debug` (see `record_source.rs`), so `unwrap_err`
         // isn't available on `Result<Option<RawRecord>, ConversionError>` --
@@ -1298,9 +1401,18 @@ mod tests {
             b_path.to_str().unwrap().to_string(),
         ];
         let samples = vec!["SA", "SB"];
-        let mut src =
-            VcfListRecordSource::new(&paths, &samples, "chr1", Some(&ref_seq), 2, 1, false, &[])
-                .unwrap();
+        let mut src = VcfListRecordSource::new(
+            &paths,
+            &samples,
+            "chr1",
+            Some(&ref_seq),
+            2,
+            1,
+            false,
+            CheckRef::Error,
+            &[],
+        )
+        .unwrap();
 
         let r1 = src.next_record().unwrap().unwrap();
         assert_eq!(r1.pos, 2);

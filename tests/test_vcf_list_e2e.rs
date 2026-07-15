@@ -6,6 +6,7 @@
 mod common;
 
 use common::{SynthRecord, build_bcf_with_index, build_fasta_with_index, read_u32_bin};
+use genoray_core::normalize::CheckRef;
 use genoray_core::orchestrator::run_vcf_list;
 use genoray_core::rvk::{DecodedKey, decode_key, decode_snp_2bit, unpack_snp_keys};
 
@@ -65,6 +66,7 @@ fn vcf_list_e2e_two_samples_one_store() {
         Some(1),
         8_388_608,
         false,
+        CheckRef::Error,
         false,
         Vec::new(),
         Vec::new(),

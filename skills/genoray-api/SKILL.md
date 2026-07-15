@@ -371,7 +371,7 @@ dropped = SparseVar2.from_vcf_list("out.svar2", "vcfs/", "ref.fa")
 dropped = SparseVar2.from_vcf_list("out.svar2", "manifest.txt", "ref.fa")
 ```
 
-Signature: `from_vcf_list(out, sources, reference=None, *, no_reference=False, skip_out_of_scope=False, ploidy=2, chunk_size=25_000, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False, info_fields=None, format_fields=None) -> int`
+Signature: `from_vcf_list(out, sources, reference=None, *, no_reference=False, skip_out_of_scope=False, ploidy=2, chunk_size=25_000, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False, info_fields=None, format_fields=None, check_ref="e") -> int`
 
 Builds **one** SVAR2 store from **N single-sample** VCFs/BCFs with different
 site lists, via a native k-way merge — no `bcftools merge`, no intermediate
@@ -448,8 +448,12 @@ multi-sample VCF.
     gets the field's default (reserved sentinel/NaN, or an explicit
     `default=`).
 - `ploidy`, `skip_out_of_scope`, `chunk_size`, `threads`, `overwrite`,
-  `long_allele_capacity`, `signatures` all mean the same as `from_vcf`, and
-  the return value is the same `int` (dropped out-of-scope ALTs).
+  `long_allele_capacity`, `signatures`, `check_ref` all mean the same as
+  `from_vcf`, and the return value is the same `int` (dropped out-of-scope
+  ALTs). `check_ref` is applied per input file during the merge (ignored
+  when `no_reference=True`): under `"x"`, a bad record is excluded from its
+  own file only (not the whole merged site), and the per-contig log reports
+  the total excluded across every input file.
 
 ### Conversion from SVAR1
 

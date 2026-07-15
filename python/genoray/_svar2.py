@@ -716,6 +716,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         signatures: bool = False,
         info_fields: "Sequence[str | InfoField] | None" = None,
         format_fields: "Sequence[str | FormatField] | None" = None,
+        check_ref: Literal["e", "x"] = "e",
     ) -> int:
         """Build one SVAR2 store from many **single-sample** VCFs/BCFs via a
         native k-way merge (no `bcftools merge`, no intermediate multi-sample
@@ -795,6 +796,13 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
 
         Returns the number of out-of-scope (symbolic/breakend) ALTs dropped
         (0 unless `skip_out_of_scope`).
+
+        check_ref: policy for a record whose REF disagrees with the reference
+        FASTA (ignored when `no_reference=True`). `"e"` (default) raises and
+        aborts the build — matching `bcftools norm --check-ref e`. `"x"` drops
+        the offending record (including a REF that runs past the contig end)
+        and continues, logging a per-contig count. Comparison is
+        case-insensitive, so soft-masked (lowercase) reference bases match.
         """
         from cyvcf2 import VCF as _CyVCF
 
@@ -850,6 +858,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         info = [t for t in flds if t[1] == "info"]
         format_ = [t for t in flds if t[1] == "format"]
 
+        _validate_check_ref(check_ref)
         return _core.run_vcf_list_conversion_pipeline(
             [str(p) for p in paths],
             None if no_reference else str(reference),
@@ -864,6 +873,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             signatures,
             info,
             format_,
+            check_ref,
         )
 
     @classmethod

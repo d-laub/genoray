@@ -791,7 +791,7 @@ fn svar2_variant_stats<'py>(
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 #[pyfunction]
-#[pyo3(signature = (vcf_paths, reference_path, chroms, output_dir, samples, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false, signatures=false, info_fields=Vec::new(), format_fields=Vec::new()))]
+#[pyo3(signature = (vcf_paths, reference_path, chroms, output_dir, samples, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false, signatures=false, info_fields=Vec::new(), format_fields=Vec::new(), check_ref="e".to_string()))]
 fn run_vcf_list_conversion_pipeline(
     py: Python,
     vcf_paths: Vec<String>,
@@ -807,7 +807,9 @@ fn run_vcf_list_conversion_pipeline(
     signatures: bool,
     info_fields: Vec<(String, String, String, Option<String>, Option<f64>)>,
     format_fields: Vec<(String, String, String, Option<String>, Option<f64>)>,
+    check_ref: String,
 ) -> PyResult<usize> {
+    let check_ref: crate::normalize::CheckRef = check_ref.parse().map_err(PyValueError::new_err)?;
     let dropped: u64 = py.detach(|| {
         orchestrator::run_vcf_list(
             &vcf_paths,
@@ -820,6 +822,7 @@ fn run_vcf_list_conversion_pipeline(
             max_threads,
             long_allele_capacity,
             skip_out_of_scope,
+            check_ref,
             signatures,
             info_fields,
             format_fields,
