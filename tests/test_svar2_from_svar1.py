@@ -281,3 +281,70 @@ def test_from_svar1_check_ref_invalid_raises(tmp_path: Path):
     src = _build_svar1(tmp_path)
     with pytest.raises(ValueError, match="check_ref"):
         SparseVar2.from_svar1(tmp_path / "out", src, ref, threads=1, check_ref="z")
+
+
+# --- Task 5: regions + samples ---
+
+
+def test_from_svar1_regions_restrict(tmp_path: Path):
+    """`regions="chr1:1-4"` (1-based inclusive -> 0-based [0,4)) covers only
+    the SNP at POS 3 (0-based pos 2); the insertion at POS 7 (0-based pos 6)
+    must be filtered out.
+    """
+    src = _build_svar1(tmp_path)
+    out = tmp_path / "s1_regions"
+    dropped = SparseVar2.from_svar1(
+        out, src, no_reference=True, regions="chr1:1-4", threads=1
+    )
+    assert dropped == 0
+
+    sv = SparseVar2(out)
+    rag = sv.decode("chr1", [(0, 40)])
+    pos = np.asarray(rag["pos"].data)
+    assert pos.tolist() == [2]
+
+
+def test_from_svar1_samples_reorder(tmp_path: Path):
+    """`samples=["S1", "S0"]` must reorder `available_samples` AND actually
+    remap the decoded CSR columns -- S1's carrier calls (originally hap
+    columns 2,3 in the full S0,S1 cohort) must land under OUTPUT columns 0,1.
+    """
+    src = _build_svar1(tmp_path)
+
+    full_out = tmp_path / "full"
+    SparseVar2.from_svar1(full_out, src, no_reference=True, threads=1)
+    full_sv = SparseVar2(full_out)
+    assert full_sv.available_samples == ["S0", "S1"]
+
+    out = tmp_path / "reordered"
+    dropped = SparseVar2.from_svar1(
+        out, src, no_reference=True, samples=["S1", "S0"], threads=1
+    )
+    assert dropped == 0
+    sv = SparseVar2(out)
+    assert sv.available_samples == ["S1", "S0"]
+
+    regions = [(0, 40)]
+    full_pos = np.asarray(full_sv.decode("chr1", regions)["pos"].data)
+    reordered_pos = np.asarray(sv.decode("chr1", regions)["pos"].data)
+
+    # Fixture ground truth (see `_write_vcf`): flat hap-major cell order is
+    # (S0,h0),(S0,h1),(S1,h0),(S1,h1) in the full cohort. var0 (SNP@3, 0-based
+    # pos 2) is carried only by S0h0; var1 (INS@7, 0-based pos 6) by S0h1,
+    # S1h0, S1h1.
+    assert full_pos.tolist() == [2, 6, 6, 6]
+    # Reordered cell order is (S1,h0),(S1,h1),(S0,h0),(S0,h1).
+    assert reordered_pos.tolist() == [6, 6, 2, 6]
+
+    # The headline claim: S1's original columns (full[2:4]) now decode
+    # byte-identically under output columns 0,1 (reordered[0:2]).
+    np.testing.assert_array_equal(reordered_pos[0:2], full_pos[2:4])
+    np.testing.assert_array_equal(reordered_pos[2:4], full_pos[0:2])
+
+
+def test_from_svar1_unknown_sample_raises(tmp_path: Path):
+    src = _build_svar1(tmp_path)
+    with pytest.raises(ValueError, match="not found"):
+        SparseVar2.from_svar1(
+            tmp_path / "out", src, no_reference=True, samples=["nope"], threads=1
+        )

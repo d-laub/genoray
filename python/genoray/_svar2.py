@@ -1144,6 +1144,10 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         source: str | Path,
         reference: str | Path | None = None,
         *,
+        regions: "str | tuple[str, int, int] | PathLike | object | None" = None,
+        samples: "str | Sequence[str] | PathLike | None" = None,
+        merge_overlapping: bool = False,
+        regions_overlap: "Literal['pos', 'record', 'variant']" = "pos",
         no_reference: bool = False,
         skip_out_of_scope: bool = False,
         chunk_size: int | None = None,
@@ -1177,8 +1181,39 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         the offending record (including a REF that runs past the contig end)
         and continues, logging a per-contig count. Comparison is
         case-insensitive, so soft-masked (lowercase) reference bases match.
+
+        `regions` restricts conversion to one or more genomic ranges. Region
+        strings use Genoray's existing convention: ``"chrom:start-end"`` is
+        1-based inclusive and is converted to a 0-based half-open interval;
+        tuple/BED/frame inputs are already 0-based half-open. Overlapping
+        regions raise unless `merge_overlapping=True`. Unlike :meth:`from_pgen`,
+        SVAR1 has no on-disk covering-range index to narrow against, so a
+        selected contig's local variants are still scanned in full -- the
+        per-record filter (in the Rust `Svar1RecordSource`) is what actually
+        restricts the output.
+
+        `regions_overlap` controls which variants a region keeps, matching
+        bcftools --regions-overlap: "pos" (POS inside [start,end)), "record"
+        (POS in [start,end+1), so an indel at the region's last base is
+        kept), or "variant" (the anchor-trimmed variant extent overlaps the
+        region). In "variant" mode a multiallelic record is kept whole if ANY
+        of its alleles truly overlaps the region; individual non-overlapping
+        alleles are not dropped. (SVAR1 is itself biallelic-only, so this only
+        ever judges a single ALT.)
+
+        `samples` selects and reorders SVAR1 samples by name, preserving
+        caller order and de-duplicating first occurrences -- the store's
+        `available_samples` (and every decoded column) matches that order
+        exactly, regardless of each sample's original SVAR1 position.
         """
         from genoray._svar import SparseVar
+        from genoray._svar._regions import _normalize_samples
+
+        if regions_overlap not in {"pos", "record", "variant"}:
+            raise ValueError(
+                "regions_overlap must be one of 'pos', 'record', or 'variant'; "
+                f"got {regions_overlap!r}"
+            )
 
         out = Path(out)
         source = Path(source)
@@ -1203,11 +1238,28 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
                 "from_svar1 supports only biallelic SVAR1 stores; this store has "
                 "multiallelic variants. Re-create it biallelically first."
             )
-        samples, ploidy, contigs, fields = _read_svar1_metadata(source)
-        n_samples = len(samples)
-        if n_samples == 0:
+        meta_samples, ploidy, contigs, fields = _read_svar1_metadata(source)
+        if len(meta_samples) == 0:
             raise ValueError(f"No samples found in {source}.")
 
+        # `sample_idx[out_s]` = the ORIGINAL SVAR1 sample index that output
+        # column `out_s` (`selected_samples[out_s]`) reads from. Identity when
+        # no subsetting is requested, so the Rust bucket remap is a no-op.
+        if samples is None:
+            selected_samples = meta_samples
+            sample_idx = list(range(len(meta_samples)))
+        else:
+            selected_samples = _normalize_samples(samples, meta_samples)
+            if not selected_samples:
+                raise ValueError("from_svar1 requires at least one sample")
+            sample_pos = {s: i for i, s in enumerate(meta_samples)}
+            sample_idx = [sample_pos[s] for s in selected_samples]
+
+        # `_svar1_index_arrays` must see the FULL contig list to compute
+        # correct GLOBAL variant-id starts (the CSR spans the whole store) --
+        # any region-based contig filtering happens AFTER, on its parallel
+        # per-contig outputs, never by re-deriving `starts` from a narrowed
+        # contig list.
         (
             starts,
             lens,
@@ -1217,10 +1269,32 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             alt_bytes_pc,
             alt_off_pc,
         ) = _svar1_index_arrays(source, contigs)
+
+        region_ranges = _normalize_svar2_regions(
+            regions,
+            contigs,
+            merge_overlapping=merge_overlapping,
+        )
+        if region_ranges:
+            region_contigs = {c for c, _, _ in region_ranges}
+            keep = [i for i, c in enumerate(contigs) if c in region_contigs]
+            if not keep:
+                raise ValueError(
+                    f"No variants found in requested regions for {source}."
+                )
+            contigs = [contigs[i] for i in keep]
+            starts = [starts[i] for i in keep]
+            lens = [lens[i] for i in keep]
+            pos_pc = [pos_pc[i] for i in keep]
+            ref_bytes_pc = [ref_bytes_pc[i] for i in keep]
+            ref_off_pc = [ref_off_pc[i] for i in keep]
+            alt_bytes_pc = [alt_bytes_pc[i] for i in keep]
+            alt_off_pc = [alt_off_pc[i] for i in keep]
+
         format_tuples, src_dtypes = _svar1_fields_manifest(fields)
 
         if chunk_size is None:
-            chunk_size = _auto_chunk_size(n_samples, ploidy)
+            chunk_size = _auto_chunk_size(len(selected_samples), ploidy)
 
         out.parent.mkdir(parents=True, exist_ok=True)
         _validate_check_ref(check_ref)
@@ -1231,7 +1305,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             starts,
             lens,
             str(out),
-            samples,
+            selected_samples,
             ploidy,
             chunk_size,
             threads,
@@ -1246,6 +1320,9 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             format_tuples,
             src_dtypes,
             check_ref,
+            region_ranges,
+            regions_overlap,
+            sample_idx,
         )
 
 

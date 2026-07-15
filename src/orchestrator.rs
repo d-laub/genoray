@@ -86,6 +86,12 @@ pub enum SourceSpec {
         alt_offsets: Vec<i64>,
         format_fields: Vec<crate::field::FieldSpec>,
         format_src_dtypes: Vec<String>,
+        regions: Vec<(u32, u32)>,
+        overlap: crate::svar2_view::OverlapMode,
+        /// Original SVAR1 sample indices, in OUTPUT/caller order -- same
+        /// permutation for every contig, one cohort-wide sample selection, not
+        /// per-contig. See `Svar1RecordSource::new`'s bucket remap.
+        sample_idx: Vec<usize>,
     },
 }
 
@@ -317,6 +323,9 @@ pub fn process_chromosome(
                         alt_offsets,
                         format_fields,
                         format_src_dtypes,
+                        regions,
+                        overlap,
+                        sample_idx,
                     } => Box::new(crate::svar1_reader::Svar1RecordSource::new(
                         &svar1_dir,
                         contig_start,
@@ -330,6 +339,9 @@ pub fn process_chromosome(
                         alt_offsets,
                         &format_fields,
                         &format_src_dtypes,
+                        regions,
+                        overlap,
+                        sample_idx,
                     )?),
                 };
                 let mut reader = crate::chunk_assembler::ChunkAssembler::new(

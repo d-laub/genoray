@@ -877,11 +877,20 @@ fn run_vcf_list_conversion_pipeline(
 /// contig `i`'s global variant-id start and length. `pos_per_contig[i]` is 0-based
 /// (`POS-1`). `format_fields` is the SVAR1 field manifest (all FORMAT);
 /// `format_src_dtypes[j]` is the numpy dtype of `format_fields[j]`'s on-disk array.
+///
+/// `region_ranges`/`regions_overlap` restrict conversion to the given per-contig
+/// `[start, end)` intervals -- SVAR1 has no covering-range narrowing (unlike
+/// PGEN's `.pvar` searchsorted), so every local variant of a selected contig is
+/// still scanned; the per-record `keeps`/`extent_overlaps` filter in
+/// `Svar1RecordSource::next_record` is the actual gate. `sample_idx[out_s]` is
+/// the ORIGINAL SVAR1 sample index that OUTPUT column `out_s` (`samples[out_s]`)
+/// reads from -- the same permutation for every contig, threaded down to
+/// `Svar1RecordSource::new`'s bucket remap.
 #[cfg(feature = "conversion")]
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 #[pyfunction]
-#[pyo3(signature = (svar1_dir, reference_path, chroms, contig_starts, contig_lens, output_dir, samples, ploidy, chunk_size, max_threads, long_allele_capacity, skip_out_of_scope, signatures, pos_per_contig, ref_bytes_per_contig, ref_offsets_per_contig, alt_bytes_per_contig, alt_offsets_per_contig, format_fields, format_src_dtypes, check_ref))]
+#[pyo3(signature = (svar1_dir, reference_path, chroms, contig_starts, contig_lens, output_dir, samples, ploidy, chunk_size, max_threads, long_allele_capacity, skip_out_of_scope, signatures, pos_per_contig, ref_bytes_per_contig, ref_offsets_per_contig, alt_bytes_per_contig, alt_offsets_per_contig, format_fields, format_src_dtypes, check_ref, region_ranges, regions_overlap, sample_idx))]
 fn run_svar1_conversion_pipeline(
     py: Python,
     svar1_dir: String,
@@ -905,6 +914,9 @@ fn run_svar1_conversion_pipeline(
     format_fields: Vec<(String, String, String, Option<String>, Option<f64>)>,
     format_src_dtypes: Vec<String>,
     check_ref: String,
+    region_ranges: Vec<(String, u32, u32)>,
+    regions_overlap: String,
+    sample_idx: Vec<usize>,
 ) -> PyResult<usize> {
     let n = chroms.len();
     if [
@@ -927,6 +939,16 @@ fn run_svar1_conversion_pipeline(
     let fields = crate::field::parse_manifest(format_fields)
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
     let check_ref: crate::normalize::CheckRef = check_ref.parse().map_err(PyValueError::new_err)?;
+
+    // Parse the region-overlap mode once, up front, so a bad value raises
+    // before any output byte is written -- mirrors `run_pgen_conversion_pipeline`.
+    let overlap_mode = crate::svar2_view::parse_overlap_mode(&regions_overlap)?;
+
+    let mut ranges_by_chrom: std::collections::HashMap<String, Vec<(u32, u32)>> =
+        std::collections::HashMap::new();
+    for (chrom, start, end) in region_ranges {
+        ranges_by_chrom.entry(chrom).or_default().push((start, end));
+    }
 
     // Move per-contig owned data into jobs before detaching.
     let mut jobs: Vec<_> = Vec::with_capacity(n);
@@ -976,6 +998,9 @@ fn run_svar1_conversion_pipeline(
                             alt_offsets: ao,
                             format_fields: fields.clone(),
                             format_src_dtypes: format_src_dtypes.clone(),
+                            regions: ranges_by_chrom.get(&chrom).cloned().unwrap_or_default(),
+                            overlap: overlap_mode,
+                            sample_idx: sample_idx.clone(),
                         },
                         reference_path.as_deref(),
                         &chrom,
