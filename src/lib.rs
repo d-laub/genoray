@@ -54,6 +54,8 @@ pub mod orchestrator;
 #[cfg(feature = "conversion")]
 pub mod pgen_reader;
 #[cfg(feature = "conversion")]
+pub mod pgen_shard;
+#[cfg(feature = "conversion")]
 pub mod pvar;
 #[cfg(feature = "conversion")]
 pub mod svar1_reader;
