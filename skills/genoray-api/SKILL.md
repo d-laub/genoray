@@ -747,6 +747,10 @@ genoray write svar1 file.vcf.gz out.svar --max-mem 4g --haploid
   together; prints a `Dropped {n} out-of-scope (symbolic/breakend) ALT
   alleles.` line when set. `--ploidy` (default 2) is VCF/BCF only — PGEN is
   diploid, and passing a non-default `--ploidy` with a `.pgen` source raises.
+  `--check-ref {e,x}` (default `e`, maps to `check_ref=`): REF-vs-reference
+  policy, ignored with `--no-reference`. `e` aborts on the first REF/FASTA
+  disagreement; `x` drops the offending record and continues. Mirrors
+  `bcftools norm --check-ref`.
 - `genoray write svar1`: unchanged SVAR 1.0 behavior — VCF or PGEN source,
   `--dosages`, `--max-mem`, `--haploid`, `--no-symbolic`/`--no-breakend`
   (independent flags here, unlike SVAR2).
