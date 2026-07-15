@@ -98,15 +98,32 @@ Responsibilities:
   coordinates (this removes #114's `record`-mode "+1 bp fetch" hack); the mode
   is carried separately to the backend filter.
 
-Two translators consume `regions_df`:
+`regions_df` becomes coalesced per-contig `(chrom, start, end)` genomic
+intervals (0-based half-open), passed to every backend alongside the
+`regions_overlap` mode.
 
-- **Genomic-interval translator** (VCF, vcf_list): `regions_df` → coalesced
-  per-contig `(chrom, start, end)` fetch intervals. The overlap mode is applied
-  in the Rust reader, per record.
-- **Index-interval translator** (PGEN, svar1): reuse v1's
-  `_resolve_kept_rows(index_df, cnorm, regions_df, mode, merge_overlapping)`,
-  which already implements pos/record/variant on a POS+ILEN index, then coalesce
-  kept indices into contiguous `[lo, hi)` variant-index runs per contig.
+**Unified reader-side overlap filter (refinement discovered during planning).**
+The spec originally proposed a separate "index-interval" path for PGEN/svar1
+via v1's `_resolve_kept_rows`. Planning surfaced a better, more uniform design:
+every conversion reader (`VcfRecordSource`, `PgenRecordSource`,
+`Svar1RecordSource`) already exposes per-record `POS` and REF/ALT bytes, and the
+finished-store view path already owns a reusable, store-independent overlap
+predicate — `crate::svar2_view::{OverlapMode, query_window, keeps}` (built in the
+always-present query-core, so the conversion feature can call it). So **all four
+backends share one mechanism**: thread the genomic regions + `OverlapMode` into
+each reader and apply the same per-record `keeps` + extent test. This guarantees
+conversion-time region filtering is byte-identical to the store's own query/view
+semantics, and avoids a second, divergent region resolver.
+
+Per-backend efficiency narrowing (so a small region in a huge contig doesn't
+scan the whole contig) is layered on top of the correctness filter:
+- VCF/vcf_list: htslib `IndexedReader.fetch` over `query_window(regions, mode)`
+  already returns only the overlapping superset.
+- PGEN: narrow the contig's `[lo, hi)` variant-index range to the covering
+  range of the requested regions (via the pvar POS column) before the
+  per-record filter runs.
+- svar1: filter over the full local range initially (narrowing is a later
+  optimization).
 
 ### Sample front-end (Python)
 
@@ -153,32 +170,34 @@ already returns the overlapping superset (including indels starting before
 
 ### `from_pgen`
 
-- Regions: extend the pvar scan (`_pvar_contig_ranges` / `_scan_pvar`) to
-  produce an `index_df` (CHROM/POS/ILEN/index), run `_resolve_kept_rows`, and
-  coalesce kept indices into contiguous `[lo, hi)` variant-index runs per contig.
-  Extend `PgenRecordSource` (`src/pgen_reader.rs`) to iterate **multiple** index
-  intervals per contig (mirrors the VCF reader's `advance_region` /
-  `current_region` state).
+- Regions: pass the coalesced genomic regions + `OverlapMode` into
+  `SourceSpec::Pgen`. `PgenRecordSource` (`src/pgen_reader.rs`) already reads
+  per-variant `POS` from its `PvarReader`, so it applies the shared
+  `keeps` + extent filter per record. For efficiency, narrow the contig's
+  `[lo, hi)` variant-index range to the covering range of the requested regions
+  in Python first (searchsorted on the pvar POS column).
 - Samples: `_normalize_samples` → psam sample indices → `change_sample_subset`
   per reader (already used in `_pgen.py:283`). pgenlib requires *sorted*
-  indices, so add a `sample_perm: Vec<usize>` remap in `PgenRecordSource` (the
-  PGEN analogue of the VCF reader's `sample_indices`) to restore caller order in
-  the emitted columns. The `samples` list written to the store reflects caller
-  order.
+  indices, so pass the sorted subset to pgenlib and add a `sample_perm:
+  Vec<usize>` remap in `PgenRecordSource` (the PGEN analogue of the VCF reader's
+  `sample_indices`) to restore caller order in the emitted columns. The
+  `samples` list written to the store reflects caller order.
 
 ### `from_svar1` (heaviest)
 
-`from_svar1` reads sparse genotype runs by variant index through
-`run_svar1_conversion_pipeline`, so both subsettings push into that Rust reader:
+`from_svar1` reads sparse genotype runs through `run_svar1_conversion_pipeline`;
+`Svar1RecordSource` already holds a `pos: Vec<u32>` and REF/ALT offset arrays, so
+both subsettings push into that Rust reader:
 
-- Regions: `_resolve_kept_var_idxs(sv1, regions_df, mode, merge_overlapping)`
-  (v1 already exposes this) → kept-variant index set passed into the pipeline;
-  the svar1 reader gains a kept-variant filter (skip variant indices not in the
-  set) and narrows the per-contig index arrays accordingly.
+- Regions: pass the coalesced genomic regions + `OverlapMode` into
+  `SourceSpec::Svar1`; the reader applies the shared `keeps` + extent filter per
+  local variant in its cursor loop (skipping non-overlapping variants).
 - Samples: `_normalize_samples` → sample-index array passed into the pipeline;
-  the svar1 reader filters and remaps the sparse per-variant sample entries to
-  the selected, caller-ordered subset. This is the deepest reader change of the
-  four backends.
+  the svar1 reader filters and remaps the sparse per-variant sample entries
+  (the sample-major CSR transposed in `build_variant_major` over `num_haps`) to
+  the selected, caller-ordered subset — shrinking `num_haps`/`num_samples` and
+  translating carrier columns. This is the deepest reader change of the four
+  backends.
 
 ## CLI (`python/genoray/_cli/__main__.py`)
 
@@ -204,8 +223,10 @@ Per backend (`tests/test_svar2_from_vcf.py`, plus new
 - `merge_overlapping=False` raises on overlap; `True` coalesces.
 - `regions=None, samples=None` matches the full-file conversion byte-for-byte.
 - Rust: `cargo test --no-default-features --features conversion` for the reader
-  changes (VCF multi-interval + mode filter, PGEN multi-range + sample_perm,
-  svar1 kept-variant + sample remap).
+  changes (shared `keeps`+extent filter in each reader; PGEN covering-range
+  narrow + `sample_perm`; svar1 per-record filter + sample remap). Also
+  `cargo check --no-default-features` (query-only core) since the readers now
+  reference `svar2_view` — see the query-core CI gap note.
 
 Gate: focused pytest per task, `pixi run pytest tests -m "not network"` before
 PR readiness, `pixi run prek run --all-files` before push.
