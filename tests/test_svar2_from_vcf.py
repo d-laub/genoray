@@ -393,6 +393,27 @@ def test_from_vcf_check_ref_exclude_continues(tmp_path: Path):
     assert int(counts.sum()) == 4
 
 
+def test_from_vcf_sharded_check_ref_exclude_counts_owned_record_once(
+    tmp_path: Path, capfd: pytest.CaptureFixture[str]
+):
+    ref = _write_ref(tmp_path)
+    vcf = _write_vcf_bad_ref(tmp_path)
+    out = tmp_path / "sharded_store"
+
+    SparseVar2.from_vcf(
+        out,
+        vcf,
+        ref,
+        check_ref="x",
+        threads=16,
+        chunk_size=1,
+    )
+
+    assert "excluded 1 record(s)" in capfd.readouterr().out
+    counts = SparseVar2(out).region_counts("chr1", [(0, 40)])
+    assert int(counts.sum()) == 4
+
+
 def test_from_vcf_check_ref_invalid_value_raises(tmp_path: Path):
     ref = _write_ref(tmp_path)
     vcf = _write_vcf_bad_ref(tmp_path)

@@ -69,6 +69,7 @@ fn convert(
         SourceSpec::Vcf {
             vcf_path: bcf.to_str().unwrap().to_string(),
             htslib_threads: 1,
+            shard_workers: 1,
             regions: Vec::new(),
         },
         Some(fasta.to_str().unwrap()),
