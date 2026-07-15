@@ -28,6 +28,7 @@ struct PendingAtom {
 }
 
 struct DecomposedRecord {
+    source_pos: u32,
     atoms: Vec<PendingAtom>,
     dropped_out_of_scope: u64,
 }
@@ -257,8 +258,9 @@ pub struct ChunkAssembler {
     num_samples: usize,
     ploidy: usize,
     /// Full 0-based contig sequence, uppercased; empty when no reference was given.
-    ref_seq: Vec<u8>,
+    ref_seq: Arc<Vec<u8>>,
     has_reference: bool,
+    owned_range: Option<(u32, u32)>,
     skip_out_of_scope: bool,
     dropped_out_of_scope: u64,
     info_fields: Vec<FieldSpec>,
@@ -337,6 +339,7 @@ fn decompose_raw_record(
     }
 
     Ok(DecomposedRecord {
+        source_pos: pos,
         atoms: pending,
         dropped_out_of_scope: dropped as u64,
     })
@@ -353,15 +356,42 @@ impl ChunkAssembler {
         fields: &[FieldSpec],
     ) -> Result<Self, ConversionError> {
         let (ref_seq, has_reference) = match fasta_path {
-            Some(path) => (crate::vcf_reader::load_contig_seq(path, chrom)?, true),
-            None => (Vec::new(), false),
+            Some(path) => (
+                Arc::new(crate::vcf_reader::load_contig_seq(path, chrom)?),
+                true,
+            ),
+            None => (Arc::new(Vec::new()), false),
         };
-        Ok(Self {
+        Ok(Self::with_reference(
             source,
             num_samples,
             ploidy,
             ref_seq,
             has_reference,
+            skip_out_of_scope,
+            fields,
+            None,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn with_reference(
+        source: Box<dyn RecordSource + Send>,
+        num_samples: usize,
+        ploidy: usize,
+        ref_seq: Arc<Vec<u8>>,
+        has_reference: bool,
+        skip_out_of_scope: bool,
+        fields: &[FieldSpec],
+        owned_range: Option<(u32, u32)>,
+    ) -> Self {
+        Self {
+            source,
+            num_samples,
+            ploidy,
+            ref_seq,
+            has_reference,
+            owned_range,
             skip_out_of_scope,
             dropped_out_of_scope: 0,
             info_fields: fields
@@ -378,7 +408,7 @@ impl ChunkAssembler {
             frontier: 0,
             eof: false,
             next_seq: 0,
-        })
+        }
     }
 
     /// Total out-of-scope (symbolic/breakend) ALTs dropped so far. Valid after the
@@ -420,7 +450,7 @@ impl ChunkAssembler {
                         decompose_raw_record(
                             rec,
                             record_seq,
-                            &self.ref_seq,
+                            self.ref_seq.as_slice(),
                             self.has_reference,
                             self.skip_out_of_scope,
                             &self.info_fields,
@@ -437,7 +467,7 @@ impl ChunkAssembler {
                     decompose_raw_record(
                         rec,
                         record_seq,
-                        &self.ref_seq,
+                        self.ref_seq.as_slice(),
                         self.has_reference,
                         self.skip_out_of_scope,
                         &self.info_fields,
@@ -449,9 +479,19 @@ impl ChunkAssembler {
         };
 
         for record in decomposed {
-            self.dropped_out_of_scope += record.dropped_out_of_scope;
+            let source_record_owned = self
+                .owned_range
+                .is_none_or(|(start, end)| record.source_pos >= start && record.source_pos < end);
+            if source_record_owned {
+                self.dropped_out_of_scope += record.dropped_out_of_scope;
+            }
             for atom in record.atoms {
-                self.heap.push(Reverse(atom));
+                let atom_owned = self
+                    .owned_range
+                    .is_none_or(|(start, end)| atom.pos >= start && atom.pos < end);
+                if atom_owned {
+                    self.heap.push(Reverse(atom));
+                }
             }
         }
         Ok(())

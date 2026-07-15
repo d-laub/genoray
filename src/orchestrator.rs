@@ -1,9 +1,10 @@
 // src/orchestrator.rs
-use crossbeam_channel::bounded;
+use crossbeam_channel::{Sender, TrySendError, bounded};
 use std::fs;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
+use std::time::Duration;
 
 use crate::enum_map::EnumKey;
 use crate::error::ConversionError;
@@ -114,6 +115,179 @@ impl crate::record_source::RecordSource for VcfListDroppedProxy {
         }
         Ok(rec)
     }
+}
+
+enum VcfShardMessage {
+    Chunk(crate::types::DenseChunk),
+    Done(u64),
+}
+
+fn send_vcf_shard_message(
+    tx: &Sender<Result<VcfShardMessage, ConversionError>>,
+    cancel: &AtomicBool,
+    mut msg: Result<VcfShardMessage, ConversionError>,
+) -> bool {
+    loop {
+        match tx.try_send(msg) {
+            Ok(()) => return true,
+            Err(TrySendError::Full(m)) => {
+                if cancel.load(Ordering::Relaxed) {
+                    return false;
+                }
+                msg = m;
+                thread::sleep(Duration::from_millis(2));
+            }
+            Err(TrySendError::Disconnected(_)) => return false,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_vcf_shards_to_dense(
+    vcf_path: &str,
+    chrom: &str,
+    samples: &[&str],
+    ploidy: usize,
+    fields: &[crate::field::FieldSpec],
+    shards: Vec<crate::vcf_reader::VcfShard>,
+    chunk_size: usize,
+    fasta_path: Option<&str>,
+    skip_out_of_scope: bool,
+    tx_dense: &Sender<crate::types::DenseChunk>,
+) -> Result<u64, ConversionError> {
+    let (ref_seq, has_reference) = match fasta_path {
+        Some(path) => (
+            Arc::new(crate::vcf_reader::load_contig_seq(path, chrom)?),
+            true,
+        ),
+        None => (Arc::new(Vec::new()), false),
+    };
+    let cancel = Arc::new(AtomicBool::new(false));
+    let sample_names: Vec<String> = samples.iter().map(|&s| s.to_string()).collect();
+    let fields_owned = fields.to_vec();
+
+    let mut receivers = Vec::with_capacity(shards.len());
+    let mut handles = Vec::with_capacity(shards.len());
+    for shard in shards {
+        let (tx, rx) = bounded::<Result<VcfShardMessage, ConversionError>>(2);
+        receivers.push(rx);
+
+        let vcf_path = vcf_path.to_string();
+        let chrom = chrom.to_string();
+        let sample_names = sample_names.clone();
+        let fields = fields_owned.clone();
+        let ref_seq = Arc::clone(&ref_seq);
+        let cancel = Arc::clone(&cancel);
+        let thread_name = format!("vshard-{}-{}", chrom, shard.ordinal);
+
+        let handle = thread::Builder::new()
+            .name(thread_name.clone())
+            .spawn(move || {
+                let run = || -> Result<u64, ConversionError> {
+                    let s_refs: Vec<&str> = sample_names.iter().map(|s| s.as_str()).collect();
+                    let source = crate::vcf_reader::VcfRecordSource::new(
+                        &vcf_path,
+                        &chrom,
+                        &s_refs,
+                        1,
+                        ploidy,
+                        &fields,
+                        vec![(shard.fetch_start, shard.fetch_end)],
+                    )?;
+                    let mut reader = crate::chunk_assembler::ChunkAssembler::with_reference(
+                        Box::new(source),
+                        s_refs.len(),
+                        ploidy,
+                        ref_seq,
+                        has_reference,
+                        skip_out_of_scope,
+                        &fields,
+                        Some((shard.own_start, shard.own_end)),
+                    );
+                    let mut local_chunk_id = 0;
+                    while !cancel.load(Ordering::Relaxed) {
+                        match reader.read_next_chunk(chunk_size, local_chunk_id, None)? {
+                            Some(chunk) => {
+                                if !send_vcf_shard_message(
+                                    &tx,
+                                    &cancel,
+                                    Ok(VcfShardMessage::Chunk(chunk)),
+                                ) {
+                                    break;
+                                }
+                                local_chunk_id += 1;
+                            }
+                            None => break,
+                        }
+                    }
+                    Ok(reader.dropped_out_of_scope())
+                };
+
+                match run() {
+                    Ok(dropped) => {
+                        let _ = send_vcf_shard_message(
+                            &tx,
+                            &cancel,
+                            Ok(VcfShardMessage::Done(dropped)),
+                        );
+                    }
+                    Err(e) => {
+                        let _ = send_vcf_shard_message(&tx, &cancel, Err(e));
+                        cancel.store(true, Ordering::Relaxed);
+                    }
+                }
+            })
+            .expect("spawn VCF shard worker");
+        handles.push((thread_name, handle));
+    }
+
+    let mut result: Result<u64, ConversionError> = Ok(0);
+    let mut next_chunk_id = 0usize;
+    for rx in &receivers {
+        loop {
+            match rx.recv() {
+                Ok(Ok(VcfShardMessage::Chunk(mut chunk))) => {
+                    chunk.chunk_id = next_chunk_id;
+                    tx_dense.send(chunk).unwrap();
+                    next_chunk_id += 1;
+                }
+                Ok(Ok(VcfShardMessage::Done(dropped))) => {
+                    if let Ok(total) = &mut result {
+                        *total += dropped;
+                    }
+                    break;
+                }
+                Ok(Err(e)) => {
+                    result = Err(e);
+                    cancel.store(true, Ordering::Relaxed);
+                    break;
+                }
+                Err(e) => {
+                    result = Err(ConversionError::Input(format!(
+                        "VCF shard worker channel disconnected on {chrom}: {e}"
+                    )));
+                    cancel.store(true, Ordering::Relaxed);
+                    break;
+                }
+            }
+        }
+        if result.is_err() {
+            break;
+        }
+    }
+    if result.is_err() {
+        cancel.store(true, Ordering::Relaxed);
+    }
+    drop(receivers);
+
+    for (thread_name, handle) in handles {
+        if handle.join().is_err() && result.is_ok() {
+            result = Err(ConversionError::WorkerPanicked {
+                thread: thread_name,
+            });
+        }
+    }
+    result
 }
 
 //The rust pipeline (Per chromosome conversion from Dense to Sparse)
@@ -234,15 +408,37 @@ pub fn process_chromosome(
                         vcf_path,
                         htslib_threads,
                         regions,
-                    } => Box::new(crate::vcf_reader::VcfRecordSource::new(
-                        &vcf_path,
-                        &chr,
-                        &s_refs,
-                        htslib_threads,
-                        ploidy,
-                        &fields_owned,
-                        regions,
-                    )?),
+                    } => {
+                        let shards = crate::vcf_reader::plan_vcf_shards(
+                            &regions,
+                            &chr,
+                            processing_threads,
+                            chunk_size as u32,
+                        )?;
+                        if shards.len() > 1 {
+                            return read_vcf_shards_to_dense(
+                                &vcf_path,
+                                &chr,
+                                &s_refs,
+                                ploidy,
+                                &fields_owned,
+                                shards,
+                                chunk_size,
+                                fasta.as_deref(),
+                                skip_out_of_scope,
+                                &tx_dense,
+                            );
+                        }
+                        Box::new(crate::vcf_reader::VcfRecordSource::new(
+                            &vcf_path,
+                            &chr,
+                            &s_refs,
+                            htslib_threads,
+                            ploidy,
+                            &fields_owned,
+                            regions,
+                        )?)
+                    }
                     SourceSpec::Pgen {
                         pgen_path: _,
                         pvar_path,
