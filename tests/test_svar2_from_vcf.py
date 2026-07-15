@@ -108,3 +108,54 @@ def test_from_vcf_plain_vcf_rejected(tmp_path: Path):
     )
     with pytest.raises(ValueError, match="bgzip"):
         SparseVar2.from_vcf(tmp_path / "s3", plain, ref, threads=1)
+
+
+def _write_vcf_bad_ref(d: Path) -> Path:
+    # Clean records at pos 3 (REF=A) and 7 (REF=C) match _REF; the record at
+    # pos 10 declares REF=A but _REF[10] is 'G' — a REF/FASTA disagreement
+    # (issue #116). Rows stay position-sorted for `bcftools index`.
+    body = (
+        "##fileformat=VCFv4.2\n"
+        "##contig=<ID=chr1,length=40>\n"
+        '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n'
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS0\tS1\n"
+        "chr1\t3\t.\tA\tG\t.\t.\t.\tGT\t1|0\t0|0\n"
+        "chr1\t7\t.\tC\tCAT\t.\t.\t.\tGT\t0|1\t1|1\n"
+        "chr1\t10\t.\tA\tT\t.\t.\t.\tGT\t0|1\t0|0\n"  # REF=A, but _REF[10]='G'
+    )
+    plain = d / "bad.vcf"
+    plain.write_text(body)
+    gz = d / "bad.vcf.gz"
+    with open(gz, "wb") as fh:
+        subprocess.run(["bgzip", "-c", str(plain)], check=True, stdout=fh)
+    subprocess.run(["bcftools", "index", str(gz)], check=True)
+    return gz
+
+
+def test_from_vcf_check_ref_error_aborts(tmp_path: Path):
+    ref = _write_ref(tmp_path)
+    vcf = _write_vcf_bad_ref(tmp_path)
+    with pytest.raises(Exception):
+        SparseVar2.from_vcf(tmp_path / "store", vcf, ref, check_ref="e", threads=1)
+
+
+def test_from_vcf_check_ref_exclude_continues(tmp_path: Path):
+    ref = _write_ref(tmp_path)
+    vcf = _write_vcf_bad_ref(tmp_path)
+    out = tmp_path / "store"
+    SparseVar2.from_vcf(out, vcf, ref, check_ref="x", threads=1)
+    assert (out / "meta.json").exists()  # completed despite the bad record
+    sv = SparseVar2(out)
+    # The two clean records survive; the pos-10 mismatch is excluded.
+    # `region_counts` is a per-hap carrier count (see `SparseVar2.region_counts`),
+    # not a distinct-variant count: pos 3 contributes 1 carrier hap (S0 "1|0"),
+    # pos 7 contributes 3 (S0 "0|1", S1 hom-alt "1|1") -> 4 total.
+    counts = sv.region_counts("chr1", [(0, 40)])
+    assert int(counts.sum()) == 4
+
+
+def test_from_vcf_check_ref_invalid_value_raises(tmp_path: Path):
+    ref = _write_ref(tmp_path)
+    vcf = _write_vcf_bad_ref(tmp_path)
+    with pytest.raises(ValueError, match="check_ref"):
+        SparseVar2.from_vcf(tmp_path / "s", vcf, ref, check_ref="z", threads=1)  # type: ignore[arg-type]

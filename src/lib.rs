@@ -120,7 +120,7 @@ fn index_vcf(path: String) -> PyResult<()> {
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 #[pyfunction]
-#[pyo3(signature = (vcf_path, reference_path, chroms, output_dir, samples, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false, signatures=false, info_fields=Vec::new(), format_fields=Vec::new()))]
+#[pyo3(signature = (vcf_path, reference_path, chroms, output_dir, samples, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false, signatures=false, info_fields=Vec::new(), format_fields=Vec::new(), check_ref="e".to_string()))]
 fn run_conversion_pipeline(
     py: Python,
     vcf_path: String,
@@ -136,6 +136,7 @@ fn run_conversion_pipeline(
     signatures: bool,
     info_fields: Vec<(String, String, String, Option<String>, Option<f64>)>,
     format_fields: Vec<(String, String, String, Option<String>, Option<f64>)>,
+    check_ref: String,
 ) -> PyResult<usize> {
     let sample_refs: Vec<&str> = samples.iter().map(|s| s.as_str()).collect();
 
@@ -143,6 +144,8 @@ fn run_conversion_pipeline(
     raw.extend(format_fields);
     let fields =
         crate::field::parse_manifest(raw).map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+    let check_ref: crate::normalize::CheckRef = check_ref.parse().map_err(PyValueError::new_err)?;
 
     let results: Vec<Result<u64, crate::error::ConversionError>> = py.detach(|| {
         // Step 1 -> HW discovery/override and budgeting
@@ -209,6 +212,7 @@ fn run_conversion_pipeline(
                         ploidy,
                         long_allele_capacity,
                         skip_out_of_scope,
+                        check_ref,
                         processing_threads,
                         signatures,
                         &fields,
@@ -333,6 +337,7 @@ fn run_pgen_conversion_pipeline(
                         ploidy,
                         long_allele_capacity,
                         skip_out_of_scope,
+                        crate::normalize::CheckRef::Error,
                         processing_threads,
                         signatures,
                         &fields,
@@ -935,6 +940,7 @@ fn run_svar1_conversion_pipeline(
                         ploidy,
                         long_allele_capacity,
                         skip_out_of_scope,
+                        crate::normalize::CheckRef::Error,
                         processing_threads,
                         signatures,
                         &fields,

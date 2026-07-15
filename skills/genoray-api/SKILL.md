@@ -246,7 +246,7 @@ dropped = SparseVar2.from_vcf(
 dropped = SparseVar2.from_vcf("out.svar2", "file.vcf.gz", no_reference=True)
 ```
 
-Signature: `from_vcf(out, source, reference=None, *, no_reference=False, skip_out_of_scope=False, ploidy=2, chunk_size=25_000, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False, info_fields=None, format_fields=None) -> int`
+Signature: `from_vcf(out, source, reference=None, *, no_reference=False, skip_out_of_scope=False, ploidy=2, chunk_size=25_000, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False, info_fields=None, format_fields=None, check_ref="e") -> int`
 
 - `source` — a bgzipped VCF (`.vcf.gz`) or BCF (`.bcf`). Auto-indexes (`.csi`) if
   no `.csi`/`.tbi` is found. For a PLINK2 PGEN source, use `from_pgen` instead
@@ -261,6 +261,13 @@ Signature: `from_vcf(out, source, reference=None, *, no_reference=False, skip_ou
   layer — there's no separate "symbolic only" vs. "breakend only" toggle.
 - Returns the number of dropped out-of-scope ALTs as an `int` (always `0`
   unless `skip_out_of_scope=True`).
+- `check_ref: Literal["e", "x"] = "e"` — policy for a record whose REF
+  disagrees with the reference FASTA (ignored when `no_reference=True`).
+  `"e"` (default) raises and aborts the build, matching `bcftools norm
+  --check-ref e`. `"x"` drops the offending record (including a REF that
+  runs past the contig end) and continues, logging a per-contig count.
+  Comparison is case-insensitive (soft-masked lowercase reference bases
+  match). Any other value raises `ValueError` before conversion starts.
 - No dosages, no `haploid=` OR-collapse, no `max_mem`-based chunking (use
   `chunk_size` instead) — these remain `SparseVar` (SVAR 1.0)-only for now.
 - `signatures=False` — when `True`, classifies every SNP/indel into its

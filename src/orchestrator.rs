@@ -127,6 +127,7 @@ pub fn process_chromosome(
     ploidy: usize,
     long_allele_capacity: usize,
     skip_out_of_scope: bool,
+    check_ref: crate::normalize::CheckRef,
     processing_threads: usize,
     signatures: bool,
     fields: &[crate::field::FieldSpec],
@@ -309,6 +310,7 @@ pub fn process_chromosome(
                     fasta.as_deref(),
                     &chr,
                     skip_out_of_scope,
+                    check_ref,
                     &fields_owned,
                 )?;
                 let mut chunk_id = 0;
@@ -317,6 +319,13 @@ pub fn process_chromosome(
                 {
                     tx_dense.send(dense_chunk).unwrap();
                     chunk_id += 1;
+                }
+                let ref_excluded = reader.ref_excluded();
+                if ref_excluded > 0 {
+                    println!(
+                        "[{chr}] check_ref=x: excluded {ref_excluded} record(s) whose REF \
+                         disagreed with the reference FASTA."
+                    );
                 }
                 Ok(reader.dropped_out_of_scope() + vcf_list_dropped.load(Ordering::Relaxed))
             }
@@ -643,6 +652,7 @@ pub fn run_vcf_list(
             ploidy,
             long_allele_capacity,
             skip_out_of_scope,
+            crate::normalize::CheckRef::Error,
             processing_threads,
             signatures,
             &fields,
