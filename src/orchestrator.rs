@@ -45,6 +45,7 @@ pub enum SourceSpec {
     Vcf {
         vcf_path: String,
         htslib_threads: usize,
+        regions: Vec<(u32, u32)>,
     },
     Pgen {
         pgen_path: String,
@@ -231,6 +232,7 @@ pub fn process_chromosome(
                     SourceSpec::Vcf {
                         vcf_path,
                         htslib_threads,
+                        regions,
                     } => Box::new(crate::vcf_reader::VcfRecordSource::new(
                         &vcf_path,
                         &chr,
@@ -238,6 +240,7 @@ pub fn process_chromosome(
                         htslib_threads,
                         ploidy,
                         &fields_owned,
+                        regions,
                     )?),
                     SourceSpec::Pgen {
                         pgen_path: _,

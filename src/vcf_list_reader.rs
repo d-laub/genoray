@@ -263,8 +263,15 @@ impl VcfListRecordSource {
         let mut cursors = Vec::with_capacity(vcf_paths.len());
         for (col, (path, &sample)) in vcf_paths.iter().zip(samples.iter()).enumerate() {
             let single_sample = [sample];
-            match VcfRecordSource::new(path, chrom, &single_sample, htslib_threads, ploidy, fields)
-            {
+            match VcfRecordSource::new(
+                path,
+                chrom,
+                &single_sample,
+                htslib_threads,
+                ploidy,
+                fields,
+                Vec::new(),
+            ) {
                 Ok(vcf) => cursors.push(FileCursor {
                     vcf: Some(vcf),
                     buf: VecDeque::new(),
