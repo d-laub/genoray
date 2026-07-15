@@ -112,36 +112,25 @@ def _is_region_triplet(value: object) -> bool:
     )
 
 
-def _normalize_svar2_vcf_regions(
+def _normalize_svar2_regions(
     regions: "str | tuple[str, int, int] | PathLike | object | None",
     available_contigs: "Sequence[str]",
     *,
     merge_overlapping: bool,
-    regions_overlap: "Literal['pos', 'record', 'variant']",
 ) -> list[tuple[str, int, int]]:
-    """Normalize caller regions to coalesced VCF fetch intervals.
+    """Normalize caller regions to coalesced, backend-agnostic genomic intervals.
 
-    This is intentionally a pre-conversion helper: it reuses the v1 coordinate
-    parser/sample conventions, then returns per-contig 0-based half-open
-    intervals suitable for `IndexedReader.fetch`. Full post-normalization
-    ownership filtering belongs to the sub-contig shard PR.
+    This is intentionally a pre-conversion/pre-slice helper: it reuses the v1
+    coordinate parser/sample conventions, then returns per-contig 0-based
+    half-open intervals. It is mode-independent -- `regions_overlap` (which
+    variants a region's POS/record/anchor-trimmed-extent must overlap) is
+    applied downstream (Rust `query_window`/`parse_overlap_mode`), not here.
     """
     from genoray._contigs import ContigNormalizer
     from genoray._svar._regions import _normalize_regions
 
     if regions is None:
         return []
-    if regions_overlap not in {"pos", "record", "variant"}:
-        raise ValueError(
-            "regions_overlap must be one of 'pos', 'record', or 'variant'; "
-            f"got {regions_overlap!r}"
-        )
-    if regions_overlap == "variant":
-        raise ValueError(
-            "SparseVar2.from_vcf currently supports regions_overlap='pos' "
-            "and 'record'. Post-normalization 'variant' ownership is part of "
-            "the sub-contig sharding follow-up."
-        )
 
     cnorm = ContigNormalizer(available_contigs)
 
@@ -159,12 +148,7 @@ def _normalize_svar2_vcf_regions(
     if regions_df.height == 0:
         raise ValueError("No requested regions match VCF contigs.")
 
-    end_offset = 1 if regions_overlap == "record" else 0
-    rows = (
-        regions_df.with_columns((pl.col("end") + end_offset).alias("end"))
-        .sort(["chrom", "start", "end"])
-        .iter_rows(named=True)
-    )
+    rows = regions_df.sort(["chrom", "start", "end"]).iter_rows(named=True)
 
     merged: list[tuple[str, int, int]] = []
     for row in rows:
@@ -606,10 +590,15 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         intervals. Region strings use Genoray's existing convention:
         ``"chrom:start-end"`` is 1-based inclusive and is converted to a
         0-based half-open interval; tuple/BED/frame inputs are already 0-based
-        half-open. Overlapping regions raise unless
-        `merge_overlapping=True`. `regions_overlap="variant"` is reserved for
-        the follow-up sub-contig normalization work; this entry point currently
-        supports `"pos"` and `"record"`.
+        half-open. Overlapping regions raise unless `merge_overlapping=True`.
+
+        `regions_overlap` controls which variants a region keeps, matching
+        bcftools --regions-overlap: "pos" (POS inside [start,end)), "record"
+        (POS in [start,end+1), so an indel at the region's last base is
+        kept), or "variant" (the anchor-trimmed variant extent overlaps the
+        region). In "variant" mode a multiallelic record is kept whole if ANY
+        of its alleles truly overlaps the region; individual non-overlapping
+        alleles are not dropped.
 
         `samples` selects and reorders VCF samples by name, preserving caller
         order and de-duplicating first occurrences.
@@ -636,6 +625,12 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         """
         from cyvcf2 import VCF as _CyVCF
         from genoray._svar._regions import _normalize_samples
+
+        if regions_overlap not in {"pos", "record", "variant"}:
+            raise ValueError(
+                "regions_overlap must be one of 'pos', 'record', or 'variant'; "
+                f"got {regions_overlap!r}"
+            )
 
         out = Path(out)
         source = Path(source)
@@ -667,11 +662,10 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             raise ValueError("from_vcf requires at least one sample")
 
         all_contigs = list(v.seqnames)
-        region_ranges = _normalize_svar2_vcf_regions(
+        region_ranges = _normalize_svar2_regions(
             regions,
             all_contigs,
             merge_overlapping=merge_overlapping,
-            regions_overlap=regions_overlap,
         )
 
         if region_ranges:
@@ -723,6 +717,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             format_,
             check_ref,
             region_ranges,
+            regions_overlap,
         )
 
     @classmethod

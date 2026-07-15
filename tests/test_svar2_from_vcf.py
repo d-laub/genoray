@@ -103,6 +103,68 @@ def test_from_vcf_regions_rejects_overlaps_by_default(tmp_path: Path):
         )
 
 
+def _write_vcf_with_spanning_deletion(d: Path) -> Path:
+    """A dedicated (non-shared) fixture: a deletion whose POS sits outside
+    ``chr1:7-12`` but whose anchor-trimmed extent reaches into it, plus the
+    in-region insertion also used by ``_write_vcf``.
+
+    ``chr1:5 TACA>T`` (0-based POS 4, REF span ``[4, 8)`` matching
+    ``_REF[4:8]`` == ``"TACA"``) deletes the anchor-trimmed extent ``[5, 8)``.
+    Region ``chr1:7-12`` is 0-based ``[6, 12)``: the deletion's POS (4) is
+    outside it, but its trimmed extent (``[5, 8)``) overlaps it at
+    ``[6, 8)``. Verified stable under the pipeline's left-alignment (POS
+    stays at 0-based 4 -- see task-2-report.md) so ``regions_overlap="pos"``
+    drops it while ``"variant"`` keeps it. This VCF is NOT the shared
+    ``_write_vcf`` fixture -- many other tests assert exact variant
+    counts/genotypes against that fixture's SNP+insertion-only contents.
+    """
+    body = (
+        "##fileformat=VCFv4.2\n"
+        "##contig=<ID=chr1,length=40>\n"
+        '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n'
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS0\tS1\n"
+        "chr1\t5\t.\tTACA\tT\t.\t.\t.\tGT\t0|1\t1|1\n"
+        "chr1\t7\t.\tC\tCAT\t.\t.\t.\tGT\t0|1\t1|1\n"
+    )
+    plain = d / "del_in.vcf"
+    plain.write_text(body)
+    gz = d / "del_in.vcf.gz"
+    with open(gz, "wb") as fh:
+        subprocess.run(["bgzip", "-c", str(plain)], check=True, stdout=fh)
+    subprocess.run(["bcftools", "index", str(gz)], check=True)
+    return gz
+
+
+def test_from_vcf_regions_overlap_variant_keeps_spanning_deletion(tmp_path: Path):
+    ref = _write_ref(tmp_path)
+    vcf = _write_vcf_with_spanning_deletion(tmp_path)
+    out = tmp_path / "variant_mode"
+    SparseVar2.from_vcf(
+        out, vcf, ref, regions="chr1:7-12", regions_overlap="variant", threads=1
+    )
+    sv = SparseVar2(out)
+    rag = sv.decode("chr1", [(0, 40)])
+    # POS 4 (0-based) is the spanning deletion; its extent overlaps the
+    # region even though its POS does not.
+    assert 4 in np.asarray(rag["pos"].data).tolist()
+
+
+def test_from_vcf_regions_overlap_pos_excludes_spanning_deletion(tmp_path: Path):
+    ref = _write_ref(tmp_path)
+    vcf = _write_vcf_with_spanning_deletion(tmp_path)
+    out_v = tmp_path / "v"
+    out_p = tmp_path / "p"
+    SparseVar2.from_vcf(
+        out_v, vcf, ref, regions="chr1:7-12", regions_overlap="variant", threads=1
+    )
+    SparseVar2.from_vcf(
+        out_p, vcf, ref, regions="chr1:7-12", regions_overlap="pos", threads=1
+    )
+    counts_v = int(SparseVar2(out_v).region_counts("chr1", [(0, 40)]).sum())
+    counts_p = int(SparseVar2(out_p).region_counts("chr1", [(0, 40)]).sum())
+    assert counts_v > counts_p
+
+
 def test_from_vcf_samples_preserve_order(tmp_path: Path):
     ref = _write_ref(tmp_path)
     vcf = _write_vcf(tmp_path, symbolic=False, indexed=True)
