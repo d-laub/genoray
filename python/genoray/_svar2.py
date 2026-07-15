@@ -850,6 +850,9 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         sources: "str | Path | Sequence[str | Path]",
         reference: str | Path | None = None,
         *,
+        regions: "str | tuple[str, int, int] | PathLike | object | None" = None,
+        merge_overlapping: bool = False,
+        regions_overlap: "Literal['pos', 'record', 'variant']" = "pos",
         no_reference: bool = False,
         skip_out_of_scope: bool = False,
         ploidy: int = 2,
@@ -938,6 +941,23 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         file's value, and a sample that doesn't carry the atom gets the
         field's default.
 
+        `regions` restricts the merge to one or more indexed VCF fetch
+        intervals, with the same convention as :meth:`from_vcf`:
+        ``"chrom:start-end"`` is 1-based inclusive (converted to 0-based
+        half-open); tuple/BED/frame inputs are already 0-based half-open.
+        Overlapping regions raise unless `merge_overlapping=True`.
+        `regions_overlap` controls which variants a region keeps, matching
+        bcftools --regions-overlap: "pos" (POS inside [start,end)), "record"
+        (POS in [start,end+1), so an indel at the region's last base is
+        kept), or "variant" (the anchor-trimmed variant extent overlaps the
+        region). In "variant" mode a multiallelic record is kept whole if ANY
+        of its alleles truly overlaps the region; individual non-overlapping
+        alleles are not dropped. The mode applies identically to every input
+        file in the merge.
+
+        `from_vcf_list` has no `samples` parameter -- each input is
+        single-sample and the cohort is defined by `sources`.
+
         Returns the number of out-of-scope (symbolic/breakend) ALTs dropped
         (0 unless `skip_out_of_scope`).
 
@@ -949,6 +969,12 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         case-insensitive, so soft-masked (lowercase) reference bases match.
         """
         from cyvcf2 import VCF as _CyVCF
+
+        if regions_overlap not in {"pos", "record", "variant"}:
+            raise ValueError(
+                "regions_overlap must be one of 'pos', 'record', or 'variant'; "
+                f"got {regions_overlap!r}"
+            )
 
         out = Path(out)
 
@@ -995,6 +1021,24 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         if not contigs:
             raise ValueError("No variants found in any input.")
 
+        region_ranges = _normalize_svar2_regions(
+            regions,
+            sorted(contig_set),
+            merge_overlapping=merge_overlapping,
+        )
+        if regions is not None:
+            ranges_by_contig: dict[str, list[tuple[int, int]]] = {}
+            for chrom, start, end in region_ranges:
+                ranges_by_contig.setdefault(chrom, []).append((start, end))
+            contigs = [c for c in contigs if c in ranges_by_contig]
+            if not contigs:
+                raise ValueError("No requested regions match any input contig.")
+            region_ranges = [
+                (chrom, start, end)
+                for chrom in contigs
+                for start, end in ranges_by_contig[chrom]
+            ]
+
         # Field specs are resolved against the FIRST file's header -- every
         # input is single-sample and expected to share a header schema (same
         # assumption the reference/samples handling already makes).
@@ -1018,6 +1062,8 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             info,
             format_,
             check_ref,
+            region_ranges,
+            regions_overlap,
         )
 
     @classmethod

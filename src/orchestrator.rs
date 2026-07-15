@@ -67,6 +67,8 @@ pub enum SourceSpec {
         /// files are open concurrently per contig, unlike the single-file
         /// `Vcf` variant.
         htslib_threads: usize,
+        regions: Vec<(u32, u32)>,
+        overlap: crate::svar2_view::OverlapMode,
     },
     Svar1 {
         svar1_dir: String,
@@ -267,6 +269,8 @@ pub fn process_chromosome(
                     SourceSpec::VcfList {
                         vcf_paths,
                         htslib_threads,
+                        regions,
+                        overlap,
                     } => {
                         let ref_seq_opt: Option<Vec<u8>> = match fasta.as_deref() {
                             Some(f) => Some(crate::vcf_reader::load_contig_seq(f, &chr)?),
@@ -282,6 +286,8 @@ pub fn process_chromosome(
                             skip_out_of_scope,
                             check_ref,
                             &fields_owned,
+                            regions,
+                            overlap,
                         )?;
                         Box::new(VcfListDroppedProxy {
                             inner: vcf_list,
@@ -610,6 +616,8 @@ pub fn run_vcf_list(
     signatures: bool,
     info_fields: Vec<(String, String, String, Option<String>, Option<f64>)>,
     format_fields: Vec<(String, String, String, Option<String>, Option<f64>)>,
+    region_ranges: Vec<(String, u32, u32)>,
+    overlap: crate::svar2_view::OverlapMode,
 ) -> Result<u64, ConversionError> {
     // Each open input file uses its own small, fixed HTSlib thread allocation
     // (there are N files open at once per contig, unlike the single-file
@@ -621,6 +629,12 @@ pub fn run_vcf_list(
     let mut raw = info_fields;
     raw.extend(format_fields);
     let fields = crate::field::parse_manifest(raw)?;
+
+    let mut ranges_by_chrom: std::collections::HashMap<String, Vec<(u32, u32)>> =
+        std::collections::HashMap::new();
+    for (chrom, start, end) in region_ranges {
+        ranges_by_chrom.entry(chrom).or_default().push((start, end));
+    }
 
     let available_cores = match max_threads {
         Some(t) if t > 0 => {
@@ -657,6 +671,8 @@ pub fn run_vcf_list(
             SourceSpec::VcfList {
                 vcf_paths: vcf_paths.to_vec(),
                 htslib_threads: VCF_LIST_HTSLIB_THREADS,
+                regions: ranges_by_chrom.get(chrom).cloned().unwrap_or_default(),
+                overlap,
             },
             fasta_ref,
             chrom,

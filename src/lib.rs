@@ -805,7 +805,7 @@ fn svar2_variant_stats<'py>(
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 #[pyfunction]
-#[pyo3(signature = (vcf_paths, reference_path, chroms, output_dir, samples, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false, signatures=false, info_fields=Vec::new(), format_fields=Vec::new(), check_ref="e".to_string()))]
+#[pyo3(signature = (vcf_paths, reference_path, chroms, output_dir, samples, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false, signatures=false, info_fields=Vec::new(), format_fields=Vec::new(), check_ref="e".to_string(), region_ranges=Vec::new(), regions_overlap="pos".to_string()))]
 fn run_vcf_list_conversion_pipeline(
     py: Python,
     vcf_paths: Vec<String>,
@@ -822,8 +822,14 @@ fn run_vcf_list_conversion_pipeline(
     info_fields: Vec<(String, String, String, Option<String>, Option<f64>)>,
     format_fields: Vec<(String, String, String, Option<String>, Option<f64>)>,
     check_ref: String,
+    region_ranges: Vec<(String, u32, u32)>,
+    regions_overlap: String,
 ) -> PyResult<usize> {
     let check_ref: crate::normalize::CheckRef = check_ref.parse().map_err(PyValueError::new_err)?;
+    // Parse the region-overlap mode once, up front, so a bad value raises
+    // before any output byte is written -- mirrors `run_conversion_pipeline`.
+    let overlap_mode = crate::svar2_view::parse_overlap_mode(&regions_overlap)?;
+
     let dropped: u64 = py.detach(|| {
         orchestrator::run_vcf_list(
             &vcf_paths,
@@ -840,6 +846,8 @@ fn run_vcf_list_conversion_pipeline(
             signatures,
             info_fields,
             format_fields,
+            region_ranges,
+            overlap_mode,
         )
     })?;
     Ok(dropped as usize)

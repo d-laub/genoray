@@ -90,6 +90,47 @@ def test_from_vcf_list_disjoint_sites_hom_ref_fill(tmp_path: Path):
     assert counts.tolist() == [1, 0, 0, 1]
 
 
+def test_from_vcf_list_regions_restricts(tmp_path: Path):
+    """`regions` restricts the k-way merge to the requested interval, exactly
+    as it restricts `from_vcf` -- exercised here through `from_vcf_list`'s
+    delegation into `orchestrator::run_vcf_list`'s per-contig `SourceSpec::
+    VcfList { regions, overlap }`, not the single-file `SourceSpec::Vcf` path.
+
+    SA's SNP@0-based-pos-2 (VCF POS 3) is INSIDE `chr1:1-4` (1-based
+    inclusive -> 0-based half-open [0,4)); SB's insertion@0-based-pos-6 (VCF
+    POS 7) is OUTSIDE it. Both samples must still appear in the store (region
+    filtering is per-variant, not per-sample), but only SA's variant should
+    survive -- proven both directly (`region_counts` on the full contig span)
+    and relative to an unrestricted conversion of the identical inputs.
+    """
+    ref = _write_ref(tmp_path)
+    a = _ss(tmp_path, "a", "SA", "chr1\t3\t.\tA\tG\t.\t.\t.\tGT\t1|0\n")
+    b = _ss(tmp_path, "b", "SB", "chr1\t7\t.\tC\tCAT\t.\t.\t.\tGT\t0|1\n")
+
+    out = tmp_path / "vl_regions"
+    SparseVar2.from_vcf_list(out, [a, b], ref, regions="chr1:1-4", threads=1)
+    sv = SparseVar2(out)
+    assert sv.available_samples == ["SA", "SB"]
+    restricted_count = int(sv.region_counts("chr1", [(0, 40)]).sum())
+    assert restricted_count >= 1
+
+    full = tmp_path / "vl_full"
+    SparseVar2.from_vcf_list(full, [a, b], ref, threads=1)
+    full_count = int(SparseVar2(full).region_counts("chr1", [(0, 40)]).sum())
+    assert restricted_count < full_count
+
+
+def test_from_vcf_list_regions_no_match_raises(tmp_path: Path):
+    """A region that doesn't overlap any input contig must raise, not
+    silently produce an empty/nonsensical store."""
+    ref = _write_ref(tmp_path)
+    a = _ss(tmp_path, "a", "SA", "chr1\t3\t.\tA\tG\t.\t.\t.\tGT\t1|0\n")
+    with pytest.raises(ValueError, match="[Nn]o requested regions"):
+        SparseVar2.from_vcf_list(
+            tmp_path / "s", [a], ref, regions="chr2:1-4", threads=1
+        )
+
+
 def test_from_vcf_list_shared_site_one_variant(tmp_path: Path):
     ref = _write_ref(tmp_path)
     a = _ss(tmp_path, "a", "SA", "chr1\t3\t.\tA\tG\t.\t.\t.\tGT\t1|0\n")

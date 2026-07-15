@@ -70,6 +70,8 @@ fn vcf_list_e2e_two_samples_one_store() {
         false,
         Vec::new(),
         Vec::new(),
+        Vec::new(),
+        genoray_core::svar2_view::OverlapMode::Pos,
     )
     .expect("run_vcf_list should succeed");
 
@@ -207,5 +209,103 @@ fn vcf_list_e2e_two_samples_one_store() {
     assert!(
         genoray_core::bits::get_bit(&dindel_geno, 3),
         "SB hap1 must carry the INS"
+    );
+}
+
+/// `regions`/`overlap` must restrict the k-way merge to in-region variants,
+/// mirroring the single-VCF `SourceSpec::Vcf` path
+/// (`test_e2e_normalized_bcf_pipeline` in `tests/test_e2e.rs`) but exercised
+/// through `run_vcf_list`'s `SourceSpec::VcfList` delegation instead. Two
+/// files, disjoint sites (same layout as
+/// `vcf_list_e2e_two_samples_one_store` above): SA's SNP at 0-based pos 2 is
+/// IN the requested region `[0, 5)`, SB's insertion at 0-based pos 6 is OUT --
+/// only the SNP should survive.
+#[test]
+fn vcf_list_e2e_regions_restricts_merge() {
+    let tmp = tempdir().unwrap();
+
+    let sa_records = vec![SynthRecord {
+        pos: 2,
+        ref_allele: b"A",
+        alts: vec![&b"G"[..]],
+        gt: vec![1, 1],
+    }];
+    let sb_records = vec![SynthRecord {
+        pos: 6,
+        ref_allele: b"C",
+        alts: vec![&b"CAT"[..]],
+        gt: vec![1, 1],
+    }];
+
+    let a_path = tmp.path().join("a.bcf");
+    let b_path = tmp.path().join("b.bcf");
+    build_bcf_with_index(&a_path, "chr1", 1000, &["SA"], &sa_records);
+    build_bcf_with_index(&b_path, "chr1", 1000, &["SB"], &sb_records);
+
+    let ref_path = tmp.path().join("ref.fa");
+    let mut all_records = sa_records;
+    all_records.extend(sb_records);
+    build_fasta_with_index(&ref_path, "chr1", 1000, &all_records);
+
+    let out = tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+
+    let vcf_paths = vec![
+        a_path.to_str().unwrap().to_string(),
+        b_path.to_str().unwrap().to_string(),
+    ];
+    let samples = vec!["SA".to_string(), "SB".to_string()];
+    let chroms = vec!["chr1".to_string()];
+
+    let dropped = run_vcf_list(
+        &vcf_paths,
+        Some(ref_path.to_str().unwrap()),
+        &chroms,
+        out.to_str().unwrap(),
+        &samples,
+        25_000,
+        2,
+        Some(1),
+        8_388_608,
+        false,
+        false,
+        Vec::new(),
+        Vec::new(),
+        vec![("chr1".to_string(), 0u32, 5u32)],
+        genoray_core::svar2_view::OverlapMode::Pos,
+    )
+    .expect("run_vcf_list should succeed");
+
+    // Region filtering happens per-record inside `VcfRecordSource`, upstream
+    // of atomization -- an out-of-region record never reaches
+    // `atomize_to_vcf_biallelic`, so it contributes 0 to the out-of-scope
+    // drop count (that count is for symbolic/breakend ALTs, not region
+    // exclusions).
+    assert_eq!(dropped, 0);
+
+    let contig_dir = out.join("chr1");
+
+    // dense/snp: SA's in-region SNP@pos2 must be present.
+    let dsnp = contig_dir.join("dense/snp");
+    let dsnp_pos = read_u32_bin(&dsnp.join("positions.bin"));
+    assert_eq!(
+        dsnp_pos,
+        vec![2u32],
+        "dense/snp should hold the in-region SNP@pos2"
+    );
+
+    // dense/indel: SB's out-of-region insertion@pos6 must be ABSENT -- the
+    // directory is still created unconditionally (see the sibling test's
+    // comment), so check the file is empty, not merely that it exists.
+    let dindel = contig_dir.join("dense/indel");
+    let p = dindel.join("positions.bin");
+    let len = if p.exists() {
+        read_u32_bin(&p).len()
+    } else {
+        0
+    };
+    assert_eq!(
+        len, 0,
+        "dense/indel should be empty -- SB's INS@pos6 lies outside chr1:0-5"
     );
 }
