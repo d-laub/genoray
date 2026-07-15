@@ -181,11 +181,8 @@ fn run_conversion_pipeline(
         println!("Using: {} cores.", available_cores);
         println!(
             "Pipeline Config: {} concurrent chromosomes | {} HTSlib decompression threads each \
-             ({} total active, {} reserved for OS/idle).",
-            concurrent_chroms,
-            htslib_threads,
-            total_active,
-            available_cores.saturating_sub(total_active),
+             ({} pipeline/BGZF threads, {} reader-side processing/shard threads).",
+            concurrent_chroms, htslib_threads, total_active, processing_threads,
         );
 
         // Step 2 -> Rayon Pool

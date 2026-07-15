@@ -391,24 +391,6 @@ pub fn process_chromosome(
         stop_sampler.clone(),
     );
 
-    // Dedicated rayon pool for reader-side CPU work: bounded per-record
-    // normalization batches plus intra-chunk presence packing. Sized to the idle
-    // cores (budget::plan_thread_budget). Built even at size 1 so the reader
-    // always has a handle; parallel work self-gates off below 2 threads.
-    // NOTE (multi-contig): process_chromosome runs once per concurrent contig, and
-    // each builds a pool of `processing_threads` — the *global* idle-core count — so
-    // N concurrent contigs allocate N pools and can oversubscribe. This is deliberate
-    // and harmless for the single-contig target (concurrent == 1, exact fit). If
-    // multi-contig normalization starts competing for these threads, divide by
-    // concurrent_chroms here.
-    let processing_pool = Arc::new(
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(processing_threads.max(1))
-            .thread_name(|i| format!("pack-{}", i))
-            .build()
-            .expect("build processing pool"),
-    );
-
     // Step 1 -> The Producer
     let reader_thread = thread::Builder::new()
         .name(format!("read-{}", chrom))
@@ -417,7 +399,6 @@ pub fn process_chromosome(
             let chr = chrom.to_string();
             // Convert references into owned Strings that can safely live forever in the thread
             let s_owned: Vec<String> = samples.iter().map(|&s| s.to_string()).collect();
-            let pool = Arc::clone(&processing_pool);
             let fields_owned: Vec<crate::field::FieldSpec> = fields.to_vec();
 
             move || -> Result<u64, ConversionError> {
@@ -529,6 +510,18 @@ pub fn process_chromosome(
                         &format_src_dtypes,
                     )?),
                 };
+
+                // Dedicated rayon pool for reader-side CPU work: bounded per-record
+                // normalization batches plus intra-chunk presence packing. The
+                // sharded VCF branch above returns before this point because its
+                // independent indexed readers consume the same `processing_threads`
+                // budget directly; building both would double-reserve cores.
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(processing_threads.max(1))
+                    .thread_name(|i| format!("pack-{}", i))
+                    .build()
+                    .expect("build processing pool");
+
                 let mut reader = crate::chunk_assembler::ChunkAssembler::new(
                     src,
                     s_refs.len(),
