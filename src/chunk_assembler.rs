@@ -28,6 +28,7 @@ struct PendingAtom {
 }
 
 struct DecomposedRecord {
+    source_pos: u32,
     atoms: Vec<PendingAtom>,
     dropped_out_of_scope: u64,
     ref_excluded: Option<String>,
@@ -258,8 +259,9 @@ pub struct ChunkAssembler {
     num_samples: usize,
     ploidy: usize,
     /// Full 0-based contig sequence, uppercased; empty when no reference was given.
-    ref_seq: Vec<u8>,
+    ref_seq: Arc<Vec<u8>>,
     has_reference: bool,
+    owned_range: Option<(u32, u32)>,
     skip_out_of_scope: bool,
     check_ref: crate::normalize::CheckRef,
     ref_excluded: u64,
@@ -293,6 +295,7 @@ fn decompose_raw_record(
             crate::normalize::RefDecision::Keep => {}
             crate::normalize::RefDecision::Exclude(err) => {
                 return Ok(DecomposedRecord {
+                    source_pos: pos,
                     atoms: Vec::new(),
                     dropped_out_of_scope: 0,
                     ref_excluded: Some(err.to_string()),
@@ -350,6 +353,7 @@ fn decompose_raw_record(
     }
 
     Ok(DecomposedRecord {
+        source_pos: pos,
         atoms: pending,
         dropped_out_of_scope: dropped as u64,
         ref_excluded: None,
@@ -369,15 +373,44 @@ impl ChunkAssembler {
         fields: &[FieldSpec],
     ) -> Result<Self, ConversionError> {
         let (ref_seq, has_reference) = match fasta_path {
-            Some(path) => (crate::vcf_reader::load_contig_seq(path, chrom)?, true),
-            None => (Vec::new(), false),
+            Some(path) => (
+                Arc::new(crate::vcf_reader::load_contig_seq(path, chrom)?),
+                true,
+            ),
+            None => (Arc::new(Vec::new()), false),
         };
-        Ok(Self {
+        Ok(Self::with_reference(
             source,
             num_samples,
             ploidy,
             ref_seq,
             has_reference,
+            skip_out_of_scope,
+            check_ref,
+            fields,
+            None,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn with_reference(
+        source: Box<dyn RecordSource + Send>,
+        num_samples: usize,
+        ploidy: usize,
+        ref_seq: Arc<Vec<u8>>,
+        has_reference: bool,
+        skip_out_of_scope: bool,
+        check_ref: crate::normalize::CheckRef,
+        fields: &[FieldSpec],
+        owned_range: Option<(u32, u32)>,
+    ) -> Self {
+        Self {
+            source,
+            num_samples,
+            ploidy,
+            ref_seq,
+            has_reference,
+            owned_range,
             skip_out_of_scope,
             check_ref,
             ref_excluded: 0,
@@ -396,7 +429,7 @@ impl ChunkAssembler {
             frontier: 0,
             eof: false,
             next_seq: 0,
-        })
+        }
     }
 
     /// Total out-of-scope (symbolic/breakend) ALTs dropped so far. Valid after the
@@ -444,7 +477,7 @@ impl ChunkAssembler {
                         decompose_raw_record(
                             rec,
                             record_seq,
-                            &self.ref_seq,
+                            self.ref_seq.as_slice(),
                             self.has_reference,
                             self.skip_out_of_scope,
                             self.check_ref,
@@ -462,7 +495,7 @@ impl ChunkAssembler {
                     decompose_raw_record(
                         rec,
                         record_seq,
-                        &self.ref_seq,
+                        self.ref_seq.as_slice(),
                         self.has_reference,
                         self.skip_out_of_scope,
                         self.check_ref,
@@ -475,20 +508,29 @@ impl ChunkAssembler {
         };
 
         for record in decomposed {
-            if let Some(err) = record.ref_excluded {
-                self.ref_excluded += 1;
-                if self.ref_excluded == 1 {
-                    println!(
-                        "Notice: check_ref=x excluding record(s) whose REF disagrees \
-                         with the reference (first: {err}); further exclusions on this \
-                         contig are counted, not printed."
-                    );
+            let source_record_owned = self
+                .owned_range
+                .is_none_or(|(start, end)| record.source_pos >= start && record.source_pos < end);
+            if source_record_owned {
+                self.dropped_out_of_scope += record.dropped_out_of_scope;
+                if let Some(err) = record.ref_excluded {
+                    self.ref_excluded += 1;
+                    if self.ref_excluded == 1 && self.owned_range.is_none() {
+                        println!(
+                            "Notice: check_ref=x excluding record(s) whose REF disagrees \
+                             with the reference (first: {err}); further exclusions on this \
+                             contig are counted, not printed."
+                        );
+                    }
                 }
-                continue;
             }
-            self.dropped_out_of_scope += record.dropped_out_of_scope;
             for atom in record.atoms {
-                self.heap.push(Reverse(atom));
+                let atom_owned = self
+                    .owned_range
+                    .is_none_or(|(start, end)| atom.pos >= start && atom.pos < end);
+                if atom_owned {
+                    self.heap.push(Reverse(atom));
+                }
             }
         }
         Ok(())

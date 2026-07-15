@@ -699,6 +699,16 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             ]
         else:
             contigs = [c for c in natsorted(v.seqnames) if next(v(c), None) is not None]
+            contig_lengths = {
+                chrom: int(length)
+                for chrom, length in zip(v.seqnames, getattr(v, "seqlens", []) or [])
+                if length is not None and int(length) > 0
+            }
+            region_ranges = [
+                (chrom, 0, contig_lengths[chrom])
+                for chrom in contigs
+                if chrom in contig_lengths
+            ]
         if not contigs:
             raise ValueError(f"No variants found in {source}.")
 
