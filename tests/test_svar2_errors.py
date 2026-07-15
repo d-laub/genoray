@@ -57,7 +57,7 @@ def test_sharded_ref_mismatch_includes_shard_region(tmp_path: Path):
     vcf = _write_vcf(tmp_path, "chr1\t3\t.\tG\tT\t.\t.\t.\tGT\t0|1\t0|0\n")
     with pytest.raises(
         ValueError,
-        match=r"VCF shard chr1.*ownership \[0, .*failed: REF 'G'.*disagrees",
+        match=r"VCF shard chr1.*ownership \[\d+, \d+\).*fetch \[\d+, \d+\).*failed: REF 'G'.*disagrees",
     ):
         SparseVar2.from_vcf(tmp_path / "store", vcf, ref, threads=16, chunk_size=5)
 
