@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import threading
 from pathlib import Path
 
 import polars as pl
@@ -55,6 +56,38 @@ def test_atomic_write_dir_overwrite_replaces(tmp_path: Path):
     assert (dest / "new.bin").read_bytes() == b"NEW"
     assert not (dest / "old.bin").exists()  # fully replaced, not merged
     assert [p.name for p in tmp_path.iterdir()] == ["out.svar"]
+
+
+def test_atomic_write_dir_no_overwrite_rechecks_at_publication(tmp_path: Path):
+    dest = tmp_path / "out.svar"
+    ready = threading.Barrier(2)
+    publish = threading.Event()
+    outcomes: list[str] = []
+
+    def writer(name: str) -> None:
+        try:
+            with atomic_write_dir(dest, overwrite=False) as staging:
+                (staging / "writer.txt").write_text(name)
+                ready.wait()
+                if name == "second":
+                    publish.wait()
+            outcomes.append(f"{name}:published")
+            if name == "first":
+                publish.set()
+        except FileExistsError:
+            outcomes.append(f"{name}:rejected")
+
+    first = threading.Thread(target=writer, args=("first",))
+    second = threading.Thread(target=writer, args=("second",))
+    second.start()
+    first.start()
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert sorted(outcomes) == ["first:published", "second:rejected"]
+    assert (dest / "writer.txt").read_text() == "first"
 
 
 def test_atomic_write_dir_failure_preserves_existing(tmp_path: Path):

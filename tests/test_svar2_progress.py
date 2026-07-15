@@ -127,6 +127,38 @@ def test_from_vcf_failure_preserves_output_and_never_emits_100(
     assert all(event.percent < 100.0 for event in events)
 
 
+def test_from_vcf_native_finalization_failure_reports_finalizing_phase(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    ref = _write_ref(tmp_path)
+    source = _write_vcf(tmp_path, symbolic=False, indexed=True)
+    events: list[ProgressEvent] = []
+
+    def fail_during_finalization(*args, **kwargs):
+        contig_callback = args[-2]
+        finalizing_callback = args[-1]
+        contig_callback("chr1")
+        finalizing_callback()
+        raise RuntimeError("finalization exploded")
+
+    monkeypatch.setattr(
+        svar2_module._core, "run_conversion_pipeline", fail_during_finalization
+    )
+
+    with pytest.raises(RuntimeError, match="finalization exploded"):
+        SparseVar2.from_vcf(
+            tmp_path / "store",
+            source,
+            ref,
+            threads=1,
+            progress_callback=events.append,
+        )
+
+    assert events[-1].state == "failed"
+    assert events[-1].phase == "finalizing"
+    assert events[-1].percent == 95.0
+
+
 def test_from_vcf_rejects_snapshot_inside_existing_output(tmp_path: Path):
     ref = _write_ref(tmp_path)
     source = _write_vcf(tmp_path, symbolic=False, indexed=True)

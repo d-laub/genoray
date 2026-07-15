@@ -50,6 +50,15 @@ def test_progress_event_is_json_serializable():
     json.dumps(payload)
 
 
+def test_progress_event_mappings_are_immutable():
+    event = _event()
+
+    with pytest.raises(TypeError):
+        event.identity["run_id"] = "mutated"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        event.details["contig"] = "chr2"  # type: ignore[index]
+
+
 def test_snapshot_sink_atomically_replaces_json(tmp_path):
     path = tmp_path / "progress" / "snapshot.json"
     sink = SnapshotSink(path)
@@ -59,6 +68,50 @@ def test_snapshot_sink_atomically_replaces_json(tmp_path):
 
     assert json.loads(path.read_text())["sequence"] == 2
     assert not list(path.parent.glob(f".{path.name}.*.tmp"))
+
+
+def test_snapshot_sink_writes_managed_nf_seqlab_protocol(tmp_path):
+    path = tmp_path / ".nf-seqlab-progress.json"
+    identity = {
+        "run_id": "aou-v8",
+        "stage_id": "build_svar2",
+        "process": "SEQLAB_BUILD_SVAR2",
+        "file_id": "chr22",
+        "parent_file_id": "chr22",
+        "task_id": "99/b6e5e2",
+        "attempt": "2",
+    }
+
+    SnapshotSink(path)(
+        _event(
+            phase="complete",
+            state="completed",
+            completed=2,
+            total=2,
+            percent=100.0,
+            identity=identity,
+            message=None,
+        )
+    )
+
+    assert json.loads(path.read_text()) == {
+        "schema": "nf-seqlab.progress/v1",
+        "run_id": "aou-v8",
+        "stage_id": "build_svar2",
+        "process": "SEQLAB_BUILD_SVAR2",
+        "file_id": "chr22",
+        "parent_file_id": "chr22",
+        "task_id": "99/b6e5e2",
+        "attempt": 2,
+        "state": "completed",
+        "phase": "complete",
+        "completed": 2,
+        "total": 2,
+        "unit": "contig",
+        "percent": 100.0,
+        "message": None,
+        "updated_at": "2026-07-14T00:00:00Z",
+    }
 
 
 def test_context_reads_env_identity_and_explicit_values_win(
@@ -92,6 +145,35 @@ def test_context_reads_env_identity_and_explicit_values_win(
         "cohort": "ADNI",
     }
     assert json.loads(snapshot.read_text())["identity"] == events[0].identity
+
+
+def test_context_disables_a_failing_progress_callback():
+    calls = 0
+
+    def fail(_event: ProgressEvent) -> None:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("dashboard unavailable")
+
+    context = ProgressContext("svar2.from_vcf", callback=fail)
+    context.emit(
+        phase="preparing",
+        state="running",
+        completed=0,
+        total=2,
+        unit="contig",
+        percent=0.0,
+    )
+    context.emit(
+        phase="preparing",
+        state="completed",
+        completed=0,
+        total=2,
+        unit="contig",
+        percent=5.0,
+    )
+
+    assert calls == 1
 
 
 def test_context_rejects_regressive_phase_and_percent():

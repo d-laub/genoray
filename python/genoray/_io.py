@@ -7,6 +7,8 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
+from filelock import FileLock
+
 
 def _unique_sibling(dest: Path, suffix: str) -> Path:
     """Return a not-yet-existing sibling path of *dest* with *suffix* injected.
@@ -48,7 +50,7 @@ def atomic_write_path(dest: Path) -> Iterator[Path]:
 
 
 @contextmanager
-def atomic_write_dir(dest: Path) -> Iterator[Path]:
+def atomic_write_dir(dest: Path, *, overwrite: bool = True) -> Iterator[Path]:
     """Write a directory atomically: yield a sibling staging dir to populate, then
     swap it into place on clean exit.
 
@@ -59,7 +61,9 @@ def atomic_write_dir(dest: Path) -> Iterator[Path]:
     is always cleaned up; on an exception in the body *dest* is left untouched.
 
     The staging dir is created in ``dest.parent`` (same filesystem) so the swap is
-    a true atomic rename and intermediate writes never cross devices.
+    a true atomic rename and intermediate writes never cross devices. When
+    ``overwrite`` is false, a sibling lock serializes the final existence check
+    and rename so racing writers cannot replace a completed output.
     """
     dest = Path(dest)
     staging = Path(
@@ -68,10 +72,20 @@ def atomic_write_dir(dest: Path) -> Iterator[Path]:
     backup: Path | None = None
     try:
         yield staging
-        if dest.exists():
-            backup = _unique_sibling(dest, ".old")
-            os.replace(dest, backup)
-        os.replace(staging, dest)
+        if overwrite:
+            if dest.exists():
+                backup = _unique_sibling(dest, ".old")
+                os.replace(dest, backup)
+            os.replace(staging, dest)
+        else:
+            lock = FileLock(str(dest.with_name(f".{dest.name}.lock")))
+            with lock:
+                if dest.exists():
+                    raise FileExistsError(
+                        f"Output path {dest} already exists. "
+                        "Use overwrite=True to overwrite."
+                    )
+                os.replace(staging, dest)
     except BaseException:
         # If we moved dest aside but failed before/at the swap, roll it back.
         if backup is not None and backup.exists() and not dest.exists():

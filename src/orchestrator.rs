@@ -12,6 +12,7 @@ use crate::streams::{REGISTRY, StreamMap, StreamTag};
 use crate::{executor, merge, monitor, writer};
 
 pub type ContigProgressCallback = Arc<dyn Fn(&str) -> Result<(), ConversionError> + Send + Sync>;
+pub type FinalizingProgressCallback = Arc<dyn Fn() -> Result<(), ConversionError> + Send + Sync>;
 
 /*
 ARCHITECTURE & TENSOR LAYOUT LIFECYCLE
@@ -622,6 +623,7 @@ pub fn run_vcf_list(
         info_fields,
         format_fields,
         None,
+        None,
     )
 }
 
@@ -642,6 +644,7 @@ pub fn run_vcf_list_with_progress(
     info_fields: Vec<(String, String, String, Option<String>, Option<f64>)>,
     format_fields: Vec<(String, String, String, Option<String>, Option<f64>)>,
     progress_callback: Option<&ContigProgressCallback>,
+    finalizing_callback: Option<&FinalizingProgressCallback>,
 ) -> Result<u64, ConversionError> {
     // Each open input file uses its own small, fixed HTSlib thread allocation
     // (there are N files open at once per contig, unlike the single-file
@@ -709,6 +712,10 @@ pub fn run_vcf_list_with_progress(
         }
     }
     println!("Cohort Processing Complete.");
+
+    if let Some(callback) = finalizing_callback {
+        callback()?;
+    }
 
     // All contigs staged — resolve each field's global on-disk dtype and
     // rewrite its staged values.bin files to that width.

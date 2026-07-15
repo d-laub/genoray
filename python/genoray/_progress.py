@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import os
+import logging
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Literal
 
 from tqdm.auto import tqdm
@@ -28,6 +30,16 @@ _DEFAULT_PHASE_ORDER = (
     "publishing",
     "complete",
 )
+_MANAGED_IDENTITY_FIELDS = (
+    "run_id",
+    "stage_id",
+    "process",
+    "file_id",
+    "parent_file_id",
+    "task_id",
+    "attempt",
+)
+_logger = logging.getLogger("genoray.progress")
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +58,10 @@ class ProgressEvent:
     identity: Mapping[str, str] = field(default_factory=dict)
     message: str | None = None
     details: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "identity", MappingProxyType(dict(self.identity)))
+        object.__setattr__(self, "details", MappingProxyType(dict(self.details)))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -76,10 +92,33 @@ class SnapshotSink:
         import json
 
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = event.to_dict()
+        if all(event.identity.get(field) for field in _MANAGED_IDENTITY_FIELDS):
+            try:
+                attempt = int(event.identity["attempt"])
+            except (TypeError, ValueError):
+                pass
+            else:
+                payload = {
+                    "schema": "nf-seqlab.progress/v1",
+                    **{
+                        field: event.identity[field]
+                        for field in _MANAGED_IDENTITY_FIELDS
+                        if field != "attempt"
+                    },
+                    "attempt": attempt,
+                    "state": event.state,
+                    "phase": event.phase,
+                    "completed": event.completed,
+                    "total": event.total,
+                    "unit": event.unit,
+                    "percent": event.percent,
+                    "message": event.message,
+                    "updated_at": event.timestamp.isoformat().replace("+00:00", "Z"),
+                }
         with atomic_write_path(self.path) as temporary:
             temporary.write_text(
-                json.dumps(event.to_dict(), sort_keys=True, separators=(",", ":"))
-                + "\n"
+                json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
             )
 
 
@@ -256,8 +295,18 @@ class ProgressContext:
             self._terminal = state == "failed" or (
                 phase == "complete" and state == "completed"
             )
+            active_sinks: list[ProgressCallback] = []
             for sink in self._sinks:
-                sink(event)
+                try:
+                    sink(event)
+                except Exception:
+                    _logger.warning(
+                        "progress callback failed; disabling it",
+                        exc_info=True,
+                    )
+                else:
+                    active_sinks.append(sink)
+            self._sinks = active_sinks
             return event
 
 
@@ -273,6 +322,10 @@ class _ConversionProgress:
     @property
     def callback(self) -> Callable[[str], None] | None:
         return self.contig_completed if self.context.enabled else None
+
+    @property
+    def finalizing_callback(self) -> Callable[[], None] | None:
+        return self.finalizing if self.context.enabled else None
 
     def start(self) -> None:
         total = len(self._contigs)
@@ -321,6 +374,17 @@ class _ConversionProgress:
                 message=f"converted {contig}",
                 details={"contig": contig, "span_kind": "contig"},
             )
+
+    def finalizing(self) -> None:
+        total = len(self._contigs)
+        self.context.emit(
+            phase="finalizing",
+            state="running",
+            completed=total,
+            total=total,
+            unit="contig",
+            percent=95.0,
+        )
 
     def finalized(self) -> None:
         total = len(self._contigs)

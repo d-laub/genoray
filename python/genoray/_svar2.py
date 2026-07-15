@@ -585,7 +585,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         reporter = _ConversionProgress(progress_context, contigs)
         with progress_context:
             reporter.start()
-            with atomic_write_dir(out) as staging:
+            with atomic_write_dir(out, overwrite=overwrite) as staging:
                 dropped = _core.run_conversion_pipeline(
                     str(source),
                     reference_path,
@@ -602,6 +602,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
                     format_,
                     check_ref,
                     reporter.callback,
+                    reporter.finalizing_callback,
                 )
                 reporter.finalized()
                 reporter.publishing()
@@ -910,7 +911,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         reporter = _ConversionProgress(progress_context, contigs)
         with progress_context:
             reporter.start()
-            with atomic_write_dir(out) as staging:
+            with atomic_write_dir(out, overwrite=overwrite) as staging:
                 dropped = _core.run_vcf_list_conversion_pipeline(
                     [str(p) for p in paths],
                     None if no_reference else str(reference),
@@ -927,6 +928,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
                     format_,
                     check_ref,
                     reporter.callback,
+                    reporter.finalizing_callback,
                 )
                 reporter.finalized()
                 reporter.publishing()
