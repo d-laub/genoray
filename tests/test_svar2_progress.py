@@ -201,6 +201,26 @@ def test_from_vcf_list_wires_structured_progress(tmp_path: Path):
     assert (out / "meta.json").is_file()
 
 
+def test_from_vcf_list_progress_preserves_check_ref_policy(tmp_path: Path):
+    ref = _write_ref(tmp_path)
+    bad = _ss(tmp_path, "bad", "SA", "chr1\t3\t.\tG\tT\t.\t.\t.\tGT\t1|0\n")
+    good = _ss(tmp_path, "good", "SB", "chr1\t7\t.\tC\tT\t.\t.\t.\tGT\t0|1\n")
+    out = tmp_path / "store"
+    events: list[ProgressEvent] = []
+
+    SparseVar2.from_vcf_list(
+        out,
+        [bad, good],
+        ref,
+        threads=1,
+        check_ref="x",
+        progress_callback=events.append,
+    )
+
+    assert events[-1].percent == 100.0
+    assert int(SparseVar2(out).region_counts("chr1", [(0, 40)]).sum()) == 1
+
+
 def test_from_vcf_list_rejects_env_snapshot_inside_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
