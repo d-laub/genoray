@@ -150,6 +150,37 @@ def test_from_vcf_explicit_none_matches_default(tmp_path: Path):
     )
 
 
+def test_from_vcf_parallel_normalization_matches_single_thread(tmp_path: Path):
+    ref = _write_ref(tmp_path)
+    vcf = _write_vcf(tmp_path, symbolic=False, indexed=True)
+
+    seq_out = tmp_path / "seq"
+    par_out = tmp_path / "par"
+    SparseVar2.from_vcf(seq_out, vcf, ref, threads=1)
+    SparseVar2.from_vcf(par_out, vcf, ref, threads=16)
+
+    seq = SparseVar2(seq_out)
+    par = SparseVar2(par_out)
+    assert par.available_samples == seq.available_samples
+    assert par.contigs == seq.contigs
+    np.testing.assert_array_equal(
+        par.region_counts("chr1", [(0, 40)]),
+        seq.region_counts("chr1", [(0, 40)]),
+    )
+
+    seq_dec = seq.decode("chr1", [(0, 40)])
+    par_dec = par.decode("chr1", [(0, 40)])
+    for field in ("pos", "ilen", "allele"):
+        np.testing.assert_array_equal(
+            np.asarray(par_dec[field].data),
+            np.asarray(seq_dec[field].data),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(par_dec[field].lengths),
+            np.asarray(seq_dec[field].lengths),
+        )
+
+
 def test_from_vcf_requires_reference_or_opt_out(tmp_path: Path):
     vcf = _write_vcf(tmp_path, symbolic=False, indexed=True)
     with pytest.raises(ValueError, match="reference"):
