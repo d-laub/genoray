@@ -54,12 +54,21 @@ pub fn plan_pgen_units(positions: &[u32], max_shards: usize, pad: u32) -> Vec<Pg
             fetch_lo -= 1;
         }
 
-        // Extend fetch_hi rightward while the next variant is within `pad`
-        // of positions[own_hi - 1] (one variant at a time).
+        // Extend fetch_hi to include every variant within `pad` of the OWNERSHIP
+        // BOUNDARY position (positions[own_hi]) -- a variant at/after the boundary
+        // can left-align by up to `pad` INTO this shard's owned [.., own_end)
+        // range, so it must be fetched even across a wide inter-variant gap.
+        // Anchoring on positions[own_hi-1] (last owned) under-fetches when
+        // gap(own_hi-1, own_hi) > pad, dropping a boundary indel from BOTH shards.
+        // Mirrors VCF shard::plan_ranges (fetch_end = own_end + pad).
         let mut fetch_hi = own_hi;
-        while fetch_hi < n && positions[fetch_hi] - positions[own_hi - 1] <= pad {
-            fetch_hi += 1;
+        if own_hi < n {
+            let boundary = positions[own_hi];
+            while fetch_hi < n && positions[fetch_hi] - boundary <= pad {
+                fetch_hi += 1;
+            }
         }
+        // own_hi == n (last shard): owns to u32::MAX; fetch_hi stays n.
 
         units.push(PgenUnit {
             own_lo,
@@ -78,15 +87,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn equal_count_split_no_padding_when_gaps_wide() {
-        // positions far apart => pad pulls in no neighbors.
+    fn fetches_boundary_variant_even_across_wide_gap() {
+        // positions far apart => left/right *interior* pads pull in no neighbors,
+        // BUT unit0 must still fetch the ownership-boundary variant at index 2
+        // (pos 2000): a boundary indel there can left-align up to 5bp into
+        // unit0's owned [0, 2000) range, so under-fetching it would drop it from
+        // both shards. Anchoring fetch_hi on the boundary position (not the last
+        // owned variant) makes unit0 fetch index 2.
         let pos = vec![0, 1000, 2000, 3000];
         let u = plan_pgen_units(&pos, 2, 5);
         assert_eq!(u.len(), 2);
         assert_eq!((u[0].own_lo, u[0].own_hi), (0, 2));
         assert_eq!((u[1].own_lo, u[1].own_hi), (2, 4));
-        assert_eq!((u[0].fetch_lo, u[0].fetch_hi), (0, 2)); // no neighbor within 5bp
-        assert_eq!((u[1].fetch_lo, u[1].fetch_hi), (2, 4));
+        assert_eq!((u[0].fetch_lo, u[0].fetch_hi), (0, 3)); // fetches boundary idx 2
+        assert_eq!((u[1].fetch_lo, u[1].fetch_hi), (2, 4)); // last shard: owns to the end
     }
 
     #[test]
@@ -96,6 +110,19 @@ mod tests {
         let u = plan_pgen_units(&pos, 2, 5);
         assert_eq!((u[1].own_lo, u[1].own_hi), (2, 4));
         assert_eq!(u[1].fetch_lo, 1); // pulled in the close left neighbor for left-align context
+    }
+
+    #[test]
+    fn fetches_boundary_indel_across_gap_wider_than_pad() {
+        // idx1(pos 10) and idx2(pos 2000) are 1990bp apart (> pad); unit0 must STILL
+        // fetch idx2 because a boundary indel there can left-align into unit0's range.
+        // This test FAILS under the old anchor (positions[own_hi-1]=pos 10, so
+        // 2000-10=1990 > 5 => old fetch_hi stays 2); it passes only when fetch_hi
+        // anchors on the ownership boundary positions[own_hi]=pos 2000.
+        let pos = vec![0, 10, 2000, 2010];
+        let u = plan_pgen_units(&pos, 2, 5);
+        assert_eq!((u[0].own_lo, u[0].own_hi), (0, 2));
+        assert_eq!(u[0].fetch_hi, 3); // fetches the boundary variant idx2 despite the wide gap
     }
 
     #[test]
