@@ -314,7 +314,16 @@ def _parse_args() -> argparse.Namespace:
         "--chunk-sizes", type=int, nargs="+", default=DEFAULT_CHUNK_SIZES
     )
     parser.add_argument("--repeats", type=int, default=1)
-    parser.add_argument("--jsonl", type=Path)
+    parser.add_argument(
+        "--jsonl",
+        type=Path,
+        help=(
+            "Write one JSON object per row to this path. Raw rows are appended "
+            "incrementally as each conversion finishes (crash-durable); when the "
+            "full sweep completes the file is rewritten with the scaling-enriched "
+            "rows (speedup/efficiency added)."
+        ),
+    )
     parser.add_argument("--keep-outputs", action="store_true")
     parser.add_argument("--no-reference", action="store_true")
     parser.add_argument("--skip-out-of-scope", action="store_true")
@@ -379,6 +388,13 @@ def main() -> None:
         raise SystemExit("provide --reference or --no-reference")
     if args.repeats < 1:
         raise SystemExit("--repeats must be positive")
+    if args.backend == "pgen" and (args.regions or args.samples):
+        raise SystemExit(
+            "--backend pgen does not support --regions/--samples: "
+            "SparseVar2.from_pgen ignores them, so recording them in the row "
+            "would falsely imply a filter was applied. Drop those flags or use "
+            "--backend vcf."
+        )
 
     samples = args.samples
     if args.sample_count is not None:
@@ -446,6 +462,12 @@ def main() -> None:
                                 )
                     print("  " + json.dumps(row, sort_keys=True), flush=True)
                 rows.append(row)
+                # Append the raw row immediately so a crash mid-sweep still
+                # leaves durable per-row output; the file is rewritten with the
+                # scaling-enriched rows once the full sweep completes.
+                if args.jsonl is not None:
+                    with args.jsonl.open("a") as fh:
+                        fh.write(json.dumps(row, sort_keys=True) + "\n")
                 if not args.keep_outputs and output.exists():
                     shutil.rmtree(output)
 
