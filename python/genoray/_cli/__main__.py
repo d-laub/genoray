@@ -89,14 +89,20 @@ def write_svar2(
     check_ref: Annotated[Literal["e", "x"], Parameter(name="--check-ref")] = "e",
 ) -> None:
     """
-    Convert a bgzipped VCF, BCF, or PLINK2 PGEN to an SVAR2 store (the default, better-across-the-board format).
+    Convert a bgzipped VCF, BCF, PLINK2 PGEN, or SVAR1 store to an SVAR2 store
+    (the default, better-across-the-board format).
 
     Parameters
     ----------
     source
-        Path to a bgzipped VCF (``.vcf.gz``), BCF (``.bcf``), or PLINK2 PGEN
-        (``.pgen``, with its ``.pvar``/``.pvar.zst`` and ``.psam`` siblings).
-        VCF/BCF inputs are auto-indexed (``.csi``) if no index is present.
+        Path to a bgzipped VCF (``.vcf.gz``), BCF (``.bcf``), PLINK2 PGEN
+        (``.pgen``, with its ``.pvar``/``.pvar.zst`` and ``.psam`` siblings),
+        or SVAR1 store (a ``*.svar`` directory). VCF/BCF inputs are
+        auto-indexed (``.csi``) if no index is present. A directory (other
+        than a ``.svar`` store) or any other file is treated as the
+        multi-file (vcf-list) form: a directory of single-sample
+        ``*.vcf.gz``/``*.bcf`` files, or a manifest listing them one per
+        line; see :meth:`SparseVar2.from_vcf_list`.
     out
         Path to the output SVAR2 directory.
     reference
@@ -108,24 +114,29 @@ def write_svar2(
         already normalized. Use only for pre-normalized (e.g. ``bcftools norm``)
         inputs.
     regions
-        VCF/BCF only. Inline region(s): a single ``chrom:start-end`` (1-based
-        inclusive, bcftools convention) or a comma-separated list. Mutually
-        exclusive with --regions-file.
+        Inline region(s): a single ``chrom:start-end`` (1-based inclusive,
+        bcftools convention) or a comma-separated list. Mutually exclusive
+        with --regions-file. Supported for every source form, including the
+        multi-file (vcf-list) directory/manifest form.
     regions_file
-        VCF/BCF only. Path to a BED file (0-based half-open) of regions.
-        Mutually exclusive with --regions.
+        Path to a BED file (0-based half-open) of regions. Mutually exclusive
+        with --regions. Same source support as --regions.
     samples
-        VCF/BCF only. Comma-separated list of sample names to keep, e.g.
-        ``A,B,C``. Mutually exclusive with --samples-file.
+        Comma-separated list of sample names to keep, e.g. ``A,B,C``.
+        Mutually exclusive with --samples-file. Supported for VCF/BCF, PGEN,
+        and SVAR1 sources; rejected for the multi-file (vcf-list) form, where
+        each input file already contributes exactly one sample.
     samples_file
-        VCF/BCF only. Path to a file of sample names (one per line). Mutually
-        exclusive with --samples.
+        Path to a file of sample names (one per line). Mutually exclusive
+        with --samples. Same source support as --samples.
     merge_overlapping
         If set, silently merge overlapping regions instead of raising.
     regions_overlap
-        How VCF records are fetched for regions: ``pos`` (default) or
-        ``record``. ``variant`` is reserved for the follow-up sub-contig
-        normalization work and currently raises from ``SparseVar2.from_vcf``.
+        How records are matched against regions: ``pos`` (default, POS inside
+        the region), ``record`` (POS in ``[start, end+1)``, so an indel at
+        the region's last base is kept), or ``variant`` (the anchor-trimmed
+        variant extent overlaps the region; a multiallelic record is kept
+        whole if any of its alleles truly overlaps).
     ploidy
         Ploidy of the samples. Default 2. VCF/BCF only — PGEN is diploid.
     chunk_size
@@ -172,11 +183,10 @@ def write_svar2(
         samples_arg = None
 
     skip_out_of_scope = skip_symbolics_and_breakends
+    is_single_vcf = source.is_file() and (
+        source.name.endswith(".vcf.gz") or source.suffix == ".bcf"
+    )
     if source.suffix == ".pgen":
-        if regions_arg is not None or samples_arg is not None:
-            raise ValueError(
-                "--regions/--samples are currently supported for VCF/BCF only"
-            )
         if ploidy != 2:
             raise ValueError(
                 "PGEN is diploid; --ploidy is only meaningful for VCF/BCF sources."
@@ -185,9 +195,53 @@ def write_svar2(
             out,
             source,
             reference,
+            regions=regions_arg,
+            samples=samples_arg,
+            merge_overlapping=merge_overlapping,
+            regions_overlap=regions_overlap,
             no_reference=no_reference,
             skip_out_of_scope=skip_out_of_scope,
             chunk_size=chunk_size,
+            threads=threads,
+            overwrite=overwrite,
+            long_allele_capacity=long_allele_capacity,
+            check_ref=check_ref,
+        )
+    elif source.suffix == ".svar":
+        dropped = SparseVar2.from_svar1(
+            out,
+            source,
+            reference,
+            regions=regions_arg,
+            samples=samples_arg,
+            merge_overlapping=merge_overlapping,
+            regions_overlap=regions_overlap,
+            no_reference=no_reference,
+            skip_out_of_scope=skip_out_of_scope,
+            chunk_size=chunk_size,
+            threads=threads,
+            overwrite=overwrite,
+            long_allele_capacity=long_allele_capacity,
+            check_ref=check_ref,
+        )
+    elif not is_single_vcf:
+        # Directory of VCFs, or a manifest file listing them (vcf-list form).
+        if samples_arg is not None:
+            raise ValueError(
+                "--samples is not supported for multi-file (vcf-list) input; "
+                "each input file contributes its own sample."
+            )
+        dropped = SparseVar2.from_vcf_list(
+            out,
+            source,
+            reference,
+            regions=regions_arg,
+            merge_overlapping=merge_overlapping,
+            regions_overlap=regions_overlap,
+            no_reference=no_reference,
+            skip_out_of_scope=skip_out_of_scope,
+            ploidy=ploidy,
+            chunk_size=chunk_size if chunk_size is not None else 25_000,
             threads=threads,
             overwrite=overwrite,
             long_allele_capacity=long_allele_capacity,

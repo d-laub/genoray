@@ -754,24 +754,36 @@ genoray write file.vcf.gz out.svar2 --reference ref.fa
 genoray write file.vcf.gz out.svar2 --no-reference
 genoray write file.vcf.gz out.svar2 --reference ref.fa --skip-symbolics-and-breakends --threads 4
 genoray write file.pgen out.svar2 --reference ref.fa
+genoray write file.pgen out.svar2 --no-reference --regions chr1:1-1000 --samples A,B
+genoray write store.svar out.svar2 --no-reference --samples A,B
+genoray write vcf_dir/ out.svar2 --no-reference --regions chr1:1-1000
 
 # SVAR 1.0 (previous default) — VCF or PGEN, dosages, --haploid, --max-mem
 genoray write svar1 file.vcf.gz out.svar --max-mem 4g --haploid
 ```
 
-- `genoray write` (SVAR2, thin wrapper over `SparseVar2.from_vcf`/`from_pgen`):
-  dispatches on the `.pgen` suffix — a `.pgen` source calls `from_pgen`,
-  anything else calls `from_vcf`. `--reference` XOR `--no-reference`
-  (required), `--chunk-size` (default 25000 for VCF/BCF, memory-derived for
-  PGEN), `--threads`/`-@`, `--overwrite`, `--long-allele-capacity` (advanced),
-  and a single `--skip-symbolics-and-breakends` flag (maps to
-  `skip_out_of_scope=`) — the SVAR2 core can't expand either symbolic ALTs
-  (`<DEL>`, `<INS>`, …) or breakends into nucleotides, so they're dropped
-  together; prints a `Dropped {n} out-of-scope (symbolic/breakend) ALT
-  alleles.` line when set. `--ploidy` (default 2) is VCF/BCF only — PGEN is
-  diploid, and passing a non-default `--ploidy` with a `.pgen` source raises.
-  `--check-ref {e,x}` (default `e`, maps to `check_ref=`): REF-vs-reference
-  policy, ignored with `--no-reference`. `e` aborts on the first REF/FASTA
+- `genoray write` (SVAR2, thin wrapper over `SparseVar2.from_vcf`/`from_pgen`/
+  `from_svar1`/`from_vcf_list`): resolves the source kind and dispatches —
+  `.pgen` → `from_pgen`, a `.svar` directory → `from_svar1`, a directory (other
+  than `.svar`) or any file that isn't a single `.vcf.gz`/`.bcf` → `from_vcf_list`
+  (vcf-list form: a directory of single-sample VCFs/BCFs, or a manifest listing
+  them), otherwise → `from_vcf`. `--regions`/`-r`, `--regions-file`/`-R`,
+  `--merge-overlapping`, `--regions-overlap` (`pos`/`record`/`variant`) work
+  for every source kind; `--samples`/`-s`, `--samples-file`/`-S` work for
+  every source kind *except* the vcf-list form, which raises (each input file
+  already contributes exactly one sample — there's no cohort to subset).
+  `--reference` XOR `--no-reference` (required), `--chunk-size` (default 25000
+  for VCF/BCF and vcf-list, memory-derived for PGEN and SVAR1), `--threads`/
+  `-@`, `--overwrite`, `--long-allele-capacity` (advanced), and a single
+  `--skip-symbolics-and-breakends` flag (maps to `skip_out_of_scope=`) — the
+  SVAR2 core can't expand either symbolic ALTs (`<DEL>`, `<INS>`, …) or
+  breakends into nucleotides, so they're dropped together; prints a `Dropped
+  {n} out-of-scope (symbolic/breakend) ALT alleles.` line when set.
+  `--ploidy` (default 2) applies to VCF/BCF and vcf-list sources only — PGEN
+  is diploid and SVAR1's ploidy comes from its own metadata, so passing a
+  non-default `--ploidy` with a `.pgen` source raises. `--check-ref {e,x}`
+  (default `e`, maps to `check_ref=`): REF-vs-reference policy for every source
+  kind, ignored with `--no-reference`. `e` aborts on the first REF/FASTA
   disagreement; `x` drops the offending record and continues. Mirrors
   `bcftools norm --check-ref`.
 - `genoray write svar1`: unchanged SVAR 1.0 behavior — VCF or PGEN source,
