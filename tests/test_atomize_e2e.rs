@@ -28,6 +28,7 @@ fn drain_reader(
         ploidy,
         &[],
         Vec::new(),
+        genoray_core::svar2_view::OverlapMode::Pos,
     )
     .unwrap();
     let mut reader = ChunkAssembler::new(

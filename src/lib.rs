@@ -121,7 +121,7 @@ fn index_vcf(path: String) -> PyResult<()> {
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 #[pyfunction]
-#[pyo3(signature = (vcf_path, reference_path, chroms, output_dir, samples, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false, signatures=false, info_fields=Vec::new(), format_fields=Vec::new(), check_ref="e".to_string(), region_ranges=Vec::new()))]
+#[pyo3(signature = (vcf_path, reference_path, chroms, output_dir, samples, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false, signatures=false, info_fields=Vec::new(), format_fields=Vec::new(), check_ref="e".to_string(), region_ranges=Vec::new(), regions_overlap="pos".to_string()))]
 fn run_conversion_pipeline(
     py: Python,
     vcf_path: String,
@@ -139,8 +139,13 @@ fn run_conversion_pipeline(
     format_fields: Vec<(String, String, String, Option<String>, Option<f64>)>,
     check_ref: String,
     region_ranges: Vec<(String, u32, u32)>,
+    regions_overlap: String,
 ) -> PyResult<usize> {
     let sample_refs: Vec<&str> = samples.iter().map(|s| s.as_str()).collect();
+
+    // Parse the region-overlap mode once, up front, so a bad value raises before
+    // any output byte is written.
+    let overlap_mode = crate::svar2_view::parse_overlap_mode(&regions_overlap)?;
 
     let mut raw = info_fields;
     raw.extend(format_fields);
@@ -211,6 +216,7 @@ fn run_conversion_pipeline(
                             vcf_path: vcf_path.clone(),
                             htslib_threads,
                             regions: ranges_by_chrom.get(chrom).cloned().unwrap_or_default(),
+                            overlap: overlap_mode,
                         },
                         fasta_ref,
                         chrom,

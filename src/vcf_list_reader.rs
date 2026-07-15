@@ -298,6 +298,7 @@ impl VcfListRecordSource {
                 ploidy,
                 fields,
                 Vec::new(),
+                crate::svar2_view::OverlapMode::Pos,
             ) {
                 Ok(vcf) => cursors.push(FileCursor {
                     vcf: Some(vcf),

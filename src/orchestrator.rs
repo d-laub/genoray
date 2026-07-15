@@ -46,6 +46,7 @@ pub enum SourceSpec {
         vcf_path: String,
         htslib_threads: usize,
         regions: Vec<(u32, u32)>,
+        overlap: crate::svar2_view::OverlapMode,
     },
     Pgen {
         pgen_path: String,
@@ -238,6 +239,7 @@ pub fn process_chromosome(
                         vcf_path,
                         htslib_threads,
                         regions,
+                        overlap,
                     } => Box::new(crate::vcf_reader::VcfRecordSource::new(
                         &vcf_path,
                         &chr,
@@ -246,6 +248,7 @@ pub fn process_chromosome(
                         ploidy,
                         &fields_owned,
                         regions,
+                        overlap,
                     )?),
                     SourceSpec::Pgen {
                         pgen_path: _,

@@ -178,6 +178,7 @@ pub fn build_contig(
             vcf_path: bcf.to_str().unwrap().to_string(),
             htslib_threads: 1,
             regions: Vec::new(),
+            overlap: genoray_core::svar2_view::OverlapMode::Pos,
         },
         Some(fasta.to_str().unwrap()),
         chrom,
