@@ -3,11 +3,13 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from genoray import SparseVar2
 
 _REF = "ACAGTACATGGGTACTAGCTAGGCTAACCGGTTAACCGGT"
+_BOUNDARY_REF = "CAAAATCAGAGT"
 
 
 def _write_ref(d: Path) -> Path:
@@ -41,6 +43,31 @@ def _write_vcf(d: Path, *, symbolic: bool, indexed: bool) -> Path:
     return gz
 
 
+def _write_boundary_ref(d: Path) -> Path:
+    ref = d / "boundary.fa"
+    ref.write_text(f">chr1\n{_BOUNDARY_REF}\n")
+    subprocess.run(["samtools", "faidx", str(ref)], check=True)
+    return ref
+
+
+def _write_boundary_vcf(d: Path) -> Path:
+    body = (
+        "##fileformat=VCFv4.2\n"
+        f"##contig=<ID=chr1,length={len(_BOUNDARY_REF)}>\n"
+        '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n'
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS0\n"
+        "chr1\t8\t.\tA\tT\t.\t.\t.\tGT\t1|0\n"
+        "chr1\t9\t.\tGAG\tG\t.\t.\t.\tGT\t1|0\n"
+    )
+    plain = d / "boundary.vcf"
+    plain.write_text(body)
+    gz = d / "boundary.vcf.gz"
+    with open(gz, "wb") as fh:
+        subprocess.run(["bgzip", "-c", str(plain)], check=True, stdout=fh)
+    subprocess.run(["bcftools", "index", str(gz)], check=True)
+    return gz
+
+
 def test_from_vcf_with_reference_roundtrips(tmp_path: Path):
     ref = _write_ref(tmp_path)
     vcf = _write_vcf(tmp_path, symbolic=False, indexed=True)
@@ -51,6 +78,167 @@ def test_from_vcf_with_reference_roundtrips(tmp_path: Path):
     sv = SparseVar2(out)
     assert sv.available_samples == ["S0", "S1"]
     assert sv.contigs == ["chr1"]
+
+
+def test_from_vcf_regions_restricts_conversion(tmp_path: Path):
+    ref = _write_ref(tmp_path)
+    vcf = _write_vcf(tmp_path, symbolic=False, indexed=True)
+    out = tmp_path / "regioned"
+    dropped = SparseVar2.from_vcf(out, vcf, ref, regions="chr1:1-4", threads=1)
+    assert dropped == 0
+
+    sv = SparseVar2(out)
+    assert sv.contigs == ["chr1"]
+    counts = sv.region_counts("chr1", [(0, 40)])
+    assert int(counts.sum()) == 1
+    rag = sv.decode("chr1", [(0, 40)])
+    assert np.asarray(rag["pos"].data).tolist() == [2]
+
+
+def test_from_vcf_regions_accepts_multiple_specs_and_merges(tmp_path: Path):
+    ref = _write_ref(tmp_path)
+    vcf = _write_vcf(tmp_path, symbolic=False, indexed=True)
+    out = tmp_path / "merged"
+    SparseVar2.from_vcf(
+        out,
+        vcf,
+        ref,
+        regions=["chr1:1-4", ("chr1", 3, 8)],
+        merge_overlapping=True,
+        threads=1,
+    )
+
+    sv = SparseVar2(out)
+    assert sv.contigs == ["chr1"]
+    counts = sv.region_counts("chr1", [(0, 40)])
+    assert int(counts.sum()) == 4
+    rag = sv.decode("chr1", [(0, 40)])
+    assert sorted(set(np.asarray(rag["pos"].data).tolist())) == [2, 6]
+
+
+def test_from_vcf_regions_rejects_overlaps_by_default(tmp_path: Path):
+    ref = _write_ref(tmp_path)
+    vcf = _write_vcf(tmp_path, symbolic=False, indexed=True)
+    with pytest.raises(ValueError, match="regions overlap"):
+        SparseVar2.from_vcf(
+            tmp_path / "overlap",
+            vcf,
+            ref,
+            regions=["chr1:1-4", ("chr1", 3, 8)],
+            threads=1,
+        )
+
+
+def test_from_vcf_samples_preserve_order(tmp_path: Path):
+    ref = _write_ref(tmp_path)
+    vcf = _write_vcf(tmp_path, symbolic=False, indexed=True)
+    out = tmp_path / "samples"
+    dropped = SparseVar2.from_vcf(out, vcf, ref, samples=["S1"], threads=1)
+    assert dropped == 0
+
+    sv = SparseVar2(out)
+    assert sv.available_samples == ["S1"]
+    counts = sv.region_counts("chr1", [(0, 40)])
+    assert counts.shape == (1, 1, 2)
+    assert counts.reshape(-1).tolist() == [1, 1]
+
+
+def test_from_vcf_samples_reject_unknown(tmp_path: Path):
+    ref = _write_ref(tmp_path)
+    vcf = _write_vcf(tmp_path, symbolic=False, indexed=True)
+    with pytest.raises(ValueError, match="Samples not found"):
+        SparseVar2.from_vcf(tmp_path / "bad_sample", vcf, ref, samples=["missing"])
+
+
+def test_from_vcf_explicit_none_matches_default(tmp_path: Path):
+    ref = _write_ref(tmp_path)
+    vcf = _write_vcf(tmp_path, symbolic=False, indexed=True)
+
+    default_out = tmp_path / "default"
+    explicit_out = tmp_path / "explicit"
+    SparseVar2.from_vcf(default_out, vcf, ref, threads=1)
+    SparseVar2.from_vcf(
+        explicit_out,
+        vcf,
+        ref,
+        regions=None,
+        samples=None,
+        threads=1,
+    )
+
+    default = SparseVar2(default_out)
+    explicit = SparseVar2(explicit_out)
+    assert explicit.contigs == default.contigs
+    assert explicit.available_samples == default.available_samples
+    np.testing.assert_array_equal(
+        explicit.region_counts("chr1", [(0, 40)]),
+        default.region_counts("chr1", [(0, 40)]),
+    )
+
+
+def test_from_vcf_parallel_normalization_matches_single_thread(tmp_path: Path):
+    ref = _write_ref(tmp_path)
+    vcf = _write_vcf(tmp_path, symbolic=False, indexed=True)
+
+    seq_out = tmp_path / "seq"
+    par_out = tmp_path / "par"
+    SparseVar2.from_vcf(seq_out, vcf, ref, threads=1)
+    SparseVar2.from_vcf(par_out, vcf, ref, threads=16)
+
+    seq = SparseVar2(seq_out)
+    par = SparseVar2(par_out)
+    assert par.available_samples == seq.available_samples
+    assert par.contigs == seq.contigs
+    np.testing.assert_array_equal(
+        par.region_counts("chr1", [(0, 40)]),
+        seq.region_counts("chr1", [(0, 40)]),
+    )
+
+    seq_dec = seq.decode("chr1", [(0, 40)])
+    par_dec = par.decode("chr1", [(0, 40)])
+    for field in ("pos", "ilen", "allele"):
+        np.testing.assert_array_equal(
+            np.asarray(par_dec[field].data),
+            np.asarray(seq_dec[field].data),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(par_dec[field].lengths),
+            np.asarray(seq_dec[field].lengths),
+        )
+
+
+def test_from_vcf_sharded_normalization_owns_left_shifted_boundary_atom(
+    tmp_path: Path,
+):
+    ref = _write_boundary_ref(tmp_path)
+    vcf = _write_boundary_vcf(tmp_path)
+
+    seq_out = tmp_path / "seq_boundary"
+    shard_out = tmp_path / "shard_boundary"
+    SparseVar2.from_vcf(seq_out, vcf, ref, threads=1, chunk_size=3)
+    SparseVar2.from_vcf(shard_out, vcf, ref, threads=16, chunk_size=3)
+
+    seq = SparseVar2(seq_out)
+    shard = SparseVar2(shard_out)
+    assert shard.available_samples == seq.available_samples
+    assert shard.contigs == seq.contigs
+    np.testing.assert_array_equal(
+        shard.region_counts("chr1", [(0, len(_BOUNDARY_REF))]),
+        seq.region_counts("chr1", [(0, len(_BOUNDARY_REF))]),
+    )
+
+    seq_dec = seq.decode("chr1", [(0, len(_BOUNDARY_REF))])
+    shard_dec = shard.decode("chr1", [(0, len(_BOUNDARY_REF))])
+    for field in ("pos", "ilen", "allele"):
+        np.testing.assert_array_equal(
+            np.asarray(shard_dec[field].data),
+            np.asarray(seq_dec[field].data),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(shard_dec[field].lengths),
+            np.asarray(seq_dec[field].lengths),
+        )
+    assert sorted(set(np.asarray(shard_dec["pos"].data).tolist())) == [6, 7]
 
 
 def test_from_vcf_requires_reference_or_opt_out(tmp_path: Path):

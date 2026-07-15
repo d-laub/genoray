@@ -120,7 +120,7 @@ fn index_vcf(path: String) -> PyResult<()> {
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 #[pyfunction]
-#[pyo3(signature = (vcf_path, reference_path, chroms, output_dir, samples, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false, signatures=false, info_fields=Vec::new(), format_fields=Vec::new()))]
+#[pyo3(signature = (vcf_path, reference_path, chroms, output_dir, samples, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false, signatures=false, info_fields=Vec::new(), format_fields=Vec::new(), region_ranges=Vec::new()))]
 fn run_conversion_pipeline(
     py: Python,
     vcf_path: String,
@@ -136,6 +136,7 @@ fn run_conversion_pipeline(
     signatures: bool,
     info_fields: Vec<(String, String, String, Option<String>, Option<f64>)>,
     format_fields: Vec<(String, String, String, Option<String>, Option<f64>)>,
+    region_ranges: Vec<(String, u32, u32)>,
 ) -> PyResult<usize> {
     let sample_refs: Vec<&str> = samples.iter().map(|s| s.as_str()).collect();
 
@@ -143,6 +144,12 @@ fn run_conversion_pipeline(
     raw.extend(format_fields);
     let fields =
         crate::field::parse_manifest(raw).map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+    let mut ranges_by_chrom: std::collections::HashMap<String, Vec<(u32, u32)>> =
+        std::collections::HashMap::new();
+    for (chrom, start, end) in region_ranges {
+        ranges_by_chrom.entry(chrom).or_default().push((start, end));
+    }
 
     let results: Vec<Result<u64, crate::error::ConversionError>> = py.detach(|| {
         // Step 1 -> HW discovery/override and budgeting
@@ -171,11 +178,8 @@ fn run_conversion_pipeline(
         println!("Using: {} cores.", available_cores);
         println!(
             "Pipeline Config: {} concurrent chromosomes | {} HTSlib decompression threads each \
-             ({} total active, {} reserved for OS/idle).",
-            concurrent_chroms,
-            htslib_threads,
-            total_active,
-            available_cores.saturating_sub(total_active),
+             ({} pipeline/BGZF threads, {} reader-side processing/shard threads).",
+            concurrent_chroms, htslib_threads, total_active, processing_threads,
         );
 
         // Step 2 -> Rayon Pool
@@ -200,6 +204,7 @@ fn run_conversion_pipeline(
                         orchestrator::SourceSpec::Vcf {
                             vcf_path: vcf_path.clone(),
                             htslib_threads,
+                            regions: ranges_by_chrom.get(chrom).cloned().unwrap_or_default(),
                         },
                         fasta_ref,
                         chrom,

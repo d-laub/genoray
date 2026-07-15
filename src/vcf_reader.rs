@@ -154,6 +154,10 @@ pub(crate) fn validate_contigs_in_fasta(
 
 pub struct VcfRecordSource {
     inner_reader: IndexedReader,
+    chrom: String,
+    rid: u32,
+    regions: Vec<(u32, u32)>,
+    current_region: usize,
     num_samples: usize,
     ploidy: usize,
     sample_indices: Vec<usize>,
@@ -161,6 +165,104 @@ pub struct VcfRecordSource {
     format_fields: Vec<FieldSpec>,
     record: Record,
     eof: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VcfShard {
+    pub fetch_start: u32,
+    pub fetch_end: u32,
+    pub own_start: u32,
+    pub own_end: u32,
+    pub ordinal: usize,
+}
+
+pub(crate) fn coalesce_fetch_regions(
+    mut regions: Vec<(u32, u32)>,
+    chrom: &str,
+) -> Result<Vec<(u32, u32)>, ConversionError> {
+    if regions.is_empty() {
+        return Ok(regions);
+    }
+    regions.sort_unstable_by_key(|&(start, end)| (start, end));
+
+    let mut merged: Vec<(u32, u32)> = Vec::with_capacity(regions.len());
+    for (start, end) in regions {
+        if end <= start {
+            return Err(ConversionError::Input(format!(
+                "Invalid fetch interval for {chrom}: start {start} must be less than end {end}"
+            )));
+        }
+        if let Some(last) = merged.last_mut()
+            && start <= last.1
+        {
+            last.1 = last.1.max(end);
+            continue;
+        }
+        merged.push((start, end));
+    }
+    Ok(merged)
+}
+
+pub(crate) fn plan_vcf_shards(
+    regions: &[(u32, u32)],
+    chrom: &str,
+    max_shards: usize,
+    target_bp: u32,
+) -> Result<Vec<VcfShard>, ConversionError> {
+    let regions = coalesce_fetch_regions(regions.to_vec(), chrom)?;
+    if regions.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let max_shards = max_shards.max(1);
+    let target_bp = target_bp.max(1);
+    let total_span: u64 = regions
+        .iter()
+        .map(|&(start, end)| u64::from(end - start))
+        .sum();
+    let target_span = total_span
+        .div_ceil(max_shards as u64)
+        .max(u64::from(target_bp))
+        .min(u64::from(u32::MAX)) as u32;
+
+    let mut out = Vec::new();
+    for (region_start, region_end) in regions {
+        let mut own_start = region_start;
+        while own_start < region_end {
+            let own_end = own_start.saturating_add(target_span).min(region_end);
+            out.push(VcfShard {
+                fetch_start: own_start.saturating_sub(crate::normalize::L_MAX),
+                fetch_end: own_end.saturating_add(crate::normalize::L_MAX),
+                own_start,
+                own_end,
+                ordinal: out.len(),
+            });
+            own_start = own_end;
+        }
+    }
+    Ok(out)
+}
+
+fn fetch_region(
+    reader: &mut IndexedReader,
+    rid: u32,
+    chrom: &str,
+    region: Option<(u32, u32)>,
+) -> Result<(), ConversionError> {
+    let (start, end, label) = match region {
+        Some((start, end)) => (
+            start as u64,
+            Some(end as u64),
+            format!("{chrom}:{start}-{end}"),
+        ),
+        None => (0, None, format!("chromosome '{chrom}'")),
+    };
+    reader
+        .fetch(rid, start, end)
+        .map_err(|e| ConversionError::Io {
+            context: format!("fetching region for {label}"),
+            source: std::io::Error::other(e.to_string()),
+        })
 }
 
 impl VcfRecordSource {
@@ -172,6 +274,7 @@ impl VcfRecordSource {
         htslib_threads: usize,
         ploidy: usize,
         fields: &[FieldSpec],
+        regions: Vec<(u32, u32)>,
     ) -> Result<Self, ConversionError> {
         // A wrong VCF path reaches Rust when the file was removed after Python's
         // upstream indexing/open; surface it as FileNotFoundError, not a ".tbi?" Input.
@@ -204,12 +307,8 @@ impl VcfRecordSource {
                     chrom: chrom.to_string(),
                 })?;
 
-        reader
-            .fetch(rid, 0, None)
-            .map_err(|e| ConversionError::Io {
-                context: format!("fetching region for chromosome '{chrom}'"),
-                source: std::io::Error::other(e.to_string()),
-            })?;
+        let regions = coalesce_fetch_regions(regions, chrom)?;
+        fetch_region(&mut reader, rid, chrom, regions.first().copied())?;
 
         let sample_indices: Vec<usize> = samples
             .iter()
@@ -235,6 +334,10 @@ impl VcfRecordSource {
 
         Ok(Self {
             inner_reader: reader,
+            chrom: chrom.to_string(),
+            rid,
+            regions,
+            current_region: 0,
             num_samples: samples.len(),
             ploidy,
             sample_indices,
@@ -244,6 +347,24 @@ impl VcfRecordSource {
             eof: false,
         })
     }
+
+    fn active_region(&self) -> Option<(u32, u32)> {
+        self.regions.get(self.current_region).copied()
+    }
+
+    fn advance_region(&mut self) -> Result<bool, ConversionError> {
+        if self.regions.is_empty() || self.current_region + 1 >= self.regions.len() {
+            return Ok(false);
+        }
+        self.current_region += 1;
+        fetch_region(
+            &mut self.inner_reader,
+            self.rid,
+            &self.chrom,
+            self.regions.get(self.current_region).copied(),
+        )?;
+        Ok(true)
+    }
 }
 
 impl RecordSource for VcfRecordSource {
@@ -251,22 +372,38 @@ impl RecordSource for VcfRecordSource {
         if self.eof {
             return Ok(None);
         }
-        match self.inner_reader.read(&mut self.record) {
-            None => {
-                self.eof = true;
-                return Ok(None);
+        loop {
+            match self.inner_reader.read(&mut self.record) {
+                None => {
+                    if self.advance_region()? {
+                        continue;
+                    }
+                    self.eof = true;
+                    return Ok(None);
+                }
+                Some(Err(e)) => {
+                    return Err(ConversionError::Io {
+                        context: "reading next VCF record".to_string(),
+                        source: std::io::Error::other(e.to_string()),
+                    });
+                }
+                Some(Ok(())) => {}
             }
-            Some(Err(e)) => {
-                return Err(ConversionError::Io {
-                    context: "reading next VCF record".to_string(),
-                    source: std::io::Error::other(e.to_string()),
-                });
+
+            let pos = self.record.pos() as u32;
+            if let Some((start, end)) = self.active_region()
+                && (pos < start || pos >= end)
+            {
+                continue;
             }
-            Some(Ok(())) => {}
+
+            return self.record_to_raw(pos);
         }
+    }
+}
 
-        let pos = self.record.pos() as u32;
-
+impl VcfRecordSource {
+    fn record_to_raw(&self, pos: u32) -> Result<Option<RawRecord>, ConversionError> {
         let reference: Vec<u8>;
         let alts: Vec<Vec<u8>>;
         {
@@ -332,5 +469,47 @@ impl RecordSource for VcfRecordSource {
             info_raw,
             format_raw,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shard_planner_covers_owned_ranges_with_padded_fetches() {
+        let shards = plan_vcf_shards(&[(0, 12)], "chr1", 3, 3).unwrap();
+        assert_eq!(
+            shards
+                .iter()
+                .map(|s| (s.own_start, s.own_end, s.ordinal))
+                .collect::<Vec<_>>(),
+            vec![(0, 4, 0), (4, 8, 1), (8, 12, 2)]
+        );
+        assert_eq!(shards[0].fetch_start, 0);
+        assert!(shards[0].fetch_end >= shards[1].own_start);
+        assert!(shards[1].fetch_start <= shards[0].own_end);
+        assert!(shards[1].fetch_end >= shards[2].own_start);
+    }
+
+    #[test]
+    fn shard_planner_coalesces_overlapping_regions_before_split() {
+        let shards = plan_vcf_shards(&[(8, 12), (0, 5), (4, 9)], "chr1", 4, 20).unwrap();
+        assert_eq!(shards.len(), 1);
+        assert_eq!((shards[0].own_start, shards[0].own_end), (0, 12));
+    }
+
+    #[test]
+    fn shard_planner_treats_max_shards_as_an_upper_bound() {
+        let shards = plan_vcf_shards(&[(0, 100)], "chr1", 4, 1).unwrap();
+        assert_eq!(shards.len(), 4);
+        assert!(shards.len() <= 4);
+        assert_eq!(
+            shards
+                .iter()
+                .map(|s| (s.own_start, s.own_end))
+                .collect::<Vec<_>>(),
+            vec![(0, 25), (25, 50), (50, 75), (75, 100)]
+        );
     }
 }

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence as AbcSequence
 from collections import Counter
+from os import PathLike
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -98,6 +100,95 @@ def _ensure_index(source: Path) -> None:
     if csi.exists() or tbi.exists():
         return
     _core.index_vcf(str(source))
+
+
+def _is_region_triplet(value: object) -> bool:
+    return (
+        isinstance(value, tuple)
+        and len(value) == 3
+        and isinstance(value[0], str)
+        and isinstance(value[1], int)
+        and isinstance(value[2], int)
+    )
+
+
+def _normalize_svar2_vcf_regions(
+    regions: "str | tuple[str, int, int] | PathLike | object | None",
+    available_contigs: "Sequence[str]",
+    *,
+    merge_overlapping: bool,
+    regions_overlap: "Literal['pos', 'record', 'variant']",
+) -> list[tuple[str, int, int]]:
+    """Normalize caller regions to coalesced VCF fetch intervals.
+
+    This is intentionally a pre-conversion helper: it reuses the v1 coordinate
+    parser/sample conventions, then returns per-contig 0-based half-open
+    intervals suitable for `IndexedReader.fetch`. Full post-normalization
+    ownership filtering belongs to the sub-contig shard PR.
+    """
+    from genoray._contigs import ContigNormalizer
+    from genoray._svar._regions import _normalize_regions
+
+    if regions is None:
+        return []
+    if regions_overlap not in {"pos", "record", "variant"}:
+        raise ValueError(
+            "regions_overlap must be one of 'pos', 'record', or 'variant'; "
+            f"got {regions_overlap!r}"
+        )
+    if regions_overlap == "variant":
+        raise ValueError(
+            "SparseVar2.from_vcf currently supports regions_overlap='pos' "
+            "and 'record'. Post-normalization 'variant' ownership is part of "
+            "the sub-contig sharding follow-up."
+        )
+
+    cnorm = ContigNormalizer(available_contigs)
+
+    if isinstance(regions, AbcSequence) and not isinstance(
+        regions, (str, bytes, PathLike)
+    ):
+        if _is_region_triplet(regions):
+            frames = [_normalize_regions(regions, cnorm)]
+        else:
+            frames = [_normalize_regions(r, cnorm) for r in regions]
+        regions_df = pl.concat(frames) if frames else pl.DataFrame()
+    else:
+        regions_df = _normalize_regions(regions, cnorm)
+
+    if regions_df.height == 0:
+        raise ValueError("No requested regions match VCF contigs.")
+
+    end_offset = 1 if regions_overlap == "record" else 0
+    rows = (
+        regions_df.with_columns((pl.col("end") + end_offset).alias("end"))
+        .sort(["chrom", "start", "end"])
+        .iter_rows(named=True)
+    )
+
+    merged: list[tuple[str, int, int]] = []
+    for row in rows:
+        chrom = str(row["chrom"])
+        start = int(row["start"])
+        end = int(row["end"])
+        if start < 0:
+            raise ValueError(f"region start must be >= 0; got {start} for {chrom}")
+        if end <= start:
+            raise ValueError(
+                f"region end must be greater than start; got {chrom}:{start}-{end}"
+            )
+
+        if merged and merged[-1][0] == chrom and start <= merged[-1][2]:
+            prev_chrom, prev_start, prev_end = merged[-1]
+            if start < prev_end and not merge_overlapping:
+                raise ValueError(
+                    "regions overlap; pass merge_overlapping=True to dedupe"
+                )
+            merged[-1] = (prev_chrom, prev_start, max(prev_end, end))
+        else:
+            merged.append((chrom, start, end))
+
+    return merged
 
 
 def _canonical_contig_id(name: str) -> str:
@@ -477,6 +568,10 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         source: str | Path,
         reference: str | Path | None = None,
         *,
+        regions: "str | tuple[str, int, int] | PathLike | object | None" = None,
+        samples: "str | Sequence[str] | PathLike | None" = None,
+        merge_overlapping: bool = False,
+        regions_overlap: "Literal['pos', 'record', 'variant']" = "pos",
         no_reference: bool = False,
         skip_out_of_scope: bool = False,
         ploidy: int = 2,
@@ -497,6 +592,18 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         out-of-scope (symbolic/breakend) ALTs dropped (0 unless
         `skip_out_of_scope`).
 
+        `regions` restricts conversion to one or more indexed VCF fetch
+        intervals. Region strings use Genoray's existing convention:
+        ``"chrom:start-end"`` is 1-based inclusive and is converted to a
+        0-based half-open interval; tuple/BED/frame inputs are already 0-based
+        half-open. Overlapping regions raise unless
+        `merge_overlapping=True`. `regions_overlap="variant"` is reserved for
+        the follow-up sub-contig normalization work; this entry point currently
+        supports `"pos"` and `"record"`.
+
+        `samples` selects and reorders VCF samples by name, preserving caller
+        order and de-duplicating first occurrences.
+
         signatures: if True, classify SBS96/ID83 codes during the write and
         store the mutcat sidecar (factored into the dense/var_key cost model).
         Requires a reference; raises if `no_reference=True`.
@@ -511,6 +618,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         variants.
         """
         from cyvcf2 import VCF as _CyVCF
+        from genoray._svar._regions import _normalize_samples
 
         out = Path(out)
         source = Path(source)
@@ -532,8 +640,58 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         _ensure_index(source)
 
         v = _CyVCF(str(source))
-        samples = list(v.samples)
-        contigs = [c for c in natsorted(v.seqnames) if next(v(c), None) is not None]
+        available_samples = list(v.samples)
+        selected_samples = (
+            available_samples
+            if samples is None
+            else _normalize_samples(samples, available_samples)
+        )
+        if not selected_samples:
+            raise ValueError("from_vcf requires at least one sample")
+
+        all_contigs = list(v.seqnames)
+        region_ranges = _normalize_svar2_vcf_regions(
+            regions,
+            all_contigs,
+            merge_overlapping=merge_overlapping,
+            regions_overlap=regions_overlap,
+        )
+
+        if region_ranges:
+            ranges_by_contig: dict[str, list[tuple[int, int]]] = {}
+            for chrom, start, end in region_ranges:
+                ranges_by_contig.setdefault(chrom, []).append((start, end))
+
+            contigs = []
+            for chrom in natsorted(ranges_by_contig):
+                has_variant = any(
+                    next(v(f"{chrom}:{start + 1}-{end}"), None) is not None
+                    for start, end in ranges_by_contig[chrom]
+                )
+                if has_variant:
+                    contigs.append(chrom)
+            if not contigs:
+                raise ValueError(
+                    f"No variants found in requested regions for {source}."
+                )
+
+            region_ranges = [
+                (chrom, start, end)
+                for chrom in contigs
+                for start, end in ranges_by_contig[chrom]
+            ]
+        else:
+            contigs = [c for c in natsorted(v.seqnames) if next(v(c), None) is not None]
+            contig_lengths = {
+                chrom: int(length)
+                for chrom, length in zip(v.seqnames, getattr(v, "seqlens", []) or [])
+                if length is not None and int(length) > 0
+            }
+            region_ranges = [
+                (chrom, 0, contig_lengths[chrom])
+                for chrom in contigs
+                if chrom in contig_lengths
+            ]
         if not contigs:
             raise ValueError(f"No variants found in {source}.")
 
@@ -546,7 +704,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             reference_path,
             contigs,
             str(out),
-            samples,
+            selected_samples,
             chunk_size,
             ploidy,
             threads,  # max_threads; None => auto
@@ -555,6 +713,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             signatures,
             info,
             format_,
+            region_ranges,
         )
 
     @classmethod

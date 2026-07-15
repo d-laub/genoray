@@ -15,6 +15,45 @@ SparseVar.from_pgen("out.svar", "file.pgen", max_mem="4g")
 svar = SparseVar("out.svar")
 ```
 
+### Region/sample-restricted SVAR2 conversion
+
+`SparseVar2.from_vcf` can convert an indexed VCF/BCF directly into a subset of
+regions and samples:
+
+```python
+from genoray import SparseVar2
+
+SparseVar2.from_vcf(
+    "subset.svar2",
+    "cohort.vcf.gz",
+    "reference.fa",
+    regions=["chr1:1-1000000", ("chr2", 0, 500_000)],
+    samples=["HG00096", "HG00097"],
+    merge_overlapping=True,
+    threads=8,
+)
+```
+
+Region strings use bcftools-style 1-based inclusive coordinates and are
+converted to 0-based half-open intervals. Tuple, BED, and frame inputs are
+already interpreted as 0-based half-open. `samples` preserves caller order and
+deduplicates repeated names by first occurrence.
+
+The equivalent CLI flags are available on the default SVAR2 writer:
+
+```bash
+genoray write cohort.vcf.gz subset.svar2 \
+  --reference reference.fa \
+  --regions chr1:1-1000000,chr2:1-500000 \
+  --samples HG00096,HG00097 \
+  --threads 8
+```
+
+Use `--regions-file/-R` for BED files and `--samples-file/-S` for one-sample-per-line
+sample lists. `regions_overlap=pos` is the default; `record` is also supported.
+Full post-normalization `variant` ownership is reserved for the follow-up
+sub-contig sharding work.
+
 ## Haploid (ploidy=1) write option
 
 For unphased somatic cohorts where phasing information is unavailable or irrelevant,

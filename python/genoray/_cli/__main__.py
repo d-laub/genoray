@@ -60,6 +60,24 @@ def write_svar2(
     no_reference: Annotated[
         bool, Parameter(name="--no-reference", negative="")
     ] = False,
+    regions: Annotated[str | None, Parameter(name=["--regions", "-r"])] = None,
+    regions_file: Annotated[
+        Path | None,
+        Parameter(
+            name=["--regions-file", "-R"],
+            validator=validators.Path(exists=True, dir_okay=False, file_okay=True),
+        ),
+    ] = None,
+    samples: Annotated[str | None, Parameter(name=["--samples", "-s"])] = None,
+    samples_file: Annotated[
+        Path | None,
+        Parameter(
+            name=["--samples-file", "-S"],
+            validator=validators.Path(exists=True, dir_okay=False, file_okay=True),
+        ),
+    ] = None,
+    merge_overlapping: bool = False,
+    regions_overlap: Literal["pos", "record", "variant"] = "pos",
     ploidy: int = 2,
     chunk_size: int | None = None,
     threads: Annotated[int | None, Parameter(name=["--threads", "-@"])] = None,
@@ -88,6 +106,25 @@ def write_svar2(
         Skip REF validation and indel left-alignment; the input is trusted to be
         already normalized. Use only for pre-normalized (e.g. ``bcftools norm``)
         inputs.
+    regions
+        VCF/BCF only. Inline region(s): a single ``chrom:start-end`` (1-based
+        inclusive, bcftools convention) or a comma-separated list. Mutually
+        exclusive with --regions-file.
+    regions_file
+        VCF/BCF only. Path to a BED file (0-based half-open) of regions.
+        Mutually exclusive with --regions.
+    samples
+        VCF/BCF only. Comma-separated list of sample names to keep, e.g.
+        ``A,B,C``. Mutually exclusive with --samples-file.
+    samples_file
+        VCF/BCF only. Path to a file of sample names (one per line). Mutually
+        exclusive with --samples.
+    merge_overlapping
+        If set, silently merge overlapping regions instead of raising.
+    regions_overlap
+        How VCF records are fetched for regions: ``pos`` (default) or
+        ``record``. ``variant`` is reserved for the follow-up sub-contig
+        normalization work and currently raises from ``SparseVar2.from_vcf``.
     ploidy
         Ploidy of the samples. Default 2. VCF/BCF only — PGEN is diploid.
     chunk_size
@@ -108,8 +145,33 @@ def write_svar2(
     """
     from genoray import SparseVar2
 
+    from ._view_helpers import parse_regions_arg
+
+    if regions is not None and regions_file is not None:
+        raise ValueError("--regions and --regions-file are mutually exclusive")
+    if samples is not None and samples_file is not None:
+        raise ValueError("--samples and --samples-file are mutually exclusive")
+
+    if regions is not None:
+        regions_arg: pl.DataFrame | Path | None = parse_regions_arg(regions)
+    elif regions_file is not None:
+        regions_arg = regions_file
+    else:
+        regions_arg = None
+
+    if samples is not None:
+        samples_arg: list[str] | Path | None = [s for s in samples.split(",") if s]
+    elif samples_file is not None:
+        samples_arg = samples_file
+    else:
+        samples_arg = None
+
     skip_out_of_scope = skip_symbolics_and_breakends
     if source.suffix == ".pgen":
+        if regions_arg is not None or samples_arg is not None:
+            raise ValueError(
+                "--regions/--samples are currently supported for VCF/BCF only"
+            )
         if ploidy != 2:
             raise ValueError(
                 "PGEN is diploid; --ploidy is only meaningful for VCF/BCF sources."
@@ -130,6 +192,10 @@ def write_svar2(
             out,
             source,
             reference,
+            regions=regions_arg,
+            samples=samples_arg,
+            merge_overlapping=merge_overlapping,
+            regions_overlap=regions_overlap,
             no_reference=no_reference,
             skip_out_of_scope=skip_out_of_scope,
             ploidy=ploidy,

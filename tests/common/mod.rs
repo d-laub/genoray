@@ -177,6 +177,7 @@ pub fn build_contig(
         genoray_core::orchestrator::SourceSpec::Vcf {
             vcf_path: bcf.to_str().unwrap().to_string(),
             htslib_threads: 1,
+            regions: Vec::new(),
         },
         Some(fasta.to_str().unwrap()),
         chrom,
