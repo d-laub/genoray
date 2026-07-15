@@ -132,11 +132,15 @@ are unaffected (validation never runs).
 The excluded-record count is surfaced via the existing `println!("Notice: ...")`
 pattern used throughout the pipeline:
 
-- a per-contig count,
-- a grand total at the end of the run,
-- the **first** offending locus (`chrom:pos REF vs FASTA`) for debuggability.
+- a per-contig count, logged as the pipeline finishes each contig,
+- the **first** offending locus (`pos REF vs FASTA`, from the carried
+  `NormalizeError`) logged once per source when the first exclusion occurs.
 
-Bounded output — never one line per excluded record.
+Bounded output — never one line per excluded record. A cross-contig grand total
+is intentionally **not** emitted: it would require changing `process_chromosome`'s
+internal return type (rippling through all four pipeline callers and the
+thread-join plumbing) for marginal value over the per-contig lines, which the
+user can trivially sum.
 
 **Return type is unchanged:** each `from_*` still returns `int` = out-of-scope
 (symbolic/breakend) ALTs dropped. Rationale: a second count cannot be added
