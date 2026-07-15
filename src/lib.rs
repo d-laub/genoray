@@ -73,6 +73,8 @@ pub mod query;
 pub mod record_source;
 pub mod rvk;
 pub mod search;
+#[cfg(feature = "conversion")]
+pub mod shard;
 pub mod spine;
 // NOTE: `streams` (StreamTag/StreamMap/REGISTRY) is *not* conversion-only despite
 // being in the original gate list: query-core `rvk.rs` and `types.rs` depend on it

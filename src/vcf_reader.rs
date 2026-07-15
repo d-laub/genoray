@@ -203,6 +203,18 @@ pub(crate) fn coalesce_fetch_regions(
     Ok(merged)
 }
 
+impl From<crate::shard::WorkUnit> for VcfShard {
+    fn from(u: crate::shard::WorkUnit) -> Self {
+        VcfShard {
+            fetch_start: u.fetch_start,
+            fetch_end: u.fetch_end,
+            own_start: u.own_start,
+            own_end: u.own_end,
+            ordinal: u.ordinal,
+        }
+    }
+}
+
 pub(crate) fn plan_vcf_shards(
     regions: &[(u32, u32)],
     chrom: &str,
@@ -213,34 +225,12 @@ pub(crate) fn plan_vcf_shards(
     if regions.is_empty() {
         return Ok(Vec::new());
     }
-
-    let max_shards = max_shards.max(1);
-    let target_bp = target_bp.max(1);
-    let total_span: u64 = regions
-        .iter()
-        .map(|&(start, end)| u64::from(end - start))
-        .sum();
-    let target_span = total_span
-        .div_ceil(max_shards as u64)
-        .max(u64::from(target_bp))
-        .min(u64::from(u32::MAX)) as u32;
-
-    let mut out = Vec::new();
-    for (region_start, region_end) in regions {
-        let mut own_start = region_start;
-        while own_start < region_end {
-            let own_end = own_start.saturating_add(target_span).min(region_end);
-            out.push(VcfShard {
-                fetch_start: own_start.saturating_sub(crate::normalize::L_MAX),
-                fetch_end: own_end.saturating_add(crate::normalize::L_MAX),
-                own_start,
-                own_end,
-                ordinal: out.len(),
-            });
-            own_start = own_end;
-        }
-    }
-    Ok(out)
+    Ok(
+        crate::shard::plan_ranges(&regions, max_shards, target_bp, crate::normalize::L_MAX)
+            .into_iter()
+            .map(VcfShard::from)
+            .collect(),
+    )
 }
 
 fn fetch_region(
