@@ -94,6 +94,12 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
   REF/FASTA disagreement; the reference FASTA threads through `process_chromosome` and the
   PyO3 entry point as a required argument; and `vcf_reader::next_atom`'s emit bound is
   widened by `L_MAX` to keep emission position-sorted.
+  A native region/sub-contig conversion benchmark harness lives at
+  `scripts/svar2_region_parallel_bench.py`. It can run against Carter-scale VCF/BCF
+  inputs from `data/README.md` or generate a deterministic wide-sample synthetic VCF,
+  then sweeps thread counts and chunk sizes in separate worker processes so per-row
+  peak RSS remains meaningful. The harness records end-to-end timing today and is
+  ready to attach native phase timings once structured conversion progress lands.
 - [x] **M3. Per-contig split + sidecar positions + format finalization.** Partition the
   SVAR2 directory by contig; keep positions as sidecar arrays; finalize the on-disk
   format. See [`architecture.md`](architecture.md#on-disk-layout).
