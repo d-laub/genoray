@@ -5,8 +5,15 @@
 //! plink-ng code and vendors none; `_core` stays MIT. Do not change this without
 //! reading `docs/superpowers/specs/2026-07-12-pgen-to-svar2-design.md`.
 //!
-//! `PgenReader.read_alleles_range` releases the GIL for its decode loop, so the
-//! `Python::attach` below only costs call dispatch, not the decode.
+//! `PgenReader.read_alleles_range` does NOT release the GIL for its decode loop
+//! (its compiled module contains no `PyEval_SaveThread`), so it holds the GIL
+//! for the whole decode. To keep GIL contention across concurrent shards to the
+//! bare minimum, each `refill` acquires the GIL exactly once -- for the
+//! `read_alleles_range` call AND a bulk copy of the whole batch into a
+//! Rust-owned buffer -- so that `next_record` (called per variant) touches no
+//! GIL at all. A previous design acquired the GIL once per row inside
+//! `next_record`; at 11-way intra-contig concurrency that per-row GIL churn
+//! collapsed throughput to ~zero (a GIL convoy that looked like a deadlock).
 
 use crate::error::ConversionError;
 use crate::pvar::PvarReader;
@@ -24,6 +31,10 @@ pub struct PgenRecordSource {
     reader: Py<PyAny>,
     /// `(batch, 2 * num_samples)` int32 allele-code scratch buffer, reused per refill.
     buf: Py<PyArray2<i32>>,
+    /// Rust-owned mirror of `buf`, refilled in bulk under a single GIL acquisition
+    /// per `refill` so `next_record` can serve rows without touching the GIL.
+    /// pgenlib's `-9` missing sentinel is already normalized to `-1` here.
+    host_buf: Vec<i32>,
     batch: usize,
     num_samples: usize,
     /// Next global variant index to fetch from the .pgen.
@@ -53,6 +64,7 @@ impl PgenRecordSource {
         Ok(Self {
             reader,
             buf,
+            host_buf: Vec::with_capacity(batch * 2 * num_samples),
             batch,
             num_samples,
             var_next: var_start,
@@ -71,6 +83,10 @@ impl PgenRecordSource {
             return Ok(0);
         }
         let hi = (lo + self.batch).min(self.var_end);
+        let columns = 2 * self.num_samples;
+        // One GIL acquisition for BOTH the pgenlib decode (which holds the GIL)
+        // AND the bulk copy into `host_buf` -- see the module doc for why
+        // per-row GIL churn here collapses under concurrent shards.
         Python::attach(|py| -> Result<(), ConversionError> {
             self.reader
                 .bind(py)
@@ -83,6 +99,13 @@ impl PgenRecordSource {
                         "pgenlib read_alleles_range({lo}, {hi}) failed: {e}"
                     ))
                 })?;
+            let arr = self.buf.bind(py).readonly();
+            let flat = arr.as_slice().expect("pgen buffer is C-contiguous");
+            let n = (hi - lo) * columns;
+            self.host_buf.clear();
+            // pgenlib encodes missing as -9; the conversion spine uses -1.
+            self.host_buf
+                .extend(flat[..n].iter().map(|&c| if c < 0 { -1 } else { c }));
             Ok(())
         })?;
         self.var_next = hi;
@@ -107,18 +130,10 @@ impl RecordSource for PgenRecordSource {
             ));
         };
 
+        // Served straight from `host_buf` -- already normalized and GIL-free.
         let columns = 2 * self.num_samples;
-        let mut gt = vec![-1i32; columns];
-        Python::attach(|py| {
-            let arr = self.buf.bind(py).readonly();
-            let flat = arr.as_slice().expect("pgen buffer is C-contiguous");
-            let base = self.row * columns;
-            for (c, out) in gt.iter_mut().enumerate() {
-                // pgenlib encodes missing as -9; the conversion spine uses -1.
-                let code = flat[base + c];
-                *out = if code < 0 { -1 } else { code };
-            }
-        });
+        let base = self.row * columns;
+        let gt = self.host_buf[base..base + columns].to_vec();
         self.row += 1;
 
         Ok(Some(RawRecord {
