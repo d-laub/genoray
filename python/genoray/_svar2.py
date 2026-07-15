@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Sequence as AbcSequence
 from collections import Counter
 from os import PathLike
@@ -802,14 +803,23 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
 
         import pgenlib
 
-        # One reader per contig: readers seek independently, so concurrent contigs
-        # must not share one. `allele_idx_offsets` is required (not just used) once
-        # any variant in the file is multiallelic -- it is a file-wide array, so
-        # every contig's reader is constructed with the same one.
+        # A pool of P readers per contig: readers seek independently, so
+        # concurrent shards (and concurrent contigs) must not share one. P
+        # over-provisions to a safe upper bound on how many shards any one
+        # contig could be split into -- the Rust side caps the actual shard
+        # count at `min(processing_threads, len(pool))`, so unused readers in
+        # a contig's pool are simply never touched. `allele_idx_offsets` is
+        # required (not just used) once any variant in the file is
+        # multiallelic -- it is a file-wide array, so every reader is
+        # constructed with the same one.
+        P = max(1, threads if threads else (os.cpu_count() or 1))
         readers = [
-            pgenlib.PgenReader(
-                bytes(source), n_samples, allele_idx_offsets=allele_idx_offsets
-            )
+            [
+                pgenlib.PgenReader(
+                    bytes(source), n_samples, allele_idx_offsets=allele_idx_offsets
+                )
+                for _ in range(P)
+            ]
             for _ in contigs
         ]
 

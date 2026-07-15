@@ -262,13 +262,15 @@ fn run_conversion_pipeline(
 /// Convert a PLINK2 PGEN to an SVAR2 store.
 ///
 /// `contig_ranges[i]` is the half-open `[var_start, var_end)` variant index range
-/// of `chroms[i]` within the `.pvar`. `pgen_readers[i]` is a distinct
-/// `pgenlib.PgenReader` for `chroms[i]` -- readers seek independently, so contigs
-/// must not share one.
+/// of `chroms[i]` within the `.pvar`. `readers[i]` is a pool of distinct
+/// `pgenlib.PgenReader`s for `chroms[i]` -- one per potential shard -- since
+/// readers seek independently and must never be shared, whether across contigs
+/// or across shards of the same contig.
 #[cfg(feature = "conversion")]
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
 #[pyfunction]
-#[pyo3(signature = (pgen_path, pvar_path, reference_path, chroms, contig_ranges, output_dir, samples, chunk_size, max_threads, long_allele_capacity, skip_out_of_scope, signatures, pgen_readers))]
+#[pyo3(signature = (pgen_path, pvar_path, reference_path, chroms, contig_ranges, output_dir, samples, chunk_size, max_threads, long_allele_capacity, skip_out_of_scope, signatures, readers))]
 fn run_pgen_conversion_pipeline(
     py: Python,
     pgen_path: String,
@@ -283,11 +285,11 @@ fn run_pgen_conversion_pipeline(
     long_allele_capacity: usize,
     skip_out_of_scope: bool,
     signatures: bool,
-    pgen_readers: Vec<Py<PyAny>>,
+    readers: Vec<Vec<Py<PyAny>>>,
 ) -> PyResult<usize> {
-    if chroms.len() != contig_ranges.len() || chroms.len() != pgen_readers.len() {
+    if chroms.len() != contig_ranges.len() || chroms.len() != readers.len() {
         return Err(PyValueError::new_err(
-            "chroms, contig_ranges, and pgen_readers must be the same length",
+            "chroms, contig_ranges, and readers must be the same length",
         ));
     }
     let sample_refs: Vec<&str> = samples.iter().map(|s| s.as_str()).collect();
@@ -296,13 +298,13 @@ fn run_pgen_conversion_pipeline(
     // PGEN carries no FORMAT, and .pvar INFO extraction is out of scope.
     let fields: Vec<crate::field::FieldSpec> = Vec::new();
 
-    // Pair each contig with its own reader BEFORE detaching, so the Py handles move
-    // into the worker threads (Py<PyAny> is Send; PyAny is not).
-    let jobs: Vec<(String, (usize, usize), Py<PyAny>)> = chroms
+    // Pair each contig with its own reader pool BEFORE detaching, so the Py
+    // handles move into the worker threads (Py<PyAny> is Send; PyAny is not).
+    let jobs: Vec<(String, (usize, usize), Vec<Py<PyAny>>)> = chroms
         .iter()
         .cloned()
         .zip(contig_ranges.iter().copied())
-        .zip(pgen_readers)
+        .zip(readers)
         .map(|((c, r), rd)| (c, r, rd))
         .collect();
 
@@ -327,14 +329,14 @@ fn run_pgen_conversion_pipeline(
 
         pool.install(|| {
             jobs.into_par_iter()
-                .map(|(chrom, (lo, hi), reader)| {
+                .map(|(chrom, (lo, hi), readers)| {
                     orchestrator::process_chromosome(
                         orchestrator::SourceSpec::Pgen {
                             pgen_path: pgen_path.clone(),
                             pvar_path: pvar_path.clone(),
                             var_start: lo,
                             var_end: hi,
-                            reader,
+                            readers,
                         },
                         reference_path.as_deref(),
                         &chrom,

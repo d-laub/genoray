@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import subprocess
 from pathlib import Path
 
@@ -271,6 +272,46 @@ def test_from_pgen_monomorphic_site_matches_from_vcf(sources_mono, tmp_path):
     ragged_vcf = a.decode("chr1", regions)
     ragged_pgen = b.decode("chr1", regions)
     _assert_ragged_equal(ragged_pgen, ragged_vcf)
+
+
+def _hash_store(store: Path) -> bytes:
+    """SHA256 over every file's (relative path, bytes) under `store`, sorted --
+    order-independent and content-exact, so two stores hash equal iff their
+    on-disk layout and every byte match exactly."""
+    h = hashlib.sha256()
+    for p in sorted(store.rglob("*")):
+        if p.is_file():
+            h.update(p.relative_to(store).as_posix().encode())
+            h.update(p.read_bytes())
+    return h.digest()
+
+
+def test_pgen_sharded_matches_serial(sources, tmp_path):
+    """Sharded PGEN conversion must be byte-identical to the serial path.
+
+    `sources` has only 4 variants (chr1, positions 2/6/11/19 0-based,
+    including a co-located multiallelic pair) -- small, but enough to
+    exercise the position-range ownership mapping across several boundaries.
+
+    `threads=8` does NOT actually shard this single-contig fixture: the
+    thread-budget planner (`budget::plan_thread_budget`) spends idle cores on
+    HTSlib decode threads first (capped at 8) before anything reaches
+    `processing_threads` (which caps PGEN shard count here), so a single
+    contig needs `usable_cores > 12` before `processing_threads` climbs above
+    1. `threads=24` -> `processing_threads=11` -> shard count is capped by the
+    4 variants themselves, so this run splits into 4 one-variant shards,
+    exercising the position-ownership boundary between every adjacent variant
+    (and `chunk_assembler`'s L_MAX=1000bp fetch padding across all of them,
+    since every variant in this fixture is well within that padding).
+    """
+    ref, _, pgen = sources
+    serial_out = tmp_path / "serial.svar2"
+    parallel_out = tmp_path / "parallel.svar2"
+
+    SparseVar2.from_pgen(serial_out, pgen, ref, threads=1)
+    SparseVar2.from_pgen(parallel_out, pgen, ref, threads=24)
+
+    assert _hash_store(serial_out) == _hash_store(parallel_out)
 
 
 def test_from_pgen_missing_pvar_is_a_clear_error(sources, tmp_path):

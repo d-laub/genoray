@@ -2,6 +2,7 @@
 use crossbeam_channel::bounded;
 use std::fs;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 
@@ -52,9 +53,11 @@ pub enum SourceSpec {
         pvar_path: String,
         var_start: usize,
         var_end: usize,
-        /// A `pgenlib.PgenReader` for THIS contig. Readers seek independently, so
-        /// each concurrent contig needs its own -- never share one.
-        reader: pyo3::Py<pyo3::PyAny>,
+        /// A pool of `pgenlib.PgenReader`s for THIS contig, one per potential
+        /// shard. Readers seek independently, so each concurrent shard needs
+        /// its own -- never share one. `readers.len()` upper-bounds how many
+        /// shards this contig can be split into.
+        readers: Vec<pyo3::Py<pyo3::PyAny>>,
     },
     /// `SparseVar2.from_vcf_list`: N single-sample VCFs with possibly disjoint
     /// site lists, k-way merged into ONE record stream (`VcfListRecordSource`).
@@ -130,6 +133,47 @@ fn with_vcf_shard_context(
         ConversionError::ContigNotInHeader { chrom: missing } => ConversionError::Input(format!(
             "{label} failed: Chromosome '{missing}' not found in VCF header"
         )),
+        ConversionError::Io { context, source } => ConversionError::Io {
+            context: format!("{label} failed while {context}"),
+            source,
+        },
+        ConversionError::MissingFile { path } => ConversionError::MissingFile {
+            path: format!("{path} ({label})"),
+        },
+        ConversionError::WorkerPanicked { thread } => ConversionError::WorkerPanicked {
+            thread: format!("{thread} ({label})"),
+        },
+        ConversionError::Npy { path, source } => ConversionError::Npy {
+            path: format!("{path} ({label})"),
+            source,
+        },
+        ConversionError::ReadNpy { path, source } => ConversionError::ReadNpy {
+            path: format!("{path} ({label})"),
+            source,
+        },
+    }
+}
+
+/// Generic PGEN-shard error decorator, mirroring `with_vcf_shard_context`'s
+/// per-arm structure. PGEN has no VCF-style header/error strings to special-
+/// case, so every arm gets the same shard-region label prefix. `unit.own_*`
+/// are 0-based reference *positions* (ownership is position-based -- see
+/// `chunk_assembler::ChunkAssembler::with_reference`); `unit.fetch_*` are
+/// absolute `.pvar`/`.pgen` variant indices.
+fn with_pgen_shard_context(
+    err: ConversionError,
+    chrom: &str,
+    unit: &crate::shard::WorkUnit,
+) -> ConversionError {
+    let label = format!(
+        "PGEN shard {chrom} ordinal {} owned pos [{}, {}) fetch var [{}, {})",
+        unit.ordinal, unit.own_start, unit.own_end, unit.fetch_start, unit.fetch_end
+    );
+    match err {
+        ConversionError::Input(msg) => ConversionError::Input(format!("{label} failed: {msg}")),
+        ConversionError::ContigNotInHeader { chrom: missing } => {
+            ConversionError::Input(format!("{label} failed: Chromosome '{missing}' not found"))
+        }
         ConversionError::Io { context, source } => ConversionError::Io {
             context: format!("{label} failed while {context}"),
             source,
@@ -325,15 +369,118 @@ pub fn process_chromosome(
                         pvar_path,
                         var_start,
                         var_end,
-                        reader,
-                    } => Box::new(crate::pgen_reader::PgenRecordSource::new(
-                        reader,
-                        &pvar_path,
-                        var_start,
-                        var_end,
-                        s_refs.len(),
-                        chunk_size,
-                    )?),
+                        readers,
+                    } => {
+                        // Ownership is by POSITION (see ChunkAssembler::with_reference),
+                        // but the split is by INDEX (plan_pgen_units) -- so read this
+                        // contig's .pvar positions up front to translate index-range
+                        // shards into contiguous, gap-free position ranges. Every
+                        // variant (including co-located multiallelic groups sharing a
+                        // position) is then owned by exactly one shard.
+                        let mut positions: Vec<u32> = Vec::with_capacity(var_end - var_start);
+                        {
+                            let mut pvar = crate::pvar::PvarReader::open(&pvar_path, var_start)?;
+                            for _ in var_start..var_end {
+                                match pvar.next_variant()? {
+                                    Some(rec) => positions.push(rec.pos),
+                                    None => break,
+                                }
+                            }
+                        }
+                        let n = positions.len();
+                        let max_shards = processing_threads.min(readers.len()).max(1);
+                        let punits = crate::pgen_shard::plan_pgen_units(
+                            &positions,
+                            max_shards,
+                            crate::normalize::L_MAX,
+                        );
+                        if punits.len() <= 1 {
+                            // Single-reader fallback: identical to today's behavior.
+                            let reader = readers
+                                .into_iter()
+                                .next()
+                                .expect("caller provisions >= 1 PGEN reader per contig");
+                            Box::new(crate::pgen_reader::PgenRecordSource::new(
+                                reader,
+                                &pvar_path,
+                                var_start,
+                                var_end,
+                                s_refs.len(),
+                                chunk_size,
+                            )?)
+                        } else {
+                            let (ref_seq, has_reference) = match fasta.as_deref() {
+                                Some(path) => (
+                                    Arc::new(crate::vcf_reader::load_contig_seq(path, &chr)?),
+                                    true,
+                                ),
+                                None => (Arc::new(Vec::new()), false),
+                            };
+                            let units: Vec<crate::shard::WorkUnit> = punits
+                                .iter()
+                                .map(|u| {
+                                    let own_start = if u.own_lo == 0 {
+                                        0
+                                    } else {
+                                        positions[u.own_lo]
+                                    };
+                                    let own_end = if u.own_hi == n {
+                                        u32::MAX
+                                    } else {
+                                        positions[u.own_hi]
+                                    };
+                                    crate::shard::WorkUnit {
+                                        own_start,
+                                        own_end,
+                                        fetch_start: (var_start + u.fetch_lo) as u32,
+                                        fetch_end: (var_start + u.fetch_hi) as u32,
+                                        ordinal: u.ordinal,
+                                    }
+                                })
+                                .collect();
+                            // Each shard needs a UNIQUE reader (readers seek
+                            // independently), but `make_assembler` below is `Fn + Sync`
+                            // and shared across worker threads -- a `Mutex<Option<_>>`
+                            // per ordinal lets each worker take its one reader exactly
+                            // once. `unit.ordinal < readers.len()` always holds because
+                            // `max_shards` (and therefore `punits.len()`) is capped at
+                            // `readers.len()` above.
+                            let readers_pool: Vec<Mutex<Option<pyo3::Py<pyo3::PyAny>>>> =
+                                readers.into_iter().map(|r| Mutex::new(Some(r))).collect();
+                            return crate::shard_exec::run(
+                                units,
+                                processing_threads,
+                                |unit| {
+                                    let reader = readers_pool[unit.ordinal]
+                                        .lock()
+                                        .unwrap()
+                                        .take()
+                                        .expect("pgen reader taken twice");
+                                    let source = crate::pgen_reader::PgenRecordSource::new(
+                                        reader,
+                                        &pvar_path,
+                                        unit.fetch_start as usize,
+                                        unit.fetch_end as usize,
+                                        s_refs.len(),
+                                        chunk_size,
+                                    )?;
+                                    Ok(crate::chunk_assembler::ChunkAssembler::with_reference(
+                                        Box::new(source),
+                                        s_refs.len(),
+                                        ploidy,
+                                        Arc::clone(&ref_seq),
+                                        has_reference,
+                                        skip_out_of_scope,
+                                        &fields_owned,
+                                        Some((unit.own_start, unit.own_end)),
+                                    ))
+                                },
+                                |e, unit| with_pgen_shard_context(e, &chr, unit),
+                                chunk_size,
+                                &tx_dense,
+                            );
+                        }
+                    }
                     SourceSpec::VcfList {
                         vcf_paths,
                         htslib_threads,
