@@ -275,7 +275,7 @@ fn run_conversion_pipeline(
 #[cfg(feature = "conversion")]
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (pgen_path, pvar_path, reference_path, chroms, contig_ranges, output_dir, samples, chunk_size, max_threads, long_allele_capacity, skip_out_of_scope, signatures, pgen_readers, check_ref))]
+#[pyo3(signature = (pgen_path, pvar_path, reference_path, chroms, contig_ranges, output_dir, samples, chunk_size, max_threads, long_allele_capacity, skip_out_of_scope, signatures, pgen_readers, check_ref, region_ranges, regions_overlap, sample_perm))]
 fn run_pgen_conversion_pipeline(
     py: Python,
     pgen_path: String,
@@ -292,6 +292,9 @@ fn run_pgen_conversion_pipeline(
     signatures: bool,
     pgen_readers: Vec<Py<PyAny>>,
     check_ref: String,
+    region_ranges: Vec<(String, u32, u32)>,
+    regions_overlap: String,
+    sample_perm: Vec<usize>,
 ) -> PyResult<usize> {
     if chroms.len() != contig_ranges.len() || chroms.len() != pgen_readers.len() {
         return Err(PyValueError::new_err(
@@ -304,6 +307,16 @@ fn run_pgen_conversion_pipeline(
     let ploidy = 2usize;
     // PGEN carries no FORMAT, and .pvar INFO extraction is out of scope.
     let fields: Vec<crate::field::FieldSpec> = Vec::new();
+
+    // Parse the region-overlap mode once, up front, so a bad value raises
+    // before any output byte is written -- mirrors `run_conversion_pipeline`.
+    let overlap_mode = crate::svar2_view::parse_overlap_mode(&regions_overlap)?;
+
+    let mut ranges_by_chrom: std::collections::HashMap<String, Vec<(u32, u32)>> =
+        std::collections::HashMap::new();
+    for (chrom, start, end) in region_ranges {
+        ranges_by_chrom.entry(chrom).or_default().push((start, end));
+    }
 
     // Pair each contig with its own reader BEFORE detaching, so the Py handles move
     // into the worker threads (Py<PyAny> is Send; PyAny is not).
@@ -344,6 +357,9 @@ fn run_pgen_conversion_pipeline(
                             var_start: lo,
                             var_end: hi,
                             reader,
+                            regions: ranges_by_chrom.get(&chrom).cloned().unwrap_or_default(),
+                            overlap: overlap_mode,
+                            sample_perm: sample_perm.clone(),
                         },
                         reference_path.as_deref(),
                         &chrom,

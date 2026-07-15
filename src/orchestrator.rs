@@ -56,6 +56,11 @@ pub enum SourceSpec {
         /// A `pgenlib.PgenReader` for THIS contig. Readers seek independently, so
         /// each concurrent contig needs its own -- never share one.
         reader: pyo3::Py<pyo3::PyAny>,
+        regions: Vec<(u32, u32)>,
+        overlap: crate::svar2_view::OverlapMode,
+        /// Same permutation for every contig -- one cohort-wide sample
+        /// selection, not per-contig. See `PgenRecordSource::sample_perm`.
+        sample_perm: Vec<usize>,
     },
     /// `SparseVar2.from_vcf_list`: N single-sample VCFs with possibly disjoint
     /// site lists, k-way merged into ONE record stream (`VcfListRecordSource`).
@@ -258,6 +263,9 @@ pub fn process_chromosome(
                         var_start,
                         var_end,
                         reader,
+                        regions,
+                        overlap,
+                        sample_perm,
                     } => Box::new(crate::pgen_reader::PgenRecordSource::new(
                         reader,
                         &pvar_path,
@@ -265,6 +273,9 @@ pub fn process_chromosome(
                         var_end,
                         s_refs.len(),
                         chunk_size,
+                        regions,
+                        overlap,
+                        sample_perm,
                     )?),
                     SourceSpec::VcfList {
                         vcf_paths,

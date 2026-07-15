@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from genoray import SparseVar2
@@ -292,3 +293,143 @@ def test_from_pgen_check_ref_invalid_raises(sources, tmp_path):
     ref, _, pgen = sources
     with pytest.raises(ValueError, match="check_ref"):
         SparseVar2.from_pgen(tmp_path / "bad.svar2", pgen, ref, check_ref="z")
+
+
+def test_from_pgen_regions_restrict(sources, tmp_path):
+    """`regions="chr1:1-4"` (0-based `[0, 4)`) covers only the POS-3 SNP."""
+    ref, _, pgen = sources
+    out = tmp_path / "pg_regions"
+    SparseVar2.from_pgen(out, pgen, ref, regions="chr1:1-4")
+
+    sv = SparseVar2(out)
+    assert sv.contigs == ["chr1"]
+    counts = sv.region_counts("chr1", [(0, len(_REF))])
+    assert int(counts.sum()) >= 1
+    rag = sv.decode("chr1", [(0, len(_REF))])
+    assert sorted(set(np.asarray(rag["pos"].data).tolist())) == [2]
+
+
+def _cell_pos(rag, sample: int, ploid: int) -> list[int]:
+    """The `pos` values decoded for one `(region 0, sample, ploid)` cell.
+
+    `Ragged.data` returns the WHOLE underlying flat buffer regardless of how
+    the `Ragged` was indexed -- only `.offsets` narrows -- so slicing a cell
+    out requires combining an indexed sub-`Ragged`'s offsets with the
+    top-level `.data` array.
+    """
+    cell = rag[0, sample, ploid]
+    flat_offsets = cell.offsets.reshape(-1)
+    lo, hi = int(flat_offsets[0]), int(flat_offsets[-1])
+    return rag.data["pos"][lo:hi].tolist()
+
+
+def test_from_pgen_samples_preserve_caller_order_and_reorders_genotypes(
+    sources, tmp_path
+):
+    """`samples=["S1", "S0"]` must both reorder `available_samples` AND put
+    S1's actual decoded genotypes under output column 0 -- a real reorder,
+    not just a relabeled name list."""
+    ref, _, pgen = sources
+    full = tmp_path / "pg_full"
+    reordered = tmp_path / "pg_reordered"
+    SparseVar2.from_pgen(full, pgen, ref)
+    SparseVar2.from_pgen(reordered, pgen, ref, samples=["S1", "S0"])
+
+    sv_full = SparseVar2(full)
+    sv_re = SparseVar2(reordered)
+    assert sv_re.available_samples == ["S1", "S0"]
+
+    regions = [(0, len(_REF))]
+    rag_full = sv_full.decode("chr1", regions)
+    rag_re = sv_re.decode("chr1", regions)
+
+    # S1 is full-cohort column 1; it must land at reordered column 0.
+    for ploid in range(2):
+        assert _cell_pos(rag_re, 0, ploid) == _cell_pos(rag_full, 1, ploid)
+    # S0 is full-cohort column 0; it must land at reordered column 1.
+    for ploid in range(2):
+        assert _cell_pos(rag_re, 1, ploid) == _cell_pos(rag_full, 0, ploid)
+
+
+def test_from_pgen_unknown_sample_raises(sources, tmp_path):
+    ref, _, pgen = sources
+    with pytest.raises(ValueError, match="not found"):
+        SparseVar2.from_pgen(tmp_path / "x", pgen, ref, samples=["NOPE"])
+
+
+def _write_pgen_with_spanning_deletion(d: Path) -> tuple[Path, Path]:
+    """(reference, pgen) with a deletion whose POS sits outside
+    ``chr1:7-12`` but whose anchor-trimmed extent reaches into it -- the same
+    fixture as `test_svar2_from_vcf.py`'s
+    `_write_vcf_with_spanning_deletion`, built through plink2 instead of read
+    directly by htslib. ``chr1:5 TACA>T`` (0-based POS 4, deleting the
+    anchor-trimmed extent ``[5, 8)``) round-trips through plink2 with POS and
+    REF/ALT unchanged (verified empirically -- plink2 does not
+    left-align/renormalize this VCF), so the POS-outside/extent-inside
+    property holds identically to the VCF fixture.
+    """
+    ref = d / "ref.fa"
+    ref.write_text(f">chr1\n{_REF}\n")
+    subprocess.run(["samtools", "faidx", str(ref)], check=True)
+
+    body = (
+        "##fileformat=VCFv4.2\n"
+        "##contig=<ID=chr1,length=40>\n"
+        '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n'
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS0\tS1\n"
+        "chr1\t5\t.\tTACA\tT\t.\t.\t.\tGT\t0|1\t1|1\n"
+        "chr1\t7\t.\tC\tCAT\t.\t.\t.\tGT\t0|1\t1|1\n"
+    )
+    plain = d / "del_in.vcf"
+    plain.write_text(body)
+    gz = d / "del_in.vcf.gz"
+    with open(gz, "wb") as fh:
+        subprocess.run(["bgzip", "-c", str(plain)], check=True, stdout=fh)
+    subprocess.run(["bcftools", "index", str(gz)], check=True)
+    subprocess.run(
+        [
+            "plink2",
+            "--make-pgen",
+            "--output-chr",
+            "chrM",
+            "--vcf",
+            str(gz),
+            "--out",
+            str(d / "del_in"),
+        ],
+        check=True,
+    )
+    pvar_text = (d / "del_in.pvar").read_text()
+    assert "\t5\t" in pvar_text, (
+        "plink2 renormalized the spanning deletion's POS; the "
+        "POS-outside/extent-inside property this test locks no longer "
+        f"holds. Actual .pvar:\n{pvar_text}"
+    )
+    return ref, d / "del_in.pgen"
+
+
+def test_from_pgen_variant_mode_covering_range_keeps_spanning_deletion(tmp_path):
+    """Locks the `_pvar_covering_ranges` lower-bound handling for
+    `regions_overlap="variant"`: it must NOT narrow the covering range's
+    lower bound below the contig's original start, or a spanning deletion
+    whose POS precedes the region (but whose extent reaches into it) would
+    never even reach the per-record Rust filter."""
+    d = tmp_path / "span"
+    d.mkdir()
+    ref, pgen = _write_pgen_with_spanning_deletion(d)
+
+    out_v = tmp_path / "variant_mode"
+    out_p = tmp_path / "pos_mode"
+    SparseVar2.from_pgen(
+        out_v, pgen, ref, regions="chr1:7-12", regions_overlap="variant", threads=1
+    )
+    SparseVar2.from_pgen(
+        out_p, pgen, ref, regions="chr1:7-12", regions_overlap="pos", threads=1
+    )
+
+    rag_v = SparseVar2(out_v).decode("chr1", [(0, len(_REF))])
+    rag_p = SparseVar2(out_p).decode("chr1", [(0, len(_REF))])
+    # POS 4 (0-based) is the spanning deletion; its extent overlaps the
+    # region even though its POS does not.
+    assert 4 in np.asarray(rag_v["pos"].data).tolist()
+    assert 4 not in np.asarray(rag_p["pos"].data).tolist()
