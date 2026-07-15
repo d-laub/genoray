@@ -46,6 +46,37 @@ DEFAULT_THREADS = [1, 2, 4, 8, 16, 32]
 DEFAULT_CHUNK_SIZES = [25_000]
 
 
+def compute_scaling(rows: list[dict]) -> list[dict]:
+    """Add speedup + parallel efficiency vs the fewest-threads row of the same
+    (backend, chunk_size) group. Rows are returned in input order, enriched."""
+    baseline: dict[tuple, float] = {}
+    for r in rows:
+        key = (r["backend"], r["chunk_size"])
+        t = r["threads"]
+        if key not in baseline or t < baseline[key][0]:
+            baseline[key] = (t, r["wall_s"])
+    out = []
+    for r in rows:
+        base_t, base_wall = baseline[(r["backend"], r["chunk_size"])]
+        speedup = base_wall / r["wall_s"]
+        out.append(
+            {**r, "speedup": speedup, "efficiency": speedup / (r["threads"] / base_t)}
+        )
+    return out
+
+
+def oracle_hash(store: Path) -> str:
+    """Stable content hash of an SVAR2 store: sha256 over sorted (relpath, bytes)."""
+    import hashlib
+
+    h = hashlib.sha256()
+    for p in sorted(store.rglob("*")):
+        if p.is_file():
+            h.update(p.relative_to(store).as_posix().encode())
+            h.update(p.read_bytes())
+    return h.hexdigest()
+
+
 def _dir_bytes(root: Path) -> int:
     return sum(p.stat().st_size for p in root.rglob("*") if p.is_file())
 
@@ -152,18 +183,30 @@ def _run_worker(args: argparse.Namespace) -> None:
 
     reference = None if args.no_reference else args.reference
     t0 = time.perf_counter()
-    dropped = SparseVar2.from_vcf(
-        out,
-        args.vcf,
-        reference,
-        regions=_pathlike_arg(args.regions),
-        samples=_pathlike_arg(args.samples),
-        no_reference=args.no_reference,
-        skip_out_of_scope=args.skip_out_of_scope,
-        chunk_size=args.chunk_size,
-        threads=args.thread_count,
-        overwrite=True,
-    )
+    if args.backend == "pgen":
+        dropped = SparseVar2.from_pgen(
+            out,
+            args.vcf,
+            reference,
+            no_reference=args.no_reference,
+            skip_out_of_scope=args.skip_out_of_scope,
+            chunk_size=args.chunk_size,
+            threads=args.thread_count,
+            overwrite=True,
+        )
+    else:
+        dropped = SparseVar2.from_vcf(
+            out,
+            args.vcf,
+            reference,
+            regions=_pathlike_arg(args.regions),
+            samples=_pathlike_arg(args.samples),
+            no_reference=args.no_reference,
+            skip_out_of_scope=args.skip_out_of_scope,
+            chunk_size=args.chunk_size,
+            threads=args.thread_count,
+            overwrite=True,
+        )
     wall_s = time.perf_counter() - t0
 
     meta = json.loads((out / "meta.json").read_text())
@@ -174,6 +217,8 @@ def _run_worker(args: argparse.Namespace) -> None:
         "reference": None if args.no_reference else str(args.reference),
         "regions": args.regions,
         "samples": args.samples,
+        "backend": args.backend,
+        "threads": args.thread_count,
         "thread_count": args.thread_count,
         "chunk_size": args.chunk_size,
         "repeat": args.repeat_index,
@@ -210,6 +255,8 @@ def _driver_command(
         str(args.vcf),
         "--output",
         str(output),
+        "--backend",
+        args.backend,
         "--thread-count",
         str(thread_count),
         "--chunk-size",
@@ -232,20 +279,22 @@ def _driver_command(
 
 def _print_markdown(rows: list[dict[str, Any]]) -> None:
     print(
-        "\n| threads | chunk_size | repeat | wall_s | peak_rss_gb | out_size_gb | variants | samples | note |"
+        "\n| backend | threads | chunk_size | repeat | wall_s | speedup | efficiency | "
+        "peak_rss_gb | out_size_gb | variants | samples | oracle_ok | note |"
     )
-    print("|---:|---:|---:|---:|---:|---:|---:|---:|---|")
+    print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|")
     for row in rows:
         if row.get("failed"):
             print(
-                f"| {row['thread_count']} | {row['chunk_size']} | {row['repeat']} | "
-                f"- | - | - | - | - | rc={row['returncode']} |"
+                f"| {row.get('backend', '')} | {row['thread_count']} | {row['chunk_size']} | "
+                f"{row['repeat']} | - | - | - | - | - | - | - | - | rc={row['returncode']} |"
             )
             continue
         print(
-            f"| {row['thread_count']} | {row['chunk_size']} | {row['repeat']} | "
-            f"{row['wall_s']} | {row['peak_rss_gb']} | {row['out_size_gb']} | "
-            f"{row['variants']} | {row['n_samples']} |  |"
+            f"| {row['backend']} | {row['thread_count']} | {row['chunk_size']} | {row['repeat']} | "
+            f"{row['wall_s']} | {row.get('speedup', '')} | {row.get('efficiency', '')} | "
+            f"{row['peak_rss_gb']} | {row['out_size_gb']} | "
+            f"{row['variants']} | {row['n_samples']} | {row.get('oracle_ok', '')} |  |"
         )
 
 
@@ -269,6 +318,22 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--keep-outputs", action="store_true")
     parser.add_argument("--no-reference", action="store_true")
     parser.add_argument("--skip-out-of-scope", action="store_true")
+    parser.add_argument(
+        "--backend",
+        choices=["vcf", "pgen"],
+        default="vcf",
+        help="Conversion backend: SparseVar2.from_vcf or SparseVar2.from_pgen.",
+    )
+    parser.add_argument(
+        "--oracle-check",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Verify every conversion is byte-identical (sha256 over sorted store "
+            "files) to the reference conversion at the fewest threads in its "
+            "(backend, chunk_size) group. On by default; a mismatch aborts the run."
+        ),
+    )
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--thread-count", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--chunk-size", type=int, help=argparse.SUPPRESS)
@@ -319,12 +384,17 @@ def main() -> None:
     if args.sample_count is not None:
         samples = str(_sample_file_for_count(args.vcf, args.out_dir, args.sample_count))
 
+    # Reference oracle hash per chunk_size, established once at the fewest
+    # threads in each (backend, chunk_size) group (threads are processed in
+    # ascending order below so the reference always runs first).
+    reference_hashes: dict[int, str] = {}
+
     rows: list[dict[str, Any]] = []
     for chunk_size in args.chunk_sizes:
-        for thread_count in args.threads:
+        for thread_count in sorted(args.threads):
             for repeat_index in range(args.repeats):
                 label = f"t{thread_count}_c{chunk_size}_r{repeat_index}"
-                output = args.out_dir / f"from_vcf_{label}.svar2"
+                output = args.out_dir / f"from_{args.backend}_{label}.svar2"
                 cmd = _driver_command(
                     args,
                     thread_count=thread_count,
@@ -334,7 +404,8 @@ def main() -> None:
                     samples=samples,
                 )
                 print(
-                    f"=== threads={thread_count} chunk={chunk_size} repeat={repeat_index} ==="
+                    f"=== backend={args.backend} threads={thread_count} "
+                    f"chunk={chunk_size} repeat={repeat_index} ==="
                 )
                 proc = subprocess.run(cmd, capture_output=True, text=True)
                 sys.stderr.write(proc.stderr[-4000:])
@@ -345,6 +416,7 @@ def main() -> None:
                 if line is None:
                     row = {
                         "failed": True,
+                        "backend": args.backend,
                         "thread_count": thread_count,
                         "chunk_size": chunk_size,
                         "repeat": repeat_index,
@@ -356,13 +428,40 @@ def main() -> None:
                     )
                 else:
                     row = json.loads(line[len("RESULT ") :])
+                    if args.oracle_check:
+                        actual_hash = oracle_hash(output)
+                        reference = reference_hashes.get(chunk_size)
+                        if reference is None:
+                            reference_hashes[chunk_size] = actual_hash
+                            row["oracle_ok"] = True
+                        else:
+                            row["oracle_ok"] = actual_hash == reference
+                            if not row["oracle_ok"]:
+                                raise SystemExit(
+                                    "Oracle check FAILED: conversion is not "
+                                    "byte-identical to the reference store for "
+                                    f"backend={args.backend} chunk_size={chunk_size} "
+                                    f"(row threads={thread_count} repeat={repeat_index}). "
+                                    f"hash={actual_hash} reference={reference}"
+                                )
                     print("  " + json.dumps(row, sort_keys=True), flush=True)
                 rows.append(row)
-                if args.jsonl is not None:
-                    with args.jsonl.open("a") as fh:
-                        fh.write(json.dumps(row, sort_keys=True) + "\n")
                 if not args.keep_outputs and output.exists():
                     shutil.rmtree(output)
+
+    ok_rows = [r for r in rows if not r.get("failed")]
+    if ok_rows:
+        scaled_iter = iter(compute_scaling(ok_rows))
+        rows = [r if r.get("failed") else next(scaled_iter) for r in rows]
+
+    if args.jsonl is not None:
+        with args.jsonl.open("w") as fh:
+            for row in rows:
+                fh.write(json.dumps(row, sort_keys=True) + "\n")
+
+    print("\n=== scaled rows ===")
+    for row in rows:
+        print(json.dumps(row, sort_keys=True))
 
     _print_markdown(rows)
 
