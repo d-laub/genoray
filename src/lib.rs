@@ -1,4 +1,5 @@
 // src/lib.rs
+#[cfg(feature = "conversion")]
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 #[cfg(feature = "conversion")]
