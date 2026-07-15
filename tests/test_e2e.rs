@@ -101,6 +101,7 @@ fn test_e2e_normalized_bcf_pipeline() {
         2,    // ploidy
         4096, // long_allele_capacity
         false,
+        genoray_core::normalize::CheckRef::Error,
         1,     // processing_threads
         false, // signatures
         &[],   // fields
@@ -194,6 +195,7 @@ fn test_e2e_max_del_postpass() {
         2,
         4096,
         false,
+        genoray_core::normalize::CheckRef::Error,
         1,     // processing_threads
         false, // signatures
         &[],   // fields
@@ -271,6 +273,7 @@ fn test_e2e_dense_snp_roundtrip() {
         2,
         4096,
         false,
+        genoray_core::normalize::CheckRef::Error,
         1,     // processing_threads
         false, // signatures
         &[],   // fields
@@ -347,6 +350,7 @@ fn test_e2e_mutation_conservation() {
         2,
         4096,
         false,
+        genoray_core::normalize::CheckRef::Error,
         1,     // processing_threads
         false, // signatures
         &[],   // fields
@@ -477,6 +481,7 @@ fn test_reader_extracts_info_format_fields() {
         None,
         "chr1",
         false,
+        genoray_core::normalize::CheckRef::Error,
         &all,
     )
     .unwrap();
@@ -634,6 +639,7 @@ fn test_reader_extracts_multiallelic_number_a_fields() {
         None,
         "chr1",
         false,
+        genoray_core::normalize::CheckRef::Error,
         &all,
     )
     .unwrap();
@@ -739,6 +745,7 @@ fn test_reader_accepts_pure_del() {
         Some(bcf_path.with_extension("fa").to_str().unwrap()),
         "chr1",
         false,
+        genoray_core::normalize::CheckRef::Error,
         &[],
     )
     .unwrap();
@@ -787,6 +794,7 @@ fn test_missing_chrom_returns_err() {
         2,
         1 << 20,
         false,
+        genoray_core::normalize::CheckRef::Error,
         1,     // processing_threads
         false, // signatures
         &[],   // fields

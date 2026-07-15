@@ -33,6 +33,7 @@ fn drain(bcf: &Path, fasta: &Path, chrom: &str, samples: &[&str]) -> Vec<(u32, i
         Some(fasta.to_str().unwrap()),
         chrom,
         false,
+        genoray_core::normalize::CheckRef::Error,
         &[],
     )
     .unwrap();
@@ -243,6 +244,7 @@ fn left_shifts_stay_sorted_across_chunk_boundaries() {
         Some(fasta.to_str().unwrap()),
         "chr1",
         false,
+        genoray_core::normalize::CheckRef::Error,
         &[],
     )
     .unwrap();
@@ -311,6 +313,7 @@ proptest! {
             Some(fasta.to_str().unwrap()),
             "chr1",
             false,
+            genoray_core::normalize::CheckRef::Error,
             &[],
         )
         .unwrap();

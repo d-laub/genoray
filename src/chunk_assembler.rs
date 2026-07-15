@@ -254,6 +254,8 @@ pub struct ChunkAssembler {
     ref_seq: Vec<u8>,
     has_reference: bool,
     skip_out_of_scope: bool,
+    check_ref: crate::normalize::CheckRef,
+    ref_excluded: u64,
     dropped_out_of_scope: u64,
     info_fields: Vec<FieldSpec>,
     format_fields: Vec<FieldSpec>,
@@ -264,6 +266,7 @@ pub struct ChunkAssembler {
 }
 
 impl ChunkAssembler {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         source: Box<dyn RecordSource + Send>,
         num_samples: usize,
@@ -271,6 +274,7 @@ impl ChunkAssembler {
         fasta_path: Option<&str>,
         chrom: &str,
         skip_out_of_scope: bool,
+        check_ref: crate::normalize::CheckRef,
         fields: &[FieldSpec],
     ) -> Result<Self, ConversionError> {
         let (ref_seq, has_reference) = match fasta_path {
@@ -284,6 +288,8 @@ impl ChunkAssembler {
             ref_seq,
             has_reference,
             skip_out_of_scope,
+            check_ref,
+            ref_excluded: 0,
             dropped_out_of_scope: 0,
             info_fields: fields
                 .iter()
@@ -308,6 +314,12 @@ impl ChunkAssembler {
         self.dropped_out_of_scope
     }
 
+    /// Records excluded because their REF disagreed with the reference under
+    /// `CheckRef::Exclude`. Valid after the read loop drains.
+    pub fn ref_excluded(&self) -> u64 {
+        self.ref_excluded
+    }
+
     // Decompose one record into atoms and push them onto the reorder heap, sharing
     // one decoded genotype vector across all atoms of the record.
     fn decompose_record(&mut self, rec: RawRecord) -> Result<(), ConversionError> {
@@ -317,7 +329,25 @@ impl ChunkAssembler {
         // Fail fast only when a reference is available; without one we trust the
         // input is already normalized/left-aligned.
         if self.has_reference {
-            crate::normalize::validate_ref(pos, &rec.reference, &self.ref_seq)?;
+            match crate::normalize::apply_check_ref(
+                self.check_ref,
+                pos,
+                &rec.reference,
+                &self.ref_seq,
+            )? {
+                crate::normalize::RefDecision::Keep => {}
+                crate::normalize::RefDecision::Exclude(e) => {
+                    self.ref_excluded += 1;
+                    if self.ref_excluded == 1 {
+                        println!(
+                            "Notice: check_ref=x excluding record(s) whose REF disagrees \
+                             with the reference (first: {e}); further exclusions on this \
+                             contig are counted, not printed."
+                        );
+                    }
+                    return Ok(());
+                }
+            }
         }
 
         let alt_refs: Vec<&[u8]> = rec.alts.iter().map(|a| a.as_slice()).collect();

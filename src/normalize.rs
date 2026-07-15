@@ -102,6 +102,59 @@ pub fn validate_ref(pos: u32, ref_allele: &[u8], ref_seq: &[u8]) -> Result<(), N
     Ok(())
 }
 
+/// Policy for how a REF/FASTA disagreement is handled during conversion,
+/// mirroring the `e`/`x` subset of `bcftools norm --check-ref`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckRef {
+    /// Abort the build on the first disagreement (the historical behavior).
+    Error,
+    /// Drop the offending record and continue.
+    Exclude,
+}
+
+impl std::str::FromStr for CheckRef {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "e" => Ok(CheckRef::Error),
+            "x" => Ok(CheckRef::Exclude),
+            other => Err(format!(
+                "invalid check_ref {other:?}; expected \"e\" (error) or \"x\" (exclude)"
+            )),
+        }
+    }
+}
+
+/// Per-record outcome of applying a [`CheckRef`] policy. `Exclude` carries the
+/// originating [`NormalizeError`] so the caller can log the first offending
+/// locus without re-running validation.
+#[derive(Debug)]
+pub enum RefDecision {
+    /// REF matches the reference — process the record normally.
+    Keep,
+    /// REF disagrees under [`CheckRef::Exclude`] — skip this whole record.
+    Exclude(NormalizeError),
+}
+
+/// Apply the [`CheckRef`] policy to one record's REF. Returns `Err` only under
+/// [`CheckRef::Error`] (propagating `RefMismatch` / `RefOutOfContig`); under
+/// [`CheckRef::Exclude`] a disagreement (either kind) becomes
+/// `Ok(RefDecision::Exclude(_))`. A matching REF is always `Ok(RefDecision::Keep)`.
+pub fn apply_check_ref(
+    mode: CheckRef,
+    pos: u32,
+    ref_allele: &[u8],
+    ref_seq: &[u8],
+) -> Result<RefDecision, NormalizeError> {
+    match validate_ref(pos, ref_allele, ref_seq) {
+        Ok(()) => Ok(RefDecision::Keep),
+        Err(e) => match mode {
+            CheckRef::Error => Err(e),
+            CheckRef::Exclude => Ok(RefDecision::Exclude(e)),
+        },
+    }
+}
+
 /// Shift an anchored indel atom to its leftmost reference-equivalent position (classic VCF
 /// left-alignment / repeat roll), capped at `l_max` leftward bases. SNP atoms and
 /// substituted-anchor insertions never move. `ref_seq` is the full 0-based contig
@@ -469,6 +522,65 @@ mod tests {
                 contig_len: 4
             })
         ));
+    }
+
+    #[test]
+    fn apply_check_ref_error_mode_propagates_mismatch() {
+        let ref_seq = b"ACGTAC";
+        assert!(matches!(
+            apply_check_ref(CheckRef::Error, 2, b"AA", ref_seq),
+            Err(NormalizeError::RefMismatch { pos: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn apply_check_ref_error_mode_propagates_out_of_contig() {
+        let ref_seq = b"ACGT";
+        assert!(matches!(
+            apply_check_ref(CheckRef::Error, 3, b"TAC", ref_seq),
+            Err(NormalizeError::RefOutOfContig { .. })
+        ));
+    }
+
+    #[test]
+    fn apply_check_ref_exclude_mode_excludes_mismatch() {
+        let ref_seq = b"ACGTAC";
+        assert!(matches!(
+            apply_check_ref(CheckRef::Exclude, 2, b"AA", ref_seq),
+            Ok(RefDecision::Exclude(NormalizeError::RefMismatch {
+                pos: 2,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn apply_check_ref_exclude_mode_excludes_out_of_contig() {
+        let ref_seq = b"ACGT";
+        assert!(matches!(
+            apply_check_ref(CheckRef::Exclude, 3, b"TAC", ref_seq),
+            Ok(RefDecision::Exclude(NormalizeError::RefOutOfContig { .. }))
+        ));
+    }
+
+    #[test]
+    fn apply_check_ref_keeps_matching_ref_in_both_modes() {
+        let ref_seq = b"ACGTAC";
+        assert!(matches!(
+            apply_check_ref(CheckRef::Error, 2, b"GT", ref_seq),
+            Ok(RefDecision::Keep)
+        ));
+        assert!(matches!(
+            apply_check_ref(CheckRef::Exclude, 2, b"GT", ref_seq),
+            Ok(RefDecision::Keep)
+        ));
+    }
+
+    #[test]
+    fn check_ref_from_str_parses_e_and_x() {
+        assert_eq!("e".parse::<CheckRef>(), Ok(CheckRef::Error));
+        assert_eq!("x".parse::<CheckRef>(), Ok(CheckRef::Exclude));
+        assert!("z".parse::<CheckRef>().is_err());
     }
 
     // Reference used across left_align tests (0-based indices):

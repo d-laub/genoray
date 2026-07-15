@@ -1,4 +1,5 @@
 // src/lib.rs
+#[cfg(feature = "conversion")]
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 #[cfg(feature = "conversion")]
@@ -120,7 +121,7 @@ fn index_vcf(path: String) -> PyResult<()> {
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 #[pyfunction]
-#[pyo3(signature = (vcf_path, reference_path, chroms, output_dir, samples, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false, signatures=false, info_fields=Vec::new(), format_fields=Vec::new()))]
+#[pyo3(signature = (vcf_path, reference_path, chroms, output_dir, samples, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false, signatures=false, info_fields=Vec::new(), format_fields=Vec::new(), check_ref="e".to_string()))]
 fn run_conversion_pipeline(
     py: Python,
     vcf_path: String,
@@ -136,6 +137,7 @@ fn run_conversion_pipeline(
     signatures: bool,
     info_fields: Vec<(String, String, String, Option<String>, Option<f64>)>,
     format_fields: Vec<(String, String, String, Option<String>, Option<f64>)>,
+    check_ref: String,
 ) -> PyResult<usize> {
     let sample_refs: Vec<&str> = samples.iter().map(|s| s.as_str()).collect();
 
@@ -143,6 +145,8 @@ fn run_conversion_pipeline(
     raw.extend(format_fields);
     let fields =
         crate::field::parse_manifest(raw).map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+    let check_ref: crate::normalize::CheckRef = check_ref.parse().map_err(PyValueError::new_err)?;
 
     let results: Vec<Result<u64, crate::error::ConversionError>> = py.detach(|| {
         // Step 1 -> HW discovery/override and budgeting
@@ -209,6 +213,7 @@ fn run_conversion_pipeline(
                         ploidy,
                         long_allele_capacity,
                         skip_out_of_scope,
+                        check_ref,
                         processing_threads,
                         signatures,
                         &fields,
@@ -257,7 +262,7 @@ fn run_conversion_pipeline(
 #[cfg(feature = "conversion")]
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (pgen_path, pvar_path, reference_path, chroms, contig_ranges, output_dir, samples, chunk_size, max_threads, long_allele_capacity, skip_out_of_scope, signatures, pgen_readers))]
+#[pyo3(signature = (pgen_path, pvar_path, reference_path, chroms, contig_ranges, output_dir, samples, chunk_size, max_threads, long_allele_capacity, skip_out_of_scope, signatures, pgen_readers, check_ref))]
 fn run_pgen_conversion_pipeline(
     py: Python,
     pgen_path: String,
@@ -273,12 +278,14 @@ fn run_pgen_conversion_pipeline(
     skip_out_of_scope: bool,
     signatures: bool,
     pgen_readers: Vec<Py<PyAny>>,
+    check_ref: String,
 ) -> PyResult<usize> {
     if chroms.len() != contig_ranges.len() || chroms.len() != pgen_readers.len() {
         return Err(PyValueError::new_err(
             "chroms, contig_ranges, and pgen_readers must be the same length",
         ));
     }
+    let check_ref: crate::normalize::CheckRef = check_ref.parse().map_err(PyValueError::new_err)?;
     let sample_refs: Vec<&str> = samples.iter().map(|s| s.as_str()).collect();
     // PGEN is diploid-only.
     let ploidy = 2usize;
@@ -333,6 +340,7 @@ fn run_pgen_conversion_pipeline(
                         ploidy,
                         long_allele_capacity,
                         skip_out_of_scope,
+                        check_ref,
                         processing_threads,
                         signatures,
                         &fields,
@@ -784,7 +792,7 @@ fn svar2_variant_stats<'py>(
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 #[pyfunction]
-#[pyo3(signature = (vcf_paths, reference_path, chroms, output_dir, samples, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false, signatures=false, info_fields=Vec::new(), format_fields=Vec::new()))]
+#[pyo3(signature = (vcf_paths, reference_path, chroms, output_dir, samples, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false, signatures=false, info_fields=Vec::new(), format_fields=Vec::new(), check_ref="e".to_string()))]
 fn run_vcf_list_conversion_pipeline(
     py: Python,
     vcf_paths: Vec<String>,
@@ -800,7 +808,9 @@ fn run_vcf_list_conversion_pipeline(
     signatures: bool,
     info_fields: Vec<(String, String, String, Option<String>, Option<f64>)>,
     format_fields: Vec<(String, String, String, Option<String>, Option<f64>)>,
+    check_ref: String,
 ) -> PyResult<usize> {
+    let check_ref: crate::normalize::CheckRef = check_ref.parse().map_err(PyValueError::new_err)?;
     let dropped: u64 = py.detach(|| {
         orchestrator::run_vcf_list(
             &vcf_paths,
@@ -813,6 +823,7 @@ fn run_vcf_list_conversion_pipeline(
             max_threads,
             long_allele_capacity,
             skip_out_of_scope,
+            check_ref,
             signatures,
             info_fields,
             format_fields,
@@ -833,7 +844,7 @@ fn run_vcf_list_conversion_pipeline(
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 #[pyfunction]
-#[pyo3(signature = (svar1_dir, reference_path, chroms, contig_starts, contig_lens, output_dir, samples, ploidy, chunk_size, max_threads, long_allele_capacity, skip_out_of_scope, signatures, pos_per_contig, ref_bytes_per_contig, ref_offsets_per_contig, alt_bytes_per_contig, alt_offsets_per_contig, format_fields, format_src_dtypes))]
+#[pyo3(signature = (svar1_dir, reference_path, chroms, contig_starts, contig_lens, output_dir, samples, ploidy, chunk_size, max_threads, long_allele_capacity, skip_out_of_scope, signatures, pos_per_contig, ref_bytes_per_contig, ref_offsets_per_contig, alt_bytes_per_contig, alt_offsets_per_contig, format_fields, format_src_dtypes, check_ref))]
 fn run_svar1_conversion_pipeline(
     py: Python,
     svar1_dir: String,
@@ -856,6 +867,7 @@ fn run_svar1_conversion_pipeline(
     alt_offsets_per_contig: Vec<Vec<i64>>,
     format_fields: Vec<(String, String, String, Option<String>, Option<f64>)>,
     format_src_dtypes: Vec<String>,
+    check_ref: String,
 ) -> PyResult<usize> {
     let n = chroms.len();
     if [
@@ -877,6 +889,7 @@ fn run_svar1_conversion_pipeline(
     let sample_refs: Vec<&str> = samples.iter().map(|s| s.as_str()).collect();
     let fields = crate::field::parse_manifest(format_fields)
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let check_ref: crate::normalize::CheckRef = check_ref.parse().map_err(PyValueError::new_err)?;
 
     // Move per-contig owned data into jobs before detaching.
     let mut jobs: Vec<_> = Vec::with_capacity(n);
@@ -935,6 +948,7 @@ fn run_svar1_conversion_pipeline(
                         ploidy,
                         long_allele_capacity,
                         skip_out_of_scope,
+                        check_ref,
                         processing_threads,
                         signatures,
                         &fields,

@@ -68,6 +68,7 @@ def write_svar2(
     skip_symbolics_and_breakends: Annotated[
         bool, Parameter(name="--skip-symbolics-and-breakends", negative="")
     ] = False,
+    check_ref: Annotated[Literal["e", "x"], Parameter(name="--check-ref")] = "e",
 ) -> None:
     """
     Convert a bgzipped VCF, BCF, or PLINK2 PGEN to an SVAR2 store (the default, better-across-the-board format).
@@ -105,6 +106,10 @@ def write_svar2(
         class into nucleotides, so they are dropped together. (On
         ``genoray write svar1`` the two classes are filtered independently
         via ``--no-symbolic`` / ``--no-breakend``.)
+    check_ref
+        REF-vs-reference policy (ignored with ``--no-reference``). ``e``
+        (default) aborts on the first REF/FASTA disagreement; ``x`` drops the
+        offending record and continues. Mirrors ``bcftools norm --check-ref``.
     """
     from genoray import SparseVar2
 
@@ -124,6 +129,7 @@ def write_svar2(
             threads=threads,
             overwrite=overwrite,
             long_allele_capacity=long_allele_capacity,
+            check_ref=check_ref,
         )
     else:
         dropped = SparseVar2.from_vcf(
@@ -137,6 +143,7 @@ def write_svar2(
             threads=threads,
             overwrite=overwrite,
             long_allele_capacity=long_allele_capacity,
+            check_ref=check_ref,
         )
     if skip_out_of_scope:
         print(f"Dropped {dropped} out-of-scope (symbolic/breakend) ALT alleles.")

@@ -53,6 +53,7 @@ fn convert(
         2,
         8 * 1024 * 1024,
         skip,
+        genoray_core::normalize::CheckRef::Error,
         1,     // processing_threads
         false, // signatures
         &[],   // fields
