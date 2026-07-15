@@ -2,7 +2,7 @@
 use crossbeam_channel::bounded;
 use std::fs;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 
 use crate::enum_map::EnumKey;
@@ -10,6 +10,8 @@ use crate::error::ConversionError;
 use crate::nrvk::LongAlleleTableWriter;
 use crate::streams::{REGISTRY, StreamMap, StreamTag};
 use crate::{executor, merge, monitor, writer};
+
+pub type ContigProgressCallback = Arc<dyn Fn(&str) -> Result<(), ConversionError> + Send + Sync>;
 
 /*
 ARCHITECTURE & TENSOR LAYOUT LIFECYCLE
@@ -188,7 +190,7 @@ pub fn process_chromosome(
     // Periodic monitoring sampler. Owns Sender clones for read-only len()/capacity()
     // introspection. The clones drop when the sampler joins, allowing the executor's
     // rx_dense.recv() to see channel-close once the reader's Sender also drops.
-    let stop_sampler = Arc::new(AtomicBool::new(false));
+    let stop_sampler = Arc::new(monitor::StopSignal::new());
     let sampler_thread = monitor::spawn_sampler(
         chrom.to_string(),
         tx_dense.clone(),
@@ -378,7 +380,7 @@ pub fn process_chromosome(
     // clones so the executor can see channel-close and drain), join EVERY thread,
     // and only then surface the first panic as a WorkerPanicked error.
     let reader_res = reader_thread.join();
-    stop_sampler.store(true, Ordering::Relaxed);
+    stop_sampler.stop();
     let sampler_res = sampler_thread.join();
     let executor_res = executor_thread.join();
     let chunk_writer_res = chunk_writer_thread.join();
@@ -605,6 +607,42 @@ pub fn run_vcf_list(
     info_fields: Vec<(String, String, String, Option<String>, Option<f64>)>,
     format_fields: Vec<(String, String, String, Option<String>, Option<f64>)>,
 ) -> Result<u64, ConversionError> {
+    run_vcf_list_with_progress(
+        vcf_paths,
+        reference_path,
+        chroms,
+        output_dir,
+        samples,
+        chunk_size,
+        ploidy,
+        max_threads,
+        long_allele_capacity,
+        skip_out_of_scope,
+        signatures,
+        info_fields,
+        format_fields,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
+pub fn run_vcf_list_with_progress(
+    vcf_paths: &[String],
+    reference_path: Option<&str>,
+    chroms: &[String],
+    output_dir: &str,
+    samples: &[String],
+    chunk_size: usize,
+    ploidy: usize,
+    max_threads: Option<usize>,
+    long_allele_capacity: usize,
+    skip_out_of_scope: bool,
+    signatures: bool,
+    info_fields: Vec<(String, String, String, Option<String>, Option<f64>)>,
+    format_fields: Vec<(String, String, String, Option<String>, Option<f64>)>,
+    progress_callback: Option<&ContigProgressCallback>,
+) -> Result<u64, ConversionError> {
     // Each open input file uses its own small, fixed HTSlib thread allocation
     // (there are N files open at once per contig, unlike the single-file
     // `Vcf` path) -- the hardware budget below only sizes `processing_threads`.
@@ -666,6 +704,9 @@ pub fn run_vcf_list(
             &fields,
         )?;
         total_dropped += dropped;
+        if let Some(callback) = progress_callback {
+            callback(chrom)?;
+        }
     }
     println!("Cohort Processing Complete.");
 

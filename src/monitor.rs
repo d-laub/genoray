@@ -21,14 +21,48 @@
 // constant factor; relative comparisons across stages remain valid.
 // ─────────────────────────────────────────────────────────────────────────────
 use crossbeam_channel::Sender;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::types::{DenseChunk, SparseChunk};
 
 const CLK_TCK_HZ: f64 = 100.0;
+
+/// Wakeable cancellation for the diagnostics sampler.
+///
+/// A condition variable keeps shutdown latency independent of the configured
+/// sample interval while retaining the sampler's existing periodic behavior.
+#[derive(Default)]
+pub struct StopSignal {
+    stopped: Mutex<bool>,
+    wake: Condvar,
+}
+
+impl StopSignal {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn stop(&self) {
+        let mut stopped = self.stopped.lock().unwrap_or_else(|e| e.into_inner());
+        *stopped = true;
+        self.wake.notify_all();
+    }
+
+    /// Wait for either cancellation or `timeout`; returns true when stopped.
+    pub fn wait_timeout(&self, timeout: Duration) -> bool {
+        let stopped = self.stopped.lock().unwrap_or_else(|e| e.into_inner());
+        if *stopped {
+            return true;
+        }
+        let (stopped, _) = self
+            .wake
+            .wait_timeout_while(stopped, timeout, |stopped| !*stopped)
+            .unwrap_or_else(|e| e.into_inner());
+        *stopped
+    }
+}
 
 fn find_thread_tid_by_name(name: &str) -> Option<i32> {
     let entries = std::fs::read_dir("/proc/self/task").ok()?;
@@ -86,7 +120,7 @@ pub fn spawn_sampler(
     tx_dense: Sender<DenseChunk>,
     tx_sparse: Sender<SparseChunk>,
     tx_long: Sender<Vec<u8>>,
-    stop: Arc<AtomicBool>,
+    stop: Arc<StopSignal>,
 ) -> thread::JoinHandle<()> {
     thread::Builder::new()
         .name(format!("samp-{}", chrom))
@@ -106,7 +140,9 @@ pub fn spawn_sampler(
 
             // Brief settle so the four pipeline threads register their /proc/.../comm
             // entries before the first lookup. Missing TIDs are re-resolved each tick.
-            std::thread::sleep(Duration::from_millis(300));
+            if stop.wait_timeout(Duration::from_millis(300)) {
+                return;
+            }
             let mut tids: Vec<Option<i32>> =
                 names.iter().map(|n| find_thread_tid_by_name(n)).collect();
             let mut prev_ticks: Vec<u64> = vec![0; names.len()];
@@ -116,9 +152,7 @@ pub fn spawn_sampler(
             let sparse_cap = tx_sparse.capacity().unwrap_or(0);
             let long_cap = tx_long.capacity().unwrap_or(0);
 
-            while !stop.load(Ordering::Relaxed) {
-                std::thread::sleep(interval);
-
+            while !stop.wait_timeout(interval) {
                 // Re-resolve any not-yet-found TIDs (handles slow startup).
                 for (i, t) in tids.iter_mut().enumerate() {
                     if t.is_none() {
