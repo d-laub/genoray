@@ -142,6 +142,41 @@ fn send_vcf_shard_message(
     }
 }
 
+fn with_vcf_shard_context(
+    err: ConversionError,
+    chrom: &str,
+    shard: crate::vcf_reader::VcfShard,
+) -> ConversionError {
+    let label = format!(
+        "VCF shard {chrom} ordinal {} ownership [{}, {}) fetch [{}, {})",
+        shard.ordinal, shard.own_start, shard.own_end, shard.fetch_start, shard.fetch_end
+    );
+    match err {
+        ConversionError::Input(msg) => ConversionError::Input(format!("{label} failed: {msg}")),
+        ConversionError::ContigNotInHeader { chrom: missing } => ConversionError::Input(format!(
+            "{label} failed: Chromosome '{missing}' not found in VCF header"
+        )),
+        ConversionError::Io { context, source } => ConversionError::Io {
+            context: format!("{label} failed while {context}"),
+            source,
+        },
+        ConversionError::MissingFile { path } => ConversionError::MissingFile {
+            path: format!("{path} ({label})"),
+        },
+        ConversionError::WorkerPanicked { thread } => ConversionError::WorkerPanicked {
+            thread: format!("{thread} ({label})"),
+        },
+        ConversionError::Npy { path, source } => ConversionError::Npy {
+            path: format!("{path} ({label})"),
+            source,
+        },
+        ConversionError::ReadNpy { path, source } => ConversionError::ReadNpy {
+            path: format!("{path} ({label})"),
+            source,
+        },
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn read_vcf_shards_to_dense(
     vcf_path: &str,
@@ -232,6 +267,7 @@ fn read_vcf_shards_to_dense(
                         );
                     }
                     Err(e) => {
+                        let e = with_vcf_shard_context(e, &chrom, shard);
                         let _ = send_vcf_shard_message(&tx, &cancel, Err(e));
                         cancel.store(true, Ordering::Relaxed);
                     }
