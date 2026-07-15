@@ -128,6 +128,37 @@ def test_atomic_write_dir_rollback_on_swap_failure(tmp_path: Path, monkeypatch):
     assert [p.name for p in tmp_path.iterdir()] == ["out.svar"]
 
 
+def test_atomic_write_dir_preserves_backup_when_rollback_fails(
+    tmp_path: Path, monkeypatch
+):
+    dest = tmp_path / "out.svar"
+    dest.mkdir()
+    (dest / "old.bin").write_bytes(b"OLD")
+
+    real_replace = os.replace
+    calls = {"n": 0}
+
+    def flaky_replace(src, dst):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise OSError("publish boom")
+        if calls["n"] == 3:
+            raise OSError("rollback boom")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(U.os, "replace", flaky_replace)
+
+    with pytest.raises(OSError, match="rollback boom"):
+        with atomic_write_dir(dest) as staging:
+            (staging / "new.bin").write_bytes(b"NEW")
+
+    assert not dest.exists()
+    backups = list(tmp_path.glob(".out.svar.old.*"))
+    assert len(backups) == 1
+    assert (backups[0] / "old.bin").read_bytes() == b"OLD"
+    assert not (backups[0] / "new.bin").exists()
+
+
 def _raise_boom(*args, **kwargs):
     raise RuntimeError("write boom")
 

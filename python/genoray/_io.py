@@ -57,11 +57,13 @@ def atomic_write_dir(dest: Path, *, overwrite: bool = True) -> Iterator[Path]:
     Swap is backup-then-swap: if *dest* already exists it is first moved aside to a
     fresh sibling name (so the staging dir is renamed onto a *non-existent* path,
     which is portable on POSIX and Windows), then the moved-aside dir is removed.
-    If the final rename fails, the moved-aside dir is rolled back. The staging dir
-    is always cleaned up; on an exception in the body *dest* is left untouched.
+    Overwriting therefore has a brief interval where *dest* is absent. If the final
+    rename fails, the moved-aside dir is rolled back; if rollback also fails, that
+    backup is retained for recovery. The staging dir is always cleaned up; on an
+    exception in the body *dest* is left untouched.
 
-    The staging dir is created in ``dest.parent`` (same filesystem) so the swap is
-    a true atomic rename and intermediate writes never cross devices. When
+    The staging dir is created in ``dest.parent`` (same filesystem) so each rename
+    is atomic and intermediate writes never cross devices. When
     ``overwrite`` is false, a sibling lock serializes the final existence check
     and rename so racing writers cannot replace a completed output.
     """
@@ -70,6 +72,7 @@ def atomic_write_dir(dest: Path, *, overwrite: bool = True) -> Iterator[Path]:
         tempfile.mkdtemp(dir=dest.parent, prefix=f".{dest.name}.", suffix=".tmp")
     )
     backup: Path | None = None
+    published = False
     try:
         yield staging
         if overwrite:
@@ -77,6 +80,7 @@ def atomic_write_dir(dest: Path, *, overwrite: bool = True) -> Iterator[Path]:
                 backup = _unique_sibling(dest, ".old")
                 os.replace(dest, backup)
             os.replace(staging, dest)
+            published = True
         else:
             lock = FileLock(str(dest.with_name(f".{dest.name}.lock")))
             with lock:
@@ -93,5 +97,5 @@ def atomic_write_dir(dest: Path, *, overwrite: bool = True) -> Iterator[Path]:
         raise
     finally:
         shutil.rmtree(staging, ignore_errors=True)
-        if backup is not None:
+        if backup is not None and published:
             shutil.rmtree(backup, ignore_errors=True)
