@@ -334,13 +334,14 @@ dropped = SparseVar2.from_pgen(
 )
 ```
 
-Signature: `from_pgen(out, source, reference=None, *, no_reference=False, skip_out_of_scope=False, chunk_size=None, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False) -> int`
+Signature: `from_pgen(out, source, reference=None, *, no_reference=False, skip_out_of_scope=False, chunk_size=None, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False, check_ref="e") -> int`
 
 - `source` — a `.pgen` file. Variant metadata is read from the sibling
   `.pvar`/`.pvar.zst`, sample names from the sibling `.psam` (all samples are
   converted — no subsetting). `reference`/`no_reference`, `skip_out_of_scope`,
-  `overwrite`, `long_allele_capacity`, and `signatures` all mean the same as
-  `from_vcf` (above), and return the same `int` (dropped out-of-scope ALTs).
+  `overwrite`, `long_allele_capacity`, `signatures`, and `check_ref` all mean
+  the same as `from_vcf` (above), and return the same `int` (dropped
+  out-of-scope ALTs).
 - **Diploid only** — no `ploidy=` kwarg (`from_vcf`'s default `ploidy=2` is
   implicit and fixed here).
 - `chunk_size=None` — unlike `from_vcf`'s fixed `25_000` default, `None` here
@@ -461,16 +462,16 @@ dropped = SparseVar2.from_svar1(
 )
 ```
 
-Signature: `from_svar1(out, source, reference=None, *, no_reference=False, skip_out_of_scope=False, chunk_size=None, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False) -> int`
+Signature: `from_svar1(out, source, reference=None, *, no_reference=False, skip_out_of_scope=False, chunk_size=None, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False, check_ref="e") -> int`
 
 Migrates an existing SVAR 1.0 (`SparseVar`) store to SVAR2 natively — reads no
 VCF and no htslib; SVAR1 is already sparse, so this reconstructs variant
 records from SVAR1's arrays and reuses the same conversion spine as `from_vcf`.
 
 - `source` — a `SparseVar` store directory (SVAR1). `reference`/`no_reference`,
-  `skip_out_of_scope`, `overwrite`, `long_allele_capacity`, and `signatures` all
-  mean the same as `from_vcf` (above), and return the same `int` (dropped
-  out-of-scope ALTs).
+  `skip_out_of_scope`, `overwrite`, `long_allele_capacity`, `signatures`, and
+  `check_ref` all mean the same as `from_vcf` (above), and return the same
+  `int` (dropped out-of-scope ALTs).
 - `ploidy` is read from SVAR1's metadata — no `ploidy=` kwarg.
 - **Biallelic SVAR1 only** — raises `ValueError` if the source store has
   multiallelic variants (SVAR1's `geno==1` model); re-create the SVAR1 store
