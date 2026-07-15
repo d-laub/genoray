@@ -241,6 +241,57 @@ def test_from_vcf_sharded_normalization_owns_left_shifted_boundary_atom(
     assert sorted(set(np.asarray(shard_dec["pos"].data).tolist())) == [6, 7]
 
 
+def test_from_vcf_fragmented_regions_use_variant_balanced_reader_pool(
+    tmp_path: Path, capfd: pytest.CaptureFixture[str]
+):
+    ref = _write_ref(tmp_path)
+    vcf = _write_vcf(tmp_path, symbolic=False, indexed=True)
+    regions = [("chr1", start, start + 1) for start in range(0, 40, 2)]
+
+    serial_out = tmp_path / "fragmented_serial"
+    parallel_out = tmp_path / "fragmented_parallel"
+    SparseVar2.from_vcf(
+        serial_out,
+        vcf,
+        ref,
+        regions=regions,
+        threads=1,
+        chunk_size=1,
+    )
+    capfd.readouterr()
+    SparseVar2.from_vcf(
+        parallel_out,
+        vcf,
+        ref,
+        regions=regions,
+        threads=16,
+        chunk_size=1,
+    )
+    captured = capfd.readouterr()
+    assert (
+        "VCF variant plan: 2 records -> 2 shard jobs "
+        "(target 1 records) across 2 reader workers"
+    ) in captured.out
+
+    serial = SparseVar2(serial_out)
+    parallel = SparseVar2(parallel_out)
+    np.testing.assert_array_equal(
+        parallel.region_counts("chr1", [(0, 40)]),
+        serial.region_counts("chr1", [(0, 40)]),
+    )
+    serial_dec = serial.decode("chr1", [(0, 40)])
+    parallel_dec = parallel.decode("chr1", [(0, 40)])
+    for field in ("pos", "ilen", "allele"):
+        np.testing.assert_array_equal(
+            np.asarray(parallel_dec[field].data),
+            np.asarray(serial_dec[field].data),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(parallel_dec[field].lengths),
+            np.asarray(serial_dec[field].lengths),
+        )
+
+
 def test_from_vcf_requires_reference_or_opt_out(tmp_path: Path):
     vcf = _write_vcf(tmp_path, symbolic=False, indexed=True)
     with pytest.raises(ValueError, match="reference"):

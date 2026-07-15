@@ -44,6 +44,7 @@ fn convert(
         genoray_core::orchestrator::SourceSpec::Vcf {
             vcf_path: bcf.to_str().unwrap().to_string(),
             htslib_threads: 1,
+            shard_workers: 1,
             regions: Vec::new(),
         },
         fasta,

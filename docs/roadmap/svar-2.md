@@ -100,6 +100,9 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
   then sweeps thread counts and chunk sizes in separate worker processes so per-row
   peak RSS remains meaningful. The harness records end-to-end timing today and is
   ready to attach native phase timings once structured conversion progress lands.
+  Indexed VCF work units are balanced by observed source-record count, not genomic
+  span: a position-only planning scan chooses equal-variant boundaries, preserves
+  equal-POS groups, and clamps normalization padding to requested-region edges.
 - [x] **M3. Per-contig split + sidecar positions + format finalization.** Partition the
   SVAR2 directory by contig; keep positions as sidecar arrays; finalize the on-disk
   format. See [`architecture.md`](architecture.md#on-disk-layout).

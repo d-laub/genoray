@@ -93,6 +93,7 @@ fn test_e2e_normalized_bcf_pipeline() {
         genoray_core::orchestrator::SourceSpec::Vcf {
             vcf_path: bcf_path.to_str().unwrap().to_string(),
             htslib_threads: 1,
+            shard_workers: 1,
             regions: Vec::new(),
         },
         Some(bcf_path.with_extension("fa").to_str().unwrap()),
@@ -233,6 +234,7 @@ fn test_e2e_max_del_postpass() {
         genoray_core::orchestrator::SourceSpec::Vcf {
             vcf_path: bcf_path.to_str().unwrap().to_string(),
             htslib_threads: 1,
+            shard_workers: 1,
             regions: Vec::new(),
         },
         Some(bcf_path.with_extension("fa").to_str().unwrap()),
@@ -312,6 +314,7 @@ fn test_e2e_dense_snp_roundtrip() {
         genoray_core::orchestrator::SourceSpec::Vcf {
             vcf_path: bcf_path.to_str().unwrap().to_string(),
             htslib_threads: 1,
+            shard_workers: 1,
             regions: Vec::new(),
         },
         Some(bcf_path.with_extension("fa").to_str().unwrap()),
@@ -390,6 +393,7 @@ fn test_e2e_mutation_conservation() {
         genoray_core::orchestrator::SourceSpec::Vcf {
             vcf_path: bcf_path.to_str().unwrap().to_string(),
             htslib_threads: 1,
+            shard_workers: 1,
             regions: Vec::new(),
         },
         Some(bcf_path.with_extension("fa").to_str().unwrap()),
@@ -845,6 +849,7 @@ fn test_missing_chrom_returns_err() {
         genoray_core::orchestrator::SourceSpec::Vcf {
             vcf_path: bcf_path.to_str().unwrap().to_string(),
             htslib_threads: 1,
+            shard_workers: 1,
             regions: Vec::new(),
         },
         Some(bcf_path.with_extension("fa").to_str().unwrap()),

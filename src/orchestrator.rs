@@ -1,5 +1,5 @@
 // src/orchestrator.rs
-use crossbeam_channel::{Sender, TrySendError, bounded};
+use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, select};
 use std::fs;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -46,6 +46,7 @@ pub enum SourceSpec {
     Vcf {
         vcf_path: String,
         htslib_threads: usize,
+        shard_workers: usize,
         regions: Vec<(u32, u32)>,
     },
     Pgen {
@@ -128,10 +129,18 @@ enum VcfShardMessage {
     },
 }
 
+fn vcf_shard_worker_count(shard_count: usize, thread_budget: usize) -> usize {
+    if shard_count == 0 {
+        0
+    } else {
+        shard_count.min(thread_budget.max(1))
+    }
+}
+
 fn send_vcf_shard_message(
-    tx: &Sender<Result<VcfShardMessage, ConversionError>>,
+    tx: &Sender<VcfShardMessage>,
     cancel: &AtomicBool,
-    mut msg: Result<VcfShardMessage, ConversionError>,
+    mut msg: VcfShardMessage,
 ) -> bool {
     loop {
         match tx.try_send(msg) {
@@ -148,14 +157,72 @@ fn send_vcf_shard_message(
     }
 }
 
+enum VcfShardReceiveError {
+    Fatal(ConversionError),
+    Disconnected(String),
+}
+
+fn recv_vcf_shard_message(
+    rx: &Receiver<VcfShardMessage>,
+    fatal_rx: &Receiver<ConversionError>,
+) -> Result<VcfShardMessage, VcfShardReceiveError> {
+    select! {
+        recv(fatal_rx) -> msg => match msg {
+            Ok(err) => Err(VcfShardReceiveError::Fatal(err)),
+            Err(err) => Err(VcfShardReceiveError::Disconnected(format!(
+                "VCF shard fatal-error channel disconnected: {err}"
+            ))),
+        },
+        recv(rx) -> msg => msg.map_err(|err| VcfShardReceiveError::Disconnected(err.to_string())),
+    }
+}
+
+fn send_dense_chunk(
+    tx: &Sender<crate::types::DenseChunk>,
+    chunk: crate::types::DenseChunk,
+    context: &str,
+) -> Result<(), ConversionError> {
+    tx.send(chunk).map_err(|_| ConversionError::Io {
+        context: context.to_string(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "dense chunk consumer disconnected",
+        ),
+    })
+}
+
+fn join_vcf_shard_workers(
+    handles: Vec<(String, thread::JoinHandle<()>)>,
+    result: Result<u64, ConversionError>,
+    channel_disconnected: bool,
+) -> Result<u64, ConversionError> {
+    let mut first_panic = None;
+    for (thread_name, handle) in handles {
+        if handle.join().is_err() && first_panic.is_none() {
+            first_panic = Some(thread_name);
+        }
+    }
+    if let Some(thread) = first_panic
+        && (channel_disconnected || result.is_ok())
+    {
+        return Err(ConversionError::WorkerPanicked { thread });
+    }
+    result
+}
+
 fn with_vcf_shard_context(
     err: ConversionError,
     chrom: &str,
     shard: crate::vcf_reader::VcfShard,
 ) -> ConversionError {
     let label = format!(
-        "VCF shard {chrom} ordinal {} ownership [{}, {}) fetch [{}, {})",
-        shard.ordinal, shard.own_start, shard.own_end, shard.fetch_start, shard.fetch_end
+        "VCF shard {chrom} ordinal {} records {} ownership [{}, {}) fetch [{}, {})",
+        shard.ordinal,
+        shard.record_count,
+        shard.own_start,
+        shard.own_end,
+        shard.fetch_start,
+        shard.fetch_end
     );
     match err {
         ConversionError::Input(msg) => ConversionError::Input(format!("{label} failed: {msg}")),
@@ -187,10 +254,11 @@ fn with_vcf_shard_context(
 fn read_vcf_shards_to_dense(
     vcf_path: &str,
     chrom: &str,
-    samples: &[&str],
+    sample_names: Arc<Vec<String>>,
     ploidy: usize,
-    fields: &[crate::field::FieldSpec],
+    fields: Arc<Vec<crate::field::FieldSpec>>,
     shards: Vec<crate::vcf_reader::VcfShard>,
+    thread_budget: usize,
     chunk_size: usize,
     fasta_path: Option<&str>,
     skip_out_of_scope: bool,
@@ -205,82 +273,97 @@ fn read_vcf_shards_to_dense(
         None => (Arc::new(Vec::new()), false),
     };
     let cancel = Arc::new(AtomicBool::new(false));
-    let sample_names: Vec<String> = samples.iter().map(|&s| s.to_string()).collect();
-    let fields_owned = fields.to_vec();
 
+    let worker_count = vcf_shard_worker_count(shards.len(), thread_budget);
+    type VcfShardJob = (crate::vcf_reader::VcfShard, Sender<VcfShardMessage>);
+    let (job_tx, job_rx) = bounded::<VcfShardJob>(shards.len().max(1));
+    let (fatal_tx, fatal_rx) = bounded::<ConversionError>(1);
     let mut receivers = Vec::with_capacity(shards.len());
-    let mut handles = Vec::with_capacity(shards.len());
     for shard in shards {
-        let (tx, rx) = bounded::<Result<VcfShardMessage, ConversionError>>(2);
+        let (tx, rx) = bounded::<VcfShardMessage>(1);
         receivers.push(rx);
+        job_tx
+            .send((shard, tx))
+            .expect("VCF shard job queue must remain connected while seeding");
+    }
+    drop(job_tx);
 
+    let mut handles = Vec::with_capacity(worker_count);
+    for worker_index in 0..worker_count {
         let vcf_path = vcf_path.to_string();
         let chrom = chrom.to_string();
-        let sample_names = sample_names.clone();
-        let fields = fields_owned.clone();
+        let sample_names = Arc::clone(&sample_names);
+        let fields = Arc::clone(&fields);
         let ref_seq = Arc::clone(&ref_seq);
         let cancel = Arc::clone(&cancel);
-        let thread_name = format!("vshard-{}-{}", chrom, shard.ordinal);
+        let job_rx = job_rx.clone();
+        let fatal_tx = fatal_tx.clone();
+        let thread_name = format!("vshard-{}-worker-{}", chrom, worker_index);
 
         let handle = thread::Builder::new()
             .name(thread_name.clone())
             .spawn(move || {
-                let run = || -> Result<(u64, u64), ConversionError> {
-                    let s_refs: Vec<&str> = sample_names.iter().map(|s| s.as_str()).collect();
-                    let source = crate::vcf_reader::VcfRecordSource::new(
-                        &vcf_path,
-                        &chrom,
-                        &s_refs,
-                        1,
-                        ploidy,
-                        &fields,
-                        vec![(shard.fetch_start, shard.fetch_end)],
-                    )?;
-                    let mut reader = crate::chunk_assembler::ChunkAssembler::with_reference(
-                        Box::new(source),
-                        s_refs.len(),
-                        ploidy,
-                        ref_seq,
-                        has_reference,
-                        skip_out_of_scope,
-                        check_ref,
-                        &fields,
-                        Some((shard.own_start, shard.own_end)),
-                    );
-                    let mut local_chunk_id = 0;
-                    while !cancel.load(Ordering::Relaxed) {
-                        match reader.read_next_chunk(chunk_size, local_chunk_id, None)? {
-                            Some(chunk) => {
-                                if !send_vcf_shard_message(
-                                    &tx,
-                                    &cancel,
-                                    Ok(VcfShardMessage::Chunk(chunk)),
-                                ) {
-                                    break;
-                                }
-                                local_chunk_id += 1;
-                            }
-                            None => break,
-                        }
-                    }
-                    Ok((reader.dropped_out_of_scope(), reader.ref_excluded()))
-                };
-
-                match run() {
-                    Ok((dropped_out_of_scope, ref_excluded)) => {
-                        let _ = send_vcf_shard_message(
-                            &tx,
-                            &cancel,
-                            Ok(VcfShardMessage::Done {
-                                dropped_out_of_scope,
-                                ref_excluded,
-                            }),
+                while !cancel.load(Ordering::Relaxed) {
+                    let Ok((shard, tx)) = job_rx.recv() else {
+                        break;
+                    };
+                    let run = || -> Result<(u64, u64), ConversionError> {
+                        let s_refs: Vec<&str> = sample_names.iter().map(|s| s.as_str()).collect();
+                        let source = crate::vcf_reader::VcfRecordSource::new(
+                            &vcf_path,
+                            &chrom,
+                            &s_refs,
+                            0,
+                            ploidy,
+                            fields.as_slice(),
+                            vec![(shard.fetch_start, shard.fetch_end)],
+                        )?;
+                        let mut reader = crate::chunk_assembler::ChunkAssembler::with_reference(
+                            Box::new(source),
+                            s_refs.len(),
+                            ploidy,
+                            Arc::clone(&ref_seq),
+                            has_reference,
+                            skip_out_of_scope,
+                            check_ref,
+                            fields.as_slice(),
+                            Some((shard.own_start, shard.own_end)),
                         );
-                    }
-                    Err(e) => {
-                        let e = with_vcf_shard_context(e, &chrom, shard);
-                        let _ = send_vcf_shard_message(&tx, &cancel, Err(e));
-                        cancel.store(true, Ordering::Relaxed);
+                        let mut local_chunk_id = 0;
+                        while !cancel.load(Ordering::Relaxed) {
+                            match reader.read_next_chunk(chunk_size, local_chunk_id, None)? {
+                                Some(chunk) => {
+                                    if !send_vcf_shard_message(
+                                        &tx,
+                                        &cancel,
+                                        VcfShardMessage::Chunk(chunk),
+                                    ) {
+                                        break;
+                                    }
+                                    local_chunk_id += 1;
+                                }
+                                None => break,
+                            }
+                        }
+                        Ok((reader.dropped_out_of_scope(), reader.ref_excluded()))
+                    };
+
+                    match run() {
+                        Ok((dropped_out_of_scope, ref_excluded)) => {
+                            let _ = send_vcf_shard_message(
+                                &tx,
+                                &cancel,
+                                VcfShardMessage::Done {
+                                    dropped_out_of_scope,
+                                    ref_excluded,
+                                },
+                            );
+                        }
+                        Err(e) => {
+                            let e = with_vcf_shard_context(e, &chrom, shard);
+                            let _ = fatal_tx.try_send(e);
+                            cancel.store(true, Ordering::Relaxed);
+                        }
                     }
                 }
             })
@@ -290,31 +373,38 @@ fn read_vcf_shards_to_dense(
 
     let mut result: Result<u64, ConversionError> = Ok(0);
     let mut ref_excluded_total = 0u64;
+    let mut channel_disconnected = false;
     let mut next_chunk_id = 0usize;
+    let dense_send_context = format!("send parallel VCF dense chunk for {chrom}");
     for rx in &receivers {
         loop {
-            match rx.recv() {
-                Ok(Ok(VcfShardMessage::Chunk(mut chunk))) => {
+            match recv_vcf_shard_message(rx, &fatal_rx) {
+                Ok(VcfShardMessage::Chunk(mut chunk)) => {
                     chunk.chunk_id = next_chunk_id;
-                    tx_dense.send(chunk).unwrap();
+                    if let Err(err) = send_dense_chunk(tx_dense, chunk, &dense_send_context) {
+                        result = Err(err);
+                        cancel.store(true, Ordering::Relaxed);
+                        break;
+                    }
                     next_chunk_id += 1;
                 }
-                Ok(Ok(VcfShardMessage::Done {
+                Ok(VcfShardMessage::Done {
                     dropped_out_of_scope,
                     ref_excluded,
-                })) => {
+                }) => {
                     if let Ok(total) = &mut result {
                         *total += dropped_out_of_scope;
                     }
                     ref_excluded_total += ref_excluded;
                     break;
                 }
-                Ok(Err(e)) => {
+                Err(VcfShardReceiveError::Fatal(e)) => {
                     result = Err(e);
                     cancel.store(true, Ordering::Relaxed);
                     break;
                 }
-                Err(e) => {
+                Err(VcfShardReceiveError::Disconnected(e)) => {
+                    channel_disconnected = true;
                     result = Err(ConversionError::Input(format!(
                         "VCF shard worker channel disconnected on {chrom}: {e}"
                     )));
@@ -327,18 +417,18 @@ fn read_vcf_shards_to_dense(
             break;
         }
     }
+    if result.is_ok()
+        && let Ok(err) = fatal_rx.try_recv()
+    {
+        result = Err(err);
+    }
     if result.is_err() {
         cancel.store(true, Ordering::Relaxed);
     }
     drop(receivers);
+    drop(fatal_tx);
 
-    for (thread_name, handle) in handles {
-        if handle.join().is_err() && result.is_ok() {
-            result = Err(ConversionError::WorkerPanicked {
-                thread: thread_name,
-            });
-        }
-    }
+    let result = join_vcf_shard_workers(handles, result, channel_disconnected);
     if result.is_ok() && ref_excluded_total > 0 {
         println!(
             "[{chrom}] check_ref=x: excluded {ref_excluded_total} record(s) whose REF \
@@ -434,8 +524,13 @@ pub fn process_chromosome(
             let fasta = fasta_path.map(|s| s.to_string());
             let chr = chrom.to_string();
             // Convert references into owned Strings that can safely live forever in the thread
-            let s_owned: Vec<String> = samples.iter().map(|&s| s.to_string()).collect();
-            let fields_owned: Vec<crate::field::FieldSpec> = fields.to_vec();
+            let s_owned = Arc::new(
+                samples
+                    .iter()
+                    .map(|&sample| sample.to_string())
+                    .collect::<Vec<_>>(),
+            );
+            let fields_owned = Arc::new(fields.to_vec());
 
             move || -> Result<u64, ConversionError> {
                 // passing the thread budget down to HTSLib
@@ -448,22 +543,45 @@ pub fn process_chromosome(
                     SourceSpec::Vcf {
                         vcf_path,
                         htslib_threads,
+                        shard_workers,
                         regions,
                     } => {
-                        let shards = crate::vcf_reader::plan_vcf_shards(
-                            &regions,
-                            &chr,
-                            processing_threads,
-                            chunk_size as u32,
-                        )?;
-                        if shards.len() > 1 {
+                        let shard_plan = if shard_workers > 1 {
+                            let positions = crate::vcf_reader::scan_vcf_region_positions(
+                                &vcf_path,
+                                &chr,
+                                htslib_threads,
+                                regions.clone(),
+                            )?;
+                            Some(crate::vcf_reader::plan_vcf_shards_by_variant_count(
+                                &positions,
+                                shard_workers,
+                                chunk_size,
+                            )?)
+                        } else {
+                            None
+                        };
+                        if let Some(plan) = shard_plan
+                            && plan.shards.len() > 1
+                        {
+                            let worker_count =
+                                vcf_shard_worker_count(plan.shards.len(), shard_workers);
+                            println!(
+                                "[{chr}] VCF variant plan: {} records -> {} shard jobs \
+                                 (target {} records) across {} reader workers.",
+                                plan.total_records,
+                                plan.shards.len(),
+                                plan.target_records,
+                                worker_count,
+                            );
                             return read_vcf_shards_to_dense(
                                 &vcf_path,
                                 &chr,
-                                &s_refs,
+                                Arc::clone(&s_owned),
                                 ploidy,
-                                &fields_owned,
-                                shards,
+                                Arc::clone(&fields_owned),
+                                plan.shards,
+                                shard_workers,
                                 chunk_size,
                                 fasta.as_deref(),
                                 skip_out_of_scope,
@@ -477,7 +595,7 @@ pub fn process_chromosome(
                             &s_refs,
                             htslib_threads,
                             ploidy,
-                            &fields_owned,
+                            fields_owned.as_slice(),
                             regions,
                         )?)
                     }
@@ -512,7 +630,7 @@ pub fn process_chromosome(
                             htslib_threads,
                             skip_out_of_scope,
                             check_ref,
-                            &fields_owned,
+                            fields_owned.as_slice(),
                         )?;
                         Box::new(VcfListDroppedProxy {
                             inner: vcf_list,
@@ -566,13 +684,14 @@ pub fn process_chromosome(
                     &chr,
                     skip_out_of_scope,
                     check_ref,
-                    &fields_owned,
+                    fields_owned.as_slice(),
                 )?;
                 let mut chunk_id = 0;
+                let dense_send_context = format!("send serial VCF dense chunk for {chr}");
                 while let Some(dense_chunk) =
                     reader.read_next_chunk(chunk_size, chunk_id, Some(&pool))?
                 {
-                    tx_dense.send(dense_chunk).unwrap();
+                    send_dense_chunk(&tx_dense, dense_chunk, &dense_send_context)?;
                     chunk_id += 1;
                 }
                 let ref_excluded =
@@ -938,4 +1057,50 @@ pub fn run_vcf_list(
     })?;
 
     Ok(total_dropped)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vcf_shard_workers_never_exceed_thread_budget() {
+        assert_eq!(vcf_shard_worker_count(300, 126), 126);
+        assert_eq!(vcf_shard_worker_count(8, 126), 8);
+        assert_eq!(vcf_shard_worker_count(8, 0), 1);
+        assert_eq!(vcf_shard_worker_count(0, 126), 0);
+    }
+
+    #[test]
+    fn fatal_shard_error_interrupts_a_silent_earlier_shard() {
+        let (_shard_tx, shard_rx) = bounded::<VcfShardMessage>(1);
+        let (fatal_tx, fatal_rx) = bounded::<ConversionError>(1);
+        fatal_tx
+            .send(ConversionError::Input("later shard failed".to_string()))
+            .unwrap();
+
+        match recv_vcf_shard_message(&shard_rx, &fatal_rx) {
+            Err(VcfShardReceiveError::Fatal(ConversionError::Input(msg))) => {
+                assert_eq!(msg, "later shard failed");
+            }
+            _ => panic!("expected the fatal shard error"),
+        }
+    }
+
+    #[test]
+    fn worker_panic_replaces_generic_channel_disconnect() {
+        let thread_name = "vshard-test-worker".to_string();
+        let handle = thread::Builder::new()
+            .name(thread_name.clone())
+            .spawn(|| panic!("test panic"))
+            .unwrap();
+        let disconnected = Err(ConversionError::Input(
+            "VCF shard worker channel disconnected".to_string(),
+        ));
+
+        match join_vcf_shard_workers(vec![(thread_name.clone(), handle)], disconnected, true) {
+            Err(ConversionError::WorkerPanicked { thread }) => assert_eq!(thread, thread_name),
+            _ => panic!("expected WorkerPanicked"),
+        }
+    }
 }

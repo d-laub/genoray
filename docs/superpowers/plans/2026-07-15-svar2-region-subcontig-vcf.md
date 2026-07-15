@@ -170,16 +170,21 @@ git commit -m "feat(cli): expose regions and samples for SVAR2 VCF writes"
 
 **Interfaces:**
 - Consumes: Task 1 per-contig normalized intervals.
-- Produces: `VcfShard { chrom, fetch_start, fetch_end, own_start, own_end, ordinal }`.
+- Produces: `VcfShard { fetch_start, fetch_end, own_start, own_end, ordinal, record_count }`.
 - Produces ownership rule: keep a normalized atom iff `own_start <= atom.pos < own_end`.
 
 - [ ] **Step 1: Add boundary tests**
 
 Create a VCF fixture where an insertion/deletion left-aligns from the padded fetch interval into a neighboring ownership interval. Assert `threads=1` and `threads=4` produce the same logical decoded variants and no duplicates.
 
-- [ ] **Step 2: Build shard planner**
+- [x] **Step 2: Build shard planner**
 
-Add a pure Rust planner that splits large intervals by `chunk_size` or approximate base-pair windows, pads by `normalize::L_MAX`, assigns stable ordinals, and coalesces adjacent requested intervals before splitting.
+Perform a lightweight indexed position scan without decoding sample fields, then
+split each requested interval after approximately equal numbers of source records.
+Never split equal-POS records. Treat `chunk_size` as a maximum record count and use
+`ceil(total_records / worker_budget)` when smaller so available workers stay busy.
+Clamp `normalize::L_MAX` padding to the caller's requested-region edges, assign
+stable ordinals, and retain each shard's exact source-record count.
 
 - [ ] **Step 3: Move normalization into worker batches**
 
@@ -223,13 +228,17 @@ git commit -m "perf(svar2): shard VCF conversion within contigs"
 - Consumes: Task 3 shard planner and PR #113 progress observer contract.
 - Produces: a single process-wide reader/normalizer/BGZF budget and one aggregated progress stream.
 
-- [ ] **Step 1: Add thread-budget tests**
+- [x] **Step 1: Add thread-budget tests**
 
 Assert that `threads=32` on one contig allocates multiple VCF shards but does not allocate `32` HTSlib threads per shard. Assert total planned worker plus BGZF plus packing threads is bounded by `threads`.
 
-- [ ] **Step 2: Implement budget allocator**
+- [x] **Step 2: Implement budget allocator**
 
-Extend `ThreadPlan` with `reader_workers`, `htslib_threads_per_reader`, `packing_threads`, and `max_inflight_batches`. Keep existing defaults for full-contig, low-thread runs.
+Extend `ThreadPlan` with a per-contig `shard_workers` budget. The position scan uses
+the serial path's HTSlib pool; shard workers then replace those HTSlib threads and
+decompress synchronously, so worker plus pipeline threads stay within the process
+budget. Bound normalization batches by cohort width (about 64 MiB of GT indices per
+reader, capped at 1,024 records).
 
 - [ ] **Step 3: Integrate progress**
 

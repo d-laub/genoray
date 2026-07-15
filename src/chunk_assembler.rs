@@ -208,7 +208,18 @@ struct AtomMeta {
 // `pack_presence_par` keeps its word-disjoint invariant. 1024 keeps the window
 // above `PARALLEL_MIN_VARIANTS` (512) so parallel packing still engages.
 const PACK_WINDOW: usize = 1024;
-const NORMALIZE_BATCH_RECORDS: usize = 1024;
+const MAX_NORMALIZE_BATCH_RECORDS: usize = 1024;
+const NORMALIZE_BATCH_TARGET_BYTES: usize = 64 * 1024 * 1024;
+
+fn normalization_batch_records(num_samples: usize, ploidy: usize) -> usize {
+    let gt_bytes_per_record = num_samples
+        .saturating_mul(ploidy)
+        .saturating_mul(std::mem::size_of::<i32>());
+    if gt_bytes_per_record == 0 {
+        return MAX_NORMALIZE_BATCH_RECORDS;
+    }
+    (NORMALIZE_BATCH_TARGET_BYTES / gt_bytes_per_record).clamp(1, MAX_NORMALIZE_BATCH_RECORDS)
+}
 
 // Pack `buf`'s presence bits into `genos` starting at variant offset `v0`, then
 // move each atom's metadata into `metas`, dropping `gt`.
@@ -448,8 +459,9 @@ impl ChunkAssembler {
         &mut self,
         pool: Option<&rayon::ThreadPool>,
     ) -> Result<(), ConversionError> {
-        let mut records = Vec::with_capacity(NORMALIZE_BATCH_RECORDS);
-        while records.len() < NORMALIZE_BATCH_RECORDS {
+        let batch_records = normalization_batch_records(self.num_samples, self.ploidy);
+        let mut records = Vec::with_capacity(batch_records);
+        while records.len() < batch_records {
             match self.source.next_record()? {
                 Some(rec) => {
                     self.frontier = rec.pos;
@@ -697,6 +709,14 @@ mod tests {
             info_vals: Vec::new(),
             format_vals: Vec::new(),
         }
+    }
+
+    #[test]
+    fn normalization_batch_is_memory_bounded_for_wide_cohorts() {
+        assert_eq!(normalization_batch_records(500_000, 2), 16);
+        assert_eq!(normalization_batch_records(10_000_000, 2), 1);
+        assert_eq!(normalization_batch_records(5_000, 2), 1024);
+        assert_eq!(normalization_batch_records(1, 2), 1024);
     }
 
     proptest! {

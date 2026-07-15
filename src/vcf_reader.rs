@@ -174,6 +174,21 @@ pub(crate) struct VcfShard {
     pub own_start: u32,
     pub own_end: u32,
     pub ordinal: usize,
+    pub record_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VcfRegionPositions {
+    pub start: u32,
+    pub end: u32,
+    pub positions: Vec<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VcfShardPlan {
+    pub shards: Vec<VcfShard>,
+    pub total_records: usize,
+    pub target_records: usize,
 }
 
 pub(crate) fn coalesce_fetch_regions(
@@ -203,44 +218,95 @@ pub(crate) fn coalesce_fetch_regions(
     Ok(merged)
 }
 
-pub(crate) fn plan_vcf_shards(
-    regions: &[(u32, u32)],
-    chrom: &str,
-    max_shards: usize,
-    target_bp: u32,
-) -> Result<Vec<VcfShard>, ConversionError> {
-    let regions = coalesce_fetch_regions(regions.to_vec(), chrom)?;
-    if regions.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let max_shards = max_shards.max(1);
-    let target_bp = target_bp.max(1);
-    let total_span: u64 = regions
-        .iter()
-        .map(|&(start, end)| u64::from(end - start))
-        .sum();
-    let target_span = total_span
-        .div_ceil(max_shards as u64)
-        .max(u64::from(target_bp))
-        .min(u64::from(u32::MAX)) as u32;
-
-    let mut out = Vec::new();
-    for (region_start, region_end) in regions {
-        let mut own_start = region_start;
-        while own_start < region_end {
-            let own_end = own_start.saturating_add(target_span).min(region_end);
-            out.push(VcfShard {
-                fetch_start: own_start.saturating_sub(crate::normalize::L_MAX),
-                fetch_end: own_end.saturating_add(crate::normalize::L_MAX),
-                own_start,
-                own_end,
-                ordinal: out.len(),
-            });
-            own_start = own_end;
+pub(crate) fn plan_vcf_shards_by_variant_count(
+    regions: &[VcfRegionPositions],
+    worker_budget: usize,
+    max_records_per_shard: usize,
+) -> Result<VcfShardPlan, ConversionError> {
+    for region in regions {
+        if region.end <= region.start {
+            return Err(ConversionError::Input(format!(
+                "Invalid VCF planning interval: start {} must be less than end {}",
+                region.start, region.end
+            )));
+        }
+        if region.positions.windows(2).any(|pair| pair[0] > pair[1]) {
+            return Err(ConversionError::Input(format!(
+                "VCF positions are not sorted inside [{}, {})",
+                region.start, region.end
+            )));
+        }
+        if let Some(&pos) = region
+            .positions
+            .iter()
+            .find(|&&pos| pos < region.start || pos >= region.end)
+        {
+            return Err(ConversionError::Input(format!(
+                "VCF position {pos} falls outside planning interval [{}, {})",
+                region.start, region.end
+            )));
         }
     }
-    Ok(out)
+
+    let total_records: usize = regions.iter().map(|region| region.positions.len()).sum();
+    let target_records = if total_records == 0 {
+        1
+    } else {
+        total_records
+            .div_ceil(worker_budget.max(1))
+            .min(max_records_per_shard.max(1))
+            .max(1)
+    };
+
+    let mut shards = Vec::new();
+    for region in regions {
+        let mut record_start = 0usize;
+        let mut own_start = region.start;
+        while record_start < region.positions.len() {
+            let mut record_end = (record_start + target_records).min(region.positions.len());
+            while record_end < region.positions.len()
+                && region.positions[record_end] == region.positions[record_end - 1]
+            {
+                record_end += 1;
+            }
+
+            let own_end = if record_end == region.positions.len() {
+                region.end
+            } else {
+                region.positions[record_end]
+            };
+            let fetch_start = if own_start == region.start {
+                region.start
+            } else {
+                own_start
+                    .saturating_sub(crate::normalize::L_MAX)
+                    .max(region.start)
+            };
+            let fetch_end = if own_end == region.end {
+                region.end
+            } else {
+                own_end
+                    .saturating_add(crate::normalize::L_MAX)
+                    .min(region.end)
+            };
+            shards.push(VcfShard {
+                fetch_start,
+                fetch_end,
+                own_start,
+                own_end,
+                ordinal: shards.len(),
+                record_count: record_end - record_start,
+            });
+            own_start = own_end;
+            record_start = record_end;
+        }
+    }
+
+    Ok(VcfShardPlan {
+        shards,
+        total_records,
+        target_records,
+    })
 }
 
 fn fetch_region(
@@ -263,6 +329,92 @@ fn fetch_region(
             context: format!("fetching region for {label}"),
             source: std::io::Error::other(e.to_string()),
         })
+}
+
+fn configure_htslib_threads(
+    reader: &mut IndexedReader,
+    thread_count: usize,
+) -> Result<(), ConversionError> {
+    if thread_count == 0 {
+        return Ok(());
+    }
+    reader
+        .set_threads(thread_count)
+        .map_err(|e| ConversionError::Io {
+            context: format!("allocating {thread_count} HTSlib background threads"),
+            source: std::io::Error::other(e.to_string()),
+        })
+}
+
+pub(crate) fn scan_vcf_region_positions(
+    vcf_path: &str,
+    chrom: &str,
+    htslib_threads: usize,
+    regions: Vec<(u32, u32)>,
+) -> Result<Vec<VcfRegionPositions>, ConversionError> {
+    if !std::path::Path::new(vcf_path).exists() {
+        return Err(ConversionError::MissingFile {
+            path: vcf_path.to_string(),
+        });
+    }
+
+    let mut reader = IndexedReader::from_path(vcf_path).map_err(|e| {
+        ConversionError::Input(format!(
+            "Failed to open VCF/BCF index for '{vcf_path}' while planning variant-count shards: {e}"
+        ))
+    })?;
+    configure_htslib_threads(&mut reader, htslib_threads)?;
+    let rid = reader.header().name2rid(chrom.as_bytes()).map_err(|_| {
+        ConversionError::ContigNotInHeader {
+            chrom: chrom.to_string(),
+        }
+    })?;
+
+    let requested = coalesce_fetch_regions(regions, chrom)?;
+    let scan_regions = if requested.is_empty() {
+        vec![(0, u32::MAX)]
+    } else {
+        requested
+    };
+    let whole_contig = scan_regions.len() == 1 && scan_regions[0] == (0, u32::MAX);
+    let mut planned = Vec::with_capacity(scan_regions.len());
+    for (start, end) in scan_regions {
+        fetch_region(
+            &mut reader,
+            rid,
+            chrom,
+            if whole_contig {
+                None
+            } else {
+                Some((start, end))
+            },
+        )?;
+        let mut record = reader.empty_record();
+        let mut positions = Vec::new();
+        loop {
+            match reader.read(&mut record) {
+                None => break,
+                Some(Err(e)) => {
+                    return Err(ConversionError::Io {
+                        context: format!("scanning VCF positions for {chrom}:[{start}, {end})"),
+                        source: std::io::Error::other(e.to_string()),
+                    });
+                }
+                Some(Ok(())) => {
+                    let pos = record.pos() as u32;
+                    if pos >= start && pos < end {
+                        positions.push(pos);
+                    }
+                }
+            }
+        }
+        planned.push(VcfRegionPositions {
+            start,
+            end,
+            positions,
+        });
+    }
+    Ok(planned)
 }
 
 impl VcfRecordSource {
@@ -291,12 +443,7 @@ impl VcfRecordSource {
             ))
         })?;
 
-        reader
-            .set_threads(htslib_threads)
-            .map_err(|e| ConversionError::Io {
-                context: format!("allocating {htslib_threads} HTSlib background threads"),
-                source: std::io::Error::other(e.to_string()),
-            })?;
+        configure_htslib_threads(&mut reader, htslib_threads)?;
 
         let header = reader.header().clone();
 
@@ -477,39 +624,70 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shard_planner_covers_owned_ranges_with_padded_fetches() {
-        let shards = plan_vcf_shards(&[(0, 12)], "chr1", 3, 3).unwrap();
+    fn variant_count_shards_balance_dense_and_sparse_coordinates() {
+        let regions = vec![
+            VcfRegionPositions {
+                start: 0,
+                end: 100,
+                positions: vec![1, 2, 3, 4],
+            },
+            VcfRegionPositions {
+                start: 1_000_000,
+                end: 2_000_000,
+                positions: vec![1_100_000, 1_300_000, 1_600_000, 1_900_000],
+            },
+        ];
+
+        let plan = plan_vcf_shards_by_variant_count(&regions, 4, 25_000).unwrap();
+        assert_eq!(plan.total_records, 8);
+        assert_eq!(plan.target_records, 2);
         assert_eq!(
-            shards
+            plan.shards
                 .iter()
-                .map(|s| (s.own_start, s.own_end, s.ordinal))
+                .map(|shard| shard.record_count)
                 .collect::<Vec<_>>(),
-            vec![(0, 4, 0), (4, 8, 1), (8, 12, 2)]
+            vec![2, 2, 2, 2]
         );
-        assert_eq!(shards[0].fetch_start, 0);
-        assert!(shards[0].fetch_end >= shards[1].own_start);
-        assert!(shards[1].fetch_start <= shards[0].own_end);
-        assert!(shards[1].fetch_end >= shards[2].own_start);
     }
 
     #[test]
-    fn shard_planner_coalesces_overlapping_regions_before_split() {
-        let shards = plan_vcf_shards(&[(8, 12), (0, 5), (4, 9)], "chr1", 4, 20).unwrap();
-        assert_eq!(shards.len(), 1);
-        assert_eq!((shards[0].own_start, shards[0].own_end), (0, 12));
+    fn variant_count_shards_do_not_split_equal_position_records() {
+        let regions = vec![VcfRegionPositions {
+            start: 0,
+            end: 100,
+            positions: vec![10, 10, 10, 20, 30, 40],
+        }];
+
+        let plan = plan_vcf_shards_by_variant_count(&regions, 3, 2).unwrap();
+        assert_eq!(
+            plan.shards
+                .iter()
+                .map(|shard| shard.record_count)
+                .collect::<Vec<_>>(),
+            vec![3, 2, 1]
+        );
+        assert_eq!(
+            plan.shards
+                .iter()
+                .map(|shard| (shard.own_start, shard.own_end))
+                .collect::<Vec<_>>(),
+            vec![(0, 20), (20, 40), (40, 100)]
+        );
     }
 
     #[test]
-    fn shard_planner_treats_max_shards_as_an_upper_bound() {
-        let shards = plan_vcf_shards(&[(0, 100)], "chr1", 4, 1).unwrap();
-        assert_eq!(shards.len(), 4);
-        assert!(shards.len() <= 4);
-        assert_eq!(
-            shards
-                .iter()
-                .map(|s| (s.own_start, s.own_end))
-                .collect::<Vec<_>>(),
-            vec![(0, 25), (25, 50), (50, 75), (75, 100)]
-        );
+    fn variant_count_shard_padding_stays_inside_requested_region() {
+        let regions = vec![VcfRegionPositions {
+            start: 100,
+            end: 200,
+            positions: vec![110, 120, 130, 140],
+        }];
+
+        let plan = plan_vcf_shards_by_variant_count(&regions, 2, 2).unwrap();
+        assert_eq!(plan.shards.len(), 2);
+        assert_eq!(plan.shards[0].fetch_start, 100);
+        assert_eq!(plan.shards[1].fetch_end, 200);
+        assert!(plan.shards[0].fetch_end >= plan.shards[1].own_start);
+        assert!(plan.shards[1].fetch_start <= plan.shards[0].own_end);
     }
 }

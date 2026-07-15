@@ -123,8 +123,8 @@ def _normalize_svar2_vcf_regions(
 
     This is intentionally a pre-conversion helper: it reuses the v1 coordinate
     parser/sample conventions, then returns per-contig 0-based half-open
-    intervals suitable for `IndexedReader.fetch`. Full post-normalization
-    ownership filtering belongs to the sub-contig shard PR.
+    intervals suitable for the native indexed position scan and variant-count
+    shard planner.
     """
     from genoray._contigs import ContigNormalizer
     from genoray._svar._regions import _normalize_regions
@@ -614,6 +614,13 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         `samples` selects and reorders VCF samples by name, preserving caller
         order and de-duplicating first occurrences.
 
+        For a splittable contig, Genoray first scans indexed record positions
+        without decoding genotypes, then derives approximately equal-variant
+        coordinate shards. `chunk_size` is the maximum records per shard and
+        packed output chunk; the planner may choose a smaller shard target to
+        occupy the `threads` budget. Requested-region boundaries remain hard
+        limits, while internal boundaries receive a normalization halo.
+
         signatures: if True, classify SBS96/ID83 codes during the write and
         store the mutcat sidecar (factored into the dense/var_key cost model).
         Requires a reference; raises if `no_reference=True`.
@@ -725,7 +732,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             selected_samples,
             chunk_size,
             ploidy,
-            threads,  # max_threads; None => auto
+            threads,  # total process thread budget; None => auto
             long_allele_capacity,
             skip_out_of_scope,
             signatures,

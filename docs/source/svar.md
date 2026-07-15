@@ -51,8 +51,14 @@ genoray write cohort.vcf.gz subset.svar2 \
 
 Use `--regions-file/-R` for BED files and `--samples-file/-S` for one-sample-per-line
 sample lists. `regions_overlap=pos` is the default; `record` is also supported.
-Full post-normalization `variant` ownership is reserved for the follow-up
-sub-contig sharding work.
+Full post-normalization `variant` overlap remains unsupported.
+
+Within each requested region, multi-threaded conversion performs an indexed
+position-only scan and divides work by observed VCF record count rather than by
+base-pair span. This keeps gene-dense and gene-sparse intervals balanced. Equal-POS
+records stay together, requested-region edges are never expanded, and only internal
+shard edges receive a left-alignment halo. `chunk_size` caps records per shard; the
+planner can choose a smaller target to occupy the available worker budget.
 
 ## Haploid (ploidy=1) write option
 

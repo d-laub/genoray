@@ -18,6 +18,10 @@ const MIN_THREADS_PER_CHROM: usize = PIPELINE_THREADS_PER_CHROM + MIN_HTSLIB_THR
 pub struct ThreadPlan {
     pub concurrent_chroms: usize,
     pub htslib_threads: usize,
+    // Per-contig reader workers when indexed VCF sharding replaces the single
+    // HTSlib reader. Each worker decompresses synchronously, so these consume
+    // the same cores otherwise reserved for HTSlib plus reader-side processing.
+    pub shard_workers: usize,
     // Cores left idle after the pipeline + htslib threads across all concurrent
     // chroms. For splittable VCF contigs this caps concurrent shard readers;
     // otherwise it sizes the reader-side processing pool used for bounded
@@ -37,9 +41,11 @@ pub fn plan_thread_budget(available_cores: usize, n_chroms: usize) -> ThreadPlan
         let htslib = std::cmp::max(1, usable_cores.saturating_sub(PIPELINE_THREADS_PER_CHROM));
         let htslib = std::cmp::min(htslib, MAX_HTSLIB_THREADS);
         let processing = processing_threads(usable_cores, 1, htslib);
+        let shard_workers = shard_workers(usable_cores, 1);
         ThreadPlan {
             concurrent_chroms: 1,
             htslib_threads: htslib,
+            shard_workers,
             processing_threads: processing,
         }
     } else {
@@ -50,12 +56,22 @@ pub fn plan_thread_budget(available_cores: usize, n_chroms: usize) -> ThreadPlan
         let htslib_unclamped = cores_per_chrom.saturating_sub(PIPELINE_THREADS_PER_CHROM);
         let htslib = htslib_unclamped.clamp(MIN_HTSLIB_THREADS, MAX_HTSLIB_THREADS);
         let processing = processing_threads(usable_cores, concurrent, htslib);
+        let shard_workers = shard_workers(usable_cores, concurrent);
         ThreadPlan {
             concurrent_chroms: concurrent,
             htslib_threads: htslib,
+            shard_workers,
             processing_threads: processing,
         }
     }
+}
+
+fn shard_workers(usable_cores: usize, concurrent: usize) -> usize {
+    usable_cores
+        .checked_div(concurrent.max(1))
+        .unwrap_or(0)
+        .saturating_sub(PIPELINE_THREADS_PER_CHROM)
+        .max(1)
 }
 
 /// Cores left idle after `concurrent` chroms each claim the pipeline threads plus
@@ -76,6 +92,7 @@ mod tests {
             ThreadPlan {
                 concurrent_chroms: 1,
                 htslib_threads: 1,
+                shard_workers: 1,
                 processing_threads: 1,
             }
         );
@@ -88,6 +105,7 @@ mod tests {
             ThreadPlan {
                 concurrent_chroms: 1,
                 htslib_threads: 1,
+                shard_workers: 1,
                 processing_threads: 1,
             }
         );
@@ -100,6 +118,7 @@ mod tests {
             ThreadPlan {
                 concurrent_chroms: 10,
                 htslib_threads: 2,
+                shard_workers: 2,
                 processing_threads: 4,
             }
         );
@@ -140,6 +159,13 @@ mod tests {
         // processing = max(1, 32 - 12) = 20.
         let plan = plan_thread_budget(33, 1);
         assert_eq!(plan.processing_threads, 20);
+    }
+
+    #[test]
+    fn test_shard_workers_replace_htslib_threads_without_exceeding_budget() {
+        assert_eq!(plan_thread_budget(33, 1).shard_workers, 28);
+        assert_eq!(plan_thread_budget(126, 1).shard_workers, 121);
+        assert_eq!(plan_thread_budget(65, 22).shard_workers, 2);
     }
 
     #[test]

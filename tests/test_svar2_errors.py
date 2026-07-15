@@ -52,14 +52,18 @@ def test_ref_mismatch_raises_value_error(tmp_path: Path):
 
 def test_sharded_ref_mismatch_includes_shard_region(tmp_path: Path):
     ref = _write_ref(tmp_path)
-    # threads=16 leaves a non-trivial reader-side shard budget for this
-    # one-contig input, so the REF mismatch is raised from a VCF shard worker.
-    vcf = _write_vcf(tmp_path, "chr1\t3\t.\tG\tT\t.\t.\t.\tGT\t0|1\t0|0\n")
+    # Two distinct positions and chunk_size=1 force two VCF shard jobs; the
+    # second record's mismatch must retain that worker's ownership context.
+    vcf = _write_vcf(
+        tmp_path,
+        "chr1\t2\t.\tC\tT\t.\t.\t.\tGT\t0|1\t0|0\n"
+        "chr1\t3\t.\tG\tT\t.\t.\t.\tGT\t0|1\t0|0\n",
+    )
     with pytest.raises(
         ValueError,
         match=r"VCF shard chr1.*ownership \[\d+, \d+\).*fetch \[\d+, \d+\).*failed: REF 'G'.*disagrees",
     ):
-        SparseVar2.from_vcf(tmp_path / "store", vcf, ref, threads=16, chunk_size=5)
+        SparseVar2.from_vcf(tmp_path / "store", vcf, ref, threads=16, chunk_size=1)
 
 
 def test_missing_reference_raises_file_not_found(tmp_path: Path):

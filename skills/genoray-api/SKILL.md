@@ -246,7 +246,7 @@ dropped = SparseVar2.from_vcf(
 dropped = SparseVar2.from_vcf("out.svar2", "file.vcf.gz", no_reference=True)
 ```
 
-Signature: `from_vcf(out, source, reference=None, *, no_reference=False, skip_out_of_scope=False, ploidy=2, chunk_size=25_000, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False, info_fields=None, format_fields=None, check_ref="e") -> int`
+Signature: `from_vcf(out, source, reference=None, *, regions=None, samples=None, merge_overlapping=False, regions_overlap="pos", no_reference=False, skip_out_of_scope=False, ploidy=2, chunk_size=25_000, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False, info_fields=None, format_fields=None, check_ref="e") -> int`
 
 - `source` — a bgzipped VCF (`.vcf.gz`) or BCF (`.bcf`). Auto-indexes (`.csi`) if
   no `.csi`/`.tbi` is found. For a PLINK2 PGEN source, use `from_pgen` instead
@@ -268,6 +268,13 @@ Signature: `from_vcf(out, source, reference=None, *, no_reference=False, skip_ou
   runs past the contig end) and continues, logging a per-contig count.
   Comparison is case-insensitive (soft-masked lowercase reference bases
   match). Any other value raises `ValueError` before conversion starts.
+- `regions=` accepts region strings, 0-based half-open tuples, BED-like paths,
+  and frames. `samples=` selects/reorders samples by name. Multi-threaded indexed
+  conversion scans positions first and balances parser shards by source-record
+  count; `chunk_size` is the maximum records per shard and output chunk.
+- `threads` is a total process budget. Variant-shard workers replace the serial
+  reader's HTSlib background threads rather than creating an HTSlib pool per
+  worker.
 - No dosages, no `haploid=` OR-collapse, no `max_mem`-based chunking (use
   `chunk_size` instead) — these remain `SparseVar` (SVAR 1.0)-only for now.
 - `signatures=False` — when `True`, classifies every SNP/indel into its
