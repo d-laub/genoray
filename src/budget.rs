@@ -19,10 +19,9 @@ pub struct ThreadPlan {
     pub concurrent_chroms: usize,
     pub htslib_threads: usize,
     // Cores left idle after the pipeline + htslib threads across all concurrent
-    // chroms. Sizes the reader-side processing pool: bounded per-record
+    // chroms. For splittable VCF contigs this caps concurrent shard readers;
+    // otherwise it sizes the reader-side processing pool used for bounded
     // normalization batches plus intra-chunk presence packing.
-    // Floored at 1 so the pool always builds; parallel work self-gates off
-    // when this is < 2.
     pub processing_threads: usize,
 }
 

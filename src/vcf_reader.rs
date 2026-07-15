@@ -498,4 +498,18 @@ mod tests {
         assert_eq!(shards.len(), 1);
         assert_eq!((shards[0].own_start, shards[0].own_end), (0, 12));
     }
+
+    #[test]
+    fn shard_planner_treats_max_shards_as_an_upper_bound() {
+        let shards = plan_vcf_shards(&[(0, 100)], "chr1", 4, 1).unwrap();
+        assert_eq!(shards.len(), 4);
+        assert!(shards.len() <= 4);
+        assert_eq!(
+            shards
+                .iter()
+                .map(|s| (s.own_start, s.own_end))
+                .collect::<Vec<_>>(),
+            vec![(0, 25), (25, 50), (50, 75), (75, 100)]
+        );
+    }
 }
