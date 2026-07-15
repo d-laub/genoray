@@ -1,7 +1,40 @@
 use crate::layout::ContigPaths;
 use crossbeam_channel::Sender;
 use std::fs::File;
-use std::os::unix::fs::FileExt;
+
+/// Positioned read that fills `buf` starting at `offset` without moving the
+/// file cursor, so callers can read through a shared `&File`. Wraps the
+/// platform pread primitives: `read_exact_at` on Unix, a `seek_read` loop on
+/// Windows (which, like `read`, may return short).
+#[cfg(unix)]
+fn pread_exact(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(buf, offset)
+}
+
+#[cfg(windows)]
+fn pread_exact(file: &File, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        match file.seek_read(buf, offset) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf = &mut buf[n..];
+                offset += n as u64;
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    if buf.is_empty() {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "failed to fill whole buffer",
+        ))
+    }
+}
 
 // strictly bounded memory bank for long alleles (non-blocking, double-buffered memory)
 // Public API
@@ -122,9 +155,7 @@ impl LongAlleleReader {
         let end_byte = self.offsets[idx + 1];
         let len = (end_byte - start_byte) as usize;
         let mut buf = vec![0u8; len];
-        self.file
-            .read_exact_at(&mut buf, start_byte)
-            .expect("pread long allele");
+        pread_exact(&self.file, &mut buf, start_byte).expect("pread long allele");
         buf
     }
 
@@ -141,9 +172,7 @@ impl LongAlleleReader {
         let total = *self.offsets.last().unwrap_or(&0) as usize;
         let mut buf = vec![0u8; total];
         if total > 0 {
-            self.file
-                .read_exact_at(&mut buf, 0)
-                .expect("pread long_alleles.bin");
+            pread_exact(&self.file, &mut buf, 0).expect("pread long_alleles.bin");
         }
         buf
     }
