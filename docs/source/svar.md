@@ -17,8 +17,11 @@ svar = SparseVar("out.svar")
 
 ### Region/sample-restricted SVAR2 conversion
 
-`SparseVar2.from_vcf` can convert an indexed VCF/BCF directly into a subset of
-regions and samples:
+`SparseVar2.from_vcf`, `from_pgen`, and `from_svar1` can all convert directly
+into a subset of regions and samples. `from_vcf_list` supports the same
+`regions=`/`merge_overlapping=`/`regions_overlap=` but has **no `samples=`**
+— each input file is single-sample, so the cohort is defined by the file set
+itself:
 
 ```python
 from genoray import SparseVar2
@@ -36,10 +39,12 @@ SparseVar2.from_vcf(
 
 Region strings use bcftools-style 1-based inclusive coordinates and are
 converted to 0-based half-open intervals. Tuple, BED, and frame inputs are
-already interpreted as 0-based half-open. `samples` preserves caller order and
-deduplicates repeated names by first occurrence.
+already interpreted as 0-based half-open. `samples` selects and reorders by
+name, preserving caller order and deduplicating repeated names by first
+occurrence.
 
-The equivalent CLI flags are available on the default SVAR2 writer:
+The equivalent CLI flags are available on the default SVAR2 writer, for every
+source kind (VCF/BCF, PGEN, an SVAR1 store, or a vcf-list directory/manifest):
 
 ```bash
 genoray write cohort.vcf.gz subset.svar2 \
@@ -49,10 +54,19 @@ genoray write cohort.vcf.gz subset.svar2 \
   --threads 8
 ```
 
-Use `--regions-file/-R` for BED files and `--samples-file/-S` for one-sample-per-line
-sample lists. `regions_overlap=pos` is the default; `record` is also supported.
-Full post-normalization `variant` ownership is reserved for the follow-up
-sub-contig sharding work.
+Use `--regions-file/-R` for BED files and `--samples-file/-S` for
+one-sample-per-line sample lists. `--samples`/`-s`/`--samples-file`/`-S` are
+rejected for the multi-file (vcf-list) directory/manifest form — each input
+file already contributes exactly one sample, so there's no cohort left to
+subset.
+
+`regions_overlap` selects one of three overlap modes, matching bcftools
+`--regions-overlap`: `"pos"` (default; POS inside `[start,end)`), `"record"`
+(POS in `[start,end+1)`, so an indel at the region's last base is kept), or
+`"variant"` (the anchor-trimmed variant extent overlaps the region). In
+`variant` mode a multiallelic record is kept whole if ANY of its alleles
+truly overlaps the region; individual non-overlapping alleles are not
+dropped.
 
 ## Haploid (ploidy=1) write option
 
