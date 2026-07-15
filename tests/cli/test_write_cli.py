@@ -53,6 +53,7 @@ def _vcf(d: Path, *, symbolic: bool) -> Path:
         '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n'
         "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS0\tS1\n"
         "chr1\t3\t.\tA\tG\t.\t.\t.\tGT\t1|0\t0|0\n"
+        "chr1\t7\t.\tC\tCAT\t.\t.\t.\tGT\t0|1\t1|1\n"
     )
     if symbolic:
         # POS 20 (1-based) in _REF is 'T'; the anchor REF base must match the
@@ -84,6 +85,60 @@ def test_write_no_reference(tmp_path: Path):
     r = _run(["write", str(vcf), str(out), "--no-reference", "--threads", "1"])
     assert r.returncode == 0, r.stderr
     assert (out / "meta.json").exists()
+
+
+def test_write_svar2_regions_and_samples(tmp_path: Path):
+    ref = _ref(tmp_path)
+    vcf = _vcf(tmp_path, symbolic=False)
+    out = tmp_path / "regioned"
+    r = _run(
+        [
+            "write",
+            str(vcf),
+            str(out),
+            "--reference",
+            str(ref),
+            "--regions",
+            "chr1:1-4",
+            "--samples",
+            "S0",
+            "--threads",
+            "1",
+        ]
+    )
+    assert r.returncode == 0, r.stderr
+    sv = SparseVar2(out)
+    assert sv.available_samples == ["S0"]
+    assert int(sv.region_counts("chr1", [(0, 40)]).sum()) == 1
+
+
+def test_write_svar2_regions_file_and_samples_file(tmp_path: Path):
+    ref = _ref(tmp_path)
+    vcf = _vcf(tmp_path, symbolic=False)
+    regions = tmp_path / "regions.bed"
+    regions.write_text("chr1\t3\t8\n")
+    samples = tmp_path / "samples.txt"
+    samples.write_text("S1\n")
+    out = tmp_path / "file_args"
+    r = _run(
+        [
+            "write",
+            str(vcf),
+            str(out),
+            "--reference",
+            str(ref),
+            "--regions-file",
+            str(regions),
+            "--samples-file",
+            str(samples),
+            "--threads",
+            "1",
+        ]
+    )
+    assert r.returncode == 0, r.stderr
+    sv = SparseVar2(out)
+    assert sv.available_samples == ["S1"]
+    assert int(sv.region_counts("chr1", [(0, 40)]).sum()) == 2
 
 
 def test_write_requires_reference_xor(tmp_path: Path):
@@ -198,6 +253,24 @@ def test_write_pgen_rejects_nondefault_ploidy(tmp_path: Path):
     )
     assert r.returncode != 0
     assert "diploid" in (r.stdout + r.stderr).lower()
+
+
+def test_write_pgen_rejects_regions_without_plink(tmp_path: Path):
+    pgen = tmp_path / "fake.pgen"
+    pgen.write_bytes(b"")
+    out = tmp_path / "fake.svar2"
+    r = _run(
+        [
+            "write",
+            str(pgen),
+            str(out),
+            "--no-reference",
+            "--regions",
+            "chr1:1-4",
+        ]
+    )
+    assert r.returncode != 0
+    assert "vcf/bcf only" in (r.stdout + r.stderr).lower()
 
 
 def test_write_svar1_still_works(tmp_path: Path):

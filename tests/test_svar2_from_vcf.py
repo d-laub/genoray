@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from genoray import SparseVar2
@@ -51,6 +52,102 @@ def test_from_vcf_with_reference_roundtrips(tmp_path: Path):
     sv = SparseVar2(out)
     assert sv.available_samples == ["S0", "S1"]
     assert sv.contigs == ["chr1"]
+
+
+def test_from_vcf_regions_restricts_conversion(tmp_path: Path):
+    ref = _write_ref(tmp_path)
+    vcf = _write_vcf(tmp_path, symbolic=False, indexed=True)
+    out = tmp_path / "regioned"
+    dropped = SparseVar2.from_vcf(out, vcf, ref, regions="chr1:1-4", threads=1)
+    assert dropped == 0
+
+    sv = SparseVar2(out)
+    assert sv.contigs == ["chr1"]
+    counts = sv.region_counts("chr1", [(0, 40)])
+    assert int(counts.sum()) == 1
+    rag = sv.decode("chr1", [(0, 40)])
+    assert np.asarray(rag["pos"].data).tolist() == [2]
+
+
+def test_from_vcf_regions_accepts_multiple_specs_and_merges(tmp_path: Path):
+    ref = _write_ref(tmp_path)
+    vcf = _write_vcf(tmp_path, symbolic=False, indexed=True)
+    out = tmp_path / "merged"
+    SparseVar2.from_vcf(
+        out,
+        vcf,
+        ref,
+        regions=["chr1:1-4", ("chr1", 3, 8)],
+        merge_overlapping=True,
+        threads=1,
+    )
+
+    sv = SparseVar2(out)
+    assert sv.contigs == ["chr1"]
+    counts = sv.region_counts("chr1", [(0, 40)])
+    assert int(counts.sum()) == 4
+    rag = sv.decode("chr1", [(0, 40)])
+    assert sorted(set(np.asarray(rag["pos"].data).tolist())) == [2, 6]
+
+
+def test_from_vcf_regions_rejects_overlaps_by_default(tmp_path: Path):
+    ref = _write_ref(tmp_path)
+    vcf = _write_vcf(tmp_path, symbolic=False, indexed=True)
+    with pytest.raises(ValueError, match="regions overlap"):
+        SparseVar2.from_vcf(
+            tmp_path / "overlap",
+            vcf,
+            ref,
+            regions=["chr1:1-4", ("chr1", 3, 8)],
+            threads=1,
+        )
+
+
+def test_from_vcf_samples_preserve_order(tmp_path: Path):
+    ref = _write_ref(tmp_path)
+    vcf = _write_vcf(tmp_path, symbolic=False, indexed=True)
+    out = tmp_path / "samples"
+    dropped = SparseVar2.from_vcf(out, vcf, ref, samples=["S1"], threads=1)
+    assert dropped == 0
+
+    sv = SparseVar2(out)
+    assert sv.available_samples == ["S1"]
+    counts = sv.region_counts("chr1", [(0, 40)])
+    assert counts.shape == (1, 1, 2)
+    assert counts.reshape(-1).tolist() == [1, 1]
+
+
+def test_from_vcf_samples_reject_unknown(tmp_path: Path):
+    ref = _write_ref(tmp_path)
+    vcf = _write_vcf(tmp_path, symbolic=False, indexed=True)
+    with pytest.raises(ValueError, match="Samples not found"):
+        SparseVar2.from_vcf(tmp_path / "bad_sample", vcf, ref, samples=["missing"])
+
+
+def test_from_vcf_explicit_none_matches_default(tmp_path: Path):
+    ref = _write_ref(tmp_path)
+    vcf = _write_vcf(tmp_path, symbolic=False, indexed=True)
+
+    default_out = tmp_path / "default"
+    explicit_out = tmp_path / "explicit"
+    SparseVar2.from_vcf(default_out, vcf, ref, threads=1)
+    SparseVar2.from_vcf(
+        explicit_out,
+        vcf,
+        ref,
+        regions=None,
+        samples=None,
+        threads=1,
+    )
+
+    default = SparseVar2(default_out)
+    explicit = SparseVar2(explicit_out)
+    assert explicit.contigs == default.contigs
+    assert explicit.available_samples == default.available_samples
+    np.testing.assert_array_equal(
+        explicit.region_counts("chr1", [(0, 40)]),
+        default.region_counts("chr1", [(0, 40)]),
+    )
 
 
 def test_from_vcf_requires_reference_or_opt_out(tmp_path: Path):

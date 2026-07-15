@@ -12,6 +12,7 @@ use common::{
 };
 use genoray_core::chunk_assembler::ChunkAssembler;
 use genoray_core::process_chromosome;
+use genoray_core::record_source::RecordSource;
 use genoray_core::rvk::decode_alt_inline;
 use genoray_core::search::{SearchTree, overlap_range};
 use genoray_core::vcf_reader::VcfRecordSource;
@@ -92,6 +93,7 @@ fn test_e2e_normalized_bcf_pipeline() {
         genoray_core::orchestrator::SourceSpec::Vcf {
             vcf_path: bcf_path.to_str().unwrap().to_string(),
             htslib_threads: 1,
+            regions: Vec::new(),
         },
         Some(bcf_path.with_extension("fa").to_str().unwrap()),
         "chr1",
@@ -152,6 +154,51 @@ fn test_e2e_normalized_bcf_pipeline() {
     assert!(!genoray_core::bits::get_bit(&dindel_geno, 3));
 }
 
+#[test]
+fn test_vcf_record_source_fetches_requested_intervals() {
+    let tmp = tempdir().unwrap();
+    let bcf_path = tmp.path().join("intervals.bcf");
+    let samples = vec!["S0"];
+    let records = vec![
+        SynthRecord {
+            pos: 2,
+            ref_allele: b"A",
+            alts: vec![&b"C"[..]],
+            gt: vec![1, 0],
+        },
+        SynthRecord {
+            pos: 6,
+            ref_allele: b"A",
+            alts: vec![&b"G"[..]],
+            gt: vec![0, 1],
+        },
+        SynthRecord {
+            pos: 10,
+            ref_allele: b"A",
+            alts: vec![&b"T"[..]],
+            gt: vec![1, 1],
+        },
+    ];
+    build_bcf_with_index(&bcf_path, "chr1", 100, &samples, &records);
+
+    let mut source = VcfRecordSource::new(
+        bcf_path.to_str().unwrap(),
+        "chr1",
+        &samples,
+        1,
+        2,
+        &[],
+        vec![(0, 4), (6, 7)],
+    )
+    .unwrap();
+
+    let mut got = Vec::new();
+    while let Some(record) = source.next_record().unwrap() {
+        got.push(record.pos);
+    }
+    assert_eq!(got, vec![2, 6]);
+}
+
 // M5 max_del post-pass, end-to-end. Two deletions with known lengths:
 //   pos=100  ATTT → A  (d=3)  gt=[1,0,0,0]  x=1 → rare → var_key/indel (hap 0)
 //   pos=200  ATT  → A  (d=2)  gt=[1,1,1,0]  x=3 → common → dense/indel (shared)
@@ -186,6 +233,7 @@ fn test_e2e_max_del_postpass() {
         genoray_core::orchestrator::SourceSpec::Vcf {
             vcf_path: bcf_path.to_str().unwrap().to_string(),
             htslib_threads: 1,
+            regions: Vec::new(),
         },
         Some(bcf_path.with_extension("fa").to_str().unwrap()),
         "chr1",
@@ -264,6 +312,7 @@ fn test_e2e_dense_snp_roundtrip() {
         genoray_core::orchestrator::SourceSpec::Vcf {
             vcf_path: bcf_path.to_str().unwrap().to_string(),
             htslib_threads: 1,
+            regions: Vec::new(),
         },
         Some(bcf_path.with_extension("fa").to_str().unwrap()),
         "chr1",
@@ -341,6 +390,7 @@ fn test_e2e_mutation_conservation() {
         genoray_core::orchestrator::SourceSpec::Vcf {
             vcf_path: bcf_path.to_str().unwrap().to_string(),
             htslib_threads: 1,
+            regions: Vec::new(),
         },
         Some(bcf_path.with_extension("fa").to_str().unwrap()),
         "chr1",
@@ -472,6 +522,7 @@ fn test_reader_extracts_info_format_fields() {
         1,
         ploidy,
         &all,
+        Vec::new(),
     )
     .unwrap();
     let mut reader = ChunkAssembler::new(
@@ -630,6 +681,7 @@ fn test_reader_extracts_multiallelic_number_a_fields() {
         1,
         ploidy,
         &all,
+        Vec::new(),
     )
     .unwrap();
     let mut reader = ChunkAssembler::new(
@@ -736,8 +788,16 @@ fn test_reader_accepts_pure_del() {
     build_bcf_with_index(&bcf_path, "chr1", 10_000, &samples, &records);
     build_fasta_with_index(&bcf_path.with_extension("fa"), "chr1", 10_000, &records);
 
-    let source =
-        VcfRecordSource::new(bcf_path.to_str().unwrap(), "chr1", &samples, 1, 2, &[]).unwrap();
+    let source = VcfRecordSource::new(
+        bcf_path.to_str().unwrap(),
+        "chr1",
+        &samples,
+        1,
+        2,
+        &[],
+        Vec::new(),
+    )
+    .unwrap();
     let mut reader = ChunkAssembler::new(
         Box::new(source),
         samples.len(),
@@ -785,6 +845,7 @@ fn test_missing_chrom_returns_err() {
         genoray_core::orchestrator::SourceSpec::Vcf {
             vcf_path: bcf_path.to_str().unwrap().to_string(),
             htslib_threads: 1,
+            regions: Vec::new(),
         },
         Some(bcf_path.with_extension("fa").to_str().unwrap()),
         "chrZ",
@@ -819,7 +880,15 @@ fn test_missing_vcf_returns_missing_file() {
     let tmp = tempdir().unwrap();
     let missing_path = tmp.path().join("does_not_exist.vcf.gz");
 
-    let res = VcfRecordSource::new(missing_path.to_str().unwrap(), "chr1", &["s0"], 1, 2, &[]);
+    let res = VcfRecordSource::new(
+        missing_path.to_str().unwrap(),
+        "chr1",
+        &["s0"],
+        1,
+        2,
+        &[],
+        Vec::new(),
+    );
 
     assert!(matches!(
         res,
