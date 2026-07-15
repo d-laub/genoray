@@ -19,8 +19,9 @@ pub struct ThreadPlan {
     pub concurrent_chroms: usize,
     pub htslib_threads: usize,
     // Cores left idle after the pipeline + htslib threads across all concurrent
-    // chroms. Sizes the reader's intra-chunk packing pool (see vcf_reader.rs).
-    // Floored at 1 so the pool always builds; parallel packing self-gates off
+    // chroms. Sizes the reader-side processing pool: bounded per-record
+    // normalization batches plus intra-chunk presence packing.
+    // Floored at 1 so the pool always builds; parallel work self-gates off
     // when this is < 2.
     pub processing_threads: usize,
 }

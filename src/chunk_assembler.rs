@@ -27,6 +27,11 @@ struct PendingAtom {
     format_vals: Vec<f64>, // len == VcfChunkReader::format_fields.len() * num_samples, field-major then sample: field*num_samples + sample
 }
 
+struct DecomposedRecord {
+    atoms: Vec<PendingAtom>,
+    dropped_out_of_scope: u64,
+}
+
 impl PartialEq for PendingAtom {
     fn eq(&self, other: &Self) -> bool {
         self.pos == other.pos && self.seq == other.seq
@@ -201,6 +206,7 @@ struct AtomMeta {
 // `pack_presence_par` keeps its word-disjoint invariant. 1024 keeps the window
 // above `PARALLEL_MIN_VARIANTS` (512) so parallel packing still engages.
 const PACK_WINDOW: usize = 1024;
+const NORMALIZE_BATCH_RECORDS: usize = 1024;
 
 // Pack `buf`'s presence bits into `genos` starting at variant offset `v0`, then
 // move each atom's metadata into `metas`, dropping `gt`.
@@ -263,6 +269,79 @@ pub struct ChunkAssembler {
     next_seq: u64,
 }
 
+#[allow(clippy::too_many_arguments)]
+fn decompose_raw_record(
+    rec: RawRecord,
+    record_seq: u64,
+    ref_seq: &[u8],
+    has_reference: bool,
+    skip_out_of_scope: bool,
+    info_fields: &[FieldSpec],
+    format_fields: &[FieldSpec],
+    num_samples: usize,
+) -> Result<DecomposedRecord, ConversionError> {
+    let pos = rec.pos;
+    let gt = Arc::new(rec.gt);
+
+    // Fail fast only when a reference is available; without one we trust the
+    // input is already normalized/left-aligned.
+    if has_reference {
+        crate::normalize::validate_ref(pos, &rec.reference, ref_seq)?;
+    }
+
+    let alt_refs: Vec<&[u8]> = rec.alts.iter().map(|a| a.as_slice()).collect();
+    let mut atoms = Vec::new();
+    let dropped = atomize_record(
+        pos,
+        &rec.reference,
+        &alt_refs,
+        &mut atoms,
+        skip_out_of_scope,
+    )?;
+
+    let mut pending = Vec::with_capacity(atoms.len());
+    for (atom_ix, atom) in atoms.into_iter().enumerate() {
+        let atom = if has_reference {
+            crate::normalize::left_align(atom, ref_seq, crate::normalize::L_MAX)
+        } else {
+            atom
+        };
+
+        let info_vals: Vec<f64> = info_fields
+            .iter()
+            .zip(rec.info_raw.iter())
+            .map(|(spec, raw)| resolve_scalar(raw.as_deref(), atom.source_alt_index, spec))
+            .collect();
+
+        let mut format_vals = Vec::with_capacity(format_fields.len() * num_samples);
+        for (spec, raw) in format_fields.iter().zip(rec.format_raw.iter()) {
+            for s in 0..num_samples {
+                let sample_vals = raw.as_ref().map(|v| v[s].as_slice());
+                format_vals.push(resolve_scalar(sample_vals, atom.source_alt_index, spec));
+            }
+        }
+
+        let seq = record_seq
+            .saturating_mul(1u64 << 32)
+            .saturating_add(atom_ix as u64);
+        pending.push(PendingAtom {
+            pos: atom.pos,
+            ilen: atom.ilen,
+            alt: atom.alt,
+            source_alt_index: atom.source_alt_index,
+            gt: Arc::clone(&gt),
+            seq,
+            info_vals,
+            format_vals,
+        });
+    }
+
+    Ok(DecomposedRecord {
+        atoms: pending,
+        dropped_out_of_scope: dropped as u64,
+    })
+}
+
 impl ChunkAssembler {
     pub fn new(
         source: Box<dyn RecordSource + Send>,
@@ -308,63 +387,72 @@ impl ChunkAssembler {
         self.dropped_out_of_scope
     }
 
-    // Decompose one record into atoms and push them onto the reorder heap, sharing
-    // one decoded genotype vector across all atoms of the record.
-    fn decompose_record(&mut self, rec: RawRecord) -> Result<(), ConversionError> {
-        let pos = rec.pos;
-        let gt = Arc::new(rec.gt);
-
-        // Fail fast only when a reference is available; without one we trust the
-        // input is already normalized/left-aligned.
-        if self.has_reference {
-            crate::normalize::validate_ref(pos, &rec.reference, &self.ref_seq)?;
-        }
-
-        let alt_refs: Vec<&[u8]> = rec.alts.iter().map(|a| a.as_slice()).collect();
-        let mut atoms = Vec::new();
-        let dropped = atomize_record(
-            pos,
-            &rec.reference,
-            &alt_refs,
-            &mut atoms,
-            self.skip_out_of_scope,
-        )?;
-        self.dropped_out_of_scope += dropped as u64;
-
-        for atom in atoms {
-            let atom = if self.has_reference {
-                crate::normalize::left_align(atom, &self.ref_seq, crate::normalize::L_MAX)
-            } else {
-                atom
-            };
-
-            let info_vals: Vec<f64> = self
-                .info_fields
-                .iter()
-                .zip(rec.info_raw.iter())
-                .map(|(spec, raw)| resolve_scalar(raw.as_deref(), atom.source_alt_index, spec))
-                .collect();
-
-            let mut format_vals = Vec::with_capacity(self.format_fields.len() * self.num_samples);
-            for (spec, raw) in self.format_fields.iter().zip(rec.format_raw.iter()) {
-                for s in 0..self.num_samples {
-                    let sample_vals = raw.as_ref().map(|v| v[s].as_slice());
-                    format_vals.push(resolve_scalar(sample_vals, atom.source_alt_index, spec));
+    fn fill_normalize_batch(
+        &mut self,
+        pool: Option<&rayon::ThreadPool>,
+    ) -> Result<(), ConversionError> {
+        let mut records = Vec::with_capacity(NORMALIZE_BATCH_RECORDS);
+        while records.len() < NORMALIZE_BATCH_RECORDS {
+            match self.source.next_record()? {
+                Some(rec) => {
+                    self.frontier = rec.pos;
+                    let record_seq = self.next_seq;
+                    self.next_seq += 1;
+                    records.push((record_seq, rec));
+                }
+                None => {
+                    self.eof = true;
+                    break;
                 }
             }
+        }
+        if records.is_empty() {
+            return Ok(());
+        }
 
-            let seq = self.next_seq;
-            self.next_seq += 1;
-            self.heap.push(Reverse(PendingAtom {
-                pos: atom.pos,
-                ilen: atom.ilen,
-                alt: atom.alt,
-                source_alt_index: atom.source_alt_index,
-                gt: Arc::clone(&gt),
-                seq,
-                info_vals,
-                format_vals,
-            }));
+        let parallel =
+            matches!(pool, Some(p) if p.current_num_threads() >= 2) && records.len() >= 2;
+        let decomposed: Vec<DecomposedRecord> = if parallel {
+            pool.unwrap().install(|| {
+                records
+                    .into_par_iter()
+                    .map(|(record_seq, rec)| {
+                        decompose_raw_record(
+                            rec,
+                            record_seq,
+                            &self.ref_seq,
+                            self.has_reference,
+                            self.skip_out_of_scope,
+                            &self.info_fields,
+                            &self.format_fields,
+                            self.num_samples,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })?
+        } else {
+            records
+                .into_iter()
+                .map(|(record_seq, rec)| {
+                    decompose_raw_record(
+                        rec,
+                        record_seq,
+                        &self.ref_seq,
+                        self.has_reference,
+                        self.skip_out_of_scope,
+                        &self.info_fields,
+                        &self.format_fields,
+                        self.num_samples,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
+
+        for record in decomposed {
+            self.dropped_out_of_scope += record.dropped_out_of_scope;
+            for atom in record.atoms {
+                self.heap.push(Reverse(atom));
+            }
         }
         Ok(())
     }
@@ -373,8 +461,12 @@ impl ChunkAssembler {
     // up to `L_MAX` bases below its record's start, so an atom is safe to emit only
     // once its position is strictly below `frontier - L_MAX` (saturating), or the
     // input is exhausted. This preserves the position-sorted invariant the Phase-2
-    // merge relies on. (Unchanged from the pre-refactor VcfChunkReader.)
-    fn next_atom(&mut self) -> Result<Option<PendingAtom>, ConversionError> {
+    // merge relies on. Refill happens in bounded record batches so normalization
+    // can use the reader-side processing pool without changing the emit rule.
+    fn next_atom(
+        &mut self,
+        pool: Option<&rayon::ThreadPool>,
+    ) -> Result<Option<PendingAtom>, ConversionError> {
         loop {
             if let Some(Reverse(top)) = self.heap.peek() {
                 if self.eof || top.pos < self.frontier.saturating_sub(crate::normalize::L_MAX) {
@@ -384,13 +476,7 @@ impl ChunkAssembler {
                 return Ok(None);
             }
 
-            match self.source.next_record()? {
-                Some(rec) => {
-                    self.frontier = rec.pos;
-                    self.decompose_record(rec)?;
-                }
-                None => self.eof = true,
-            }
+            self.fill_normalize_batch(pool)?;
         }
     }
 
@@ -419,7 +505,7 @@ impl ChunkAssembler {
         let mut v = 0usize;
 
         while v + buf.len() < chunk_size {
-            match self.next_atom()? {
+            match self.next_atom(pool)? {
                 Some(a) => {
                     buf.push(a);
                     if buf.len() == window {
