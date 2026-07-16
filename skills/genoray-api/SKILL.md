@@ -263,6 +263,14 @@ Signature: `from_vcf(out, source, reference=None, *, no_reference=False, skip_ou
   unless `skip_out_of_scope=True`).
 - No dosages, no `haploid=` OR-collapse, no `max_mem`-based chunking (use
   `chunk_size` instead) — these remain `SparseVar` (SVAR 1.0)-only for now.
+- `threads=None` — thread budget (autodetected if `None`). For single-file
+  input, conversion shards **within** a contig once the budget clears HTSlib's
+  decode-thread allocation (roughly 15+ threads); below that it runs one
+  un-sharded reader. Sub-contig sharding is driven entirely by this existing
+  `threads` value — no separate knob — and output is byte-identical to serial
+  conversion at every thread count (`from_vcf_list`, the N-single-sample-VCF
+  merge path, does not shard within a contig). See "Parallel conversion" in
+  `docs/source/svar.md` for scaling numbers.
 - `signatures=False` — when `True`, classifies every SNP/indel into its
   SBS96/ID83 mutation-type code during the write and stores a `mutcat`
   sidecar per contig (factored into the write's dense/var_key cost model).
@@ -334,6 +342,10 @@ Signature: `from_pgen(out, source, reference=None, *, no_reference=False, skip_o
   converted — no subsetting). `reference`/`no_reference`, `skip_out_of_scope`,
   `overwrite`, `long_allele_capacity`, and `signatures` all mean the same as
   `from_vcf` (above), and return the same `int` (dropped out-of-scope ALTs).
+- `threads=None` shards within a contig the same way `from_vcf` does, and is
+  equally byte-identical — but sharding does **not** speed up PGEN conversion:
+  `pgenlib`'s genotype decode holds the CPython GIL, so shard readers serialize
+  on it. Sharding is intentionally not over-decomposed for this backend.
 - **Diploid only** — no `ploidy=` kwarg (`from_vcf`'s default `ploidy=2` is
   implicit and fixed here).
 - `chunk_size=None` — unlike `from_vcf`'s fixed `25_000` default, `None` here
