@@ -40,6 +40,20 @@ parallel memory architecture.
 
 */
 
+/// Over-decompose VCF work units beyond the worker count so the work-stealing
+/// collector (`shard_exec::run`) can absorb density skew across the contig --
+/// more shards than workers means an idle worker always has something to
+/// steal. 4 is a starting value to be tuned from benchmark imbalance data.
+///
+/// VCF-only: PGEN is intentionally NOT over-decomposed here. `readers_pool`
+/// provisions exactly one `pgenlib.PgenReader` per potential shard
+/// (`max_shards` caps `readers.len()`), and pgenlib holds the GIL through its
+/// decode, so concurrent PGEN shard reads are GIL-serialized -- sharding adds
+/// pure overhead there rather than parallelism (see the convoy fix fa47530;
+/// full chr21c benchmark: 340s sharded vs 273s serial). See the
+/// `SourceSpec::Pgen` branch below for the unchanged `max_shards` calc.
+pub(crate) const OVERSHARD_FACTOR: usize = 4;
+
 /// Which backend a contig's records come from. Everything downstream of
 /// `ChunkAssembler` is identical for both.
 pub enum SourceSpec {
@@ -298,7 +312,7 @@ pub fn process_chromosome(
                         let shards = crate::vcf_reader::plan_vcf_shards(
                             &regions,
                             &chr,
-                            processing_threads,
+                            processing_threads.saturating_mul(OVERSHARD_FACTOR),
                             chunk_size as u32,
                         )?;
                         if shards.len() > 1 {
@@ -388,6 +402,17 @@ pub fn process_chromosome(
                             }
                         }
                         let n = positions.len();
+                        // Deliberately NOT over-decomposed with `OVERSHARD_FACTOR`
+                        // (VCF-only, see its doc comment): pgenlib holds the GIL
+                        // through its decode, so concurrent PGEN shard reads are
+                        // GIL-serialized -- extra shards here would add pure
+                        // overhead to an already GIL-bound path rather than
+                        // improving stealing (fa47530 fixed a convoy from this;
+                        // full chr21c: 340s sharded vs 273s serial). This also
+                        // stays capped at `readers.len()` because each concurrent
+                        // shard needs its own dedicated `pgenlib.PgenReader` --
+                        // `readers_pool` provisions exactly one per potential
+                        // shard, indexed by ordinal.
                         let max_shards = processing_threads.min(readers.len()).max(1);
                         let punits = crate::pgen_shard::plan_pgen_units(
                             &positions,

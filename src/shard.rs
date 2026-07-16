@@ -88,4 +88,11 @@ mod tests {
     fn empty_in_empty_out() {
         assert!(plan_ranges(&[], 4, 10, 5).is_empty());
     }
+
+    #[test]
+    fn over_decomposes_beyond_worker_count() {
+        // workers=4, factor=4 => up to 16 units over a big contig.
+        let u = plan_ranges(&[(0, 16000)], 16, 1000, 5);
+        assert_eq!(u.len(), 16);
+    }
 }
