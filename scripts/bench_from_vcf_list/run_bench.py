@@ -33,7 +33,12 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--manifest", type=Path, required=True)
     ap.add_argument("--out", type=Path, required=True)
-    ap.add_argument("--chrom", default="chr1")
+    ap.add_argument(
+        "--chrom",
+        default="chr1",
+        help="the manifest's contig (informational; the Python from_vcf_list path "
+        "processes the whole manifest -- restrict at cohort-generation time)",
+    )
     ap.add_argument("--reference", type=Path, default=None)
     ap.add_argument("--subset", type=int, default=None, help="use first K files")
     ap.add_argument("--threads", type=int, default=None)
@@ -42,7 +47,7 @@ def main() -> None:
     a = ap.parse_args()
 
     paths = [p for p in a.manifest.read_text().split() if p]
-    if a.subset:
+    if a.subset is not None:
         paths = paths[: a.subset]
     src = _subprocess_src(
         str(a.out), paths, str(a.reference) if a.reference else None, a.threads
@@ -53,31 +58,42 @@ def main() -> None:
         runner = fh.name
 
     wall_s = maxrss_kb = None
-    if a.profiler == "memray":
-        subprocess.run(["memray", "run", "-o", "bench.memray", runner], check=True)
-        print(
-            "memray profile: bench.memray (view with `memray flamegraph bench.memray`)"
-        )
-    else:
-        cmd = (
-            ["/usr/bin/time", "-v", sys.executable, runner]
-            if a.profiler == "time"
-            else [sys.executable, runner]
-        )
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-        sys.stderr.write(proc.stderr)
-        if a.profiler == "time":
-            m = re.search(r"Maximum resident set size \(kbytes\): (\d+)", proc.stderr)
-            e = re.search(r"Elapsed \(wall clock\).*?:\s*([\d:.]+)", proc.stderr)
-            maxrss_kb = int(m.group(1)) if m else None
-            if e:
+    try:
+        if a.profiler == "memray":
+            subprocess.run(["memray", "run", "-o", "bench.memray", runner], check=True)
+            print(
+                "memray profile: bench.memray (view with `memray flamegraph bench.memray`)"
+            )
+        else:
+            cmd = (
+                ["/usr/bin/time", "-v", sys.executable, runner]
+                if a.profiler == "time"
+                else [sys.executable, runner]
+            )
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            sys.stderr.write(proc.stderr)
+            proc.check_returncode()
+            if a.profiler == "time":
+                m = re.search(
+                    r"Maximum resident set size \(kbytes\): (\d+)", proc.stderr
+                )
+                e = re.search(r"Elapsed \(wall clock\).*?:\s*([\d:.]+)", proc.stderr)
+                # Fail loud rather than write a blank row: a silent None here would
+                # look like a real zero-cost measurement in a multi-N sweep.
+                if m is None or e is None:
+                    raise RuntimeError(
+                        "could not parse MaxRSS/Elapsed from /usr/bin/time -v output; "
+                        "refusing to append a blank results row"
+                    )
+                maxrss_kb = int(m.group(1))
                 parts = [float(x) for x in e.group(1).split(":")]
                 wall_s = (
                     parts[-1]
                     + (parts[-2] * 60 if len(parts) > 1 else 0)
                     + (parts[-3] * 3600 if len(parts) > 2 else 0)
                 )
-        proc.check_returncode()
+    finally:
+        Path(runner).unlink(missing_ok=True)
 
     new = not a.results.exists()
     with open(a.results, "a", newline="") as fh:
