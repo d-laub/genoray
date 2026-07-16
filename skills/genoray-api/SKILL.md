@@ -246,7 +246,7 @@ dropped = SparseVar2.from_vcf(
 dropped = SparseVar2.from_vcf("out.svar2", "file.vcf.gz", no_reference=True)
 ```
 
-Signature: `from_vcf(out, source, reference=None, *, no_reference=False, skip_out_of_scope=False, ploidy=2, chunk_size=25_000, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False, info_fields=None, format_fields=None) -> int`
+Signature: `from_vcf(out, source, reference=None, *, no_reference=False, skip_out_of_scope=False, ploidy=2, chunk_size=25_000, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False, info_fields=None, format_fields=None, check_ref="e") -> int`
 
 - `source` — a bgzipped VCF (`.vcf.gz`) or BCF (`.bcf`). Auto-indexes (`.csi`) if
   no `.csi`/`.tbi` is found. For a PLINK2 PGEN source, use `from_pgen` instead
@@ -261,6 +261,13 @@ Signature: `from_vcf(out, source, reference=None, *, no_reference=False, skip_ou
   layer — there's no separate "symbolic only" vs. "breakend only" toggle.
 - Returns the number of dropped out-of-scope ALTs as an `int` (always `0`
   unless `skip_out_of_scope=True`).
+- `check_ref: Literal["e", "x"] = "e"` — policy for a record whose REF
+  disagrees with the reference FASTA (ignored when `no_reference=True`).
+  `"e"` (default) raises and aborts the build, matching `bcftools norm
+  --check-ref e`. `"x"` drops the offending record (including a REF that
+  runs past the contig end) and continues, logging a per-contig count.
+  Comparison is case-insensitive (soft-masked lowercase reference bases
+  match). Any other value raises `ValueError` before conversion starts.
 - No dosages, no `haploid=` OR-collapse, no `max_mem`-based chunking (use
   `chunk_size` instead) — these remain `SparseVar` (SVAR 1.0)-only for now.
 - `threads=None` — thread budget (autodetected if `None`). For single-file
@@ -335,13 +342,14 @@ dropped = SparseVar2.from_pgen(
 )
 ```
 
-Signature: `from_pgen(out, source, reference=None, *, no_reference=False, skip_out_of_scope=False, chunk_size=None, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False) -> int`
+Signature: `from_pgen(out, source, reference=None, *, no_reference=False, skip_out_of_scope=False, chunk_size=None, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False, check_ref="e") -> int`
 
 - `source` — a `.pgen` file. Variant metadata is read from the sibling
   `.pvar`/`.pvar.zst`, sample names from the sibling `.psam` (all samples are
   converted — no subsetting). `reference`/`no_reference`, `skip_out_of_scope`,
-  `overwrite`, `long_allele_capacity`, and `signatures` all mean the same as
-  `from_vcf` (above), and return the same `int` (dropped out-of-scope ALTs).
+  `overwrite`, `long_allele_capacity`, `signatures`, and `check_ref` all mean
+  the same as `from_vcf` (above), and return the same `int` (dropped
+  out-of-scope ALTs).
 - Unlike `from_vcf`, PGEN sub-contig **sharding is disabled** (single reader
   per contig) and `threads` never changes a single output byte. Reason
   (measured, chr21c ~1M variants x 3202 samples): single-reader conversion is
@@ -382,7 +390,7 @@ dropped = SparseVar2.from_vcf_list("out.svar2", "vcfs/", "ref.fa")
 dropped = SparseVar2.from_vcf_list("out.svar2", "manifest.txt", "ref.fa")
 ```
 
-Signature: `from_vcf_list(out, sources, reference=None, *, no_reference=False, skip_out_of_scope=False, ploidy=2, chunk_size=25_000, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False, info_fields=None, format_fields=None) -> int`
+Signature: `from_vcf_list(out, sources, reference=None, *, no_reference=False, skip_out_of_scope=False, ploidy=2, chunk_size=25_000, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False, info_fields=None, format_fields=None, check_ref="e") -> int`
 
 Builds **one** SVAR2 store from **N single-sample** VCFs/BCFs with different
 site lists, via a native k-way merge — no `bcftools merge`, no intermediate
@@ -459,8 +467,12 @@ multi-sample VCF.
     gets the field's default (reserved sentinel/NaN, or an explicit
     `default=`).
 - `ploidy`, `skip_out_of_scope`, `chunk_size`, `threads`, `overwrite`,
-  `long_allele_capacity`, `signatures` all mean the same as `from_vcf`, and
-  the return value is the same `int` (dropped out-of-scope ALTs).
+  `long_allele_capacity`, `signatures`, `check_ref` all mean the same as
+  `from_vcf`, and the return value is the same `int` (dropped out-of-scope
+  ALTs). `check_ref` is applied per input file during the merge (ignored
+  when `no_reference=True`): under `"x"`, a bad record is excluded from its
+  own file only (not the whole merged site), and the per-contig log reports
+  the total excluded across every input file.
 
 ### Conversion from SVAR1
 
@@ -473,16 +485,16 @@ dropped = SparseVar2.from_svar1(
 )
 ```
 
-Signature: `from_svar1(out, source, reference=None, *, no_reference=False, skip_out_of_scope=False, chunk_size=None, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False) -> int`
+Signature: `from_svar1(out, source, reference=None, *, no_reference=False, skip_out_of_scope=False, chunk_size=None, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False, check_ref="e") -> int`
 
 Migrates an existing SVAR 1.0 (`SparseVar`) store to SVAR2 natively — reads no
 VCF and no htslib; SVAR1 is already sparse, so this reconstructs variant
 records from SVAR1's arrays and reuses the same conversion spine as `from_vcf`.
 
 - `source` — a `SparseVar` store directory (SVAR1). `reference`/`no_reference`,
-  `skip_out_of_scope`, `overwrite`, `long_allele_capacity`, and `signatures` all
-  mean the same as `from_vcf` (above), and return the same `int` (dropped
-  out-of-scope ALTs).
+  `skip_out_of_scope`, `overwrite`, `long_allele_capacity`, `signatures`, and
+  `check_ref` all mean the same as `from_vcf` (above), and return the same
+  `int` (dropped out-of-scope ALTs).
 - `ploidy` is read from SVAR1's metadata — no `ploidy=` kwarg.
 - **Biallelic SVAR1 only** — raises `ValueError` if the source store has
   multiallelic variants (SVAR1's `geno==1` model); re-create the SVAR1 store
@@ -754,6 +766,10 @@ genoray write svar1 file.vcf.gz out.svar --max-mem 4g --haploid
   together; prints a `Dropped {n} out-of-scope (symbolic/breakend) ALT
   alleles.` line when set. `--ploidy` (default 2) is VCF/BCF only — PGEN is
   diploid, and passing a non-default `--ploidy` with a `.pgen` source raises.
+  `--check-ref {e,x}` (default `e`, maps to `check_ref=`): REF-vs-reference
+  policy, ignored with `--no-reference`. `e` aborts on the first REF/FASTA
+  disagreement; `x` drops the offending record and continues. Mirrors
+  `bcftools norm --check-ref`.
 - `genoray write svar1`: unchanged SVAR 1.0 behavior — VCF or PGEN source,
   `--dosages`, `--max-mem`, `--haploid`, `--no-symbolic`/`--no-breakend`
   (independent flags here, unlike SVAR2).

@@ -266,3 +266,18 @@ def test_from_svar1_rejects_multiallelic(tmp_path: Path):
 
     with pytest.raises(ValueError, match="biallelic"):
         SparseVar2.from_svar1(tmp_path / "out", v1_out, ref, threads=1)
+
+
+def test_from_svar1_check_ref_accepts_x(tmp_path: Path):
+    ref = _write_ref(tmp_path)
+    src = _build_svar1(tmp_path)
+    out = tmp_path / "check_ref_x"
+    SparseVar2.from_svar1(out, src, ref, threads=1, check_ref="x")
+    assert (out / "meta.json").exists()
+
+
+def test_from_svar1_check_ref_invalid_raises(tmp_path: Path):
+    ref = _write_ref(tmp_path)
+    src = _build_svar1(tmp_path)
+    with pytest.raises(ValueError, match="check_ref"):
+        SparseVar2.from_svar1(tmp_path / "out", src, ref, threads=1, check_ref="z")

@@ -575,3 +575,25 @@ def test_check_fd_budget_raises_soft_limit_when_hard_limit_allows(monkeypatch):
 
     _check_fd_budget(1000)  # must not raise
     assert raised["limits"][0] >= 1000 * 2 + 64
+
+
+def test_from_vcf_list_check_ref_error_aborts(tmp_path: Path):
+    ref = _write_ref(tmp_path)
+    a = _ss(tmp_path, "a", "A", "chr1\t3\t.\tA\tG\t.\t.\t.\tGT\t1|0\n")
+    b = _ss(
+        tmp_path, "b", "B", "chr1\t10\t.\tA\tT\t.\t.\t.\tGT\t0|1\n"
+    )  # REF=A, _REF[10]='G'
+    with pytest.raises(Exception):
+        SparseVar2.from_vcf_list(tmp_path / "s", [a, b], ref, check_ref="e", threads=1)
+
+
+def test_from_vcf_list_check_ref_exclude_continues(tmp_path: Path):
+    ref = _write_ref(tmp_path)
+    a = _ss(tmp_path, "a", "A", "chr1\t3\t.\tA\tG\t.\t.\t.\tGT\t1|0\n")
+    b = _ss(tmp_path, "b", "B", "chr1\t10\t.\tA\tT\t.\t.\t.\tGT\t0|1\n")
+    out = tmp_path / "store"
+    SparseVar2.from_vcf_list(out, [a, b], ref, check_ref="x", threads=1)
+    assert (out / "meta.json").exists()  # merge completed; b's bad record excluded
+    sv = SparseVar2(out)
+    counts = sv.region_counts("chr1", [(0, 40)])
+    assert int(counts.sum()) == 1  # only a's clean pos-3 record survives

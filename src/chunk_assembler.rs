@@ -31,6 +31,12 @@ struct DecomposedRecord {
     source_pos: u32,
     atoms: Vec<PendingAtom>,
     dropped_out_of_scope: u64,
+    /// `Some(detail)` when this record was dropped by `CheckRef::Exclude`
+    /// (its REF disagreed with the reference); `detail` is the mismatch
+    /// message, surfaced once for the first exclusion on the contig. The
+    /// decomposition runs off-thread, so the owning `ChunkAssembler` tallies
+    /// `ref_excluded` from this field rather than mutating a counter directly.
+    ref_excluded: Option<String>,
 }
 
 impl PartialEq for PendingAtom {
@@ -262,6 +268,8 @@ pub struct ChunkAssembler {
     has_reference: bool,
     owned_range: Option<(u32, u32)>,
     skip_out_of_scope: bool,
+    check_ref: crate::normalize::CheckRef,
+    ref_excluded: u64,
     dropped_out_of_scope: u64,
     info_fields: Vec<FieldSpec>,
     format_fields: Vec<FieldSpec>,
@@ -278,6 +286,7 @@ fn decompose_raw_record(
     ref_seq: &[u8],
     has_reference: bool,
     skip_out_of_scope: bool,
+    check_ref: crate::normalize::CheckRef,
     info_fields: &[FieldSpec],
     format_fields: &[FieldSpec],
     num_samples: usize,
@@ -285,10 +294,21 @@ fn decompose_raw_record(
     let pos = rec.pos;
     let gt = Arc::new(rec.gt);
 
-    // Fail fast only when a reference is available; without one we trust the
-    // input is already normalized/left-aligned.
+    // Only when a reference is available: fail fast (`CheckRef::Error`) or drop
+    // the record (`CheckRef::Exclude`) if its REF disagrees with the reference.
+    // Without a reference we trust the input is already normalized/left-aligned.
     if has_reference {
-        crate::normalize::validate_ref(pos, &rec.reference, ref_seq)?;
+        match crate::normalize::apply_check_ref(check_ref, pos, &rec.reference, ref_seq)? {
+            crate::normalize::RefDecision::Keep => {}
+            crate::normalize::RefDecision::Exclude(e) => {
+                return Ok(DecomposedRecord {
+                    source_pos: pos,
+                    atoms: Vec::new(),
+                    dropped_out_of_scope: 0,
+                    ref_excluded: Some(e.to_string()),
+                });
+            }
+        }
     }
 
     let alt_refs: Vec<&[u8]> = rec.alts.iter().map(|a| a.as_slice()).collect();
@@ -342,10 +362,12 @@ fn decompose_raw_record(
         source_pos: pos,
         atoms: pending,
         dropped_out_of_scope: dropped as u64,
+        ref_excluded: None,
     })
 }
 
 impl ChunkAssembler {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         source: Box<dyn RecordSource + Send>,
         num_samples: usize,
@@ -353,6 +375,7 @@ impl ChunkAssembler {
         fasta_path: Option<&str>,
         chrom: &str,
         skip_out_of_scope: bool,
+        check_ref: crate::normalize::CheckRef,
         fields: &[FieldSpec],
     ) -> Result<Self, ConversionError> {
         let (ref_seq, has_reference) = match fasta_path {
@@ -369,6 +392,7 @@ impl ChunkAssembler {
             ref_seq,
             has_reference,
             skip_out_of_scope,
+            check_ref,
             fields,
             None,
         ))
@@ -382,6 +406,7 @@ impl ChunkAssembler {
         ref_seq: Arc<Vec<u8>>,
         has_reference: bool,
         skip_out_of_scope: bool,
+        check_ref: crate::normalize::CheckRef,
         fields: &[FieldSpec],
         owned_range: Option<(u32, u32)>,
     ) -> Self {
@@ -393,6 +418,8 @@ impl ChunkAssembler {
             has_reference,
             owned_range,
             skip_out_of_scope,
+            check_ref,
+            ref_excluded: 0,
             dropped_out_of_scope: 0,
             info_fields: fields
                 .iter()
@@ -415,6 +442,12 @@ impl ChunkAssembler {
     /// read loop drains.
     pub fn dropped_out_of_scope(&self) -> u64 {
         self.dropped_out_of_scope
+    }
+
+    /// Records excluded because their REF disagreed with the reference under
+    /// `CheckRef::Exclude`. Valid after the read loop drains.
+    pub fn ref_excluded(&self) -> u64 {
+        self.ref_excluded
     }
 
     fn fill_normalize_batch(
@@ -453,6 +486,7 @@ impl ChunkAssembler {
                             self.ref_seq.as_slice(),
                             self.has_reference,
                             self.skip_out_of_scope,
+                            self.check_ref,
                             &self.info_fields,
                             &self.format_fields,
                             self.num_samples,
@@ -470,6 +504,7 @@ impl ChunkAssembler {
                         self.ref_seq.as_slice(),
                         self.has_reference,
                         self.skip_out_of_scope,
+                        self.check_ref,
                         &self.info_fields,
                         &self.format_fields,
                         self.num_samples,
@@ -482,6 +517,21 @@ impl ChunkAssembler {
             let source_record_owned = self
                 .owned_range
                 .is_none_or(|(start, end)| record.source_pos >= start && record.source_pos < end);
+            // A CheckRef::Exclude drop produces no atoms; only the owning shard
+            // tallies it (a padded boundary record can be seen by two shards).
+            if let Some(detail) = record.ref_excluded {
+                if source_record_owned {
+                    self.ref_excluded += 1;
+                    if self.ref_excluded == 1 {
+                        println!(
+                            "Notice: check_ref=x excluding record(s) whose REF disagrees \
+                             with the reference (first: {detail}); further exclusions on \
+                             this contig are counted, not printed."
+                        );
+                    }
+                }
+                continue;
+            }
             if source_record_owned {
                 self.dropped_out_of_scope += record.dropped_out_of_scope;
             }

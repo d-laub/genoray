@@ -187,6 +187,7 @@ pub fn build_contig(
         ploidy,
         4096, // long_allele_capacity
         false,
+        genoray_core::normalize::CheckRef::Error,
         1,     // processing_threads
         false, // signatures
         &[],   // fields

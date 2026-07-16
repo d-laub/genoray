@@ -299,6 +299,15 @@ def _check_fd_budget(n_files: int) -> None:
     )
 
 
+def _validate_check_ref(check_ref: str) -> str:
+    """Validate a `check_ref` mode string. Returns it unchanged on success."""
+    if check_ref not in ("e", "x"):
+        raise ValueError(
+            f'check_ref must be "e" (error) or "x" (exclude), got {check_ref!r}'
+        )
+    return check_ref
+
+
 class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
     """Reader for a finished SVAR2 store (M6a skeleton).
 
@@ -582,6 +591,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         signatures: bool = False,
         info_fields: Sequence[str | InfoField] | None = None,
         format_fields: Sequence[str | FormatField] | None = None,
+        check_ref: Literal["e", "x"] = "e",
     ) -> int:
         """Convert a bgzipped VCF or BCF to an SVAR2 store.
 
@@ -616,6 +626,13 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         otherwise a reserved sentinel/NaN is written. FORMAT fields are
         genotype-aligned: non-carrier values are dropped for var_key-routed
         variants.
+
+        check_ref: policy for a record whose REF disagrees with the reference
+        FASTA (ignored when `no_reference=True`). `"e"` (default) raises and
+        aborts the build — matching `bcftools norm --check-ref e`. `"x"` drops
+        the offending record (including a REF that runs past the contig end)
+        and continues, logging a per-contig count. Comparison is
+        case-insensitive, so soft-masked (lowercase) reference bases match.
         """
         from cyvcf2 import VCF as _CyVCF
         from genoray._svar._regions import _normalize_samples
@@ -699,6 +716,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         flds = _resolve_fields(str(source), info_fields, format_fields)
         info = [t for t in flds if t[1] == "info"]
         format_ = [t for t in flds if t[1] == "format"]
+        _validate_check_ref(check_ref)
         return _core.run_conversion_pipeline(
             str(source),
             reference_path,
@@ -714,6 +732,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             info,
             format_,
             region_ranges,
+            check_ref,
         )
 
     @classmethod
@@ -730,6 +749,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         overwrite: bool = False,
         long_allele_capacity: int = 8 * 1024 * 1024,
         signatures: bool = False,
+        check_ref: Literal["e", "x"] = "e",
     ) -> int:
         """Convert a PLINK2 PGEN to an SVAR2 store.
 
@@ -760,6 +780,13 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         Haplotype resolution for *unphased* heterozygotes follows the allele-code
         order ``pgenlib`` returns — the same caveat :meth:`from_vcf` carries for
         unphased ``GT``.
+
+        check_ref: policy for a record whose REF disagrees with the reference
+        FASTA (ignored when `no_reference=True`). `"e"` (default) raises and
+        aborts the build — matching `bcftools norm --check-ref e`. `"x"` drops
+        the offending record (including a REF that runs past the contig end)
+        and continues, logging a per-contig count. Comparison is
+        case-insensitive, so soft-masked (lowercase) reference bases match.
         """
         from genoray._pgen import _read_psam
 
@@ -842,6 +869,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             for _ in contigs
         ]
 
+        _validate_check_ref(check_ref)
         return _core.run_pgen_conversion_pipeline(
             str(source),
             str(pvar),
@@ -856,6 +884,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             skip_out_of_scope,
             signatures,
             readers,
+            check_ref,
         )
 
     @classmethod
@@ -875,6 +904,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         signatures: bool = False,
         info_fields: "Sequence[str | InfoField] | None" = None,
         format_fields: "Sequence[str | FormatField] | None" = None,
+        check_ref: Literal["e", "x"] = "e",
     ) -> int:
         """Build one SVAR2 store from many **single-sample** VCFs/BCFs via a
         native k-way merge (no `bcftools merge`, no intermediate multi-sample
@@ -954,6 +984,13 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
 
         Returns the number of out-of-scope (symbolic/breakend) ALTs dropped
         (0 unless `skip_out_of_scope`).
+
+        check_ref: policy for a record whose REF disagrees with the reference
+        FASTA (ignored when `no_reference=True`). `"e"` (default) raises and
+        aborts the build — matching `bcftools norm --check-ref e`. `"x"` drops
+        the offending record (including a REF that runs past the contig end)
+        and continues, logging a per-contig count. Comparison is
+        case-insensitive, so soft-masked (lowercase) reference bases match.
         """
         from cyvcf2 import VCF as _CyVCF
 
@@ -1009,6 +1046,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         info = [t for t in flds if t[1] == "info"]
         format_ = [t for t in flds if t[1] == "format"]
 
+        _validate_check_ref(check_ref)
         return _core.run_vcf_list_conversion_pipeline(
             [str(p) for p in paths],
             None if no_reference else str(reference),
@@ -1023,6 +1061,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             signatures,
             info,
             format_,
+            check_ref,
         )
 
     @classmethod
@@ -1039,6 +1078,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         overwrite: bool = False,
         long_allele_capacity: int = 8 * 1024 * 1024,
         signatures: bool = False,
+        check_ref: Literal["e", "x"] = "e",
     ) -> int:
         """Convert a SVAR1 (``SparseVar``) store to an SVAR2 store natively.
 
@@ -1057,6 +1097,13 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         values, a dense-routed variant's non-carrier cells are filled with the
         field's default/missing sentinel — field output is byte-identical to
         :meth:`from_vcf` only for var_key (carrier-only) routing.
+
+        check_ref: policy for a record whose REF disagrees with the reference
+        FASTA (ignored when `no_reference=True`). `"e"` (default) raises and
+        aborts the build — matching `bcftools norm --check-ref e`. `"x"` drops
+        the offending record (including a REF that runs past the contig end)
+        and continues, logging a per-contig count. Comparison is
+        case-insensitive, so soft-masked (lowercase) reference bases match.
         """
         from genoray._svar import SparseVar
 
@@ -1103,6 +1150,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             chunk_size = _auto_chunk_size(n_samples, ploidy)
 
         out.parent.mkdir(parents=True, exist_ok=True)
+        _validate_check_ref(check_ref)
         return _core.run_svar1_conversion_pipeline(
             str(source),
             None if no_reference else str(reference),
@@ -1124,6 +1172,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             alt_off_pc,
             format_tuples,
             src_dtypes,
+            check_ref,
         )
 
 

@@ -109,6 +109,7 @@ pub enum SourceSpec {
 struct VcfListDroppedProxy {
     inner: crate::vcf_list_reader::VcfListRecordSource,
     dropped_out: Arc<AtomicU64>,
+    ref_excluded_out: Arc<AtomicU64>,
 }
 
 impl crate::record_source::RecordSource for VcfListDroppedProxy {
@@ -128,6 +129,8 @@ impl crate::record_source::RecordSource for VcfListDroppedProxy {
         if rec.is_none() {
             self.dropped_out
                 .store(self.inner.dropped_out_of_scope(), Ordering::Relaxed);
+            self.ref_excluded_out
+                .store(self.inner.ref_excluded(), Ordering::Relaxed);
         }
         Ok(rec)
     }
@@ -221,6 +224,7 @@ pub fn process_chromosome(
     ploidy: usize,
     long_allele_capacity: usize,
     skip_out_of_scope: bool,
+    check_ref: crate::normalize::CheckRef,
     processing_threads: usize,
     signatures: bool,
     fields: &[crate::field::FieldSpec],
@@ -303,6 +307,7 @@ pub fn process_chromosome(
                 // Only populated (and only meaningful) for `SourceSpec::VcfList`;
                 // stays 0 for the other variants.
                 let vcf_list_dropped = Arc::new(AtomicU64::new(0));
+                let vcf_list_ref_excluded = Arc::new(AtomicU64::new(0));
                 let src: Box<dyn crate::record_source::RecordSource + Send> = match source {
                     SourceSpec::Vcf {
                         vcf_path,
@@ -353,6 +358,7 @@ pub fn process_chromosome(
                                         Arc::clone(&ref_seq),
                                         has_reference,
                                         skip_out_of_scope,
+                                        check_ref,
                                         &fields_owned,
                                         Some((unit.own_start, unit.own_end)),
                                     ))
@@ -496,6 +502,7 @@ pub fn process_chromosome(
                                         Arc::clone(&ref_seq),
                                         has_reference,
                                         skip_out_of_scope,
+                                        check_ref,
                                         &fields_owned,
                                         Some((unit.own_start, unit.own_end)),
                                     ))
@@ -522,11 +529,13 @@ pub fn process_chromosome(
                             ploidy,
                             htslib_threads,
                             skip_out_of_scope,
+                            check_ref,
                             &fields_owned,
                         )?;
                         Box::new(VcfListDroppedProxy {
                             inner: vcf_list,
                             dropped_out: Arc::clone(&vcf_list_dropped),
+                            ref_excluded_out: Arc::clone(&vcf_list_ref_excluded),
                         })
                     }
                     SourceSpec::Svar1 {
@@ -574,6 +583,7 @@ pub fn process_chromosome(
                     fasta.as_deref(),
                     &chr,
                     skip_out_of_scope,
+                    check_ref,
                     &fields_owned,
                 )?;
                 let mut chunk_id = 0;
@@ -582,6 +592,14 @@ pub fn process_chromosome(
                 {
                     tx_dense.send(dense_chunk).unwrap();
                     chunk_id += 1;
+                }
+                let ref_excluded =
+                    reader.ref_excluded() + vcf_list_ref_excluded.load(Ordering::Relaxed);
+                if ref_excluded > 0 {
+                    println!(
+                        "[{chr}] check_ref=x: excluded {ref_excluded} record(s) whose REF \
+                         disagreed with the reference FASTA."
+                    );
                 }
                 Ok(reader.dropped_out_of_scope() + vcf_list_dropped.load(Ordering::Relaxed))
             }
@@ -849,6 +867,7 @@ pub fn run_vcf_list(
     max_threads: Option<usize>,
     long_allele_capacity: usize,
     skip_out_of_scope: bool,
+    check_ref: crate::normalize::CheckRef,
     signatures: bool,
     info_fields: Vec<(String, String, String, Option<String>, Option<f64>)>,
     format_fields: Vec<(String, String, String, Option<String>, Option<f64>)>,
@@ -908,6 +927,7 @@ pub fn run_vcf_list(
             ploidy,
             long_allele_capacity,
             skip_out_of_scope,
+            check_ref,
             processing_threads,
             signatures,
             &fields,

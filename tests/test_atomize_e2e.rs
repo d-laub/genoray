@@ -37,6 +37,7 @@ fn drain_reader(
         Some(fasta_path.to_str().unwrap()),
         chrom,
         false,
+        genoray_core::normalize::CheckRef::Error,
         &[],
     )
     .unwrap();

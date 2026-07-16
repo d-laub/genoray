@@ -326,3 +326,16 @@ def test_from_pgen_missing_pvar_is_a_clear_error(sources, tmp_path):
     lonely.write_bytes(pgen.read_bytes())
     with pytest.raises(FileNotFoundError, match="No .pvar or .pvar.zst"):
         SparseVar2.from_pgen(tmp_path / "x.svar2", lonely, no_reference=True)
+
+
+def test_from_pgen_check_ref_accepts_x(sources, tmp_path):
+    ref, _, pgen = sources
+    out = tmp_path / "check_ref_x.svar2"
+    SparseVar2.from_pgen(out, pgen, ref, check_ref="x")
+    assert (out / "meta.json").exists()
+
+
+def test_from_pgen_check_ref_invalid_raises(sources, tmp_path):
+    ref, _, pgen = sources
+    with pytest.raises(ValueError, match="check_ref"):
+        SparseVar2.from_pgen(tmp_path / "bad.svar2", pgen, ref, check_ref="z")
