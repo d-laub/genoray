@@ -1,3 +1,52 @@
+## 3.1.0 (2026-07-16)
+
+### Feat
+
+- **cli**: route regions/samples to pgen and svar1 writes
+- **svar2**: add regions and samples to from_svar1
+- **svar2**: add regions and samples to from_pgen
+- **svar2**: add regions to from_vcf_list
+- **svar2**: shared per-record overlap filter in VCF reader
+- **svar2**: add region and sample VCF conversion
+- --check-ref flag on genoray write
+- check_ref option for from_vcf_list (k-way merge)
+- check_ref option for from_pgen and from_svar1
+- check_ref option for from_vcf (single-source engine)
+- add CheckRef policy and apply_check_ref helper
+- **svar2**: shard PGEN conversion by variant-index range
+- **svar2**: PGEN variant-index shard planner with boundary padding
+- **bench**: matched PGEN generation helper (plink2)
+- **bench**: scaling metrics + byte-identical oracle gate in region bench
+- **svar2**: add region and sample VCF conversion
+
+### Fix
+
+- **svar2**: reconcile Rust test call sites after check_ref rebase
+- **svar2**: reject regions_overlap='variant' with multiple regions per contig
+- **svar2**: aggregate check_ref exclusions across VCF shards
+- **svar2**: eliminate GIL convoy in concurrent PGEN shard reads
+- **svar2**: fetch shard-boundary variant so PGEN sharding stays byte-identical
+- **bench**: restore crash-durable jsonl + guard pgen filters, test oracle_hash
+- **svar2**: include VCF shard context in worker errors
+- **svar2**: avoid double-reserving VCF shard workers
+- make long-allele positioned reads cross-platform (Windows)
+- ungate field_finalize so genoray builds without conversion
+
+### Refactor
+
+- **svar2**: backend-agnostic region front-end; from_vcf uses OverlapMode
+- gate PyValueError import behind conversion feature
+- **svar2**: extract backend-agnostic shard planner
+
+### Perf
+
+- **svar2**: disable PGEN sub-contig sharding pending pgenlib GIL fix
+- **svar2**: over-decompose VCF shards for work-stealing load balance
+- **svar2**: work-stealing shard collector with reorder buffer (VCF)
+- **svar2**: add region conversion benchmark harness
+- **svar2**: shard VCF conversion within contigs
+- **svar2**: parallelize VCF normalization batches
+
 ## 3.0.0 (2026-07-14)
 
 ### BREAKING CHANGE
