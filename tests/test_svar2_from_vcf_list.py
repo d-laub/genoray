@@ -131,6 +131,26 @@ def test_from_vcf_list_regions_no_match_raises(tmp_path: Path):
         )
 
 
+def test_from_vcf_list_regions_overlap_variant_rejects_multiple_regions_per_contig(
+    tmp_path: Path,
+):
+    """`regions_overlap="variant"` with 2+ disjoint regions on the same
+    contig is unsound (see `genoray._svar2._reject_multiregion_variant`) and
+    must raise rather than silently double-count variants."""
+    ref = _write_ref(tmp_path)
+    a = _ss(tmp_path, "a", "SA", "chr1\t3\t.\tA\tG\t.\t.\t.\tGT\t1|0\n")
+    b = _ss(tmp_path, "b", "SB", "chr1\t7\t.\tC\tCAT\t.\t.\t.\tGT\t0|1\n")
+    with pytest.raises(ValueError, match="at most one region per contig"):
+        SparseVar2.from_vcf_list(
+            tmp_path / "vl_multi_variant",
+            [a, b],
+            ref,
+            regions=["chr1:1-4", "chr1:7-12"],
+            regions_overlap="variant",
+            threads=1,
+        )
+
+
 def test_from_vcf_list_shared_site_one_variant(tmp_path: Path):
     ref = _write_ref(tmp_path)
     a = _ss(tmp_path, "a", "SA", "chr1\t3\t.\tA\tG\t.\t.\t.\tGT\t1|0\n")

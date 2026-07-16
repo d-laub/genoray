@@ -175,6 +175,31 @@ def _normalize_svar2_regions(
     return merged
 
 
+def _reject_multiregion_variant(
+    region_ranges: "list[tuple[str, int, int]]", regions_overlap: str
+) -> None:
+    """`regions_overlap="variant"` is only sound with at most ONE region per
+    contig: a variant whose anchor-trimmed extent spans the gap between two
+    disjoint regions on the same contig is handled inconsistently across the
+    conversion readers (double-counted in the VCF path, dropped in the
+    PGEN/SVAR1 paths). Until per-region ownership is unified, reject it up
+    front. `pos`/`record` modes are unaffected (POS belongs to exactly one
+    coalesced region)."""
+    if regions_overlap != "variant":
+        return
+    from collections import Counter
+
+    counts = Counter(chrom for chrom, _s, _e in region_ranges)
+    multi = sorted(c for c, n in counts.items() if n > 1)
+    if multi:
+        raise ValueError(
+            "regions_overlap='variant' currently supports at most one region "
+            f"per contig, but these contigs have multiple: {multi}. Convert "
+            "them in separate calls, coalesce with merge_overlapping=True if "
+            "they are adjacent/overlapping, or use regions_overlap='pos'/'record'."
+        )
+
+
 def _canonical_contig_id(name: str) -> str:
     """The `chr`-prefix-insensitive, mito-alias-aware identity that
     :class:`genoray._contigs.ContigNormalizer` treats as "the same contig" --
@@ -667,6 +692,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             all_contigs,
             merge_overlapping=merge_overlapping,
         )
+        _reject_multiregion_variant(region_ranges, regions_overlap)
 
         if region_ranges:
             ranges_by_contig: dict[str, list[tuple[int, int]]] = {}
@@ -861,6 +887,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             contigs,
             merge_overlapping=merge_overlapping,
         )
+        _reject_multiregion_variant(region_ranges, regions_overlap)
         if region_ranges:
             covering = _pvar_covering_ranges(
                 pvar, contigs, ranges, region_ranges, regions_overlap
@@ -1097,6 +1124,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             sorted(contig_set),
             merge_overlapping=merge_overlapping,
         )
+        _reject_multiregion_variant(region_ranges, regions_overlap)
         if regions is not None:
             ranges_by_contig: dict[str, list[tuple[int, int]]] = {}
             for chrom, start, end in region_ranges:
@@ -1275,6 +1303,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             contigs,
             merge_overlapping=merge_overlapping,
         )
+        _reject_multiregion_variant(region_ranges, regions_overlap)
         if region_ranges:
             region_contigs = {c for c, _, _ in region_ranges}
             keep = [i for i, c in enumerate(contigs) if c in region_contigs]

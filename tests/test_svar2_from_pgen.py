@@ -309,6 +309,23 @@ def test_from_pgen_regions_restrict(sources, tmp_path):
     assert sorted(set(np.asarray(rag["pos"].data).tolist())) == [2]
 
 
+def test_from_pgen_regions_overlap_variant_rejects_multiple_regions_per_contig(
+    sources, tmp_path
+):
+    """`regions_overlap="variant"` with 2+ disjoint regions on the same
+    contig is unsound (see `genoray._svar2._reject_multiregion_variant`) and
+    must raise rather than silently drop variants."""
+    ref, _, pgen = sources
+    with pytest.raises(ValueError, match="at most one region per contig"):
+        SparseVar2.from_pgen(
+            tmp_path / "pg_multi_variant",
+            pgen,
+            ref,
+            regions=["chr1:1-4", "chr1:7-12"],
+            regions_overlap="variant",
+        )
+
+
 def _cell_pos(rag, sample: int, ploid: int) -> list[int]:
     """The `pos` values decoded for one `(region 0, sample, ploid)` cell.
 

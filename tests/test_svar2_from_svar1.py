@@ -304,6 +304,24 @@ def test_from_svar1_regions_restrict(tmp_path: Path):
     assert pos.tolist() == [2]
 
 
+def test_from_svar1_regions_overlap_variant_rejects_multiple_regions_per_contig(
+    tmp_path: Path,
+):
+    """`regions_overlap="variant"` with 2+ disjoint regions on the same
+    contig is unsound (see `genoray._svar2._reject_multiregion_variant`) and
+    must raise rather than silently drop variants."""
+    src = _build_svar1(tmp_path)
+    with pytest.raises(ValueError, match="at most one region per contig"):
+        SparseVar2.from_svar1(
+            tmp_path / "s1_multi_variant",
+            src,
+            no_reference=True,
+            regions=["chr1:1-4", "chr1:7-12"],
+            regions_overlap="variant",
+            threads=1,
+        )
+
+
 def test_from_svar1_samples_reorder(tmp_path: Path):
     """`samples=["S1", "S0"]` must reorder `available_samples` AND actually
     remap the decoded CSR columns -- S1's carrier calls (originally hap

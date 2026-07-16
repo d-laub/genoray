@@ -261,7 +261,9 @@ Signature: `from_vcf(out, source, reference=None, *, regions=None, samples=None,
   an indel at the region's last base is kept), or `"variant"` (the
   anchor-trimmed variant extent overlaps the region). In `"variant"` mode a
   multiallelic record is kept whole if ANY of its alleles truly overlaps the
-  region; individual non-overlapping alleles are not dropped.
+  region; individual non-overlapping alleles are not dropped. `"variant"`
+  currently requires at most one region per contig; multiple regions per
+  contig raise — use `"pos"`/`"record"`, or convert separately.
 - **`samples=`** — selects and reorders VCF samples by name: preserves caller
   order, de-duplicates first occurrences, raises `ValueError` on an unknown
   name. `available_samples` and every decoded column match the caller's order

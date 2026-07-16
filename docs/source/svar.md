@@ -66,7 +66,8 @@ subset.
 `"variant"` (the anchor-trimmed variant extent overlaps the region). In
 `variant` mode a multiallelic record is kept whole if ANY of its alleles
 truly overlaps the region; individual non-overlapping alleles are not
-dropped.
+dropped. `variant` currently requires at most one region per contig; multiple
+regions per contig raise — use `pos`/`record`, or convert separately.
 
 ## Haploid (ploidy=1) write option
 

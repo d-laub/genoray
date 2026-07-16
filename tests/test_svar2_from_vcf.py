@@ -165,6 +165,74 @@ def test_from_vcf_regions_overlap_pos_excludes_spanning_deletion(tmp_path: Path)
     assert counts_v > counts_p
 
 
+def test_from_vcf_regions_overlap_variant_rejects_multiple_regions_per_contig(
+    tmp_path: Path,
+):
+    """Two disjoint regions on the SAME contig are unsound under
+    `regions_overlap="variant"` (a deletion's anchor-trimmed extent could span
+    the gap between them and be double-counted/dropped depending on the
+    reader) -- must raise rather than silently misbehave.
+    """
+    ref = _write_ref(tmp_path)
+    vcf = _write_vcf(tmp_path, symbolic=False, indexed=True)
+    with pytest.raises(ValueError, match="at most one region per contig"):
+        SparseVar2.from_vcf(
+            tmp_path / "multi_variant",
+            vcf,
+            ref,
+            regions=["chr1:1-4", "chr1:7-12"],
+            regions_overlap="variant",
+            threads=1,
+        )
+
+
+def test_from_vcf_regions_overlap_pos_allows_multiple_regions_per_contig(
+    tmp_path: Path,
+):
+    """The same two disjoint regions are fine under `regions_overlap="pos"`
+    (POS belongs to exactly one coalesced region) -- must NOT raise, and must
+    still restrict conversion to each region's own variant.
+    """
+    ref = _write_ref(tmp_path)
+    vcf = _write_vcf(tmp_path, symbolic=False, indexed=True)
+    out = tmp_path / "multi_pos"
+    SparseVar2.from_vcf(
+        out,
+        vcf,
+        ref,
+        regions=["chr1:1-4", "chr1:7-12"],
+        regions_overlap="pos",
+        threads=1,
+    )
+    sv = SparseVar2(out)
+    rag = sv.decode("chr1", [(0, 40)])
+    assert sorted(set(np.asarray(rag["pos"].data).tolist())) == [2, 6]
+
+
+def test_from_vcf_regions_overlap_variant_allows_merged_adjacent_regions(
+    tmp_path: Path,
+):
+    """Two overlapping/adjacent region specs that `merge_overlapping=True`
+    coalesces into ONE interval per contig must NOT trip the multi-region
+    guard, even though the caller passed multiple region specs.
+    """
+    ref = _write_ref(tmp_path)
+    vcf = _write_vcf(tmp_path, symbolic=False, indexed=True)
+    out = tmp_path / "multi_variant_merged"
+    SparseVar2.from_vcf(
+        out,
+        vcf,
+        ref,
+        regions=["chr1:1-4", ("chr1", 3, 8)],
+        merge_overlapping=True,
+        regions_overlap="variant",
+        threads=1,
+    )
+    sv = SparseVar2(out)
+    rag = sv.decode("chr1", [(0, 40)])
+    assert sorted(set(np.asarray(rag["pos"].data).tolist())) == [2, 6]
+
+
 def test_from_vcf_samples_preserve_order(tmp_path: Path):
     ref = _write_ref(tmp_path)
     vcf = _write_vcf(tmp_path, symbolic=False, indexed=True)
