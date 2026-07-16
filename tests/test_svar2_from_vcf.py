@@ -342,6 +342,33 @@ def test_from_vcf_check_ref_exclude_continues(tmp_path: Path):
     assert int(counts.sum()) == 4
 
 
+def test_from_vcf_sharded_check_ref_exclude_counts_owned_record_once(
+    tmp_path: Path, capfd: pytest.CaptureFixture[str]
+):
+    """check_ref=x must survive sub-contig sharding: the excluded record is
+    dropped (byte-identical to the serial exclude above) AND counted exactly
+    once in the per-contig summary, even though each shard's ``ChunkAssembler``
+    tracks its own ``ref_excluded`` and the padded fetch window means a boundary
+    record can be seen by two shards.
+
+    ``threads=16`` + ``chunk_size=1`` forces the work-stealing sharded path
+    (over-decomposed VCF units) on this tiny input; the count is aggregated
+    across shards by ``shard_exec::run`` -> ``ShardTotals.ref_excluded`` and
+    reported once via ``orchestrator::report_ref_excluded``. Ported from PR #115
+    (which #119 supersedes) to keep its coverage. ``capfd`` (not ``capsys``)
+    because the summary is a Rust ``println!`` on fd 1.
+    """
+    ref = _write_ref(tmp_path)
+    vcf = _write_vcf_bad_ref(tmp_path)
+    out = tmp_path / "sharded_store"
+
+    SparseVar2.from_vcf(out, vcf, ref, check_ref="x", threads=16, chunk_size=1)
+
+    assert "excluded 1 record(s)" in capfd.readouterr().out
+    counts = SparseVar2(out).region_counts("chr1", [(0, 40)])
+    assert int(counts.sum()) == 4
+
+
 def test_from_vcf_check_ref_invalid_value_raises(tmp_path: Path):
     ref = _write_ref(tmp_path)
     vcf = _write_vcf_bad_ref(tmp_path)

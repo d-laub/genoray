@@ -50,7 +50,9 @@ parallel memory architecture.
 /// (`max_shards` caps `readers.len()`), and pgenlib holds the GIL through its
 /// decode, so concurrent PGEN shard reads are GIL-serialized -- sharding adds
 /// pure overhead there rather than parallelism (see the convoy fix fa47530;
-/// full chr21c benchmark: 340s sharded vs 273s serial). See the
+/// reproducible chr21c benchmark: 44.9s sharded vs 32.6s serial -- PGEN
+/// conversion is already fast and executor/IO-bound, not decode-bound, so PGEN
+/// sub-contig sharding is disabled by default at the Python layer). See the
 /// `SourceSpec::Pgen` branch below for the unchanged `max_shards` calc.
 pub(crate) const OVERSHARD_FACTOR: usize = 4;
 
@@ -133,6 +135,18 @@ impl crate::record_source::RecordSource for VcfListDroppedProxy {
                 .store(self.inner.ref_excluded(), Ordering::Relaxed);
         }
         Ok(rec)
+    }
+}
+
+/// Emit the per-contig `check_ref=x` exclusion summary (nothing when none were
+/// excluded). Shared by the single-reader and sub-contig-sharded paths so both
+/// report the same line; the sharded path sums the count across shards first.
+fn report_ref_excluded(chrom: &str, ref_excluded: u64) {
+    if ref_excluded > 0 {
+        println!(
+            "[{chrom}] check_ref=x: excluded {ref_excluded} record(s) whose REF \
+             disagreed with the reference FASTA."
+        );
     }
 }
 
@@ -338,7 +352,7 @@ pub fn process_chromosome(
                                     ordinal: s.ordinal,
                                 })
                                 .collect();
-                            return crate::shard_exec::run(
+                            let totals = crate::shard_exec::run(
                                 units,
                                 processing_threads,
                                 |unit| {
@@ -372,7 +386,9 @@ pub fn process_chromosome(
                                 },
                                 chunk_size,
                                 &tx_dense,
-                            );
+                            )?;
+                            report_ref_excluded(&chr, totals.ref_excluded);
+                            return Ok(totals.dropped_out_of_scope);
                         }
                         Box::new(crate::vcf_reader::VcfRecordSource::new(
                             &vcf_path,
@@ -478,7 +494,7 @@ pub fn process_chromosome(
                             // `readers.len()` above.
                             let readers_pool: Vec<Mutex<Option<pyo3::Py<pyo3::PyAny>>>> =
                                 readers.into_iter().map(|r| Mutex::new(Some(r))).collect();
-                            return crate::shard_exec::run(
+                            let totals = crate::shard_exec::run(
                                 units,
                                 processing_threads,
                                 |unit| {
@@ -510,7 +526,9 @@ pub fn process_chromosome(
                                 |e, unit| with_pgen_shard_context(e, &chr, unit),
                                 chunk_size,
                                 &tx_dense,
-                            );
+                            )?;
+                            report_ref_excluded(&chr, totals.ref_excluded);
+                            return Ok(totals.dropped_out_of_scope);
                         }
                     }
                     SourceSpec::VcfList {
@@ -593,14 +611,10 @@ pub fn process_chromosome(
                     tx_dense.send(dense_chunk).unwrap();
                     chunk_id += 1;
                 }
-                let ref_excluded =
-                    reader.ref_excluded() + vcf_list_ref_excluded.load(Ordering::Relaxed);
-                if ref_excluded > 0 {
-                    println!(
-                        "[{chr}] check_ref=x: excluded {ref_excluded} record(s) whose REF \
-                         disagreed with the reference FASTA."
-                    );
-                }
+                report_ref_excluded(
+                    &chr,
+                    reader.ref_excluded() + vcf_list_ref_excluded.load(Ordering::Relaxed),
+                );
                 Ok(reader.dropped_out_of_scope() + vcf_list_dropped.load(Ordering::Relaxed))
             }
         })

@@ -105,8 +105,21 @@ enum Msg {
     Done {
         unit_ordinal: usize,
         dropped: u64,
+        ref_excluded: u64,
     },
     Err(ConversionError),
+}
+
+/// Per-contig counters returned by [`run`], summed across every shard. Both are
+/// diagnostic totals the caller reports after the shards drain (the sharded
+/// output itself is byte-identical regardless of how the units were split).
+pub struct ShardTotals {
+    /// Out-of-scope (symbolic/breakend) ALTs dropped across all shards.
+    pub dropped_out_of_scope: u64,
+    /// Records excluded by `CheckRef::Exclude` across all shards (each shard
+    /// tallies only the records it owns, so a padded boundary record is counted
+    /// once even when it appears in two shards' fetch windows).
+    pub ref_excluded: u64,
 }
 
 /// Distribute `units` across a fixed pool of `workers` threads pulling from a
@@ -123,8 +136,8 @@ enum Msg {
 /// unit's shard-region context (see `orchestrator::with_vcf_shard_context`);
 /// this module stays backend-agnostic about how a `WorkUnit` is described.
 ///
-/// Returns the total `dropped_out_of_scope` across every unit, or the first
-/// error encountered (context-decorated).
+/// Returns the [`ShardTotals`] (summed `dropped_out_of_scope` and `ref_excluded`)
+/// across every unit, or the first error encountered (context-decorated).
 pub fn run<F, G>(
     units: Vec<WorkUnit>,
     workers: usize,
@@ -132,14 +145,17 @@ pub fn run<F, G>(
     err_context: G,
     chunk_size: usize,
     tx_dense: &Sender<DenseChunk>,
-) -> Result<u64, ConversionError>
+) -> Result<ShardTotals, ConversionError>
 where
     F: Fn(&WorkUnit) -> Result<ChunkAssembler, ConversionError> + Sync,
     G: Fn(ConversionError, &WorkUnit) -> ConversionError + Sync,
 {
     let n_units = units.len();
     if n_units == 0 {
-        return Ok(0);
+        return Ok(ShardTotals {
+            dropped_out_of_scope: 0,
+            ref_excluded: 0,
+        });
     }
     let workers = workers.max(1);
     let cancel = Arc::new(AtomicBool::new(false));
@@ -225,6 +241,7 @@ where
                             .send(Msg::Done {
                                 unit_ordinal: unit.ordinal,
                                 dropped: asm.dropped_out_of_scope(),
+                                ref_excluded: asm.ref_excluded(),
                             })
                             .is_err()
                         {
@@ -247,6 +264,7 @@ where
         let mut pending: HashMap<(usize, usize), DenseChunk> = HashMap::new();
         let mut rb = ReorderBuffer::new(n_units);
         let mut total_dropped = 0u64;
+        let mut total_ref_excluded = 0u64;
         let mut first_err: Option<ConversionError> = None;
         let mut done_count = 0usize;
 
@@ -275,10 +293,12 @@ where
                 Msg::Done {
                     unit_ordinal,
                     dropped,
+                    ref_excluded,
                 } => {
                     done_count += 1;
                     if first_err.is_none() {
                         total_dropped += dropped;
+                        total_ref_excluded += ref_excluded;
                         rb.push(unit_ordinal, 0, true, &mut |gid, tag| {
                             if let Some(mut c) = pending.remove(&tag) {
                                 c.chunk_id = gid;
@@ -316,7 +336,10 @@ where
             }
         }
 
-        first_err.map(Err).unwrap_or(Ok(total_dropped))
+        first_err.map(Err).unwrap_or(Ok(ShardTotals {
+            dropped_out_of_scope: total_dropped,
+            ref_excluded: total_ref_excluded,
+        }))
     })
 }
 
