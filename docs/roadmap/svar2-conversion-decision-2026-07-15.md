@@ -23,10 +23,15 @@ See `svar2-conversion-baseline-2026-07-15.md`. Summary:
   (inflate+parse) bound (memory `svar2-conversion-reader-bound`, ~78% reader at 1
   thread). The executor stage is downstream of the reader and is not on the
   critical path — adding executor parallelism cannot beat the reader ceiling.
-- **PGEN (chr21c):** sharding is byte-identical but **net slower** (340 s vs
-  273 s serial) because `pgenlib` decode holds the GIL; the bottleneck is the
-  GIL-serialized read, not the executor (memory
-  `pgenlib-holds-gil-sharded-reads`).
+- **PGEN (chr21c):** sharding is byte-identical but **net slower** (44.9 s vs
+  32.6 s serial on a quiet node — the earlier 340 s/273 s pair was a contention
+  artifact, see the baseline doc). Single-reader conversion is already fast
+  (~33 s) and bound by the shared executor/writer + reference I/O, not decode,
+  so sharding can't beat that floor; concurrent readers add coordination and,
+  on `pgenlib`<0.92, GIL-serialize (memory `pgenlib-holds-gil-sharded-reads`).
+  Bumping to a GIL-releasing pgenlib (0.94.x, internal `prange`) does **not**
+  help — the conversion is flat at ~33 s across `OMP_NUM_THREADS` 1→32 —
+  because decode isn't the bottleneck, so the pin stays at `0.91.*`.
 
 In both backends the bottleneck is the **reader**, not the shared executor. The
 executor's wall-time share is well below the 25% gate.
@@ -42,12 +47,22 @@ for no benefit while the reader dominates.
 
 ### PGEN-specific recommendation
 
-PGEN sub-contig sharding is **byte-identical but counter-productive** (GIL-bound
-reads). It is retained in the codebase (correct, tested) but should be treated as
-**not beneficial by default**; a follow-up may cap PGEN `processing_threads`-side
-sharding to 1 (single-reader fast path) unless/until a GIL-free PGEN reader
-exists. VCF sharding — the real win — over-decomposes; PGEN intentionally does
-not (`OVERSHARD_FACTOR` is applied to the VCF branch only).
+PGEN sub-contig sharding is **byte-identical but counter-productive**, so it is
+**disabled by default**: `from_pgen` pins the shard budget to `P = 1` (single
+reader per contig). The machinery is retained (correct, tested via the
+`pgen_shard` unit tests) but off. Measurement (baseline doc): single-reader
+conversion is already fast (~33 s, executor/IO-bound not decode-bound), and
+sharding measures slower (44.9 s at `threads=24`).
+
+Bumping `pgenlib` to a GIL-releasing build (0.94.x adds `prange(nogil=True)` to
+`read_alleles_range`) was evaluated and **rejected**: the conversion is flat at
+~33 s across `OMP_NUM_THREADS` 1→32 and identical to 0.91.0, because decode is
+not the bottleneck. The pin stays at `0.91.*`; revisit only if a future
+reader/executor change shifts the bottleneck onto decode (then a single 0.94.x
+reader would parallelize decode internally — no sub-contig sharding needed).
+
+VCF sharding — the real win — over-decomposes; PGEN intentionally does not
+(`OVERSHARD_FACTOR` is applied to the VCF branch only).
 
 ## Gate resolution
 

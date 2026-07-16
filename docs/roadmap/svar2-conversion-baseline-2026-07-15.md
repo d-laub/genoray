@@ -34,22 +34,44 @@ Two structural facts shape the curve:
    (3.9×/32 ≈ 12%) but the wall-clock win is real and the ceiling is I/O, not the
    scheme.
 
+> **Caveat on absolute wall-times.** These VCF numbers were taken on the same
+> shared cluster whose contention later proved to inflate the PGEN absolutes
+> (see below). The load-bearing results here are the **speedup ratio** (~3.9× at
+> 32 threads) and **byte-identity at every thread count**, both of which are
+> ratios/invariants robust to a uniform slowdown; treat the raw seconds as
+> indicative, not precise.
+
 ## PGEN → SVAR2 (chr21c, matched)
 
-| threads | wall (s) | vs serial | byte-identical |
-|--------:|---------:|----------:|:--------------:|
-| 1  | 273.0 | 1.00× | ✅ |
-| 24 | 340.8 | 0.80× (**slower**) | ✅ |
+Re-measured on a quiet `carter-cn-02` (chr21c: ~1M variants × 3202 samples).
+An earlier run on a heavily-contended node reported 273 s serial / 340 s
+sharded; **those absolute numbers were a contention artifact and do not
+reproduce** (they were ~8× inflated). The reproducible picture:
 
-**PGEN sharding is byte-identical but NET SLOWER.** Root cause: `pgenlib`'s
-`read_alleles_range` holds the CPython GIL for its entire decode (verified
-against the compiled `.so`; the prior in-code comment claiming it releases the
-GIL was wrong). So concurrent shard readers cannot decode in parallel — they
-serialize on the GIL — and sharding adds pure coordination overhead. A
-per-variant GIL re-acquisition in the reader additionally produced a GIL convoy
-that stalled large runs entirely; that was fixed (`fa47530`, bulk-copy each
-batch under one GIL acquisition, O(records)→O(refills)), which is what makes the
-340 s run complete at all. See memory `pgenlib-holds-gil-sharded-reads`.
+| config | wall (s) | vs serial | byte-identical |
+|:-------|---------:|----------:|:--------------:|
+| serial `P=1`, pgenlib 0.91.0 | 32.6–32.9 | 1.00× | ✅ |
+| serial `P=1`, pgenlib 0.94.1 | 33.0 | 1.00× | ✅ |
+| sub-contig sharded, `threads=24` (0.91.0) | 44.9 | **0.73× (slower)** | ✅ |
+| pgenlib 0.94.1, `OMP_NUM_THREADS` 1→32 | 32.6–33.0 | flat | ✅ |
+
+All rows share the same store hash. Two conclusions, both reproducible:
+
+1. **PGEN sharding is byte-identical but NET SLOWER** (44.9 s vs 32.6 s).
+   Single-reader conversion is already fast (~33 s) and bound by the shared
+   executor/writer + reference I/O, **not** by pgenlib decode — so sub-contig
+   sharding cannot beat that floor, and concurrent readers only add
+   coordination overhead (and, on `pgenlib`<0.92, serialize on the CPython GIL:
+   `read_alleles_range` holds it through the whole decode — verified against
+   both the compiled `.so` and the `.pyx`, 0 `nogil`/`prange` in 0.91.0). A
+   per-variant GIL re-acquisition additionally produced a convoy that stalled
+   large sharded runs; fixed in `fa47530` (bulk-copy each batch under one GIL
+   acquisition). See memory `pgenlib-holds-gil-sharded-reads`.
+2. **A GIL-releasing pgenlib does not help.** 0.94.1 parallelizes
+   `read_alleles_range` decode via `prange(nogil=True)`, but the conversion is
+   flat at ~33 s across `OMP_NUM_THREADS` 1→32 and identical to 0.91.0 —
+   because decode isn't the bottleneck. Hence the `pgenlib` pin stays at
+   `0.91.*`; bumping to 0.94.x buys nothing here (see the decision record).
 
 ## Byte-identity
 

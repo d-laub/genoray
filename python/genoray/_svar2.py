@@ -811,18 +811,26 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         # file-wide array, so every reader is constructed with the same one.
         #
         # P == 1 => PGEN sub-contig sharding is DISABLED (single reader per
-        # contig, byte-identical to the serial path). Rationale: `pgenlib`
-        # <0.92 holds the CPython GIL through `read_alleles_range`'s decode
-        # (verified: 0 `nogil`/`prange` in 0.91.0's .pyx; 52 `nogil`/23
-        # `prange` in 0.94.1), so concurrent shard readers cannot overlap --
-        # they serialize on the GIL and sharding is NET SLOWER (chr21: 340s
-        # sharded vs 273s serial). The intra-contig sharding machinery
-        # (plan_pgen_units, per-ordinal readers) is retained and validated
-        # (byte-identical at 1M-variant scale) for re-enablement once the
-        # pgenlib pin is bumped to a GIL-releasing build AND sharding is
-        # re-measured to actually help. See
-        # docs/roadmap/svar2-conversion-decision-2026-07-15.md and memory
-        # `pgenlib-holds-gil-sharded-reads`.
+        # contig, byte-identical to the serial path). Rationale, from a
+        # reproducible sweep on carter-cn-02 over chr21c (~1M variants x 3202
+        # samples): single-reader conversion is already fast (~33s) and is
+        # bound by the shared executor/writer + reference I/O, NOT by pgenlib
+        # decode. So sub-contig sharding cannot beat that floor -- measured
+        # threads=24 sharding is NET SLOWER (44.9s vs 32.6s, 0.73x) because
+        # concurrent readers add coordination overhead and, on `pgenlib`<0.92,
+        # serialize on the CPython GIL (verified: 0 `nogil`/`prange` in
+        # 0.91.0's .pyx). Nor does bumping to a GIL-releasing pgenlib help:
+        # 0.94.1 parallelizes `read_alleles_range` decode via `prange`
+        # (nogil=True), yet the same conversion is unchanged at ~33s across
+        # OMP_NUM_THREADS 1..32 -- decode isn't the bottleneck, so the internal
+        # parallelism buys nothing here. (An earlier 273s/340s serial/sharded
+        # pair was a cluster-contention artifact and does not reproduce; the
+        # slower-when-sharded conclusion holds at both scales.) The intra-contig
+        # sharding machinery (plan_pgen_units, per-ordinal readers) is retained
+        # and validated byte-identical at 1M-variant scale for re-enablement
+        # only if a future reader/executor change shifts the bottleneck onto
+        # decode. See docs/roadmap/svar2-conversion-decision-2026-07-15.md and
+        # memory `pgenlib-holds-gil-sharded-reads`.
         P = 1
         readers = [
             [

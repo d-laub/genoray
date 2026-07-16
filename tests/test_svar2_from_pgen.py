@@ -290,14 +290,15 @@ def test_pgen_thread_count_independent(sources, tmp_path):
     """PGEN conversion output must be byte-identical regardless of `threads`.
 
     PGEN sub-contig sharding is currently **disabled** (`from_pgen` pins the
-    shard budget `P = 1`): `pgenlib` 0.91.x holds the CPython GIL through its
-    entire allele decode, so concurrent shard readers serialize on the GIL and
-    sharding is net *slower* than a single reader (see memory
-    `pgenlib-holds-gil-sharded-reads` and the decision record
-    `docs/roadmap/svar2-conversion-decision-2026-07-15.md`). The Rust sharding
-    machinery is retained (correct + tested via the `pgen_shard` unit tests)
-    for re-enablement once the `pgenlib` pin is bumped to a GIL-releasing
-    release (>=0.94.x adds `nogil`/`prange`).
+    shard budget `P = 1`): single-reader PGEN conversion is already fast and
+    bound by the executor/writer + reference I/O, not pgenlib decode, so
+    sub-contig sharding measures *slower* (concurrent readers add coordination
+    and, on 0.91.x, GIL-serialize the decode). Bumping to a GIL-releasing
+    pgenlib (>=0.94.x, internal `prange`) does not help -- decode isn't the
+    bottleneck. See memory `pgenlib-holds-gil-sharded-reads` and the decision
+    record `docs/roadmap/svar2-conversion-decision-2026-07-15.md`. The Rust
+    sharding machinery is retained (correct + tested via the `pgen_shard` unit
+    tests) for re-enablement only if the bottleneck ever shifts onto decode.
 
     So with sharding off, `threads` only scales HTSlib-style decode threads for
     the single PGEN reader; it must never change a single output byte. This

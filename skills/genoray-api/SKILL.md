@@ -342,14 +342,17 @@ Signature: `from_pgen(out, source, reference=None, *, no_reference=False, skip_o
   converted — no subsetting). `reference`/`no_reference`, `skip_out_of_scope`,
   `overwrite`, `long_allele_capacity`, and `signatures` all mean the same as
   `from_vcf` (above), and return the same `int` (dropped out-of-scope ALTs).
-- `threads=None` (or any value) scales HTSlib-style decode threads for a
-  **single** PGEN reader per contig; unlike `from_vcf`, PGEN sub-contig
-  **sharding is disabled** and `threads` never changes a single output byte.
-  Reason: `pgenlib`'s genotype decode holds the CPython GIL (0.91.x has no
-  `nogil`/`prange`), so concurrent shard readers serialize on the GIL and
-  sharding is net *slower* than one reader. The sharding machinery exists and
-  is byte-identical (validated to 1M variants), gated off pending a `pgenlib`
-  pin bump to a GIL-releasing build (>=0.94.x).
+- Unlike `from_vcf`, PGEN sub-contig **sharding is disabled** (single reader
+  per contig) and `threads` never changes a single output byte. Reason
+  (measured, chr21c ~1M variants x 3202 samples): single-reader conversion is
+  already fast (~33s) and bound by the shared executor/writer + reference I/O,
+  not by pgenlib decode -- so sharding cannot beat that floor and measured
+  as *slower* (44.9s at threads=24 vs 32.6s serial). Bumping `pgenlib` to a
+  GIL-releasing build (>=0.94.x, which parallelizes decode via `prange`) does
+  not help either: the conversion is flat at ~33s across `OMP_NUM_THREADS`
+  1..32, so decode parallelism buys nothing. The sharding machinery exists and
+  is byte-identical (validated to 1M variants) for re-enablement only if a
+  future change shifts the bottleneck onto decode.
 - **Diploid only** — no `ploidy=` kwarg (`from_vcf`'s default `ploidy=2` is
   implicit and fixed here).
 - `chunk_size=None` — unlike `from_vcf`'s fixed `25_000` default, `None` here
