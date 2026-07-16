@@ -597,3 +597,41 @@ def test_from_vcf_list_check_ref_exclude_continues(tmp_path: Path):
     sv = SparseVar2(out)
     counts = sv.region_counts("chr1", [(0, 40)])
     assert int(counts.sum()) == 1  # only a's clean pos-3 record survives
+
+
+def test_from_vcf_list_auto_chunk_size(tmp_path, monkeypatch):
+    """chunk_size=None (default) wires in the budget-derived _auto_chunk_size;
+    an explicit int passes through unchanged (back-compat).
+
+    Note: _auto_chunk_size(2, 2) == 25_000 == the old fixed default, so only a
+    sentinel return value distinguishes "wired the budget path" from "kept the
+    old constant". We patch _auto_chunk_size to a sentinel and assert the
+    pipeline receives it.
+    """
+    import genoray._svar2 as sv2
+
+    seen = {}
+    real_pipeline = sv2._core.run_vcf_list_conversion_pipeline
+
+    def spy(paths, ref, contigs, out, samples, chunk_size, *rest):
+        seen["chunk_size"] = chunk_size
+        return real_pipeline(paths, ref, contigs, out, samples, chunk_size, *rest)
+
+    monkeypatch.setattr(sv2._core, "run_vcf_list_conversion_pipeline", spy)
+    monkeypatch.setattr(sv2, "_auto_chunk_size", lambda n_samples, ploidy=2: 7777)
+
+    a = _ss(tmp_path, "a", "S0", "chr1\t5\t.\tA\tC\t.\tPASS\t.\tGT\t1/1\n")
+    b = _ss(tmp_path, "b", "S1", "chr1\t5\t.\tA\tC\t.\tPASS\t.\tGT\t1/1\n")
+
+    # default: chunk_size omitted -> budget-derived path used (not the old 25_000)
+    SparseVar2.from_vcf_list(
+        tmp_path / "out", [a, b], no_reference=True, overwrite=True
+    )
+    assert seen["chunk_size"] == 7777
+
+    # explicit override still passes through verbatim
+    seen.clear()
+    SparseVar2.from_vcf_list(
+        tmp_path / "out2", [a, b], no_reference=True, overwrite=True, chunk_size=321
+    )
+    assert seen["chunk_size"] == 321

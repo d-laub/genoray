@@ -371,7 +371,7 @@ dropped = SparseVar2.from_vcf_list("out.svar2", "vcfs/", "ref.fa")
 dropped = SparseVar2.from_vcf_list("out.svar2", "manifest.txt", "ref.fa")
 ```
 
-Signature: `from_vcf_list(out, sources, reference=None, *, no_reference=False, skip_out_of_scope=False, ploidy=2, chunk_size=25_000, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False, info_fields=None, format_fields=None, check_ref="e") -> int`
+Signature: `from_vcf_list(out, sources, reference=None, *, no_reference=False, skip_out_of_scope=False, ploidy=2, chunk_size=None, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False, info_fields=None, format_fields=None, check_ref="e") -> int`
 
 Builds **one** SVAR2 store from **N single-sample** VCFs/BCFs with different
 site lists, via a native k-way merge — no `bcftools merge`, no intermediate
@@ -447,7 +447,12 @@ multi-sample VCF.
     gets its own file's value; a sample that doesn't carry the atom at all
     gets the field's default (reserved sentinel/NaN, or an explicit
     `default=`).
-- `ploidy`, `skip_out_of_scope`, `chunk_size`, `threads`, `overwrite`,
+- `chunk_size=None` — unlike `from_vcf`'s fixed `25_000` default, `None` here
+  derives a budget-based chunk size from the cohort size (`_auto_chunk_size`),
+  so one packed dense chunk stays ~256 MiB regardless of how many files are
+  merged (a fixed constant makes the dense working set grow linearly in the
+  number of inputs — issue #120). Pass an int to override with a fixed count.
+- `ploidy`, `skip_out_of_scope`, `threads`, `overwrite`,
   `long_allele_capacity`, `signatures`, `check_ref` all mean the same as
   `from_vcf`, and the return value is the same `int` (dropped out-of-scope
   ALTs). `check_ref` is applied per input file during the merge (ignored

@@ -709,7 +709,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         no_reference: bool = False,
         skip_out_of_scope: bool = False,
         ploidy: int = 2,
-        chunk_size: int = 25_000,
+        chunk_size: int | None = None,
         threads: int | None = None,
         overwrite: bool = False,
         long_allele_capacity: int = 8 * 1024 * 1024,
@@ -803,6 +803,13 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         the offending record (including a REF that runs past the contig end)
         and continues, logging a per-contig count. Comparison is
         case-insensitive, so soft-masked (lowercase) reference bases match.
+
+        chunk_size: variants per conversion chunk. When omitted (`None`,
+        default), a memory-budget-derived value (`_auto_chunk_size`) is used so
+        one packed dense chunk stays ~`_DENSE_CHUNK_TARGET_BYTES` regardless of
+        cohort size — otherwise a fixed count makes the dense working set grow
+        linearly in the number of input files (issue #120). Pass an int to
+        override with a fixed count.
         """
         from cyvcf2 import VCF as _CyVCF
 
@@ -859,6 +866,11 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         format_ = [t for t in flds if t[1] == "format"]
 
         _validate_check_ref(check_ref)
+        if chunk_size is None:
+            # Budget-derive so a packed dense chunk stays ~_DENSE_CHUNK_TARGET_BYTES
+            # regardless of cohort size -- a fixed 25k chunk's dense RAM grows linearly
+            # in the number of input files (issue #120).
+            chunk_size = _auto_chunk_size(len(samples), ploidy)
         return _core.run_vcf_list_conversion_pipeline(
             [str(p) for p in paths],
             None if no_reference else str(reference),
