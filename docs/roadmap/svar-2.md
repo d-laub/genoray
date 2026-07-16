@@ -94,6 +94,12 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
   REF/FASTA disagreement; the reference FASTA threads through `process_chromosome` and the
   PyO3 entry point as a required argument; and `vcf_reader::next_atom`'s emit bound is
   widened by `L_MAX` to keep emission position-sorted.
+  A native region/sub-contig conversion benchmark harness lives at
+  `scripts/svar2_region_parallel_bench.py`. It can run against Carter-scale VCF/BCF
+  inputs from `data/README.md` or generate a deterministic wide-sample synthetic VCF,
+  then sweeps thread counts and chunk sizes in separate worker processes so per-row
+  peak RSS remains meaningful. The harness records end-to-end timing today and is
+  ready to attach native phase timings once structured conversion progress lands.
 - [x] **M3. Per-contig split + sidecar positions + format finalization.** Partition the
   SVAR2 directory by contig; keep positions as sidecar arrays; finalize the on-disk
   format. See [`architecture.md`](architecture.md#on-disk-layout).
@@ -374,6 +380,36 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
   dispatch, proptest), `src/orchestrator.rs` + `src/lib.rs` (pool built and threaded
   through). No public API change. Rust suite + 525 pytest green; both oracle hashes
   byte-identical.
+
+- [x] **M15. Generalized intra-contig parallel conversion (VCF + PGEN).**
+  Builds on M14: instead of only parallelizing presence-packing, shard the
+  contig itself across a work-stealing pool of reader/executor pipelines so a
+  single-contig conversion uses the full `threads` budget. Backend-agnostic
+  shard planner + work-stealing collector (reorder buffer, deterministic
+  merge), a PGEN adapter (variant-index sharding), and a benchmarking +
+  profiling harness with a byte-identical gate deciding between a shared-executor
+  scheme (Approach A) and fully independent per-shard sub-pipelines (Approach B).
+  See the design spec
+  [`../superpowers/specs/2026-07-15-svar2-parallel-conversion-design.md`](../superpowers/specs/2026-07-15-svar2-parallel-conversion-design.md)
+  and plan
+  [`../superpowers/plans/2026-07-15-svar2-parallel-conversion.md`](../superpowers/plans/2026-07-15-svar2-parallel-conversion.md).
+  *Done:* Approach A (shared executor, work-stealing shards, over-decomposition
+  for VCF) shipped for both `from_vcf` and `from_pgen`; Approach B was gated on
+  the shared executor exceeding 25% of wall time at 32 threads and did **not**
+  fire (the conversion is reader/htslib-input-bound, not executor-bound — see
+  [`svar2-conversion-decision-2026-07-15.md`](svar2-conversion-decision-2026-07-15.md)),
+  so Approach B was not built. Public API is unchanged — sharding is entirely
+  internal to the existing `threads=` budget. Byte-identical output vs. serial
+  conversion is gated by a store-hash oracle at every thread count for both
+  backends. **VCF** scales ~3.9× at 32 cores (chr21, 1176s → 300s); sub-contig
+  sharding only engages once the thread budget clears HTSlib decode-thread
+  allocation (~15 cores). **PGEN** sharding is byte-identical but not faster —
+  `pgenlib`'s genotype decode holds the CPython GIL, so shard readers serialize
+  and sharding is net slightly slower than serial (memory
+  `pgenlib-holds-gil-sharded-reads`); PGEN is intentionally not over-decomposed.
+  `from_vcf_list` does not shard within a contig (it already opens one fd per
+  input file per contig). Full scaling results in
+  [`svar2-conversion-baseline-2026-07-15.md`](svar2-conversion-baseline-2026-07-15.md).
 
 ### Longer term
 

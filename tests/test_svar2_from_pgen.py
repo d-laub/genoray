@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import subprocess
 from pathlib import Path
 
@@ -272,6 +273,52 @@ def test_from_pgen_monomorphic_site_matches_from_vcf(sources_mono, tmp_path):
     ragged_vcf = a.decode("chr1", regions)
     ragged_pgen = b.decode("chr1", regions)
     _assert_ragged_equal(ragged_pgen, ragged_vcf)
+
+
+def _hash_store(store: Path) -> bytes:
+    """SHA256 over every file's (relative path, bytes) under `store`, sorted --
+    order-independent and content-exact, so two stores hash equal iff their
+    on-disk layout and every byte match exactly."""
+    h = hashlib.sha256()
+    for p in sorted(store.rglob("*")):
+        if p.is_file():
+            h.update(p.relative_to(store).as_posix().encode())
+            h.update(p.read_bytes())
+    return h.digest()
+
+
+def test_pgen_thread_count_independent(sources, tmp_path):
+    """PGEN conversion output must be byte-identical regardless of `threads`.
+
+    PGEN sub-contig sharding is currently **disabled** (`from_pgen` pins the
+    shard budget `P = 1`): single-reader PGEN conversion is already fast and
+    bound by the executor/writer + reference I/O, not pgenlib decode, so
+    sub-contig sharding measures *slower* (concurrent readers add coordination
+    and, on 0.91.x, GIL-serialize the decode). Bumping to a GIL-releasing
+    pgenlib (>=0.94.x, internal `prange`) does not help -- decode isn't the
+    bottleneck. See memory `pgenlib-holds-gil-sharded-reads` and the decision
+    record `docs/roadmap/svar2-conversion-decision-2026-07-15.md`. The Rust
+    sharding machinery is retained (correct + tested via the `pgen_shard` unit
+    tests) for re-enablement only if the bottleneck ever shifts onto decode.
+
+    So with sharding off, `threads` only scales HTSlib-style decode threads for
+    the single PGEN reader; it must never change a single output byte. This
+    test locks that invariant: `threads=1` (serial) vs `threads=24` (max
+    decode threads) must produce byte-identical stores. `sources` has 4
+    variants (chr1, positions 2/6/11/19 0-based, including a co-located
+    multiallelic pair), exercising the single-reader position-ownership path.
+
+    When PGEN sharding is re-enabled (P>1), this test doubles as the
+    byte-identity gate for the sharded path.
+    """
+    ref, _, pgen = sources
+    serial_out = tmp_path / "serial.svar2"
+    parallel_out = tmp_path / "parallel.svar2"
+
+    SparseVar2.from_pgen(serial_out, pgen, ref, threads=1)
+    SparseVar2.from_pgen(parallel_out, pgen, ref, threads=24)
+
+    assert _hash_store(serial_out) == _hash_store(parallel_out)
 
 
 def test_from_pgen_missing_pvar_is_a_clear_error(sources, tmp_path):

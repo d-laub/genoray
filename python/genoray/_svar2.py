@@ -719,6 +719,23 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             ]
         else:
             contigs = [c for c in natsorted(v.seqnames) if next(v(c), None) is not None]
+            # Whole-contig conversion: fill explicit [0, len) ranges so the Rust
+            # VCF path can sub-contig shard -- its shard planner needs concrete
+            # intervals, and an empty region list disables sharding. `regions`
+            # was None here, so `regions_overlap` stays the default "pos", which
+            # is exactly what the sharded path requires for byte-identity. A
+            # contig with variants but no reported length simply gets no range
+            # (Rust then reads it whole via the single reader).
+            contig_lengths = {
+                chrom: int(length)
+                for chrom, length in zip(v.seqnames, getattr(v, "seqlens", []) or [])
+                if length is not None and int(length) > 0
+            }
+            region_ranges = [
+                (chrom, 0, contig_lengths[chrom])
+                for chrom in contigs
+                if chrom in contig_lengths
+            ]
         if not contigs:
             raise ValueError(f"No variants found in {source}.")
 
@@ -904,21 +921,54 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
 
         import pgenlib
 
-        # One reader per contig: readers seek independently, so concurrent contigs
-        # must not share one. `allele_idx_offsets` is required (not just used) once
-        # any variant in the file is multiallelic -- it is a file-wide array, so
-        # every contig's reader is constructed with the same one. Readers are
-        # ALWAYS constructed with the full `.psam` sample count -- that's the
-        # file's raw/on-disk cohort size, independent of any `samples=` subset.
+        # A pool of P readers per contig: readers seek independently, so
+        # concurrent shards (and concurrent contigs) must not share one. The
+        # Rust side caps the actual shard count at
+        # `min(processing_threads, len(pool))`, so `len(pool)` also bounds
+        # intra-contig sharding. `allele_idx_offsets` is required (not just
+        # used) once any variant in the file is multiallelic -- it is a
+        # file-wide array, so every reader is constructed with the same one.
+        # Readers are ALWAYS constructed with the full `.psam` sample count
+        # (`n_samples`) -- the file's raw on-disk cohort size, independent of any
+        # `samples=` subset, which is applied afterwards via change_sample_subset.
+        #
+        # P == 1 => PGEN sub-contig sharding is DISABLED (single reader per
+        # contig, byte-identical to the serial path). Rationale, from a
+        # reproducible sweep on carter-cn-02 over chr21c (~1M variants x 3202
+        # samples): single-reader conversion is already fast (~33s) and is
+        # bound by the shared executor/writer + reference I/O, NOT by pgenlib
+        # decode. So sub-contig sharding cannot beat that floor -- measured
+        # threads=24 sharding is NET SLOWER (44.9s vs 32.6s, 0.73x) because
+        # concurrent readers add coordination overhead and, on `pgenlib`<0.92,
+        # serialize on the CPython GIL (verified: 0 `nogil`/`prange` in
+        # 0.91.0's .pyx). Nor does bumping to a GIL-releasing pgenlib help:
+        # 0.94.1 parallelizes `read_alleles_range` decode via `prange`
+        # (nogil=True), yet the same conversion is unchanged at ~33s across
+        # OMP_NUM_THREADS 1..32 -- decode isn't the bottleneck, so the internal
+        # parallelism buys nothing here. (An earlier 273s/340s serial/sharded
+        # pair was a cluster-contention artifact and does not reproduce; the
+        # slower-when-sharded conclusion holds at both scales.) The intra-contig
+        # sharding machinery (plan_pgen_units, per-ordinal readers) is retained
+        # and validated byte-identical at 1M-variant scale for re-enablement
+        # only if a future reader/executor change shifts the bottleneck onto
+        # decode. See docs/roadmap/svar2-conversion-decision-2026-07-15.md and
+        # memory `pgenlib-holds-gil-sharded-reads`.
+        P = 1
         readers = [
-            pgenlib.PgenReader(
-                bytes(source), n_samples, allele_idx_offsets=allele_idx_offsets
-            )
+            [
+                pgenlib.PgenReader(
+                    bytes(source), n_samples, allele_idx_offsets=allele_idx_offsets
+                )
+                for _ in range(P)
+            ]
             for _ in contigs
         ]
         if subset_idx is not None:
-            for r in readers:
-                r.change_sample_subset(subset_idx)
+            # `readers` is nested (a per-shard pool per contig, P readers each),
+            # so subset every reader in every pool.
+            for pool in readers:
+                for r in pool:
+                    r.change_sample_subset(subset_idx)
 
         _validate_check_ref(check_ref)
         return _core.run_pgen_conversion_pipeline(

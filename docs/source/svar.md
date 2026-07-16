@@ -69,6 +69,41 @@ truly overlaps the region; individual non-overlapping alleles are not
 dropped. `variant` currently requires at most one region per contig; multiple
 regions per contig raise — use `pos`/`record`, or convert separately.
 
+### Parallel conversion
+
+Single-file `SparseVar2.from_vcf` shards **within a contig**, driven by the same
+`threads=` budget shown above — no new argument. Sub-contig sharding only kicks
+in for the default whole-contig (`regions_overlap="pos"`) path: the thread budget
+first spends added cores on HTSlib decode threads for the single reader, so the
+sub-contig shard budget stays at 1 (an un-sharded reader) until the core count
+clears that stage (~15 cores on the benchmarked hardware). Output is
+**byte-identical** to serial conversion at every thread count — sharding is gated
+by a store-hash oracle and does not reintroduce missingness (a `./.` haplotype
+and a hom-ref haplotype remain indistinguishable in SVAR2 either way).
+
+Sub-contig sharding is restricted to `regions_overlap="pos"` (which the
+whole-contig default uses). `"record"` and `"variant"` conversions run on a
+single reader per contig, because their kept-record sets do not coincide with
+the POS-ownership partition sharding dedups by.
+
+The two backends behave differently:
+
+- **VCF** scales well: ~3.9× wall-clock speedup at 32 cores on a chr21 germline
+  BCF (1176s → 300s), byte-identical. The VCF path over-decomposes shards
+  (factor 4) for work-stealing load balance.
+- **PGEN** sub-contig sharding is **disabled** (`from_pgen` pins a single reader
+  per contig). It is byte-identical but not faster: `pgenlib`'s genotype decode
+  holds the CPython GIL, so shard readers serialize on it, and a reproducible
+  chr21c benchmark measured sharding as net slower than serial (44.9s vs 32.6s)
+  from added coordination overhead. The machinery is retained for re-enablement
+  if a future reader/executor change shifts the bottleneck onto decode.
+
+`SparseVar2.from_vcf_list` (merging N single-sample VCFs) does not shard within
+a contig — it already opens one file descriptor per input file per contig.
+
+See `docs/roadmap/svar2-conversion-baseline-2026-07-15.md` for the full scaling
+results.
+
 ## Haploid (ploidy=1) write option
 
 For unphased somatic cohorts where phasing information is unavailable or irrelevant,

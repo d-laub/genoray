@@ -55,6 +55,8 @@ pub mod orchestrator;
 #[cfg(feature = "conversion")]
 pub mod pgen_reader;
 #[cfg(feature = "conversion")]
+pub mod pgen_shard;
+#[cfg(feature = "conversion")]
 pub mod pvar;
 #[cfg(feature = "conversion")]
 pub mod svar1_reader;
@@ -74,6 +76,10 @@ pub mod query;
 pub mod record_source;
 pub mod rvk;
 pub mod search;
+#[cfg(feature = "conversion")]
+pub mod shard;
+#[cfg(feature = "conversion")]
+pub mod shard_exec;
 pub mod spine;
 // NOTE: `streams` (StreamTag/StreamMap/REGISTRY) is *not* conversion-only despite
 // being in the original gate list: query-core `rvk.rs` and `types.rs` depend on it
@@ -152,12 +158,13 @@ fn run_conversion_pipeline(
     let fields =
         crate::field::parse_manifest(raw).map_err(|e| PyValueError::new_err(e.to_string()))?;
 
-    let check_ref: crate::normalize::CheckRef = check_ref.parse().map_err(PyValueError::new_err)?;
     let mut ranges_by_chrom: std::collections::HashMap<String, Vec<(u32, u32)>> =
         std::collections::HashMap::new();
     for (chrom, start, end) in region_ranges {
         ranges_by_chrom.entry(chrom).or_default().push((start, end));
     }
+
+    let check_ref: crate::normalize::CheckRef = check_ref.parse().map_err(PyValueError::new_err)?;
 
     let results: Vec<Result<u64, crate::error::ConversionError>> = py.detach(|| {
         // Step 1 -> HW discovery/override and budgeting
@@ -186,11 +193,8 @@ fn run_conversion_pipeline(
         println!("Using: {} cores.", available_cores);
         println!(
             "Pipeline Config: {} concurrent chromosomes | {} HTSlib decompression threads each \
-             ({} total active, {} reserved for OS/idle).",
-            concurrent_chroms,
-            htslib_threads,
-            total_active,
-            available_cores.saturating_sub(total_active),
+             ({} pipeline/BGZF threads, {} reader-side processing/shard threads).",
+            concurrent_chroms, htslib_threads, total_active, processing_threads,
         );
 
         // Step 2 -> Rayon Pool
@@ -269,13 +273,15 @@ fn run_conversion_pipeline(
 /// Convert a PLINK2 PGEN to an SVAR2 store.
 ///
 /// `contig_ranges[i]` is the half-open `[var_start, var_end)` variant index range
-/// of `chroms[i]` within the `.pvar`. `pgen_readers[i]` is a distinct
-/// `pgenlib.PgenReader` for `chroms[i]` -- readers seek independently, so contigs
-/// must not share one.
+/// of `chroms[i]` within the `.pvar`. `readers[i]` is a pool of distinct
+/// `pgenlib.PgenReader`s for `chroms[i]` -- one per potential shard -- since
+/// readers seek independently and must never be shared, whether across contigs
+/// or across shards of the same contig.
 #[cfg(feature = "conversion")]
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
 #[pyfunction]
-#[pyo3(signature = (pgen_path, pvar_path, reference_path, chroms, contig_ranges, output_dir, samples, chunk_size, max_threads, long_allele_capacity, skip_out_of_scope, signatures, pgen_readers, check_ref, region_ranges, regions_overlap, sample_perm))]
+#[pyo3(signature = (pgen_path, pvar_path, reference_path, chroms, contig_ranges, output_dir, samples, chunk_size, max_threads, long_allele_capacity, skip_out_of_scope, signatures, readers, check_ref, region_ranges, regions_overlap, sample_perm))]
 fn run_pgen_conversion_pipeline(
     py: Python,
     pgen_path: String,
@@ -290,15 +296,15 @@ fn run_pgen_conversion_pipeline(
     long_allele_capacity: usize,
     skip_out_of_scope: bool,
     signatures: bool,
-    pgen_readers: Vec<Py<PyAny>>,
+    readers: Vec<Vec<Py<PyAny>>>,
     check_ref: String,
     region_ranges: Vec<(String, u32, u32)>,
     regions_overlap: String,
     sample_perm: Vec<usize>,
 ) -> PyResult<usize> {
-    if chroms.len() != contig_ranges.len() || chroms.len() != pgen_readers.len() {
+    if chroms.len() != contig_ranges.len() || chroms.len() != readers.len() {
         return Err(PyValueError::new_err(
-            "chroms, contig_ranges, and pgen_readers must be the same length",
+            "chroms, contig_ranges, and readers must be the same length",
         ));
     }
     let check_ref: crate::normalize::CheckRef = check_ref.parse().map_err(PyValueError::new_err)?;
@@ -318,13 +324,13 @@ fn run_pgen_conversion_pipeline(
         ranges_by_chrom.entry(chrom).or_default().push((start, end));
     }
 
-    // Pair each contig with its own reader BEFORE detaching, so the Py handles move
-    // into the worker threads (Py<PyAny> is Send; PyAny is not).
-    let jobs: Vec<(String, (usize, usize), Py<PyAny>)> = chroms
+    // Pair each contig with its own reader pool BEFORE detaching, so the Py
+    // handles move into the worker threads (Py<PyAny> is Send; PyAny is not).
+    let jobs: Vec<(String, (usize, usize), Vec<Py<PyAny>>)> = chroms
         .iter()
         .cloned()
         .zip(contig_ranges.iter().copied())
-        .zip(pgen_readers)
+        .zip(readers)
         .map(|((c, r), rd)| (c, r, rd))
         .collect();
 
@@ -349,14 +355,14 @@ fn run_pgen_conversion_pipeline(
 
         pool.install(|| {
             jobs.into_par_iter()
-                .map(|(chrom, (lo, hi), reader)| {
+                .map(|(chrom, (lo, hi), readers)| {
                     orchestrator::process_chromosome(
                         orchestrator::SourceSpec::Pgen {
                             pgen_path: pgen_path.clone(),
                             pvar_path: pvar_path.clone(),
                             var_start: lo,
                             var_end: hi,
-                            reader,
+                            readers,
                             regions: ranges_by_chrom.get(&chrom).cloned().unwrap_or_default(),
                             overlap: overlap_mode,
                             sample_perm: sample_perm.clone(),

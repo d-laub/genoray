@@ -9,6 +9,7 @@ import pytest
 from genoray import SparseVar2
 
 _REF = "ACAGTACATGGGTACTAGCTAGGCTAACCGGTTAACCGGT"
+_BOUNDARY_REF = "CAAAATCAGAGT"
 
 
 def _write_ref(d: Path) -> Path:
@@ -39,6 +40,31 @@ def _write_vcf(d: Path, *, symbolic: bool, indexed: bool) -> Path:
         subprocess.run(["bgzip", "-c", str(plain)], check=True, stdout=fh)
     if indexed:
         subprocess.run(["bcftools", "index", str(gz)], check=True)
+    return gz
+
+
+def _write_boundary_ref(d: Path) -> Path:
+    ref = d / "boundary.fa"
+    ref.write_text(f">chr1\n{_BOUNDARY_REF}\n")
+    subprocess.run(["samtools", "faidx", str(ref)], check=True)
+    return ref
+
+
+def _write_boundary_vcf(d: Path) -> Path:
+    body = (
+        "##fileformat=VCFv4.2\n"
+        f"##contig=<ID=chr1,length={len(_BOUNDARY_REF)}>\n"
+        '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n'
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS0\n"
+        "chr1\t8\t.\tA\tT\t.\t.\t.\tGT\t1|0\n"
+        "chr1\t9\t.\tGAG\tG\t.\t.\t.\tGT\t1|0\n"
+    )
+    plain = d / "boundary.vcf"
+    plain.write_text(body)
+    gz = d / "boundary.vcf.gz"
+    with open(gz, "wb") as fh:
+        subprocess.run(["bgzip", "-c", str(plain)], check=True, stdout=fh)
+    subprocess.run(["bcftools", "index", str(gz)], check=True)
     return gz
 
 
@@ -280,6 +306,71 @@ def test_from_vcf_explicit_none_matches_default(tmp_path: Path):
     )
 
 
+def test_from_vcf_parallel_normalization_matches_single_thread(tmp_path: Path):
+    ref = _write_ref(tmp_path)
+    vcf = _write_vcf(tmp_path, symbolic=False, indexed=True)
+
+    seq_out = tmp_path / "seq"
+    par_out = tmp_path / "par"
+    SparseVar2.from_vcf(seq_out, vcf, ref, threads=1)
+    SparseVar2.from_vcf(par_out, vcf, ref, threads=16)
+
+    seq = SparseVar2(seq_out)
+    par = SparseVar2(par_out)
+    assert par.available_samples == seq.available_samples
+    assert par.contigs == seq.contigs
+    np.testing.assert_array_equal(
+        par.region_counts("chr1", [(0, 40)]),
+        seq.region_counts("chr1", [(0, 40)]),
+    )
+
+    seq_dec = seq.decode("chr1", [(0, 40)])
+    par_dec = par.decode("chr1", [(0, 40)])
+    for field in ("pos", "ilen", "allele"):
+        np.testing.assert_array_equal(
+            np.asarray(par_dec[field].data),
+            np.asarray(seq_dec[field].data),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(par_dec[field].lengths),
+            np.asarray(seq_dec[field].lengths),
+        )
+
+
+def test_from_vcf_sharded_normalization_owns_left_shifted_boundary_atom(
+    tmp_path: Path,
+):
+    ref = _write_boundary_ref(tmp_path)
+    vcf = _write_boundary_vcf(tmp_path)
+
+    seq_out = tmp_path / "seq_boundary"
+    shard_out = tmp_path / "shard_boundary"
+    SparseVar2.from_vcf(seq_out, vcf, ref, threads=1, chunk_size=3)
+    SparseVar2.from_vcf(shard_out, vcf, ref, threads=16, chunk_size=3)
+
+    seq = SparseVar2(seq_out)
+    shard = SparseVar2(shard_out)
+    assert shard.available_samples == seq.available_samples
+    assert shard.contigs == seq.contigs
+    np.testing.assert_array_equal(
+        shard.region_counts("chr1", [(0, len(_BOUNDARY_REF))]),
+        seq.region_counts("chr1", [(0, len(_BOUNDARY_REF))]),
+    )
+
+    seq_dec = seq.decode("chr1", [(0, len(_BOUNDARY_REF))])
+    shard_dec = shard.decode("chr1", [(0, len(_BOUNDARY_REF))])
+    for field in ("pos", "ilen", "allele"):
+        np.testing.assert_array_equal(
+            np.asarray(shard_dec[field].data),
+            np.asarray(seq_dec[field].data),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(shard_dec[field].lengths),
+            np.asarray(seq_dec[field].lengths),
+        )
+    assert sorted(set(np.asarray(shard_dec["pos"].data).tolist())) == [6, 7]
+
+
 def test_from_vcf_requires_reference_or_opt_out(tmp_path: Path):
     vcf = _write_vcf(tmp_path, symbolic=False, indexed=True)
     with pytest.raises(ValueError, match="reference"):
@@ -378,6 +469,33 @@ def test_from_vcf_check_ref_exclude_continues(tmp_path: Path):
     # not a distinct-variant count: pos 3 contributes 1 carrier hap (S0 "1|0"),
     # pos 7 contributes 3 (S0 "0|1", S1 hom-alt "1|1") -> 4 total.
     counts = sv.region_counts("chr1", [(0, 40)])
+    assert int(counts.sum()) == 4
+
+
+def test_from_vcf_sharded_check_ref_exclude_counts_owned_record_once(
+    tmp_path: Path, capfd: pytest.CaptureFixture[str]
+):
+    """check_ref=x must survive sub-contig sharding: the excluded record is
+    dropped (byte-identical to the serial exclude above) AND counted exactly
+    once in the per-contig summary, even though each shard's ``ChunkAssembler``
+    tracks its own ``ref_excluded`` and the padded fetch window means a boundary
+    record can be seen by two shards.
+
+    ``threads=16`` + ``chunk_size=1`` forces the work-stealing sharded path
+    (over-decomposed VCF units) on this tiny input; the count is aggregated
+    across shards by ``shard_exec::run`` -> ``ShardTotals.ref_excluded`` and
+    reported once via ``orchestrator::report_ref_excluded``. Ported from PR #115
+    (which #119 supersedes) to keep its coverage. ``capfd`` (not ``capsys``)
+    because the summary is a Rust ``println!`` on fd 1.
+    """
+    ref = _write_ref(tmp_path)
+    vcf = _write_vcf_bad_ref(tmp_path)
+    out = tmp_path / "sharded_store"
+
+    SparseVar2.from_vcf(out, vcf, ref, check_ref="x", threads=16, chunk_size=1)
+
+    assert "excluded 1 record(s)" in capfd.readouterr().out
+    counts = SparseVar2(out).region_counts("chr1", [(0, 40)])
     assert int(counts.sum()) == 4
 
 

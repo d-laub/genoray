@@ -179,7 +179,16 @@ pub struct VcfRecordSource {
     eof: bool,
 }
 
-fn coalesce_fetch_regions(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VcfShard {
+    pub fetch_start: u32,
+    pub fetch_end: u32,
+    pub own_start: u32,
+    pub own_end: u32,
+    pub ordinal: usize,
+}
+
+pub(crate) fn coalesce_fetch_regions(
     mut regions: Vec<(u32, u32)>,
     chrom: &str,
 ) -> Result<Vec<(u32, u32)>, ConversionError> {
@@ -204,6 +213,36 @@ fn coalesce_fetch_regions(
         merged.push((start, end));
     }
     Ok(merged)
+}
+
+impl From<crate::shard::WorkUnit> for VcfShard {
+    fn from(u: crate::shard::WorkUnit) -> Self {
+        VcfShard {
+            fetch_start: u.fetch_start,
+            fetch_end: u.fetch_end,
+            own_start: u.own_start,
+            own_end: u.own_end,
+            ordinal: u.ordinal,
+        }
+    }
+}
+
+pub(crate) fn plan_vcf_shards(
+    regions: &[(u32, u32)],
+    chrom: &str,
+    max_shards: usize,
+    target_bp: u32,
+) -> Result<Vec<VcfShard>, ConversionError> {
+    let regions = coalesce_fetch_regions(regions.to_vec(), chrom)?;
+    if regions.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(
+        crate::shard::plan_ranges(&regions, max_shards, target_bp, crate::normalize::L_MAX)
+            .into_iter()
+            .map(VcfShard::from)
+            .collect(),
+    )
 }
 
 fn fetch_region(
@@ -466,5 +505,47 @@ impl VcfRecordSource {
             info_raw,
             format_raw,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shard_planner_covers_owned_ranges_with_padded_fetches() {
+        let shards = plan_vcf_shards(&[(0, 12)], "chr1", 3, 3).unwrap();
+        assert_eq!(
+            shards
+                .iter()
+                .map(|s| (s.own_start, s.own_end, s.ordinal))
+                .collect::<Vec<_>>(),
+            vec![(0, 4, 0), (4, 8, 1), (8, 12, 2)]
+        );
+        assert_eq!(shards[0].fetch_start, 0);
+        assert!(shards[0].fetch_end >= shards[1].own_start);
+        assert!(shards[1].fetch_start <= shards[0].own_end);
+        assert!(shards[1].fetch_end >= shards[2].own_start);
+    }
+
+    #[test]
+    fn shard_planner_coalesces_overlapping_regions_before_split() {
+        let shards = plan_vcf_shards(&[(8, 12), (0, 5), (4, 9)], "chr1", 4, 20).unwrap();
+        assert_eq!(shards.len(), 1);
+        assert_eq!((shards[0].own_start, shards[0].own_end), (0, 12));
+    }
+
+    #[test]
+    fn shard_planner_treats_max_shards_as_an_upper_bound() {
+        let shards = plan_vcf_shards(&[(0, 100)], "chr1", 4, 1).unwrap();
+        assert_eq!(shards.len(), 4);
+        assert!(shards.len() <= 4);
+        assert_eq!(
+            shards
+                .iter()
+                .map(|s| (s.own_start, s.own_end))
+                .collect::<Vec<_>>(),
+            vec![(0, 25), (25, 50), (50, 75), (75, 100)]
+        );
     }
 }
