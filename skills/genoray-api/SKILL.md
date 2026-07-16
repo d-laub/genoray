@@ -342,10 +342,14 @@ Signature: `from_pgen(out, source, reference=None, *, no_reference=False, skip_o
   converted — no subsetting). `reference`/`no_reference`, `skip_out_of_scope`,
   `overwrite`, `long_allele_capacity`, and `signatures` all mean the same as
   `from_vcf` (above), and return the same `int` (dropped out-of-scope ALTs).
-- `threads=None` shards within a contig the same way `from_vcf` does, and is
-  equally byte-identical — but sharding does **not** speed up PGEN conversion:
-  `pgenlib`'s genotype decode holds the CPython GIL, so shard readers serialize
-  on it. Sharding is intentionally not over-decomposed for this backend.
+- `threads=None` (or any value) scales HTSlib-style decode threads for a
+  **single** PGEN reader per contig; unlike `from_vcf`, PGEN sub-contig
+  **sharding is disabled** and `threads` never changes a single output byte.
+  Reason: `pgenlib`'s genotype decode holds the CPython GIL (0.91.x has no
+  `nogil`/`prange`), so concurrent shard readers serialize on the GIL and
+  sharding is net *slower* than one reader. The sharding machinery exists and
+  is byte-identical (validated to 1M variants), gated off pending a `pgenlib`
+  pin bump to a GIL-releasing build (>=0.94.x).
 - **Diploid only** — no `ploidy=` kwarg (`from_vcf`'s default `ploidy=2` is
   implicit and fixed here).
 - `chunk_size=None` — unlike `from_vcf`'s fixed `25_000` default, `None` here

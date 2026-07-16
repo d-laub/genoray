@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 from collections.abc import Sequence as AbcSequence
 from collections import Counter
 from os import PathLike
@@ -804,15 +803,27 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         import pgenlib
 
         # A pool of P readers per contig: readers seek independently, so
-        # concurrent shards (and concurrent contigs) must not share one. P
-        # over-provisions to a safe upper bound on how many shards any one
-        # contig could be split into -- the Rust side caps the actual shard
-        # count at `min(processing_threads, len(pool))`, so unused readers in
-        # a contig's pool are simply never touched. `allele_idx_offsets` is
-        # required (not just used) once any variant in the file is
-        # multiallelic -- it is a file-wide array, so every reader is
-        # constructed with the same one.
-        P = max(1, threads if threads else (os.cpu_count() or 1))
+        # concurrent shards (and concurrent contigs) must not share one. The
+        # Rust side caps the actual shard count at
+        # `min(processing_threads, len(pool))`, so `len(pool)` also bounds
+        # intra-contig sharding. `allele_idx_offsets` is required (not just
+        # used) once any variant in the file is multiallelic -- it is a
+        # file-wide array, so every reader is constructed with the same one.
+        #
+        # P == 1 => PGEN sub-contig sharding is DISABLED (single reader per
+        # contig, byte-identical to the serial path). Rationale: `pgenlib`
+        # <0.92 holds the CPython GIL through `read_alleles_range`'s decode
+        # (verified: 0 `nogil`/`prange` in 0.91.0's .pyx; 52 `nogil`/23
+        # `prange` in 0.94.1), so concurrent shard readers cannot overlap --
+        # they serialize on the GIL and sharding is NET SLOWER (chr21: 340s
+        # sharded vs 273s serial). The intra-contig sharding machinery
+        # (plan_pgen_units, per-ordinal readers) is retained and validated
+        # (byte-identical at 1M-variant scale) for re-enablement once the
+        # pgenlib pin is bumped to a GIL-releasing build AND sharding is
+        # re-measured to actually help. See
+        # docs/roadmap/svar2-conversion-decision-2026-07-15.md and memory
+        # `pgenlib-holds-gil-sharded-reads`.
+        P = 1
         readers = [
             [
                 pgenlib.PgenReader(

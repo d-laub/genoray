@@ -286,23 +286,28 @@ def _hash_store(store: Path) -> bytes:
     return h.digest()
 
 
-def test_pgen_sharded_matches_serial(sources, tmp_path):
-    """Sharded PGEN conversion must be byte-identical to the serial path.
+def test_pgen_thread_count_independent(sources, tmp_path):
+    """PGEN conversion output must be byte-identical regardless of `threads`.
 
-    `sources` has only 4 variants (chr1, positions 2/6/11/19 0-based,
-    including a co-located multiallelic pair) -- small, but enough to
-    exercise the position-range ownership mapping across several boundaries.
+    PGEN sub-contig sharding is currently **disabled** (`from_pgen` pins the
+    shard budget `P = 1`): `pgenlib` 0.91.x holds the CPython GIL through its
+    entire allele decode, so concurrent shard readers serialize on the GIL and
+    sharding is net *slower* than a single reader (see memory
+    `pgenlib-holds-gil-sharded-reads` and the decision record
+    `docs/roadmap/svar2-conversion-decision-2026-07-15.md`). The Rust sharding
+    machinery is retained (correct + tested via the `pgen_shard` unit tests)
+    for re-enablement once the `pgenlib` pin is bumped to a GIL-releasing
+    release (>=0.94.x adds `nogil`/`prange`).
 
-    `threads=8` does NOT actually shard this single-contig fixture: the
-    thread-budget planner (`budget::plan_thread_budget`) spends idle cores on
-    HTSlib decode threads first (capped at 8) before anything reaches
-    `processing_threads` (which caps PGEN shard count here), so a single
-    contig needs `usable_cores > 12` before `processing_threads` climbs above
-    1. `threads=24` -> `processing_threads=11` -> shard count is capped by the
-    4 variants themselves, so this run splits into 4 one-variant shards,
-    exercising the position-ownership boundary between every adjacent variant
-    (and `chunk_assembler`'s L_MAX=1000bp fetch padding across all of them,
-    since every variant in this fixture is well within that padding).
+    So with sharding off, `threads` only scales HTSlib-style decode threads for
+    the single PGEN reader; it must never change a single output byte. This
+    test locks that invariant: `threads=1` (serial) vs `threads=24` (max
+    decode threads) must produce byte-identical stores. `sources` has 4
+    variants (chr1, positions 2/6/11/19 0-based, including a co-located
+    multiallelic pair), exercising the single-reader position-ownership path.
+
+    When PGEN sharding is re-enabled (P>1), this test doubles as the
+    byte-identity gate for the sharded path.
     """
     ref, _, pgen = sources
     serial_out = tmp_path / "serial.svar2"
