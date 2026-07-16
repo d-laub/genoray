@@ -69,6 +69,61 @@ pub fn keeps(m: OverlapMode, q_start: u32, q_end: u32, pos: u32) -> bool {
     }
 }
 
+/// Parse the public `regions_overlap` string into an [`OverlapMode`].
+pub fn parse_overlap_mode(s: &str) -> Result<OverlapMode, ConversionError> {
+    match s {
+        "pos" => Ok(OverlapMode::Pos),
+        "record" => Ok(OverlapMode::Record),
+        "variant" => Ok(OverlapMode::Variant),
+        other => Err(ConversionError::Input(format!(
+            "regions_overlap must be 'pos', 'record', or 'variant'; got {other:?}"
+        ))),
+    }
+}
+
+/// True iff ANY allele's anchor-trimmed genomic span overlaps `[q_start, q_end)`.
+/// Anchor-trimming removes the shared prefix/suffix of REF vs each ALT so a
+/// deletion `ACGT>A` is judged on the deleted `CGT` (offset span `[pos+1,pos+4)`),
+/// not the full record span — matching bcftools `--regions-overlap variant`.
+/// An allele that fully trims away (a pure insertion) is a zero-width point at
+/// the insertion offset and overlaps iff `q_start <= point < q_end`.
+pub fn extent_overlaps(
+    pos: u32,
+    _ref_len: u32,
+    alts: &[&[u8]],
+    ref_allele: &[u8],
+    q_start: u32,
+    q_end: u32,
+) -> bool {
+    for alt in alts {
+        // shared prefix
+        let mut p = 0usize;
+        let max_p = ref_allele.len().min(alt.len());
+        while p < max_p && ref_allele[p] == alt[p] {
+            p += 1;
+        }
+        // shared suffix (not crossing the prefix already consumed)
+        let mut s = 0usize;
+        while s < (ref_allele.len() - p).min(alt.len() - p)
+            && ref_allele[ref_allele.len() - 1 - s] == alt[alt.len() - 1 - s]
+        {
+            s += 1;
+        }
+        let v_start = pos + p as u32;
+        let ref_consumed = ref_allele.len().saturating_sub(p + s) as u32;
+        let v_end = v_start + ref_consumed; // may equal v_start for insertions
+        let overlaps = if v_end == v_start {
+            q_start <= v_start && v_start < q_end // zero-width insertion point
+        } else {
+            v_start < q_end && q_start < v_end
+        };
+        if overlaps {
+            return true;
+        }
+    }
+    false
+}
+
 /// Cohort size the store was written with, from the top-level `meta.json`. The
 /// contig's sidecars are indexed by *original* sample column, so `ContigReader`
 /// must be opened with the original cohort size, not the subset's.

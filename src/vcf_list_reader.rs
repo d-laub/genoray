@@ -278,6 +278,8 @@ impl VcfListRecordSource {
         skip_out_of_scope: bool,
         check_ref: crate::normalize::CheckRef,
         fields: &[FieldSpec],
+        regions: Vec<(u32, u32)>,
+        overlap: crate::svar2_view::OverlapMode,
     ) -> Result<Self, ConversionError> {
         if vcf_paths.len() != samples.len() {
             return Err(ConversionError::Input(format!(
@@ -290,8 +292,16 @@ impl VcfListRecordSource {
         let mut cursors = Vec::with_capacity(vcf_paths.len());
         for (col, (path, &sample)) in vcf_paths.iter().zip(samples.iter()).enumerate() {
             let single_sample = [sample];
-            match VcfRecordSource::new(path, chrom, &single_sample, htslib_threads, ploidy, fields)
-            {
+            match VcfRecordSource::new(
+                path,
+                chrom,
+                &single_sample,
+                htslib_threads,
+                ploidy,
+                fields,
+                regions.clone(),
+                overlap,
+            ) {
                 Ok(vcf) => cursors.push(FileCursor {
                     vcf: Some(vcf),
                     buf: VecDeque::new(),
@@ -696,6 +706,8 @@ mod tests {
             false,
             CheckRef::Error,
             &[],
+            Vec::new(),
+            crate::svar2_view::OverlapMode::Pos,
         )
         .unwrap();
 
@@ -758,6 +770,8 @@ mod tests {
             false,
             CheckRef::Error,
             &[],
+            Vec::new(),
+            crate::svar2_view::OverlapMode::Pos,
         )
         .unwrap();
 
@@ -799,6 +813,8 @@ mod tests {
             false,
             CheckRef::Error,
             &[],
+            Vec::new(),
+            crate::svar2_view::OverlapMode::Pos,
         )
         .unwrap();
 
@@ -846,6 +862,8 @@ mod tests {
             false,
             CheckRef::Error,
             &[],
+            Vec::new(),
+            crate::svar2_view::OverlapMode::Pos,
         )
         .unwrap();
 
@@ -910,6 +928,8 @@ mod tests {
             false,
             CheckRef::Error,
             &[],
+            Vec::new(),
+            crate::svar2_view::OverlapMode::Pos,
         )
         .unwrap();
 
@@ -1021,6 +1041,8 @@ mod tests {
             false,
             CheckRef::Error,
             &[],
+            Vec::new(),
+            crate::svar2_view::OverlapMode::Pos,
         )
         .unwrap();
 
@@ -1204,6 +1226,8 @@ mod tests {
             false,
             CheckRef::Error,
             &fields,
+            Vec::new(),
+            crate::svar2_view::OverlapMode::Pos,
         )
         .unwrap();
 
@@ -1333,6 +1357,8 @@ mod tests {
             false,
             CheckRef::Error,
             &[],
+            Vec::new(),
+            crate::svar2_view::OverlapMode::Pos,
         )
         .unwrap();
 
@@ -1411,6 +1437,8 @@ mod tests {
             false,
             CheckRef::Error,
             &[],
+            Vec::new(),
+            crate::svar2_view::OverlapMode::Pos,
         )
         .unwrap();
 

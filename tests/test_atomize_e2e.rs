@@ -20,8 +20,17 @@ fn drain_reader(
     // Each test builds `bcf_path.with_extension("fa")` from its records *before* calling
     // drain_reader (see the per-test edit below); here we just point the reader at it.
     let fasta_path = bcf_path.with_extension("fa");
-    let source =
-        VcfRecordSource::new(bcf_path.to_str().unwrap(), chrom, samples, 1, ploidy, &[]).unwrap();
+    let source = VcfRecordSource::new(
+        bcf_path.to_str().unwrap(),
+        chrom,
+        samples,
+        1,
+        ploidy,
+        &[],
+        Vec::new(),
+        genoray_core::svar2_view::OverlapMode::Pos,
+    )
+    .unwrap();
     let mut reader = ChunkAssembler::new(
         Box::new(source),
         samples.len(),

@@ -45,6 +45,8 @@ pub enum SourceSpec {
     Vcf {
         vcf_path: String,
         htslib_threads: usize,
+        regions: Vec<(u32, u32)>,
+        overlap: crate::svar2_view::OverlapMode,
     },
     Pgen {
         pgen_path: String,
@@ -54,6 +56,11 @@ pub enum SourceSpec {
         /// A `pgenlib.PgenReader` for THIS contig. Readers seek independently, so
         /// each concurrent contig needs its own -- never share one.
         reader: pyo3::Py<pyo3::PyAny>,
+        regions: Vec<(u32, u32)>,
+        overlap: crate::svar2_view::OverlapMode,
+        /// Same permutation for every contig -- one cohort-wide sample
+        /// selection, not per-contig. See `PgenRecordSource::sample_perm`.
+        sample_perm: Vec<usize>,
     },
     /// `SparseVar2.from_vcf_list`: N single-sample VCFs with possibly disjoint
     /// site lists, k-way merged into ONE record stream (`VcfListRecordSource`).
@@ -65,6 +72,8 @@ pub enum SourceSpec {
         /// files are open concurrently per contig, unlike the single-file
         /// `Vcf` variant.
         htslib_threads: usize,
+        regions: Vec<(u32, u32)>,
+        overlap: crate::svar2_view::OverlapMode,
     },
     Svar1 {
         svar1_dir: String,
@@ -77,6 +86,12 @@ pub enum SourceSpec {
         alt_offsets: Vec<i64>,
         format_fields: Vec<crate::field::FieldSpec>,
         format_src_dtypes: Vec<String>,
+        regions: Vec<(u32, u32)>,
+        overlap: crate::svar2_view::OverlapMode,
+        /// Original SVAR1 sample indices, in OUTPUT/caller order -- same
+        /// permutation for every contig, one cohort-wide sample selection, not
+        /// per-contig. See `Svar1RecordSource::new`'s bucket remap.
+        sample_idx: Vec<usize>,
     },
 }
 
@@ -236,6 +251,8 @@ pub fn process_chromosome(
                     SourceSpec::Vcf {
                         vcf_path,
                         htslib_threads,
+                        regions,
+                        overlap,
                     } => Box::new(crate::vcf_reader::VcfRecordSource::new(
                         &vcf_path,
                         &chr,
@@ -243,6 +260,8 @@ pub fn process_chromosome(
                         htslib_threads,
                         ploidy,
                         &fields_owned,
+                        regions,
+                        overlap,
                     )?),
                     SourceSpec::Pgen {
                         pgen_path: _,
@@ -250,6 +269,9 @@ pub fn process_chromosome(
                         var_start,
                         var_end,
                         reader,
+                        regions,
+                        overlap,
+                        sample_perm,
                     } => Box::new(crate::pgen_reader::PgenRecordSource::new(
                         reader,
                         &pvar_path,
@@ -257,10 +279,15 @@ pub fn process_chromosome(
                         var_end,
                         s_refs.len(),
                         chunk_size,
+                        regions,
+                        overlap,
+                        sample_perm,
                     )?),
                     SourceSpec::VcfList {
                         vcf_paths,
                         htslib_threads,
+                        regions,
+                        overlap,
                     } => {
                         let ref_seq_opt: Option<Vec<u8>> = match fasta.as_deref() {
                             Some(f) => Some(crate::vcf_reader::load_contig_seq(f, &chr)?),
@@ -276,6 +303,8 @@ pub fn process_chromosome(
                             skip_out_of_scope,
                             check_ref,
                             &fields_owned,
+                            regions,
+                            overlap,
                         )?;
                         Box::new(VcfListDroppedProxy {
                             inner: vcf_list,
@@ -294,6 +323,9 @@ pub fn process_chromosome(
                         alt_offsets,
                         format_fields,
                         format_src_dtypes,
+                        regions,
+                        overlap,
+                        sample_idx,
                     } => Box::new(crate::svar1_reader::Svar1RecordSource::new(
                         &svar1_dir,
                         contig_start,
@@ -307,6 +339,9 @@ pub fn process_chromosome(
                         alt_offsets,
                         &format_fields,
                         &format_src_dtypes,
+                        regions,
+                        overlap,
+                        sample_idx,
                     )?),
                 };
                 let mut reader = crate::chunk_assembler::ChunkAssembler::new(
@@ -604,6 +639,8 @@ pub fn run_vcf_list(
     signatures: bool,
     info_fields: Vec<(String, String, String, Option<String>, Option<f64>)>,
     format_fields: Vec<(String, String, String, Option<String>, Option<f64>)>,
+    region_ranges: Vec<(String, u32, u32)>,
+    overlap: crate::svar2_view::OverlapMode,
 ) -> Result<u64, ConversionError> {
     // Each open input file uses its own small, fixed HTSlib thread allocation
     // (there are N files open at once per contig, unlike the single-file
@@ -615,6 +652,12 @@ pub fn run_vcf_list(
     let mut raw = info_fields;
     raw.extend(format_fields);
     let fields = crate::field::parse_manifest(raw)?;
+
+    let mut ranges_by_chrom: std::collections::HashMap<String, Vec<(u32, u32)>> =
+        std::collections::HashMap::new();
+    for (chrom, start, end) in region_ranges {
+        ranges_by_chrom.entry(chrom).or_default().push((start, end));
+    }
 
     let available_cores = match max_threads {
         Some(t) if t > 0 => {
@@ -651,6 +694,8 @@ pub fn run_vcf_list(
             SourceSpec::VcfList {
                 vcf_paths: vcf_paths.to_vec(),
                 htslib_threads: VCF_LIST_HTSLIB_THREADS,
+                regions: ranges_by_chrom.get(chrom).cloned().unwrap_or_default(),
+                overlap,
             },
             fasta_ref,
             chrom,

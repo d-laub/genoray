@@ -44,6 +44,8 @@ fn convert(
         genoray_core::orchestrator::SourceSpec::Vcf {
             vcf_path: bcf.to_str().unwrap().to_string(),
             htslib_threads: 1,
+            regions: Vec::new(),
+            overlap: genoray_core::svar2_view::OverlapMode::Pos,
         },
         fasta,
         "chr1",

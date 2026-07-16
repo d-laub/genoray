@@ -1,6 +1,7 @@
 use crate::error::ConversionError;
 use crate::field::{FieldCategory, FieldSpec, HtslibType};
 use crate::record_source::{RawRecord, RecordSource};
+use crate::svar2_view::{self, OverlapMode};
 use rust_htslib::bcf::record::Record;
 use rust_htslib::bcf::{IndexedReader, Read};
 use rust_htslib::errors::Error as HtslibError;
@@ -154,6 +155,21 @@ pub(crate) fn validate_contigs_in_fasta(
 
 pub struct VcfRecordSource {
     inner_reader: IndexedReader,
+    chrom: String,
+    rid: u32,
+    /// The ORIGINAL (unwidened) coalesced query intervals, indexed by
+    /// `current_region`. These are what `active_region()` returns for the
+    /// per-record overlap predicate — NOT the (possibly widened) fetch bounds.
+    regions: Vec<(u32, u32)>,
+    /// Per-region fetch bounds, `query_window(&regions, overlap)` — parallel to
+    /// `regions` (same length, same order), so `fetch_regions[current_region]`
+    /// is the htslib-fetch interval for `regions[current_region]`. `Record` mode
+    /// widens the end by one base here so a variant at `POS == q_end` is
+    /// surfaced by the fetch, then kept by `keeps(Record, ..)` (inclusive upper).
+    fetch_regions: Vec<(u32, u32)>,
+    /// How a record's overlap with `regions[current_region]` is judged.
+    overlap: OverlapMode,
+    current_region: usize,
     num_samples: usize,
     ploidy: usize,
     sample_indices: Vec<usize>,
@@ -163,8 +179,58 @@ pub struct VcfRecordSource {
     eof: bool,
 }
 
+fn coalesce_fetch_regions(
+    mut regions: Vec<(u32, u32)>,
+    chrom: &str,
+) -> Result<Vec<(u32, u32)>, ConversionError> {
+    if regions.is_empty() {
+        return Ok(regions);
+    }
+    regions.sort_unstable_by_key(|&(start, end)| (start, end));
+
+    let mut merged: Vec<(u32, u32)> = Vec::with_capacity(regions.len());
+    for (start, end) in regions {
+        if end <= start {
+            return Err(ConversionError::Input(format!(
+                "Invalid fetch interval for {chrom}: start {start} must be less than end {end}"
+            )));
+        }
+        if let Some(last) = merged.last_mut()
+            && start <= last.1
+        {
+            last.1 = last.1.max(end);
+            continue;
+        }
+        merged.push((start, end));
+    }
+    Ok(merged)
+}
+
+fn fetch_region(
+    reader: &mut IndexedReader,
+    rid: u32,
+    chrom: &str,
+    region: Option<(u32, u32)>,
+) -> Result<(), ConversionError> {
+    let (start, end, label) = match region {
+        Some((start, end)) => (
+            start as u64,
+            Some(end as u64),
+            format!("{chrom}:{start}-{end}"),
+        ),
+        None => (0, None, format!("chromosome '{chrom}'")),
+    };
+    reader
+        .fetch(rid, start, end)
+        .map_err(|e| ConversionError::Io {
+            context: format!("fetching region for {label}"),
+            source: std::io::Error::other(e.to_string()),
+        })
+}
+
 impl VcfRecordSource {
     // opens the file, applies the sample filter at the C-level, and jumps to the chromosome.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         vcf_path: &str,
         chrom: &str,
@@ -172,6 +238,8 @@ impl VcfRecordSource {
         htslib_threads: usize,
         ploidy: usize,
         fields: &[FieldSpec],
+        regions: Vec<(u32, u32)>,
+        overlap: OverlapMode,
     ) -> Result<Self, ConversionError> {
         // A wrong VCF path reaches Rust when the file was removed after Python's
         // upstream indexing/open; surface it as FileNotFoundError, not a ".tbi?" Input.
@@ -204,12 +272,14 @@ impl VcfRecordSource {
                     chrom: chrom.to_string(),
                 })?;
 
-        reader
-            .fetch(rid, 0, None)
-            .map_err(|e| ConversionError::Io {
-                context: format!("fetching region for chromosome '{chrom}'"),
-                source: std::io::Error::other(e.to_string()),
-            })?;
+        // Coalesce the ORIGINAL regions first — this canonical list stays in
+        // `self.regions` and is what the per-record overlap predicate tests.
+        // The fetch bounds are `query_window`-widened per mode (a 1:1 map that
+        // preserves length + order), kept parallel by `current_region`; do NOT
+        // re-coalesce them or the index correspondence breaks.
+        let regions = coalesce_fetch_regions(regions, chrom)?;
+        let fetch_regions = svar2_view::query_window(&regions, overlap);
+        fetch_region(&mut reader, rid, chrom, fetch_regions.first().copied())?;
 
         let sample_indices: Vec<usize> = samples
             .iter()
@@ -235,6 +305,12 @@ impl VcfRecordSource {
 
         Ok(Self {
             inner_reader: reader,
+            chrom: chrom.to_string(),
+            rid,
+            regions,
+            fetch_regions,
+            overlap,
+            current_region: 0,
             num_samples: samples.len(),
             ploidy,
             sample_indices,
@@ -244,6 +320,26 @@ impl VcfRecordSource {
             eof: false,
         })
     }
+
+    fn active_region(&self) -> Option<(u32, u32)> {
+        self.regions.get(self.current_region).copied()
+    }
+
+    fn advance_region(&mut self) -> Result<bool, ConversionError> {
+        if self.regions.is_empty() || self.current_region + 1 >= self.regions.len() {
+            return Ok(false);
+        }
+        self.current_region += 1;
+        // Fetch the WIDENED interval; the per-record predicate still tests the
+        // original `regions[current_region]` returned by `active_region()`.
+        fetch_region(
+            &mut self.inner_reader,
+            self.rid,
+            &self.chrom,
+            self.fetch_regions.get(self.current_region).copied(),
+        )?;
+        Ok(true)
+    }
 }
 
 impl RecordSource for VcfRecordSource {
@@ -251,22 +347,60 @@ impl RecordSource for VcfRecordSource {
         if self.eof {
             return Ok(None);
         }
-        match self.inner_reader.read(&mut self.record) {
-            None => {
-                self.eof = true;
-                return Ok(None);
+        loop {
+            match self.inner_reader.read(&mut self.record) {
+                None => {
+                    if self.advance_region()? {
+                        continue;
+                    }
+                    self.eof = true;
+                    return Ok(None);
+                }
+                Some(Err(e)) => {
+                    return Err(ConversionError::Io {
+                        context: "reading next VCF record".to_string(),
+                        source: std::io::Error::other(e.to_string()),
+                    });
+                }
+                Some(Ok(())) => {}
             }
-            Some(Err(e)) => {
-                return Err(ConversionError::Io {
-                    context: "reading next VCF record".to_string(),
-                    source: std::io::Error::other(e.to_string()),
-                });
+
+            let pos = self.record.pos() as u32;
+            // `active_region()` returns the ORIGINAL (unwidened) interval for
+            // this record's fetch window; the fetch itself used the widened
+            // `fetch_regions[current_region]`. `Variant` is an extent rule
+            // (`extent_overlaps`, the only arm that needs allele bytes); `Pos`/
+            // `Record` are POS rules (`keeps`, `pos` only). Bind `alleles` ONLY
+            // for the Variant arm so the default/full-conversion and Pos/Record
+            // paths pay zero extra allele-decode cost per record.
+            if let Some((q_start, q_end)) = self.active_region() {
+                let kept = match self.overlap {
+                    OverlapMode::Variant => {
+                        let alleles = self.record.alleles();
+                        let ref_allele = alleles[0];
+                        svar2_view::extent_overlaps(
+                            pos,
+                            ref_allele.len() as u32,
+                            &alleles[1..],
+                            ref_allele,
+                            q_start,
+                            q_end,
+                        )
+                    }
+                    m => svar2_view::keeps(m, q_start, q_end, pos),
+                };
+                if !kept {
+                    continue;
+                }
             }
-            Some(Ok(())) => {}
+
+            return self.record_to_raw(pos);
         }
+    }
+}
 
-        let pos = self.record.pos() as u32;
-
+impl VcfRecordSource {
+    fn record_to_raw(&self, pos: u32) -> Result<Option<RawRecord>, ConversionError> {
         let reference: Vec<u8>;
         let alts: Vec<Vec<u8>>;
         {
