@@ -43,36 +43,41 @@ def generate_cohort(
     rng = random.Random(seed)
     n_shared = int(n_variants * shared_frac)
     shared_pos = sorted(rng.sample(range(1, contig_len), n_shared)) if n_shared else []
-    # Pin each shared site's REF/ALT ONCE (from the top-level rng) so every file
-    # that includes it emits an identical variant. genoray's k-way merge joins on
-    # (pos, ilen, alt), so shared sites must match on REF/ALT to actually join --
-    # and in no_reference mode a coincidental (ilen, alt) match with a differing
-    # REF would hard-error the conversion. Randomizing per file would defeat both.
-    shared_variants: dict[int, tuple[str, str]] = {}
-    for pos in shared_pos:
-        ref = rng.choice(_BASES)
-        is_indel = rng.random() < indel_frac
-        shared_variants[pos] = _alt(rng, ref, is_indel)
     shared_set = set(shared_pos)
+
+    # Every position's REF/ALT is a deterministic function of the position alone,
+    # so any two files that emit the same position ALWAYS agree -- whether it's a
+    # shared-pool site or a coincidental private/private collision. This matters at
+    # scale: with many files, private positions collide across files (birthday
+    # paradox in a finite contig), and genoray's no_reference k-way merge
+    # hard-errors on a cross-file REF disagreement. Deriving from the position (not
+    # a per-file rng) mirrors a real cohort called against one reference.
+    variant_cache: dict[int, tuple[str, str]] = {}
+
+    def variant_at(pos: int) -> tuple[str, str]:
+        v = variant_cache.get(pos)
+        if v is None:
+            prng = random.Random((seed * 1_000_003) ^ (pos * 2_654_435_761))
+            ref = prng.choice(_BASES)
+            is_indel = prng.random() < indel_frac
+            v = _alt(prng, ref, is_indel)
+            variant_cache[pos] = v
+        return v
+
     manifest_paths: list[str] = []
     for i in range(n_files):
         frng = random.Random(seed * 100003 + i)
         n_priv = n_variants - n_shared
-        # Draw private positions disjoint from the shared pool so a private site
-        # never clobbers a shared site's pinned REF/ALT and per-file counts stay
-        # exact. Oversample to absorb collisions, then take the first n_priv.
+        # Draw private positions disjoint from the shared pool so per-file counts
+        # stay exact. Oversample to absorb collisions, then take the first n_priv.
         priv_pos: list[int] = []
         if n_priv:
             pool = frng.sample(range(1, contig_len), min(n_priv * 2, contig_len - 1))
             priv_pos = [p for p in pool if p not in shared_set][:n_priv]
-        variants: dict[int, tuple[str, str]] = dict(shared_variants)
-        for pos in priv_pos:
-            ref = frng.choice(_BASES)
-            is_indel = frng.random() < indel_frac
-            variants[pos] = _alt(frng, ref, is_indel)
+        positions = sorted(shared_set | set(priv_pos))
         lines = []
-        for pos in sorted(variants):
-            r, a = variants[pos]
+        for pos in positions:
+            r, a = variant_at(pos)
             lines.append(f"{contig}\t{pos}\t.\t{r}\t{a}\t.\tPASS\t.\tGT\t1/1\n")
         sample = f"S{i:05d}"
         plain = out_dir / f"sample_{i:05d}.vcf"

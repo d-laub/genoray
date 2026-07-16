@@ -56,3 +56,38 @@ def test_generate_cohort_shape(tmp_path: Path):
     assert shared_positions  # at least one POS appears in >= 2 files
     for pos in shared_positions:
         assert len(variants_by_pos[pos]) == 1  # identical REF/ALT across files
+
+
+def test_generate_cohort_no_cross_file_ref_disagreement(tmp_path: Path):
+    """At scale, private positions collide ACROSS files (birthday paradox in a
+    finite contig). Every position that ends up in >= 2 files -- shared-pool OR a
+    coincidental private/private collision -- must carry an identical REF/ALT, or
+    from_vcf_list's no_reference k-way merge hard-errors on a cross-file REF
+    disagreement. Force heavy private collisions with a tiny contig + many files.
+    """
+    from collections import Counter, defaultdict
+
+    gen = _load()
+    manifest = gen.generate_cohort(
+        tmp_path,
+        n_files=10,
+        n_variants=40,
+        contig="chr1",
+        contig_len=100,  # tiny -> private positions collide across files
+        shared_frac=0.1,
+        indel_frac=0.2,
+        seed=3,
+    )
+    paths = [Path(p) for p in manifest.read_text().split()]
+    pos_counts: Counter[int] = Counter()
+    variants_by_pos: dict[int, set[tuple[str, str]]] = defaultdict(set)
+    for p in paths:
+        for r in VCF(str(p))("chr1"):
+            pos_counts[r.POS] += 1
+            variants_by_pos[r.POS].add((r.REF, r.ALT[0]))
+    collisions = [pos for pos, c in pos_counts.items() if c >= 2]
+    assert collisions  # the tiny contig must actually force cross-file collisions
+    for pos in collisions:
+        assert len(variants_by_pos[pos]) == 1, (
+            f"pos {pos} has disagreeing REF/ALT across files: {variants_by_pos[pos]}"
+        )
