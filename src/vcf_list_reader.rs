@@ -248,11 +248,29 @@ impl Ord for HeapEntry {
     }
 }
 
+/// Frontier-heap key: which live cursor to advance next.
+///
+/// The derived `Ord` compares `frontier` then `col`, and `Option`'s own `Ord`
+/// puts `None` before every `Some(_)` — so a min-heap of these reproduces the
+/// old O(N) `min_by_key(|c| c.frontier)` scan exactly, including its
+/// first-min-wins tiebreak (equal frontiers → smallest column wins).
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct FrontierKey {
+    frontier: Option<u32>,
+    col: usize,
+}
+
 /// K-way merge of N single-sample VCFs (with possibly disjoint site lists) into
 /// one biallelic, hom-ref-filled `RawRecord` stream.
 pub struct VcfListRecordSource {
     cursors: Vec<FileCursor>,
     heap: BinaryHeap<Reverse<HeapEntry>>,
+    /// One entry per *live* cursor, keyed by its frontier — makes selecting the
+    /// cursor to advance O(log N) instead of an O(N) scan over `cursors`.
+    /// Invariant: exactly one entry per non-eof cursor, maintained by popping the
+    /// advanced cursor's entry and pushing its updated frontier back (an eof'd
+    /// cursor is simply never re-pushed).
+    frontier_heap: BinaryHeap<Reverse<FrontierKey>>,
     ref_seq: Option<Vec<u8>>,
     ploidy: usize,
     skip_out_of_scope: bool,
@@ -332,9 +350,23 @@ impl VcfListRecordSource {
             .filter(|f| f.category == FieldCategory::Format)
             .cloned()
             .collect();
+        // Seed the frontier heap with every live cursor (all unstarted, so all
+        // `frontier == None`); a file whose header lacks `chrom` is already eof
+        // and never participates.
+        let frontier_heap: BinaryHeap<Reverse<FrontierKey>> = cursors
+            .iter()
+            .filter(|c| !c.eof)
+            .map(|c| {
+                Reverse(FrontierKey {
+                    frontier: c.frontier,
+                    col: c.col,
+                })
+            })
+            .collect();
         Ok(Self {
             cursors,
             heap: BinaryHeap::new(),
+            frontier_heap,
             ref_seq: ref_seq.map(|s| s.to_vec()),
             ploidy,
             skip_out_of_scope,
@@ -463,41 +495,32 @@ impl VcfListRecordSource {
 impl RecordSource for VcfListRecordSource {
     fn next_record(&mut self) -> Result<Option<RawRecord>, ConversionError> {
         loop {
-            // One pass over the cursors computes every liveness aggregate AND
-            // the advance target at once. This inner `loop` runs once per atom
-            // read plus once per record emitted, so at N files it was
-            // O((atoms + records) * N) with a fresh `Vec<Option<u32>>`
-            // allocated every iteration (both the top-of-loop `live_frontiers`
-            // collect and the separate `min_by_key` argmin scan showed up as
-            // the dominant cost under `perf`). Fusing them keeps the algorithm
-            // O(N) per iteration but drops the per-iteration allocation and
-            // three of the four scans. (A frontier heap would make selection
-            // O(log N) — deferred; the constant-factor win here is the easy
-            // one and leaves behaviour identical.)
-            let mut any_live = false;
-            let mut all_started = true;
-            let mut min_started: Option<u32> = None;
-            // The live cursor with the smallest frontier, `None` (unstarted)
-            // sorting before every `Some(_)` — matches the old
-            // `min_by_key(|c| c.frontier)`, including its first-min-wins
-            // tiebreak (strict `<` keeps the earliest index on ties).
-            let mut advance_idx: Option<usize> = None;
-            let mut advance_key: Option<Option<u32>> = None;
-            for (i, c) in self.cursors.iter().enumerate() {
-                if c.eof {
-                    continue;
-                }
-                any_live = true;
-                match c.frontier {
-                    None => all_started = false,
-                    Some(f) => min_started = Some(min_started.map_or(f, |m| m.min(f))),
-                }
-                if advance_key.is_none_or(|best| c.frontier < best) {
-                    advance_key = Some(c.frontier);
-                    advance_idx = Some(i);
-                }
-            }
-            let all_eof = !any_live;
+            // Selection is O(log N) via `frontier_heap` (one entry per live
+            // cursor), replacing the old O(N) scan over `cursors` — which this
+            // inner `loop` ran once per atom read *plus* once per record
+            // emitted, i.e. O((atoms + records) * N) overall, and which `perf`
+            // measured at ~35% of total conversion self-time at N=500 (a share
+            // that grows linearly in N).
+            //
+            // Every aggregate the release gate needs falls out of the heap's
+            // top, because `FrontierKey` orders `None` (unstarted) before every
+            // `Some(_)`:
+            //   - empty heap             => no live cursors => all_eof
+            //   - top.frontier.is_some() => no unstarted live cursor left
+            //                               => all_started
+            //
+            // `min_frontier` is exactly the heap top — the minimum frontier over
+            // all LIVE cursors. Under `all_started` (every live frontier `Some`)
+            // it therefore equals the old scan's "min *started* frontier", which
+            // is the only condition the gate below reads it under (the `&&`
+            // short-circuits). It is deliberately NOT that quantity when an
+            // unstarted cursor exists — it is `None` there — so do not read it
+            // outside the `all_started` guard.
+            let (all_eof, all_started, min_frontier, advance_idx) = match self.frontier_heap.peek()
+            {
+                None => (true, true, None, None),
+                Some(Reverse(top)) => (false, top.frontier.is_some(), top.frontier, Some(top.col)),
+            };
 
             // Unstarted cursors (`frontier == None`) must be read before anything
             // can release — otherwise a not-yet-opened file's first record could
@@ -505,7 +528,7 @@ impl RecordSource for VcfListRecordSource {
             let releasable = all_eof
                 || (all_started
                     && self.heap.peek().is_some_and(|Reverse(e)| {
-                        min_started.is_some_and(|m| e.atom.pos < m.saturating_sub(L_MAX))
+                        min_frontier.is_some_and(|m| e.atom.pos < m.saturating_sub(L_MAX))
                     }));
 
             if releasable {
@@ -536,10 +559,22 @@ impl RecordSource for VcfListRecordSource {
                 };
             }
 
-            // Advance the live cursor with the smallest frontier (computed in
-            // the single pass above).
+            // Advance the live cursor with the smallest frontier (the frontier
+            // heap's top). Drop its entry first, then re-insert its updated
+            // frontier afterwards, so the heap keeps exactly one entry per live
+            // cursor; a cursor that just hit eof is simply not re-pushed.
             match advance_idx {
                 Some(i) => {
+                    // `i` came from `FrontierKey::col`, so the frontier heap
+                    // indexes `cursors` by `col` — which only works because the
+                    // constructor builds one cursor per `enumerate()` index (see
+                    // `new`). Pin that or a reordered `cursors` would silently
+                    // advance the wrong file.
+                    debug_assert_eq!(
+                        self.cursors[i].col, i,
+                        "frontier heap indexes cursors by col"
+                    );
+                    self.frontier_heap.pop();
                     let ref_seq = self.ref_seq.as_deref();
                     if let Some(atom) = self.cursors[i].advance(
                         ref_seq,
@@ -553,6 +588,12 @@ impl RecordSource for VcfListRecordSource {
                         // (see `HeapEntry::key`) — no separate key to allocate.
                         let col = self.cursors[i].col;
                         self.heap.push(Reverse(HeapEntry { col, atom }));
+                    }
+                    if !self.cursors[i].eof {
+                        self.frontier_heap.push(Reverse(FrontierKey {
+                            frontier: self.cursors[i].frontier,
+                            col: self.cursors[i].col,
+                        }));
                     }
                 }
                 // No live cursors: `all_eof` was already true above, which forces
@@ -1419,5 +1460,108 @@ mod tests {
         assert_eq!(r1.gt, vec![1, 0, /* SB, hom-ref filled */ 0, 0]);
         assert!(src.next_record().unwrap().is_none());
         assert_eq!(src.dropped_out_of_scope(), 0);
+    }
+
+    /// `next_record` used to pick the cursor to advance with an O(N) argmin scan
+    /// over `cursors`; it now peeks a `FrontierKey` min-heap. The two must agree
+    /// exactly — same cursor, same liveness aggregates — or the merge's release
+    /// gate changes and the emitted record stream (and therefore the store bytes)
+    /// changes with it. Fuzz both over many random frontier configurations,
+    /// including ties, unstarted (`None`) cursors, and eof'd cursors.
+    ///
+    /// Scope: this covers the *derivation* (ordering + aggregates) off a heap
+    /// top. The heap's *maintenance* (one entry per live cursor via
+    /// pop-then-push, never re-pushing an eof'd cursor, and the seeding filter
+    /// that keeps born-eof cursors out) is exercised by the tests that drive the
+    /// real `next_record`: `file_without_contig_is_skipped` (born eof),
+    /// `contig_in_header_but_no_records_is_hom_ref_filled_not_errored`
+    /// (immediate eof), `multiallelic_in_one_file_splits_across_records`
+    /// (frontier unchanged while draining a record's atom buffer),
+    /// `streaming_release_before_full_drain` (the release gate), and end-to-end
+    /// by `tests/test_svar2_from_vcf_list_parity.py`'s byte-identical fixture.
+    #[test]
+    fn frontier_heap_matches_naive_scan() {
+        // (all_eof, all_started, min_started, advance_idx)
+        type Sel = (bool, bool, Option<u32>, Option<usize>);
+
+        // The pre-refactor scan, verbatim in spirit: `None` sorts before every
+        // `Some(_)`, strict `<` keeps the earliest index on ties.
+        fn naive(states: &[(Option<u32>, bool)]) -> Sel {
+            let mut any_live = false;
+            let mut all_started = true;
+            let mut min_started: Option<u32> = None;
+            let mut advance_idx: Option<usize> = None;
+            let mut advance_key: Option<Option<u32>> = None;
+            for (i, (frontier, eof)) in states.iter().enumerate() {
+                if *eof {
+                    continue;
+                }
+                any_live = true;
+                match frontier {
+                    None => all_started = false,
+                    Some(f) => min_started = Some(min_started.map_or(*f, |m| m.min(*f))),
+                }
+                if advance_key.is_none_or(|best| *frontier < best) {
+                    advance_key = Some(*frontier);
+                    advance_idx = Some(i);
+                }
+            }
+            (!any_live, all_started, min_started, advance_idx)
+        }
+
+        // Exactly the derivation `next_record` performs off the frontier heap.
+        fn heap_based(states: &[(Option<u32>, bool)]) -> Sel {
+            let fh: BinaryHeap<Reverse<FrontierKey>> = states
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, eof))| !*eof)
+                .map(|(i, (frontier, _))| {
+                    Reverse(FrontierKey {
+                        frontier: *frontier,
+                        col: i,
+                    })
+                })
+                .collect();
+            match fh.peek() {
+                None => (true, true, None, None),
+                Some(Reverse(top)) => (false, top.frontier.is_some(), top.frontier, Some(top.col)),
+            }
+        }
+
+        fn xorshift(seed: &mut u64) -> u64 {
+            *seed ^= *seed << 13;
+            *seed ^= *seed >> 7;
+            *seed ^= *seed << 17;
+            *seed
+        }
+
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        for _ in 0..5000 {
+            let n = (xorshift(&mut seed) % 12) as usize + 1;
+            // Small frontier range => frequent ties, which is where a wrong
+            // tiebreak would hide.
+            let states: Vec<(Option<u32>, bool)> = (0..n)
+                .map(|_| {
+                    let eof = xorshift(&mut seed).is_multiple_of(5);
+                    let frontier = if xorshift(&mut seed).is_multiple_of(4) {
+                        None
+                    } else {
+                        Some((xorshift(&mut seed) % 7) as u32)
+                    };
+                    (frontier, eof)
+                })
+                .collect();
+            let a = naive(&states);
+            let b = heap_based(&states);
+            assert_eq!(a.0, b.0, "all_eof mismatch for {states:?}");
+            assert_eq!(a.1, b.1, "all_started mismatch for {states:?}");
+            assert_eq!(a.3, b.3, "advance_idx mismatch for {states:?}");
+            // `min_started` is only ever read under `all_started` (the release
+            // gate short-circuits on it), which is exactly where the heap top is
+            // guaranteed to be the minimum *started* frontier.
+            if a.1 && !a.0 {
+                assert_eq!(a.2, b.2, "min_started mismatch for {states:?}");
+            }
+        }
     }
 }
