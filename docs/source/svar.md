@@ -17,8 +17,11 @@ svar = SparseVar("out.svar")
 
 ### Region/sample-restricted SVAR2 conversion
 
-`SparseVar2.from_vcf` can convert an indexed VCF/BCF directly into a subset of
-regions and samples:
+`SparseVar2.from_vcf`, `from_pgen`, and `from_svar1` can all convert directly
+into a subset of regions and samples. `from_vcf_list` supports the same
+`regions=`/`merge_overlapping=`/`regions_overlap=` but has **no `samples=`**
+— each input file is single-sample, so the cohort is defined by the file set
+itself:
 
 ```python
 from genoray import SparseVar2
@@ -36,10 +39,12 @@ SparseVar2.from_vcf(
 
 Region strings use bcftools-style 1-based inclusive coordinates and are
 converted to 0-based half-open intervals. Tuple, BED, and frame inputs are
-already interpreted as 0-based half-open. `samples` preserves caller order and
-deduplicates repeated names by first occurrence.
+already interpreted as 0-based half-open. `samples` selects and reorders by
+name, preserving caller order and deduplicating repeated names by first
+occurrence.
 
-The equivalent CLI flags are available on the default SVAR2 writer:
+The equivalent CLI flags are available on the default SVAR2 writer, for every
+source kind (VCF/BCF, PGEN, an SVAR1 store, or a vcf-list directory/manifest):
 
 ```bash
 genoray write cohort.vcf.gz subset.svar2 \
@@ -49,30 +54,49 @@ genoray write cohort.vcf.gz subset.svar2 \
   --threads 8
 ```
 
-Use `--regions-file/-R` for BED files and `--samples-file/-S` for one-sample-per-line
-sample lists. `regions_overlap=pos` is the default; `record` is also supported.
+Use `--regions-file/-R` for BED files and `--samples-file/-S` for
+one-sample-per-line sample lists. `--samples`/`-s`/`--samples-file`/`-S` are
+rejected for the multi-file (vcf-list) directory/manifest form — each input
+file already contributes exactly one sample, so there's no cohort left to
+subset.
+
+`regions_overlap` selects one of three overlap modes, matching bcftools
+`--regions-overlap`: `"pos"` (default; POS inside `[start,end)`), `"record"`
+(POS in `[start,end+1)`, so an indel at the region's last base is kept), or
+`"variant"` (the anchor-trimmed variant extent overlaps the region). In
+`variant` mode a multiallelic record is kept whole if ANY of its alleles
+truly overlaps the region; individual non-overlapping alleles are not
+dropped. `variant` currently requires at most one region per contig; multiple
+regions per contig raise — use `pos`/`record`, or convert separately.
 
 ### Parallel conversion
 
-Single-file `SparseVar2.from_vcf` and `SparseVar2.from_pgen` shard **within a
-contig**, driven by the same `threads=` budget shown above — no new argument.
-Sharding only kicks in at higher thread counts: the thread budget first spends
-added cores on HTSlib decode threads for the single reader, so the sub-contig
-shard budget stays at 1 (an un-sharded reader) until the core count clears that
-stage (~15 cores on the benchmarked hardware). Output is **byte-identical** to
-serial conversion at every thread count — sharding is gated by a store-hash
-oracle and does not reintroduce missingness (a `./.` haplotype and a hom-ref
-haplotype remain indistinguishable in SVAR2 either way).
+Single-file `SparseVar2.from_vcf` shards **within a contig**, driven by the same
+`threads=` budget shown above — no new argument. Sub-contig sharding only kicks
+in for the default whole-contig (`regions_overlap="pos"`) path: the thread budget
+first spends added cores on HTSlib decode threads for the single reader, so the
+sub-contig shard budget stays at 1 (an un-sharded reader) until the core count
+clears that stage (~15 cores on the benchmarked hardware). Output is
+**byte-identical** to serial conversion at every thread count — sharding is gated
+by a store-hash oracle and does not reintroduce missingness (a `./.` haplotype
+and a hom-ref haplotype remain indistinguishable in SVAR2 either way).
 
-The two backends scale differently:
+Sub-contig sharding is restricted to `regions_overlap="pos"` (which the
+whole-contig default uses). `"record"` and `"variant"` conversions run on a
+single reader per contig, because their kept-record sets do not coincide with
+the POS-ownership partition sharding dedups by.
+
+The two backends behave differently:
 
 - **VCF** scales well: ~3.9× wall-clock speedup at 32 cores on a chr21 germline
   BCF (1176s → 300s), byte-identical. The VCF path over-decomposes shards
   (factor 4) for work-stealing load balance.
-- **PGEN** sharding is byte-identical but **not faster** — `pgenlib`'s genotype
-  decode holds the CPython GIL, so shard readers serialize on it, and sharding
-  is net slightly slower than serial (340s vs 273s on chr21) due to added
-  coordination overhead. PGEN is intentionally not over-decomposed.
+- **PGEN** sub-contig sharding is **disabled** (`from_pgen` pins a single reader
+  per contig). It is byte-identical but not faster: `pgenlib`'s genotype decode
+  holds the CPython GIL, so shard readers serialize on it, and a reproducible
+  chr21c benchmark measured sharding as net slower than serial (44.9s vs 32.6s)
+  from added coordination overhead. The machinery is retained for re-enablement
+  if a future reader/executor change shifts the bottleneck onto decode.
 
 `SparseVar2.from_vcf_list` (merging N single-sample VCFs) does not shard within
 a contig — it already opens one file descriptor per input file per contig.

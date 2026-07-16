@@ -94,6 +94,7 @@ fn test_e2e_normalized_bcf_pipeline() {
             vcf_path: bcf_path.to_str().unwrap().to_string(),
             htslib_threads: 1,
             regions: Vec::new(),
+            overlap: genoray_core::svar2_view::OverlapMode::Pos,
         },
         Some(bcf_path.with_extension("fa").to_str().unwrap()),
         "chr1",
@@ -189,6 +190,7 @@ fn test_vcf_record_source_fetches_requested_intervals() {
         2,
         &[],
         vec![(0, 4), (6, 7)],
+        genoray_core::svar2_view::OverlapMode::Pos,
     )
     .unwrap();
 
@@ -197,6 +199,35 @@ fn test_vcf_record_source_fetches_requested_intervals() {
         got.push(record.pos);
     }
     assert_eq!(got, vec![2, 6]);
+}
+
+#[test]
+fn overlap_modes_delimit_by_pos_record_variant() {
+    // Fixture: chr1 with a SNP at POS=10 (0-based 9) and a 3bp deletion at
+    // POS=5 (0-based 4, REF="ACGT", ALT="A") whose extent [4,8) reaches into a
+    // region starting at 6. Region requested: [6, 12) 0-based half-open.
+    use genoray_core::svar2_view::{OverlapMode, extent_overlaps, keeps};
+
+    // pos mode: deletion POS=4 is outside [6,12) -> dropped; SNP POS=9 kept.
+    assert!(!keeps(OverlapMode::Pos, 6, 12, 4));
+    assert!(keeps(OverlapMode::Pos, 6, 12, 9));
+    // record mode: still POS-based, deletion POS=4 outside -> dropped.
+    assert!(!keeps(OverlapMode::Record, 6, 12, 4));
+    // variant mode: deletion extent [4,8) overlaps [6,12) -> kept.
+    let ref_allele = b"ACGT";
+    let alts: [&[u8]; 1] = [b"A"];
+    assert!(extent_overlaps(
+        4,
+        ref_allele.len() as u32,
+        &alts,
+        ref_allele,
+        6,
+        12
+    ));
+    // A SNP just past the region end is out under variant too.
+    let snp_ref = b"C";
+    let snp_alts: [&[u8]; 1] = [b"T"];
+    assert!(!extent_overlaps(20, 1, &snp_alts, snp_ref, 6, 12));
 }
 
 // M5 max_del post-pass, end-to-end. Two deletions with known lengths:
@@ -234,6 +265,7 @@ fn test_e2e_max_del_postpass() {
             vcf_path: bcf_path.to_str().unwrap().to_string(),
             htslib_threads: 1,
             regions: Vec::new(),
+            overlap: genoray_core::svar2_view::OverlapMode::Pos,
         },
         Some(bcf_path.with_extension("fa").to_str().unwrap()),
         "chr1",
@@ -313,6 +345,7 @@ fn test_e2e_dense_snp_roundtrip() {
             vcf_path: bcf_path.to_str().unwrap().to_string(),
             htslib_threads: 1,
             regions: Vec::new(),
+            overlap: genoray_core::svar2_view::OverlapMode::Pos,
         },
         Some(bcf_path.with_extension("fa").to_str().unwrap()),
         "chr1",
@@ -391,6 +424,7 @@ fn test_e2e_mutation_conservation() {
             vcf_path: bcf_path.to_str().unwrap().to_string(),
             htslib_threads: 1,
             regions: Vec::new(),
+            overlap: genoray_core::svar2_view::OverlapMode::Pos,
         },
         Some(bcf_path.with_extension("fa").to_str().unwrap()),
         "chr1",
@@ -523,6 +557,7 @@ fn test_reader_extracts_info_format_fields() {
         ploidy,
         &all,
         Vec::new(),
+        genoray_core::svar2_view::OverlapMode::Pos,
     )
     .unwrap();
     let mut reader = ChunkAssembler::new(
@@ -682,6 +717,7 @@ fn test_reader_extracts_multiallelic_number_a_fields() {
         ploidy,
         &all,
         Vec::new(),
+        genoray_core::svar2_view::OverlapMode::Pos,
     )
     .unwrap();
     let mut reader = ChunkAssembler::new(
@@ -796,6 +832,7 @@ fn test_reader_accepts_pure_del() {
         2,
         &[],
         Vec::new(),
+        genoray_core::svar2_view::OverlapMode::Pos,
     )
     .unwrap();
     let mut reader = ChunkAssembler::new(
@@ -846,6 +883,7 @@ fn test_missing_chrom_returns_err() {
             vcf_path: bcf_path.to_str().unwrap().to_string(),
             htslib_threads: 1,
             regions: Vec::new(),
+            overlap: genoray_core::svar2_view::OverlapMode::Pos,
         },
         Some(bcf_path.with_extension("fa").to_str().unwrap()),
         "chrZ",
@@ -888,10 +926,102 @@ fn test_missing_vcf_returns_missing_file() {
         2,
         &[],
         Vec::new(),
+        genoray_core::svar2_view::OverlapMode::Pos,
     );
 
     assert!(matches!(
         res,
         Err(genoray_core::error::ConversionError::MissingFile { .. })
     ));
+}
+
+// End-to-end: `regions_overlap` mode must gate a spanning deletion through the
+// FULL conversion pipeline (reader -> merge -> on-disk store), not just the
+// helper. A 3bp deletion at 0-based POS=4 (REF="ACGT", ALT="A") has an
+// anchor-trimmed extent [5, 8) that reaches into the region [6, 12) but whose
+// POS lies before it. htslib's interval index over-fetches it (its END spans
+// into the region), so it reaches the per-record filter under BOTH modes:
+//   - `variant`: extent [5,8) overlaps [6,12) -> the deletion is kept.
+//   - `pos`:     POS=4 is outside [6,12)      -> the deletion is dropped.
+// A control SNP at POS=8 sits inside the region and is present in both modes,
+// so the pipeline never sees an empty contig.
+#[test]
+fn regions_overlap_variant_keeps_spanning_deletion_e2e() {
+    use std::path::Path;
+
+    let samples = vec!["S0"]; // np = 2
+
+    let records = vec![
+        SynthRecord {
+            pos: 4,
+            ref_allele: b"ACGT",
+            alts: vec![&b"A"[..]],
+            gt: vec![1, 0], // x=1 carrier
+        },
+        SynthRecord {
+            pos: 8,
+            ref_allele: b"A",
+            alts: vec![&b"C"[..]],
+            gt: vec![1, 1], // control SNP inside the region, kept in both modes
+        },
+    ];
+
+    // Collect every indel-stream position on disk (the deletion routes to one of
+    // var_key/indel or dense/indel depending on the cost model; scan both).
+    let indel_positions = |contig_dir: &Path| -> Vec<u32> {
+        let mut out = Vec::new();
+        for sub in ["var_key/indel", "dense/indel"] {
+            let p = contig_dir.join(sub).join("positions.bin");
+            if p.exists() {
+                out.extend(read_u32_bin(&p));
+            }
+        }
+        out
+    };
+
+    let run = |overlap: genoray_core::svar2_view::OverlapMode| -> Vec<u32> {
+        let tmp = tempdir().unwrap();
+        let bcf_path = tmp.path().join("spanning.bcf");
+        build_bcf_with_index(&bcf_path, "chr1", 10_000, &samples, &records);
+        build_fasta_with_index(&bcf_path.with_extension("fa"), "chr1", 10_000, &records);
+
+        let out_dir = tmp.path().join("out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        process_chromosome(
+            genoray_core::orchestrator::SourceSpec::Vcf {
+                vcf_path: bcf_path.to_str().unwrap().to_string(),
+                htslib_threads: 1,
+                regions: vec![(6, 12)],
+                overlap,
+            },
+            Some(bcf_path.with_extension("fa").to_str().unwrap()),
+            "chr1",
+            out_dir.to_str().unwrap(),
+            &samples,
+            100,
+            2,
+            4096,
+            false,
+            genoray_core::normalize::CheckRef::Error,
+            1,     // processing_threads
+            false, // signatures
+            &[],   // fields
+        )
+        .expect("conversion");
+        indel_positions(&out_dir.join("chr1"))
+    };
+
+    // variant: the spanning deletion at POS=4 survives.
+    let variant_pos = run(genoray_core::svar2_view::OverlapMode::Variant);
+    assert!(
+        variant_pos.contains(&4),
+        "variant mode must keep the spanning deletion at POS=4; got {variant_pos:?}"
+    );
+
+    // pos: the spanning deletion is pruned (its POS is before the region).
+    let pos_pos = run(genoray_core::svar2_view::OverlapMode::Pos);
+    assert!(
+        !pos_pos.contains(&4),
+        "pos mode must drop the spanning deletion at POS=4; got {pos_pos:?}"
+    );
 }

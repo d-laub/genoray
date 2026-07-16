@@ -25,8 +25,17 @@ fn write_ref(fasta_path: &Path, chrom: &str, seq: &[u8]) {
 }
 
 fn drain(bcf: &Path, fasta: &Path, chrom: &str, samples: &[&str]) -> Vec<(u32, i32)> {
-    let source =
-        VcfRecordSource::new(bcf.to_str().unwrap(), chrom, samples, 1, 2, &[], Vec::new()).unwrap();
+    let source = VcfRecordSource::new(
+        bcf.to_str().unwrap(),
+        chrom,
+        samples,
+        1,
+        2,
+        &[],
+        Vec::new(),
+        genoray_core::svar2_view::OverlapMode::Pos,
+    )
+    .unwrap();
     let mut reader = ChunkAssembler::new(
         Box::new(source),
         samples.len(),
@@ -245,6 +254,7 @@ fn left_shifts_stay_sorted_across_chunk_boundaries() {
         2,
         &[],
         Vec::new(),
+        genoray_core::svar2_view::OverlapMode::Pos,
     )
     .unwrap();
     let mut reader = ChunkAssembler::new(
@@ -322,6 +332,7 @@ proptest! {
             2,
             &[],
             Vec::new(),
+            genoray_core::svar2_view::OverlapMode::Pos,
         )
         .unwrap();
         let mut reader = ChunkAssembler::new(
