@@ -61,10 +61,16 @@ The plan's framing of R1 as *the* linear RAM term does not survive measurement.
 
 ### R2 (O(N) open readers) — **IS the driver**
 
-The unexplained ~386 KB/file (392 minus R1's 6.25) tracks the one thing that scales with
-file count: `from_vcf_list` opens **all N files concurrently, per contig** (each with its
-own htslib/BGZF reader + buffers). This is the linear term, and it is what stands between
-today's behaviour and issue #120's goal of *peak RAM independent of cohort size*.
+The unexplained ~386 KB/file (392 minus R1's 6.25) tracks the one thing that obviously
+scales with file count: `from_vcf_list` opens **all N files concurrently, per contig**
+(each with its own htslib/BGZF reader + buffers).
+
+**Caveat — this is inference by elimination on a residual, not an isolated
+measurement.** R3 (ledgers, below) also scales with N and was **not** measured, and
+per-sample FORMAT buffers/sample metadata scale with N too; any of them could account for
+part of that ~386 KB/file. A `dhat` run at N≥500 (recipe: `scripts/bench_from_vcf_list/
+README.md` §4) would separate R2 from R3 cheaply — **do that before committing to Task 9's
+design**, since Task 9 is expensive and is sequenced on this attribution.
 
 ### R3 (ledger growth) — **UNDECIDED, not measured**
 
@@ -111,9 +117,9 @@ existing "htslib-INPUT-bound (inflate+parse)" characterisation. Thread utilisati
 
 | # | Fix | Status | Measured verdict |
 |---|---|---|---|
-| R1 | Budget-derive `chunk_size` (Task 6) | **shipped** `cc24f1d` | Correct, but only bites at **N > ~43k**. Dense term is ~1% of peak at N=2000. Keep as a guardrail; not the #120 fix. |
+| R1 | Budget-derive `chunk_size` (Task 6) | **shipped** `cc24f1d` | Correct, but only bites at **N > ~43k**. Dense term is ~1% of peak at N=2000. Keep it: it converges `from_vcf_list` with `from_pgen`/`from_svar1` (which already default this way) and guards absurd N — but it is **not** the #120 fix. |
 | S1 | Frontier min-heap (Task 7) | **shipped** `d3c4efa` | **Big win.** 34.72% → 3.09% self-time; wall 74.3 s → 35.6 s at N=500; win grows with N. |
-| R2 | Cap open readers (staged merge, Task 9) | **not built** | **The RAM driver** (~386 KB/file). Sole blocker to "RAM independent of cohort size". |
+| R2 | Cap open readers (staged merge, Task 9) | **not built** | **Inferred** RAM driver (~386 KB/file *residual*, not isolated — R3 is unmeasured and could account for part of it). Most likely blocker to "RAM independent of cohort size"; confirm with dhat first. |
 | S2 | Parallel leaf decompression (Task 9) | **not built** | htslib parse ~20%+; thread utilisation unmeasured. Plausible, unproven. |
 | R3 | Ledger trim (Task 10) | **not built** | **Unknown — dhat not run.** |
 | — | `max_mem` knob (Task 8) | **not built** | Worth doing, but see decision below. |
@@ -121,11 +127,14 @@ existing "htslib-INPUT-bound (inflate+parse)" characterisation. Thread utilisati
 ## Phase 3 decision (the gate this doc exists for)
 
 - **Task 9 (staged / batched merge) — WARRANTED, and it is now the highest-value
-  remaining work.** R2 is the dominant, linear RAM term (~386 KB/file → ~1.1 GB at
-  N=2000, ~4.2 GB at N=10k). Batching files into intermediate sorted runs caps concurrent
-  open readers and is the *only* identified change that makes peak RAM independent of
-  cohort size — the stated goal of issue #120. It also removes the `ulimit -n` ceiling
-  `_check_fd_budget` currently enforces.
+  remaining work — but run dhat first (one cheap step).** The linear RAM term is real and
+  measured (~383 KB/file → ~1.1 GB at N=2000, ~4.2 GB at N=10k); attributing it to R2 is
+  inference by elimination (see the R2 caveat above), and R3 is an unmeasured claimant on
+  the same residual. A dhat run at N≥500 confirms the split before spending the expensive
+  batching work on it. Assuming it confirms: batching files into intermediate sorted runs
+  caps concurrent open readers and is the only identified change that makes peak RAM
+  independent of cohort size — the stated goal of issue #120. It would also remove the
+  `ulimit -n` ceiling `_check_fd_budget` currently enforces.
   - The **S2 half** (rayon-parallel leaf decompression) is *not* independently justified
     by these numbers — bundle it only if the batching work makes it near-free, otherwise
     split it out and measure thread utilisation first.

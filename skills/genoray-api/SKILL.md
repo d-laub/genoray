@@ -450,8 +450,12 @@ multi-sample VCF.
 - `chunk_size=None` — unlike `from_vcf`'s fixed `25_000` default, `None` here
   derives a budget-based chunk size from the cohort size (`_auto_chunk_size`),
   so one packed dense chunk stays ~256 MiB regardless of how many files are
-  merged (a fixed constant makes the dense working set grow linearly in the
-  number of inputs — issue #120). Pass an int to override with a fixed count.
+  merged; this is the same default `from_pgen`/`from_svar1` already use. Scope:
+  it bounds only the dense-chunk term, which is a small fraction of peak RAM at
+  typical cohort sizes (the budget does not bite until roughly 43k inputs, below
+  which it returns the historical `25_000`) — a large-cohort guardrail, not a
+  fix for overall RAM scaling in the number of inputs. Pass an int to override
+  with a fixed count.
 - `ploidy`, `skip_out_of_scope`, `threads`, `overwrite`,
   `long_allele_capacity`, `signatures`, `check_ref` all mean the same as
   `from_vcf`, and the return value is the same `int` (dropped out-of-scope

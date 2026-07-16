@@ -807,9 +807,13 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         chunk_size: variants per conversion chunk. When omitted (`None`,
         default), a memory-budget-derived value (`_auto_chunk_size`) is used so
         one packed dense chunk stays ~`_DENSE_CHUNK_TARGET_BYTES` regardless of
-        cohort size — otherwise a fixed count makes the dense working set grow
-        linearly in the number of input files (issue #120). Pass an int to
-        override with a fixed count.
+        cohort size — the same default `from_pgen` and `from_svar1` already use.
+        Scope: this bounds only the *dense-chunk* term, which is a small
+        fraction of peak RAM at typical cohort sizes (the budget does not bite
+        until roughly 43k inputs, below which it returns the historical
+        25_000). It is a large-cohort guardrail, not a fix for overall RAM
+        scaling in the number of input files. Pass an int to override with a
+        fixed count.
         """
         from cyvcf2 import VCF as _CyVCF
 

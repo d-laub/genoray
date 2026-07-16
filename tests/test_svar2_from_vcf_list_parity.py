@@ -63,6 +63,10 @@ def test_parity_chunk_size_invariant(tmp_path: Path):
     SparseVar2.from_vcf_list(
         out_large, paths, no_reference=True, overwrite=True, chunk_size=25_000
     )
+    # Guard against a vacuous pass: hash_store() over two EMPTY dirs compares
+    # equal, so a regression that produced no store at all would look green.
+    assert (out_small / "meta.json").exists()
+    assert (out_large / "meta.json").exists()
     assert hash_store(out_small) == hash_store(out_large)
 
 
@@ -71,4 +75,7 @@ def test_parity_repeatable(tmp_path: Path):
     o1, o2 = tmp_path / "a", tmp_path / "b"
     SparseVar2.from_vcf_list(o1, paths, no_reference=True, overwrite=True)
     SparseVar2.from_vcf_list(o2, paths, no_reference=True, overwrite=True)
+    # See test_parity_chunk_size_invariant: two empty stores hash equal.
+    assert (o1 / "meta.json").exists()
+    assert (o2 / "meta.json").exists()
     assert hash_store(o1) == hash_store(o2)
