@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence as AbcSequence
 from collections import Counter
+from os import PathLike
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -98,6 +100,104 @@ def _ensure_index(source: Path) -> None:
     if csi.exists() or tbi.exists():
         return
     _core.index_vcf(str(source))
+
+
+def _is_region_triplet(value: object) -> bool:
+    return (
+        isinstance(value, tuple)
+        and len(value) == 3
+        and isinstance(value[0], str)
+        and isinstance(value[1], int)
+        and isinstance(value[2], int)
+    )
+
+
+def _normalize_svar2_regions(
+    regions: "str | tuple[str, int, int] | PathLike | object | None",
+    available_contigs: "Sequence[str]",
+    *,
+    merge_overlapping: bool,
+) -> list[tuple[str, int, int]]:
+    """Normalize caller regions to coalesced, backend-agnostic genomic intervals.
+
+    This is intentionally a pre-conversion/pre-slice helper: it reuses the v1
+    coordinate parser/sample conventions, then returns per-contig 0-based
+    half-open intervals. It is mode-independent -- `regions_overlap` (which
+    variants a region's POS/record/anchor-trimmed-extent must overlap) is
+    applied downstream (Rust `query_window`/`parse_overlap_mode`), not here.
+    """
+    from genoray._contigs import ContigNormalizer
+    from genoray._svar._regions import _normalize_regions
+
+    if regions is None:
+        return []
+
+    cnorm = ContigNormalizer(available_contigs)
+
+    if isinstance(regions, AbcSequence) and not isinstance(
+        regions, (str, bytes, PathLike)
+    ):
+        if _is_region_triplet(regions):
+            frames = [_normalize_regions(regions, cnorm)]
+        else:
+            frames = [_normalize_regions(r, cnorm) for r in regions]
+        regions_df = pl.concat(frames) if frames else pl.DataFrame()
+    else:
+        regions_df = _normalize_regions(regions, cnorm)
+
+    if regions_df.height == 0:
+        raise ValueError("No requested regions match VCF contigs.")
+
+    rows = regions_df.sort(["chrom", "start", "end"]).iter_rows(named=True)
+
+    merged: list[tuple[str, int, int]] = []
+    for row in rows:
+        chrom = str(row["chrom"])
+        start = int(row["start"])
+        end = int(row["end"])
+        if start < 0:
+            raise ValueError(f"region start must be >= 0; got {start} for {chrom}")
+        if end <= start:
+            raise ValueError(
+                f"region end must be greater than start; got {chrom}:{start}-{end}"
+            )
+
+        if merged and merged[-1][0] == chrom and start <= merged[-1][2]:
+            prev_chrom, prev_start, prev_end = merged[-1]
+            if start < prev_end and not merge_overlapping:
+                raise ValueError(
+                    "regions overlap; pass merge_overlapping=True to dedupe"
+                )
+            merged[-1] = (prev_chrom, prev_start, max(prev_end, end))
+        else:
+            merged.append((chrom, start, end))
+
+    return merged
+
+
+def _reject_multiregion_variant(
+    region_ranges: "list[tuple[str, int, int]]", regions_overlap: str
+) -> None:
+    """`regions_overlap="variant"` is only sound with at most ONE region per
+    contig: a variant whose anchor-trimmed extent spans the gap between two
+    disjoint regions on the same contig is handled inconsistently across the
+    conversion readers (double-counted in the VCF path, dropped in the
+    PGEN/SVAR1 paths). Until per-region ownership is unified, reject it up
+    front. `pos`/`record` modes are unaffected (POS belongs to exactly one
+    coalesced region)."""
+    if regions_overlap != "variant":
+        return
+    from collections import Counter
+
+    counts = Counter(chrom for chrom, _s, _e in region_ranges)
+    multi = sorted(c for c, n in counts.items() if n > 1)
+    if multi:
+        raise ValueError(
+            "regions_overlap='variant' currently supports at most one region "
+            f"per contig, but these contigs have multiple: {multi}. Convert "
+            "them in separate calls, coalesce with merge_overlapping=True if "
+            "they are adjacent/overlapping, or use regions_overlap='pos'/'record'."
+        )
 
 
 def _canonical_contig_id(name: str) -> str:
@@ -486,6 +586,10 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         source: str | Path,
         reference: str | Path | None = None,
         *,
+        regions: "str | tuple[str, int, int] | PathLike | object | None" = None,
+        samples: "str | Sequence[str] | PathLike | None" = None,
+        merge_overlapping: bool = False,
+        regions_overlap: "Literal['pos', 'record', 'variant']" = "pos",
         no_reference: bool = False,
         skip_out_of_scope: bool = False,
         ploidy: int = 2,
@@ -506,6 +610,23 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         input is trusted to be already normalized. Returns the number of
         out-of-scope (symbolic/breakend) ALTs dropped (0 unless
         `skip_out_of_scope`).
+
+        `regions` restricts conversion to one or more indexed VCF fetch
+        intervals. Region strings use Genoray's existing convention:
+        ``"chrom:start-end"`` is 1-based inclusive and is converted to a
+        0-based half-open interval; tuple/BED/frame inputs are already 0-based
+        half-open. Overlapping regions raise unless `merge_overlapping=True`.
+
+        `regions_overlap` controls which variants a region keeps, matching
+        bcftools --regions-overlap: "pos" (POS inside [start,end)), "record"
+        (POS in [start,end+1), so an indel at the region's last base is
+        kept), or "variant" (the anchor-trimmed variant extent overlaps the
+        region). In "variant" mode a multiallelic record is kept whole if ANY
+        of its alleles truly overlaps the region; individual non-overlapping
+        alleles are not dropped.
+
+        `samples` selects and reorders VCF samples by name, preserving caller
+        order and de-duplicating first occurrences.
 
         signatures: if True, classify SBS96/ID83 codes during the write and
         store the mutcat sidecar (factored into the dense/var_key cost model).
@@ -528,6 +649,13 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         case-insensitive, so soft-masked (lowercase) reference bases match.
         """
         from cyvcf2 import VCF as _CyVCF
+        from genoray._svar._regions import _normalize_samples
+
+        if regions_overlap not in {"pos", "record", "variant"}:
+            raise ValueError(
+                "regions_overlap must be one of 'pos', 'record', or 'variant'; "
+                f"got {regions_overlap!r}"
+            )
 
         out = Path(out)
         source = Path(source)
@@ -549,8 +677,65 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         _ensure_index(source)
 
         v = _CyVCF(str(source))
-        samples = list(v.samples)
-        contigs = [c for c in natsorted(v.seqnames) if next(v(c), None) is not None]
+        available_samples = list(v.samples)
+        selected_samples = (
+            available_samples
+            if samples is None
+            else _normalize_samples(samples, available_samples)
+        )
+        if not selected_samples:
+            raise ValueError("from_vcf requires at least one sample")
+
+        all_contigs = list(v.seqnames)
+        region_ranges = _normalize_svar2_regions(
+            regions,
+            all_contigs,
+            merge_overlapping=merge_overlapping,
+        )
+        _reject_multiregion_variant(region_ranges, regions_overlap)
+
+        if region_ranges:
+            ranges_by_contig: dict[str, list[tuple[int, int]]] = {}
+            for chrom, start, end in region_ranges:
+                ranges_by_contig.setdefault(chrom, []).append((start, end))
+
+            contigs = []
+            for chrom in natsorted(ranges_by_contig):
+                has_variant = any(
+                    next(v(f"{chrom}:{start + 1}-{end}"), None) is not None
+                    for start, end in ranges_by_contig[chrom]
+                )
+                if has_variant:
+                    contigs.append(chrom)
+            if not contigs:
+                raise ValueError(
+                    f"No variants found in requested regions for {source}."
+                )
+
+            region_ranges = [
+                (chrom, start, end)
+                for chrom in contigs
+                for start, end in ranges_by_contig[chrom]
+            ]
+        else:
+            contigs = [c for c in natsorted(v.seqnames) if next(v(c), None) is not None]
+            # Whole-contig conversion: fill explicit [0, len) ranges so the Rust
+            # VCF path can sub-contig shard -- its shard planner needs concrete
+            # intervals, and an empty region list disables sharding. `regions`
+            # was None here, so `regions_overlap` stays the default "pos", which
+            # is exactly what the sharded path requires for byte-identity. A
+            # contig with variants but no reported length simply gets no range
+            # (Rust then reads it whole via the single reader).
+            contig_lengths = {
+                chrom: int(length)
+                for chrom, length in zip(v.seqnames, getattr(v, "seqlens", []) or [])
+                if length is not None and int(length) > 0
+            }
+            region_ranges = [
+                (chrom, 0, contig_lengths[chrom])
+                for chrom in contigs
+                if chrom in contig_lengths
+            ]
         if not contigs:
             raise ValueError(f"No variants found in {source}.")
 
@@ -564,7 +749,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             reference_path,
             contigs,
             str(out),
-            samples,
+            selected_samples,
             chunk_size,
             ploidy,
             threads,  # max_threads; None => auto
@@ -574,6 +759,8 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             info,
             format_,
             check_ref,
+            region_ranges,
+            regions_overlap,
         )
 
     @classmethod
@@ -583,6 +770,10 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         source: str | Path,
         reference: str | Path | None = None,
         *,
+        regions: "str | tuple[str, int, int] | PathLike | object | None" = None,
+        samples: "str | Sequence[str] | PathLike | None" = None,
+        merge_overlapping: bool = False,
+        regions_overlap: "Literal['pos', 'record', 'variant']" = "pos",
         no_reference: bool = False,
         skip_out_of_scope: bool = False,
         chunk_size: int | None = None,
@@ -609,14 +800,31 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         a memory budget, since a packed dense chunk costs
         ``chunk_size * n_samples * 2 / 8`` bytes.
 
+        `regions` restricts conversion to one or more `.pvar` variant-index
+        ranges. Region strings use Genoray's existing convention:
+        ``"chrom:start-end"`` is 1-based inclusive and is converted to a
+        0-based half-open interval; tuple/BED/frame inputs are already 0-based
+        half-open. Overlapping regions raise unless `merge_overlapping=True`.
+
+        `regions_overlap` controls which variants a region keeps, matching
+        bcftools --regions-overlap: "pos" (POS inside [start,end)), "record"
+        (POS in [start,end+1), so an indel at the region's last base is
+        kept), or "variant" (the anchor-trimmed variant extent overlaps the
+        region). In "variant" mode a multiallelic record is kept whole if ANY
+        of its alleles truly overlaps the region; individual non-overlapping
+        alleles are not dropped.
+
+        `samples` selects and reorders `.psam` samples by name, preserving
+        caller order and de-duplicating first occurrences -- the store's
+        `available_samples` (and every decoded column) matches that order
+        exactly, regardless of each sample's original `.psam` position.
+
         Not supported (and silently ignored rather than errored, where noted):
 
         - **Dosages.** SVAR2 stores no dosages; a ``.pgen`` dosage track is ignored
           and hardcalls are read as usual.
         - **INFO/FORMAT fields.** PGEN has no FORMAT; ``.pvar`` INFO extraction is
           not implemented.
-        - **Sample subsetting.** All samples in the ``.psam`` are converted, matching
-          :meth:`from_vcf`.
 
         Haplotype resolution for *unphased* heterozygotes follows the allele-code
         order ``pgenlib`` returns — the same caveat :meth:`from_vcf` carries for
@@ -630,6 +838,13 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         case-insensitive, so soft-masked (lowercase) reference bases match.
         """
         from genoray._pgen import _read_psam
+        from genoray._svar._regions import _normalize_samples
+
+        if regions_overlap not in {"pos", "record", "variant"}:
+            raise ValueError(
+                "regions_overlap must be one of 'pos', 'record', or 'variant'; "
+                f"got {regions_overlap!r}"
+            )
 
         out = Path(out)
         source = Path(source)
@@ -656,30 +871,104 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             raise FileNotFoundError(psam)
         out.parent.mkdir(parents=True, exist_ok=True)
 
-        samples = cast("list[str]", _read_psam(psam).tolist())
-        n_samples = len(samples)
+        all_psam_samples = cast("list[str]", _read_psam(psam).tolist())
+        n_samples = len(all_psam_samples)
         if n_samples == 0:
             raise ValueError(f"No samples found in {psam}.")
+
+        # `sample_perm[out]` = the position, within the sorted subset pgenlib
+        # returns after `change_sample_subset`, that output column `out`
+        # (caller order) should read from. Identity when no subsetting is
+        # requested, so the Rust gather is byte-identical to a plain copy.
+        subset_idx: "NDArray[np.uint32] | None" = None
+        if samples is None:
+            selected_samples = all_psam_samples
+            sample_perm = list(range(n_samples))
+        else:
+            selected_samples = _normalize_samples(samples, all_psam_samples)
+            if not selected_samples:
+                raise ValueError("from_pgen requires at least one sample")
+            psam_index = {s: i for i, s in enumerate(all_psam_samples)}
+            sel_idx = [psam_index[s] for s in selected_samples]
+            sorted_idx = sorted(set(sel_idx))
+            pos_in_sorted = {orig: k for k, orig in enumerate(sorted_idx)}
+            sample_perm = [pos_in_sorted[i] for i in sel_idx]
+            subset_idx = np.asarray(sorted_idx, dtype=np.uint32)
 
         contigs, ranges, allele_idx_offsets = _pvar_contig_ranges(pvar)
         if not contigs:
             raise ValueError(f"No variants found in {pvar}.")
 
+        region_ranges = _normalize_svar2_regions(
+            regions,
+            contigs,
+            merge_overlapping=merge_overlapping,
+        )
+        _reject_multiregion_variant(region_ranges, regions_overlap)
+        if region_ranges:
+            covering = _pvar_covering_ranges(
+                pvar, contigs, ranges, region_ranges, regions_overlap
+            )
+            contigs = [c for c in contigs if c in covering]
+            ranges = [covering[c] for c in contigs]
+            if not contigs:
+                raise ValueError(
+                    f"No variants found in requested regions for {source}."
+                )
+
         if chunk_size is None:
-            chunk_size = _auto_chunk_size(n_samples)
+            chunk_size = _auto_chunk_size(len(selected_samples))
 
         import pgenlib
 
-        # One reader per contig: readers seek independently, so concurrent contigs
-        # must not share one. `allele_idx_offsets` is required (not just used) once
-        # any variant in the file is multiallelic -- it is a file-wide array, so
-        # every contig's reader is constructed with the same one.
+        # A pool of P readers per contig: readers seek independently, so
+        # concurrent shards (and concurrent contigs) must not share one. The
+        # Rust side caps the actual shard count at
+        # `min(processing_threads, len(pool))`, so `len(pool)` also bounds
+        # intra-contig sharding. `allele_idx_offsets` is required (not just
+        # used) once any variant in the file is multiallelic -- it is a
+        # file-wide array, so every reader is constructed with the same one.
+        # Readers are ALWAYS constructed with the full `.psam` sample count
+        # (`n_samples`) -- the file's raw on-disk cohort size, independent of any
+        # `samples=` subset, which is applied afterwards via change_sample_subset.
+        #
+        # P == 1 => PGEN sub-contig sharding is DISABLED (single reader per
+        # contig, byte-identical to the serial path). Rationale, from a
+        # reproducible sweep on carter-cn-02 over chr21c (~1M variants x 3202
+        # samples): single-reader conversion is already fast (~33s) and is
+        # bound by the shared executor/writer + reference I/O, NOT by pgenlib
+        # decode. So sub-contig sharding cannot beat that floor -- measured
+        # threads=24 sharding is NET SLOWER (44.9s vs 32.6s, 0.73x) because
+        # concurrent readers add coordination overhead and, on `pgenlib`<0.92,
+        # serialize on the CPython GIL (verified: 0 `nogil`/`prange` in
+        # 0.91.0's .pyx). Nor does bumping to a GIL-releasing pgenlib help:
+        # 0.94.1 parallelizes `read_alleles_range` decode via `prange`
+        # (nogil=True), yet the same conversion is unchanged at ~33s across
+        # OMP_NUM_THREADS 1..32 -- decode isn't the bottleneck, so the internal
+        # parallelism buys nothing here. (An earlier 273s/340s serial/sharded
+        # pair was a cluster-contention artifact and does not reproduce; the
+        # slower-when-sharded conclusion holds at both scales.) The intra-contig
+        # sharding machinery (plan_pgen_units, per-ordinal readers) is retained
+        # and validated byte-identical at 1M-variant scale for re-enablement
+        # only if a future reader/executor change shifts the bottleneck onto
+        # decode. See docs/roadmap/svar2-conversion-decision-2026-07-15.md and
+        # memory `pgenlib-holds-gil-sharded-reads`.
+        P = 1
         readers = [
-            pgenlib.PgenReader(
-                bytes(source), n_samples, allele_idx_offsets=allele_idx_offsets
-            )
+            [
+                pgenlib.PgenReader(
+                    bytes(source), n_samples, allele_idx_offsets=allele_idx_offsets
+                )
+                for _ in range(P)
+            ]
             for _ in contigs
         ]
+        if subset_idx is not None:
+            # `readers` is nested (a per-shard pool per contig, P readers each),
+            # so subset every reader in every pool.
+            for pool in readers:
+                for r in pool:
+                    r.change_sample_subset(subset_idx)
 
         _validate_check_ref(check_ref)
         return _core.run_pgen_conversion_pipeline(
@@ -689,7 +978,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             contigs,
             ranges,
             str(out),
-            samples,
+            selected_samples,
             chunk_size,
             threads,
             long_allele_capacity,
@@ -697,6 +986,9 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             signatures,
             readers,
             check_ref,
+            region_ranges,
+            regions_overlap,
+            sample_perm,
         )
 
     @classmethod
@@ -706,6 +998,9 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         sources: "str | Path | Sequence[str | Path]",
         reference: str | Path | None = None,
         *,
+        regions: "str | tuple[str, int, int] | PathLike | object | None" = None,
+        merge_overlapping: bool = False,
+        regions_overlap: "Literal['pos', 'record', 'variant']" = "pos",
         no_reference: bool = False,
         skip_out_of_scope: bool = False,
         ploidy: int = 2,
@@ -794,6 +1089,23 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         file's value, and a sample that doesn't carry the atom gets the
         field's default.
 
+        `regions` restricts the merge to one or more indexed VCF fetch
+        intervals, with the same convention as :meth:`from_vcf`:
+        ``"chrom:start-end"`` is 1-based inclusive (converted to 0-based
+        half-open); tuple/BED/frame inputs are already 0-based half-open.
+        Overlapping regions raise unless `merge_overlapping=True`.
+        `regions_overlap` controls which variants a region keeps, matching
+        bcftools --regions-overlap: "pos" (POS inside [start,end)), "record"
+        (POS in [start,end+1), so an indel at the region's last base is
+        kept), or "variant" (the anchor-trimmed variant extent overlaps the
+        region). In "variant" mode a multiallelic record is kept whole if ANY
+        of its alleles truly overlaps the region; individual non-overlapping
+        alleles are not dropped. The mode applies identically to every input
+        file in the merge.
+
+        `from_vcf_list` has no `samples` parameter -- each input is
+        single-sample and the cohort is defined by `sources`.
+
         Returns the number of out-of-scope (symbolic/breakend) ALTs dropped
         (0 unless `skip_out_of_scope`).
 
@@ -816,6 +1128,12 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         fixed count.
         """
         from cyvcf2 import VCF as _CyVCF
+
+        if regions_overlap not in {"pos", "record", "variant"}:
+            raise ValueError(
+                "regions_overlap must be one of 'pos', 'record', or 'variant'; "
+                f"got {regions_overlap!r}"
+            )
 
         out = Path(out)
 
@@ -862,6 +1180,25 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         if not contigs:
             raise ValueError("No variants found in any input.")
 
+        region_ranges = _normalize_svar2_regions(
+            regions,
+            sorted(contig_set),
+            merge_overlapping=merge_overlapping,
+        )
+        _reject_multiregion_variant(region_ranges, regions_overlap)
+        if regions is not None:
+            ranges_by_contig: dict[str, list[tuple[int, int]]] = {}
+            for chrom, start, end in region_ranges:
+                ranges_by_contig.setdefault(chrom, []).append((start, end))
+            contigs = [c for c in contigs if c in ranges_by_contig]
+            if not contigs:
+                raise ValueError("No requested regions match any input contig.")
+            region_ranges = [
+                (chrom, start, end)
+                for chrom in contigs
+                for start, end in ranges_by_contig[chrom]
+            ]
+
         # Field specs are resolved against the FIRST file's header -- every
         # input is single-sample and expected to share a header schema (same
         # assumption the reference/samples handling already makes).
@@ -890,6 +1227,8 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             info,
             format_,
             check_ref,
+            region_ranges,
+            regions_overlap,
         )
 
     @classmethod
@@ -899,6 +1238,10 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         source: str | Path,
         reference: str | Path | None = None,
         *,
+        regions: "str | tuple[str, int, int] | PathLike | object | None" = None,
+        samples: "str | Sequence[str] | PathLike | None" = None,
+        merge_overlapping: bool = False,
+        regions_overlap: "Literal['pos', 'record', 'variant']" = "pos",
         no_reference: bool = False,
         skip_out_of_scope: bool = False,
         chunk_size: int | None = None,
@@ -932,8 +1275,39 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         the offending record (including a REF that runs past the contig end)
         and continues, logging a per-contig count. Comparison is
         case-insensitive, so soft-masked (lowercase) reference bases match.
+
+        `regions` restricts conversion to one or more genomic ranges. Region
+        strings use Genoray's existing convention: ``"chrom:start-end"`` is
+        1-based inclusive and is converted to a 0-based half-open interval;
+        tuple/BED/frame inputs are already 0-based half-open. Overlapping
+        regions raise unless `merge_overlapping=True`. Unlike :meth:`from_pgen`,
+        SVAR1 has no on-disk covering-range index to narrow against, so a
+        selected contig's local variants are still scanned in full -- the
+        per-record filter (in the Rust `Svar1RecordSource`) is what actually
+        restricts the output.
+
+        `regions_overlap` controls which variants a region keeps, matching
+        bcftools --regions-overlap: "pos" (POS inside [start,end)), "record"
+        (POS in [start,end+1), so an indel at the region's last base is
+        kept), or "variant" (the anchor-trimmed variant extent overlaps the
+        region). In "variant" mode a multiallelic record is kept whole if ANY
+        of its alleles truly overlaps the region; individual non-overlapping
+        alleles are not dropped. (SVAR1 is itself biallelic-only, so this only
+        ever judges a single ALT.)
+
+        `samples` selects and reorders SVAR1 samples by name, preserving
+        caller order and de-duplicating first occurrences -- the store's
+        `available_samples` (and every decoded column) matches that order
+        exactly, regardless of each sample's original SVAR1 position.
         """
         from genoray._svar import SparseVar
+        from genoray._svar._regions import _normalize_samples
+
+        if regions_overlap not in {"pos", "record", "variant"}:
+            raise ValueError(
+                "regions_overlap must be one of 'pos', 'record', or 'variant'; "
+                f"got {regions_overlap!r}"
+            )
 
         out = Path(out)
         source = Path(source)
@@ -958,11 +1332,28 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
                 "from_svar1 supports only biallelic SVAR1 stores; this store has "
                 "multiallelic variants. Re-create it biallelically first."
             )
-        samples, ploidy, contigs, fields = _read_svar1_metadata(source)
-        n_samples = len(samples)
-        if n_samples == 0:
+        meta_samples, ploidy, contigs, fields = _read_svar1_metadata(source)
+        if len(meta_samples) == 0:
             raise ValueError(f"No samples found in {source}.")
 
+        # `sample_idx[out_s]` = the ORIGINAL SVAR1 sample index that output
+        # column `out_s` (`selected_samples[out_s]`) reads from. Identity when
+        # no subsetting is requested, so the Rust bucket remap is a no-op.
+        if samples is None:
+            selected_samples = meta_samples
+            sample_idx = list(range(len(meta_samples)))
+        else:
+            selected_samples = _normalize_samples(samples, meta_samples)
+            if not selected_samples:
+                raise ValueError("from_svar1 requires at least one sample")
+            sample_pos = {s: i for i, s in enumerate(meta_samples)}
+            sample_idx = [sample_pos[s] for s in selected_samples]
+
+        # `_svar1_index_arrays` must see the FULL contig list to compute
+        # correct GLOBAL variant-id starts (the CSR spans the whole store) --
+        # any region-based contig filtering happens AFTER, on its parallel
+        # per-contig outputs, never by re-deriving `starts` from a narrowed
+        # contig list.
         (
             starts,
             lens,
@@ -972,10 +1363,33 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             alt_bytes_pc,
             alt_off_pc,
         ) = _svar1_index_arrays(source, contigs)
+
+        region_ranges = _normalize_svar2_regions(
+            regions,
+            contigs,
+            merge_overlapping=merge_overlapping,
+        )
+        _reject_multiregion_variant(region_ranges, regions_overlap)
+        if region_ranges:
+            region_contigs = {c for c, _, _ in region_ranges}
+            keep = [i for i, c in enumerate(contigs) if c in region_contigs]
+            if not keep:
+                raise ValueError(
+                    f"No variants found in requested regions for {source}."
+                )
+            contigs = [contigs[i] for i in keep]
+            starts = [starts[i] for i in keep]
+            lens = [lens[i] for i in keep]
+            pos_pc = [pos_pc[i] for i in keep]
+            ref_bytes_pc = [ref_bytes_pc[i] for i in keep]
+            ref_off_pc = [ref_off_pc[i] for i in keep]
+            alt_bytes_pc = [alt_bytes_pc[i] for i in keep]
+            alt_off_pc = [alt_off_pc[i] for i in keep]
+
         format_tuples, src_dtypes = _svar1_fields_manifest(fields)
 
         if chunk_size is None:
-            chunk_size = _auto_chunk_size(n_samples, ploidy)
+            chunk_size = _auto_chunk_size(len(selected_samples), ploidy)
 
         out.parent.mkdir(parents=True, exist_ok=True)
         _validate_check_ref(check_ref)
@@ -986,7 +1400,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             starts,
             lens,
             str(out),
-            samples,
+            selected_samples,
             ploidy,
             chunk_size,
             threads,
@@ -1001,6 +1415,9 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             format_tuples,
             src_dtypes,
             check_ref,
+            region_ranges,
+            regions_overlap,
+            sample_idx,
         )
 
 
@@ -1101,6 +1518,71 @@ def _pvar_contig_ranges(
         contigs.append(str(chrom))
         ranges.append((int(lo), int(hi) + 1))
     return contigs, ranges, allele_idx_offsets
+
+
+def _pvar_covering_ranges(
+    pvar: Path,
+    contigs: list[str],
+    ranges: list[tuple[int, int]],
+    region_ranges: list[tuple[str, int, int]],
+    regions_overlap: str,
+) -> dict[str, tuple[int, int]]:
+    """Narrow each contig's `[lo, hi)` variant-index range (from
+    `_pvar_contig_ranges`) to the covering range of its `region_ranges`, via a
+    searchsorted over that contig's `.pvar` POS column.
+
+    This is ONLY an optimization for how much of the `.pgen`/`.pvar` gets
+    scanned -- the per-record Rust filter (`PgenRecordSource`, via
+    `svar2_view::keeps`/`extent_overlaps`) is the source of truth for which
+    variants are actually kept. The covering range returned here MUST include
+    every variant the per-record filter would keep, or a real match would
+    silently never reach the reader:
+
+    - **Upper bound** is safe to narrow for every mode: a variant whose
+      0-based POS lands at or past a region's end can never overlap it --
+      even a `"variant"`-mode extent can only start at or after POS, never
+      before it. `"record"` mode's effective end is one base past the
+      nominal end (mirrors `keeps`'s inclusive upper bound).
+    - **Lower bound** is only safe to narrow for `"pos"`/`"record"` (POS-
+      membership rules: a variant whose POS precedes every region's start can
+      never be kept). `"variant"` mode can keep a call whose POS precedes the
+      region but whose anchor-trimmed *extent* (e.g. a deletion) reaches into
+      it, so the lower bound stays at the contig's original `lo`.
+
+    Returns only the contigs with >= 1 region AND >= 1 covered variant.
+    """
+    from genoray._pgen import _scan_pvar
+
+    by_contig: dict[str, list[tuple[int, int]]] = {}
+    for chrom, start, end in region_ranges:
+        by_contig.setdefault(chrom, []).append((start, end))
+
+    contig_range = dict(zip(contigs, ranges))
+    pos_df = _scan_pvar(pvar).select("#CHROM", "POS").with_row_index("vidx").collect()
+
+    out: dict[str, tuple[int, int]] = {}
+    for chrom, regs in by_contig.items():
+        if chrom not in contig_range:
+            continue
+        lo, hi = contig_range[chrom]
+        # `.pvar` POS is 1-based; local index `i` (0-based, ascending within
+        # the contig) maps to global vidx `lo + i`.
+        pos = pos_df.filter(pl.col("#CHROM") == chrom).sort("vidx")["POS"].to_numpy()
+        min_start = min(s for s, _ in regs)
+        max_end = max(e for _, e in regs)
+
+        eff_end = max_end + 1 if regions_overlap == "record" else max_end
+        hi_local = int(np.searchsorted(pos, eff_end + 1, side="left"))
+
+        if regions_overlap == "variant":
+            lo_local = 0
+        else:
+            lo_local = int(np.searchsorted(pos, min_start + 1, side="left"))
+
+        new_lo, new_hi = lo + lo_local, lo + hi_local
+        if new_hi > new_lo:
+            out[chrom] = (new_lo, new_hi)
+    return out
 
 
 def _read_svar1_metadata(

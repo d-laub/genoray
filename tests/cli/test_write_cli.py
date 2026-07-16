@@ -53,6 +53,7 @@ def _vcf(d: Path, *, symbolic: bool) -> Path:
         '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n'
         "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS0\tS1\n"
         "chr1\t3\t.\tA\tG\t.\t.\t.\tGT\t1|0\t0|0\n"
+        "chr1\t7\t.\tC\tCAT\t.\t.\t.\tGT\t0|1\t1|1\n"
     )
     if symbolic:
         # POS 20 (1-based) in _REF is 'T'; the anchor REF base must match the
@@ -84,6 +85,60 @@ def test_write_no_reference(tmp_path: Path):
     r = _run(["write", str(vcf), str(out), "--no-reference", "--threads", "1"])
     assert r.returncode == 0, r.stderr
     assert (out / "meta.json").exists()
+
+
+def test_write_svar2_regions_and_samples(tmp_path: Path):
+    ref = _ref(tmp_path)
+    vcf = _vcf(tmp_path, symbolic=False)
+    out = tmp_path / "regioned"
+    r = _run(
+        [
+            "write",
+            str(vcf),
+            str(out),
+            "--reference",
+            str(ref),
+            "--regions",
+            "chr1:1-4",
+            "--samples",
+            "S0",
+            "--threads",
+            "1",
+        ]
+    )
+    assert r.returncode == 0, r.stderr
+    sv = SparseVar2(out)
+    assert sv.available_samples == ["S0"]
+    assert int(sv.region_counts("chr1", [(0, 40)]).sum()) == 1
+
+
+def test_write_svar2_regions_file_and_samples_file(tmp_path: Path):
+    ref = _ref(tmp_path)
+    vcf = _vcf(tmp_path, symbolic=False)
+    regions = tmp_path / "regions.bed"
+    regions.write_text("chr1\t3\t8\n")
+    samples = tmp_path / "samples.txt"
+    samples.write_text("S1\n")
+    out = tmp_path / "file_args"
+    r = _run(
+        [
+            "write",
+            str(vcf),
+            str(out),
+            "--reference",
+            str(ref),
+            "--regions-file",
+            str(regions),
+            "--samples-file",
+            str(samples),
+            "--threads",
+            "1",
+        ]
+    )
+    assert r.returncode == 0, r.stderr
+    sv = SparseVar2(out)
+    assert sv.available_samples == ["S1"]
+    assert int(sv.region_counts("chr1", [(0, 40)]).sum()) == 2
 
 
 def test_write_requires_reference_xor(tmp_path: Path):
@@ -200,6 +255,30 @@ def test_write_pgen_rejects_nondefault_ploidy(tmp_path: Path):
     assert "diploid" in (r.stdout + r.stderr).lower()
 
 
+def test_write_pgen_regions_dispatch_without_plink(tmp_path: Path):
+    """--regions/--samples now route to `from_pgen` (no longer VCF/BCF-only);
+    this exercises that dispatch without needing a real plink2-built PGEN --
+    a bare `.pgen` with no `.pvar` sibling fails deterministically inside
+    `from_pgen` itself (missing sibling), never with the old blanket
+    rejection message."""
+    pgen = tmp_path / "fake.pgen"
+    pgen.write_bytes(b"")
+    out = tmp_path / "fake.svar2"
+    r = _run(
+        [
+            "write",
+            str(pgen),
+            str(out),
+            "--no-reference",
+            "--regions",
+            "chr1:1-4",
+        ]
+    )
+    assert r.returncode != 0
+    assert "vcf/bcf only" not in (r.stdout + r.stderr).lower()
+    assert "pvar" in (r.stdout + r.stderr).lower()
+
+
 def test_write_svar1_still_works(tmp_path: Path):
     vcf = _vcf(tmp_path, symbolic=False)
     out = tmp_path / "v1.svar"
@@ -207,3 +286,98 @@ def test_write_svar1_still_works(tmp_path: Path):
     assert r.returncode == 0, r.stderr
     sv = SparseVar(out)
     assert sv.n_variants >= 1
+
+
+def test_write_pgen_regions_and_samples(tmp_path: Path):
+    """Task 6: --regions/--samples now route through to `from_pgen`."""
+    vcf = _vcf(tmp_path, symbolic=False)
+    pgen = _pgen(tmp_path, vcf)
+    out = tmp_path / "pgen_regioned.svar2"
+    r = _run(
+        [
+            "write",
+            str(pgen),
+            str(out),
+            "--no-reference",
+            "--regions",
+            "chr1:1-4",
+            "--samples",
+            "S1",
+            "--threads",
+            "1",
+        ]
+    )
+    assert r.returncode == 0, r.stderr
+    sv = SparseVar2(out)
+    assert sv.available_samples == ["S1"]
+
+
+def _single_sample_vcf(d: Path, name: str, sample: str, rows: str) -> Path:
+    """A single-sample bgzipped+indexed VCF, for the vcf-list (directory)
+    input form."""
+    header = (
+        "##fileformat=VCFv4.2\n"
+        "##contig=<ID=chr1,length=40>\n"
+        '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n'
+        f"#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t{sample}\n"
+    )
+    plain = d / f"{name}.vcf"
+    plain.write_text(header + rows)
+    gz = d / f"{name}.vcf.gz"
+    with open(gz, "wb") as fh:
+        subprocess.run(["bgzip", "-c", str(plain)], check=True, stdout=fh)
+    subprocess.run(["bcftools", "index", str(gz)], check=True)
+    return gz
+
+
+def test_write_vcf_list_rejects_samples(tmp_path: Path):
+    vcf_dir = tmp_path / "vcfs"
+    vcf_dir.mkdir()
+    _single_sample_vcf(vcf_dir, "a", "S0", "chr1\t3\t.\tA\tG\t.\t.\t.\tGT\t1|0\n")
+    _single_sample_vcf(vcf_dir, "b", "S1", "chr1\t7\t.\tC\tCAT\t.\t.\t.\tGT\t0|1\n")
+    out = tmp_path / "list_out"
+    r = _run(["write", str(vcf_dir), str(out), "--no-reference", "--samples", "S0"])
+    assert r.returncode != 0
+    assert "not supported for multi-file" in (r.stdout + r.stderr).lower()
+
+
+def test_write_vcf_list_dispatches(tmp_path: Path):
+    """Sanity check that the vcf-list (directory) form is actually reachable
+    (not just erroring) now that source-kind resolution routes it to
+    `from_vcf_list` instead of falling through to the single-VCF `from_vcf`
+    path (which would fail trying to bgzip-check/index a directory)."""
+    vcf_dir = tmp_path / "vcfs2"
+    vcf_dir.mkdir()
+    _single_sample_vcf(vcf_dir, "a", "S0", "chr1\t3\t.\tA\tG\t.\t.\t.\tGT\t1|0\n")
+    _single_sample_vcf(vcf_dir, "b", "S1", "chr1\t7\t.\tC\tCAT\t.\t.\t.\tGT\t0|1\n")
+    out = tmp_path / "list_out2"
+    r = _run(["write", str(vcf_dir), str(out), "--no-reference", "--threads", "1"])
+    assert r.returncode == 0, r.stderr
+    sv = SparseVar2(out)
+    assert sv.available_samples == ["S0", "S1"]
+
+
+def test_write_svar1_regions_and_samples(tmp_path: Path):
+    """Task 6: --regions/--samples now route through to `from_svar1` for a
+    `.svar` (SVAR1) source."""
+    vcf = _vcf(tmp_path, symbolic=False)
+    v1 = tmp_path / "v1.svar"
+    r = _run(["write", "svar1", str(vcf), str(v1), "--max-mem", "64m"])
+    assert r.returncode == 0, r.stderr
+
+    out = tmp_path / "v1_to_v2.svar2"
+    r = _run(
+        [
+            "write",
+            str(v1),
+            str(out),
+            "--no-reference",
+            "--samples",
+            "S1",
+            "--threads",
+            "1",
+        ]
+    )
+    assert r.returncode == 0, r.stderr
+    sv = SparseVar2(out)
+    assert sv.available_samples == ["S1"]

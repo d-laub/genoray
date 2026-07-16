@@ -7,6 +7,7 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 
 use genoray_core::normalize::CheckRef;
 use genoray_core::orchestrator::run_vcf_list;
+use genoray_core::svar2_view::OverlapMode;
 use rust_htslib::bcf::{Read, Reader};
 use std::fs;
 use std::time::Instant;
@@ -49,15 +50,17 @@ fn main() {
         std::slice::from_ref(chrom),
         out_dir,
         &samples,
-        25_000,          // chunk_size (later tasks may sweep this)
-        2,               // ploidy
-        None,            // max_threads = auto
-        8 * 1024 * 1024, // long_allele_capacity
-        false,           // skip_out_of_scope
-        CheckRef::Error, // check_ref (mirrors the from_vcf_list default "e")
-        false,           // signatures
-        Vec::new(),      // info_fields
-        Vec::new(),      // format_fields
+        25_000,           // chunk_size (later tasks may sweep this)
+        2,                // ploidy
+        None,             // max_threads = auto
+        8 * 1024 * 1024,  // long_allele_capacity
+        false,            // skip_out_of_scope
+        CheckRef::Error,  // check_ref (mirrors the from_vcf_list default "e")
+        false,            // signatures
+        Vec::new(),       // info_fields
+        Vec::new(),       // format_fields
+        Vec::new(),       // region_ranges: empty => whole contig, as the bench intends
+        OverlapMode::Pos, // overlap (inert with no regions; mirrors the default)
     )
     .expect("run_vcf_list");
     eprintln!(

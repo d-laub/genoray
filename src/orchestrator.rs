@@ -2,6 +2,7 @@
 use crossbeam_channel::bounded;
 use std::fs;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 
@@ -39,21 +40,49 @@ parallel memory architecture.
 
 */
 
+/// Over-decompose VCF work units beyond the worker count so the work-stealing
+/// collector (`shard_exec::run`) can absorb density skew across the contig --
+/// more shards than workers means an idle worker always has something to
+/// steal. 4 is a starting value to be tuned from benchmark imbalance data.
+///
+/// VCF-only: PGEN is intentionally NOT over-decomposed here. `readers_pool`
+/// provisions exactly one `pgenlib.PgenReader` per potential shard
+/// (`max_shards` caps `readers.len()`), and pgenlib holds the GIL through its
+/// decode, so concurrent PGEN shard reads are GIL-serialized -- sharding adds
+/// pure overhead there rather than parallelism (see the convoy fix fa47530;
+/// reproducible chr21c benchmark: 44.9s sharded vs 32.6s serial -- PGEN
+/// conversion is already fast and executor/IO-bound, not decode-bound, so PGEN
+/// sub-contig sharding is disabled by default at the Python layer). See the
+/// `SourceSpec::Pgen` branch below for the unchanged `max_shards` calc.
+pub(crate) const OVERSHARD_FACTOR: usize = 4;
+
 /// Which backend a contig's records come from. Everything downstream of
 /// `ChunkAssembler` is identical for both.
 pub enum SourceSpec {
     Vcf {
         vcf_path: String,
         htslib_threads: usize,
+        regions: Vec<(u32, u32)>,
+        overlap: crate::svar2_view::OverlapMode,
     },
     Pgen {
         pgen_path: String,
         pvar_path: String,
         var_start: usize,
         var_end: usize,
-        /// A `pgenlib.PgenReader` for THIS contig. Readers seek independently, so
-        /// each concurrent contig needs its own -- never share one.
-        reader: pyo3::Py<pyo3::PyAny>,
+        /// A pool of `pgenlib.PgenReader`s for THIS contig, one per potential
+        /// shard. Readers seek independently, so each concurrent shard needs
+        /// its own -- never share one. `readers.len()` upper-bounds how many
+        /// shards this contig can be split into. (Sub-contig PGEN sharding is
+        /// disabled at the Python layer -- `from_pgen` pins P=1 -- so at runtime
+        /// this pool holds exactly one reader and the sharded branch below is
+        /// dead; kept as intact infrastructure pending a pgenlib GIL fix.)
+        readers: Vec<pyo3::Py<pyo3::PyAny>>,
+        regions: Vec<(u32, u32)>,
+        overlap: crate::svar2_view::OverlapMode,
+        /// Same permutation for every contig -- one cohort-wide sample
+        /// selection, not per-contig. See `PgenRecordSource::sample_perm`.
+        sample_perm: Vec<usize>,
     },
     /// `SparseVar2.from_vcf_list`: N single-sample VCFs with possibly disjoint
     /// site lists, k-way merged into ONE record stream (`VcfListRecordSource`).
@@ -65,6 +94,8 @@ pub enum SourceSpec {
         /// files are open concurrently per contig, unlike the single-file
         /// `Vcf` variant.
         htslib_threads: usize,
+        regions: Vec<(u32, u32)>,
+        overlap: crate::svar2_view::OverlapMode,
     },
     Svar1 {
         svar1_dir: String,
@@ -77,6 +108,12 @@ pub enum SourceSpec {
         alt_offsets: Vec<i64>,
         format_fields: Vec<crate::field::FieldSpec>,
         format_src_dtypes: Vec<String>,
+        regions: Vec<(u32, u32)>,
+        overlap: crate::svar2_view::OverlapMode,
+        /// Original SVAR1 sample indices, in OUTPUT/caller order -- same
+        /// permutation for every contig, one cohort-wide sample selection, not
+        /// per-contig. See `Svar1RecordSource::new`'s bucket remap.
+        sample_idx: Vec<usize>,
     },
 }
 
@@ -115,6 +152,94 @@ impl crate::record_source::RecordSource for VcfListDroppedProxy {
                 .store(self.inner.ref_excluded(), Ordering::Relaxed);
         }
         Ok(rec)
+    }
+}
+
+/// Emit the per-contig `check_ref=x` exclusion summary (nothing when none were
+/// excluded). Shared by the single-reader and sub-contig-sharded paths so both
+/// report the same line; the sharded path sums the count across shards first.
+fn report_ref_excluded(chrom: &str, ref_excluded: u64) {
+    if ref_excluded > 0 {
+        println!(
+            "[{chrom}] check_ref=x: excluded {ref_excluded} record(s) whose REF \
+             disagreed with the reference FASTA."
+        );
+    }
+}
+
+fn with_vcf_shard_context(
+    err: ConversionError,
+    chrom: &str,
+    shard: crate::vcf_reader::VcfShard,
+) -> ConversionError {
+    let label = format!(
+        "VCF shard {chrom} ordinal {} ownership [{}, {}) fetch [{}, {})",
+        shard.ordinal, shard.own_start, shard.own_end, shard.fetch_start, shard.fetch_end
+    );
+    match err {
+        ConversionError::Input(msg) => ConversionError::Input(format!("{label} failed: {msg}")),
+        ConversionError::ContigNotInHeader { chrom: missing } => ConversionError::Input(format!(
+            "{label} failed: Chromosome '{missing}' not found in VCF header"
+        )),
+        ConversionError::Io { context, source } => ConversionError::Io {
+            context: format!("{label} failed while {context}"),
+            source,
+        },
+        ConversionError::MissingFile { path } => ConversionError::MissingFile {
+            path: format!("{path} ({label})"),
+        },
+        ConversionError::WorkerPanicked { thread } => ConversionError::WorkerPanicked {
+            thread: format!("{thread} ({label})"),
+        },
+        ConversionError::Npy { path, source } => ConversionError::Npy {
+            path: format!("{path} ({label})"),
+            source,
+        },
+        ConversionError::ReadNpy { path, source } => ConversionError::ReadNpy {
+            path: format!("{path} ({label})"),
+            source,
+        },
+    }
+}
+
+/// Generic PGEN-shard error decorator, mirroring `with_vcf_shard_context`'s
+/// per-arm structure. PGEN has no VCF-style header/error strings to special-
+/// case, so every arm gets the same shard-region label prefix. `unit.own_*`
+/// are 0-based reference *positions* (ownership is position-based -- see
+/// `chunk_assembler::ChunkAssembler::with_reference`); `unit.fetch_*` are
+/// absolute `.pvar`/`.pgen` variant indices.
+fn with_pgen_shard_context(
+    err: ConversionError,
+    chrom: &str,
+    unit: &crate::shard::WorkUnit,
+) -> ConversionError {
+    let label = format!(
+        "PGEN shard {chrom} ordinal {} owned pos [{}, {}) fetch var [{}, {})",
+        unit.ordinal, unit.own_start, unit.own_end, unit.fetch_start, unit.fetch_end
+    );
+    match err {
+        ConversionError::Input(msg) => ConversionError::Input(format!("{label} failed: {msg}")),
+        ConversionError::ContigNotInHeader { chrom: missing } => {
+            ConversionError::Input(format!("{label} failed: Chromosome '{missing}' not found"))
+        }
+        ConversionError::Io { context, source } => ConversionError::Io {
+            context: format!("{label} failed while {context}"),
+            source,
+        },
+        ConversionError::MissingFile { path } => ConversionError::MissingFile {
+            path: format!("{path} ({label})"),
+        },
+        ConversionError::WorkerPanicked { thread } => ConversionError::WorkerPanicked {
+            thread: format!("{thread} ({label})"),
+        },
+        ConversionError::Npy { path, source } => ConversionError::Npy {
+            path: format!("{path} ({label})"),
+            source,
+        },
+        ConversionError::ReadNpy { path, source } => ConversionError::ReadNpy {
+            path: format!("{path} ({label})"),
+            source,
+        },
     }
 }
 
@@ -197,23 +322,6 @@ pub fn process_chromosome(
         stop_sampler.clone(),
     );
 
-    // Dedicated rayon pool for the reader's intra-chunk presence packing. Sized to
-    // the idle cores (budget::plan_thread_budget). Built even at size 1 so the
-    // reader always has a handle; parallel packing self-gates off below 2 threads.
-    // NOTE (multi-contig): process_chromosome runs once per concurrent contig, and
-    // each builds a pool of `processing_threads` — the *global* idle-core count — so
-    // N concurrent contigs allocate N pools and can oversubscribe. This is deliberate
-    // and harmless: the target is the single-contig case (concurrent == 1, exact fit),
-    // and profiling (roadmap M14) shows packing is <0.05% of reader time, so the extra
-    // threads sit idle. Divide by concurrent_chroms here if packing ever grows costly.
-    let processing_pool = Arc::new(
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(processing_threads.max(1))
-            .thread_name(|i| format!("pack-{}", i))
-            .build()
-            .expect("build processing pool"),
-    );
-
     // Step 1 -> The Producer
     let reader_thread = thread::Builder::new()
         .name(format!("read-{}", chrom))
@@ -222,7 +330,6 @@ pub fn process_chromosome(
             let chr = chrom.to_string();
             // Convert references into owned Strings that can safely live forever in the thread
             let s_owned: Vec<String> = samples.iter().map(|&s| s.to_string()).collect();
-            let pool = Arc::clone(&processing_pool);
             let fields_owned: Vec<crate::field::FieldSpec> = fields.to_vec();
 
             move || -> Result<u64, ConversionError> {
@@ -236,31 +343,273 @@ pub fn process_chromosome(
                     SourceSpec::Vcf {
                         vcf_path,
                         htslib_threads,
-                    } => Box::new(crate::vcf_reader::VcfRecordSource::new(
-                        &vcf_path,
-                        &chr,
-                        &s_refs,
-                        htslib_threads,
-                        ploidy,
-                        &fields_owned,
-                    )?),
+                        regions,
+                        overlap,
+                    } => {
+                        // Sub-contig sharding tiles the coalesced regions into
+                        // POS-ownership ranges and dedups every record by POS
+                        // (`ChunkAssembler.owned_range`). That composes with the
+                        // region filter ONLY when the overlap semantics ARE that
+                        // POS partition -- i.e. `Pos` mode, which the whole-contig
+                        // default also uses. Under `Record` (keeps `POS == q_end`,
+                        // one base past every shard's half-open own-range) or
+                        // `Variant` (keeps a deletion whose POS precedes the region
+                        // but whose extent spans in -- a POS owned by no shard),
+                        // POS-ownership would silently drop kept records, breaking
+                        // byte-identity. Those two modes are only ever set with an
+                        // explicit user region, so they take the single reader
+                        // below, where `VcfRecordSource` applies the exact
+                        // per-record predicate. For `Pos`, passing each shard's
+                        // padded fetch window as the reader's `regions` with `Pos`
+                        // reproduces the whole-contig split byte-for-byte
+                        // (`query_window(Pos)` is identity; `keeps(Pos, ..)` is the
+                        // half-open POS test the pre-region sharded reader used).
+                        let shards = if overlap == crate::svar2_view::OverlapMode::Pos {
+                            crate::vcf_reader::plan_vcf_shards(
+                                &regions,
+                                &chr,
+                                processing_threads.saturating_mul(OVERSHARD_FACTOR),
+                                chunk_size as u32,
+                            )?
+                        } else {
+                            Vec::new()
+                        };
+                        if shards.len() > 1 {
+                            let (ref_seq, has_reference) = match fasta.as_deref() {
+                                Some(path) => (
+                                    Arc::new(crate::vcf_reader::load_contig_seq(path, &chr)?),
+                                    true,
+                                ),
+                                None => (Arc::new(Vec::new()), false),
+                            };
+                            let units: Vec<crate::shard::WorkUnit> = shards
+                                .iter()
+                                .map(|s| crate::shard::WorkUnit {
+                                    own_start: s.own_start,
+                                    own_end: s.own_end,
+                                    fetch_start: s.fetch_start,
+                                    fetch_end: s.fetch_end,
+                                    ordinal: s.ordinal,
+                                })
+                                .collect();
+                            let totals = crate::shard_exec::run(
+                                units,
+                                processing_threads,
+                                |unit| {
+                                    let source = crate::vcf_reader::VcfRecordSource::new(
+                                        &vcf_path,
+                                        &chr,
+                                        &s_refs,
+                                        1, // htslib_threads: many concurrent shard readers, keep each small
+                                        ploidy,
+                                        &fields_owned,
+                                        // The shard's padded fetch window IS the
+                                        // reader's region; `Pos` makes the fetch
+                                        // unwidened and the per-record filter the
+                                        // plain half-open POS test. `owned_range`
+                                        // (below) does the cross-shard POS dedup.
+                                        vec![(unit.fetch_start, unit.fetch_end)],
+                                        crate::svar2_view::OverlapMode::Pos,
+                                    )?;
+                                    Ok(crate::chunk_assembler::ChunkAssembler::with_reference(
+                                        Box::new(source),
+                                        s_refs.len(),
+                                        ploidy,
+                                        Arc::clone(&ref_seq),
+                                        has_reference,
+                                        skip_out_of_scope,
+                                        check_ref,
+                                        &fields_owned,
+                                        Some((unit.own_start, unit.own_end)),
+                                    ))
+                                },
+                                |e, unit| {
+                                    with_vcf_shard_context(
+                                        e,
+                                        &chr,
+                                        crate::vcf_reader::VcfShard::from(*unit),
+                                    )
+                                },
+                                chunk_size,
+                                &tx_dense,
+                            )?;
+                            report_ref_excluded(&chr, totals.ref_excluded);
+                            return Ok(totals.dropped_out_of_scope);
+                        }
+                        Box::new(crate::vcf_reader::VcfRecordSource::new(
+                            &vcf_path,
+                            &chr,
+                            &s_refs,
+                            htslib_threads,
+                            ploidy,
+                            &fields_owned,
+                            regions,
+                            overlap,
+                        )?)
+                    }
                     SourceSpec::Pgen {
                         pgen_path: _,
                         pvar_path,
                         var_start,
                         var_end,
-                        reader,
-                    } => Box::new(crate::pgen_reader::PgenRecordSource::new(
-                        reader,
-                        &pvar_path,
-                        var_start,
-                        var_end,
-                        s_refs.len(),
-                        chunk_size,
-                    )?),
+                        readers,
+                        regions,
+                        overlap,
+                        sample_perm,
+                    } => {
+                        // Ownership is by POSITION (see ChunkAssembler::with_reference),
+                        // but the split is by INDEX (plan_pgen_units) -- so read this
+                        // contig's .pvar positions up front to translate index-range
+                        // shards into contiguous, gap-free position ranges. Every
+                        // variant (including co-located multiallelic groups sharing a
+                        // position) is then owned by exactly one shard.
+                        let mut positions: Vec<u32> = Vec::with_capacity(var_end - var_start);
+                        {
+                            let mut pvar = crate::pvar::PvarReader::open(&pvar_path, var_start)?;
+                            for _ in var_start..var_end {
+                                match pvar.next_variant()? {
+                                    Some(rec) => positions.push(rec.pos),
+                                    None => break,
+                                }
+                            }
+                        }
+                        let n = positions.len();
+                        // Deliberately NOT over-decomposed with `OVERSHARD_FACTOR`
+                        // (VCF-only, see its doc comment): pgenlib holds the GIL
+                        // through its decode, so concurrent PGEN shard reads are
+                        // GIL-serialized -- extra shards here would add pure
+                        // overhead to an already GIL-bound path rather than
+                        // improving stealing (fa47530 fixed a convoy from this;
+                        // full chr21c: 340s sharded vs 273s serial). This also
+                        // stays capped at `readers.len()` because each concurrent
+                        // shard needs its own dedicated `pgenlib.PgenReader` --
+                        // `readers_pool` provisions exactly one per potential
+                        // shard, indexed by ordinal.
+                        //
+                        // Sharding is additionally restricted to `Pos` overlap:
+                        // like the VCF path, POS-ownership dedup only reproduces
+                        // `Record`/`Variant` semantics for `Pos`, so those modes
+                        // (only set with an explicit user region) take the
+                        // single-reader fallback where `PgenRecordSource` applies
+                        // the exact per-record predicate. This is belt-and-braces
+                        // -- `from_pgen` pins P=1, so `readers.len() == 1` already
+                        // forces the fallback regardless of overlap mode.
+                        let max_shards = if overlap == crate::svar2_view::OverlapMode::Pos {
+                            processing_threads.min(readers.len()).max(1)
+                        } else {
+                            1
+                        };
+                        let punits = crate::pgen_shard::plan_pgen_units(
+                            &positions,
+                            max_shards,
+                            crate::normalize::L_MAX,
+                        );
+                        if punits.len() <= 1 {
+                            // Single-reader fallback: identical to today's behavior.
+                            let reader = readers
+                                .into_iter()
+                                .next()
+                                .expect("caller provisions >= 1 PGEN reader per contig");
+                            Box::new(crate::pgen_reader::PgenRecordSource::new(
+                                reader,
+                                &pvar_path,
+                                var_start,
+                                var_end,
+                                s_refs.len(),
+                                chunk_size,
+                                regions,
+                                overlap,
+                                sample_perm,
+                            )?)
+                        } else {
+                            let (ref_seq, has_reference) = match fasta.as_deref() {
+                                Some(path) => (
+                                    Arc::new(crate::vcf_reader::load_contig_seq(path, &chr)?),
+                                    true,
+                                ),
+                                None => (Arc::new(Vec::new()), false),
+                            };
+                            let units: Vec<crate::shard::WorkUnit> = punits
+                                .iter()
+                                .map(|u| {
+                                    let own_start = if u.own_lo == 0 {
+                                        0
+                                    } else {
+                                        positions[u.own_lo]
+                                    };
+                                    let own_end = if u.own_hi == n {
+                                        u32::MAX
+                                    } else {
+                                        positions[u.own_hi]
+                                    };
+                                    crate::shard::WorkUnit {
+                                        own_start,
+                                        own_end,
+                                        fetch_start: (var_start + u.fetch_lo) as u32,
+                                        fetch_end: (var_start + u.fetch_hi) as u32,
+                                        ordinal: u.ordinal,
+                                    }
+                                })
+                                .collect();
+                            // Each shard needs a UNIQUE reader (readers seek
+                            // independently), but `make_assembler` below is `Fn + Sync`
+                            // and shared across worker threads -- a `Mutex<Option<_>>`
+                            // per ordinal lets each worker take its one reader exactly
+                            // once. `unit.ordinal < readers.len()` always holds because
+                            // `max_shards` (and therefore `punits.len()`) is capped at
+                            // `readers.len()` above.
+                            let readers_pool: Vec<Mutex<Option<pyo3::Py<pyo3::PyAny>>>> =
+                                readers.into_iter().map(|r| Mutex::new(Some(r))).collect();
+                            let totals = crate::shard_exec::run(
+                                units,
+                                processing_threads,
+                                |unit| {
+                                    let reader = readers_pool[unit.ordinal]
+                                        .lock()
+                                        .unwrap()
+                                        .take()
+                                        .expect("pgen reader taken twice");
+                                    let source = crate::pgen_reader::PgenRecordSource::new(
+                                        reader,
+                                        &pvar_path,
+                                        unit.fetch_start as usize,
+                                        unit.fetch_end as usize,
+                                        s_refs.len(),
+                                        chunk_size,
+                                        // Sharding is `Pos`-only (see `max_shards`),
+                                        // so each shard applies the plain half-open
+                                        // POS filter over its own region slice while
+                                        // `owned_range` dedups; cloned because the
+                                        // closure runs once per shard.
+                                        regions.clone(),
+                                        overlap,
+                                        sample_perm.clone(),
+                                    )?;
+                                    Ok(crate::chunk_assembler::ChunkAssembler::with_reference(
+                                        Box::new(source),
+                                        s_refs.len(),
+                                        ploidy,
+                                        Arc::clone(&ref_seq),
+                                        has_reference,
+                                        skip_out_of_scope,
+                                        check_ref,
+                                        &fields_owned,
+                                        Some((unit.own_start, unit.own_end)),
+                                    ))
+                                },
+                                |e, unit| with_pgen_shard_context(e, &chr, unit),
+                                chunk_size,
+                                &tx_dense,
+                            )?;
+                            report_ref_excluded(&chr, totals.ref_excluded);
+                            return Ok(totals.dropped_out_of_scope);
+                        }
+                    }
                     SourceSpec::VcfList {
                         vcf_paths,
                         htslib_threads,
+                        regions,
+                        overlap,
                     } => {
                         let ref_seq_opt: Option<Vec<u8>> = match fasta.as_deref() {
                             Some(f) => Some(crate::vcf_reader::load_contig_seq(f, &chr)?),
@@ -276,6 +625,8 @@ pub fn process_chromosome(
                             skip_out_of_scope,
                             check_ref,
                             &fields_owned,
+                            regions,
+                            overlap,
                         )?;
                         Box::new(VcfListDroppedProxy {
                             inner: vcf_list,
@@ -294,6 +645,9 @@ pub fn process_chromosome(
                         alt_offsets,
                         format_fields,
                         format_src_dtypes,
+                        regions,
+                        overlap,
+                        sample_idx,
                     } => Box::new(crate::svar1_reader::Svar1RecordSource::new(
                         &svar1_dir,
                         contig_start,
@@ -307,8 +661,23 @@ pub fn process_chromosome(
                         alt_offsets,
                         &format_fields,
                         &format_src_dtypes,
+                        regions,
+                        overlap,
+                        sample_idx,
                     )?),
                 };
+
+                // Dedicated rayon pool for reader-side CPU work: bounded per-record
+                // normalization batches plus intra-chunk presence packing. The
+                // sharded VCF branch above returns before this point because its
+                // independent indexed readers consume the same `processing_threads`
+                // budget directly; building both would double-reserve cores.
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(processing_threads.max(1))
+                    .thread_name(|i| format!("pack-{}", i))
+                    .build()
+                    .expect("build processing pool");
+
                 let mut reader = crate::chunk_assembler::ChunkAssembler::new(
                     src,
                     s_refs.len(),
@@ -326,14 +695,10 @@ pub fn process_chromosome(
                     tx_dense.send(dense_chunk).unwrap();
                     chunk_id += 1;
                 }
-                let ref_excluded =
-                    reader.ref_excluded() + vcf_list_ref_excluded.load(Ordering::Relaxed);
-                if ref_excluded > 0 {
-                    println!(
-                        "[{chr}] check_ref=x: excluded {ref_excluded} record(s) whose REF \
-                         disagreed with the reference FASTA."
-                    );
-                }
+                report_ref_excluded(
+                    &chr,
+                    reader.ref_excluded() + vcf_list_ref_excluded.load(Ordering::Relaxed),
+                );
                 Ok(reader.dropped_out_of_scope() + vcf_list_dropped.load(Ordering::Relaxed))
             }
         })
@@ -604,6 +969,8 @@ pub fn run_vcf_list(
     signatures: bool,
     info_fields: Vec<(String, String, String, Option<String>, Option<f64>)>,
     format_fields: Vec<(String, String, String, Option<String>, Option<f64>)>,
+    region_ranges: Vec<(String, u32, u32)>,
+    overlap: crate::svar2_view::OverlapMode,
 ) -> Result<u64, ConversionError> {
     // Each open input file uses its own small, fixed HTSlib thread allocation
     // (there are N files open at once per contig, unlike the single-file
@@ -615,6 +982,12 @@ pub fn run_vcf_list(
     let mut raw = info_fields;
     raw.extend(format_fields);
     let fields = crate::field::parse_manifest(raw)?;
+
+    let mut ranges_by_chrom: std::collections::HashMap<String, Vec<(u32, u32)>> =
+        std::collections::HashMap::new();
+    for (chrom, start, end) in region_ranges {
+        ranges_by_chrom.entry(chrom).or_default().push((start, end));
+    }
 
     let available_cores = match max_threads {
         Some(t) if t > 0 => {
@@ -651,6 +1024,8 @@ pub fn run_vcf_list(
             SourceSpec::VcfList {
                 vcf_paths: vcf_paths.to_vec(),
                 htslib_threads: VCF_LIST_HTSLIB_THREADS,
+                regions: ranges_by_chrom.get(chrom).cloned().unwrap_or_default(),
+                overlap,
             },
             fasta_ref,
             chrom,
