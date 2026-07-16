@@ -32,6 +32,9 @@ svar2-codec = { path = "svar2-codec" }
 thiserror = "2"
 # .pvar.zst decompression for the PGEN record source. BSD-3/MIT; no plink-ng code.
 zstd = { version = "0.13", optional = true }
+# Heap profiling for the from_vcf_list bench binary only (gated behind `dhat-heap`,
+# never compiled into the shipped _core cdylib).
+dhat = { version = "0.3", optional = true }
 
 [dev-dependencies]
 proptest = "1.11.0"
@@ -52,6 +55,10 @@ extension-module = ["pyo3/extension-module"]
 # abi3`) so lint hooks (default features) and `cargo test --no-default-features`
 # stay unaffected. abi3-py310 => one cpXY-abi3 wheel covers Python 3.10-3.13.
 abi3 = ["pyo3/abi3-py310"]
+# Heap profiling for the from_vcf_list bench binary only; pulls in the dhat
+# allocator, which the binary installs behind this same cfg. Never enabled for
+# the shipped cdylib.
+dhat-heap = ["dep:dhat"]
 
 [workspace]
 members = ["svar2-codec"]
@@ -62,3 +69,9 @@ members = ["svar2-codec"]
 [profile.profiling]
 inherits = "release"
 debug = true
+
+# Native driver for orchestrator::run_vcf_list — the clean target for dhat / perf /
+# callgrind / cargo-show-asm (no Python in the loop). Needs the conversion pipeline.
+[[bin]]
+name = "bench_from_vcf_list"
+required-features = ["conversion"]
