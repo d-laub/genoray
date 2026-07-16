@@ -70,6 +70,7 @@ fn convert(
             vcf_path: bcf.to_str().unwrap().to_string(),
             htslib_threads: 1,
             regions: Vec::new(),
+            overlap: genoray_core::svar2_view::OverlapMode::Pos,
         },
         Some(fasta.to_str().unwrap()),
         "chr1",
@@ -160,11 +161,13 @@ fn vcf_list_ref_mismatch_excluded_under_x() {
         2,
         Some(1),
         8 * 1024 * 1024,
-        false,             // skip_out_of_scope
-        CheckRef::Exclude, // NEW
-        false,             // signatures
-        Vec::new(),        // info_fields
-        Vec::new(),        // format_fields
+        false,                                      // skip_out_of_scope
+        CheckRef::Exclude,                          // NEW
+        false,                                      // signatures
+        Vec::new(),                                 // info_fields
+        Vec::new(),                                 // format_fields
+        Vec::new(),                                 // region_ranges
+        genoray_core::svar2_view::OverlapMode::Pos, // overlap
     )
     .unwrap();
     assert_eq!(

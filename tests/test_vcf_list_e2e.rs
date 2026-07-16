@@ -268,6 +268,7 @@ fn vcf_list_e2e_regions_restricts_merge() {
         Some(1),
         8_388_608,
         false,
+        CheckRef::Error,
         false,
         Vec::new(),
         Vec::new(),

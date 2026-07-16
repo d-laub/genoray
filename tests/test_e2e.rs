@@ -1002,6 +1002,7 @@ fn regions_overlap_variant_keeps_spanning_deletion_e2e() {
             2,
             4096,
             false,
+            genoray_core::normalize::CheckRef::Error,
             1,     // processing_threads
             false, // signatures
             &[],   // fields
