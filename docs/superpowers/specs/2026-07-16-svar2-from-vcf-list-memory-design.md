@@ -297,16 +297,62 @@ per chunk**: O(carriers_in_chunk + columns), using the bucket counts as the
 Expected at N=7089 genome-wide: **~524 billion strided bit-tests → ~58M operations
 (~9,000×)**, and churn sites #1+#2 (**67% of all allocation churn**) drop by ~N×.
 
-### 3.1a Rejected alternative: two-pass, sample-parallel
+### 3.1a Design B — two-pass, sample-parallel: deferred, but may well win
 
-Build the union var_key index first (heap merge, O(V log N)), then emit each sample's
-calls independently from its own file (O(v_per_file) each, embarrassingly parallel).
-Genuinely linear and parallel, and it would retire the all-files-open design outright.
+**Not rejected. Deferred, with explicit triggers to adopt it.** Design A (§3.1) fixes the
+*asymptote*; Design B additionally fixes the *constant and the parallelism*, and it is a
+strictly better end state. It is deferred only because it is a rewrite, not because it is
+worse.
 
-**Rejected for now**: it reads every input twice and is a rewrite of the orchestrator
-rather than a change to the seam, while §3.1 reaches the same asymptote by extending work
-already required for the memory fix. Worth revisiting if the per-sample fan-out is ever
-wanted for other reasons.
+**Shape.**
+
+- **Pass 1** — merge only the `var_key`s (position/REF/ALT) across all N files via the
+  existing frontier heap, producing the union variant index. No genotypes, no fields, so
+  per-record cost is a fraction of today's.
+- **Pass 2** — for each sample independently, walk its own file, look up each variant's
+  id in the union index, and append to that sample's stream. O(v_per_file) per sample,
+  **embarrassingly parallel across cores**.
+
+**Why it may beat Design A on wall-clock, even though both are linear.** The production
+log shows `read≈99% exec=0%` — **one core busy out of eight**. Design A keeps that: the
+k-way merge is inherently serial, so A converts an O(N²) serial merge into an O(N) serial
+merge. Design B's pass 2 is per-sample independent work with no shared state, so it
+scales with cores. On the 8-core production job that is up to another ~8×; on a big node,
+more.
+
+**And it dissolves three other problems structurally**, rather than mitigating them:
+
+| problem | Design A | Design B |
+|---|---|---|
+| O(N²) scan | fixed | fixed |
+| allocation churn / arenas | fixed (carrier lists) | fixed (never widens) |
+| **serial read phase (1 of 8 cores)** | unchanged | **parallel per sample** |
+| **N files open at once** | unchanged (§3.2 mitigates threads) | **~cores files open in pass 2** |
+| **`ulimit -n` / `_check_fd_budget` ceiling** | unchanged | **retired** |
+| store layout | needs a counting sort to reach sample-major | **already sample-major — emits it natively** |
+
+That last row matters: the store *is* sample-major, which is exactly what B produces
+without the per-chunk counting sort Design A needs.
+
+**Costs.** Reads every input twice — though the files are ~97 KB each and page-cached
+from pass 1, so the second read is close to free. Pass 1 still needs the k-way merge
+across N files (only the fd/thread cost of pass 2 is bounded), unless pass 1 is itself
+batched — cheap to do, since var_keys alone are small. Chiefly, it is an orchestrator
+rewrite rather than a change at one seam.
+
+**Adopt Design B if any of these hold after A lands** — decide on measurements, not
+taste:
+
+1. **A is linear but still slow.** If the N-sweep (§5) confirms linear scaling yet
+   wall-clock at N=7089 is still hours, the remaining lever is the idle 7 cores, and
+   that is B.
+2. **`read≈99% exec=0%` persists.** A does not touch the serial structure; if the read
+   phase is still one-core-bound after A, B is the only design here that changes it.
+3. **The fd/open-files ceiling bites again.** `_check_fd_budget` and #122's contig-6
+   index-seek failure both trace to holding N files open. B bounds pass 2 to ~cores.
+
+Design A is not wasted work if B follows: `Carriers`, the route-before-densify inversion,
+and the field plumbing are all reused by B's pass 2. **A is the incremental half of B.**
 
 ### 3.2 Stop the per-contig thread storm
 
