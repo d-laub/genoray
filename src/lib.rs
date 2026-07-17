@@ -81,6 +81,11 @@ pub mod shard;
 #[cfg(feature = "conversion")]
 pub mod shard_exec;
 pub mod spine;
+// NOTE: `svar1_query` is ungated even though `svar1_reader` (the conversion-side
+// SVAR1 RecordSource) is gated: it reads the same raw mmap'd buffers but has zero
+// htslib/zstd dependency (memmap2 + bytemuck + `search.rs` only), and gvl links it
+// with `default-features = false`. Same reasoning as `query` above.
+pub mod svar1_query;
 // NOTE: `streams` (StreamTag/StreamMap/REGISTRY) is *not* conversion-only despite
 // being in the original gate list: query-core `rvk.rs` and `types.rs` depend on it
 // unconditionally (StreamMap is a real struct field / decode-path type, not just an
