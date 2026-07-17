@@ -679,7 +679,11 @@ def test_from_vcf_list_auto_chunk_size(tmp_path, monkeypatch):
         return real_pipeline(paths, ref, contigs, out, samples, chunk_size, *rest)
 
     monkeypatch.setattr(sv2._core, "run_vcf_list_conversion_pipeline", spy)
-    monkeypatch.setattr(sv2, "_auto_chunk_size", lambda n_samples, ploidy=2: 7777)
+    monkeypatch.setattr(
+        sv2,
+        "_auto_chunk_size",
+        lambda n_samples, ploidy=2, n_format_fields=0, max_mem=None: 7777,
+    )
 
     a = _ss(tmp_path, "a", "S0", "chr1\t5\t.\tA\tC\t.\tPASS\t.\tGT\t1/1\n")
     b = _ss(tmp_path, "b", "S1", "chr1\t5\t.\tA\tC\t.\tPASS\t.\tGT\t1/1\n")

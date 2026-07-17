@@ -416,7 +416,7 @@ dropped = SparseVar2.from_vcf_list("out.svar2", "vcfs/", "ref.fa")
 dropped = SparseVar2.from_vcf_list("out.svar2", "manifest.txt", "ref.fa")
 ```
 
-Signature: `from_vcf_list(out, sources, reference=None, *, regions=None, merge_overlapping=False, regions_overlap="pos", no_reference=False, skip_out_of_scope=False, ploidy=2, chunk_size=None, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False, info_fields=None, format_fields=None, check_ref="e") -> int`
+Signature: `from_vcf_list(out, sources, reference=None, *, regions=None, merge_overlapping=False, regions_overlap="pos", no_reference=False, skip_out_of_scope=False, ploidy=2, chunk_size=None, max_mem=None, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False, info_fields=None, format_fields=None, check_ref="e") -> int`
 
 Builds **one** SVAR2 store from **N single-sample** VCFs/BCFs with different
 site lists, via a native k-way merge — no `bcftools merge`, no intermediate
@@ -504,12 +504,26 @@ multi-sample VCF.
 - `chunk_size=None` — unlike `from_vcf`'s fixed `25_000` default, `None` here
   derives a budget-based chunk size from the cohort size (`_auto_chunk_size`),
   so one packed dense chunk stays ~256 MiB regardless of how many files are
-  merged; this is the same default `from_pgen`/`from_svar1` already use. Scope:
-  it bounds only the dense-chunk term, which is a small fraction of peak RAM at
-  typical cohort sizes (the budget does not bite until roughly 43k inputs, below
-  which it returns the historical `25_000`) — a large-cohort guardrail, not a
-  fix for overall RAM scaling in the number of inputs. Pass an int to override
-  with a fixed count.
+  merged; this is the same default `from_pgen`/`from_svar1` already use. The
+  budget accounts for both the packed genotype grid AND any staged
+  `format_fields` (`n_format_fields * n_samples * 4` bytes/variant — this term
+  can dominate the grid by `32 * F / ploidy`, e.g. 112x at F=7, ploidy=2), so
+  requesting FORMAT fields on a large cohort shrinks the auto chunk size
+  accordingly. Scope: it bounds only the dense-chunk term, which is a small
+  fraction of peak RAM at typical cohort sizes with no fields requested (the
+  budget does not bite until roughly 43k inputs, below which it returns the
+  historical `25_000`) — a large-cohort guardrail, not a fix for overall RAM
+  scaling in the number of inputs. Pass an int to override with a fixed count.
+- `max_mem: int | str | None = None` — caps the bytes one in-flight dense
+  chunk may occupy (same string forms as the module-level `max_mem`
+  convention, e.g. `"4g"`, parsed by the shared memory-string helper),
+  overriding the default `_DENSE_CHUNK_TARGET_BYTES` (~256 MiB) that
+  `_auto_chunk_size` budgets against when `chunk_size=None`. It is a
+  **worst-case ceiling**: the estimate assumes every variant routes dense,
+  since the dense fraction is a per-chunk, data-dependent routing outcome not
+  knowable up front. Cohorts whose variants route sparse (e.g. private somatic
+  calls) use considerably less than the ceiling. Ignored when `chunk_size` is
+  passed explicitly.
 - `ploidy`, `skip_out_of_scope`, `threads`, `overwrite`,
   `long_allele_capacity`, `signatures`, `check_ref` all mean the same as
   `from_vcf`, and the return value is the same `int` (dropped out-of-scope
