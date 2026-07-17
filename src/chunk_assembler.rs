@@ -240,7 +240,7 @@ pub(crate) fn resolve_scalar(vals: Option<&[f64]>, source_alt_index: u16, spec: 
 //   fallback path. `cf.value` already returns `None` for a non-carrier, and
 //   `resolve_scalar(None, 0, spec)` resolves that to the spec default
 //   regardless of the index passed, so `0` there is inert, not a real choice.
-fn resolve_format(
+pub(crate) fn resolve_format(
     fv: &FormatVals,
     spec: &FieldSpec,
     source_alt_index: u16,

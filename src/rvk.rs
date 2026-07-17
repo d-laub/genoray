@@ -174,6 +174,7 @@ fn emit_call(
     hap: usize,
     num_samples: usize,
     per_cat: &[(bool, usize)],
+    format_specs: &[&FieldSpec],
     streams: &mut crate::streams::StreamMap<SparseSubStream>,
     dense: &mut DenseMap<DenseSubChunk>,
     counts: &mut crate::streams::StreamMap<u32>,
@@ -196,7 +197,21 @@ fn emit_call(
             // calling sample's.
             for (i, &(is_format, idx)) in per_cat.iter().enumerate() {
                 let val = if is_format {
-                    staged_f64(&chunk.format_staged[idx], v * num_samples + s)
+                    match chunk.format_by_carrier.as_ref() {
+                        // Carrier-sparse: resolve for this calling sample. The
+                        // ByCarrier arm ignores source_alt_index (values were
+                        // resolved against each file's own ALT at merge time),
+                        // so 0 is inert. `idx` is the per-category FORMAT index,
+                        // which is also the field index into FormatVals.
+                        Some(fbc) => crate::chunk_assembler::resolve_format(
+                            &fbc[v],
+                            format_specs[idx],
+                            0,
+                            s,
+                            idx,
+                        ),
+                        None => staged_f64(&chunk.format_staged[idx], v * num_samples + s),
+                    }
                 } else {
                     staged_f64(&chunk.info_staged[idx], v)
                 };
@@ -410,12 +425,22 @@ fn route_variants(
         // samples filled with the field's sentinel/default.
         for &(is_format, idx) in &per_cat {
             if is_format {
-                let default_val = format_specs[idx].missing_sentinel();
+                let spec = format_specs[idx];
                 for s in 0..num_samples {
-                    let val = if is_carrier(v, s) {
-                        staged_f64(&chunk.format_staged[idx], v * num_samples + s)
-                    } else {
-                        default_val
+                    let val = match chunk.format_by_carrier.as_ref() {
+                        // Carrier source: value() returns None for a non-carrier,
+                        // which resolve_format maps to the field default -- exactly
+                        // the `is_carrier ? staged : default` the grid path did.
+                        Some(fbc) => {
+                            crate::chunk_assembler::resolve_format(&fbc[v], spec, 0, s, idx)
+                        }
+                        None => {
+                            if is_carrier(v, s) {
+                                staged_f64(&chunk.format_staged[idx], v * num_samples + s)
+                            } else {
+                                spec.missing_sentinel()
+                            }
+                        }
                     };
                     sub.field_format[idx].push_f64(val);
                 }
@@ -473,6 +498,11 @@ fn dense2sparse_vk_by_scan(
         |v| chunk.genos.popcount_plane(v),
     );
 
+    let format_specs: Vec<&FieldSpec> = fields
+        .iter()
+        .filter(|f| f.category == FieldCategory::Format)
+        .collect();
+
     let estimated_nnz = (v_variants * columns) / 20;
     let mut streams = crate::streams::StreamMap::from_fn(|tag| {
         let spec = &crate::streams::REGISTRY[tag.index()];
@@ -521,6 +551,7 @@ fn dense2sparse_vk_by_scan(
                     hap,
                     num_samples,
                     &per_cat,
+                    &format_specs,
                     &mut streams,
                     &mut dense,
                     &mut counts,
@@ -601,6 +632,11 @@ pub fn dense2sparse_vk(
         |v| unsafe { carriers.get_unchecked(v) }.len(),
     );
 
+    let format_specs: Vec<&FieldSpec> = fields
+        .iter()
+        .filter(|f| f.category == FieldCategory::Format)
+        .collect();
+
     let estimated_nnz = (v_variants * columns) / 20;
     let mut streams = crate::streams::StreamMap::from_fn(|tag| {
         let spec = &crate::streams::REGISTRY[tag.index()];
@@ -658,6 +694,7 @@ pub fn dense2sparse_vk(
                 column,
                 num_samples,
                 &per_cat,
+                &format_specs,
                 &mut streams,
                 &mut dense,
                 &mut counts,
@@ -888,6 +925,65 @@ mod tests {
                 "carrier-driven and grid-scan emission diverged at {v_variants}x{n_samples}"
             );
         }
+    }
+
+    // The carrier path must resolve FORMAT from `format_by_carrier`, NOT the
+    // `format_staged` grid. Build a carrier-bearing chunk whose grid is
+    // deliberately wrong and whose carrier FORMAT is correct; the emitted
+    // field values must match the carrier FORMAT.
+    #[test]
+    fn carrier_format_read_prefers_format_by_carrier() {
+        use crate::record_source::{CarrierFormat, FormatVals};
+        use std::sync::Arc;
+
+        let v_variants = 8usize;
+        let n_samples = 4usize;
+        let mut chunk = private_chunk(v_variants, n_samples); // carriers: Some(..)
+
+        // Correct carrier FORMAT: variant i carried by sample (i % n_samples);
+        // DP = 100 + i, GQ = 200 + i for that one carrier sample.
+        let mut fbc: Vec<Arc<FormatVals>> = Vec::with_capacity(v_variants);
+        for i in 0..v_variants {
+            let mut cf = CarrierFormat::new(2);
+            cf.push_sample(
+                (i % n_samples) as u32,
+                &[(100 + i) as f64, (200 + i) as f64],
+            );
+            fbc.push(Arc::new(FormatVals::ByCarrier(cf)));
+        }
+        chunk.format_by_carrier = Some(fbc);
+
+        // Poison the grid so a stray read from it is caught.
+        chunk.format_staged = vec![
+            StagedColumn::Int(vec![-1; v_variants * n_samples]),
+            StagedColumn::Int(vec![-1; v_variants * n_samples]),
+        ];
+
+        let mut bank = make_bank();
+        let out = dense2sparse_vk(&chunk, &mut bank, false, &two_format_fields());
+
+        // All variants are single-carrier SNPs => VarKey stream. Collect its
+        // two field columns and assert they equal the carrier FORMAT, never -1.
+        let snp = out.streams.get(crate::streams::StreamTag::VarKeySnp);
+        assert_eq!(snp.field_calls.len(), 2);
+        let dp: Vec<i32> = match &snp.field_calls[0] {
+            StagedColumn::Int(v) => v.clone(),
+            _ => panic!("DP staged as non-int"),
+        };
+        assert!(
+            dp.iter().all(|&x| x != -1),
+            "read leaked from poisoned grid: {dp:?}"
+        );
+        assert_eq!(dp.len(), v_variants);
+        // Emission is column-major; every value is 100 + (its variant index).
+        let mut sorted = dp.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted,
+            (0..v_variants)
+                .map(|i| (100 + i) as i32)
+                .collect::<Vec<_>>()
+        );
     }
 
     // sample_lengths must receive one entry per column per chunk, including
