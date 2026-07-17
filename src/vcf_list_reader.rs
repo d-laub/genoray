@@ -17,7 +17,7 @@ use crate::chunk_assembler::resolve_scalar;
 use crate::error::ConversionError;
 use crate::field::{FieldCategory, FieldSpec};
 use crate::normalize::{L_MAX, atomize_to_vcf_biallelic};
-use crate::record_source::{RawRecord, RecordSource};
+use crate::record_source::{Calls, Carriers, RawRecord, RecordSource};
 use crate::vcf_reader::VcfRecordSource;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, VecDeque};
@@ -411,7 +411,10 @@ impl VcfListRecordSource {
     // Build the merged `RawRecord` for a group of same-key `(col, NormAtom)`
     // pairs: one biallelic record whose REF/ALT come from the first atom (they
     // agree by construction — same key), with every column not present in the
-    // group left hom-ref (`0`, the `gt` vec's fill value).
+    // group left hom-ref by omission from the `Carriers` list `Calls::Sparse`
+    // carries (see below) — `group` already names every haplotype that isn't
+    // hom-ref for this atom, so there's no need to widen to `num_samples *
+    // ploidy` and scan it back downstream.
     fn build_record(
         &self,
         key: &(u32, i32, Vec<u8>),
@@ -462,10 +465,40 @@ impl VcfListRecordSource {
             }
         }
         let alt = group[0].1.alt.clone();
-        let mut gt = vec![0i32; self.num_samples * self.ploidy];
+        // The frontier `group` is already exactly the carrier list: one entry per file
+        // whose next record is at this key. Build `Carriers` from it directly rather
+        // than materialising an N-wide vector and scanning it back downstream — this
+        // retires churn site #1 (70.66 GB / 11.8M blocks while never holding more than
+        // 43 MB live, per dhat).
+        //
+        // `group` is strictly ascending in `col`, which `Carriers::push` requires:
+        // `self.heap` is a `BinaryHeap<Reverse<HeapEntry>>`, so successive `pop()`s
+        // yield `HeapEntry`s in non-decreasing `HeapEntry::Ord` order, i.e. `(pos,
+        // ilen, alt, col)`. The group-drain loop above only continues popping while
+        // `(pos, ilen, alt)` matches `group[0]`'s, so within one group that key is
+        // constant and the ordering degenerates to `col` alone — and no two atoms in
+        // the same group can share a `col` (each file contributes at most one atom per
+        // merge key). So `group[i].0` is strictly increasing in `i`, and `base = col *
+        // self.ploidy` together with the inner `0..ploidy` loop preserves that
+        // ascending order all the way down to individual haplotype columns.
+        let mut carriers = Carriers::new();
         for (col, atom) in &group {
-            let base = col * self.ploidy;
-            gt[base..base + self.ploidy].copy_from_slice(&atom.ploid_codes);
+            let base = (*col * self.ploidy) as u32;
+            for (p, &code) in atom.ploid_codes.iter().enumerate() {
+                // `ploid_codes`: -1 missing, 1 carries this atom's source ALT, 0 other
+                // (incl. REF). Only non-zero codes are carriers; 0 means REF, which
+                // `Calls::Sparse` represents by absence.
+                if code != 0 {
+                    // `NormAtom` has no `source_alt_index` field of its own (unlike
+                    // `PendingAtom` downstream): every merged `RawRecord` this function
+                    // returns is single-ALT (`alts: vec![alt]`, just below), so once
+                    // `chunk_assembler::decompose_raw_record` re-atomizes it, the
+                    // resulting `PendingAtom::source_alt_index` is deterministically
+                    // `1` — matching the `1` a carrier gets here.
+                    let allele = if code < 0 { -1 } else { 1 };
+                    carriers.push(base + p as u32, allele);
+                }
+            }
         }
 
         // INFO: first-carrier wins. `group` is popped off the heap in
@@ -495,7 +528,7 @@ impl VcfListRecordSource {
             pos: key.0,
             reference,
             alts: vec![alt],
-            calls: crate::record_source::Calls::Dense(gt),
+            calls: Calls::Sparse(carriers),
             info_raw,
             format_raw,
         })
@@ -622,6 +655,17 @@ mod tests {
     use rust_htslib::bcf::{Format, Header, Writer};
     use std::path::{Path, PathBuf};
     use tempfile::tempdir;
+
+    // Build the `Calls::Sparse` `next_record` now emits from `(col, allele)` pairs,
+    // ascending by col -- shorthand for the N-wide `Calls::Dense(vec![...])` literals
+    // every test below used before the merge stopped widening to N.
+    fn sparse(pairs: &[(u32, i32)]) -> Calls {
+        let mut c = Carriers::new();
+        for &(col, allele) in pairs {
+            c.push(col, allele);
+        }
+        Calls::Sparse(c)
+    }
 
     // One synthetic single-sample record: 0-based pos, REF, ALTs, and a flat
     // per-haplotype genotype (allele index, or -1 for missing), length ploidy.
@@ -755,17 +799,11 @@ mod tests {
         let r1 = src.next_record().unwrap().unwrap();
         assert_eq!(r1.pos, 2);
         assert_eq!(r1.alts, vec![b"G".to_vec()]);
-        assert_eq!(
-            r1.calls,
-            crate::record_source::Calls::Dense(vec![1, 0, /* SB */ 0, 0])
-        );
+        assert_eq!(r1.calls, sparse(&[/* SA hap0 */ (0, 1)]));
 
         let r2 = src.next_record().unwrap().unwrap();
         assert_eq!(r2.pos, 6);
-        assert_eq!(
-            r2.calls,
-            crate::record_source::Calls::Dense(vec![/* SA */ 0, 0, /* SB */ 0, 1])
-        );
+        assert_eq!(r2.calls, sparse(&[/* SB hap1 */ (3, 1)]));
 
         assert!(src.next_record().unwrap().is_none());
         assert_eq!(src.dropped_out_of_scope(), 0);
@@ -825,10 +863,7 @@ mod tests {
         let r1 = src.next_record().unwrap().unwrap();
         assert_eq!(r1.pos, 2);
         assert_eq!(r1.alts, vec![b"G".to_vec()]);
-        assert_eq!(
-            r1.calls,
-            crate::record_source::Calls::Dense(vec![1, 0, 0, 1])
-        );
+        assert_eq!(r1.calls, sparse(&[(0, 1), (3, 1)]));
         assert!(src.next_record().unwrap().is_none());
     }
 
@@ -871,12 +906,12 @@ mod tests {
         let r1 = src.next_record().unwrap().unwrap();
         assert_eq!(r1.pos, 2);
         assert_eq!(r1.alts, vec![b"G".to_vec()]);
-        assert_eq!(r1.calls, crate::record_source::Calls::Dense(vec![1, 0]));
+        assert_eq!(r1.calls, sparse(&[(0, 1)]));
 
         let r2 = src.next_record().unwrap().unwrap();
         assert_eq!(r2.pos, 2);
         assert_eq!(r2.alts, vec![b"T".to_vec()]);
-        assert_eq!(r2.calls, crate::record_source::Calls::Dense(vec![0, 1]));
+        assert_eq!(r2.calls, sparse(&[(1, 1)]));
 
         assert!(src.next_record().unwrap().is_none());
     }
@@ -919,7 +954,7 @@ mod tests {
 
         let r1 = src.next_record().unwrap().unwrap();
         assert_eq!(r1.pos, 2);
-        assert_eq!(r1.calls, crate::record_source::Calls::Dense(vec![-1, 1]));
+        assert_eq!(r1.calls, sparse(&[(0, -1), (1, 1)]));
         assert!(src.next_record().unwrap().is_none());
     }
 
@@ -985,10 +1020,7 @@ mod tests {
 
         let r1 = src.next_record().unwrap().unwrap();
         assert_eq!(r1.pos, 2);
-        assert_eq!(
-            r1.calls,
-            crate::record_source::Calls::Dense(vec![1, 0, /* SB, filled hom-ref */ 0, 0])
-        );
+        assert_eq!(r1.calls, sparse(&[/* SA hap0 */ (0, 1)]));
         assert!(src.next_record().unwrap().is_none());
     }
 
@@ -1105,8 +1137,10 @@ mod tests {
         assert_eq!(r1.alts, vec![b"G".to_vec()]);
         assert_eq!(
             r1.calls,
-            crate::record_source::Calls::Dense(vec![
-                /* SA */ 1, 0, /* SB */ 0, 0, /* SC */ 1, 1
+            sparse(&[
+                /* SA hap0 */ (0, 1),
+                /* SC hap0 */ (4, 1),
+                /* SC hap1 */ (5, 1)
             ])
         );
 
@@ -1136,9 +1170,7 @@ mod tests {
         assert_eq!(r2.alts, vec![b"G".to_vec()]);
         assert_eq!(
             r2.calls,
-            crate::record_source::Calls::Dense(vec![
-                /* SA */ 1, 0, /* SB */ 0, 1, /* SC */ 0, 0
-            ])
+            sparse(&[/* SA hap0 */ (0, 1), /* SB hap1 */ (3, 1)])
         );
 
         // Records 3 & 4: pos 4000 stays as TWO separate records — SB's DEL
@@ -1149,23 +1181,13 @@ mod tests {
         assert_eq!(r3.pos, 4000);
         assert_eq!(r3.reference, b"AT".to_vec());
         assert_eq!(r3.alts, vec![b"A".to_vec()]);
-        assert_eq!(
-            r3.calls,
-            crate::record_source::Calls::Dense(vec![
-                /* SA */ 0, 0, /* SB */ 0, 1, /* SC */ 0, 0
-            ])
-        );
+        assert_eq!(r3.calls, sparse(&[/* SB hap1 */ (3, 1)]));
 
         let r4 = src.next_record().unwrap().unwrap();
         assert_eq!(r4.pos, 4000);
         assert_eq!(r4.reference, b"A".to_vec());
         assert_eq!(r4.alts, vec![b"G".to_vec()]);
-        assert_eq!(
-            r4.calls,
-            crate::record_source::Calls::Dense(vec![
-                /* SA */ 1, 0, /* SB */ 0, 0, /* SC */ 0, 0
-            ])
-        );
+        assert_eq!(r4.calls, sparse(&[/* SA hap0 */ (0, 1)]));
 
         // SC's early EOF didn't strand or truncate anything downstream.
         assert!(src.next_record().unwrap().is_none());
@@ -1225,6 +1247,120 @@ mod tests {
         rust_htslib::bcf::index::build(&path, None, 0, rust_htslib::bcf::index::Type::Csi(14))
             .expect("build BCF index");
         path
+    }
+
+    // Write one single-sample, CSI-indexed BCF per `(sample, records)` pair, all on
+    // contig "1", where each record is `(0-based pos, REF, ALT, gt)` and `gt` is a
+    // '/'- or '|'-separated string of allele indices (or `.` for missing) -- e.g.
+    // `"1/1"`. Phasing in the separator is cosmetic here (`NormAtom::ploid_codes`
+    // only cares about the allele index, not phase), so every genotype is written
+    // `Phased` regardless of which separator the caller used, matching the only
+    // `GenotypeAllele` variants this module already relies on elsewhere
+    // (`Phased`/`PhasedMissing`). A sample with no records gets a header-only file
+    // (mirrors `contig_in_header_but_no_records_is_hom_ref_filled_not_errored`),
+    // exercising the merge's most common real shape: N per-sample files sharing a
+    // contig, most of which have zero calls on any given variant.
+    #[allow(clippy::type_complexity)]
+    fn write_single_sample_vcfs(
+        dir: &Path,
+        specs: &[(&str, &[(u32, &str, &str, &str)])],
+    ) -> Vec<String> {
+        let chrom_len: u64 = 10_000;
+        specs
+            .iter()
+            .enumerate()
+            .map(|(i, (sample, records))| {
+                let path = dir.join(format!("s{i}.bcf"));
+                let mut header = Header::new();
+                header.push_record(format!("##contig=<ID=1,length={chrom_len}>").as_bytes());
+                header
+                    .push_record(b"##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">");
+                header.push_sample(sample.as_bytes());
+                {
+                    let mut writer = Writer::from_path(&path, &header, false, Format::Bcf)
+                        .expect("open BCF writer");
+                    for &(pos, r, alt, gt) in records.iter() {
+                        let mut record = writer.empty_record();
+                        record.set_rid(Some(0));
+                        record.set_pos(pos as i64);
+                        record
+                            .set_alleles(&[r.as_bytes(), alt.as_bytes()])
+                            .expect("set alleles");
+                        let gt_alleles: Vec<GenotypeAllele> = gt
+                            .split(['/', '|'])
+                            .map(|tok| {
+                                if tok == "." {
+                                    GenotypeAllele::PhasedMissing
+                                } else {
+                                    GenotypeAllele::Phased(
+                                        tok.parse().expect("gt token must be an int or '.'"),
+                                    )
+                                }
+                            })
+                            .collect();
+                        record.push_genotypes(&gt_alleles).expect("push genotypes");
+                        writer.write(&record).expect("write record");
+                    }
+                }
+                rust_htslib::bcf::index::build(
+                    &path,
+                    None,
+                    0,
+                    rust_htslib::bcf::index::Type::Csi(14),
+                )
+                .expect("build BCF index");
+                path.to_str().unwrap().to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn merged_record_calls_are_sparse_and_name_only_carriers() {
+        // The merge already knows which columns carry a record -- the frontier group
+        // IS the carrier list. Widening it to N and scanning it back is the O(V x N)
+        // that issue #120 traces to.
+        let dir = tempdir().unwrap();
+        // 3 single-sample files; only sample 1 carries the variant at pos 100.
+        let paths = write_single_sample_vcfs(
+            dir.path(),
+            &[
+                ("s0", &[]),
+                ("s1", &[(100u32, "A", "T", "1/1")]),
+                ("s2", &[]),
+            ],
+        );
+        let samples = ["s0", "s1", "s2"];
+        let mut src = VcfListRecordSource::new(
+            &paths,
+            &samples,
+            "1",
+            None,
+            2,
+            // htslib_threads: every other test in this module uses 1, not 0 -- `0`
+            // panics inside rust-htslib's `set_threads` ("n_threads must be > 0";
+            // production never passes 0 either, see `budget::MIN_HTSLIB_THREADS`).
+            1,
+            false,
+            // `ref_seq` is `None` here, so `check_ref` never actually gates anything
+            // (see `FileCursor::advance`); `Error` is the simplest valid variant --
+            // `CheckRef` has no `Skip`.
+            CheckRef::Error,
+            &[],
+            Vec::new(),
+            crate::svar2_view::OverlapMode::Pos,
+        )
+        .unwrap();
+
+        let rec = src.next_record().unwrap().unwrap();
+        assert!(
+            matches!(rec.calls, Calls::Sparse(_)),
+            "the k-way merge must not widen to N"
+        );
+        // sample 1, ploidy 2 => columns 2 and 3, both ALT1.
+        let got: Vec<(u32, i32)> = rec.calls.iter_non_ref().collect();
+        assert_eq!(got, vec![(2, 1), (3, 1)]);
+        assert_eq!(rec.calls.allele_at(0), 0, "non-carriers read as REF");
+        assert_eq!(rec.calls.len_dense(), None);
     }
 
     #[test]
@@ -1517,10 +1653,7 @@ mod tests {
 
         let r1 = src.next_record().unwrap().unwrap();
         assert_eq!(r1.pos, 2);
-        assert_eq!(
-            r1.calls,
-            crate::record_source::Calls::Dense(vec![1, 0, /* SB, hom-ref filled */ 0, 0])
-        );
+        assert_eq!(r1.calls, sparse(&[/* SA hap0 */ (0, 1)]));
         assert!(src.next_record().unwrap().is_none());
         assert_eq!(src.dropped_out_of_scope(), 0);
     }
