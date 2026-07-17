@@ -14,7 +14,11 @@
 //! representation, so consumers build a zero-copy view straight from the index pairs
 //! (cf. `SparseVar.read_ranges` -> `Ragged.from_offsets`).
 
+use std::fs::File;
 use std::ops::Range;
+use std::path::Path;
+
+use memmap2::Mmap;
 
 use crate::search::{SearchTree, overlap_range};
 
@@ -61,6 +65,100 @@ pub fn var_ranges(
             (contig_start + s as u32)..(contig_start + e as u32)
         })
         .collect()
+}
+
+/// mmap a file read-only, returning `None` for a zero-length file (memmap2 rejects
+/// empty maps; an SVAR1 store where no hap carries a call has an empty
+/// `variant_idxs`). Local rather than reusing `query::sidecar::mmap_file`, which is
+/// `pub(crate)` inside a private module — and keeping this module's dependencies
+/// minimal is what keeps it ungated.
+fn mmap_ro(path: &Path) -> std::io::Result<Option<Mmap>> {
+    let f = File::open(path)?;
+    if f.metadata()?.len() == 0 {
+        return Ok(None);
+    }
+    // SAFETY: a finished, read-only store artifact; we never mutate the file while
+    // it is mapped. Same contract as `query::sidecar::mmap_file`.
+    Ok(Some(unsafe { Mmap::map(&f)? }))
+}
+
+/// An SVAR1 store opened for range queries. Holds `variant_idxs` mmap'd (it is one
+/// entry per non-ref call — never materialize it) and the small CSR `offsets`
+/// resident (`num_haps + 1`), mirroring the SVAR2 `SubStreamView` split.
+///
+/// Unlike SVAR2's `ContigReader`, this takes **no `chrom`**: an SVAR1 store is one
+/// flat directory and contigs are contiguous in global-id space. Per-contig scoping
+/// is the caller's job, via `var_ranges`'s `contig_start`.
+pub struct Svar1Reader {
+    n_samples: usize,
+    ploidy: usize,
+    variant_idxs: Option<Mmap>,
+    offsets: Vec<i64>,
+}
+
+impl Svar1Reader {
+    /// Open the SVAR1 store rooted at `svar1_dir` for a cohort of `n_samples` at
+    /// `ploidy`.
+    ///
+    /// NOTE: `variant_idxs.npy` and `offsets.npy` are **headerless raw buffers**
+    /// despite the extension (Python np.memmaps them). Do not reach for
+    /// `ndarray_npy::read_npy` — that is only correct for SVAR2's real `.npy`
+    /// sidecars.
+    pub fn open(svar1_dir: &str, n_samples: usize, ploidy: usize) -> std::io::Result<Self> {
+        let dir = Path::new(svar1_dir);
+        let variant_idxs = mmap_ro(&dir.join("variant_idxs.npy"))?;
+
+        // `fs::read` gives an unaligned Vec<u8>, so `cast_slice` would panic;
+        // `pod_collect_to_vec` copies element-wise and is alignment-safe. `offsets`
+        // is tiny (num_haps + 1), so the copy is free.
+        let offsets_bytes = std::fs::read(dir.join("offsets.npy"))?;
+        let offsets: Vec<i64> = bytemuck::pod_collect_to_vec(&offsets_bytes);
+
+        let want = n_samples * ploidy + 1;
+        if offsets.len() != want {
+            return Err(std::io::Error::other(format!(
+                "{}/offsets.npy has {} entries; expected n_samples*ploidy+1 = {} \
+                 (n_samples={n_samples}, ploidy={ploidy})",
+                svar1_dir,
+                offsets.len(),
+                want,
+            )));
+        }
+
+        Ok(Self {
+            n_samples,
+            ploidy,
+            variant_idxs,
+            offsets,
+        })
+    }
+
+    pub fn n_samples(&self) -> usize {
+        self.n_samples
+    }
+
+    pub fn ploidy(&self) -> usize {
+        self.ploidy
+    }
+
+    /// The flat `variant_idxs` buffer: each hap's `offsets[h]..offsets[h+1]` slice
+    /// holds its sorted global non-ref variant ids. Exposed so consumers can hand it
+    /// straight to a kernel as a zero-copy sparse-index input.
+    ///
+    /// mmap pages are page-aligned, so `bytemuck`'s alignment check always passes;
+    /// a missing/empty map yields an empty slice.
+    pub fn variant_idxs(&self) -> &[i32] {
+        match &self.variant_idxs {
+            Some(m) => bytemuck::cast_slice(&m[..]),
+            None => &[],
+        }
+    }
+
+    /// CSR offsets over haplotypes; `len() == n_samples * ploidy + 1`. Hap column is
+    /// `sample * ploidy + p`.
+    pub fn offsets(&self) -> &[i64] {
+        &self.offsets
+    }
 }
 
 #[cfg(test)]
@@ -116,5 +214,61 @@ mod tests {
         let (vs, ve, mvl) = fixture();
         let got = var_ranges(&vs, &ve, mvl, 0, &[(30, 31), (10, 11)]);
         assert_eq!(got, vec![2..3, 0..1], "output must be in `regions` order");
+    }
+
+    use std::io::Write;
+
+    /// Write a HEADERLESS raw buffer. SVAR1's `*.npy` files have no npy header
+    /// despite the extension -- Python np.memmaps them, Rust bytemucks them.
+    /// Mirrors `svar1_reader.rs`'s test helper of the same name.
+    fn write_raw<T: bytemuck::NoUninit>(dir: &std::path::Path, name: &str, data: &[T]) {
+        let mut f = std::fs::File::create(dir.join(name)).unwrap();
+        f.write_all(bytemuck::cast_slice(data)).unwrap();
+    }
+
+    /// 2 samples x ploidy 2 = 4 haps. Per-hap sorted global ids:
+    ///   hap0: [0, 2, 4]   hap1: [3]   hap2: [2]   hap3: []
+    fn write_store(dir: &std::path::Path) {
+        write_raw::<i32>(dir, "variant_idxs.npy", &[0, 2, 4, 3, 2]);
+        write_raw::<i64>(dir, "offsets.npy", &[0, 3, 4, 5, 5]);
+    }
+
+    #[test]
+    fn reader_opens_and_exposes_raw_buffers() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_store(tmp.path());
+        let r = Svar1Reader::open(tmp.path().to_str().unwrap(), 2, 2).unwrap();
+        assert_eq!(r.n_samples(), 2);
+        assert_eq!(r.ploidy(), 2);
+        assert_eq!(r.variant_idxs(), &[0, 2, 4, 3, 2]);
+        assert_eq!(r.offsets(), &[0, 3, 4, 5, 5]);
+    }
+
+    #[test]
+    fn reader_missing_dir_is_err() {
+        assert!(Svar1Reader::open("/no/such/svar1/store", 2, 2).is_err());
+    }
+
+    #[test]
+    fn reader_rejects_offsets_of_wrong_length() {
+        // offsets MUST be num_haps + 1. A mismatch means the caller's
+        // n_samples/ploidy disagree with the store -- fail loudly rather than
+        // index out of bounds later inside find_ranges.
+        let tmp = tempfile::tempdir().unwrap();
+        write_raw::<i32>(tmp.path(), "variant_idxs.npy", &[0, 1]);
+        write_raw::<i64>(tmp.path(), "offsets.npy", &[0, 1, 2]); // len 3 => 2 haps
+        let err = Svar1Reader::open(tmp.path().to_str().unwrap(), 2, 2); // wants 5
+        assert!(err.is_err(), "offsets length mismatch must be an error");
+    }
+
+    #[test]
+    fn reader_empty_variant_idxs_is_ok() {
+        // A store where no hap carries any non-ref call: variant_idxs is
+        // zero-length. memmap2 rejects empty maps, so this must not blow up.
+        let tmp = tempfile::tempdir().unwrap();
+        write_raw::<i32>(tmp.path(), "variant_idxs.npy", &[] as &[i32]);
+        write_raw::<i64>(tmp.path(), "offsets.npy", &[0, 0, 0, 0, 0]);
+        let r = Svar1Reader::open(tmp.path().to_str().unwrap(), 2, 2).unwrap();
+        assert_eq!(r.variant_idxs(), &[] as &[i32]);
     }
 }
