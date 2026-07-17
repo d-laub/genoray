@@ -71,6 +71,7 @@ pub mod py_query;
 pub mod py_query_batch;
 pub mod py_query_decode;
 pub mod py_query_ranges;
+pub mod py_svar1_query;
 pub mod query;
 #[cfg(feature = "conversion")]
 pub mod record_source;
@@ -1071,5 +1072,6 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "conversion")]
     m.add_function(wrap_pyfunction!(index_vcf, m)?)?;
     m.add_class::<crate::py_query::PyContigReader>()?;
+    m.add_class::<crate::py_svar1_query::PySvar1Reader>()?;
     Ok(())
 }
