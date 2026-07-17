@@ -915,13 +915,24 @@ mod tests {
         }
     }
 
-    // Task 8: carrier-driven emission (`dense2sparse_vk` with `chunk.carriers
-    // == Some`) must be byte-identical to the grid scan
+    // Task 8 (extended by Task 4): carrier-driven emission (`dense2sparse_vk`
+    // with `chunk.carriers == Some`) must be byte-identical to the grid scan
     // (`dense2sparse_vk_by_scan`, reached via `dense2sparse_vk` when
-    // `chunk.carriers == None`) -- the carrier list and the presence grid are
-    // two encodings of the same chunk, so both paths must emit identical
-    // SparseChunks: same calls, same order, same sample_lengths. Order
-    // matters: `merge_mini_sc`'s ledger arithmetic depends on it.
+    // `chunk.carriers == None`) -- same presence data, same calls, same
+    // order, same sample_lengths. Order matters: `merge_mini_sc`'s ledger
+    // arithmetic depends on it.
+    //
+    // `via_carriers` and `via_scan` also resolve FORMAT through two DIFFERENT
+    // encodings, not just two iteration orders: `via_carriers` reads
+    // `chunk.format_by_carrier` (the `ByCarrier` arm of `resolve_format`);
+    // `via_scan` is a dense-encoded sibling built from scratch (carriers ==
+    // None AND format_by_carrier == None, so Task 3's carrier-only
+    // debug_asserts never fire) whose `format_staged` grid holds the same
+    // values `private_chunk` encodes per-carrier (DP = v*n_samples+s, GQ =
+    // 2*(v*n_samples+s) at the sole carrier sample s = v % n_samples), read
+    // through the `Dense` arm. The two sides can only agree if both FORMAT
+    // arms resolve to the same values for the same underlying data -- this is
+    // now a cross-encoding FORMAT parity test, not just a scan-order check.
     #[test]
     fn carrier_driven_emission_matches_the_grid_scan_exactly() {
         for (v_variants, n_samples) in [(64usize, 8usize), (64, 512), (1000, 64)] {
@@ -931,9 +942,27 @@ mod tests {
             let mut bank_carriers = make_bank();
             let via_carriers = dense2sparse_vk(&chunk, &mut bank_carriers, false, &fields);
 
-            // Same chunk with the carrier list withheld => forced down the scan path.
+            // Dense-encoded sibling of the SAME data: carriers withheld (=> the
+            // grid-scan path) AND format_by_carrier withheld, with the dense
+            // FORMAT grid populated to the values `private_chunk`'s carrier
+            // FORMAT encodes at each variant's sole carrier cell (DP = v*n+s,
+            // GQ = 2*(v*n+s) at flat index v*n_samples+s). So `via_carriers`
+            // resolves FORMAT via the ByCarrier arm and `via_scan` reads the
+            // Dense grid -- the assert below now proves the two ENCODINGS agree,
+            // not just the two iteration orders. Respects the Task 3 invariant:
+            // this dense sibling has carriers == None, so it never hits the
+            // carrier-only debug-asserts in dense2sparse_vk.
             let mut scanned = chunk.clone();
             scanned.carriers = None;
+            scanned.format_by_carrier = None;
+            scanned.format_staged = vec![
+                StagedColumn::Int((0..v_variants * n_samples).map(|i| i as i32).collect()),
+                StagedColumn::Int(
+                    (0..v_variants * n_samples)
+                        .map(|i| (i * 2) as i32)
+                        .collect(),
+                ),
+            ];
             let mut bank_scan = make_bank();
             let via_scan = dense2sparse_vk(&scanned, &mut bank_scan, false, &fields);
 
@@ -974,7 +1003,10 @@ mod tests {
             fbc.push(Arc::new(FormatVals::ByCarrier(cf)));
         }
         chunk.format_by_carrier = Some(fbc);
-        debug_assert!(chunk.format_staged.is_empty());
+        debug_assert!(
+            chunk.format_staged.is_empty(),
+            "the poison-free guard relies on an empty grid: a stray format_staged read must panic, not return a stale value"
+        );
 
         let mut bank = make_bank();
         let out = dense2sparse_vk(&chunk, &mut bank, false, &two_format_fields());
