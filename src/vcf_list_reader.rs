@@ -489,15 +489,33 @@ impl VcfListRecordSource {
         // matches the pre-Task-5 dense `build_record`, which looped `for (col, atom)
         // in &group { gt[base..base+ploidy].copy_from_slice(&atom.ploid_codes) }` —
         // a later atom for the same `col` fully overwrote an earlier one's ploidy
-        // block. `BTreeMap::insert` on a repeated key overwrites the value and keeps
-        // iteration ascending by key, reproducing both properties at once.
-        let mut by_col: std::collections::BTreeMap<usize, &Vec<i32>> =
-            std::collections::BTreeMap::new();
-        for (col, atom) in &group {
-            by_col.insert(*col, &atom.ploid_codes);
-        }
+        // block.
+        //
+        // A `BTreeMap` reproduces that (overwrite-on-repeat-key, ascending
+        // iteration) but allocates a node on every insert -- paid on every
+        // emitted record, including the overwhelming common case of zero
+        // collisions, which is exactly the allocation churn #120 exists to
+        // remove. `group` is popped off `self.heap` -- a `BinaryHeap` of
+        // `Reverse<HeapEntry>`, i.e. a min-heap over `HeapEntry::cmp`, which
+        // orders by `(key, col)` ascending (see `HeapEntry::key`/`Ord` above)
+        // -- one entry at a time in the group-drain loop, so `group` is
+        // non-decreasing in `col`: any repeated `col` is a CONTIGUOUS run.
+        // Walk `group` collapsing each such run to its last element (the
+        // run's last atom is also the last atom for that `col` in overall
+        // `group` order, since later cols can't sort back before it) --
+        // same last-write-wins result as the `BTreeMap`, with no allocation
+        // beyond `Carriers`'s own buffers.
         let mut carriers = Carriers::new();
-        for (col, ploid_codes) in by_col {
+        let mut i = 0;
+        while i < group.len() {
+            let col = group[i].0;
+            let mut j = i;
+            while j + 1 < group.len() && group[j + 1].0 == col {
+                j += 1;
+            }
+            // `group[j]` is the run's last atom == the last-write-wins winner
+            // for this `col`.
+            let ploid_codes = &group[j].1.ploid_codes;
             let base = (col * self.ploidy) as u32;
             for (p, &code) in ploid_codes.iter().enumerate() {
                 // `ploid_codes`: -1 missing, 1 carries this atom's source ALT, 0 other
@@ -514,6 +532,7 @@ impl VcfListRecordSource {
                     carriers.push(base + p as u32, allele);
                 }
             }
+            i = j + 1;
         }
 
         // INFO: first-carrier wins. `group` is popped off the heap in
