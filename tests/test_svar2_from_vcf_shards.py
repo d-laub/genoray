@@ -20,7 +20,14 @@ def _write_ref(d: Path) -> Path:
     return ref
 
 
-def _write_vcf(d: Path, name: str, rows: str, samples: tuple[str, ...]) -> Path:
+def _write_vcf(
+    d: Path,
+    name: str,
+    rows: str,
+    samples: tuple[str, ...],
+    *,
+    suffix: str = ".vcf.gz",
+) -> Path:
     header = (
         "##fileformat=VCFv4.2\n"
         f"##contig=<ID=chr1,length={len(_REF)}>\n"
@@ -31,11 +38,32 @@ def _write_vcf(d: Path, name: str, rows: str, samples: tuple[str, ...]) -> Path:
     )
     plain = d / f"{name}.vcf"
     plain.write_text(header + rows)
-    gz = d / f"{name}.vcf.gz"
+    gz = d / f"{name}{suffix}"
     with open(gz, "wb") as fh:
         subprocess.run(["bgzip", "-c", str(plain)], check=True, stdout=fh)
     subprocess.run(["bcftools", "index", str(gz)], check=True)
     return gz
+
+
+def test_from_vcf_shards_accepts_vcf_bgz_suffix(tmp_path: Path) -> None:
+    ref = _write_ref(tmp_path)
+    source = _write_vcf(
+        tmp_path,
+        "native",
+        "chr1\t8\t.\tA\tT\t.\t.\t.\tGT\t1|0\t0|1\n",
+        ("S0", "S1"),
+        suffix=".vcf.bgz",
+    )
+
+    out = tmp_path / "native.svar2"
+    SparseVar2.from_vcf_shards(
+        out,
+        [(source, ("chr1", 0, len(_REF)))],
+        ref,
+        threads=2,
+    )
+
+    assert SparseVar2(out).available_samples == ["S0", "S1"]
 
 
 def _assert_store_equal(a: Path, b: Path) -> None:

@@ -95,14 +95,14 @@ def write_svar2(
     Parameters
     ----------
     source
-        Path to a bgzipped VCF (``.vcf.gz``), BCF (``.bcf``), PLINK2 PGEN
-        (``.pgen``, with its ``.pvar``/``.pvar.zst`` and ``.psam`` siblings),
-        or SVAR1 store (a ``*.svar`` directory). VCF/BCF inputs are
-        auto-indexed (``.csi``) if no index is present. A directory (other
-        than a ``.svar`` store) or any other file is treated as the
+        Path to a bgzipped VCF (``.vcf.gz`` or ``.vcf.bgz``), BCF (``.bcf``),
+        PLINK2 PGEN (``.pgen``, with its ``.pvar``/``.pvar.zst`` and ``.psam``
+        siblings), or SVAR1 store (a ``*.svar`` directory). VCF/BCF inputs
+        are auto-indexed (``.csi``) if no index is present. A directory
+        (other than a ``.svar`` store) or any other file is treated as the
         multi-file (vcf-list) form: a directory of single-sample
-        ``*.vcf.gz``/``*.bcf`` files, or a manifest listing them one per
-        line; see :meth:`SparseVar2.from_vcf_list`.
+        ``*.vcf.gz``/``*.vcf.bgz``/``*.bcf`` files, or a manifest listing
+        them one per line; see :meth:`SparseVar2.from_vcf_list`.
     out
         Path to the output SVAR2 directory.
     reference
@@ -160,6 +160,7 @@ def write_svar2(
         offending record and continues. Mirrors ``bcftools norm --check-ref``.
     """
     from genoray import SparseVar2
+    from genoray._svar2 import _is_bgzipped_vcf
 
     from ._view_helpers import parse_regions_arg
 
@@ -184,7 +185,7 @@ def write_svar2(
 
     skip_out_of_scope = skip_symbolics_and_breakends
     is_single_vcf = source.is_file() and (
-        source.name.endswith(".vcf.gz") or source.suffix == ".bcf"
+        _is_bgzipped_vcf(source) or source.suffix == ".bcf"
     )
     if source.suffix == ".pgen":
         if ploidy != 2:

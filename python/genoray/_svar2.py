@@ -41,9 +41,11 @@ def _resolve_vcf_sources(sources: "str | Path | Sequence[str | Path]") -> list[P
 
     - a `Sequence` (list/tuple, not `str`/`Path`) of file paths, taken as-is
       and in the given order.
-    - a single directory `Path`: every `*.vcf.gz` then every `*.bcf` directly
-      inside it (non-recursive), each group name-sorted (`natsort`).
-    - a single file `Path` ending in `.vcf.gz` or `.bcf`: that one file.
+    - a single directory `Path`: every `*.vcf.gz`/`*.vcf.bgz` then every
+      `*.bcf` directly inside it (non-recursive), each group name-sorted
+      (`natsort`).
+    - a single file `Path` ending in `.vcf.gz`, `.vcf.bgz`, or `.bcf`: that
+      one file.
     - any other single file `Path`: treated as a manifest -- one path per
       line, blank lines and `#`-prefixed comment lines skipped, relative
       entries resolved against the manifest's parent directory.
@@ -51,8 +53,10 @@ def _resolve_vcf_sources(sources: "str | Path | Sequence[str | Path]") -> list[P
     if isinstance(sources, (str, Path)):
         path = Path(sources)
         if path.is_dir():
-            paths = natsorted(path.glob("*.vcf.gz")) + natsorted(path.glob("*.bcf"))
-        elif path.name.endswith(".vcf.gz") or path.suffix == ".bcf":
+            paths = natsorted(
+                [*path.glob("*.vcf.gz"), *path.glob("*.vcf.bgz")]
+            ) + natsorted(path.glob("*.bcf"))
+        elif _is_bgzipped_vcf(path) or path.suffix == ".bcf":
             paths = [path]
         elif path.suffix == ".vcf":
             # Without this, a bare `.vcf` single-path `sources` falls into the
@@ -61,8 +65,9 @@ def _resolve_vcf_sources(sources: "str | Path | Sequence[str | Path]") -> list[P
             # *path* -- producing a bewildering downstream error far from the
             # real problem. `_ensure_bgzipped` always raises here (this
             # branch is reached only when the suffix is exactly `.vcf`, which
-            # is neither `.bcf` nor `.vcf.gz`); the `paths = []` afterward is
-            # unreachable but keeps this branch's static type honest.
+            # is neither `.bcf` nor a recognized bgzipped VCF suffix); the
+            # `paths = []` afterward is unreachable but keeps this branch's
+            # static type honest.
             _ensure_bgzipped(path)
             paths = cast("list[Path]", [])
         else:
@@ -83,13 +88,17 @@ def _resolve_vcf_sources(sources: "str | Path | Sequence[str | Path]") -> list[P
     return paths
 
 
+def _is_bgzipped_vcf(source: Path) -> bool:
+    return source.name.endswith((".vcf.gz", ".vcf.bgz"))
+
+
 def _ensure_bgzipped(source: Path) -> None:
     """Reject a plain (uncompressed) VCF — it can't be tabix/csi-indexed."""
     is_bcf = source.suffix == ".bcf"
-    is_vcfgz = source.name.endswith(".vcf.gz")
-    if not (is_bcf or is_vcfgz):
+    if not (is_bcf or _is_bgzipped_vcf(source)):
         raise ValueError(
-            f"{source} must be a BCF (.bcf) or bgzipped VCF (.vcf.gz); bgzip it first."
+            f"{source} must be a BCF (.bcf) or bgzipped VCF "
+            "(.vcf.gz/.vcf.bgz); bgzip it first."
         )
 
 
@@ -1240,12 +1249,12 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         `_resolve_vcf_sources`):
 
         - a `Sequence` of paths -- explicit, in the given order.
-        - a single directory `Path` -- every `*.vcf.gz` then every `*.bcf`
-          directly inside it (non-recursive), each group name-sorted.
-        - a single file `Path` -- if it ends in `.vcf.gz`/`.bcf`, that one
-          file; otherwise treated as a manifest (one path per line, blank
-          and `#`-comment lines skipped, relative entries resolved against
-          the manifest's directory).
+        - a single directory `Path` -- every `*.vcf.gz`/`*.vcf.bgz` then every
+          `*.bcf` directly inside it (non-recursive), each group name-sorted.
+        - a single file `Path` -- if it ends in
+          `.vcf.gz`/`.vcf.bgz`/`.bcf`, that one file; otherwise treated as a
+          manifest (one path per line, blank and `#`-comment lines skipped,
+          relative entries resolved against the manifest's directory).
 
         As with :meth:`from_vcf`, each input VCF's records must already be
         position-sorted per contig; an unsorted file raises `ValueError`
