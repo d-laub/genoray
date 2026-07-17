@@ -971,6 +971,91 @@ mod tests {
         }
     }
 
+    // `carrier_driven_emission_matches_the_grid_scan_exactly` above only ever
+    // routes VarKey -- `private_chunk`'s bit pattern is one carrier per
+    // variant, so `choose_representation` never picks `Representation::Dense`
+    // there. That leaves `route_variants`' Dense second-pass FORMAT fill (the
+    // `Some(fbc)` branch at ~line 430, added when Task 7 carried FORMAT
+    // sparsely all the way through instead of re-densifying) untested by any
+    // fast, hermetic Rust unit -- only a Python oracle exercises it
+    // end-to-end. Build a CARRIER-encoded chunk with the SAME genotype /
+    // routing as `chunk_with_dense_variants` (which has real all-hap,
+    // Dense-routed variants) but carrier-sparse FORMAT, and check its
+    // resolved FORMAT is byte-identical to the dense-grid encoding of the
+    // exact same data.
+    #[test]
+    fn dense_routed_carrier_format_matches_the_grid_fill_exactly() {
+        use crate::record_source::{CarrierFormat, FormatVals};
+        use std::sync::Arc;
+
+        let v_variants = 8usize;
+        let n_dense = 3usize;
+        let n_samples = 4usize;
+        let ploidy = 2usize;
+        let columns = n_samples * ploidy;
+
+        // Reference: dense-grid encoding. `carriers == None` takes the
+        // grid-scan path (`dense2sparse_vk_by_scan`), which reads FORMAT
+        // straight out of `format_staged`'s ramp grid (col0 = i, col1 = 2*i
+        // at flat index v*n_samples+s).
+        let dense_sib = chunk_with_dense_variants(v_variants, n_dense, n_samples);
+
+        // Twin: identical genos/pos/ilens/alt/alt_offsets (same routing
+        // decisions), but carrier-sparse FORMAT/carriers instead of the dense
+        // grid -- exactly the encoding a k-way-merged chunk with a Dense-routed
+        // variant would carry. `carriers` matches `dense_sib`'s bit pattern
+        // exactly: all columns for v < n_dense (all-hap -> routes Dense),
+        // column 0 only for v >= n_dense (single-hap -> routes VarKey).
+        let mut carrier_twin = dense_sib.clone();
+        let mut carriers = Vec::with_capacity(v_variants);
+        let mut format_by_carrier: Vec<Arc<FormatVals>> = Vec::with_capacity(v_variants);
+        for v in 0..v_variants {
+            let mut c = Carriers::new();
+            let mut cf = CarrierFormat::new(2);
+            if v < n_dense {
+                for col in 0..columns {
+                    c.push(col as u32, 1);
+                }
+                for s in 0..n_samples {
+                    let flat = (v * n_samples + s) as f64;
+                    cf.push_sample(s as u32, &[flat, flat * 2.0]);
+                }
+            } else {
+                c.push(0, 1);
+                let flat = (v * n_samples) as f64;
+                cf.push_sample(0, &[flat, flat * 2.0]);
+            }
+            carriers.push(c);
+            format_by_carrier.push(Arc::new(FormatVals::ByCarrier(cf)));
+        }
+        carrier_twin.carriers = Some(carriers);
+        carrier_twin.format_by_carrier = Some(format_by_carrier);
+        // Per Task 3's invariant, a carrier-bearing chunk never stages the
+        // dense FORMAT grid -- `dense2sparse_vk` debug_asserts this.
+        carrier_twin.format_staged = Vec::new();
+
+        let fields = two_format_fields();
+        let via_grid = dense2sparse_vk(&dense_sib, &mut make_bank(), false, &fields);
+        let via_carrier = dense2sparse_vk(&carrier_twin, &mut make_bank(), false, &fields);
+
+        // Non-vacuity: at least one class must actually have routed variants
+        // Dense, or this "parity" check would silently degrade into an
+        // all-VarKey comparison that never touches the arm under test.
+        let any_dense = via_grid
+            .dense
+            .iter()
+            .any(|(_, sub)| sub.n_dense_variants > 0);
+        assert!(
+            any_dense,
+            "expected at least one variant to route Dense -- test would be vacuous otherwise"
+        );
+
+        assert_eq!(
+            via_carrier, via_grid,
+            "carrier vs grid FORMAT diverged on the Dense-routed second-pass fill"
+        );
+    }
+
     // The carrier path must resolve FORMAT from `format_by_carrier`, NOT the
     // `format_staged` grid. Build a carrier-bearing chunk whose carrier
     // FORMAT is correct; the emitted field values must match it. Per Task 3,
