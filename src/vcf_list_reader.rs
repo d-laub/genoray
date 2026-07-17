@@ -471,20 +471,35 @@ impl VcfListRecordSource {
         // retires churn site #1 (70.66 GB / 11.8M blocks while never holding more than
         // 43 MB live, per dhat).
         //
-        // `group` is strictly ascending in `col`, which `Carriers::push` requires:
-        // `self.heap` is a `BinaryHeap<Reverse<HeapEntry>>`, so successive `pop()`s
-        // yield `HeapEntry`s in non-decreasing `HeapEntry::Ord` order, i.e. `(pos,
-        // ilen, alt, col)`. The group-drain loop above only continues popping while
-        // `(pos, ilen, alt)` matches `group[0]`'s, so within one group that key is
-        // constant and the ordering degenerates to `col` alone — and no two atoms in
-        // the same group can share a `col` (each file contributes at most one atom per
-        // merge key). So `group[i].0` is strictly increasing in `i`, and `base = col *
-        // self.ploidy` together with the inner `0..ploidy` loop preserves that
-        // ascending order all the way down to individual haplotype columns.
-        let mut carriers = Carriers::new();
+        // `group` is ascending in `col` ONLY across DISTINCT files: each `FileCursor`
+        // owns a unique `col`, so two entries from different files can never tie.
+        // But `col` is NOT unique across the whole group — a single multiallelic
+        // record can atomize (`normalize::atomize_biallelic`) into more than one
+        // sub-atom sharing the same elementary `(pos, ilen, alt)` key (e.g. REF
+        // `AGC` ALT `TGC,TGA` both contribute a `pos+0, SNV A>T` sub-atom), and
+        // `FileCursor::advance` buffers those sub-atoms one at a time, so the SAME
+        // cursor's `col` can be re-pushed onto `self.heap` more than once before a
+        // group is drained — see `multiallelic_key_collision_collapses_last_write_wins`
+        // below, which reproduces exactly this case and would panic on the old
+        // "no two atoms share a col" assumption. So `group` can contain more than one
+        // `(col, atom)` pair for the same `col`, and `Carriers::push` requires
+        // strictly ascending, UNIQUE columns — collapse duplicates before pushing.
+        //
+        // Collapse with last-write-wins per `col`, in `group` iteration order: this
+        // matches the pre-Task-5 dense `build_record`, which looped `for (col, atom)
+        // in &group { gt[base..base+ploidy].copy_from_slice(&atom.ploid_codes) }` —
+        // a later atom for the same `col` fully overwrote an earlier one's ploidy
+        // block. `BTreeMap::insert` on a repeated key overwrites the value and keeps
+        // iteration ascending by key, reproducing both properties at once.
+        let mut by_col: std::collections::BTreeMap<usize, &Vec<i32>> =
+            std::collections::BTreeMap::new();
         for (col, atom) in &group {
-            let base = (*col * self.ploidy) as u32;
-            for (p, &code) in atom.ploid_codes.iter().enumerate() {
+            by_col.insert(*col, &atom.ploid_codes);
+        }
+        let mut carriers = Carriers::new();
+        for (col, ploid_codes) in by_col {
+            let base = (col * self.ploidy) as u32;
+            for (p, &code) in ploid_codes.iter().enumerate() {
                 // `ploid_codes`: -1 missing, 1 carries this atom's source ALT, 0 other
                 // (incl. REF). Only non-zero codes are carriers; 0 means REF, which
                 // `Calls::Sparse` represents by absence.
@@ -912,6 +927,76 @@ mod tests {
         assert_eq!(r2.pos, 2);
         assert_eq!(r2.alts, vec![b"T".to_vec()]);
         assert_eq!(r2.calls, sparse(&[(1, 1)]));
+
+        assert!(src.next_record().unwrap().is_none());
+    }
+
+    // Reviewer finding: a single multiallelic record can atomize into two
+    // sub-atoms sharing the same elementary `(pos, ilen, alt)` merge key --
+    // here REF `AGC` ALT `TGC,TGA`: ALT1 (`TGC`) atomizes to one SNV at pos+0
+    // (A>T); ALT2 (`TGA`) atomizes to an interior SNV at pos+0 (A>T -- the
+    // SAME key as ALT1's atom) plus a boundary SNV at pos+2 (C>A). Both pos+0
+    // sub-atoms come from the SAME file/cursor (`col`), so the merge frontier
+    // `group` for that key holds two `(col, atom)` pairs with an IDENTICAL
+    // `col` -- proven by this test to panic pre-fix (`Carriers::push`'s
+    // debug_assert "carrier columns must be pushed strictly ascending" fires,
+    // since the old code assumed one atom per `col` per group). GT `2|1`
+    // makes the two colliding sub-atoms genuinely divergent (ALT1's atom
+    // carries hap1 only, ploid_codes `[0, 1]`; ALT2's atom carries hap0 only,
+    // `[1, 0]`), so this also exercises the last-write-wins collapse, not
+    // just a no-op dedup of identical values.
+    #[test]
+    fn multiallelic_key_collision_collapses_last_write_wins() {
+        let tmp = tempdir().unwrap();
+        let a = write_ss_vcf(
+            tmp.path(),
+            "a",
+            "chr1",
+            100,
+            "SA",
+            &[SsRec {
+                pos: 2,
+                r: b"AGC",
+                alts: vec![b"TGC", b"TGA"],
+                gt: vec![2, 1],
+            }],
+        );
+        let ref_seq = make_ref(tmp.path(), "chr1", 100, &[(2, b"AGC")]);
+
+        let paths = vec![a.to_str().unwrap().to_string()];
+        let samples = vec!["SA"];
+        let mut src = VcfListRecordSource::new(
+            &paths,
+            &samples,
+            "chr1",
+            Some(&ref_seq),
+            2,
+            1,
+            false,
+            CheckRef::Error,
+            &[],
+            Vec::new(),
+            crate::svar2_view::OverlapMode::Pos,
+        )
+        .unwrap();
+
+        // The colliding key (pos 2, A>T) releases as one merged record. Per
+        // the group-drain order (buffer order == ALT order: ALT1's atom
+        // first, ALT2's atom last), last-write-wins picks ALT2's atom
+        // (`ploid_codes [1, 0]`) -- exactly what the pre-Task-5 dense
+        // `build_record`'s `copy_from_slice`, run over the same `group`
+        // order, would also have produced for this `col`'s whole ploidy
+        // block: `gt[0..2] = [1, 0]`, i.e. hap0 carries, hap1 does not.
+        let r1 = src.next_record().unwrap().unwrap();
+        assert_eq!(r1.pos, 2);
+        assert_eq!(r1.alts, vec![b"T".to_vec()]);
+        assert_eq!(r1.calls, sparse(&[(0, 1)]));
+
+        // The non-colliding boundary atom (pos 4, C>A) is unaffected.
+        let r2 = src.next_record().unwrap().unwrap();
+        assert_eq!(r2.pos, 4);
+        assert_eq!(r2.alts, vec![b"A".to_vec()]);
+        assert_eq!(r2.calls, sparse(&[(0, 1)]));
 
         assert!(src.next_record().unwrap().is_none());
     }
