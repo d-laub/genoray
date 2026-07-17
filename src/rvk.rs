@@ -283,22 +283,11 @@ fn route_variants(
     };
 
     // Dense per-class tables accumulate positions + keys as we discover dense
-    // variants; geno_bits is sized after the pre-pass (n_dense known). This
-    // also ensures a long insertion is pushed to the bank a single time, not
-    // once per carrying haplotype.
+    // variants; geno_bits and field staging are sized after the pre-pass
+    // (n_dense known per class -- see below). This also ensures a long
+    // insertion is pushed to the bank a single time, not once per carrying
+    // haplotype.
     let mut dense = DenseMap::from_fn(|c| DenseSubChunk::empty(c.key_bytes()));
-    for (_c, sub) in dense.iter_mut() {
-        sub.field_info = fields
-            .iter()
-            .filter(|f| f.category == FieldCategory::Info)
-            .map(|f| StagedColumn::with_capacity(f.stage_is_float(), v_variants))
-            .collect();
-        sub.field_format = fields
-            .iter()
-            .filter(|f| f.category == FieldCategory::Format)
-            .map(|f| StagedColumn::with_capacity(f.stage_is_float(), v_variants * num_samples))
-            .collect();
-    }
     let mut routes: Vec<Route> = Vec::with_capacity(v_variants);
 
     // Summed per-record storage width (bits) of the active INFO/FORMAT
@@ -372,35 +361,69 @@ fn route_variants(
                 }
                 sub.n_dense_variants += 1;
 
-                // Genotype-aligned (Option A) dense field push: INFO once per
-                // dense variant; FORMAT as a full per-sample column, with
-                // non-carrier samples filled with the field's sentinel/default.
-                for &(is_format, idx) in &per_cat {
-                    if is_format {
-                        let default_val = format_specs[idx].missing_sentinel();
-                        for s in 0..num_samples {
-                            let val = if is_carrier(v, s) {
-                                staged_f64(&chunk.format_staged[idx], v * num_samples + s)
-                            } else {
-                                default_val
-                            };
-                            sub.field_format[idx].push_f64(val);
-                        }
-                    } else {
-                        let val = staged_f64(&chunk.info_staged[idx], v);
-                        sub.field_info[idx].push_f64(val);
-                    }
-                }
-
                 routes.push(Route::Dense { class: dclass, col });
             }
         }
     }
 
-    // Size each dense class's hap-major geno block now that n_dense is known.
+    // Every variant is now classified, so each class's dense count is known
+    // exactly (`sub.n_dense_variants`). Reserve the geno bit block and field
+    // staging on that count, not `v_variants` -- reserving the whole chunk
+    // for both classes before any variant was classified dense cost ~10 GB
+    // of address space per chunk at N=7089, F=7, in a cohort where ~nothing
+    // routes dense (untouched pages cost VmData, not RSS, but a `ulimit -v`
+    // still sees it). A class with zero dense variants keeps its
+    // default-empty `field_info`/`field_format` (`DenseSubChunk::empty`) --
+    // the writer skips a class entirely when `n_dense_variants == 0` (see
+    // writer.rs), so nothing downstream ever reads them.
     for (_c, sub) in dense.iter_mut() {
         let bits = columns * sub.n_dense_variants;
         sub.geno_bits = vec![0u8; bits.div_ceil(8)];
+        if sub.n_dense_variants == 0 {
+            continue;
+        }
+        sub.field_info = fields
+            .iter()
+            .filter(|f| f.category == FieldCategory::Info)
+            .map(|f| StagedColumn::with_capacity(f.stage_is_float(), sub.n_dense_variants))
+            .collect();
+        sub.field_format = fields
+            .iter()
+            .filter(|f| f.category == FieldCategory::Format)
+            .map(|f| {
+                StagedColumn::with_capacity(f.stage_is_float(), sub.n_dense_variants * num_samples)
+            })
+            .collect();
+    }
+
+    // Second pass: push the dense variants' field values now that their
+    // columns are correctly sized. Walks `routes` rather than re-classifying
+    // `chunk` -- `classify_variant`/`pack_variant` push long alleles into
+    // `bank`, so re-running classification here would double-push them.
+    for (v, route) in routes.iter().enumerate() {
+        let Route::Dense { class, .. } = route else {
+            continue;
+        };
+        let sub = dense.get_mut(*class);
+        // Genotype-aligned (Option A) dense field push: INFO once per dense
+        // variant; FORMAT as a full per-sample column, with non-carrier
+        // samples filled with the field's sentinel/default.
+        for &(is_format, idx) in &per_cat {
+            if is_format {
+                let default_val = format_specs[idx].missing_sentinel();
+                for s in 0..num_samples {
+                    let val = if is_carrier(v, s) {
+                        staged_f64(&chunk.format_staged[idx], v * num_samples + s)
+                    } else {
+                        default_val
+                    };
+                    sub.field_format[idx].push_f64(val);
+                }
+            } else {
+                let val = staged_f64(&chunk.info_staged[idx], v);
+                sub.field_info[idx].push_f64(val);
+            }
+        }
     }
 
     RoutingPrePass {
@@ -742,6 +765,43 @@ mod tests {
         chunk
     }
 
+    // Build a DenseChunk where the first `n_dense` variants are carried by
+    // every hap (all columns set -- `choose_representation` routes these
+    // Dense) and the remaining `v_variants - n_dense` are carried by a single
+    // hap each (routes VarKey). `carriers` is left `None` so `dense2sparse_vk`
+    // takes the grid-scan path, which reads `x` straight from `genos` --
+    // exactly what `route_variants` sizes its dense staging from.
+    fn chunk_with_dense_variants(
+        v_variants: usize,
+        n_dense: usize,
+        n_samples: usize,
+    ) -> DenseChunk {
+        let ploidy = 2usize;
+        let columns = n_samples * ploidy;
+        let refs: Vec<&[u8]> = vec![b"A"; v_variants];
+        let alts: Vec<&[u8]> = vec![b"C"; v_variants];
+        let mut bit_pattern = vec![false; v_variants * columns];
+        for v in 0..v_variants {
+            if v < n_dense {
+                for c in 0..columns {
+                    bit_pattern[v * columns + c] = true;
+                }
+            } else {
+                bit_pattern[v * columns] = true;
+            }
+        }
+        let mut chunk = build_test_chunk(v_variants, n_samples, ploidy, &refs, &alts, &bit_pattern);
+        chunk.format_staged = vec![
+            StagedColumn::Int((0..v_variants * n_samples).map(|i| i as i32).collect()),
+            StagedColumn::Int(
+                (0..v_variants * n_samples)
+                    .map(|i| (i * 2) as i32)
+                    .collect(),
+            ),
+        ];
+        chunk
+    }
+
     // Two FORMAT FieldSpecs, so the field-push order inside `emit_call` is
     // covered by the differential test (not just the empty-`fields` case).
     fn two_format_fields() -> Vec<FieldSpec> {
@@ -762,6 +822,31 @@ mod tests {
                 default: None,
             },
         ]
+    }
+
+    // Task 9: dense field staging must be sized on the number of variants
+    // that actually route Dense, not the whole chunk -- reserving
+    // `v_variants * num_samples` per column for every class, before any
+    // variant is classified, is ~10 GB of address space per chunk at
+    // production scale (N=7089, F=7) for a cohort where almost nothing
+    // routes dense.
+    #[test]
+    fn dense_staging_reserves_on_the_dense_count_not_the_chunk() {
+        let chunk = chunk_with_dense_variants(
+            /* v_variants */ 1000, /* n_dense */ 2, /* samples */ 64,
+        );
+        let mut bank = make_bank();
+        let out = dense2sparse_vk(&chunk, &mut bank, false, &two_format_fields());
+
+        for (_class, sub) in out.dense.iter() {
+            for col in sub.field_format.iter() {
+                assert!(
+                    col.capacity() <= 2 * 64 * 2,
+                    "reserved {} for 2 dense variants x 64 samples",
+                    col.capacity()
+                );
+            }
+        }
     }
 
     // Task 8: carrier-driven emission (`dense2sparse_vk` with `chunk.carriers

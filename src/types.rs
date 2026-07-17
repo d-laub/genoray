@@ -119,6 +119,14 @@ impl StagedColumn {
             StagedColumn::Float(x) => x.push(v as f32),
         }
     }
+
+    /// The inner `Vec`'s capacity -- reservation tests only, not a hot path.
+    pub fn capacity(&self) -> usize {
+        match self {
+            StagedColumn::Int(x) => x.capacity(),
+            StagedColumn::Float(x) => x.capacity(),
+        }
+    }
 }
 
 // Defines DenseChunk and SparseChunk structs. All other files import from here.
