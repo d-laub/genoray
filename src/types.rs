@@ -1,5 +1,6 @@
-use crate::record_source::Carriers;
+use crate::record_source::{Carriers, FormatVals};
 use crate::streams::StreamMap;
+use std::sync::Arc;
 
 // Key-layout constants now live in the `svar2-codec` crate (single source of
 // layout truth). Re-exported so existing `crate::types::{MIN_I31,
@@ -164,6 +165,17 @@ pub struct DenseChunk {
     /// own atom's `source_alt_index` -- i.e. exactly the bits `pack_row` set
     /// for it, so it and `genos` are two encodings of the same presence data.
     pub carriers: Option<Vec<Carriers>>,
+
+    /// Per-variant FORMAT values, carrier-sparse, one entry per variant in
+    /// chunk order. `Some` iff `carriers.is_some()` (the k-way merge over
+    /// single-sample VCFs); `None` for natively dense sources (multi-sample
+    /// VCF, PGEN), which keep `format_staged`. `carriers` and this are two
+    /// carrier-sparse encodings of the same chunk, keyed differently:
+    /// `carriers` by haplotype column (genotype presence), this by sample
+    /// (FORMAT is per-sample, not per-haplotype). When `Some`, `format_staged`
+    /// is left empty (see chunk_assembler.rs) and `rvk` resolves FORMAT from
+    /// here instead.
+    pub format_by_carrier: Option<Vec<Arc<FormatVals>>>,
 }
 
 // One position-sorted sub-stream of calls with byte-erased keys (`key_bytes`

@@ -739,6 +739,7 @@ mod tests {
             info_staged: Vec::new(),
             format_staged: Vec::new(),
             carriers: None,
+            format_by_carrier: None,
         }
     }
 

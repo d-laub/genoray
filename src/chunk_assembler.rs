@@ -718,6 +718,7 @@ impl ChunkAssembler {
         // Sequential metadata pass (cheap, ordering-preserving).
         let mut off = 0u32;
         let mut carrier_opts: Vec<Option<Carriers>> = Vec::with_capacity(metas.len());
+        let mut format_arcs: Vec<Arc<FormatVals>> = Vec::with_capacity(metas.len());
         for a in metas.iter_mut() {
             pos.push(a.pos);
             ilens.push(a.ilen);
@@ -745,6 +746,7 @@ impl ChunkAssembler {
                     ));
                 }
             }
+            format_arcs.push(Arc::clone(&a.format_vals));
             carrier_opts.push(a.carriers.take());
         }
 
@@ -770,6 +772,11 @@ impl ChunkAssembler {
             None
         };
 
+        // `format_by_carrier` is Some/None in lockstep with `carriers`: both
+        // come from a carrier-bearing source or neither does (the `all_some`/
+        // `all_none` uniformity asserted above).
+        let format_by_carrier = if all_some { Some(format_arcs) } else { None };
+
         Ok(Some(DenseChunk {
             chunk_id,
             pos,
@@ -780,6 +787,7 @@ impl ChunkAssembler {
             info_staged,
             format_staged,
             carriers,
+            format_by_carrier,
         }))
     }
 }
