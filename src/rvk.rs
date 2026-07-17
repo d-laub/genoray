@@ -136,9 +136,92 @@ pub fn classify_variant(ilen: i32, alt_allele: &[u8], bank: &mut LongAlleleTable
     }
 }
 
-// The core Dense-to-Sparse Matrix Transposer.
-// Flips Row-Major VCF data into Column-Major (Sample-Major) Sparse Tensors.
-pub fn dense2sparse_vk(
+// Per-variant routing record built in the pre-pass shared by
+// `dense2sparse_vk_by_scan` and `dense2sparse_vk`.
+enum Route {
+    VarKey(VarKey),
+    // dense variant: which class + its column index within that class's table
+    Dense { class: DenseClass, col: u32 },
+}
+
+// Read a staged column's value back as `f64` (the common currency for field
+// resolution). `Int` also carries Flag columns (staged as 0/1). Shared by the
+// routing pre-pass (dense per-sample fill) and `emit_call` below.
+#[inline(always)]
+fn staged_f64(col: &StagedColumn, idx: usize) -> f64 {
+    match col {
+        StagedColumn::Int(v) => v[idx] as f64,
+        StagedColumn::Float(v) => v[idx] as f64,
+    }
+}
+
+// Emit one located call: push it into its var_key stream (with field values,
+// in FLAT `fields` order) or set its bit in the dense class's hap-major geno
+// block. This is today's `Route::VarKey` / `Route::Dense` arm bodies, moved
+// here verbatim so the grid-scan (`dense2sparse_vk_by_scan`) and the
+// carrier-driven transpose (`dense2sparse_vk`) can never diverge on what a
+// located call actually does -- only on how they locate it. Preserves exactly:
+// the `hap = s * ploidy + p` derivation (passed in as `hap` since each caller
+// computes it its own way), the `field_calls` push order, and the `counts`
+// bookkeeping.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn emit_call(
+    route: &Route,
+    chunk: &DenseChunk,
+    v: usize,
+    s: usize,
+    hap: usize,
+    num_samples: usize,
+    per_cat: &[(bool, usize)],
+    streams: &mut crate::streams::StreamMap<SparseSubStream>,
+    dense: &mut DenseMap<DenseSubChunk>,
+    counts: &mut crate::streams::StreamMap<u32>,
+) {
+    match route {
+        Route::VarKey(vk) => {
+            // SAFETY: every caller bounds `v` to `0..v_variants`, and
+            // `chunk.pos.len() == v_variants` (see the routing pre-pass'
+            // dense-branch comment), so `pos[v]` is in bounds.
+            let pos = unsafe { *chunk.pos.get_unchecked(v) };
+            let (tag, key_le): (StreamTag, [u8; 4]) = match vk {
+                VarKey::Snp(code) => (StreamTag::VarKeySnp, [*code, 0, 0, 0]),
+                VarKey::Indel(key) => (StreamTag::VarKeyIndel, key.to_le_bytes()),
+            };
+            let spec = &crate::streams::REGISTRY[tag.index()];
+            let st = streams.get_mut(tag);
+            st.push_call(pos, &key_le[..spec.key_bytes]);
+            // Genotype-aligned (Option A) per-call field push, aligned to call
+            // order: INFO uses the variant's single value; FORMAT uses the
+            // calling sample's.
+            for (i, &(is_format, idx)) in per_cat.iter().enumerate() {
+                let val = if is_format {
+                    staged_f64(&chunk.format_staged[idx], v * num_samples + s)
+                } else {
+                    staged_f64(&chunk.info_staged[idx], v)
+                };
+                st.field_calls[i].push_f64(val);
+            }
+            *counts.get_mut(tag) += 1;
+        }
+        Route::Dense { class, col } => {
+            let sub = dense.get_mut(*class);
+            let bit = hap * sub.n_dense_variants + (*col as usize);
+            crate::bits::set_bit(&mut sub.geno_bits, bit);
+        }
+    }
+}
+
+// Today's Dense-to-Sparse Matrix Transposer, kept exactly as it was before
+// Task 8 (route-before-densify): a column-outer, variant-inner scan that walks
+// every (variant, column) presence bit to find the carriers. Used two ways:
+// as the production path for chunks whose source is natively dense
+// (`chunk.carriers == None`, where scanning `genos` is both correct and
+// cheapest -- see `DenseChunk::carriers` in types.rs), and as the parity
+// oracle `dense2sparse_vk`'s differential test runs a carrier-bearing chunk
+// through directly (with `carriers` withheld) to prove the carrier-driven
+// path emits byte-identical output.
+fn dense2sparse_vk_by_scan(
     chunk: &DenseChunk,
     bank: &mut LongAlleleTableWriter,
     sidecar_bits_enabled: bool,
@@ -146,23 +229,6 @@ pub fn dense2sparse_vk(
 ) -> SparseChunk {
     let (v_variants, num_samples, ploidy) = chunk.genos.shape;
     let columns = num_samples * ploidy;
-
-    // Per-variant routing record built in one pre-pass.
-    enum Route {
-        VarKey(VarKey),
-        // dense variant: which class + its column index within that class's table
-        Dense { class: DenseClass, col: u32 },
-    }
-
-    // Read a staged column's value back as `f64` (the common currency for
-    // field resolution). `Int` also carries Flag columns (staged as 0/1).
-    #[inline(always)]
-    fn staged_f64(col: &StagedColumn, idx: usize) -> f64 {
-        match col {
-            StagedColumn::Int(v) => v[idx] as f64,
-            StagedColumn::Float(v) => v[idx] as f64,
-        }
-    }
 
     // Map each flat index in `fields` to (is_format, per-category index) so
     // both routing branches can index straight into `chunk.info_staged` /
@@ -360,38 +426,20 @@ pub fn dense2sparse_vk(
                 // SAFETY: `routes` was built by the pre-pass loop above,
                 // which pushes exactly one `Route` per `v in 0..v_variants`,
                 // so `routes.len() == v_variants` and `routes[v]` is in
-                // bounds here for the same `v`. `chunk.pos.len() ==
-                // v_variants` (see the dense-branch comment above), so
-                // `pos[v]` is likewise in bounds.
-                match unsafe { routes.get_unchecked(v) } {
-                    Route::VarKey(vk) => {
-                        let pos = unsafe { *chunk.pos.get_unchecked(v) };
-                        let (tag, key_le): (StreamTag, [u8; 4]) = match vk {
-                            VarKey::Snp(code) => (StreamTag::VarKeySnp, [*code, 0, 0, 0]),
-                            VarKey::Indel(key) => (StreamTag::VarKeyIndel, key.to_le_bytes()),
-                        };
-                        let spec = &crate::streams::REGISTRY[tag.index()];
-                        let st = streams.get_mut(tag);
-                        st.push_call(pos, &key_le[..spec.key_bytes]);
-                        // Genotype-aligned (Option A) per-call field push,
-                        // aligned to call order: INFO uses the variant's
-                        // single value; FORMAT uses the calling sample's.
-                        for (i, &(is_format, idx)) in per_cat.iter().enumerate() {
-                            let val = if is_format {
-                                staged_f64(&chunk.format_staged[idx], v * num_samples + s)
-                            } else {
-                                staged_f64(&chunk.info_staged[idx], v)
-                            };
-                            st.field_calls[i].push_f64(val);
-                        }
-                        *counts.get_mut(tag) += 1;
-                    }
-                    Route::Dense { class, col } => {
-                        let sub = dense.get_mut(*class);
-                        let bit = hap * sub.n_dense_variants + (*col as usize);
-                        crate::bits::set_bit(&mut sub.geno_bits, bit);
-                    }
-                }
+                // bounds here for the same `v`.
+                let route = unsafe { routes.get_unchecked(v) };
+                emit_call(
+                    route,
+                    chunk,
+                    v,
+                    s,
+                    hap,
+                    num_samples,
+                    &per_cat,
+                    &mut streams,
+                    &mut dense,
+                    &mut counts,
+                );
             }
             for (tag, c) in counts.into_iter_tagged() {
                 streams.get_mut(tag).sample_lengths.push(c);
@@ -406,9 +454,287 @@ pub fn dense2sparse_vk(
     }
 }
 
+// The core Dense-to-Sparse Matrix Transposer, and the entry point every
+// caller uses. Routes each chunk by how its presence data arrived:
+//
+// - `chunk.carriers == None` (a natively dense source -- a multi-sample VCF,
+//   PGEN): falls straight through to `dense2sparse_vk_by_scan`, today's
+//   grid-scan, unchanged. For these sources `genos` IS the cheapest and only
+//   source of truth (see `DenseChunk::carriers` in types.rs).
+// - `chunk.carriers == Some(..)` (the k-way merge over single-sample VCFs):
+//   runs the carrier-driven emission below, which counting-sorts the chunk's
+//   carriers by column and walks only the (variant, column) pairs that are
+//   actually present -- replacing a scan of every (variant, column) slot
+//   (`dense2sparse_vk_by_scan`'s ~O(V x N) bit-test) with O(carriers +
+//   columns) work. Sparse-routed variants never touch `chunk.genos` here; the
+//   routing pre-pass below is otherwise identical to `dense2sparse_vk_by_scan`
+//   (duplicated rather than shared, so that function's status as an untouched
+//   parity oracle is never put at risk by a change made for this path).
+pub fn dense2sparse_vk(
+    chunk: &DenseChunk,
+    bank: &mut LongAlleleTableWriter,
+    sidecar_bits_enabled: bool,
+    fields: &[FieldSpec],
+) -> SparseChunk {
+    let Some(carriers) = chunk.carriers.as_ref() else {
+        return dense2sparse_vk_by_scan(chunk, bank, sidecar_bits_enabled, fields);
+    };
+
+    let (v_variants, num_samples, ploidy) = chunk.genos.shape;
+    let columns = num_samples * ploidy;
+    debug_assert_eq!(
+        carriers.len(),
+        v_variants,
+        "DenseChunk::carriers must have one entry per variant, in chunk order"
+    );
+
+    // Map each flat index in `fields` to (is_format, per-category index) so
+    // both routing branches can index straight into `chunk.info_staged` /
+    // `chunk.format_staged` without re-filtering `fields` per variant/call.
+    // INVARIANT (reader-side): `info_staged`/`format_staged` are ordered to
+    // match the INFO/FORMAT-filtered order of `fields` (see types.rs).
+    let per_cat: Vec<(bool, usize)> = {
+        let mut info_i = 0usize;
+        let mut fmt_i = 0usize;
+        fields
+            .iter()
+            .map(|f| match f.category {
+                FieldCategory::Info => {
+                    let idx = info_i;
+                    info_i += 1;
+                    (false, idx)
+                }
+                FieldCategory::Format => {
+                    let idx = fmt_i;
+                    fmt_i += 1;
+                    (true, idx)
+                }
+            })
+            .collect()
+    };
+    let format_specs: Vec<&FieldSpec> = fields
+        .iter()
+        .filter(|f| f.category == FieldCategory::Format)
+        .collect();
+
+    // Genotype-aligned carrier test: sample `s` carries variant `v` iff any
+    // of its ploidy bits are set in `chunk.genos`. Used only for the dense
+    // FORMAT per-sample fill (Option A semantics) below -- a genuinely dense
+    // variant needs every sample's carrier status regardless of routing
+    // strategy, so this still reads `genos` (see `dense2sparse_vk_by_scan`'s
+    // identical comment).
+    let is_carrier = |v: usize, s: usize| -> bool {
+        (0..ploidy).any(|p| {
+            let flat_idx = v * columns + s * ploidy + p;
+            (chunk.genos.words[flat_idx >> 6] >> (flat_idx & 63)) & 1 == 1
+        })
+    };
+
+    // Dense per-class tables accumulate positions + keys as we discover dense
+    // variants; geno_bits is sized after the pre-pass (n_dense known). This
+    // also ensures a long insertion is pushed to the bank a single time, not
+    // once per carrying haplotype.
+    let mut dense = DenseMap::from_fn(|c| DenseSubChunk::empty(c.key_bytes()));
+    for (_c, sub) in dense.iter_mut() {
+        sub.field_info = fields
+            .iter()
+            .filter(|f| f.category == FieldCategory::Info)
+            .map(|f| StagedColumn::with_capacity(f.stage_is_float(), v_variants))
+            .collect();
+        sub.field_format = fields
+            .iter()
+            .filter(|f| f.category == FieldCategory::Format)
+            .map(|f| StagedColumn::with_capacity(f.stage_is_float(), v_variants * num_samples))
+            .collect();
+    }
+    let mut routes: Vec<Route> = Vec::with_capacity(v_variants);
+
+    // Summed per-record storage width (bits) of the active INFO/FORMAT
+    // fields, computed once outside the per-variant loop. `Auto` dtype has
+    // no fixed width yet, so it's estimated at the 4-byte (32-bit) staged
+    // i32/f32 width used during staging.
+    let info_bits: u64 = fields
+        .iter()
+        .filter(|f| f.category == FieldCategory::Info)
+        .map(|f| f.dtype.width_bytes().unwrap_or(4) as u64 * 8)
+        .sum();
+    let format_bits: u64 = fields
+        .iter()
+        .filter(|f| f.category == FieldCategory::Format)
+        .map(|f| f.dtype.width_bytes().unwrap_or(4) as u64 * 8)
+        .sum();
+
+    for v in 0..v_variants {
+        // SAFETY: `v` ranges over `0..v_variants` and `chunk.ilens.len() ==
+        // v_variants` (one entry per variant), so `ilens[v]` is in bounds.
+        // `chunk.alt_offsets` is a CSR offset array of length `v_variants +
+        // 1` (one extra sentinel past the last variant), so both
+        // `alt_offsets[v]` and `alt_offsets[v + 1]` are in bounds for `v <
+        // v_variants`. By CSR construction those two offsets are
+        // monotonically non-decreasing and bound exactly the ALT bytes for
+        // variant `v` within `chunk.alt`, so `alt[start_idx..end_idx]` is a
+        // valid sub-slice. `carriers.len() == v_variants` is asserted above,
+        // so `carriers[v]` is likewise in bounds.
+        let ilen = unsafe { *chunk.ilens.get_unchecked(v) };
+        let start_idx = unsafe { *chunk.alt_offsets.get_unchecked(v) } as usize;
+        let end_idx = unsafe { *chunk.alt_offsets.get_unchecked(v + 1) } as usize;
+        let alt_allele = unsafe { chunk.alt.get_unchecked(start_idx..end_idx) };
+
+        let vk = classify_variant(ilen, alt_allele, bank);
+        let (class, dclass) = match vk {
+            VarKey::Snp(_) => (Class::Snp, DenseClass::Snp),
+            VarKey::Indel(_) => (Class::Indel, DenseClass::Indel),
+        };
+        // Equivalent to `chunk.genos.popcount_plane(v)` (`dense2sparse_vk_by_
+        // scan`'s source of `x`): `carriers[v]` was built (chunk_assembler.rs)
+        // from exactly the columns where this atom's own allele is present --
+        // the same presence bits `pack_row` set for it -- so its length is
+        // that popcount by construction. Using it here means the routing
+        // pre-pass never has to touch `chunk.genos` for a sparse-sourced
+        // chunk either.
+        let x = unsafe { carriers.get_unchecked(v) }.len();
+
+        let sidecar_bits = if sidecar_bits_enabled {
+            match class {
+                Class::Snp => crate::cost_model::SIDECAR_BITS_SNP,
+                Class::Indel => crate::cost_model::SIDECAR_BITS_INDEL,
+            }
+        } else {
+            0
+        };
+        match choose_representation(
+            class,
+            num_samples,
+            ploidy,
+            x,
+            sidecar_bits,
+            info_bits,
+            format_bits,
+        ) {
+            Representation::VarKey => routes.push(Route::VarKey(vk)),
+            Representation::Dense => {
+                let sub = dense.get_mut(dclass);
+                let col = sub.n_dense_variants as u32;
+                // SAFETY: `v` is the same loop index bound by `0..v_variants`
+                // above, and `chunk.pos.len() == v_variants`, so `pos[v]` is
+                // in bounds.
+                let pos = unsafe { *chunk.pos.get_unchecked(v) };
+                sub.positions.push(pos);
+                match vk {
+                    VarKey::Snp(code) => sub.keys.push(code),
+                    VarKey::Indel(key) => sub.keys.extend_from_slice(&key.to_le_bytes()),
+                }
+                sub.n_dense_variants += 1;
+
+                // Genotype-aligned (Option A) dense field push: INFO once per
+                // dense variant; FORMAT as a full per-sample column, with
+                // non-carrier samples filled with the field's sentinel/default.
+                for &(is_format, idx) in &per_cat {
+                    if is_format {
+                        let default_val = format_specs[idx].missing_sentinel();
+                        for s in 0..num_samples {
+                            let val = if is_carrier(v, s) {
+                                staged_f64(&chunk.format_staged[idx], v * num_samples + s)
+                            } else {
+                                default_val
+                            };
+                            sub.field_format[idx].push_f64(val);
+                        }
+                    } else {
+                        let val = staged_f64(&chunk.info_staged[idx], v);
+                        sub.field_info[idx].push_f64(val);
+                    }
+                }
+
+                routes.push(Route::Dense { class: dclass, col });
+            }
+        }
+    }
+
+    // Size each dense class's hap-major geno block now that n_dense is known.
+    for (_c, sub) in dense.iter_mut() {
+        let bits = columns * sub.n_dense_variants;
+        sub.geno_bits = vec![0u8; bits.div_ceil(8)];
+    }
+
+    let estimated_nnz = (v_variants * columns) / 20;
+    let mut streams = crate::streams::StreamMap::from_fn(|tag| {
+        let spec = &crate::streams::REGISTRY[tag.index()];
+        SparseSubStream::with_capacity(spec.key_bytes, estimated_nnz, columns)
+    });
+    for (_tag, st) in streams.iter_mut() {
+        st.field_calls = fields
+            .iter()
+            .map(|f| StagedColumn::with_capacity(f.stage_is_float(), estimated_nnz))
+            .collect();
+    }
+
+    // Counting sort the chunk's carriers by column. The streams are
+    // sample-major, so we must emit in column order; bucketing is O(carriers
+    // + columns) and replaces a scan of every (variant, column) slot.
+    let mut counts_per_col = vec![0u32; columns + 1];
+    for cs in carriers.iter() {
+        for (col, _allele) in cs.iter() {
+            counts_per_col[col as usize + 1] += 1;
+        }
+    }
+    for i in 0..columns {
+        counts_per_col[i + 1] += counts_per_col[i];
+    }
+    let total: usize = counts_per_col[columns] as usize;
+    let mut by_col: Vec<u32> = vec![0u32; total]; // variant index, grouped by column
+    {
+        let mut cursor = counts_per_col.clone();
+        for (v, cs) in carriers.iter().enumerate() {
+            for (col, _allele) in cs.iter() {
+                let slot = &mut cursor[col as usize];
+                by_col[*slot as usize] = v as u32;
+                *slot += 1;
+            }
+        }
+    }
+
+    for column in 0..columns {
+        let s = column / ploidy;
+        let lo = counts_per_col[column] as usize;
+        let hi = counts_per_col[column + 1] as usize;
+        let mut counts = crate::streams::StreamMap::from_fn(|_| 0u32);
+        for &v in &by_col[lo..hi] {
+            let v = v as usize;
+            // SAFETY: `by_col` entries come from `carriers.iter().enumerate()`,
+            // bounded by `carriers.len() == v_variants` (asserted above), and
+            // `routes` has exactly one entry per `v in 0..v_variants` from the
+            // pre-pass loop above, so `routes[v]` is in bounds.
+            let route = unsafe { routes.get_unchecked(v) };
+            emit_call(
+                route,
+                chunk,
+                v,
+                s,
+                column,
+                num_samples,
+                &per_cat,
+                &mut streams,
+                &mut dense,
+                &mut counts,
+            );
+        }
+        for (tag, c) in counts.into_iter_tagged() {
+            streams.get_mut(tag).sample_lengths.push(c);
+        }
+    }
+
+    SparseChunk {
+        chunk_id: chunk.chunk_id,
+        streams,
+        dense,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::record_source::Carriers;
     use crate::types::{BitGrid3, MIN_I31};
     use crossbeam_channel::bounded;
     use proptest::prelude::*;
@@ -468,6 +794,109 @@ mod tests {
             genos,
             info_staged: Vec::new(),
             format_staged: Vec::new(),
+            carriers: None,
+        }
+    }
+
+    // Build a DenseChunk whose variant `i` is carried by exactly one hap --
+    // sample `i % s`'s first ploidy slot (SNP A->C, source_alt_index 1
+    // throughout) -- with `genos` and `carriers` populated as two consistent
+    // encodings of the same presence data, per the differential test's
+    // premise. Also stages two FORMAT columns' worth of deterministic values
+    // so a test that requests `two_format_fields()` has real data to push;
+    // harmless (unread) for a test that passes no fields.
+    fn private_chunk(v_variants: usize, n_samples: usize) -> DenseChunk {
+        let ploidy = 2usize;
+        let columns = n_samples * ploidy;
+        let refs: Vec<&[u8]> = vec![b"A"; v_variants];
+        let alts: Vec<&[u8]> = vec![b"C"; v_variants];
+        let mut bit_pattern = vec![false; v_variants * columns];
+        let mut carriers = Vec::with_capacity(v_variants);
+        for i in 0..v_variants {
+            let hap = (i % n_samples) * ploidy; // p = 0
+            bit_pattern[i * columns + hap] = true;
+            let mut c = Carriers::new();
+            c.push(hap as u32, 1);
+            carriers.push(c);
+        }
+        let mut chunk = build_test_chunk(v_variants, n_samples, ploidy, &refs, &alts, &bit_pattern);
+        chunk.carriers = Some(carriers);
+        chunk.format_staged = vec![
+            StagedColumn::Int((0..v_variants * n_samples).map(|i| i as i32).collect()),
+            StagedColumn::Int(
+                (0..v_variants * n_samples)
+                    .map(|i| (i * 2) as i32)
+                    .collect(),
+            ),
+        ];
+        chunk
+    }
+
+    // Two FORMAT FieldSpecs, so the field-push order inside `emit_call` is
+    // covered by the differential test (not just the empty-`fields` case).
+    fn two_format_fields() -> Vec<FieldSpec> {
+        use crate::field::{HtslibType, StorageDtype};
+        vec![
+            FieldSpec {
+                name: "DP".into(),
+                category: FieldCategory::Format,
+                htype: HtslibType::Int,
+                dtype: StorageDtype::Auto,
+                default: None,
+            },
+            FieldSpec {
+                name: "GQ".into(),
+                category: FieldCategory::Format,
+                htype: HtslibType::Int,
+                dtype: StorageDtype::Auto,
+                default: None,
+            },
+        ]
+    }
+
+    // Task 8: carrier-driven emission (`dense2sparse_vk` with `chunk.carriers
+    // == Some`) must be byte-identical to the grid scan
+    // (`dense2sparse_vk_by_scan`, reached via `dense2sparse_vk` when
+    // `chunk.carriers == None`) -- the carrier list and the presence grid are
+    // two encodings of the same chunk, so both paths must emit identical
+    // SparseChunks: same calls, same order, same sample_lengths. Order
+    // matters: `merge_mini_sc`'s ledger arithmetic depends on it.
+    #[test]
+    fn carrier_driven_emission_matches_the_grid_scan_exactly() {
+        for (v_variants, n_samples) in [(64usize, 8usize), (64, 512), (1000, 64)] {
+            let chunk = private_chunk(v_variants, n_samples); // carriers: Some(..)
+            let fields = two_format_fields();
+
+            let mut bank_carriers = make_bank();
+            let via_carriers = dense2sparse_vk(&chunk, &mut bank_carriers, false, &fields);
+
+            // Same chunk with the carrier list withheld => forced down the scan path.
+            let mut scanned = chunk.clone();
+            scanned.carriers = None;
+            let mut bank_scan = make_bank();
+            let via_scan = dense2sparse_vk(&scanned, &mut bank_scan, false, &fields);
+
+            assert_eq!(
+                via_carriers, via_scan,
+                "carrier-driven and grid-scan emission diverged at {v_variants}x{n_samples}"
+            );
+        }
+    }
+
+    // sample_lengths must receive one entry per column per chunk, including
+    // zeros for columns with no calls -- merge.rs's per-(chunk, column)
+    // ledger arithmetic silently corrupts the store otherwise.
+    #[test]
+    fn carrier_emission_still_writes_one_sample_length_per_column() {
+        let chunk = private_chunk(64, 8);
+        let mut bank = make_bank();
+        let out = dense2sparse_vk(&chunk, &mut bank, false, &[]);
+        for (_tag, st) in out.streams.iter() {
+            assert_eq!(
+                st.sample_lengths.len(),
+                8 * 2,
+                "one entry per column, zeros included"
+            );
         }
     }
 

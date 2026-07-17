@@ -13,6 +13,7 @@ pub trait EnumKey: Copy + 'static {
 
 /// Fixed-size map keyed by `K`, backed by an array (O(1), no hashing).
 /// `N` is pinned to `K::COUNT` by the concrete type aliases.
+#[derive(Debug, PartialEq)]
 pub struct EnumMap<K: EnumKey, T, const N: usize> {
     slots: [T; N],
     _k: PhantomData<K>,

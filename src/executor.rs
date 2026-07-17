@@ -82,6 +82,7 @@ mod tests {
             genos,
             info_staged: Vec::new(),
             format_staged: Vec::new(),
+            carriers: None,
         }
     }
 

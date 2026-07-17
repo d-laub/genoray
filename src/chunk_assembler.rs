@@ -1,7 +1,7 @@
 use crate::error::ConversionError;
 use crate::field::{FieldCategory, FieldSpec};
 use crate::normalize::atomize_record;
-use crate::record_source::{Calls, FormatVals, RawRecord, RecordSource};
+use crate::record_source::{Calls, Carriers, FormatVals, RawRecord, RecordSource};
 use crate::types::{BitGrid3, DenseChunk, StagedColumn};
 use rayon::prelude::*;
 use std::cmp::Reverse;
@@ -272,6 +272,11 @@ struct AtomMeta {
     source_alt_index: u16,
     info_vals: Vec<f64>,
     format_vals: Arc<FormatVals>,
+    /// Columns whose allele is this atom's `source_alt_index` -- i.e. exactly the
+    /// bits `pack_row` sets for this atom. `None` when the source is natively
+    /// dense, where recovering carriers from the grid is correct and cheaper than
+    /// retaining them (see `DenseChunk::carriers`, src/types.rs).
+    carriers: Option<Carriers>,
 }
 
 // Atoms buffered before their presence bits are flushed into the chunk's BitGrid.
@@ -316,6 +321,23 @@ fn flush_window(
 
     metas.reserve(buf.len());
     for a in buf.drain(..) {
+        // Reuses the same `allele == src` filter `pack_row` already applies (see
+        // above) -- O(carriers), not a new scan. `Calls::Sparse`'s carrier list is
+        // ascending by construction (Task 3-7), and filtering an ascending sequence
+        // keeps it ascending, so `Carriers::push`'s ordering invariant holds.
+        let carriers = match a.calls.as_ref() {
+            Calls::Dense(_) => None,
+            Calls::Sparse(_) => {
+                let src = a.source_alt_index as i32;
+                let mut c = Carriers::new();
+                for (col, allele) in a.calls.iter_non_ref() {
+                    if allele == src {
+                        c.push(col, allele);
+                    }
+                }
+                Some(c)
+            }
+        };
         metas.push(AtomMeta {
             pos: a.pos,
             ilen: a.ilen,
@@ -323,6 +345,7 @@ fn flush_window(
             source_alt_index: a.source_alt_index,
             info_vals: a.info_vals,
             format_vals: a.format_vals,
+            carriers,
         });
     }
 }
@@ -694,7 +717,8 @@ impl ChunkAssembler {
 
         // Sequential metadata pass (cheap, ordering-preserving).
         let mut off = 0u32;
-        for a in metas.iter() {
+        let mut carrier_opts: Vec<Option<Carriers>> = Vec::with_capacity(metas.len());
+        for a in metas.iter_mut() {
             pos.push(a.pos);
             ilens.push(a.ilen);
             alt.extend_from_slice(&a.alt);
@@ -717,7 +741,30 @@ impl ChunkAssembler {
                     ));
                 }
             }
+            carrier_opts.push(a.carriers.take());
         }
+
+        // A chunk is fed by a single source, so carrier-bearing is all-or-nothing:
+        // either every atom carried one (the k-way merge) or none did (a natively
+        // dense source). `rvk` treats `Some`/`None` as its routing switch, so a
+        // mixed chunk would silently corrupt that decision -- assert the
+        // uniformity here rather than downstream.
+        let all_some = carrier_opts.iter().all(|c| c.is_some());
+        let all_none = carrier_opts.iter().all(|c| c.is_none());
+        debug_assert!(
+            all_some || all_none,
+            "a chunk must not mix carrier-bearing and dense-source atoms"
+        );
+        let carriers = if all_some {
+            Some(
+                carrier_opts
+                    .into_iter()
+                    .map(|c| c.expect("checked all_some above"))
+                    .collect(),
+            )
+        } else {
+            None
+        };
 
         Ok(Some(DenseChunk {
             chunk_id,
@@ -728,6 +775,7 @@ impl ChunkAssembler {
             genos,
             info_staged,
             format_staged,
+            carriers,
         }))
     }
 }

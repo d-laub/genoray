@@ -72,7 +72,13 @@ pub mod py_query_batch;
 pub mod py_query_decode;
 pub mod py_query_ranges;
 pub mod query;
-#[cfg(feature = "conversion")]
+// NOTE: `record_source` is *not* conversion-only despite housing the write-path
+// `RawRecord`/`RecordSource` seam: query-core `types.rs::DenseChunk` and
+// `rvk.rs::dense2sparse_vk` reference its `Carriers` type unconditionally (Task 8,
+// route-before-densify), and the module has zero htslib dependency (only
+// `error::ConversionError`, itself already ungated). Gating it broke the
+// query-core build; it stays ungated as shared infra, same reasoning as
+// `field_finalize`/`py_convert`/`streams` above.
 pub mod record_source;
 pub mod rvk;
 pub mod search;
