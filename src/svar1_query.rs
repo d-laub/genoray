@@ -125,6 +125,22 @@ impl Svar1Reader {
             )));
         }
 
+        // The CSR total: `offsets`'s last entry must equal `variant_idxs`'s entry
+        // count, or a truncated/mismatched `variant_idxs.npy` would otherwise pass
+        // `open()` and panic deep inside `find_ranges` at `vi[o_s..o_e]`. Also reject
+        // a negative last offset (a corrupt store) up front, since `find_ranges`
+        // casts offsets to `usize` assuming non-negativity.
+        let last = offsets[want - 1];
+        let n_entries = variant_idxs
+            .as_ref()
+            .map_or(0, |m| m.len() / std::mem::size_of::<i32>());
+        if last < 0 || last as usize != n_entries {
+            return Err(std::io::Error::other(format!(
+                "{svar1_dir}/offsets.npy's last entry is {last}; expected it to equal \
+                 variant_idxs.npy's entry count = {n_entries}",
+            )));
+        }
+
         Ok(Self {
             n_samples,
             ploidy,
@@ -211,12 +227,24 @@ pub fn find_ranges(
     let mut stops = Vec::with_capacity(n);
 
     for r in ranges {
+        debug_assert!(
+            r.start <= r.end,
+            "find_ranges: inverted range {}..{} (start > end)",
+            r.start,
+            r.end
+        );
+        // u32 -> i32: safe because global variant ids are stored as `i32` (SVAR1's
+        // on-disk dtype), so a valid id is always < 2^31 and cannot lose data here.
         let (lo, hi) = (r.start as i32, r.end as i32);
         for &s in &sample_cols {
             for p in 0..ploidy {
                 let h = s * ploidy + p; // sample-major, ploidy-minor
                 let o_s = offs[h];
                 let o_e = offs[h + 1];
+                // i64 -> usize: safe because `Svar1Reader::open` rejects a negative
+                // last offset (and CSR offsets are monotone non-decreasing), so every
+                // `offs[h]` here is non-negative.
+                debug_assert!(o_s >= 0 && o_e >= o_s, "corrupt CSR offsets: {o_s}..{o_e}");
                 let hap = &vi[o_s as usize..o_e as usize];
                 // + o_s makes the index absolute into the flat buffer (Python does
                 // the same: `np.searchsorted(sp_genos, var_ranges).T + o_s`).
@@ -334,6 +362,22 @@ mod tests {
         write_raw::<i64>(tmp.path(), "offsets.npy", &[0, 1, 2]); // len 3 => 2 haps
         let err = Svar1Reader::open(tmp.path().to_str().unwrap(), 2, 2); // wants 5
         assert!(err.is_err(), "offsets length mismatch must be an error");
+    }
+
+    #[test]
+    fn reader_rejects_offsets_last_not_matching_variant_idxs() {
+        // offsets.len() is correct for the cohort (2 samples x ploidy 2 -> 5), but
+        // its last entry (9) doesn't match variant_idxs's actual entry count (2) --
+        // a truncated/corrupt variant_idxs.npy. Must be rejected in `open()`, not
+        // panic later in `find_ranges`.
+        let tmp = tempfile::tempdir().unwrap();
+        write_raw::<i32>(tmp.path(), "variant_idxs.npy", &[0, 1]);
+        write_raw::<i64>(tmp.path(), "offsets.npy", &[0, 1, 2, 3, 9]);
+        let err = Svar1Reader::open(tmp.path().to_str().unwrap(), 2, 2);
+        assert!(
+            err.is_err(),
+            "offsets last-entry / variant_idxs length mismatch must be an error"
+        );
     }
 
     #[test]
