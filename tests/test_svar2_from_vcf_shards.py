@@ -66,6 +66,60 @@ def test_from_vcf_shards_accepts_vcf_bgz_suffix(tmp_path: Path) -> None:
     assert SparseVar2(out).available_samples == ["S0", "S1"]
 
 
+def test_from_vcf_shards_closes_each_header_before_opening_next(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cyvcf2 import VCF as RealVCF
+
+    class TrackingVCF:
+        active = 0
+        max_active = 0
+
+        def __init__(self, path: str) -> None:
+            self._inner = RealVCF(path)
+            self._closed = False
+            type(self).active += 1
+            type(self).max_active = max(type(self).max_active, type(self).active)
+
+        def __getattr__(self, name: str):
+            return getattr(self._inner, name)
+
+        def close(self) -> None:
+            if not self._closed:
+                self._inner.close()
+                self._closed = True
+                type(self).active -= 1
+
+    monkeypatch.setattr("cyvcf2.VCF", TrackingVCF)
+    ref = _write_ref(tmp_path)
+    samples = ("S0", "S1")
+    shard_a = _write_vcf(
+        tmp_path,
+        "a",
+        "chr1\t8\t.\tA\tT\t.\t.\t.\tGT\t1|0\t0|1\n",
+        samples,
+    )
+    shard_b = _write_vcf(
+        tmp_path,
+        "b",
+        "chr1\t9\t.\tGAG\tG\t.\t.\t.\tGT\t1|0\t1|1\n",
+        samples,
+    )
+
+    SparseVar2.from_vcf_shards(
+        tmp_path / "headers.svar2",
+        [
+            (shard_a, ("chr1", 0, 8)),
+            (shard_b, ("chr1", 8, len(_REF))),
+        ],
+        ref,
+        threads=2,
+    )
+
+    assert TrackingVCF.active == 0
+    assert TrackingVCF.max_active == 1
+
+
 def _assert_store_equal(a: Path, b: Path) -> None:
     left = SparseVar2(a)
     right = SparseVar2(b)

@@ -867,8 +867,15 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
                 vcf = _CyVCF(str(path))
                 paths.append(path)
                 vcfs.append(vcf)
-
-                file_samples = list(vcf.samples)
+                try:
+                    file_samples = list(vcf.samples)
+                    file_seqnames = list(vcf.seqnames)
+                finally:
+                    # Cohort headers can contain hundreds of thousands of sample
+                    # names. Keep at most one cyvcf2 header resident during
+                    # preflight instead of retaining one per physical source.
+                    vcf.close()
+                    vcfs.pop()
                 if cohort_samples is None:
                     cohort_samples = file_samples
                 elif file_samples != cohort_samples:
@@ -877,11 +884,11 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
                         "required by the first source"
                     )
 
-                file_contigs = set(vcf.seqnames)
+                file_contigs = set(file_seqnames)
                 per_file_contigs.append((path, file_contigs))
                 owned = _normalize_svar2_regions(
                     owned_input,
-                    list(vcf.seqnames),
+                    file_seqnames,
                     merge_overlapping=True,
                 )
                 for chrom, start, end in owned:
