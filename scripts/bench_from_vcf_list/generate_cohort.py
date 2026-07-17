@@ -23,8 +23,17 @@ _POSITIONS_PER_PRIVATE_VARIANT = 20
 _HTYPE = {"VAF": "Float", "DP": "Integer"}  # extend as fields are added
 
 
+def _split_shared_private(n_variants: int, shared_frac: float) -> tuple[int, int]:
+    """Split `n_variants` into (n_shared, n_priv). `n_shared + n_priv == n_variants`
+    always holds — the single source of truth for `required_contig_len`,
+    `union_positions`, and `generate_cohort` so they never drift apart."""
+    n_shared = int(n_variants * shared_frac)
+    n_priv = n_variants - n_shared
+    return n_shared, n_priv
+
+
 def required_contig_len(n_files: int, n_variants: int, shared_frac: float) -> int:
-    n_priv = int(n_variants * (1.0 - shared_frac))
+    _, n_priv = _split_shared_private(n_variants, shared_frac)
     return max(1_000_000, n_files * n_priv * _POSITIONS_PER_PRIVATE_VARIANT)
 
 
@@ -33,8 +42,7 @@ def union_positions(
 ) -> float:
     """Expected distinct positions across the cohort — the birthday-problem estimate
     used to assert the cohort is realistic (not saturating)."""
-    n_shared = int(n_variants * shared_frac)
-    n_priv = n_variants - n_shared
+    n_shared, n_priv = _split_shared_private(n_variants, shared_frac)
     span = max(contig_len, 1)
     p = n_priv / span
     return n_shared + span * (1.0 - (1.0 - p) ** n_files)
@@ -93,6 +101,12 @@ def generate_cohort(
     seed: int = 0,
     format_fields: Sequence[str] = (),
 ) -> Path:
+    """Write `n_files` single-sample VCF/BCFs plus a manifest to `out_dir`.
+
+    `n_variants` is **per contig, per file**: each contig in `contigs` gets its
+    own `n_variants`-sized shared/private split, so the total variants per file
+    is `n_variants * len(contigs)`.
+    """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     contigs = list(contigs) if contigs else ["1"]
@@ -104,8 +118,7 @@ def generate_cohort(
     # space (real cohorts have roughly as many private sites on chr2 as chr1), and
     # keeping the per-contig formula matches union_positions/required_contig_len,
     # which are single-contig quantities.
-    n_shared = int(n_variants * shared_frac)
-    n_priv = n_variants - n_shared
+    n_shared, n_priv = _split_shared_private(n_variants, shared_frac)
 
     # Every position's REF/ALT is a deterministic function of (contig, position)
     # alone, so any two files that emit the same position ALWAYS agree -- whether
@@ -175,7 +188,12 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("out_dir", type=Path)
     ap.add_argument("--n-files", type=int, required=True)
-    ap.add_argument("--n-variants", type=int, required=True)
+    ap.add_argument(
+        "--n-variants",
+        type=int,
+        required=True,
+        help="variants per contig, per file (total per file = n_variants * n_contigs)",
+    )
     ap.add_argument(
         "--contig",
         dest="contigs",
