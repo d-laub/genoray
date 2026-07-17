@@ -1,5 +1,6 @@
-"""`Polars <https://docs.pola.rs/>`_ expressions for filtering a genoray index (extension :code:`.gvi`)
-given the minimum set of index columns:
+"""`Polars <https://docs.pola.rs/>`_ expressions for filtering a genoray index (extension :code:`.gvi`).
+
+These require the minimum set of index columns:
 
 - :code:`"CHROM"` : :code:`pl.Utf8`
 - :code:`"POS"` : :code:`pl.Int64`

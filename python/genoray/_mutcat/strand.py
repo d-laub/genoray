@@ -20,17 +20,13 @@ from .._contigs import ContigNormalizer
 def load_gene_intervals(gtf: str | pl.DataFrame) -> pl.DataFrame:
     """Load ``feature == "gene"`` footprints from a GTF as 0-based half-open rows.
 
-    Parameters
-    ----------
-    gtf
-        Path to a GTF/GTF.gz, or a pre-loaded Polars DataFrame with GTF columns
-        (``seqname``/``chrom``, ``feature``, ``start`` [1-based], ``end``
-        [inclusive], ``strand``).
+    Args:
+        gtf: Path to a GTF/GTF.gz, or a pre-loaded Polars DataFrame with GTF columns
+            (``seqname``/``chrom``, ``feature``, ``start`` [1-based], ``end``
+            [inclusive], ``strand``).
 
-    Returns
-    -------
-    pl.DataFrame
-        Columns ``chrom`` (Utf8), ``start`` (Int64, 0-based), ``stop`` (Int64,
+    Returns:
+        pl.DataFrame: Columns ``chrom`` (Utf8), ``start`` (Int64, 0-based), ``stop`` (Int64,
         exclusive), ``strand`` (Utf8, ``"+"``/``"-"``).
     """
     if isinstance(gtf, pl.DataFrame):

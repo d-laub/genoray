@@ -78,15 +78,11 @@ L = TypeVar("L", Genos, GenosPhasing, GenosDosages, GenosPhasingDosages)
 class PGEN:
     """Create a PGEN reader.
 
-    Parameters
-    ----------
-    path
-        Path to the PGEN file. Only used for genotypes if a dosage path is provided as well.
-    filter
-        Polars expression to filter variants. Should return True for variants to keep. Will have at least the columns
-        `CHROM`, `POS` (1-based), `REF`, `ALT`, and `ILEN` available to use.
-    dosage_path
-        Path to a dosage PGEN file. If None, the genotype PGEN file will be used for both genotypes and dosages.
+    Args:
+        path: Path to the PGEN file. Only used for genotypes if a dosage path is provided as well.
+        filter: Polars expression to filter variants. Should return True for variants to keep. Will have at least the columns
+            `CHROM`, `POS` (1-based), `REF`, `ALT`, and `ILEN` available to use.
+        dosage_path: Path to a dosage PGEN file. If None, the genotype PGEN file will be used for both genotypes and dosages.
     """
 
     available_samples: list[str]
@@ -206,9 +202,10 @@ class PGEN:
 
     @property
     def nbytes(self) -> int:
-        """Total in-memory footprint, in bytes, of resident (non-mmap'd) data
-        structures held by this reader. Sums the gvi variant index dataframe
-        and the StartsEndsIlens cache. Returns 0 after `_free_index()`.
+        """Total in-memory footprint, in bytes, of resident (non-mmap'd) data structures held by this reader.
+
+        Sums the gvi variant index dataframe and the StartsEndsIlens cache. Returns 0
+        after `_free_index()`.
         """
         n = 0
         if self._index is not None:
@@ -249,10 +246,8 @@ class PGEN:
     def set_samples(self, samples: ArrayLike | None) -> Self:
         """Set the samples to use.
 
-        Parameters
-        ----------
-        samples
-            List of sample names to use. If None, all samples will be used.
+        Args:
+            samples: List of sample names to use. If None, all samples will be used.
         """
         if samples is not None:
             samples = np.atleast_1d(samples)
@@ -328,19 +323,13 @@ class PGEN:
     ) -> NDArray[np.uint32]:
         """Return the start and end indices of the variants in the given ranges.
 
-        Parameters
-        ----------
-        contig
-            Contig name.
-        starts
-            0-based start positions of the ranges.
-        ends
-            0-based, exclusive end positions of the ranges.
+        Args:
+            contig: Contig name.
+            starts: 0-based start positions of the ranges.
+            ends: 0-based, exclusive end positions of the ranges.
 
-        Returns
-        -------
-        n_variants
-            Shape: :code:`(ranges)`. Number of variants in the given ranges.
+        Returns:
+            n_variants: Shape: :code:`(ranges)`. Number of variants in the given ranges.
         """
         if self._c_norm is None or self._index is None:
             self._init_index()
@@ -355,17 +344,12 @@ class PGEN:
     ) -> tuple[NDArray[V_IDX_TYPE], NDArray[OFFSET_TYPE]]:
         """Get variant indices and the number of indices per range.
 
-        Parameters
-        ----------
-        contig
-            Contig name.
-        starts
-            0-based start positions of the ranges.
-        ends
-            0-based, exclusive end positions of the ranges.
+        Args:
+            contig: Contig name.
+            starts: 0-based start positions of the ranges.
+            ends: 0-based, exclusive end positions of the ranges.
 
-        Returns
-        -------
+        Returns:
             Shape: (tot_variants). Variant indices for the given ranges, as
             0-based **positions into this reader's (filtered) ``_index``** — i.e.
             ``reader._index[var_idxs]`` is always valid. With no filter these
@@ -384,10 +368,11 @@ class PGEN:
         starts: ArrayLike = 0,
         ends: ArrayLike = POS_MAX,
     ) -> tuple[NDArray[V_IDX_TYPE], NDArray[OFFSET_TYPE]]:
-        """Internal: like :meth:`var_idxs`, but maps the positional indices to
-        physical (file-global) PVAR row ids for pgenlib random access. The
-        ``_index["index"]`` column holds physical ids; ``var_idxs`` returns
-        positions into ``_index`` (issue #69), so reads remap here.
+        """Map positional variant indices to physical PVAR row ids for pgenlib random access.
+
+        Like :meth:`var_idxs`, but the ``_index["index"]`` column holds physical
+        (file-global) ids; ``var_idxs`` returns positions into ``_index`` (issue #69),
+        so reads remap here.
         """
         pos, offsets = self.var_idxs(contig, starts, ends)
         assert self._index is not None
@@ -422,20 +407,14 @@ class PGEN:
     ) -> T:
         """Read genotypes and/or dosages for a range.
 
-        Parameters
-        ----------
-        contig
-            Contig name.
-        start
-            0-based start position.
-        end
-            0-based, exclusive end position.
-        mode
-            Type of data to read. Can be :code:`Genos`, :code:`Dosages`, :code:`GenosPhasing`,
-            :code:`GenosDosages`, or :code:`GenosPhasingDosages`.
+        Args:
+            contig: Contig name.
+            start: 0-based start position.
+            end: 0-based, exclusive end position.
+            mode: Type of data to read. Can be :code:`Genos`, :code:`Dosages`, :code:`GenosPhasing`,
+                :code:`GenosDosages`, or :code:`GenosPhasingDosages`.
 
-        Returns
-        -------
+        Returns:
             Genotypes and/or dosages. Genotypes have shape :code:`(samples ploidy variants)` and
             dosages have shape :code:`(samples variants)`. Missing genotypes have value -1 and missing dosages
             have value np.nan. If just using genotypes or dosages, will be a single array, otherwise
@@ -468,23 +447,16 @@ class PGEN:
     ) -> Generator[T]:
         """Iterate over genotypes and/or dosages for a range in chunks limited by :code:`max_mem`.
 
-        Parameters
-        ----------
-        contig
-            Contig name.
-        start
-            0-based start position.
-        end
-            0-based, exclusive end position.
-        max_mem
-            Maximum memory to use for each chunk. Can be an integer or a string with a suffix
-            (e.g. "4g", "2 MB").
-        mode
-            Type of data to read. Can be :code:`Genos`, :code:`Dosages`, :code:`GenosPhasing`,
-            :code:`GenosDosages`, or :code:`GenosPhasingDosages`.
+        Args:
+            contig: Contig name.
+            start: 0-based start position.
+            end: 0-based, exclusive end position.
+            max_mem: Maximum memory to use for each chunk. Can be an integer or a string with a suffix
+                (e.g. "4g", "2 MB").
+            mode: Type of data to read. Can be :code:`Genos`, :code:`Dosages`, :code:`GenosPhasing`,
+                :code:`GenosDosages`, or :code:`GenosPhasingDosages`.
 
-        Returns
-        -------
+        Returns:
             Generator of genotypes and/or dosages. Genotypes have shape :code:`(samples ploidy variants)` and
             dosages have shape :code:`(samples variants)`. Missing genotypes have value -1 and missing dosages
             have value np.nan. If just using genotypes or dosages, will be a single array, otherwise
@@ -531,20 +503,14 @@ class PGEN:
     ) -> tuple[T, NDArray[OFFSET_TYPE]]:
         """Read genotypes and/or dosages for multiple ranges.
 
-        Parameters
-        ----------
-        contig
-            Contig name.
-        starts
-            0-based start positions.
-        ends
-            0-based, exclusive end positions.
-        mode
-            Type of data to read. Can be :code:`Genos`, :code:`Dosages`, :code:`GenosPhasing`,
-            :code:`GenosDosages`, or :code:`GenosPhasingDosages`.
+        Args:
+            contig: Contig name.
+            starts: 0-based start positions.
+            ends: 0-based, exclusive end positions.
+            mode: Type of data to read. Can be :code:`Genos`, :code:`Dosages`, :code:`GenosPhasing`,
+                :code:`GenosDosages`, or :code:`GenosPhasingDosages`.
 
-        Returns
-        -------
+        Returns:
             Genotypes and/or dosages. Genotypes have shape :code:`(samples ploidy variants)` and
             dosages have shape :code:`(samples variants)`. Missing genotypes have value -1 and missing dosages
             have value np.nan. If just using genotypes or dosages, will be a single array, otherwise
@@ -552,14 +518,13 @@ class PGEN:
 
             Shape: (ranges+1). Offsets to slice out data for each range from the variants axis like so:
 
-        Examples
-        --------
-        .. code-block:: python
+        Examples:
+            .. code-block:: python
 
-            data, offsets = reader.read_ranges(...)
-            data[..., offsets[i] : offsets[i + 1]]  # data for range i
+                data, offsets = reader.read_ranges(...)
+                data[..., offsets[i] : offsets[i + 1]]  # data for range i
 
-        Note that the number of variants for range :code:`i` is :code:`np.diff(offsets)[i]`.
+            Note that the number of variants for range :code:`i` is :code:`np.diff(offsets)[i]`.
         """
         starts = np.atleast_1d(np.asarray(starts, POS_TYPE))
         n_ranges = len(starts)
@@ -591,39 +556,31 @@ class PGEN:
     ) -> Generator[Generator[T]]:
         """Read genotypes and/or dosages for multiple ranges in chunks limited by :code:`max_mem`.
 
-        Parameters
-        ----------
-        contig
-            Contig name.
-        starts
-            0-based start positions.
-        ends
-            0-based, exclusive end positions.
-        max_mem
-            Maximum memory to use for each chunk. Can be an integer or a string with a suffix
-            (e.g. "4g", "2 MB").
-        mode
-            Type of data to read. Can be :code:`Genos`, :code:`Dosages`, :code:`GenosPhasing`,
-            :code:`GenosDosages`, or :code:`GenosPhasingDosages`.
+        Args:
+            contig: Contig name.
+            starts: 0-based start positions.
+            ends: 0-based, exclusive end positions.
+            max_mem: Maximum memory to use for each chunk. Can be an integer or a string with a suffix
+                (e.g. "4g", "2 MB").
+            mode: Type of data to read. Can be :code:`Genos`, :code:`Dosages`, :code:`GenosPhasing`,
+                :code:`GenosDosages`, or :code:`GenosPhasingDosages`.
 
-        Returns
-        -------
+        Returns:
             Generator of generators of genotypes and/or dosages of each ranges' data. Genotypes have shape :code:`(samples ploidy variants)` and
             dosages have shape :code:`(samples variants)`. Missing genotypes have value -1 and missing dosages
             have value np.nan. If just using genotypes or dosages, will be a single array, otherwise
             will be a tuple of arrays.
 
-        Examples
-        --------
-        .. code-block:: python
+        Examples:
+            .. code-block:: python
 
-            gen = reader.read_ranges_chunks(...)
-            for range_ in gen:
-                if range_ is None:
-                    continue
-                for chunk in range_:
-                    # do something with chunk
-                    pass
+                gen = reader.read_ranges_chunks(...)
+                for range_ in gen:
+                    if range_ is None:
+                        continue
+                    for chunk in range_:
+                        # do something with chunk
+                        pass
         """
         max_mem = parse_memory(max_mem)
 
@@ -684,6 +641,7 @@ class PGEN:
         ]
     ]:
         """Read genotypes and/or dosages for multiple ranges in chunks approximately limited by :code:`max_mem`.
+
         Will extend the ranges so that the returned data corresponds to haplotypes that have at least as much
         length as the original ranges.
 
@@ -692,40 +650,32 @@ class PGEN:
             Even if the reader is set to only return dosages, this method must read in genotypes to compute
             haplotype lengths so there is no performance difference between reading with/without genotypes.
 
-        Parameters
-        ----------
-        contig
-            Contig name.
-        starts
-            0-based start positions.
-        ends
-            0-based, exclusive end positions.
-        max_mem
-            Maximum memory to use for each chunk. Can be an integer or a string with a suffix
-            (e.g. "4g", "2 MB").
-        mode
-            Type of data to read. Can be :code:`Genos`, :code:`Dosages`, :code:`GenosPhasing`,
-            :code:`GenosDosages`, or :code:`GenosPhasingDosages`.
+        Args:
+            contig: Contig name.
+            starts: 0-based start positions.
+            ends: 0-based, exclusive end positions.
+            max_mem: Maximum memory to use for each chunk. Can be an integer or a string with a suffix
+                (e.g. "4g", "2 MB").
+            mode: Type of data to read. Can be :code:`Genos`, :code:`Dosages`, :code:`GenosPhasing`,
+                :code:`GenosDosages`, or :code:`GenosPhasingDosages`.
 
-        Returns
-        -------
+        Returns:
             Generator of generators of genotypes and/or dosages of each ranges' data, plus an integer indicating
             the 0-based end position of the final variant in the chunk. Genotypes have shape
             :code:`(samples ploidy variants)` and dosages have shape :code:`(samples variants)`. Missing genotypes
             have value -1 and missing dosages have value np.nan. If just using genotypes or dosages, will be a
             single array, otherwise will be a tuple of arrays.
 
-        Examples
-        --------
-        .. code-block:: python
+        Examples:
+            .. code-block:: python
 
-            gen = reader.read_ranges_chunks(...)
-            for range_ in gen:
-                if range_ is None:
-                    continue
-                for chunk in range_:
-                    # do something with chunk
-                    pass
+                gen = reader.read_ranges_chunks(...)
+                for range_ in gen:
+                    if range_ is None:
+                        continue
+                    for chunk in range_:
+                        # do something with chunk
+                        pass
         """
         if self._sei is None:
             raise ValueError(
@@ -801,10 +751,8 @@ class PGEN:
     def _mem_per_variant(self, mode: type[T]) -> int:
         """Calculate the memory required per variant for the given mode.
 
-        Returns
-        -------
-        int
-            Memory required per variant in bytes.
+        Returns:
+            int: Memory required per variant in bytes.
         """
         mem = mode.nbytes_per_variant(self.n_samples, self.ploidy)
         if isinstance(self._s_unsorter, np.ndarray):
@@ -1016,8 +964,10 @@ class StartsEndsIlens:
 
 
 def _valid_index(index_path: Path) -> bool:
-    """Check if the index is valid. Needs to exist and have a modified time greater than
-    the PVAR file."""
+    """Check if the index is valid.
+
+    Needs to exist and have a modified time greater than the PVAR file.
+    """
     if not index_path.exists():
         return False
 
@@ -1121,7 +1071,6 @@ def _load_index(
 
 def _write_index(index_path: Path):
     """Write PVAR index."""
-
     with atomic_write_path(index_path) as _tmp:
         (
             _scan_pvar(index_path.with_suffix(""))

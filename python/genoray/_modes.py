@@ -17,18 +17,13 @@ def make_array_mode(
 ) -> type:
     """Build a phantom ``NDArray`` mode class.
 
-    Parameters
-    ----------
-    name
-        The generated class ``__name__``.
-    dtype
-        NumPy scalar type the array must have (e.g. ``np.int8``).
-    ndim
-        Required number of dimensions (3 for genotype arrays, 2 for
-        dosage/phasing-style arrays).
-    genos
-        If True, the ploidy axis (``shape[1]``) must be in ``(2, 3)`` and
-        ``empty`` allocates a 3D ``(n_samples, ploidy, n_variants)`` array.
+    Args:
+        name: The generated class ``__name__``.
+        dtype: NumPy scalar type the array must have (e.g. ``np.int8``).
+        ndim: Required number of dimensions (3 for genotype arrays, 2 for
+            dosage/phasing-style arrays).
+        genos: If True, the ploidy axis (``shape[1]``) must be in ``(2, 3)`` and
+            ``empty`` allocates a 3D ``(n_samples, ploidy, n_variants)`` array.
     """
 
     def predicate(obj: Any) -> bool:

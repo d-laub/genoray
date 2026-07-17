@@ -37,28 +37,19 @@ def _empty_annot() -> pl.DataFrame:
 def _get_strand_and_codon_pos(
     cds_df: pl.DataFrame, var_table: pl.DataFrame, contig_normalizer: ContigNormalizer
 ) -> pl.DataFrame:
+    """Calculate strand and codon position for variants overlapping CDS regions.
+
+    Args:
+        cds_df (pl.DataFrame): CDS features from GTF with columns: chrom, start, end, strand, frame,
+            gene_id, transcript_id, gene_biotype, transcript_support_level, tag
+            coordinates should be 1-based
+        var_table (pl.DataFrame): Variant table with columns: index, CHROM, POS, ILEN, ...
+            POS should be 1-based
+        contig_normalizer (ContigNormalizer): Normalizer to match chromosome names between CDS and granges
+
+    Returns:
+        pl.DataFrame: Annotation with varID, gene_id, strand, codon_pos
     """
-    Calculate strand and codon position for variants overlapping CDS regions.
-
-    Parameters
-    ----------
-    cds_df : pl.DataFrame
-        CDS features from GTF with columns: chrom, start, end, strand, frame,
-        gene_id, transcript_id, gene_biotype, transcript_support_level, tag
-        coordinates should be 1-based
-    var_table : pl.DataFrame
-        Variant table with columns: index, CHROM, POS, ILEN, ...
-        POS should be 1-based
-    contig_normalizer : ContigNormalizer
-        Normalizer to match chromosome names between CDS and granges
-
-
-    Returns
-    -------
-    pl.DataFrame
-        Annotation with varID, gene_id, strand, codon_pos
-    """
-
     # Normalize CDS chromosome names to match granges
     # Cast to string first to avoid categorical comparison issues
     cds_df = cds_df.with_columns(
@@ -208,34 +199,24 @@ class SparseVarAnnotateMixin:
         strand_encoding: dict[str | None, int] | None = None,
         codon_null_token: int | None = None,
     ) -> pl.DataFrame:
-        """
-        Annotate variants with gene_id, strand, and codon_pos from GTF CDS features.
+        """Annotate variants with gene_id, strand, and codon_pos from GTF CDS features.
 
         Computes codon position for SNVs only; indels receive strand but null codon_pos.
 
-        Parameters
-        ----------
-        gtf : str or pl.DataFrame
-            Path to GTF file (.gtf or .gtf.gz) or pre-loaded Polars DataFrame.
-        level_filter : int or None, default 1
-            If set, keep rows with GTF 'level' <= level_filter (1 = highest quality).
-        write_back : bool, default True
-            If True, update self.index in-place and write to index.arrow file.
-        strand_encoding : dict or None, optional
-            Encode strand as integers. Example: {'+': 0, '-': 1, None: 2}
-        codon_null_token : int or None, optional
-            Replace null codon_pos with this integer for ML models.
+        Args:
+            gtf (str or pl.DataFrame): Path to GTF file (.gtf or .gtf.gz) or pre-loaded Polars DataFrame.
+            level_filter (int or None, default 1): If set, keep rows with GTF 'level' <= level_filter (1 = highest quality).
+            write_back (bool, default True): If True, update self.index in-place and write to index.arrow file.
+            strand_encoding (dict or None, optional): Encode strand as integers. Example: {'+': 0, '-': 1, None: 2}
+            codon_null_token (int or None, optional): Replace null codon_pos with this integer for ML models.
 
-        Returns
-        -------
-        pl.DataFrame
-            Columns: varID (UInt32), gene_id (Utf8), strand (Utf8/Int16), codon_pos (Int8/Int16)
+        Returns:
+            pl.DataFrame: Columns: varID (UInt32), gene_id (Utf8), strand (Utf8/Int16), codon_pos (Int8/Int16)
 
-        Examples
-        --------
-        >>> svar = SparseVar("data.svar")
-        >>> annot = svar.annotate_with_gtf("gencode.v45.gtf.gz")
-        >>> annot.head()
+        Examples:
+            >>> svar = SparseVar("data.svar")
+            >>> annot = svar.annotate_with_gtf("gencode.v45.gtf.gz")
+            >>> annot.head()
         """
         # Validate inputs
         if level_filter is not None and not isinstance(level_filter, int):
@@ -325,35 +306,30 @@ class SparseVarAnnotateMixin:
         contigs: "list[str] | None" = None,
         write_back: bool = True,
     ) -> None:
-        """Classify every variant into SBS-96 / DBS-78 / ID-83 channels and store
-        a per-genotype-entry ``mutcat`` field (int16, enum-encoded).
+        """Classify every variant into SBS-96 / DBS-78 / ID-83 channels and store a per-genotype-entry ``mutcat`` field (int16, enum-encoded).
 
         Adjacent SNVs carried on the same haplotype are combined into DBS; the
         5' entry receives the DBS code and the 3' entry a ``DBS_PARTNER`` sentinel.
 
-        Parameters
-        ----------
-        reference
-            Reference genome.  A :class:`~genoray._reference.Reference` instance,
-            or a path to a FASTA file (with a ``.fai`` index alongside it).
-        contigs
-            If given, only variants on these contigs are classified; entries on
-            all other contigs are marked ``NOT_ANNOTATED`` and their contigs are
-            never fetched from the reference.  Names are matched via the
-            :class:`~genoray._contigs.ContigNormalizer` (so ``chr1``/``1`` both
-            work).  Requested contigs absent from the ``.svar`` index are skipped
-            with a warning.  A listed contig present in the index but absent from
-            the reference still raises (use the allowlist to exclude it instead).
-            ``None`` (default) classifies all contigs.
-        write_back
-            If ``True`` (default), persist ``mutcat.npy`` and update
-            ``metadata.json`` on disk so that subsequent ``SparseVar(...)``
-            opens will see the field.  If ``False``, the ``mutcat`` field lives
-            only in memory (``self.fields["mutcat"]``) and is NOT written to
-            disk — reopening the file will not find it.  Note: the
-            ``metadata.json`` update is not safe against concurrent writers;
-            single-writer access is expected (consistent with
-            ``annotate_with_gtf``).
+        Args:
+            reference: Reference genome.  A :class:`~genoray._reference.Reference` instance,
+                or a path to a FASTA file (with a ``.fai`` index alongside it).
+            contigs: If given, only variants on these contigs are classified; entries on
+                all other contigs are marked ``NOT_ANNOTATED`` and their contigs are
+                never fetched from the reference.  Names are matched via the
+                :class:`~genoray._contigs.ContigNormalizer` (so ``chr1``/``1`` both
+                work).  Requested contigs absent from the ``.svar`` index are skipped
+                with a warning.  A listed contig present in the index but absent from
+                the reference still raises (use the allowlist to exclude it instead).
+                ``None`` (default) classifies all contigs.
+            write_back: If ``True`` (default), persist ``mutcat.npy`` and update
+                ``metadata.json`` on disk so that subsequent ``SparseVar(...)``
+                opens will see the field.  If ``False``, the ``mutcat`` field lives
+                only in memory (``self.fields["mutcat"]``) and is NOT written to
+                disk — reopening the file will not find it.  Note: the
+                ``metadata.json`` update is not safe against concurrent writers;
+                single-writer access is expected (consistent with
+                ``annotate_with_gtf``).
         """
         if not isinstance(reference, Reference):
             reference = Reference.from_path(reference)
@@ -478,13 +454,10 @@ class SparseVarAnnotateMixin:
            calls.
         3. Not found at all — raises :class:`ValueError`.
 
-        Parameters
-        ----------
-        kind
-            One of ``"SBS96"``, ``"DBS78"``, ``"ID83"``.
-        count
-            ``"allele"`` counts every non-ref allele copy; ``"sample"`` counts
-            each category at most once per sample (presence/absence).
+        Args:
+            kind: One of ``"SBS96"``, ``"DBS78"``, ``"ID83"``.
+            count: ``"allele"`` counts every non-ref allele copy; ``"sample"`` counts
+                each category at most once per sample (presence/absence).
         """
         if kind not in ("SBS96", "DBS78", "ID83"):
             raise ValueError(f"Unknown matrix kind {kind!r}.")
@@ -545,27 +518,23 @@ class SparseVarAnnotateMixin:
         Builds the ``kind`` catalogue via :meth:`mutation_matrix` and decomposes
         it into per-sample activities via :func:`genoray.fit_signatures`.
 
-        Parameters
-        ----------
-        kind
-            One of ``"SBS96"``, ``"DBS78"``, ``"ID83"``.
-        reference
-            Reference signatures as a Polars ``DataFrame`` (``MutationType`` +
-            signature columns), a path to a COSMIC-style TSV, or ``None`` to fetch
-            the default COSMIC set via :func:`genoray.cosmic_signatures`.
-        count
-            Counting unit passed to :meth:`mutation_matrix`.
-        max_delta, min_activity
-            Forwarded to :func:`genoray.fit_signatures`.
-        n_jobs, backend
-            Forwarded to :func:`genoray.fit_signatures` to control per-sample
-            parallelism (``1`` (default) runs serially; ``-1`` uses all cores;
-            process-based ``"loky"`` backend).
+        Args:
+            kind: One of ``"SBS96"``, ``"DBS78"``, ``"ID83"``.
+            reference: Reference signatures as a Polars ``DataFrame`` (``MutationType`` +
+                signature columns), a path to a COSMIC-style TSV, or ``None`` to fetch
+                the default COSMIC set via :func:`genoray.cosmic_signatures`.
+            count: Counting unit passed to :meth:`mutation_matrix`.
+            max_delta: Forwarded to :func:`genoray.fit_signatures`.
+            min_activity: Forwarded to :func:`genoray.fit_signatures`.
+            n_jobs: Forwarded to :func:`genoray.fit_signatures` to control per-sample
+                parallelism (``1`` (default) runs serially; ``-1`` uses all cores;
+                process-based ``"loky"`` backend).
+            backend: Forwarded to :func:`genoray.fit_signatures` to control per-sample
+                parallelism (``1`` (default) runs serially; ``-1`` uses all cores;
+                process-based ``"loky"`` backend).
 
-        Returns
-        -------
-        pl.DataFrame
-            One row per sample: ``Sample``, one column per signature, and
+        Returns:
+            pl.DataFrame: One row per sample: ``Sample``, one column per signature, and
             ``cosine_similarity``.
         """
         catalogue = self.mutation_matrix(kind, count=count)

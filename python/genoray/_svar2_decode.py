@@ -81,8 +81,10 @@ class _DecodeMixin:
     def region_counts(
         self, contig: str, regions: Iterable[tuple[int, int]]
     ) -> "np.ndarray":
-        """Decode-free per-``(region, sample, ploid)`` variant count, shape
-        ``(R, S, P)``. The simplified ``SparseVar.var_ranges`` replacement."""
+        """Decode-free per-``(region, sample, ploid)`` variant count, shape ``(R, S, P)``.
+
+        The simplified ``SparseVar.var_ranges`` replacement.
+        """
         reg = [(int(s), int(e)) for s, e in regions]
         flat = self._readers[contig].region_counts(reg)
         # n_samples/ploidy are @property on the SparseVar2 host (see note above).

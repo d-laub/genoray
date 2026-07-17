@@ -29,10 +29,11 @@ class InfoField:
 
 @dataclass(frozen=True)
 class FormatField:
-    """A per-sample FORMAT field to store in the SVAR2 output. Genotype-aligned:
-    only carrier calls (var_key) or a full per-sample dense column are stored;
-    non-carrier values in var_key-routed variants are dropped. Same ``dtype``/
-    ``default`` semantics as :class:`InfoField`.
+    """A per-sample FORMAT field to store in the SVAR2 output.
+
+    Genotype-aligned: only carrier calls (var_key) or a full per-sample dense
+    column are stored; non-carrier values in var_key-routed variants are dropped.
+    Same ``dtype``/``default`` semantics as :class:`InfoField`.
     """
 
     name: str

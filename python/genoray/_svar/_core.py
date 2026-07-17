@@ -74,16 +74,12 @@ _SRT = TypeVar("_SRT")
 class SparseVar(SparseVarAnnotateMixin, Generic[_SRT]):
     """Open a Sparse Variant (SVAR) directory.
 
-    Parameters
-    ----------
-    path
-        Path to the SVAR directory.
-    attrs
-        Expression of attributes to load in addition to the ALT and ILEN columns.
-    fields
-        Names of fields to load from the SVAR directory. Must be keys of
-        :attr:`available_fields`. Only VCF FORMAT fields with ``Number=G`` are currently
-        supported as custom fields.
+    Args:
+        path: Path to the SVAR directory.
+        attrs: Expression of attributes to load in addition to the ALT and ILEN columns.
+        fields: Names of fields to load from the SVAR directory. Must be keys of
+            :attr:`available_fields`. Only VCF FORMAT fields with ``Number=G`` are currently
+            supported as custom fields.
     """
 
     path: Path
@@ -110,9 +106,10 @@ class SparseVar(SparseVarAnnotateMixin, Generic[_SRT]):
 
     @property
     def nbytes(self) -> int:
-        """Total in-memory footprint, in bytes, of resident (non-mmap'd) data
-        held by this reader. Only the polars variant index counts; `genos`
-        and `fields` are memory-mapped and excluded.
+        """Total in-memory footprint, in bytes, of resident (non-mmap'd) data held by this reader.
+
+        Only the polars variant index counts; `genos` and `fields` are memory-mapped
+        and excluded.
         """
         return int(self.index.estimated_size())
 
@@ -227,22 +224,18 @@ class SparseVar(SparseVarAnnotateMixin, Generic[_SRT]):
         starts: ArrayLike = 0,
         ends: ArrayLike = POS_MAX,
     ) -> NDArray[V_IDX_TYPE]:
-        """Get variant index ranges for each query range. i.e.
+        """Get variant index ranges for each query range.
+
         For each query range, return the minimum and maximum variant that overlaps.
         Note that this means some variants within those ranges may not actually overlap with
         the query range if there is a deletion that spans the start of the query.
 
-        Parameters
-        ----------
-        contig
-            Contig name.
-        starts
-            0-based start positions of the ranges.
-        ends
-            0-based, exclusive end positions of the ranges.
+        Args:
+            contig: Contig name.
+            starts: 0-based start positions of the ranges.
+            ends: 0-based, exclusive end positions of the ranges.
 
-        Returns
-        -------
+        Returns:
             Shape: :code:`(ranges, 2)`. The first column is the start index of the variant
             and the second column is the end index of the variant.
         """
@@ -251,11 +244,10 @@ class SparseVar(SparseVarAnnotateMixin, Generic[_SRT]):
     def _covers_all_variants(
         self, regions: "pl.DataFrame", mode: "Literal['pos', 'record', 'variant']"
     ) -> bool:
-        """True iff *regions* select every variant (one region per present contig,
-        each spanning [0, pos_max]).  Lets write_view skip POS materialization.
+        """True iff *regions* select every variant (one region per present contig, each spanning [0, pos_max]).
 
-        Only applies to ``pos``/``record`` modes (``variant`` mode is ILEN-aware
-        and resolved through ``var_ranges``).
+        Lets write_view skip POS materialization. Only applies to ``pos``/``record``
+        modes (``variant`` mode is ILEN-aware and resolved through ``var_ranges``).
         """
         if mode == "variant":
             return False
@@ -292,21 +284,14 @@ class SparseVar(SparseVarAnnotateMixin, Generic[_SRT]):
     ) -> NDArray[OFFSET_TYPE]:
         """Find the start and end offsets of the sparse genotypes for each range.
 
-        Parameters
-        ----------
-        contig
-            Contig name.
-        starts
-            0-based start positions of the ranges.
-        ends
-            0-based, exclusive end positions of the ranges.
-        samples
-            List of sample names to read. If None, read all samples.
-        out
-            Output array to write to. If None, a new array will be created.
+        Args:
+            contig: Contig name.
+            starts: 0-based start positions of the ranges.
+            ends: 0-based, exclusive end positions of the ranges.
+            samples: List of sample names to read. If None, read all samples.
+            out: Output array to write to. If None, a new array will be created.
 
-        Returns
-        -------
+        Returns:
             Shape: (2, ranges, samples, ploidy). The first column is the start index of the variant
             and the second column is the end index of the variant.
         """
@@ -353,21 +338,14 @@ class SparseVar(SparseVarAnnotateMixin, Generic[_SRT]):
     ) -> NDArray[OFFSET_TYPE]:
         """Find the start and end offsets of the sparse genotypes for each range.
 
-        Parameters
-        ----------
-        contig
-            Contig name.
-        starts
-            0-based start positions of the ranges.
-        ends
-            0-based, exclusive end positions of the ranges.
-        samples
-            List of sample names to read. If None, read all samples.
-        out
-            Output array to write to. If None, a new array will be created.
+        Args:
+            contig: Contig name.
+            starts: 0-based start positions of the ranges.
+            ends: 0-based, exclusive end positions of the ranges.
+            samples: List of sample names to read. If None, read all samples.
+            out: Output array to write to. If None, a new array will be created.
 
-        Returns
-        -------
+        Returns:
             Shape: (2, ranges, samples, ploidy). The first column is the start index of the variant
             and the second column is the end index of the variant.
         """
@@ -418,19 +396,13 @@ class SparseVar(SparseVarAnnotateMixin, Generic[_SRT]):
     ) -> _SRT:
         """Read the genotypes for the given ranges.
 
-        Parameters
-        ----------
-        contig
-            Contig name.
-        starts
-            0-based start positions of the ranges.
-        ends
-            0-based, exclusive end positions of the ranges.
-        samples
-            List of sample names to read. If None, read all samples.
+        Args:
+            contig: Contig name.
+            starts: 0-based start positions of the ranges.
+            ends: 0-based, exclusive end positions of the ranges.
+            samples: List of sample names to read. If None, read all samples.
 
-        Returns
-        -------
+        Returns:
             When no fields are loaded: ``Ragged[V_IDX_TYPE]`` with shape
             ``(ranges, samples, ploidy, ~variants)``. When fields are loaded: an awkward
             record array of the same outer shape where ``result.genos`` is
@@ -469,23 +441,18 @@ class SparseVar(SparseVarAnnotateMixin, Generic[_SRT]):
         ends: ArrayLike = POS_MAX,
         samples: ArrayLike | None = None,
     ) -> _SRT:
-        """Read the genotypes for the given ranges such that each entry of variants is guaranteed to have
-        the minimum amount of variants to reach the query length. This can mean either fewer or more variants
-        than would be returned than by :code:`read_ranges`, depending on the presence of indels.
+        """Read genotypes for the given ranges, each with the minimum variants to reach the query length.
 
-        Parameters
-        ----------
-        contig
-            Contig name.
-        starts
-            0-based start positions of the ranges.
-        ends
-            0-based, exclusive end positions of the ranges.
-        samples
-            List of sample names to read. If None, read all samples.
+        This can mean either fewer or more variants than would be returned than by
+        :code:`read_ranges`, depending on the presence of indels.
 
-        Returns
-        -------
+        Args:
+            contig: Contig name.
+            starts: 0-based start positions of the ranges.
+            ends: 0-based, exclusive end positions of the ranges.
+            samples: List of sample names to read. If None, read all samples.
+
+        Returns:
             Same return structure as :meth:`read_ranges`.
         """
         samples, _ = _resolve_sample_idxs(samples, self.available_samples, self._s2i)
@@ -524,13 +491,12 @@ class SparseVar(SparseVarAnnotateMixin, Generic[_SRT]):
     ) -> SparseVar:
         """Return a shallow copy of this ``SparseVar`` with updated fields.
 
-        Parameters
-        ----------
-        fields
-            - ``None``: leave fields unchanged (returns shallow copy).
-            - ``Sequence[str]``: names of fields to load from the SVAR directory.
-              Must be keys of :attr:`available_fields`.
-            - ``False``: drop all fields, returning a ``SparseVar[Ragged[V_IDX_TYPE]]``.
+        Args:
+            fields:
+                - ``None``: leave fields unchanged (returns shallow copy).
+                - ``Sequence[str]``: names of fields to load from the SVAR directory.
+                  Must be keys of :attr:`available_fields`.
+                - ``False``: drop all fields, returning a ``SparseVar[Ragged[V_IDX_TYPE]]``.
         """
         new = copy.copy(self)
 
@@ -568,42 +534,30 @@ class SparseVar(SparseVarAnnotateMixin, Generic[_SRT]):
     ):
         """Create a Sparse Variant (.svar) from a VCF/BCF.
 
-        Parameters
-        ----------
-        out
-            Path to the output directory.
-        vcf
-            VCF file to write from.
-        max_mem
-            Maximum memory to use while writing.
-        overwrite
-            Whether to overwrite the output directory if it exists.
-        with_dosages
-            Whether to write dosages.
-        n_jobs
-            Number of jobs to use for parallel processing.
-        regions
-            Region(s) to include. Accepts the same input types as ``write_view``:
-            a ``"chrom:start-end"`` string (1-based, end-inclusive), a
-            ``(chrom, start, end)`` tuple (0-based, end-exclusive), a BED file
-            path, or a frame-like. ``None`` (default) includes all regions.
-        samples
-            Sample name(s) to include (a name, a sequence of names, or a path to a
-            newline-delimited file). Caller order is preserved, deduped by first
-            occurrence. ``None`` (default) includes all samples. Variants whose
-            minor allele count is 0 across the chosen samples are dropped from the
-            output; if every variant drops, a ``ValueError`` is raised.
-        merge_overlapping
-            If ``False`` (default) raise on overlapping input regions; if ``True``
-            dedupe via pyranges merge.
-        regions_overlap
-            ``"pos"`` (default), ``"record"``, or ``"variant"`` — same semantics
-            as ``write_view``.
-        haploid
-            If ``True``, OR-collapse the ploidy axis into a single haploid call
-            per sample (a variant present on any haplotype becomes one call) and
-            record ``ploidy=1`` in the output metadata. Intended for unphased
-            somatic data. Default ``False``.
+        Args:
+            out: Path to the output directory.
+            vcf: VCF file to write from.
+            max_mem: Maximum memory to use while writing.
+            overwrite: Whether to overwrite the output directory if it exists.
+            with_dosages: Whether to write dosages.
+            n_jobs: Number of jobs to use for parallel processing.
+            regions: Region(s) to include. Accepts the same input types as ``write_view``:
+                a ``"chrom:start-end"`` string (1-based, end-inclusive), a
+                ``(chrom, start, end)`` tuple (0-based, end-exclusive), a BED file
+                path, or a frame-like. ``None`` (default) includes all regions.
+            samples: Sample name(s) to include (a name, a sequence of names, or a path to a
+                newline-delimited file). Caller order is preserved, deduped by first
+                occurrence. ``None`` (default) includes all samples. Variants whose
+                minor allele count is 0 across the chosen samples are dropped from the
+                output; if every variant drops, a ``ValueError`` is raised.
+            merge_overlapping: If ``False`` (default) raise on overlapping input regions; if ``True``
+                dedupe via pyranges merge.
+            regions_overlap: ``"pos"`` (default), ``"record"``, or ``"variant"`` — same semantics
+                as ``write_view``.
+            haploid: If ``True``, OR-collapse the ploidy axis into a single haploid call
+                per sample (a variant present on any haplotype becomes one call) and
+                record ``ploidy=1`` in the output metadata. Intended for unphased
+                somatic data. Default ``False``.
         """
         out = Path(out)
 
@@ -743,42 +697,30 @@ class SparseVar(SparseVarAnnotateMixin, Generic[_SRT]):
     ):
         """Create a Sparse Variant (.svar) from a PGEN.
 
-        Parameters
-        ----------
-        out
-            Path to the output directory.
-        pgen
-            PGEN file to write from.
-        max_mem
-            Maximum memory to use while writing.
-        overwrite
-            Whether to overwrite the output directory if it exists.
-        with_dosages
-            Whether to write dosages.
-        n_jobs
-            Number of jobs to use for parallel processing.
-        regions
-            Region(s) to include. Accepts the same input types as ``write_view``:
-            a ``"chrom:start-end"`` string (1-based, end-inclusive), a
-            ``(chrom, start, end)`` tuple (0-based, end-exclusive), a BED file
-            path, or a frame-like. ``None`` (default) includes all regions.
-        samples
-            Sample name(s) to include (a name, a sequence of names, or a path to a
-            newline-delimited file). Caller order is preserved, deduped by first
-            occurrence. ``None`` (default) includes all samples. Variants whose
-            minor allele count is 0 across the chosen samples are dropped from the
-            output; if every variant drops, a ``ValueError`` is raised.
-        merge_overlapping
-            If ``False`` (default) raise on overlapping input regions; if ``True``
-            dedupe via pyranges merge.
-        regions_overlap
-            ``"pos"`` (default), ``"record"``, or ``"variant"`` — same semantics
-            as ``write_view``.
-        haploid
-            If ``True``, OR-collapse the ploidy axis into a single haploid call
-            per sample (a variant present on any haplotype becomes one call) and
-            record ``ploidy=1`` in the output metadata. Intended for unphased
-            somatic data. Default ``False``.
+        Args:
+            out: Path to the output directory.
+            pgen: PGEN file to write from.
+            max_mem: Maximum memory to use while writing.
+            overwrite: Whether to overwrite the output directory if it exists.
+            with_dosages: Whether to write dosages.
+            n_jobs: Number of jobs to use for parallel processing.
+            regions: Region(s) to include. Accepts the same input types as ``write_view``:
+                a ``"chrom:start-end"`` string (1-based, end-inclusive), a
+                ``(chrom, start, end)`` tuple (0-based, end-exclusive), a BED file
+                path, or a frame-like. ``None`` (default) includes all regions.
+            samples: Sample name(s) to include (a name, a sequence of names, or a path to a
+                newline-delimited file). Caller order is preserved, deduped by first
+                occurrence. ``None`` (default) includes all samples. Variants whose
+                minor allele count is 0 across the chosen samples are dropped from the
+                output; if every variant drops, a ``ValueError`` is raised.
+            merge_overlapping: If ``False`` (default) raise on overlapping input regions; if ``True``
+                dedupe via pyranges merge.
+            regions_overlap: ``"pos"`` (default), ``"record"``, or ``"variant"`` — same semantics
+                as ``write_view``.
+            haploid: If ``True``, OR-collapse the ploidy axis into a single haploid call
+                per sample (a variant present on any haplotype becomes one call) and
+                record ``ploidy=1`` in the output metadata. Intended for unphased
+                somatic data. Default ``False``.
         """
         out = Path(out)
 
@@ -989,58 +931,46 @@ class SparseVar(SparseVarAnnotateMixin, Generic[_SRT]):
     ) -> None:
         """Write a subset of this SparseVar to a new directory.
 
-        Parameters
-        ----------
-        regions
-            Region(s) to include. Accepts the same input types as
-            :func:`_normalize_regions`: a ``"chrom:start-end"`` string, a
-            ``(chrom, start, end)`` tuple, a BED file path, or a
-            polars/pandas/pyranges frame.
-        samples
-            Samples to include.  Accepts a single sample name, a list, or a
-            path to a file of newline-separated names.
-        output
-            Destination directory for the new SparseVar.
-        fields
-            Fields to carry over (``None`` = all available except ``"mutcat"``; ``[]`` = none).
-            The derived ``mutcat`` field is **never** copied positionally by
-            ``write_view`` because its mutation codes — especially DBS adjacency —
-            are only valid for the full variant set; subsetting may drop a DBS
-            partner and leave a stale 5' code.  Pass ``reference=`` to recompute
-            ``mutcat`` on the subset instead (see below).  Explicitly including
-            ``"mutcat"`` in *fields* without also providing *reference* raises a
-            :class:`ValueError`.
-        reference
-            If provided (a :class:`~genoray._reference.Reference` instance, or a
-            path to a FASTA file), :meth:`annotate_mutations` is called on the
-            output view after all other data have been written, recomputing
-            ``mutcat`` codes for the subset.  This is the supported way to get a
-            valid ``mutcat`` field on a view.  When ``None`` (default), no
-            annotation is performed and the output will not have a ``mutcat``
-            field.  When provided, the FASTA is validated up front (before any
-            output is written) so a bad path fails fast.
-        merge_overlapping
-            If ``True`` silently merge overlapping regions; if ``False``
-            raise ``ValueError`` when overlaps are detected.
-        regions_overlap
-            How variants are matched to regions — ``"pos"``, ``"record"``, or
-            ``"variant"``.  See :func:`_resolve_kept_var_idxs`.
-        overwrite
-            Whether to overwrite *output* if it already exists.
-        threads
-            Number of Numba threads to use.  ``None`` uses all available CPUs.
-        progress
-            If ``True``, display a phase-level :mod:`rich` progress bar while the
-            view is written (one tick per major step: counting, genotypes, each
-            field, index build, and mutation annotation when *reference* is
-            given).  Defaults to ``False`` (no bar, no overhead).
+        Args:
+            regions: Region(s) to include. Accepts the same input types as
+                :func:`_normalize_regions`: a ``"chrom:start-end"`` string, a
+                ``(chrom, start, end)`` tuple, a BED file path, or a
+                polars/pandas/pyranges frame.
+            samples: Samples to include.  Accepts a single sample name, a list, or a
+                path to a file of newline-separated names.
+            output: Destination directory for the new SparseVar.
+            fields: Fields to carry over (``None`` = all available except ``"mutcat"``; ``[]`` = none).
+                The derived ``mutcat`` field is **never** copied positionally by
+                ``write_view`` because its mutation codes — especially DBS adjacency —
+                are only valid for the full variant set; subsetting may drop a DBS
+                partner and leave a stale 5' code.  Pass ``reference=`` to recompute
+                ``mutcat`` on the subset instead (see below).  Explicitly including
+                ``"mutcat"`` in *fields* without also providing *reference* raises a
+                :class:`ValueError`.
+            reference: If provided (a :class:`~genoray._reference.Reference` instance, or a
+                path to a FASTA file), :meth:`annotate_mutations` is called on the
+                output view after all other data have been written, recomputing
+                ``mutcat`` codes for the subset.  This is the supported way to get a
+                valid ``mutcat`` field on a view.  When ``None`` (default), no
+                annotation is performed and the output will not have a ``mutcat``
+                field.  When provided, the FASTA is validated up front (before any
+                output is written) so a bad path fails fast.
+            merge_overlapping: If ``True`` silently merge overlapping regions; if ``False``
+                raise ``ValueError`` when overlaps are detected.
+            regions_overlap: How variants are matched to regions — ``"pos"``, ``"record"``, or
+                ``"variant"``.  See :func:`_resolve_kept_var_idxs`.
+            overwrite: Whether to overwrite *output* if it already exists.
+            threads: Number of Numba threads to use.  ``None`` uses all available CPUs.
+            progress: If ``True``, display a phase-level :mod:`rich` progress bar while the
+                view is written (one tick per major step: counting, genotypes, each
+                field, index build, and mutation annotation when *reference* is
+                given).  Defaults to ``False`` (no bar, no overhead).
 
-        Notes
-        -----
-        Variants whose minor allele count is 0 in the chosen sample subset are
-        dropped from the output. If every candidate variant drops, a
-        :class:`ValueError` is raised — the same code path that fires when
-        ``regions`` itself selects no variants.
+        Notes:
+            Variants whose minor allele count is 0 in the chosen sample subset are
+            dropped from the output. If every candidate variant drops, a
+            :class:`ValueError` is raised — the same code path that fires when
+            ``regions`` itself selects no variants.
         """
         from contextlib import nullcontext
 

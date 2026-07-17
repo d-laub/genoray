@@ -99,32 +99,23 @@ def _dense2sparse_with_length(
     ilens: NDArray[np.int32],
     dosages: NDArray[DOSAGE_TYPE] | None = None,
 ) -> Ragged[V_IDX_TYPE] | tuple[Ragged[V_IDX_TYPE], Ragged[DOSAGE_TYPE]]:
-    """Convert a dense ``with_length`` window (shared, over-extended across all
-    samples/haplotypes) into per-haplotype-minimal sparse output, identical to
-    ``SparseVar.read_ranges_with_length`` for the same query.
+    """Convert a dense ``with_length`` window (shared, over-extended across all samples/haplotypes) into per-haplotype-minimal sparse output, identical to ``SparseVar.read_ranges_with_length`` for the same query.
 
-    Parameters
-    ----------
-    genos
-        Dense genotypes for the window. Shape: (samples, ploidy, variants).
-    var_idxs
-        Global variant indices of the window, used only to populate the sparse
-        output. Shape: (variants,).
-    q_start, q_end
-        0-based, half-open original query span (before extension).
-    v_starts
-        0-based start positions of the window's variants (i.e. POS - 1).
-        Window-aligned: same length as the ``genos`` variant axis and
-        positionally aligned with ``var_idxs`` (NOT a global per-dataset array).
-        Shape: (variants,).
-    ilens
-        ILEN of the window's variants (ALT - REF length). Window-aligned, like
-        ``v_starts``. Shape: (variants,).
-    dosages
-        Optional dense dosages. Shape: (samples, variants).
+    Args:
+        genos: Dense genotypes for the window. Shape: (samples, ploidy, variants).
+        var_idxs: Global variant indices of the window, used only to populate the sparse
+            output. Shape: (variants,).
+        q_start: 0-based, half-open original query span (before extension).
+        q_end: 0-based, half-open original query span (before extension).
+        v_starts: 0-based start positions of the window's variants (i.e. POS - 1).
+            Window-aligned: same length as the ``genos`` variant axis and
+            positionally aligned with ``var_idxs`` (NOT a global per-dataset array).
+            Shape: (variants,).
+        ilens: ILEN of the window's variants (ALT - REF length). Window-aligned, like
+            ``v_starts``. Shape: (variants,).
+        dosages: Optional dense dosages. Shape: (samples, variants).
 
-    Returns
-    -------
+    Returns:
         ``Ragged[V_IDX_TYPE]`` of shape (samples, ploidy, ~variants), or a tuple
         with a matching ``Ragged[DOSAGE_TYPE]`` when ``dosages`` is given.
     """
@@ -506,20 +497,30 @@ def _write_from_reader(
     (when not subsetting samples), job-size resolution, the parallel per-contig
     run, chunk concatenation, and the sample-subsetting MAC-drop finalize.
 
-    Parameters
-    ----------
-    make_tasks
-        ``(chunk_dir, job_mem) -> list[joblib.delayed task]``. Builds the
-        per-contig joblib tasks (wrapping ``_process_contig_vcf`` /
-        ``_process_contig_pgen``). For PGEN this callback is also responsible
-        for freeing/closing the source reader right before returning, so that
-        happens after task construction but before ``joblib.Parallel`` runs —
-        matching ``from_pgen``'s original memory-freeing order exactly.
-    pre_run_check
-        Optional callback invoked inside the ``atomic_write_dir`` staging block
-        immediately after the metadata write. This is where ``from_pgen``'s
-        ``with_dosages and pgen._sei is None`` check lived; its placement
-        (inside staging, right after the metadata write) is preserved exactly.
+    Args:
+        out: Output SVAR directory to write.
+        contigs: Contig names in output order.
+        caller_samples: Output sample names, in order.
+        out_ploidy: Ploidy recorded in the output metadata.
+        with_dosages: Whether a dosages field is written.
+        metadata_json: Serialized ``metadata.json`` contents to write.
+        working_df: Filtered variant index frame (from ``_build_working_index``).
+        kept_rows: Positional row ids in ``working_df`` selected by the region filter.
+        alt_is_utf8: Whether the source ALT column was comma-Utf8 (for on-disk round-trip).
+        ilen_added: Whether an ILEN column was synthesized (and must be dropped on write).
+        subsetting_samples: Whether a sample subset is applied (gates the up-front index write).
+        max_mem: Memory budget for job-size resolution.
+        n_jobs: Number of parallel workers for the per-contig run.
+        make_tasks: ``(chunk_dir, job_mem) -> list[joblib.delayed task]``. Builds the
+            per-contig joblib tasks (wrapping ``_process_contig_vcf`` /
+            ``_process_contig_pgen``). For PGEN this callback is also responsible
+            for freeing/closing the source reader right before returning, so that
+            happens after task construction but before ``joblib.Parallel`` runs —
+            matching ``from_pgen``'s original memory-freeing order exactly.
+        pre_run_check: Optional callback invoked inside the ``atomic_write_dir`` staging block
+            immediately after the metadata write. This is where ``from_pgen``'s
+            ``with_dosages and pgen._sei is None`` check lived; its placement
+            (inside staging, right after the metadata write) is preserved exactly.
     """
     with atomic_write_dir(out) as staging:
         with open(staging / "metadata.json", "w") as f:

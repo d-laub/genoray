@@ -54,8 +54,7 @@ def _subset_var_idxs_and_recompute_af(
     ploidy: int,
     with_dosages: bool,
 ) -> tuple[NDArray[V_IDX_TYPE], NDArray[np.float32]]:
-    """After concat, drop variants whose MAC across the (already sample-subset)
-    output is 0 and remap surviving variant ids to a compacted range.
+    """After concat, drop variants whose MAC across the (already sample-subset) output is 0 and remap surviving variant ids to a compacted range.
 
     A MAC=0 variant contributes no entries to ``variant_idxs.npy`` (it is never
     non-ref in any kept sample/ploidy slot), so dropping it requires only a
@@ -107,8 +106,9 @@ def _subset_var_idxs_and_recompute_af(
 def _build_working_index(
     src_index_path: Path, pl_filter: pl.Expr | None
 ) -> tuple[pl.DataFrame, bool, bool]:
-    """Load the source index, apply ``pl_filter`` (if any), and return a working
-    frame with ALT as list[str], an ILEN list column, and an ``index`` column
+    """Load the source index, apply ``pl_filter`` (if any), and return a working frame.
+
+    Frame has ALT as list[str], an ILEN list column, and an ``index`` column
     holding each row's position (the SVAR variant id). Also returns
     ``(alt_is_utf8, ilen_added)`` so the on-disk format can be reconstructed.
     """
@@ -134,10 +134,11 @@ def _write_index_from_working(
     ilen_added: bool,
     af: "NDArray[np.float32] | None" = None,
 ) -> None:
-    """Write the rows of *working_df* selected by *rows* (in the given order) to
-    *dst* in the canonical SVAR on-disk index format: ALT re-joined to comma-Utf8
-    if it was originally Utf8, ILEN dropped if we added it, and the helper
-    ``index`` column dropped. If *af* is given, (re)sets an ``AF`` column.
+    """Write the rows of *working_df* selected by *rows* (in the given order) to *dst* in the canonical SVAR on-disk index format.
+
+    ALT is re-joined to comma-Utf8 if it was originally Utf8, ILEN dropped if we
+    added it, and the helper ``index`` column dropped. If *af* is given, (re)sets
+    an ``AF`` column.
 
     *rows* must be a numpy array of positional row offsets into *working_df*
     (i.e. values from the ``index`` column, which equals row position since

@@ -34,8 +34,7 @@ if TYPE_CHECKING:
 
 
 def _resolve_vcf_sources(sources: "str | Path | Sequence[str | Path]") -> list[Path]:
-    """Resolve `sources` (as accepted by :meth:`SparseVar2.from_vcf_list`) to a
-    concrete, ordered list of VCF/BCF paths.
+    """Resolve `sources` (as accepted by :meth:`SparseVar2.from_vcf_list`) to a concrete, ordered list of VCF/BCF paths.
 
     `sources` may be:
 
@@ -178,13 +177,14 @@ def _normalize_svar2_regions(
 def _reject_multiregion_variant(
     region_ranges: "list[tuple[str, int, int]]", regions_overlap: str
 ) -> None:
-    """`regions_overlap="variant"` is only sound with at most ONE region per
-    contig: a variant whose anchor-trimmed extent spans the gap between two
-    disjoint regions on the same contig is handled inconsistently across the
-    conversion readers (double-counted in the VCF path, dropped in the
-    PGEN/SVAR1 paths). Until per-region ownership is unified, reject it up
-    front. `pos`/`record` modes are unaffected (POS belongs to exactly one
-    coalesced region)."""
+    """`regions_overlap="variant"` is only sound with at most ONE region per contig.
+
+    A variant whose anchor-trimmed extent spans the gap between two disjoint
+    regions on the same contig is handled inconsistently across the conversion
+    readers (double-counted in the VCF path, dropped in the PGEN/SVAR1 paths).
+    Until per-region ownership is unified, reject it up front. `pos`/`record`
+    modes are unaffected (POS belongs to exactly one coalesced region).
+    """
     if regions_overlap != "variant":
         return
     from collections import Counter
@@ -201,11 +201,12 @@ def _reject_multiregion_variant(
 
 
 def _canonical_contig_id(name: str) -> str:
-    """The `chr`-prefix-insensitive, mito-alias-aware identity that
-    :class:`genoray._contigs.ContigNormalizer` treats as "the same contig" --
-    used here only to *detect* (not resolve) a cohort mixing `chr1`/`1`-style
-    naming across input files, mirroring `ContigNormalizer`'s own rule
-    (`contig_map`'s `chr`-stripping and `_MITO_ALIASES` grouping).
+    """A `chr`-prefix-insensitive, mito-alias-aware contig identity.
+
+    Matches what :class:`genoray._contigs.ContigNormalizer` treats as "the same
+    contig" -- used here only to *detect* (not resolve) a cohort mixing
+    `chr1`/`1`-style naming across input files, mirroring `ContigNormalizer`'s
+    own rule (`contig_map`'s `chr`-stripping and `_MITO_ALIASES` grouping).
     """
     if name in _MITO_ALIASES:
         return "MT"
@@ -215,8 +216,7 @@ def _canonical_contig_id(name: str) -> str:
 def _check_consistent_contig_naming(
     per_file_contigs: "list[tuple[Path, set[str]]]",
 ) -> None:
-    """Raise if the cohort mixes naming schemes for the same logical contig
-    across input files (e.g. file A calls it ``chr1``, file B calls it ``1``).
+    """Raise if the cohort mixes naming schemes for the same logical contig across input files (e.g. file A calls it ``chr1``, file B calls it ``1``).
 
     `from_vcf_list`'s native k-way merge (`VcfListRecordSource`) matches
     contigs by exact per-file string, not through `ContigNormalizer` -- each
@@ -267,9 +267,10 @@ _FD_SAFETY_MARGIN = 64
 
 
 def _check_fd_budget(n_files: int) -> None:
-    """Guard against FD exhaustion before opening `n_files` inputs concurrently
-    (`from_vcf_list` holds one `IndexedReader` per file per contig -- see
-    `VcfListRecordSource`), and raise an error that actually names the real
+    """Guard against FD exhaustion before opening `n_files` inputs concurrently.
+
+    `from_vcf_list` holds one `IndexedReader` per file per contig -- see
+    `VcfListRecordSource` -- and this raises an error that actually names the real
     problem.
 
     Without this, hitting a common soft `RLIMIT_NOFILE` (e.g. 1024) at large
@@ -1013,9 +1014,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         format_fields: "Sequence[str | FormatField] | None" = None,
         check_ref: Literal["e", "x"] = "e",
     ) -> int:
-        """Build one SVAR2 store from many **single-sample** VCFs/BCFs via a
-        native k-way merge (no `bcftools merge`, no intermediate multi-sample
-        VCF).
+        """Build one SVAR2 store from many **single-sample** VCFs/BCFs via a native k-way merge (no `bcftools merge`, no intermediate multi-sample VCF).
 
         Each file in `sources` must have exactly one sample column; that
         sample becomes one sample in the resulting store, named after its
@@ -1420,9 +1419,10 @@ def _find_pvar(pgen: Path) -> Path:
 def _pvar_contig_ranges(
     pvar: Path,
 ) -> tuple[list[str], list[tuple[int, int]], NDArray[np.uintp]]:
-    """Contigs in `.pvar` file order, each one's half-open `[lo, hi)` variant
-    index range, and the file-wide `allele_idx_offsets` array `pgenlib.PgenReader`
-    requires once any variant in the file is multiallelic.
+    """Contigs in `.pvar` file order, each one's half-open `[lo, hi)` variant index range, and the file-wide `allele_idx_offsets` array.
+
+    The `allele_idx_offsets` array is what `pgenlib.PgenReader` requires once any
+    variant in the file is multiallelic.
 
     `allele_idx_offsets` has length `n_variants + 1`: `offsets[0] = 0` and
     `offsets[i+1] = offsets[i] + 1 + n_alts(i)`, where `n_alts(i)` is the number of
@@ -1511,9 +1511,10 @@ def _pvar_covering_ranges(
     region_ranges: list[tuple[str, int, int]],
     regions_overlap: str,
 ) -> dict[str, tuple[int, int]]:
-    """Narrow each contig's `[lo, hi)` variant-index range (from
-    `_pvar_contig_ranges`) to the covering range of its `region_ranges`, via a
-    searchsorted over that contig's `.pvar` POS column.
+    """Narrow each contig's `[lo, hi)` variant-index range to the covering range of its `region_ranges`.
+
+    Narrows the range from `_pvar_contig_ranges` via a searchsorted over that
+    contig's `.pvar` POS column.
 
     This is ONLY an optimization for how much of the `.pgen`/`.pvar` gets
     scanned -- the per-record Rust filter (`PgenRecordSource`, via
@@ -1583,8 +1584,7 @@ def _read_svar1_metadata(
 
 
 def _pack_strings(values: list[str]) -> tuple[bytes, "np.ndarray"]:
-    """Pack a list of ASCII allele strings into (concatenated bytes, i64 offsets)
-    with offsets length len(values)+1."""
+    """Pack a list of ASCII allele strings into (concatenated bytes, i64 offsets) with offsets length len(values)+1."""
     encoded = [v.encode("ascii") for v in values]
     offsets = np.zeros(len(encoded) + 1, dtype=np.int64)
     np.cumsum([len(b) for b in encoded], out=offsets[1:])

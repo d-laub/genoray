@@ -25,9 +25,9 @@ def _unique_sibling(dest: Path, suffix: str) -> Path:
 
 @contextmanager
 def atomic_write_path(dest: Path) -> Iterator[Path]:
-    """Write a single file atomically: yield a sibling temp path to write to, then
-    ``os.replace`` it onto *dest* on clean exit. On any exception the temp file is
-    removed and *dest* is left untouched.
+    """Write a single file atomically: yield a sibling temp path to write to, then ``os.replace`` it onto *dest* on clean exit.
+
+    On any exception the temp file is removed and *dest* is left untouched.
 
     The temp file is created in ``dest.parent`` so the final rename stays on one
     filesystem (a true atomic rename, no cross-device copy).
@@ -49,8 +49,7 @@ def atomic_write_path(dest: Path) -> Iterator[Path]:
 
 @contextmanager
 def atomic_write_dir(dest: Path) -> Iterator[Path]:
-    """Write a directory atomically: yield a sibling staging dir to populate, then
-    swap it into place on clean exit.
+    """Write a directory atomically: yield a sibling staging dir to populate, then swap it into place on clean exit.
 
     Swap is backup-then-swap: if *dest* already exists it is first moved aside to a
     fresh sibling name (so the staging dir is renamed onto a *non-existent* path,

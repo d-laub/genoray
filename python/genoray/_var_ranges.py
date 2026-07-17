@@ -19,10 +19,12 @@ _logging.getLogger("polars_bio").setLevel(_logging.ERROR)
 
 
 def _var_end_expr() -> pl.Expr:
-    """0-based exclusive end for a variant. A null/absent ILEN (symbolic SV with
-    no computable length) is treated as a point variant (end == POS); a negative
-    ILEN (deletion) extends the span leftward. Shared by var_ranges/var_indices/
-    var_counts so the symbolic-SV handling stays consistent across all three.
+    """0-based exclusive end for a variant.
+
+    A null/absent ILEN (symbolic SV with no computable length) is treated as a
+    point variant (end == POS); a negative ILEN (deletion) extends the span
+    leftward. Shared by var_ranges/var_indices/var_counts so the symbolic-SV
+    handling stays consistent across all three.
     """
     return pl.col("POS") - pl.col("ILEN").list.first().clip(upper_bound=0).fill_null(0)
 
@@ -34,22 +36,20 @@ def var_ranges(
     starts: ArrayLike,
     ends: ArrayLike,
 ) -> NDArray[V_IDX_TYPE]:
-    """Get variant index ranges for each query range. i.e.
+    """Get variant index ranges for each query range.
+
     For each query range, return the minimum and maximum variant that overlaps.
     Note that this means some variants within those ranges may not actually overlap with
     the query range if there is a deletion that spans the start of the query.
 
-    Parameters
-    ----------
-    contig
-        Contig name.
-    starts
-        0-based start positions of the ranges.
-    ends
-        0-based, exclusive end positions of the ranges.
+    Args:
+        contig_normalizer: Normalizer for matching query contig names to the index.
+        var_table: Variant index DataFrame to query (columns CHROM, POS, ILEN).
+        contig: Contig name.
+        starts: 0-based start positions of the ranges.
+        ends: 0-based, exclusive end positions of the ranges.
 
-    Returns
-    -------
+    Returns:
         Shape: :code:`(ranges, 2)`. The first column is the start index of the variant
         and the second column is the end index of the variant.
     """
