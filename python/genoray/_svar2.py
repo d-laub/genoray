@@ -24,6 +24,7 @@ from genoray._svar2_fields import (
 )
 from genoray._svar2_mutcat import _MutcatMixin
 from genoray._svar2_ops import Mode, _assert_concat_compatible, _load_meta, _write_store
+from genoray._utils import parse_memory
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -917,7 +918,8 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
                 )
 
         if chunk_size is None:
-            chunk_size = _auto_chunk_size(len(selected_samples))
+            # from_pgen is diploid-only (no `ploidy=` parameter).
+            chunk_size = _auto_chunk_size(len(selected_samples), 2)
 
         import pgenlib
 
@@ -1004,7 +1006,8 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         no_reference: bool = False,
         skip_out_of_scope: bool = False,
         ploidy: int = 2,
-        chunk_size: int = 25_000,
+        chunk_size: int | None = None,
+        max_mem: int | str | None = None,
         threads: int | None = None,
         overwrite: bool = False,
         long_allele_capacity: int = 8 * 1024 * 1024,
@@ -1115,6 +1118,42 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         the offending record (including a REF that runs past the contig end)
         and continues, logging a per-contig count. Comparison is
         case-insensitive, so soft-masked (lowercase) reference bases match.
+
+        chunk_size: variants per conversion chunk. When omitted (`None`,
+        default), a memory-budget-derived value (`_auto_chunk_size`) is used so
+        one packed dense chunk stays ~`_DENSE_CHUNK_TARGET_BYTES` regardless of
+        cohort size — the same default `from_pgen` and `from_svar1` already use.
+        Scope: this bounds only the *dense-chunk* term, which is a small
+        fraction of peak RAM at typical cohort sizes (the budget does not bite
+        until roughly 43k inputs, below which it returns the historical
+        25_000). It is a large-cohort guardrail, not a fix for overall RAM
+        scaling in the number of input files. Pass an int to override with a
+        fixed count.
+
+        `max_mem` caps the bytes one in-flight dense chunk may occupy, sizing
+        `chunk_size` against the packed genotype grid plus staged FORMAT
+        values. It is a worst-case ceiling: the estimate assumes every variant
+        routes dense, so cohorts whose variants route sparse (e.g. private
+        somatic calls) use considerably less.
+
+        For large multi-contig merges, also consider setting
+        ``MALLOC_ARENA_MAX`` in the environment -- see the Notes section
+        below.
+
+        Notes
+        -----
+        Peak RSS on very large multi-contig merges is dominated by glibc arena
+        behaviour, not by live data: glibc sizes its arena count from the
+        *machine's* core count (8 x ncores, so 768 on a 96-core node) and
+        never unmaps a heap once created.
+
+        Setting ``MALLOC_ARENA_MAX=2`` in the environment *before* the
+        process starts can help -- measured 9.20 GB -> 6.89 GB peak on a
+        3-contig, 1000-file merge at no time cost. It is **not** a safe
+        default: with thousands of concurrent readers contending on two
+        arena locks the same knob measured 12% *worse* RAM and **73%
+        slower** on a 4000-file single-contig merge. Measure before
+        adopting it.
         """
         from cyvcf2 import VCF as _CyVCF
 
@@ -1196,6 +1235,16 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         format_ = [t for t in flds if t[1] == "format"]
 
         _validate_check_ref(check_ref)
+        if chunk_size is None:
+            # Budget-derive so a packed dense chunk stays ~_DENSE_CHUNK_TARGET_BYTES
+            # (or the caller's max_mem) regardless of cohort size -- a fixed 25k chunk's
+            # dense RAM grows linearly in the number of input files (issue #120).
+            chunk_size = _auto_chunk_size(
+                len(samples),
+                ploidy,
+                n_format_fields=len(format_),
+                max_mem=None if max_mem is None else parse_memory(max_mem),
+            )
         return _core.run_vcf_list_conversion_pipeline(
             [str(p) for p in paths],
             None if no_reference else str(reference),
@@ -1673,14 +1722,31 @@ def _svar1_fields_manifest(
 
 # Target byte size of one packed dense chunk (chunk_size * n_samples * ploidy / 8).
 _DENSE_CHUNK_TARGET_BYTES = 256 * 1024 * 1024
+# Staged FORMAT is one 4-byte value per (variant, sample, field).
+_STAGED_FORMAT_BYTES = 4
 
 
-def _auto_chunk_size(n_samples: int, ploidy: int = 2) -> int:
-    """Variants per chunk, derived from a memory budget rather than a fixed count.
+def _auto_chunk_size(
+    n_samples: int,
+    ploidy: int,
+    n_format_fields: int = 0,
+    max_mem: int | None = None,
+) -> int:
+    """Variants per dense chunk, sized so one chunk fits `max_mem`.
 
-    A packed dense chunk costs `chunk_size * n_samples * ploidy / 8` bytes, so a
-    fixed 25k chunk that is fine at 200 samples is not at 500k.
+    Budgets both terms a chunk actually costs: the packed presence grid
+    (`n_samples * ploidy / 8` bytes per variant) and staged FORMAT values
+    (`n_format_fields * n_samples * 4`). The FORMAT term dominates by `32 * F / ploidy`
+    -- 112x at F=7, ploidy=2 -- so budgeting the grid alone is meaningless whenever
+    fields are requested (issue #120).
+
+    The estimate is deliberately worst-case: it assumes every variant routes dense.
+    The dense fraction is a per-chunk, data-dependent routing outcome and is not known
+    here, so `max_mem` is a ceiling rather than a prediction. Cohorts whose variants
+    route sparse simply come in under it -- under-budgeting would reintroduce the OOM.
     """
-    bits_per_variant = n_samples * ploidy
-    by_budget = (_DENSE_CHUNK_TARGET_BYTES * 8) // max(bits_per_variant, 1)
-    return max(1024, min(25_000, int(by_budget)))
+    budget = _DENSE_CHUNK_TARGET_BYTES if max_mem is None else max_mem
+    grid_bytes = (n_samples * ploidy) // 8
+    format_bytes = n_format_fields * n_samples * _STAGED_FORMAT_BYTES
+    per_variant = max(grid_bytes + format_bytes, 1)
+    return max(1024, min(25_000, budget // per_variant))

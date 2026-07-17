@@ -1,7 +1,9 @@
 use crate::error::ConversionError;
 use crate::field::{FieldCategory, FieldSpec};
 use crate::normalize::atomize_record;
-use crate::record_source::{RawRecord, RecordSource};
+use crate::record_source::{
+    Calls, Carriers, FormatVals, RawRecord, RecordSource, resolve_format, resolve_scalar,
+};
 use crate::types::{BitGrid3, DenseChunk, StagedColumn};
 use rayon::prelude::*;
 use std::cmp::Reverse;
@@ -15,16 +17,23 @@ struct PendingAtom {
     ilen: i32,
     alt: Vec<u8>,
     source_alt_index: u16,
-    gt: Arc<Vec<i32>>, // len = num_samples * ploidy; allele index per column (-1 = missing)
+    calls: Arc<Calls>, // shared across the atoms decomposed from one record
     seq: u64,          // stable tiebreak for equal positions
 
-    // Resolved field values for THIS atom (already indexed by source_alt_index
-    // where the underlying VCF field is Number=A). Populated in
-    // `decompose_current_record`, gathered into `DenseChunk::{info,format}_staged`
-    // in `read_next_chunk`'s sequential metadata pass. Empty when no fields of
-    // that category were requested.
-    info_vals: Vec<f64>,   // len == VcfChunkReader::info_fields.len()
-    format_vals: Vec<f64>, // len == VcfChunkReader::format_fields.len() * num_samples, field-major then sample: field*num_samples + sample
+    // INFO is resolved eagerly (already indexed by source_alt_index where the
+    // underlying VCF field is Number=A) since it's already O(1) per atom -- one
+    // scalar per requested spec, not F x N. Populated in `decompose_raw_record`,
+    // gathered into `DenseChunk::info_staged` in `read_next_chunk`'s sequential
+    // metadata pass. Empty when no INFO fields were requested.
+    info_vals: Vec<f64>, // len == VcfChunkReader::info_fields.len()
+
+    // FORMAT, by contrast, is a source-record-level buffer shared across every
+    // atom decomposed from that record (like `calls` above) rather than
+    // resolved per atom: resolving it per atom would materialise F x N per
+    // atom even when the record has one carrier out of N, which is churn site
+    // #2 this type exists to remove. Resolved lazily, per (sample, field), in
+    // `read_next_chunk`'s metadata pass via `resolve_format`.
+    format_vals: Arc<FormatVals>,
 }
 
 struct DecomposedRecord {
@@ -65,24 +74,41 @@ impl Ord for PendingAtom {
 #[inline]
 fn pack_row(words: &mut [u64], word_base: usize, vi: usize, a: &PendingAtom, columns: usize) {
     let src = a.source_alt_index as i32;
-    let gtc: &[i32] = &a.gt;
     let base = vi * columns;
-    let mut col = 0usize;
-    while col < columns {
-        let flat = base + col;
-        let w = (flat >> 6) - word_base;
-        let b = flat & 63;
-        let n = (64 - b).min(columns - col);
-        let mut acc = 0u64;
-        for k in 0..n {
-            // SAFETY: col + k < columns == gtc.len().
-            acc |= ((unsafe { *gtc.get_unchecked(col + k) } == src) as u64) << (b + k);
+    match a.calls.as_ref() {
+        Calls::Dense(gtc) => {
+            let mut col = 0usize;
+            while col < columns {
+                let flat = base + col;
+                let w = (flat >> 6) - word_base;
+                let b = flat & 63;
+                let n = (64 - b).min(columns - col);
+                let mut acc = 0u64;
+                for k in 0..n {
+                    // SAFETY: col + k < columns == gtc.len().
+                    acc |= ((unsafe { *gtc.get_unchecked(col + k) } == src) as u64) << (b + k);
+                }
+                // SAFETY: w indexes a word within this row's target slice.
+                unsafe {
+                    *words.get_unchecked_mut(w) |= acc;
+                }
+                col += n;
+            }
         }
-        // SAFETY: w indexes a word within this row's target slice.
-        unsafe {
-            *words.get_unchecked_mut(w) |= acc;
+        Calls::Sparse(_) => {
+            // Only the carriers can match `src`; every other column is REF and packs 0.
+            // This is the O(carriers) path that replaces the O(columns) scan.
+            for (col, allele) in a.calls.iter_non_ref() {
+                if allele == src {
+                    let flat = base + col as usize;
+                    let w = (flat >> 6) - word_base;
+                    // SAFETY: col < columns by construction (see VcfListRecordSource).
+                    unsafe {
+                        *words.get_unchecked_mut(w) |= 1u64 << (flat & 63);
+                    }
+                }
+            }
         }
-        col += n;
     }
 }
 
@@ -145,66 +171,27 @@ fn pack_presence_par(
     });
 }
 
-// Delegates to `FieldSpec::missing_sentinel` — single source of truth shared
-// with `dense2sparse_vk`'s genotype-aligned non-carrier fill (src/rvk.rs).
-fn sentinel_default(spec: &FieldSpec) -> f64 {
-    spec.missing_sentinel()
-}
-
-// htslib missing-value detection on an already-widened f64: floats use NaN
-// (covers both htslib's MISSING and VECTOR_END float encodings, which are
-// distinct NaN bit patterns); ints use MISSING (i32::MIN) or VECTOR_END
-// (i32::MIN + 1) — the round-trip through f64 is exact for both since they're
-// in i32 range.
-fn is_htslib_missing(raw_val: f64, is_float: bool) -> bool {
-    if is_float {
-        raw_val.is_nan()
-    } else {
-        let iv = raw_val as i32;
-        iv == i32::MIN || iv == i32::MIN + 1
-    }
-}
-
-// Resolve one atom's value from a record-level raw buffer (already widened to
-// f64): `None` (field absent from the record/sample) or an out-of-range
-// Number=A index falls back to the spec's sentinel/default; a length-1 buffer
-// is a Number=1 scalar, otherwise indexed by `source_alt_index - 1` (Number=A):
-// `source_alt_index` is 1-based (ALT1 → 1, matching BCF GT allele codes; see
-// `normalize::atomize_record`), but htslib's Number=A buffer is 0-based
-// per-ALT (ALT1's value lives at `vals[0]`).
-pub(crate) fn resolve_scalar(vals: Option<&[f64]>, source_alt_index: u16, spec: &FieldSpec) -> f64 {
-    let default_val = sentinel_default(spec);
-    let Some(vals) = vals else {
-        return default_val;
-    };
-    if vals.is_empty() {
-        return default_val;
-    }
-    let raw_val = if vals.len() == 1 {
-        vals[0]
-    } else {
-        // source_alt_index is 1-based; htslib Number=A buffers are 0-based per-ALT.
-        match vals.get(source_alt_index.saturating_sub(1) as usize) {
-            Some(&v) => v,
-            None => return default_val,
-        }
-    };
-    if is_htslib_missing(raw_val, spec.stage_is_float()) {
-        default_val
-    } else {
-        raw_val
-    }
-}
-
 // An atom whose presence bits are already packed into the chunk's BitGrid. `gt`
-// and `source_alt_index` are dropped at that point, so per-chunk staging memory
-// no longer scales with `chunk_size * num_samples * ploidy`.
+// is dropped at that point, so per-chunk staging memory no longer scales with
+// `chunk_size * num_samples * ploidy`. `source_alt_index` is retained (a `u16`,
+// not a per-sample buffer) because FORMAT resolution is now lazy: the metadata
+// pass in `read_next_chunk` needs it to resolve `format_vals`'s `Dense` arm
+// (see `resolve_format`) the same way `decompose_raw_record` used to, eagerly,
+// per atom. Carrier-bearing chunks never run that resolution here: their
+// `format_vals` is moved wholesale into `DenseChunk::format_by_carrier` and
+// resolved in `rvk` per carrier instead.
 struct AtomMeta {
     pos: u32,
     ilen: i32,
     alt: Vec<u8>,
+    source_alt_index: u16,
     info_vals: Vec<f64>,
-    format_vals: Vec<f64>,
+    format_vals: Arc<FormatVals>,
+    /// Columns whose allele is this atom's `source_alt_index` -- i.e. exactly the
+    /// bits `pack_row` sets for this atom. `None` when the source is natively
+    /// dense, where recovering carriers from the grid is correct and cheaper than
+    /// retaining them (see `DenseChunk::carriers`, src/types.rs).
+    carriers: Option<Carriers>,
 }
 
 // Atoms buffered before their presence bits are flushed into the chunk's BitGrid.
@@ -249,12 +236,31 @@ fn flush_window(
 
     metas.reserve(buf.len());
     for a in buf.drain(..) {
+        // Reuses the same `allele == src` filter `pack_row` already applies (see
+        // above) -- O(carriers), not a new scan. `Calls::Sparse`'s carrier list is
+        // ascending by construction (Task 3-7), and filtering an ascending sequence
+        // keeps it ascending, so `Carriers::push`'s ordering invariant holds.
+        let carriers = match a.calls.as_ref() {
+            Calls::Dense(_) => None,
+            Calls::Sparse(_) => {
+                let src = a.source_alt_index as i32;
+                let mut c = Carriers::new();
+                for (col, allele) in a.calls.iter_non_ref() {
+                    if allele == src {
+                        c.push(col, allele);
+                    }
+                }
+                Some(c)
+            }
+        };
         metas.push(AtomMeta {
             pos: a.pos,
             ilen: a.ilen,
             alt: a.alt,
+            source_alt_index: a.source_alt_index,
             info_vals: a.info_vals,
             format_vals: a.format_vals,
+            carriers,
         });
     }
 }
@@ -288,11 +294,13 @@ fn decompose_raw_record(
     skip_out_of_scope: bool,
     check_ref: crate::normalize::CheckRef,
     info_fields: &[FieldSpec],
-    format_fields: &[FieldSpec],
-    num_samples: usize,
 ) -> Result<DecomposedRecord, ConversionError> {
     let pos = rec.pos;
-    let gt = Arc::new(rec.gt);
+    let calls = Arc::new(rec.calls);
+    // Shared, not resolved: every atom decomposed from this record gets a cheap
+    // `Arc::clone` of the SAME buffer, resolved lazily per (sample, field) at
+    // chunk-metadata time (`resolve_format`) rather than widened to F x N here.
+    let format_vals = Arc::new(rec.format_vals);
 
     // Only when a reference is available: fail fast (`CheckRef::Error`) or drop
     // the record (`CheckRef::Exclude`) if its REF disagrees with the reference.
@@ -335,14 +343,6 @@ fn decompose_raw_record(
             .map(|(spec, raw)| resolve_scalar(raw.as_deref(), atom.source_alt_index, spec))
             .collect();
 
-        let mut format_vals = Vec::with_capacity(format_fields.len() * num_samples);
-        for (spec, raw) in format_fields.iter().zip(rec.format_raw.iter()) {
-            for s in 0..num_samples {
-                let sample_vals = raw.as_ref().map(|v| v[s].as_slice());
-                format_vals.push(resolve_scalar(sample_vals, atom.source_alt_index, spec));
-            }
-        }
-
         let seq = record_seq
             .saturating_mul(1u64 << 32)
             .saturating_add(atom_ix as u64);
@@ -351,10 +351,10 @@ fn decompose_raw_record(
             ilen: atom.ilen,
             alt: atom.alt,
             source_alt_index: atom.source_alt_index,
-            gt: Arc::clone(&gt),
+            calls: Arc::clone(&calls),
             seq,
             info_vals,
-            format_vals,
+            format_vals: Arc::clone(&format_vals),
         });
     }
 
@@ -488,8 +488,6 @@ impl ChunkAssembler {
                             self.skip_out_of_scope,
                             self.check_ref,
                             &self.info_fields,
-                            &self.format_fields,
-                            self.num_samples,
                         )
                     })
                     .collect::<Result<Vec<_>, _>>()
@@ -506,8 +504,6 @@ impl ChunkAssembler {
                         self.skip_out_of_scope,
                         self.check_ref,
                         &self.info_fields,
-                        &self.format_fields,
-                        self.num_samples,
                     )
                 })
                 .collect::<Result<Vec<_>, _>>()?
@@ -628,15 +624,24 @@ impl ChunkAssembler {
             .iter()
             .map(|spec| StagedColumn::with_capacity(spec.stage_is_float(), v))
             .collect();
-        let mut format_staged: Vec<StagedColumn> = self
-            .format_fields
-            .iter()
-            .map(|spec| StagedColumn::with_capacity(spec.stage_is_float(), v * num_samples))
-            .collect();
+        // A chunk is carrier-bearing iff its first atom carries (uniformity is
+        // asserted below). Decide once, up front, so FORMAT staging can be
+        // skipped entirely for carrier-bearing chunks.
+        let carrier_bearing = metas.first().is_some_and(|a| a.carriers.is_some());
+        let mut format_staged: Vec<StagedColumn> = if carrier_bearing {
+            Vec::new()
+        } else {
+            self.format_fields
+                .iter()
+                .map(|spec| StagedColumn::with_capacity(spec.stage_is_float(), v * num_samples))
+                .collect()
+        };
 
         // Sequential metadata pass (cheap, ordering-preserving).
         let mut off = 0u32;
-        for a in metas.iter() {
+        let mut carrier_opts: Vec<Option<Carriers>> = Vec::with_capacity(metas.len());
+        let mut format_arcs: Vec<Arc<FormatVals>> = Vec::with_capacity(metas.len());
+        for a in metas.iter_mut() {
             pos.push(a.pos);
             ilens.push(a.ilen);
             alt.extend_from_slice(&a.alt);
@@ -646,12 +651,55 @@ impl ChunkAssembler {
             for (i, col) in info_staged.iter_mut().enumerate() {
                 col.push_f64(a.info_vals[i]);
             }
-            for (j, col) in format_staged.iter_mut().enumerate() {
-                for s in 0..num_samples {
-                    col.push_f64(a.format_vals[j * num_samples + s]);
+            // Dense-source chunks stage every sample's value per atom (F x N):
+            // for these, `genos`/`format_staged` IS the representation and the
+            // per-sample column is the real work. Carrier-bearing chunks skip
+            // this entirely -- their FORMAT rides `format_by_carrier` and `rvk`
+            // resolves it per carrier (route-before-densify), so the old
+            // unconditional F x N staging (the from_vcf_list O(N^2)) is gone.
+            if !carrier_bearing {
+                for (j, col) in format_staged.iter_mut().enumerate() {
+                    for s in 0..num_samples {
+                        col.push_f64(resolve_format(
+                            &a.format_vals,
+                            &self.format_fields[j],
+                            a.source_alt_index,
+                            s,
+                            j,
+                        ));
+                    }
                 }
             }
+            format_arcs.push(Arc::clone(&a.format_vals));
+            carrier_opts.push(a.carriers.take());
         }
+
+        // A chunk is fed by a single source, so carrier-bearing is all-or-nothing:
+        // either every atom carried one (the k-way merge) or none did (a natively
+        // dense source). `rvk` treats `Some`/`None` as its routing switch, so a
+        // mixed chunk would silently corrupt that decision -- assert the
+        // uniformity here rather than downstream.
+        let all_some = carrier_opts.iter().all(|c| c.is_some());
+        let all_none = carrier_opts.iter().all(|c| c.is_none());
+        debug_assert!(
+            all_some || all_none,
+            "a chunk must not mix carrier-bearing and dense-source atoms"
+        );
+        let carriers = if all_some {
+            Some(
+                carrier_opts
+                    .into_iter()
+                    .map(|c| c.expect("checked all_some above"))
+                    .collect(),
+            )
+        } else {
+            None
+        };
+
+        // `format_by_carrier` is Some/None in lockstep with `carriers`: both
+        // come from a carrier-bearing source or neither does (the `all_some`/
+        // `all_none` uniformity asserted above).
+        let format_by_carrier = if all_some { Some(format_arcs) } else { None };
 
         Ok(Some(DenseChunk {
             chunk_id,
@@ -662,6 +710,8 @@ impl ChunkAssembler {
             genos,
             info_staged,
             format_staged,
+            carriers,
+            format_by_carrier,
         }))
     }
 }
@@ -669,8 +719,20 @@ impl ChunkAssembler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::field::{HtslibType, StorageDtype};
+    use crate::record_source::CarrierFormat;
     use proptest::prelude::*;
     use std::sync::OnceLock;
+
+    fn format_spec(name: &str) -> FieldSpec {
+        FieldSpec {
+            name: name.to_string(),
+            category: FieldCategory::Format,
+            htype: HtslibType::Float,
+            dtype: StorageDtype::Auto,
+            default: None,
+        }
+    }
 
     // One shared 4-thread pool for all proptest cases (building a pool per case is slow).
     fn test_pool() -> &'static rayon::ThreadPool {
@@ -690,10 +752,10 @@ mod tests {
             ilen: 0,
             alt: Vec::new(),
             source_alt_index: src,
-            gt: std::sync::Arc::new(gt),
+            calls: std::sync::Arc::new(Calls::Dense(gt)),
             seq: 0,
             info_vals: Vec::new(),
-            format_vals: Vec::new(),
+            format_vals: Arc::new(FormatVals::Dense(Vec::new())),
         }
     }
 
@@ -703,11 +765,251 @@ mod tests {
             ilen: 0,
             alt: Vec::new(),
             source_alt_index: src,
-            gt: std::sync::Arc::new(gt),
+            calls: std::sync::Arc::new(Calls::Dense(gt)),
             seq: pos as u64,
             info_vals: Vec::new(),
-            format_vals: Vec::new(),
+            format_vals: Arc::new(FormatVals::Dense(Vec::new())),
         }
+    }
+
+    // `Calls::Sparse` counterpart to `atom`: same shape, carriers derived from
+    // `gt`'s non-zero entries in ascending column order (what `Carriers`
+    // requires).
+    fn sparse_atom(gt: &[i32], src: u16) -> PendingAtom {
+        let mut carriers = crate::record_source::Carriers::new();
+        for (col, &g) in gt.iter().enumerate() {
+            if g != 0 {
+                carriers.push(col as u32, g);
+            }
+        }
+        PendingAtom {
+            pos: 0,
+            ilen: 0,
+            alt: Vec::new(),
+            source_alt_index: src,
+            calls: std::sync::Arc::new(Calls::Sparse(carriers)),
+            seq: 0,
+            info_vals: Vec::new(),
+            format_vals: Arc::new(FormatVals::Dense(Vec::new())),
+        }
+    }
+
+    // Task 7's own correctness trap: `resolve_format`'s two arms must NOT treat
+    // `source_alt_index` the same way. `Dense` buffers are still record-raw
+    // (Number=A, one entry per source ALT, 0-based) exactly as they were before
+    // this change, so this arm must keep re-applying `source_alt_index` via
+    // `resolve_scalar` -- the same call `decompose_raw_record` made eagerly
+    // pre-refactor. `ByCarrier` values are already fully resolved per carrier at
+    // merge time (`vcf_list_reader.rs`'s `FileCursor::advance`, against THAT
+    // FILE's own `source_alt_index`, before the merge heap ever sees them), so
+    // re-applying an index here would double-resolve and is required to be inert.
+    #[test]
+    fn resolve_format_dense_reapplies_alt_index_but_by_carrier_does_not() {
+        let spec = format_spec("DP");
+        // One sample, Number=A buffer with a DIFFERENT value per source ALT:
+        // ALT1 -> 10.0, ALT2 -> 20.0.
+        let dense = FormatVals::Dense(vec![Some(vec![vec![10.0, 20.0]])]);
+        assert_eq!(
+            resolve_format(&dense, &spec, 1, 0, 0),
+            10.0,
+            "an ALT1 atom must read vals[0]"
+        );
+        assert_eq!(
+            resolve_format(&dense, &spec, 2, 0, 0),
+            20.0,
+            "an ALT2 atom must read vals[1], not ALT1's value"
+        );
+
+        let mut cf = CarrierFormat::new(1);
+        cf.push_sample(0, &[7.0]);
+        let by_carrier = FormatVals::ByCarrier(cf);
+        assert_eq!(resolve_format(&by_carrier, &spec, 1, 0, 0), 7.0);
+        assert_eq!(
+            resolve_format(&by_carrier, &spec, 2, 0, 0),
+            7.0,
+            "ByCarrier must not re-apply source_alt_index -- it's already resolved"
+        );
+    }
+
+    // End-to-end regression for the same trap, through the REAL pipeline (not just
+    // the helper in isolation): a genuinely multiallelic Dense-sourced record (the
+    // shape `from_vcf`/`from_pgen`/`from_svar1` produce, as opposed to
+    // `from_vcf_list`'s always-single-ALT merged records) must hand each of its
+    // decomposed atoms ITS OWN `source_alt_index`, paired with the SAME shared
+    // `format_vals` buffer, so `resolve_format` at chunk-metadata time reads back
+    // each atom's own ALT1/ALT2 slot rather than a fixed or leaked index.
+    #[test]
+    fn decompose_raw_record_threads_each_atoms_own_alt_index_to_dense_format() {
+        let format_specs = [format_spec("DP")];
+        let rec = RawRecord {
+            pos: 0,
+            reference: b"A".to_vec(),
+            alts: vec![b"C".to_vec(), b"G".to_vec()],
+            calls: Calls::Dense(vec![1, 2]), // irrelevant to FORMAT resolution
+            info_raw: Vec::new(),
+            format_vals: FormatVals::Dense(vec![Some(vec![vec![10.0, 20.0]])]),
+        };
+        let decomposed = decompose_raw_record(
+            rec,
+            0,
+            &[],
+            false,
+            false,
+            crate::normalize::CheckRef::Error,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            decomposed.atoms.len(),
+            2,
+            "REF A / ALT C,G must atomize to two SNV atoms"
+        );
+        for atom in &decomposed.atoms {
+            let expect = if atom.source_alt_index == 1 {
+                10.0
+            } else {
+                20.0
+            };
+            let got = resolve_format(
+                &atom.format_vals,
+                &format_specs[0],
+                atom.source_alt_index,
+                0,
+                0,
+            );
+            assert_eq!(
+                got, expect,
+                "atom with source_alt_index={} must resolve its OWN ALT slot",
+                atom.source_alt_index
+            );
+        }
+    }
+
+    #[test]
+    fn pack_row_dense_calls_matches_the_raw_gt_loop() {
+        // Guards the Task 4 migration: packing from Calls::Dense must reproduce, bit for
+        // bit, what the old `&a.gt` loop produced. Any drift here is a store diff.
+        let columns = 8usize;
+        let gt = vec![0i32, 1, 1, 0, 2, -1, 1, 0];
+        let src_alt = 1i32;
+
+        let mut expect = vec![0u64; 1];
+        for (col, &g) in gt.iter().enumerate() {
+            if g == src_alt {
+                expect[0] |= 1u64 << col;
+            }
+        }
+
+        let atom = PendingAtom {
+            pos: 100,
+            ilen: 0,
+            alt: b"A".to_vec(),
+            source_alt_index: src_alt as u16,
+            calls: std::sync::Arc::new(crate::record_source::Calls::Dense(gt)),
+            seq: 0,
+            info_vals: Vec::new(),
+            format_vals: Arc::new(FormatVals::Dense(Vec::new())),
+        };
+
+        let mut got = vec![0u64; 1];
+        pack_row(&mut got, 0, 0, &atom, columns);
+        assert_eq!(got, expect);
+    }
+
+    #[test]
+    fn pack_row_sparse_and_dense_produce_identical_bits() {
+        // The whole design rests on this: a carrier list and a widened vector are two
+        // encodings of the same record, so they must pack to the same bits.
+        let columns = 8usize;
+        let gt = vec![0i32, 1, 1, 0, 2, -1, 1, 0];
+        let src_alt = 1u16;
+
+        let mut carriers = crate::record_source::Carriers::new();
+        for (col, &g) in gt.iter().enumerate() {
+            if g != 0 {
+                carriers.push(col as u32, g);
+            }
+        }
+
+        let mk = |calls: crate::record_source::Calls| PendingAtom {
+            pos: 100,
+            ilen: 0,
+            alt: b"A".to_vec(),
+            source_alt_index: src_alt,
+            calls: std::sync::Arc::new(calls),
+            seq: 0,
+            info_vals: Vec::new(),
+            format_vals: Arc::new(FormatVals::Dense(Vec::new())),
+        };
+
+        let mut dense_bits = vec![0u64; 1];
+        pack_row(
+            &mut dense_bits,
+            0,
+            0,
+            &mk(crate::record_source::Calls::Dense(gt)),
+            columns,
+        );
+
+        let mut sparse_bits = vec![0u64; 1];
+        pack_row(
+            &mut sparse_bits,
+            0,
+            0,
+            &mk(crate::record_source::Calls::Sparse(carriers)),
+            columns,
+        );
+
+        assert_eq!(sparse_bits, dense_bits);
+    }
+
+    #[test]
+    fn pack_row_sparse_matches_dense_across_word_boundaries() {
+        // columns = 100 puts variant 1's row across words 1/2/3, exercising the
+        // `w = (flat >> 6) - word_base` arithmetic across several word indices.
+        // Both calls below pass `word_base = 0`; a nonzero `word_base` is not
+        // covered here (see the `Calls::Sparse` proptest coverage in
+        // `test_par_packing_matches_seq` for that).
+        let columns = 100usize;
+        let mut gt = vec![0i32; columns];
+        for c in [0usize, 63, 64, 65, 99] {
+            gt[c] = 1;
+        }
+        let mut carriers = crate::record_source::Carriers::new();
+        for (col, &g) in gt.iter().enumerate() {
+            if g != 0 {
+                carriers.push(col as u32, g);
+            }
+        }
+        let mk = |calls: crate::record_source::Calls| PendingAtom {
+            pos: 1,
+            ilen: 0,
+            alt: b"A".to_vec(),
+            source_alt_index: 1,
+            calls: std::sync::Arc::new(calls),
+            seq: 0,
+            info_vals: Vec::new(),
+            format_vals: Arc::new(FormatVals::Dense(Vec::new())),
+        };
+        let words = (columns * 2).div_ceil(64);
+
+        let mut d = vec![0u64; words];
+        pack_row(
+            &mut d,
+            0,
+            1,
+            &mk(crate::record_source::Calls::Dense(gt)),
+            columns,
+        );
+        let mut s = vec![0u64; words];
+        pack_row(
+            &mut s,
+            0,
+            1,
+            &mk(crate::record_source::Calls::Sparse(carriers)),
+            columns,
+        );
+        assert_eq!(s, d);
     }
 
     proptest! {
@@ -715,7 +1017,11 @@ mod tests {
 
         // Parallel packing reproduces sequential packing bit-for-bit, for arbitrary
         // shapes (incl. v not a multiple of the word-aligned block size), allele
-        // indices (incl. missing -1 and out-of-range values), and source alts.
+        // indices (incl. missing -1 and out-of-range values), source alts, and a
+        // mix of `Calls::Dense`/`Calls::Sparse` atoms -- production hits
+        // `Calls::Sparse` at a nonzero `word_base` via this same parallel path
+        // (`pack_presence_par`'s per-block `word_base = c * words_per_block`), so
+        // this generator must exercise that combination too, not just `Dense`.
         #[test]
         fn test_par_packing_matches_seq(
             num_samples in 1usize..40,
@@ -739,7 +1045,11 @@ mod tests {
                         _ => (next() % 4) as i32,
                     })
                     .collect();
-                atoms.push(atom(gt, src));
+                if next() % 2 == 0 {
+                    atoms.push(sparse_atom(&gt, src));
+                } else {
+                    atoms.push(atom(gt, src));
+                }
             }
 
             let mut seq = BitGrid3::zeros(v, num_samples, ploidy);
