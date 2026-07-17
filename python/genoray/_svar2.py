@@ -948,6 +948,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             if chunk_size is None:
                 chunk_size = _auto_chunk_size(len(selected_samples), ploidy)
 
+            flds: list[tuple[str, str, str, str | None, float | None]]
             if not info_fields and not format_fields:
                 # Resolving an empty field manifest still opens and parses the
                 # VCF header. Avoid a redundant second pass over every native
