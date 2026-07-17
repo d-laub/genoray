@@ -1,7 +1,7 @@
 use crate::error::ConversionError;
 use crate::field::{FieldCategory, FieldSpec};
 use crate::normalize::atomize_record;
-use crate::record_source::{Calls, RawRecord, RecordSource};
+use crate::record_source::{Calls, FormatVals, RawRecord, RecordSource};
 use crate::types::{BitGrid3, DenseChunk, StagedColumn};
 use rayon::prelude::*;
 use std::cmp::Reverse;
@@ -18,13 +18,20 @@ struct PendingAtom {
     calls: Arc<Calls>, // shared across the atoms decomposed from one record
     seq: u64,          // stable tiebreak for equal positions
 
-    // Resolved field values for THIS atom (already indexed by source_alt_index
-    // where the underlying VCF field is Number=A). Populated in
-    // `decompose_current_record`, gathered into `DenseChunk::{info,format}_staged`
-    // in `read_next_chunk`'s sequential metadata pass. Empty when no fields of
-    // that category were requested.
-    info_vals: Vec<f64>,   // len == VcfChunkReader::info_fields.len()
-    format_vals: Vec<f64>, // len == VcfChunkReader::format_fields.len() * num_samples, field-major then sample: field*num_samples + sample
+    // INFO is resolved eagerly (already indexed by source_alt_index where the
+    // underlying VCF field is Number=A) since it's already O(1) per atom -- one
+    // scalar per requested spec, not F x N. Populated in `decompose_raw_record`,
+    // gathered into `DenseChunk::info_staged` in `read_next_chunk`'s sequential
+    // metadata pass. Empty when no INFO fields were requested.
+    info_vals: Vec<f64>, // len == VcfChunkReader::info_fields.len()
+
+    // FORMAT, by contrast, is a source-record-level buffer shared across every
+    // atom decomposed from that record (like `calls` above) rather than
+    // resolved per atom: resolving it per atom would materialise F x N per
+    // atom even when the record has one carrier out of N, which is churn site
+    // #2 this type exists to remove. Resolved lazily, per (sample, field), in
+    // `read_next_chunk`'s metadata pass via `resolve_format`.
+    format_vals: Arc<FormatVals>,
 }
 
 struct DecomposedRecord {
@@ -213,15 +220,58 @@ pub(crate) fn resolve_scalar(vals: Option<&[f64]>, source_alt_index: u16, spec: 
     }
 }
 
+// Field `j` (`spec`) for sample `s`, from a record-level `FormatVals` -- the
+// lazy counterpart to the eager per-atom resolution `decompose_raw_record` used
+// to do. `source_alt_index` is THIS ATOM's own index (atoms sharing one source
+// record can each carry a different ALT after `atomize_record` decomposes a
+// multiallelic record), not the record's.
+//
+// **The ALT-index asymmetry between the two arms is deliberate, not a bug:**
+// - `Dense` buffers are still record-raw (Number=A, one entry per source ALT,
+//   0-based) exactly as `decode_format_raw`/`RawRecord::format_vals` produced
+//   them -- so this arm must re-apply `source_alt_index` via `resolve_scalar`,
+//   the same call `decompose_raw_record` made before this change.
+// - `ByCarrier` values are already fully resolved, per carrier, against THAT
+//   FILE's OWN `source_alt_index` at merge time (`vcf_list_reader.rs`'s
+//   `FileCursor::advance`, before the merge heap ever sees them) -- a k-way
+//   merge of single-sample files only ever emits single-ALT `RawRecord`s
+//   (`alts: vec![alt]`), so re-applying an index here would double-resolve
+//   against the WRONG (always-1) index and silently corrupt a non-carrier's
+//   fallback path. `cf.value` already returns `None` for a non-carrier, and
+//   `resolve_scalar(None, 0, spec)` resolves that to the spec default
+//   regardless of the index passed, so `0` there is inert, not a real choice.
+fn resolve_format(
+    fv: &FormatVals,
+    spec: &FieldSpec,
+    source_alt_index: u16,
+    s: usize,
+    j: usize,
+) -> f64 {
+    match fv {
+        FormatVals::ByCarrier(cf) => cf
+            .value(s, j)
+            .unwrap_or_else(|| resolve_scalar(None, 0, spec)),
+        FormatVals::Dense(raw) => {
+            let sample_vals = raw[j].as_ref().map(|v| v[s].as_slice());
+            resolve_scalar(sample_vals, source_alt_index, spec)
+        }
+    }
+}
+
 // An atom whose presence bits are already packed into the chunk's BitGrid. `gt`
-// and `source_alt_index` are dropped at that point, so per-chunk staging memory
-// no longer scales with `chunk_size * num_samples * ploidy`.
+// is dropped at that point, so per-chunk staging memory no longer scales with
+// `chunk_size * num_samples * ploidy`. `source_alt_index` is retained (a `u16`,
+// not a per-sample buffer) because FORMAT resolution is now lazy: the metadata
+// pass in `read_next_chunk` needs it to resolve `format_vals`'s `Dense` arm
+// (see `resolve_format`) the same way `decompose_raw_record` used to, eagerly,
+// per atom.
 struct AtomMeta {
     pos: u32,
     ilen: i32,
     alt: Vec<u8>,
+    source_alt_index: u16,
     info_vals: Vec<f64>,
-    format_vals: Vec<f64>,
+    format_vals: Arc<FormatVals>,
 }
 
 // Atoms buffered before their presence bits are flushed into the chunk's BitGrid.
@@ -270,6 +320,7 @@ fn flush_window(
             pos: a.pos,
             ilen: a.ilen,
             alt: a.alt,
+            source_alt_index: a.source_alt_index,
             info_vals: a.info_vals,
             format_vals: a.format_vals,
         });
@@ -305,11 +356,13 @@ fn decompose_raw_record(
     skip_out_of_scope: bool,
     check_ref: crate::normalize::CheckRef,
     info_fields: &[FieldSpec],
-    format_fields: &[FieldSpec],
-    num_samples: usize,
 ) -> Result<DecomposedRecord, ConversionError> {
     let pos = rec.pos;
     let calls = Arc::new(rec.calls);
+    // Shared, not resolved: every atom decomposed from this record gets a cheap
+    // `Arc::clone` of the SAME buffer, resolved lazily per (sample, field) at
+    // chunk-metadata time (`resolve_format`) rather than widened to F x N here.
+    let format_vals = Arc::new(rec.format_vals);
 
     // Only when a reference is available: fail fast (`CheckRef::Error`) or drop
     // the record (`CheckRef::Exclude`) if its REF disagrees with the reference.
@@ -352,14 +405,6 @@ fn decompose_raw_record(
             .map(|(spec, raw)| resolve_scalar(raw.as_deref(), atom.source_alt_index, spec))
             .collect();
 
-        let mut format_vals = Vec::with_capacity(format_fields.len() * num_samples);
-        for (spec, raw) in format_fields.iter().zip(rec.format_raw.iter()) {
-            for s in 0..num_samples {
-                let sample_vals = raw.as_ref().map(|v| v[s].as_slice());
-                format_vals.push(resolve_scalar(sample_vals, atom.source_alt_index, spec));
-            }
-        }
-
         let seq = record_seq
             .saturating_mul(1u64 << 32)
             .saturating_add(atom_ix as u64);
@@ -371,7 +416,7 @@ fn decompose_raw_record(
             calls: Arc::clone(&calls),
             seq,
             info_vals,
-            format_vals,
+            format_vals: Arc::clone(&format_vals),
         });
     }
 
@@ -505,8 +550,6 @@ impl ChunkAssembler {
                             self.skip_out_of_scope,
                             self.check_ref,
                             &self.info_fields,
-                            &self.format_fields,
-                            self.num_samples,
                         )
                     })
                     .collect::<Result<Vec<_>, _>>()
@@ -523,8 +566,6 @@ impl ChunkAssembler {
                         self.skip_out_of_scope,
                         self.check_ref,
                         &self.info_fields,
-                        &self.format_fields,
-                        self.num_samples,
                     )
                 })
                 .collect::<Result<Vec<_>, _>>()?
@@ -663,9 +704,17 @@ impl ChunkAssembler {
             for (i, col) in info_staged.iter_mut().enumerate() {
                 col.push_f64(a.info_vals[i]);
             }
+            // Only dense-routed variants need every sample's value; resolve per
+            // column here rather than materialising F x N per atom upstream.
             for (j, col) in format_staged.iter_mut().enumerate() {
                 for s in 0..num_samples {
-                    col.push_f64(a.format_vals[j * num_samples + s]);
+                    col.push_f64(resolve_format(
+                        &a.format_vals,
+                        &self.format_fields[j],
+                        a.source_alt_index,
+                        s,
+                        j,
+                    ));
                 }
             }
         }
@@ -686,8 +735,20 @@ impl ChunkAssembler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::field::{HtslibType, StorageDtype};
+    use crate::record_source::CarrierFormat;
     use proptest::prelude::*;
     use std::sync::OnceLock;
+
+    fn format_spec(name: &str) -> FieldSpec {
+        FieldSpec {
+            name: name.to_string(),
+            category: FieldCategory::Format,
+            htype: HtslibType::Float,
+            dtype: StorageDtype::Auto,
+            default: None,
+        }
+    }
 
     // One shared 4-thread pool for all proptest cases (building a pool per case is slow).
     fn test_pool() -> &'static rayon::ThreadPool {
@@ -710,7 +771,7 @@ mod tests {
             calls: std::sync::Arc::new(Calls::Dense(gt)),
             seq: 0,
             info_vals: Vec::new(),
-            format_vals: Vec::new(),
+            format_vals: Arc::new(FormatVals::Dense(Vec::new())),
         }
     }
 
@@ -723,7 +784,98 @@ mod tests {
             calls: std::sync::Arc::new(Calls::Dense(gt)),
             seq: pos as u64,
             info_vals: Vec::new(),
-            format_vals: Vec::new(),
+            format_vals: Arc::new(FormatVals::Dense(Vec::new())),
+        }
+    }
+
+    // Task 7's own correctness trap: `resolve_format`'s two arms must NOT treat
+    // `source_alt_index` the same way. `Dense` buffers are still record-raw
+    // (Number=A, one entry per source ALT, 0-based) exactly as they were before
+    // this change, so this arm must keep re-applying `source_alt_index` via
+    // `resolve_scalar` -- the same call `decompose_raw_record` made eagerly
+    // pre-refactor. `ByCarrier` values are already fully resolved per carrier at
+    // merge time (`vcf_list_reader.rs`'s `FileCursor::advance`, against THAT
+    // FILE's own `source_alt_index`, before the merge heap ever sees them), so
+    // re-applying an index here would double-resolve and is required to be inert.
+    #[test]
+    fn resolve_format_dense_reapplies_alt_index_but_by_carrier_does_not() {
+        let spec = format_spec("DP");
+        // One sample, Number=A buffer with a DIFFERENT value per source ALT:
+        // ALT1 -> 10.0, ALT2 -> 20.0.
+        let dense = FormatVals::Dense(vec![Some(vec![vec![10.0, 20.0]])]);
+        assert_eq!(
+            resolve_format(&dense, &spec, 1, 0, 0),
+            10.0,
+            "an ALT1 atom must read vals[0]"
+        );
+        assert_eq!(
+            resolve_format(&dense, &spec, 2, 0, 0),
+            20.0,
+            "an ALT2 atom must read vals[1], not ALT1's value"
+        );
+
+        let mut cf = CarrierFormat::new(1);
+        cf.push_sample(0, &[7.0]);
+        let by_carrier = FormatVals::ByCarrier(cf);
+        assert_eq!(resolve_format(&by_carrier, &spec, 1, 0, 0), 7.0);
+        assert_eq!(
+            resolve_format(&by_carrier, &spec, 2, 0, 0),
+            7.0,
+            "ByCarrier must not re-apply source_alt_index -- it's already resolved"
+        );
+    }
+
+    // End-to-end regression for the same trap, through the REAL pipeline (not just
+    // the helper in isolation): a genuinely multiallelic Dense-sourced record (the
+    // shape `from_vcf`/`from_pgen`/`from_svar1` produce, as opposed to
+    // `from_vcf_list`'s always-single-ALT merged records) must hand each of its
+    // decomposed atoms ITS OWN `source_alt_index`, paired with the SAME shared
+    // `format_vals` buffer, so `resolve_format` at chunk-metadata time reads back
+    // each atom's own ALT1/ALT2 slot rather than a fixed or leaked index.
+    #[test]
+    fn decompose_raw_record_threads_each_atoms_own_alt_index_to_dense_format() {
+        let format_specs = [format_spec("DP")];
+        let rec = RawRecord {
+            pos: 0,
+            reference: b"A".to_vec(),
+            alts: vec![b"C".to_vec(), b"G".to_vec()],
+            calls: Calls::Dense(vec![1, 2]), // irrelevant to FORMAT resolution
+            info_raw: Vec::new(),
+            format_vals: FormatVals::Dense(vec![Some(vec![vec![10.0, 20.0]])]),
+        };
+        let decomposed = decompose_raw_record(
+            rec,
+            0,
+            &[],
+            false,
+            false,
+            crate::normalize::CheckRef::Error,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            decomposed.atoms.len(),
+            2,
+            "REF A / ALT C,G must atomize to two SNV atoms"
+        );
+        for atom in &decomposed.atoms {
+            let expect = if atom.source_alt_index == 1 {
+                10.0
+            } else {
+                20.0
+            };
+            let got = resolve_format(
+                &atom.format_vals,
+                &format_specs[0],
+                atom.source_alt_index,
+                0,
+                0,
+            );
+            assert_eq!(
+                got, expect,
+                "atom with source_alt_index={} must resolve its OWN ALT slot",
+                atom.source_alt_index
+            );
         }
     }
 
@@ -750,7 +902,7 @@ mod tests {
             calls: std::sync::Arc::new(crate::record_source::Calls::Dense(gt)),
             seq: 0,
             info_vals: Vec::new(),
-            format_vals: Vec::new(),
+            format_vals: Arc::new(FormatVals::Dense(Vec::new())),
         };
 
         let mut got = vec![0u64; 1];
@@ -781,7 +933,7 @@ mod tests {
             calls: std::sync::Arc::new(calls),
             seq: 0,
             info_vals: Vec::new(),
-            format_vals: Vec::new(),
+            format_vals: Arc::new(FormatVals::Dense(Vec::new())),
         };
 
         let mut dense_bits = vec![0u64; 1];
@@ -827,7 +979,7 @@ mod tests {
             calls: std::sync::Arc::new(calls),
             seq: 0,
             info_vals: Vec::new(),
-            format_vals: Vec::new(),
+            format_vals: Arc::new(FormatVals::Dense(Vec::new())),
         };
         let words = (columns * 2).div_ceil(64);
 

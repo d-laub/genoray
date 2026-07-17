@@ -324,7 +324,7 @@ impl RecordSource for Svar1RecordSource {
                 alts: vec![alt],
                 calls: crate::record_source::Calls::Dense(gt),
                 info_raw: Vec::new(), // SVAR1 has no INFO fields
-                format_raw,
+                format_vals: crate::record_source::FormatVals::Dense(format_raw),
             }));
         }
     }
@@ -333,6 +333,7 @@ impl RecordSource for Svar1RecordSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::record_source::FormatVals;
 
     // 2 samples × ploidy 2 = 4 haplotypes. Global variant ids 0..5.
     // Contig under test starts at global id 2, has 3 local variants (ids 2,3,4).
@@ -413,8 +414,11 @@ mod tests {
             r0.calls,
             crate::record_source::Calls::Dense(vec![1, 0, 1, 0])
         ); // hap0 & hap2 carry ALT1
-        // format_raw[0] = Some(per-sample). S0 carried on hap0 -> 0.5; S1 on hap2 -> 2.5
-        let ds0 = r0.format_raw[0].as_ref().unwrap();
+        // format_vals[0] = Some(per-sample). S0 carried on hap0 -> 0.5; S1 on hap2 -> 2.5
+        let FormatVals::Dense(fv0) = &r0.format_vals else {
+            panic!("SVAR1 source must produce Dense FormatVals")
+        };
+        let ds0 = fv0[0].as_ref().unwrap();
         assert_eq!(ds0[0], vec![0.5]);
         assert_eq!(ds0[1], vec![2.5]);
 
@@ -423,7 +427,10 @@ mod tests {
             r1.calls,
             crate::record_source::Calls::Dense(vec![0, 0, 0, 1])
         ); // only S1 hap1
-        let ds1 = r1.format_raw[0].as_ref().unwrap();
+        let FormatVals::Dense(fv1) = &r1.format_vals else {
+            panic!("SVAR1 source must produce Dense FormatVals")
+        };
+        let ds1 = fv1[0].as_ref().unwrap();
         assert!(ds1[0][0].is_nan()); // S0 non-carrier -> missing sentinel (NaN)
         assert_eq!(ds1[1], vec![1.5]); // S1 carrier
 

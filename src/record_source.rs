@@ -24,12 +24,10 @@ pub struct RawRecord {
     /// in spec order. `None` = the field is absent from this record. Empty when no
     /// INFO fields were requested.
     pub info_raw: Vec<Option<Vec<f64>>>,
-    /// Raw FORMAT buffers, widened to f64: outer index = requested FORMAT
-    /// `FieldSpec` in spec order, inner index = **selected** sample
-    /// (`0..num_samples`, already remapped from the source's own sample order).
-    /// Outer `None` = the field is absent from this record for all samples. Empty
-    /// when no FORMAT fields were requested.
-    pub format_raw: Vec<Option<Vec<Vec<f64>>>>,
+    /// Raw FORMAT buffers. `Dense` for sources whose records physically carry
+    /// every sample (a multi-sample VCF, PGEN); `ByCarrier` for a k-way merge of
+    /// single-sample files, where only the carrying samples have anything to say.
+    pub format_vals: FormatVals,
 }
 
 /// A cursor over one contig's variant records, in file order.
@@ -158,6 +156,95 @@ impl Calls {
             Calls::Dense(gt) => Some(gt.len()),
             Calls::Sparse(_) => None,
         }
+    }
+}
+
+/// FORMAT values for the samples that actually called a record.
+///
+/// `vals[i * n_fields + j]` is field `j` for the sample at `samples[i]`. A sample
+/// absent from `samples` resolves to the field's default downstream -- the same
+/// contract an empty per-sample buffer has today.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CarrierFormat {
+    /// Selected-sample index per carrier, strictly ascending.
+    samples: Vec<u32>,
+    /// Row-major `[carrier][field]`.
+    vals: Vec<f64>,
+    n_fields: usize,
+}
+
+impl CarrierFormat {
+    pub fn new(n_fields: usize) -> Self {
+        Self {
+            samples: Vec::new(),
+            vals: Vec::new(),
+            n_fields,
+        }
+    }
+
+    /// `vals` must have exactly `n_fields` entries, in FORMAT `FieldSpec` order.
+    /// `sample` must be strictly greater than the previous push (callers walk
+    /// samples in ascending order).
+    pub fn push_sample(&mut self, sample: u32, vals: &[f64]) {
+        debug_assert_eq!(vals.len(), self.n_fields);
+        debug_assert!(
+            self.samples.last().is_none_or(|&p| p < sample),
+            "carrier samples must be pushed strictly ascending"
+        );
+        self.samples.push(sample);
+        self.vals.extend_from_slice(vals);
+    }
+
+    /// Field `field` for `sample`, or `None` if that sample called nothing here.
+    pub fn value(&self, sample: usize, field: usize) -> Option<f64> {
+        if self.n_fields == 0 || field >= self.n_fields {
+            return None;
+        }
+        let i = self.samples.binary_search(&(sample as u32)).ok()?;
+        Some(self.vals[i * self.n_fields + field])
+    }
+
+    pub fn clear(&mut self) {
+        self.samples.clear();
+        self.vals.clear();
+    }
+}
+
+/// Raw FORMAT buffers for one record.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FormatVals {
+    /// Outer index = requested FORMAT `FieldSpec` in spec order, inner index =
+    /// selected sample. Outer `None` = field absent from this record for all
+    /// samples. Natural for sources whose records carry every sample.
+    Dense(Vec<Option<Vec<Vec<f64>>>>),
+    /// Only the calling samples. Natural for a k-way merge of single-sample files.
+    ByCarrier(CarrierFormat),
+}
+
+#[cfg(test)]
+mod format_vals_tests {
+    use super::*;
+
+    // FORMAT is per *sample* (not per haplotype column). A non-carrier must resolve to
+    // the field default -- the same contract `resolve_scalar` gives an empty buffer
+    // today -- so Dense and ByCarrier stay interchangeable.
+    #[test]
+    fn by_carrier_returns_none_for_non_carriers() {
+        let mut cf = CarrierFormat::new(2); // 2 FORMAT fields
+        cf.push_sample(1, &[0.5, 30.0]);
+        cf.push_sample(3, &[0.25, 12.0]);
+
+        assert_eq!(cf.value(1, 0), Some(0.5));
+        assert_eq!(cf.value(1, 1), Some(30.0));
+        assert_eq!(cf.value(3, 0), Some(0.25));
+        assert_eq!(cf.value(0, 0), None, "sample 0 carries nothing");
+        assert_eq!(cf.value(2, 1), None, "sample 2 carries nothing");
+    }
+
+    #[test]
+    fn by_carrier_is_empty_when_no_fields_requested() {
+        let cf = CarrierFormat::new(0);
+        assert_eq!(cf.value(0, 0), None);
     }
 }
 

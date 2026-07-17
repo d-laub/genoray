@@ -229,7 +229,7 @@ impl RecordSource for PgenRecordSource {
                 calls: crate::record_source::Calls::Dense(gt),
                 // PGEN has no FORMAT, and .pvar INFO extraction is out of scope for v1.
                 info_raw: Vec::new(),
-                format_raw: Vec::new(),
+                format_vals: crate::record_source::FormatVals::Dense(Vec::new()),
             }));
         }
     }

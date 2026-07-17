@@ -17,7 +17,7 @@ use crate::chunk_assembler::resolve_scalar;
 use crate::error::ConversionError;
 use crate::field::{FieldCategory, FieldSpec};
 use crate::normalize::{L_MAX, atomize_to_vcf_biallelic};
-use crate::record_source::{Calls, Carriers, RawRecord, RecordSource};
+use crate::record_source::{Calls, CarrierFormat, Carriers, FormatVals, RawRecord, RecordSource};
 use crate::vcf_reader::VcfRecordSource;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, VecDeque};
@@ -174,7 +174,7 @@ impl FileCursor {
                         }
 
                         // Resolve this atom's field values against THIS file's raw
-                        // record buffer now, while `rec.info_raw`/`rec.format_raw`
+                        // record buffer now, while `rec.info_raw`/`rec.format_vals`
                         // (and `br.source_alt_index`) are still in scope — the merge
                         // heap only ever sees the pre-resolved scalars from here on.
                         let info_vals: Vec<f64> = info_specs
@@ -184,10 +184,17 @@ impl FileCursor {
                                 resolve_scalar(raw.as_deref(), br.source_alt_index, spec)
                             })
                             .collect();
+                        // `rec` comes from a per-file `VcfRecordSource`, which always
+                        // produces `Dense` (one single-sample VCF's own record is the
+                        // dense representation for that one sample -- there is no
+                        // narrower carrier list to build here).
+                        let FormatVals::Dense(format_raw) = &rec.format_vals else {
+                            unreachable!("VcfRecordSource always produces Dense FormatVals")
+                        };
                         // Single sample per file ⇒ always inner index 0.
                         let format_vals: Vec<f64> = format_specs
                             .iter()
-                            .zip(rec.format_raw.iter())
+                            .zip(format_raw.iter())
                             .map(|(spec, raw)| {
                                 let sample_vals = raw.as_ref().map(|v| v[0].as_slice());
                                 resolve_scalar(sample_vals, br.source_alt_index, spec)
@@ -275,7 +282,6 @@ pub struct VcfListRecordSource {
     ploidy: usize,
     skip_out_of_scope: bool,
     check_ref: crate::normalize::CheckRef,
-    num_samples: usize,
     info_specs: Vec<FieldSpec>,
     format_specs: Vec<FieldSpec>,
 }
@@ -381,7 +387,6 @@ impl VcfListRecordSource {
             ploidy,
             skip_out_of_scope,
             check_ref,
-            num_samples: vcf_paths.len(),
             info_specs,
             format_specs,
         })
@@ -505,6 +510,17 @@ impl VcfListRecordSource {
         // `group` order, since later cols can't sort back before it) --
         // same last-write-wins result as the `BTreeMap`, with no allocation
         // beyond `Carriers`'s own buffers.
+        // FORMAT: per-sample, built in the SAME collapse pass as `carriers` below.
+        // A file's presence in `group` at all (regardless of its `ploid_codes`)
+        // is what makes it a FORMAT member here -- matching the pre-existing
+        // dense semantics, which set `per_sample[*col]` for every `(col, atom)`
+        // in `group` unconditionally. `CarrierFormat::push_sample` requires
+        // strictly ascending, UNIQUE sample indices, same as `Carriers::push`
+        // requires for columns -- so it needs the identical duplicate-`col`
+        // collapse (last-write-wins) as the carrier loop just below, not a
+        // second, independent walk of `group`.
+        let mut cf = CarrierFormat::new(self.format_specs.len());
+
         let mut carriers = Carriers::new();
         let mut i = 0;
         while i < group.len() {
@@ -515,7 +531,11 @@ impl VcfListRecordSource {
             }
             // `group[j]` is the run's last atom == the last-write-wins winner
             // for this `col`.
-            let ploid_codes = &group[j].1.ploid_codes;
+            let winner = &group[j].1;
+            if !self.format_specs.is_empty() {
+                cf.push_sample(col as u32, &winner.format_vals);
+            }
+            let ploid_codes = &winner.ploid_codes;
             let base = (col * self.ploidy) as u32;
             for (p, &code) in ploid_codes.iter().enumerate() {
                 // `ploid_codes`: -1 missing, 1 carries this atom's source ALT, 0 other
@@ -544,27 +564,13 @@ impl VcfListRecordSource {
             .map(|i| Some(vec![group[0].1.info_vals[i]]))
             .collect();
 
-        // FORMAT: per-sample. Each carrier column supplies its own file's
-        // value; a non-carrier column is left an empty buffer, which
-        // `resolve_scalar` downstream (in `ChunkAssembler`) resolves to the
-        // field's default — same contract as a record-absent field.
-        let format_raw: Vec<Option<Vec<Vec<f64>>>> = (0..self.format_specs.len())
-            .map(|j| {
-                let mut per_sample: Vec<Vec<f64>> = vec![Vec::new(); self.num_samples];
-                for (col, atom) in &group {
-                    per_sample[*col] = vec![atom.format_vals[j]];
-                }
-                Some(per_sample)
-            })
-            .collect();
-
         Ok(RawRecord {
             pos: key.0,
             reference,
             alts: vec![alt],
             calls: Calls::Sparse(carriers),
             info_raw,
-            format_raw,
+            format_vals: FormatVals::ByCarrier(cf),
         })
     }
 }
@@ -1472,16 +1478,16 @@ mod tests {
         // Two files: a shared SNP@pos2 that BOTH carry (proves INFO
         // first-carrier-wins across two DIFFERENT AF values, and FORMAT
         // per-sample carrying each file's own DP), plus a second SNP@pos20
-        // that ONLY file A carries (proves the non-carrier column's
-        // `format_raw` entry is the empty `vec![]` the design contract
-        // promises -- NOT file A's carrier value leaking across columns,
-        // and NOT some other placeholder).
+        // that ONLY file A carries (proves the non-carrier sample's
+        // `CarrierFormat::value` is `None`, the design contract promises --
+        // NOT file A's carrier value leaking across samples, and NOT some
+        // other placeholder).
         //
         // This is deliberately tested at the `RawRecord` layer rather than
         // through `SparseVar2.decode()`: `decode()`'s Ragged output only
         // ever emits ALT-carrying (sample, ploid) cells (see
         // `test_from_vcf_list_missing_hap_is_unobservable_in_decode` for the
-        // analogous genotype-side limitation), so a non-carrier column's
+        // analogous genotype-side limitation), so a non-carrier sample's
         // resolved value never surfaces through it -- the `RawRecord` this
         // merge produces is the only place the empty-vs-populated buffer
         // contract is directly observable.
@@ -1557,24 +1563,29 @@ mod tests {
             vec![Some(vec![0.1_f32 as f64])],
             "INFO AF must be SA's (first-carrier/col0) value 0.1, not SB's 0.9"
         );
+        let FormatVals::ByCarrier(cf1) = &r1.format_vals else {
+            panic!("the k-way merge must produce ByCarrier FormatVals")
+        };
         assert_eq!(
-            r1.format_raw,
-            vec![Some(vec![vec![10.0], vec![20.0]])],
+            (cf1.value(0, 0), cf1.value(1, 0)),
+            (Some(10.0), Some(20.0)),
             "FORMAT DP must be per-sample: SA's own 10, SB's own 20"
         );
 
         // pos20: only SA carries it -- SB's column is a non-member (not just
-        // a genotype non-carrier), so its FORMAT buffer must be the empty
-        // `vec![]` the design contract calls for (-> downstream default),
-        // not SA's 77 leaking across columns.
+        // a genotype non-carrier), so `CarrierFormat::value` must be `None`
+        // (-> downstream default), not SA's 77 leaking across columns.
         let r2 = src.next_record().unwrap().unwrap();
         assert_eq!(r2.pos, 20);
         assert_eq!(r2.info_raw, vec![Some(vec![0.4_f32 as f64])]);
+        let FormatVals::ByCarrier(cf2) = &r2.format_vals else {
+            panic!("the k-way merge must produce ByCarrier FormatVals")
+        };
         assert_eq!(
-            r2.format_raw,
-            vec![Some(vec![vec![77.0], vec![]])],
-            "SB is not a member at pos20 -- its FORMAT DP buffer must be \
-             empty, not SA's carrier value"
+            (cf2.value(0, 0), cf2.value(1, 0)),
+            (Some(77.0), None),
+            "SB is not a member at pos20 -- its FORMAT DP value must be \
+             None, not SA's carrier value"
         );
 
         assert!(src.next_record().unwrap().is_none());
