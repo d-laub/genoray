@@ -161,6 +161,81 @@ impl Svar1Reader {
     }
 }
 
+/// Absolute CSR index pairs for a cartesian `(range, sample, ploid)` query.
+///
+/// `starts`/`stops` are each `n_ranges * n_samples * ploidy` long in C-order
+/// `(range, sample, ploid)` — i.e. exactly Python `_find_starts_ends`'s `(2, r, s, p)`
+/// output with the leading axis split into two vectors. Indices are absolute into
+/// [`Svar1Reader::variant_idxs`].
+pub struct Svar1RangesBundle {
+    pub n_ranges: usize,
+    pub n_samples: usize,
+    pub ploidy: usize,
+    /// Original sample indices, in output order (identity when `samples` was `None`).
+    pub sample_cols: Vec<usize>,
+    pub starts: Vec<i64>,
+    pub stops: Vec<i64>,
+}
+
+/// Variant-id ranges -> absolute CSR index pairs. The Rust port of
+/// `_find_starts_ends` (`python/genoray/_svar/_kernels.py`).
+///
+/// Each hap's CSR run holds **sorted** global variant ids, so a `[v_lo, v_hi)` id
+/// range maps to a sub-slice by two `partition_point`s. `samples`, if given, selects
+/// (and reorders) a sample subset by original index; `None` means all samples in
+/// store order.
+///
+/// Empty results are **in-bounds zero-length** (`start == stop`), never a sentinel —
+/// see [`var_ranges`].
+///
+/// Single-threaded by design, matching the SVAR2 query core (`query/gather.rs`); the
+/// consumer owns parallelism.
+pub fn find_ranges(
+    reader: &Svar1Reader,
+    ranges: &[Range<u32>],
+    samples: Option<&[usize]>,
+) -> Svar1RangesBundle {
+    let ploidy = reader.ploidy();
+    let sample_cols: Vec<usize> = match samples {
+        Some(s) => s.to_vec(),
+        None => (0..reader.n_samples()).collect(),
+    };
+
+    let vi = reader.variant_idxs();
+    let offs = reader.offsets();
+    let n_ranges = ranges.len();
+    let n_samples = sample_cols.len();
+    let n = n_ranges * n_samples * ploidy;
+
+    let mut starts = Vec::with_capacity(n);
+    let mut stops = Vec::with_capacity(n);
+
+    for r in ranges {
+        let (lo, hi) = (r.start as i32, r.end as i32);
+        for &s in &sample_cols {
+            for p in 0..ploidy {
+                let h = s * ploidy + p; // sample-major, ploidy-minor
+                let o_s = offs[h];
+                let o_e = offs[h + 1];
+                let hap = &vi[o_s as usize..o_e as usize];
+                // + o_s makes the index absolute into the flat buffer (Python does
+                // the same: `np.searchsorted(sp_genos, var_ranges).T + o_s`).
+                starts.push(hap.partition_point(|&g| g < lo) as i64 + o_s);
+                stops.push(hap.partition_point(|&g| g < hi) as i64 + o_s);
+            }
+        }
+    }
+
+    Svar1RangesBundle {
+        n_ranges,
+        n_samples,
+        ploidy,
+        sample_cols,
+        starts,
+        stops,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,5 +345,77 @@ mod tests {
         write_raw::<i64>(tmp.path(), "offsets.npy", &[0, 0, 0, 0, 0]);
         let r = Svar1Reader::open(tmp.path().to_str().unwrap(), 2, 2).unwrap();
         assert_eq!(r.variant_idxs(), &[] as &[i32]);
+    }
+
+    #[test]
+    // A one-element `&[2..5]` is intentional: it's a single-range query, not a
+    // "did you mean the range itself" typo.
+    #[allow(clippy::single_range_in_vec_init)]
+    fn find_ranges_binary_searches_each_hap_csr() {
+        // hap0: [0, 2, 4] @ entries 0..3   hap1: [3] @ entry 3
+        // hap2: [2] @ entry 4              hap3: []  @ entry 5..5
+        let tmp = tempfile::tempdir().unwrap();
+        write_store(tmp.path());
+        let r = Svar1Reader::open(tmp.path().to_str().unwrap(), 2, 2).unwrap();
+
+        // id range [2, 5): hap0 -> entries 1..3 ([2,4]); hap1 -> 3..4 ([3]);
+        //                  hap2 -> 4..5 ([2]);          hap3 -> 5..5 (empty)
+        let b = find_ranges(&r, &[2..5], None);
+        assert_eq!(b.n_ranges, 1);
+        assert_eq!(b.n_samples, 2);
+        assert_eq!(b.ploidy, 2);
+        assert_eq!(b.sample_cols, vec![0, 1]);
+        // C-order (range, sample, ploid) -> hap0, hap1, hap2, hap3
+        assert_eq!(b.starts, vec![1, 3, 4, 5]);
+        assert_eq!(b.stops, vec![3, 4, 5, 5]);
+    }
+
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)]
+    fn find_ranges_empty_id_range_is_in_bounds_zero_length() {
+        // A zero-length input range must produce start == stop, in bounds --
+        // never a sentinel (poison for seqpro Ragged.to_packed's int64 math).
+        let tmp = tempfile::tempdir().unwrap();
+        write_store(tmp.path());
+        let r = Svar1Reader::open(tmp.path().to_str().unwrap(), 2, 2).unwrap();
+        let b = find_ranges(&r, &[7..7], None);
+        for (s, e) in b.starts.iter().zip(&b.stops) {
+            assert_eq!(s, e, "empty range must be zero-length");
+            assert!(
+                *s >= 0 && *s <= 5,
+                "offset {s} must be in bounds of variant_idxs"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)]
+    fn find_ranges_sample_subset_selects_and_reorders() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_store(tmp.path());
+        let r = Svar1Reader::open(tmp.path().to_str().unwrap(), 2, 2).unwrap();
+        // sample 1 only -> haps 2, 3
+        let b = find_ranges(&r, &[2..5], Some(&[1]));
+        assert_eq!(b.n_samples, 1);
+        assert_eq!(b.sample_cols, vec![1]);
+        assert_eq!(b.starts, vec![4, 5]);
+        assert_eq!(b.stops, vec![5, 5]);
+
+        // reordered subset -> hap order follows sample_cols, not store order
+        let b = find_ranges(&r, &[2..5], Some(&[1, 0]));
+        assert_eq!(b.starts, vec![4, 5, 1, 3]);
+    }
+
+    #[test]
+    fn find_ranges_multiple_ranges_are_c_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_store(tmp.path());
+        let r = Svar1Reader::open(tmp.path().to_str().unwrap(), 2, 2).unwrap();
+        let b = find_ranges(&r, &[0..1, 2..5], None);
+        assert_eq!(b.n_ranges, 2);
+        // range 0 ([0,1)): hap0 -> 0..1, others empty
+        // range 1 ([2,5)): as above
+        assert_eq!(b.starts, vec![0, 3, 4, 5, /* range 1 */ 1, 3, 4, 5]);
+        assert_eq!(b.stops, vec![1, 3, 4, 5, /* range 1 */ 3, 4, 5, 5]);
     }
 }
