@@ -226,7 +226,7 @@ impl RecordSource for PgenRecordSource {
                 pos: meta.pos,
                 reference: meta.reference,
                 alts: meta.alts,
-                gt,
+                calls: crate::record_source::Calls::Dense(gt),
                 // PGEN has no FORMAT, and .pvar INFO extraction is out of scope for v1.
                 info_raw: Vec::new(),
                 format_raw: Vec::new(),

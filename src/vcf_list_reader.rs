@@ -163,7 +163,7 @@ impl FileCursor {
                         let k = br.source_alt_index as i32;
                         let mut ploid_codes = vec![0i32; ploidy];
                         for (p, code) in ploid_codes.iter_mut().enumerate() {
-                            let g = rec.gt[p];
+                            let g = rec.calls.allele_at(p);
                             *code = if g == -1 {
                                 -1
                             } else if g == k {
@@ -495,7 +495,7 @@ impl VcfListRecordSource {
             pos: key.0,
             reference,
             alts: vec![alt],
-            gt,
+            calls: crate::record_source::Calls::Dense(gt),
             info_raw,
             format_raw,
         })
@@ -755,11 +755,17 @@ mod tests {
         let r1 = src.next_record().unwrap().unwrap();
         assert_eq!(r1.pos, 2);
         assert_eq!(r1.alts, vec![b"G".to_vec()]);
-        assert_eq!(r1.gt, vec![1, 0, /* SB */ 0, 0]);
+        assert_eq!(
+            r1.calls,
+            crate::record_source::Calls::Dense(vec![1, 0, /* SB */ 0, 0])
+        );
 
         let r2 = src.next_record().unwrap().unwrap();
         assert_eq!(r2.pos, 6);
-        assert_eq!(r2.gt, vec![/* SA */ 0, 0, /* SB */ 0, 1]);
+        assert_eq!(
+            r2.calls,
+            crate::record_source::Calls::Dense(vec![/* SA */ 0, 0, /* SB */ 0, 1])
+        );
 
         assert!(src.next_record().unwrap().is_none());
         assert_eq!(src.dropped_out_of_scope(), 0);
@@ -819,7 +825,10 @@ mod tests {
         let r1 = src.next_record().unwrap().unwrap();
         assert_eq!(r1.pos, 2);
         assert_eq!(r1.alts, vec![b"G".to_vec()]);
-        assert_eq!(r1.gt, vec![1, 0, 0, 1]);
+        assert_eq!(
+            r1.calls,
+            crate::record_source::Calls::Dense(vec![1, 0, 0, 1])
+        );
         assert!(src.next_record().unwrap().is_none());
     }
 
@@ -862,12 +871,12 @@ mod tests {
         let r1 = src.next_record().unwrap().unwrap();
         assert_eq!(r1.pos, 2);
         assert_eq!(r1.alts, vec![b"G".to_vec()]);
-        assert_eq!(r1.gt, vec![1, 0]);
+        assert_eq!(r1.calls, crate::record_source::Calls::Dense(vec![1, 0]));
 
         let r2 = src.next_record().unwrap().unwrap();
         assert_eq!(r2.pos, 2);
         assert_eq!(r2.alts, vec![b"T".to_vec()]);
-        assert_eq!(r2.gt, vec![0, 1]);
+        assert_eq!(r2.calls, crate::record_source::Calls::Dense(vec![0, 1]));
 
         assert!(src.next_record().unwrap().is_none());
     }
@@ -910,7 +919,7 @@ mod tests {
 
         let r1 = src.next_record().unwrap().unwrap();
         assert_eq!(r1.pos, 2);
-        assert_eq!(r1.gt, vec![-1, 1]);
+        assert_eq!(r1.calls, crate::record_source::Calls::Dense(vec![-1, 1]));
         assert!(src.next_record().unwrap().is_none());
     }
 
@@ -976,7 +985,10 @@ mod tests {
 
         let r1 = src.next_record().unwrap().unwrap();
         assert_eq!(r1.pos, 2);
-        assert_eq!(r1.gt, vec![1, 0, /* SB, filled hom-ref */ 0, 0]);
+        assert_eq!(
+            r1.calls,
+            crate::record_source::Calls::Dense(vec![1, 0, /* SB, filled hom-ref */ 0, 0])
+        );
         assert!(src.next_record().unwrap().is_none());
     }
 
@@ -1091,7 +1103,12 @@ mod tests {
         let r1 = src.next_record().unwrap().unwrap();
         assert_eq!(r1.pos, 10);
         assert_eq!(r1.alts, vec![b"G".to_vec()]);
-        assert_eq!(r1.gt, vec![/* SA */ 1, 0, /* SB */ 0, 0, /* SC */ 1, 1]);
+        assert_eq!(
+            r1.calls,
+            crate::record_source::Calls::Dense(vec![
+                /* SA */ 1, 0, /* SB */ 0, 0, /* SC */ 1, 1
+            ])
+        );
 
         // Discriminator: this record can only have been released through the
         // FRONTIER gate, not the `all_eof` drain — SA and SB are still live
@@ -1117,7 +1134,12 @@ mod tests {
         let r2 = src.next_record().unwrap().unwrap();
         assert_eq!(r2.pos, 1500);
         assert_eq!(r2.alts, vec![b"G".to_vec()]);
-        assert_eq!(r2.gt, vec![/* SA */ 1, 0, /* SB */ 0, 1, /* SC */ 0, 0]);
+        assert_eq!(
+            r2.calls,
+            crate::record_source::Calls::Dense(vec![
+                /* SA */ 1, 0, /* SB */ 0, 1, /* SC */ 0, 0
+            ])
+        );
 
         // Records 3 & 4: pos 4000 stays as TWO separate records — SB's DEL
         // (ilen -1) sorts before SA's SNP (ilen 0) under the `(pos, ilen,
@@ -1127,13 +1149,23 @@ mod tests {
         assert_eq!(r3.pos, 4000);
         assert_eq!(r3.reference, b"AT".to_vec());
         assert_eq!(r3.alts, vec![b"A".to_vec()]);
-        assert_eq!(r3.gt, vec![/* SA */ 0, 0, /* SB */ 0, 1, /* SC */ 0, 0]);
+        assert_eq!(
+            r3.calls,
+            crate::record_source::Calls::Dense(vec![
+                /* SA */ 0, 0, /* SB */ 0, 1, /* SC */ 0, 0
+            ])
+        );
 
         let r4 = src.next_record().unwrap().unwrap();
         assert_eq!(r4.pos, 4000);
         assert_eq!(r4.reference, b"A".to_vec());
         assert_eq!(r4.alts, vec![b"G".to_vec()]);
-        assert_eq!(r4.gt, vec![/* SA */ 1, 0, /* SB */ 0, 0, /* SC */ 0, 0]);
+        assert_eq!(
+            r4.calls,
+            crate::record_source::Calls::Dense(vec![
+                /* SA */ 1, 0, /* SB */ 0, 0, /* SC */ 0, 0
+            ])
+        );
 
         // SC's early EOF didn't strand or truncate anything downstream.
         assert!(src.next_record().unwrap().is_none());
@@ -1485,7 +1517,10 @@ mod tests {
 
         let r1 = src.next_record().unwrap().unwrap();
         assert_eq!(r1.pos, 2);
-        assert_eq!(r1.gt, vec![1, 0, /* SB, hom-ref filled */ 0, 0]);
+        assert_eq!(
+            r1.calls,
+            crate::record_source::Calls::Dense(vec![1, 0, /* SB, hom-ref filled */ 0, 0])
+        );
         assert!(src.next_record().unwrap().is_none());
         assert_eq!(src.dropped_out_of_scope(), 0);
     }

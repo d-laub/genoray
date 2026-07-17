@@ -501,7 +501,7 @@ impl VcfRecordSource {
             pos,
             reference,
             alts,
-            gt,
+            calls: crate::record_source::Calls::Dense(gt),
             info_raw,
             format_raw,
         }))

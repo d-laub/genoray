@@ -16,9 +16,10 @@ pub struct RawRecord {
     /// ALT alleles in file order. ALT1 is `alts[0]`; note `PendingAtom::
     /// source_alt_index` is 1-based (ALT1 => 1), matching BCF GT allele codes.
     pub alts: Vec<Vec<u8>>,
-    /// Allele index per haplotype column, length `num_samples * ploidy`,
-    /// sample-major then ploidy-minor. `0` = REF, `k` = ALT k, `-1` = missing.
-    pub gt: Vec<i32>,
+    /// Per-haplotype allele calls. `Calls::Dense` carries one entry per column;
+    /// `Calls::Sparse` carries only the non-REF columns, which is what a k-way merge
+    /// of single-sample files naturally produces.
+    pub calls: Calls,
     /// Raw INFO buffers, widened to f64, one entry per requested INFO `FieldSpec`
     /// in spec order. `None` = the field is absent from this record. Empty when no
     /// INFO fields were requested.

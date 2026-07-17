@@ -1,7 +1,7 @@
 use crate::error::ConversionError;
 use crate::field::{FieldCategory, FieldSpec};
 use crate::normalize::atomize_record;
-use crate::record_source::{RawRecord, RecordSource};
+use crate::record_source::{Calls, RawRecord, RecordSource};
 use crate::types::{BitGrid3, DenseChunk, StagedColumn};
 use rayon::prelude::*;
 use std::cmp::Reverse;
@@ -15,7 +15,7 @@ struct PendingAtom {
     ilen: i32,
     alt: Vec<u8>,
     source_alt_index: u16,
-    gt: Arc<Vec<i32>>, // len = num_samples * ploidy; allele index per column (-1 = missing)
+    calls: Arc<Calls>, // shared across the atoms decomposed from one record
     seq: u64,          // stable tiebreak for equal positions
 
     // Resolved field values for THIS atom (already indexed by source_alt_index
@@ -65,24 +65,41 @@ impl Ord for PendingAtom {
 #[inline]
 fn pack_row(words: &mut [u64], word_base: usize, vi: usize, a: &PendingAtom, columns: usize) {
     let src = a.source_alt_index as i32;
-    let gtc: &[i32] = &a.gt;
     let base = vi * columns;
-    let mut col = 0usize;
-    while col < columns {
-        let flat = base + col;
-        let w = (flat >> 6) - word_base;
-        let b = flat & 63;
-        let n = (64 - b).min(columns - col);
-        let mut acc = 0u64;
-        for k in 0..n {
-            // SAFETY: col + k < columns == gtc.len().
-            acc |= ((unsafe { *gtc.get_unchecked(col + k) } == src) as u64) << (b + k);
+    match a.calls.as_ref() {
+        Calls::Dense(gtc) => {
+            let mut col = 0usize;
+            while col < columns {
+                let flat = base + col;
+                let w = (flat >> 6) - word_base;
+                let b = flat & 63;
+                let n = (64 - b).min(columns - col);
+                let mut acc = 0u64;
+                for k in 0..n {
+                    // SAFETY: col + k < columns == gtc.len().
+                    acc |= ((unsafe { *gtc.get_unchecked(col + k) } == src) as u64) << (b + k);
+                }
+                // SAFETY: w indexes a word within this row's target slice.
+                unsafe {
+                    *words.get_unchecked_mut(w) |= acc;
+                }
+                col += n;
+            }
         }
-        // SAFETY: w indexes a word within this row's target slice.
-        unsafe {
-            *words.get_unchecked_mut(w) |= acc;
+        Calls::Sparse(_) => {
+            // Only the carriers can match `src`; every other column is REF and packs 0.
+            // This is the O(carriers) path that replaces the O(columns) scan.
+            for (col, allele) in a.calls.iter_non_ref() {
+                if allele == src {
+                    let flat = base + col as usize;
+                    let w = (flat >> 6) - word_base;
+                    // SAFETY: col < columns by construction (see VcfListRecordSource).
+                    unsafe {
+                        *words.get_unchecked_mut(w) |= 1u64 << (flat & 63);
+                    }
+                }
+            }
         }
-        col += n;
     }
 }
 
@@ -292,7 +309,7 @@ fn decompose_raw_record(
     num_samples: usize,
 ) -> Result<DecomposedRecord, ConversionError> {
     let pos = rec.pos;
-    let gt = Arc::new(rec.gt);
+    let calls = Arc::new(rec.calls);
 
     // Only when a reference is available: fail fast (`CheckRef::Error`) or drop
     // the record (`CheckRef::Exclude`) if its REF disagrees with the reference.
@@ -351,7 +368,7 @@ fn decompose_raw_record(
             ilen: atom.ilen,
             alt: atom.alt,
             source_alt_index: atom.source_alt_index,
-            gt: Arc::clone(&gt),
+            calls: Arc::clone(&calls),
             seq,
             info_vals,
             format_vals,
@@ -690,7 +707,7 @@ mod tests {
             ilen: 0,
             alt: Vec::new(),
             source_alt_index: src,
-            gt: std::sync::Arc::new(gt),
+            calls: std::sync::Arc::new(Calls::Dense(gt)),
             seq: 0,
             info_vals: Vec::new(),
             format_vals: Vec::new(),
@@ -703,11 +720,42 @@ mod tests {
             ilen: 0,
             alt: Vec::new(),
             source_alt_index: src,
-            gt: std::sync::Arc::new(gt),
+            calls: std::sync::Arc::new(Calls::Dense(gt)),
             seq: pos as u64,
             info_vals: Vec::new(),
             format_vals: Vec::new(),
         }
+    }
+
+    #[test]
+    fn pack_row_dense_calls_matches_the_raw_gt_loop() {
+        // Guards the Task 4 migration: packing from Calls::Dense must reproduce, bit for
+        // bit, what the old `&a.gt` loop produced. Any drift here is a store diff.
+        let columns = 8usize;
+        let gt = vec![0i32, 1, 1, 0, 2, -1, 1, 0];
+        let src_alt = 1i32;
+
+        let mut expect = vec![0u64; 1];
+        for (col, &g) in gt.iter().enumerate() {
+            if g == src_alt {
+                expect[0] |= 1u64 << col;
+            }
+        }
+
+        let atom = PendingAtom {
+            pos: 100,
+            ilen: 0,
+            alt: b"A".to_vec(),
+            source_alt_index: src_alt as u16,
+            calls: std::sync::Arc::new(crate::record_source::Calls::Dense(gt)),
+            seq: 0,
+            info_vals: Vec::new(),
+            format_vals: Vec::new(),
+        };
+
+        let mut got = vec![0u64; 1];
+        pack_row(&mut got, 0, 0, &atom, columns);
+        assert_eq!(got, expect);
     }
 
     proptest! {
