@@ -67,13 +67,6 @@ impl Carriers {
         self.alleles.push(allele);
     }
 
-    /// Retain the allocation, drop the contents — lets a reader reuse one buffer
-    /// across records instead of allocating per record.
-    pub fn clear(&mut self) {
-        self.cols.clear();
-        self.alleles.clear();
-    }
-
     pub fn len(&self) -> usize {
         self.cols.len()
     }
@@ -202,11 +195,6 @@ impl CarrierFormat {
         }
         let i = self.samples.binary_search(&(sample as u32)).ok()?;
         Some(self.vals[i * self.n_fields + field])
-    }
-
-    pub fn clear(&mut self) {
-        self.samples.clear();
-        self.vals.clear();
     }
 }
 

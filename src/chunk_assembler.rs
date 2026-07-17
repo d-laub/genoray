@@ -728,8 +728,12 @@ impl ChunkAssembler {
             for (i, col) in info_staged.iter_mut().enumerate() {
                 col.push_f64(a.info_vals[i]);
             }
-            // Only dense-routed variants need every sample's value; resolve per
-            // column here rather than materialising F x N per atom upstream.
+            // Stage every sample's value for every atom here (F x N per atom,
+            // unconditional on how the variant will eventually route) --
+            // `rvk` decides dense vs. sparse/VarKey downstream and only dense
+            // variants end up reading the per-sample columns, but that
+            // decision isn't made yet at staging time. `max_mem` bounds this
+            // term rather than the staging itself being made conditional.
             for (j, col) in format_staged.iter_mut().enumerate() {
                 for s in 0..num_samples {
                     col.push_f64(resolve_format(
@@ -831,6 +835,28 @@ mod tests {
             source_alt_index: src,
             calls: std::sync::Arc::new(Calls::Dense(gt)),
             seq: pos as u64,
+            info_vals: Vec::new(),
+            format_vals: Arc::new(FormatVals::Dense(Vec::new())),
+        }
+    }
+
+    // `Calls::Sparse` counterpart to `atom`: same shape, carriers derived from
+    // `gt`'s non-zero entries in ascending column order (what `Carriers`
+    // requires).
+    fn sparse_atom(gt: &[i32], src: u16) -> PendingAtom {
+        let mut carriers = crate::record_source::Carriers::new();
+        for (col, &g) in gt.iter().enumerate() {
+            if g != 0 {
+                carriers.push(col as u32, g);
+            }
+        }
+        PendingAtom {
+            pos: 0,
+            ilen: 0,
+            alt: Vec::new(),
+            source_alt_index: src,
+            calls: std::sync::Arc::new(Calls::Sparse(carriers)),
+            seq: 0,
             info_vals: Vec::new(),
             format_vals: Arc::new(FormatVals::Dense(Vec::new())),
         }
@@ -1007,7 +1033,11 @@ mod tests {
 
     #[test]
     fn pack_row_sparse_matches_dense_across_word_boundaries() {
-        // columns = 100 puts variant 1's row across words and exercises `word_base`.
+        // columns = 100 puts variant 1's row across words 1/2/3, exercising the
+        // `w = (flat >> 6) - word_base` arithmetic across several word indices.
+        // Both calls below pass `word_base = 0`; a nonzero `word_base` is not
+        // covered here (see the `Calls::Sparse` proptest coverage in
+        // `test_par_packing_matches_seq` for that).
         let columns = 100usize;
         let mut gt = vec![0i32; columns];
         for c in [0usize, 63, 64, 65, 99] {
@@ -1055,7 +1085,11 @@ mod tests {
 
         // Parallel packing reproduces sequential packing bit-for-bit, for arbitrary
         // shapes (incl. v not a multiple of the word-aligned block size), allele
-        // indices (incl. missing -1 and out-of-range values), and source alts.
+        // indices (incl. missing -1 and out-of-range values), source alts, and a
+        // mix of `Calls::Dense`/`Calls::Sparse` atoms -- production hits
+        // `Calls::Sparse` at a nonzero `word_base` via this same parallel path
+        // (`pack_presence_par`'s per-block `word_base = c * words_per_block`), so
+        // this generator must exercise that combination too, not just `Dense`.
         #[test]
         fn test_par_packing_matches_seq(
             num_samples in 1usize..40,
@@ -1079,7 +1113,11 @@ mod tests {
                         _ => (next() % 4) as i32,
                     })
                     .collect();
-                atoms.push(atom(gt, src));
+                if next() % 2 == 0 {
+                    atoms.push(sparse_atom(&gt, src));
+                } else {
+                    atoms.push(atom(gt, src));
+                }
             }
 
             let mut seq = BitGrid3::zeros(v, num_samples, ploidy);

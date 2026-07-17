@@ -433,15 +433,21 @@ fn route_variants(
     }
 }
 
-// Today's Dense-to-Sparse Matrix Transposer, kept exactly as it was before
-// Task 8 (route-before-densify): a column-outer, variant-inner scan that walks
-// every (variant, column) presence bit to find the carriers. Used two ways:
-// as the production path for chunks whose source is natively dense
+// Today's Dense-to-Sparse Matrix Transposer: a column-outer, variant-inner
+// scan that walks every (variant, column) presence bit to find the carriers.
+// Its routing pre-pass (`route_variants`) and emission arms (`emit_call`) are
+// shared with `dense2sparse_vk`'s carrier-driven path below -- the two
+// functions differ only in *iteration order*: this one walks the full grid,
+// the carrier-driven path walks only the carrier list. Used two ways: as the
+// production path for chunks whose source is natively dense
 // (`chunk.carriers == None`, where scanning `genos` is both correct and
-// cheapest -- see `DenseChunk::carriers` in types.rs), and as the parity
-// oracle `dense2sparse_vk`'s differential test runs a carrier-bearing chunk
-// through directly (with `carriers` withheld) to prove the carrier-driven
-// path emits byte-identical output.
+// cheapest -- see `DenseChunk::carriers` in types.rs), and as one side of
+// `dense2sparse_vk`'s differential test, which runs a carrier-bearing chunk
+// through directly (with `carriers` withheld) to prove the two iteration
+// orders emit byte-identical output. Because routing and emission are shared
+// code, that test proves emission-order and carrier-count equivalence -- it
+// does NOT differentially cover `route_variants` itself; a routing bug would
+// reproduce identically on both paths and the test would still pass.
 fn dense2sparse_vk_by_scan(
     chunk: &DenseChunk,
     bank: &mut LongAlleleTableWriter,
@@ -546,9 +552,11 @@ fn dense2sparse_vk_by_scan(
 //   actually present -- replacing a scan of every (variant, column) slot
 //   (`dense2sparse_vk_by_scan`'s ~O(V x N) bit-test) with O(carriers +
 //   columns) work. Sparse-routed variants never touch `chunk.genos` here; the
-//   routing pre-pass below is otherwise identical to `dense2sparse_vk_by_scan`
-//   (duplicated rather than shared, so that function's status as an untouched
-//   parity oracle is never put at risk by a change made for this path).
+//   routing pre-pass and emission arms are shared with
+//   `dense2sparse_vk_by_scan` (`route_variants`, `emit_call`) rather than
+//   duplicated -- the two functions differ only in iteration order, so the
+//   differential test between them proves emission-order and carrier-count
+//   equivalence, not that `route_variants` itself is correct.
 pub fn dense2sparse_vk(
     chunk: &DenseChunk,
     bank: &mut LongAlleleTableWriter,
@@ -572,8 +580,11 @@ pub fn dense2sparse_vk(
     // (chunk_assembler.rs) from exactly the columns where this atom's own
     // allele is present -- the same presence bits `pack_row` set for it --
     // so its length is that popcount by construction. Using it here means
-    // the routing pre-pass never has to touch `chunk.genos` for a
-    // sparse-sourced chunk either.
+    // the routing pre-pass doesn't need `chunk.genos` to count carriers for a
+    // sparse-routed variant -- but it can still read `chunk.genos.words` via
+    // the `is_carrier` closure when a variant routes *dense* and FORMAT
+    // fields are requested, regardless of whether the chunk's source was
+    // sparse or dense.
     let RoutingPrePass {
         routes,
         mut dense,
