@@ -948,13 +948,20 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             if chunk_size is None:
                 chunk_size = _auto_chunk_size(len(selected_samples), ploidy)
 
-            flds = _resolve_fields(str(paths[0]), info_fields, format_fields)
-            for path in paths[1:]:
-                other = _resolve_fields(str(path), info_fields, format_fields)
-                if other != flds:
-                    raise ValueError(
-                        f"VCF shard {path} has incompatible requested INFO/FORMAT headers"
-                    )
+            if not info_fields and not format_fields:
+                # Resolving an empty field manifest still opens and parses the
+                # VCF header. Avoid a redundant second pass over every native
+                # cohort source when the caller only needs genotypes.
+                flds = []
+            else:
+                flds = _resolve_fields(str(paths[0]), info_fields, format_fields)
+                for path in paths[1:]:
+                    other = _resolve_fields(str(path), info_fields, format_fields)
+                    if other != flds:
+                        raise ValueError(
+                            f"VCF shard {path} has incompatible requested "
+                            "INFO/FORMAT headers"
+                        )
         finally:
             for vcf in vcfs:
                 vcf.close()

@@ -120,6 +120,29 @@ def test_from_vcf_shards_closes_each_header_before_opening_next(
     assert TrackingVCF.max_active == 1
 
 
+def test_from_vcf_shards_skips_field_header_scan_when_no_fields_requested(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail_if_called(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("field headers should not be reopened without fields")
+
+    monkeypatch.setattr("genoray._svar2._resolve_fields", fail_if_called)
+    ref = _write_ref(tmp_path)
+    source = _write_vcf(
+        tmp_path,
+        "native",
+        "chr1\t8\t.\tA\tT\t.\t.\t.\tGT\t1|0\t0|1\n",
+        ("S0", "S1"),
+    )
+
+    SparseVar2.from_vcf_shards(
+        tmp_path / "no-fields.svar2",
+        [(source, ("chr1", 0, len(_REF)))],
+        ref,
+        threads=2,
+    )
+
+
 def _assert_store_equal(a: Path, b: Path) -> None:
     left = SparseVar2(a)
     right = SparseVar2(b)
