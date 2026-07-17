@@ -758,6 +758,98 @@ mod tests {
         assert_eq!(got, expect);
     }
 
+    #[test]
+    fn pack_row_sparse_and_dense_produce_identical_bits() {
+        // The whole design rests on this: a carrier list and a widened vector are two
+        // encodings of the same record, so they must pack to the same bits.
+        let columns = 8usize;
+        let gt = vec![0i32, 1, 1, 0, 2, -1, 1, 0];
+        let src_alt = 1u16;
+
+        let mut carriers = crate::record_source::Carriers::new();
+        for (col, &g) in gt.iter().enumerate() {
+            if g != 0 {
+                carriers.push(col as u32, g);
+            }
+        }
+
+        let mk = |calls: crate::record_source::Calls| PendingAtom {
+            pos: 100,
+            ilen: 0,
+            alt: b"A".to_vec(),
+            source_alt_index: src_alt,
+            calls: std::sync::Arc::new(calls),
+            seq: 0,
+            info_vals: Vec::new(),
+            format_vals: Vec::new(),
+        };
+
+        let mut dense_bits = vec![0u64; 1];
+        pack_row(
+            &mut dense_bits,
+            0,
+            0,
+            &mk(crate::record_source::Calls::Dense(gt)),
+            columns,
+        );
+
+        let mut sparse_bits = vec![0u64; 1];
+        pack_row(
+            &mut sparse_bits,
+            0,
+            0,
+            &mk(crate::record_source::Calls::Sparse(carriers)),
+            columns,
+        );
+
+        assert_eq!(sparse_bits, dense_bits);
+    }
+
+    #[test]
+    fn pack_row_sparse_matches_dense_across_word_boundaries() {
+        // columns = 100 puts variant 1's row across words and exercises `word_base`.
+        let columns = 100usize;
+        let mut gt = vec![0i32; columns];
+        for c in [0usize, 63, 64, 65, 99] {
+            gt[c] = 1;
+        }
+        let mut carriers = crate::record_source::Carriers::new();
+        for (col, &g) in gt.iter().enumerate() {
+            if g != 0 {
+                carriers.push(col as u32, g);
+            }
+        }
+        let mk = |calls: crate::record_source::Calls| PendingAtom {
+            pos: 1,
+            ilen: 0,
+            alt: b"A".to_vec(),
+            source_alt_index: 1,
+            calls: std::sync::Arc::new(calls),
+            seq: 0,
+            info_vals: Vec::new(),
+            format_vals: Vec::new(),
+        };
+        let words = (columns * 2).div_ceil(64);
+
+        let mut d = vec![0u64; words];
+        pack_row(
+            &mut d,
+            0,
+            1,
+            &mk(crate::record_source::Calls::Dense(gt)),
+            columns,
+        );
+        let mut s = vec![0u64; words];
+        pack_row(
+            &mut s,
+            0,
+            1,
+            &mk(crate::record_source::Calls::Sparse(carriers)),
+            columns,
+        );
+        assert_eq!(s, d);
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(300))]
 
