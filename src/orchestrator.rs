@@ -97,6 +97,15 @@ pub enum SourceSpec {
         regions: Vec<(u32, u32)>,
         overlap: crate::svar2_view::OverlapMode,
     },
+    /// N multi-sample VCFs representing disjoint genomic intervals of ONE
+    /// cohort. Every file has the same sample columns/order. `units` are
+    /// globally sorted, non-overlapping raw-POS ownership intervals for this
+    /// contig. Padded source-run workers normalize concurrently and retain
+    /// atoms by normalized-POS ownership, including across file boundaries.
+    VcfShards {
+        vcf_paths: Vec<String>,
+        units: Vec<crate::vcf_shard_reader::VcfCohortShardUnit>,
+    },
     Svar1 {
         svar1_dir: String,
         contig_start: usize,
@@ -634,6 +643,63 @@ pub fn process_chromosome(
                             ref_excluded_out: Arc::clone(&vcf_list_ref_excluded),
                         })
                     }
+                    SourceSpec::VcfShards { vcf_paths, units } => {
+                        let work_units = crate::vcf_shard_reader::plan_work_units(
+                            &units,
+                            crate::normalize::L_MAX,
+                        )?;
+                        let owned = Arc::new(units);
+                        let paths = Arc::new(vcf_paths);
+                        let (ref_seq, has_reference) = match fasta.as_deref() {
+                            Some(path) => (
+                                Arc::new(crate::vcf_reader::load_contig_seq(path, &chr)?),
+                                true,
+                            ),
+                            None => (Arc::new(Vec::new()), false),
+                        };
+                        let totals = crate::shard_exec::run(
+                            work_units,
+                            processing_threads,
+                            |unit| {
+                                let slices = crate::vcf_shard_reader::slices_for_fetch(
+                                    owned.as_ref(),
+                                    unit.fetch_start,
+                                    unit.fetch_end,
+                                );
+                                let source =
+                                    crate::vcf_shard_reader::VcfCohortSliceRecordSource::new(
+                                        paths.as_ref(),
+                                        slices,
+                                        &chr,
+                                        &s_refs,
+                                        ploidy,
+                                        &fields_owned,
+                                    )?;
+                                Ok(crate::chunk_assembler::ChunkAssembler::with_reference(
+                                    Box::new(source),
+                                    s_refs.len(),
+                                    ploidy,
+                                    Arc::clone(&ref_seq),
+                                    has_reference,
+                                    skip_out_of_scope,
+                                    check_ref,
+                                    &fields_owned,
+                                    Some((unit.own_start, unit.own_end)),
+                                ))
+                            },
+                            |e, unit| {
+                                with_vcf_shard_context(
+                                    e,
+                                    &chr,
+                                    crate::vcf_reader::VcfShard::from(*unit),
+                                )
+                            },
+                            chunk_size,
+                            &tx_dense,
+                        )?;
+                        report_ref_excluded(&chr, totals.ref_excluded);
+                        return Ok(totals.dropped_out_of_scope);
+                    }
                     SourceSpec::Svar1 {
                         svar1_dir,
                         contig_start,
@@ -668,10 +734,8 @@ pub fn process_chromosome(
                 };
 
                 // Dedicated rayon pool for reader-side CPU work: bounded per-record
-                // normalization batches plus intra-chunk presence packing. The
-                // sharded VCF branch above returns before this point because its
-                // independent indexed readers consume the same `processing_threads`
-                // budget directly; building both would double-reserve cores.
+                // normalization batches plus intra-chunk presence packing. Sharded
+                // sources return above after using the same thread budget directly.
                 let pool = rayon::ThreadPoolBuilder::new()
                     .num_threads(processing_threads.max(1))
                     .thread_name(|i| format!("pack-{}", i))

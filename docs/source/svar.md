@@ -18,7 +18,9 @@ svar = SparseVar("out.svar")
 ### Region/sample-restricted SVAR2 conversion
 
 `SparseVar2.from_vcf`, `from_pgen`, and `from_svar1` can all convert directly
-into a subset of regions and samples. `from_vcf_list` supports the same
+into a subset of regions and samples. `from_vcf_shards` does the same for
+position-partitioned multi-sample cohort VCFs (with POS overlap semantics).
+`from_vcf_list` supports the same
 `regions=`/`merge_overlapping=`/`regions_overlap=` but has **no `samples=`**
 — each input file is single-sample, so the cohort is defined by the file set
 itself:
@@ -34,6 +36,20 @@ SparseVar2.from_vcf(
     samples=["HG00096", "HG00097"],
     merge_overlapping=True,
     threads=8,
+)
+
+# Native position partitions of the same multi-sample cohort. Each ownership
+# input is 0-based, half-open and may also be a BED/frame/region list.
+SparseVar2.from_vcf_shards(
+    "subset.svar2",
+    [
+        ("part-000.vcf.gz", [("chr22", 0, 10_000_000)]),
+        ("part-001.vcf.gz", [("chr22", 10_000_000, 20_000_000)]),
+    ],
+    "reference.fa",
+    regions="chr22",
+    samples=["HG00096", "HG00097"],
+    threads=16,
 )
 ```
 
@@ -100,6 +116,20 @@ The two backends behave differently:
 
 `SparseVar2.from_vcf_list` (merging N single-sample VCFs) does not shard within
 a contig — it already opens one file descriptor per input file per contig.
+
+`SparseVar2.from_vcf_shards` is a different multi-file shape: every file has
+the identical multi-sample header and owns disjoint raw-POS intervals. It uses
+a fixed pool of indexed readers over padded native source runs. Reads and
+normalization execute concurrently, while normalized-POS ownership
+deduplicates records crossing worker/file boundaries and preserves global
+order. Consequently an indel can left-align across a physical file boundary
+without being lost or written out of order. Output is byte-identical to
+converting the same raw records from one VCF; no concatenated VCF is
+materialized. Source ownership must be explicit and non-overlapping. The
+default memory-bounded chunk size targets a 256 MiB packed dense chunk, rather
+than applying a fixed variant count to very large cohorts. The current
+implementation supports `regions_overlap="pos"` only and raises for
+`record`/`variant` rather than silently approximating their extent semantics.
 
 See `docs/roadmap/svar2-conversion-baseline-2026-07-15.md` for the full scaling
 results.

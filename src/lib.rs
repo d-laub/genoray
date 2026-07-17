@@ -103,6 +103,8 @@ pub mod vcf_list_reader;
 #[cfg(feature = "conversion")]
 pub mod vcf_reader;
 #[cfg(feature = "conversion")]
+pub mod vcf_shard_reader;
+#[cfg(feature = "conversion")]
 pub mod writer;
 
 #[cfg(feature = "conversion")]
@@ -273,6 +275,174 @@ fn run_conversion_pipeline(
     )
     .map_err(|e| pyo3::exceptions::PyOSError::new_err(format!("failed to write meta.json: {e}")))?;
 
+    Ok(total_dropped as usize)
+}
+
+/// Convert position-sharded, multi-sample VCFs into one SVAR2 store.
+///
+/// `shard_ranges` entries are `(path_index, chrom, start, end)` raw-POS
+/// ownership intervals. Python validates identical cohort headers and
+/// non-overlap; this boundary repeats the structural checks before any worker
+/// is launched. Padded workers decode and normalize source runs concurrently;
+/// normalized-POS ownership preserves correctness across physical boundaries.
+#[cfg(feature = "conversion")]
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
+#[pyfunction]
+#[pyo3(signature = (vcf_paths, shard_ranges, reference_path, chroms, output_dir, samples, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false, signatures=false, info_fields=Vec::new(), format_fields=Vec::new(), check_ref="e".to_string()))]
+fn run_vcf_shards_conversion_pipeline(
+    py: Python,
+    vcf_paths: Vec<String>,
+    shard_ranges: Vec<(usize, String, u32, u32)>,
+    reference_path: Option<String>,
+    chroms: Vec<String>,
+    output_dir: String,
+    samples: Vec<String>,
+    chunk_size: usize,
+    ploidy: usize,
+    max_threads: Option<usize>,
+    long_allele_capacity: usize,
+    skip_out_of_scope: bool,
+    signatures: bool,
+    info_fields: Vec<(String, String, String, Option<String>, Option<f64>)>,
+    format_fields: Vec<(String, String, String, Option<String>, Option<f64>)>,
+    check_ref: String,
+) -> PyResult<usize> {
+    let check_ref: crate::normalize::CheckRef = check_ref.parse().map_err(PyValueError::new_err)?;
+    let mut raw = info_fields;
+    raw.extend(format_fields);
+    let fields =
+        crate::field::parse_manifest(raw).map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+    let mut ranges_by_chrom: std::collections::HashMap<String, Vec<(usize, u32, u32)>> =
+        std::collections::HashMap::new();
+    for (path_index, chrom, start, end) in shard_ranges {
+        if path_index >= vcf_paths.len() {
+            return Err(PyValueError::new_err(format!(
+                "VCF shard range references path index {path_index}, but only {} paths were provided",
+                vcf_paths.len()
+            )));
+        }
+        if end <= start {
+            return Err(PyValueError::new_err(format!(
+                "invalid VCF shard ownership interval {chrom}:{start}-{end}"
+            )));
+        }
+        ranges_by_chrom
+            .entry(chrom)
+            .or_default()
+            .push((path_index, start, end));
+    }
+
+    for chrom in &chroms {
+        let ranges = ranges_by_chrom.get_mut(chrom).ok_or_else(|| {
+            PyValueError::new_err(format!("no VCF shard ownership intervals for {chrom}"))
+        })?;
+        ranges.sort_unstable_by_key(|&(path_index, start, end)| (start, end, path_index));
+        for pair in ranges.windows(2) {
+            if pair[1].1 < pair[0].2 {
+                return Err(PyValueError::new_err(format!(
+                    "VCF shard ownership intervals overlap on {chrom}: {}-{} and {}-{}",
+                    pair[0].1, pair[0].2, pair[1].1, pair[1].2
+                )));
+            }
+        }
+    }
+
+    let sample_refs: Vec<&str> = samples.iter().map(String::as_str).collect();
+    let results: Vec<Result<u64, crate::error::ConversionError>> = py.detach(|| {
+        let available_cores = match max_threads {
+            Some(t) if t > 0 => {
+                println!("Notice: Using user-provided thread limit: {t}");
+                t
+            }
+            _ => {
+                let detected = std::thread::available_parallelism().unwrap().get();
+                println!("Notice: No thread limit provided. Hardware Detected: {detected} cores.");
+                detected
+            }
+        };
+        let plan = crate::budget::plan_thread_budget(available_cores, chroms.len());
+        let concurrent_chroms = plan.concurrent_chroms;
+        // Cohort-shard input needs no per-reader HTSlib background pool: the
+        // independent indexed readers ARE the useful decode parallelism. Reuse
+        // the cores the ordinary single-file plan reserves for HTSlib, plus
+        // this chromosome's share of the leftover processing budget.
+        let reader_workers = (plan.htslib_threads
+            + plan.processing_threads / concurrent_chroms)
+            .max(1);
+        println!("Using: {available_cores} cores.");
+        println!(
+            "Pipeline Config (VCF cohort shards): {} concurrent chromosomes | {} indexed-reader workers per chromosome.",
+            concurrent_chroms, reader_workers
+        );
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(concurrent_chroms)
+            .thread_name(|i| format!("rayon-{i}"))
+            .build()
+            .unwrap();
+        let fasta_ref = reference_path.as_deref();
+        pool.install(|| {
+            chroms
+                .par_iter()
+                .map(|chrom| {
+                    println!("==> Processing {chrom}");
+                    let units = ranges_by_chrom[chrom]
+                        .iter()
+                        .enumerate()
+                        .map(
+                            |(ordinal, &(path_index, start, end))| {
+                                crate::vcf_shard_reader::VcfCohortShardUnit {
+                                    path_index,
+                                    start,
+                                    end,
+                                    ordinal,
+                                }
+                            },
+                        )
+                        .collect();
+                    orchestrator::process_chromosome(
+                        orchestrator::SourceSpec::VcfShards {
+                            vcf_paths: vcf_paths.clone(),
+                            units,
+                        },
+                        fasta_ref,
+                        chrom,
+                        &output_dir,
+                        &sample_refs,
+                        chunk_size,
+                        ploidy,
+                        long_allele_capacity,
+                        skip_out_of_scope,
+                        check_ref,
+                        reader_workers,
+                        signatures,
+                        &fields,
+                    )
+                })
+                .collect()
+        })
+    });
+
+    let mut total_dropped = 0u64;
+    for result in results {
+        total_dropped += result?;
+    }
+    let resolved_fields = crate::field_finalize::finalize_fields(
+        std::path::Path::new(&output_dir),
+        &chroms,
+        &fields,
+    )?;
+    crate::meta::write_meta(
+        std::path::Path::new(&output_dir),
+        crate::meta::FORMAT_VERSION,
+        &samples,
+        &chroms,
+        ploidy,
+        &resolved_fields,
+    )
+    .map_err(|e| pyo3::exceptions::PyOSError::new_err(format!("failed to write meta.json: {e}")))?;
     Ok(total_dropped as usize)
 }
 
@@ -1067,6 +1237,8 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(svar2_variant_stats, m)?)?;
     #[cfg(feature = "conversion")]
     m.add_function(wrap_pyfunction!(run_vcf_list_conversion_pipeline, m)?)?;
+    #[cfg(feature = "conversion")]
+    m.add_function(wrap_pyfunction!(run_vcf_shards_conversion_pipeline, m)?)?;
     #[cfg(feature = "conversion")]
     m.add_function(wrap_pyfunction!(run_svar1_conversion_pipeline, m)?)?;
     #[cfg(feature = "conversion")]

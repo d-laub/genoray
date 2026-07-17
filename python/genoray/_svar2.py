@@ -764,6 +764,208 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         )
 
     @classmethod
+    def from_vcf_shards(
+        cls,
+        out: str | Path,
+        sources: "Sequence[tuple[str | Path, object]]",
+        reference: str | Path | None = None,
+        *,
+        regions: "str | tuple[str, int, int] | PathLike | object | None" = None,
+        samples: "str | Sequence[str] | PathLike | None" = None,
+        merge_overlapping: bool = False,
+        regions_overlap: "Literal['pos', 'record', 'variant']" = "pos",
+        no_reference: bool = False,
+        skip_out_of_scope: bool = False,
+        ploidy: int = 2,
+        chunk_size: int | None = None,
+        threads: int | None = None,
+        overwrite: bool = False,
+        long_allele_capacity: int = 8 * 1024 * 1024,
+        signatures: bool = False,
+        info_fields: Sequence[str | InfoField] | None = None,
+        format_fields: Sequence[str | FormatField] | None = None,
+        check_ref: Literal["e", "x"] = "e",
+    ) -> int:
+        """Convert position-sharded multi-sample VCFs into one SVAR2 store.
+
+        ``sources`` is an ordered sequence of ``(path, ownership_regions)``
+        pairs. Every path must be an indexed VCF/BCF for the same cohort: the
+        sample names and their order must be identical. Ownership regions use
+        the normal Genoray region inputs and are 0-based half-open for tuple,
+        BED, or frame inputs. Across all sources they must be disjoint; gaps
+        and empty owned intervals are allowed.
+
+        Indexed readers consume and normalize padded native source intervals
+        concurrently under ``threads=``. Normalized-POS ownership keeps each
+        atom exactly once when it crosses a physical source-file boundary. No
+        concatenated VCF is materialized.
+
+        ``chunk_size=None`` chooses a cohort-size-aware value targeting a
+        256 MiB packed dense chunk, avoiding multi-gigabyte chunks for very
+        large cohorts.
+
+        The other conversion options match :meth:`from_vcf`. This first public
+        version supports ``regions_overlap='pos'``; record/variant-extent
+        selection requires a second predicate in addition to source ownership
+        and is rejected rather than approximated.
+        """
+        from cyvcf2 import VCF as _CyVCF
+        from genoray._svar._regions import _normalize_samples
+
+        if regions_overlap != "pos":
+            raise ValueError(
+                "from_vcf_shards currently supports only regions_overlap='pos'; "
+                "source ownership is POS-based"
+            )
+        if not isinstance(sources, AbcSequence) or isinstance(
+            sources, (str, bytes, PathLike)
+        ):
+            raise TypeError(
+                "sources must be a sequence of (path, ownership_regions) pairs"
+            )
+        if not sources:
+            raise ValueError("from_vcf_shards requires at least one source")
+
+        out = Path(out)
+        if (reference is None) == (not no_reference):
+            raise ValueError(
+                "provide exactly one of `reference` (a FASTA path) or "
+                "`no_reference=True`"
+            )
+        if signatures and no_reference:
+            raise ValueError("signatures=True requires a reference (not no_reference).")
+        if out.exists() and not overwrite:
+            raise FileExistsError(
+                f"Output path {out} already exists. Use overwrite=True to overwrite."
+            )
+        out.parent.mkdir(parents=True, exist_ok=True)
+
+        paths: list[Path] = []
+        vcfs: list[Any] = []
+        ownership: list[tuple[int, str, int, int]] = []
+        per_file_contigs: list[tuple[Path, set[str]]] = []
+        cohort_samples: list[str] | None = None
+        try:
+            for path_index, entry in enumerate(sources):
+                if not isinstance(entry, tuple) or len(entry) != 2:
+                    raise TypeError(
+                        "each source must be a (path, ownership_regions) pair"
+                    )
+                path = Path(entry[0])
+                owned_input = entry[1]
+                _ensure_bgzipped(path)
+                _ensure_index(path)
+                vcf = _CyVCF(str(path))
+                paths.append(path)
+                vcfs.append(vcf)
+
+                file_samples = list(vcf.samples)
+                if cohort_samples is None:
+                    cohort_samples = file_samples
+                elif file_samples != cohort_samples:
+                    raise ValueError(
+                        f"VCF shard {path} does not have the identical sample order "
+                        "required by the first source"
+                    )
+
+                file_contigs = set(vcf.seqnames)
+                per_file_contigs.append((path, file_contigs))
+                owned = _normalize_svar2_regions(
+                    owned_input,
+                    list(vcf.seqnames),
+                    merge_overlapping=True,
+                )
+                for chrom, start, end in owned:
+                    ownership.append((path_index, chrom, start, end))
+
+            assert cohort_samples is not None
+            if not cohort_samples:
+                raise ValueError("from_vcf_shards requires at least one sample")
+            _check_consistent_contig_naming(per_file_contigs)
+
+            # Validate physical ownership BEFORE applying the caller's optional
+            # query subset. An overlap is a malformed shard map even if the
+            # requested region happens not to touch it.
+            ownership.sort(key=lambda x: (x[1], x[2], x[3], x[0]))
+            for left, right in zip(ownership, ownership[1:]):
+                if left[1] == right[1] and right[2] < left[3]:
+                    raise ValueError(
+                        "VCF shard ownership intervals overlap: "
+                        f"{left[1]}:{left[2]}-{left[3]} and "
+                        f"{right[1]}:{right[2]}-{right[3]}"
+                    )
+
+            all_contigs = natsorted({chrom for _i, chrom, _s, _e in ownership})
+            if not all_contigs:
+                raise ValueError("from_vcf_shards resolved no ownership intervals")
+            requested = _normalize_svar2_regions(
+                regions,
+                all_contigs,
+                merge_overlapping=merge_overlapping,
+            )
+
+            if requested:
+                requested_by_contig: dict[str, list[tuple[int, int]]] = {}
+                for chrom, start, end in requested:
+                    requested_by_contig.setdefault(chrom, []).append((start, end))
+                selected_ownership: list[tuple[int, str, int, int]] = []
+                for path_index, chrom, own_start, own_end in ownership:
+                    for query_start, query_end in requested_by_contig.get(chrom, []):
+                        start = max(own_start, query_start)
+                        end = min(own_end, query_end)
+                        if start < end:
+                            selected_ownership.append((path_index, chrom, start, end))
+            else:
+                selected_ownership = ownership
+
+            if not selected_ownership:
+                raise ValueError("No requested regions match VCF shard ownership.")
+            contigs = natsorted({chrom for _i, chrom, _s, _e in selected_ownership})
+            selected_samples = (
+                cohort_samples
+                if samples is None
+                else _normalize_samples(samples, cohort_samples)
+            )
+            if not selected_samples:
+                raise ValueError("from_vcf_shards requires at least one sample")
+
+            if chunk_size is None:
+                chunk_size = _auto_chunk_size(len(selected_samples), ploidy)
+
+            flds = _resolve_fields(str(paths[0]), info_fields, format_fields)
+            for path in paths[1:]:
+                other = _resolve_fields(str(path), info_fields, format_fields)
+                if other != flds:
+                    raise ValueError(
+                        f"VCF shard {path} has incompatible requested INFO/FORMAT headers"
+                    )
+        finally:
+            for vcf in vcfs:
+                vcf.close()
+
+        info = [field for field in flds if field[1] == "info"]
+        format_ = [field for field in flds if field[1] == "format"]
+        assert chunk_size is not None
+        _validate_check_ref(check_ref)
+        return _core.run_vcf_shards_conversion_pipeline(
+            [str(path) for path in paths],
+            selected_ownership,
+            None if no_reference else str(reference),
+            contigs,
+            str(out),
+            selected_samples,
+            chunk_size,
+            ploidy,
+            threads,
+            long_allele_capacity,
+            skip_out_of_scope,
+            signatures,
+            info,
+            format_,
+            check_ref,
+        )
+
+    @classmethod
     def from_pgen(
         cls,
         out: str | Path,
