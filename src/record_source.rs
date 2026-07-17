@@ -109,6 +109,14 @@ impl Calls {
     ///
     /// O(1) for `Dense`, O(log n_carriers) for `Sparse`. Prefer `iter_non_ref` in hot
     /// loops — a scan of every column is exactly the O(V x N) this design removes.
+    ///
+    /// `col` must be less than the cohort's column count (`num_samples * ploidy`); the
+    /// caller owns that bound, not this type. `Sparse` has no width to check it
+    /// against — carrying one per record would defeat the point of the representation
+    /// — so an out-of-range `col` silently reads back as REF (`0`), the same as any
+    /// other absent column. `Dense` panics instead, since it indexes a `Vec` directly.
+    /// Do not rely on that panic to catch indexing bugs: the same bug against a
+    /// `Sparse` record fails silently rather than loudly.
     pub fn allele_at(&self, col: usize) -> i32 {
         match self {
             Calls::Dense(gt) => gt[col],
@@ -221,5 +229,33 @@ mod calls_tests {
         assert_eq!(s.n_non_ref(), 0);
         assert_eq!(s.allele_at(3), 0);
         assert_eq!(s.iter_non_ref().count(), 0);
+    }
+
+    /// Pins the documented asymmetry from `Calls::allele_at`'s doc comment: `Sparse`
+    /// has no width to bounds-check against, so a column past the cohort's actual
+    /// width (8, per the fixtures above) silently reads as REF instead of panicking
+    /// like `Dense` would. This is deliberate — see the doc comment — but must stay a
+    /// pinned property, not an accident a later refactor could change unknowingly.
+    #[test]
+    fn out_of_range_column_reads_as_ref_on_sparse() {
+        let s = Calls::Sparse(sparse_fixture());
+        assert_eq!(s.allele_at(8), 0);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "REF is represented by absence, not a 0 entry")]
+    fn push_panics_on_ref_allele() {
+        let mut c = Carriers::new();
+        c.push(0, 0);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "carrier columns must be pushed strictly ascending")]
+    fn push_panics_on_non_ascending_columns() {
+        let mut c = Carriers::new();
+        c.push(2, 1);
+        c.push(1, 1);
     }
 }
