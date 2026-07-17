@@ -85,12 +85,15 @@ def test_generated_union_matches_estimate_and_grows_linearly(tmp_path: Path) -> 
 
     # Load-bearing assertion: ties the birthday-problem estimator to what the
     # generator actually emits. p = n_priv/contig_len ~ 27/1e6 ~ 2.7e-5, so
-    # cross-file collisions are rare and the estimate should be tight.
-    assert abs(small_union - predicted_small) / predicted_small < 0.15, (
+    # cross-file collisions are rare and the estimate should be tight. Bound is
+    # 2% (not padded further): seed=0 is fixed so this test has zero run-to-run
+    # variance, and the measured error is 0.03-0.05% -- two orders of magnitude
+    # below the bound.
+    assert abs(small_union - predicted_small) / predicted_small < 0.02, (
         f"empirical union {small_union} vs predicted {predicted_small:.1f} "
         "(n_files=20) -- estimator and generator disagree"
     )
-    assert abs(big_union - predicted_big) / predicted_big < 0.15, (
+    assert abs(big_union - predicted_big) / predicted_big < 0.02, (
         f"empirical union {big_union} vs predicted {predicted_big:.1f} "
         "(n_files=200) -- estimator and generator disagree"
     )

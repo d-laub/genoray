@@ -26,7 +26,7 @@ def test_generate_cohort_shape(tmp_path: Path):
         tmp_path,
         n_files=4,
         n_variants=6,
-        contig="chr1",
+        contigs=["chr1"],
         contig_len=10_000,
         shared_frac=0.5,
         indel_frac=0.25,
@@ -72,7 +72,7 @@ def test_generate_cohort_no_cross_file_ref_disagreement(tmp_path: Path):
         tmp_path,
         n_files=10,
         n_variants=40,
-        contig="chr1",
+        contigs=["chr1"],
         contig_len=100,  # tiny -> private positions collide across files
         shared_frac=0.1,
         indel_frac=0.2,

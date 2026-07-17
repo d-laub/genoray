@@ -8,21 +8,32 @@ this directory inside the pixi env (`pixi run bash -lc '...'`) unless noted.
 
 ```bash
 python generate_cohort.py /tmp/cohort --n-files 2000 --n-variants 30000 \
-    --contig chr1 --contig-len 1000000 --shared-frac 0.1 --indel-frac 0.1 --seed 0
+    --contig chr1 --contig-len 1000000 --shared-frac 0.1 --indel-frac 0.1 --seed 0 \
+    --format-field VAF --format-field DP
 ```
 
 Each file is a single-sample bgzipped+indexed VCF; shared sites carry identical
-REF/ALT across files so the k-way merge actually joins. Emits `manifest.txt`
-(one path per line).
+REF/ALT across files so the k-way merge actually joins. `--contig` and
+`--format-field` are repeatable (omit `--contig` for a single default contig
+`1`; omit `--format-field` for none, which is what the old zero-FORMAT-field
+harness was blind to). Emits `manifest.txt` (one path per line).
 
 ## 2. RAM / wall-time sweep (Python entry, /usr/bin/time)
 
 ```bash
 for k in 100 500 1000 2000; do
   python run_bench.py --manifest /tmp/cohort/manifest.txt --out /tmp/out_$k \
-      --chrom chr1 --subset $k --profiler time --results results.csv
+      --chrom chr1 --subset $k --profiler time --results results.csv \
+      --format-field VAF --format-field DP
 done
 ```
+
+`--chrom` is also repeatable but informational only for `run_bench.py` -- the
+Python `from_vcf_list` path always processes the whole manifest, so restrict
+contigs at cohort-generation time (step 1) if you need a subset. Pass
+`--format-field` here to match whatever fields the cohort was generated with;
+this is what makes the harness see the FORMAT-field cost that a
+zero-FORMAT-field run misses.
 
 `results.csv` gets one `n_files,wall_s,maxrss_kb,profiler` row per run.
 
