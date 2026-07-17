@@ -203,7 +203,7 @@ fn emit_call(
                         // resolved against each file's own ALT at merge time),
                         // so 0 is inert. `idx` is the per-category FORMAT index,
                         // which is also the field index into FormatVals.
-                        Some(fbc) => crate::chunk_assembler::resolve_format(
+                        Some(fbc) => crate::record_source::resolve_format(
                             &fbc[v],
                             format_specs[idx],
                             0,
@@ -431,9 +431,7 @@ fn route_variants(
                         // Carrier source: value() returns None for a non-carrier,
                         // which resolve_format maps to the field default -- exactly
                         // the `is_carrier ? staged : default` the grid path did.
-                        Some(fbc) => {
-                            crate::chunk_assembler::resolve_format(&fbc[v], spec, 0, s, idx)
-                        }
+                        Some(fbc) => crate::record_source::resolve_format(&fbc[v], spec, 0, s, idx),
                         None => {
                             if is_carrier(v, s) {
                                 staged_f64(&chunk.format_staged[idx], v * num_samples + s)

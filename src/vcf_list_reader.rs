@@ -13,11 +13,12 @@
 //! each carrier contributing its own file's value and non-carriers falling back
 //! to the field's default downstream.
 
-use crate::chunk_assembler::resolve_scalar;
 use crate::error::ConversionError;
 use crate::field::{FieldCategory, FieldSpec};
 use crate::normalize::{L_MAX, atomize_to_vcf_biallelic};
-use crate::record_source::{Calls, CarrierFormat, Carriers, FormatVals, RawRecord, RecordSource};
+use crate::record_source::{
+    Calls, CarrierFormat, Carriers, FormatVals, RawRecord, RecordSource, resolve_scalar,
+};
 use crate::vcf_reader::VcfRecordSource;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, VecDeque};

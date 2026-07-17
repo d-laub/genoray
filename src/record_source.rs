@@ -6,6 +6,7 @@
 //! of these fields per record anyway, so owning costs nothing.
 
 use crate::error::ConversionError;
+use crate::field::FieldSpec;
 
 /// One variant record, decoded to the minimum the conversion spine needs.
 pub struct RawRecord {
@@ -207,6 +208,95 @@ pub enum FormatVals {
     Dense(Vec<Option<Vec<Vec<f64>>>>),
     /// Only the calling samples. Natural for a k-way merge of single-sample files.
     ByCarrier(CarrierFormat),
+}
+
+// Delegates to `FieldSpec::missing_sentinel` — single source of truth shared
+// with `dense2sparse_vk`'s genotype-aligned non-carrier fill (src/rvk.rs).
+fn sentinel_default(spec: &FieldSpec) -> f64 {
+    spec.missing_sentinel()
+}
+
+// htslib missing-value detection on an already-widened f64: floats use NaN
+// (covers both htslib's MISSING and VECTOR_END float encodings, which are
+// distinct NaN bit patterns); ints use MISSING (i32::MIN) or VECTOR_END
+// (i32::MIN + 1) — the round-trip through f64 is exact for both since they're
+// in i32 range.
+fn is_htslib_missing(raw_val: f64, is_float: bool) -> bool {
+    if is_float {
+        raw_val.is_nan()
+    } else {
+        let iv = raw_val as i32;
+        iv == i32::MIN || iv == i32::MIN + 1
+    }
+}
+
+// Resolve one atom's value from a record-level raw buffer (already widened to
+// f64): `None` (field absent from the record/sample) or an out-of-range
+// Number=A index falls back to the spec's sentinel/default; a length-1 buffer
+// is a Number=1 scalar, otherwise indexed by `source_alt_index - 1` (Number=A):
+// `source_alt_index` is 1-based (ALT1 → 1, matching BCF GT allele codes; see
+// `normalize::atomize_record`), but htslib's Number=A buffer is 0-based
+// per-ALT (ALT1's value lives at `vals[0]`).
+pub(crate) fn resolve_scalar(vals: Option<&[f64]>, source_alt_index: u16, spec: &FieldSpec) -> f64 {
+    let default_val = sentinel_default(spec);
+    let Some(vals) = vals else {
+        return default_val;
+    };
+    if vals.is_empty() {
+        return default_val;
+    }
+    let raw_val = if vals.len() == 1 {
+        vals[0]
+    } else {
+        // source_alt_index is 1-based; htslib Number=A buffers are 0-based per-ALT.
+        match vals.get(source_alt_index.saturating_sub(1) as usize) {
+            Some(&v) => v,
+            None => return default_val,
+        }
+    };
+    if is_htslib_missing(raw_val, spec.stage_is_float()) {
+        default_val
+    } else {
+        raw_val
+    }
+}
+
+// Field `j` (`spec`) for sample `s`, from a record-level `FormatVals` -- the
+// lazy counterpart to the eager per-atom resolution `decompose_raw_record` used
+// to do. `source_alt_index` is THIS ATOM's own index (atoms sharing one source
+// record can each carry a different ALT after `atomize_record` decomposes a
+// multiallelic record), not the record's.
+//
+// **The ALT-index asymmetry between the two arms is deliberate, not a bug:**
+// - `Dense` buffers are still record-raw (Number=A, one entry per source ALT,
+//   0-based) exactly as `decode_format_raw`/`RawRecord::format_vals` produced
+//   them -- so this arm must re-apply `source_alt_index` via `resolve_scalar`,
+//   the same call `decompose_raw_record` made before this change.
+// - `ByCarrier` values are already fully resolved, per carrier, against THAT
+//   FILE's OWN `source_alt_index` at merge time (`vcf_list_reader.rs`'s
+//   `FileCursor::advance`, before the merge heap ever sees them) -- a k-way
+//   merge of single-sample files only ever emits single-ALT `RawRecord`s
+//   (`alts: vec![alt]`), so re-applying an index here would double-resolve
+//   against the WRONG (always-1) index and silently corrupt a non-carrier's
+//   fallback path. `cf.value` already returns `None` for a non-carrier, and
+//   `resolve_scalar(None, 0, spec)` resolves that to the spec default
+//   regardless of the index passed, so `0` there is inert, not a real choice.
+pub(crate) fn resolve_format(
+    fv: &FormatVals,
+    spec: &FieldSpec,
+    source_alt_index: u16,
+    s: usize,
+    j: usize,
+) -> f64 {
+    match fv {
+        FormatVals::ByCarrier(cf) => cf
+            .value(s, j)
+            .unwrap_or_else(|| resolve_scalar(None, 0, spec)),
+        FormatVals::Dense(raw) => {
+            let sample_vals = raw[j].as_ref().map(|v| v[s].as_slice());
+            resolve_scalar(sample_vals, source_alt_index, spec)
+        }
+    }
 }
 
 #[cfg(test)]
