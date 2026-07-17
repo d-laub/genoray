@@ -15,18 +15,25 @@ import tempfile
 from pathlib import Path
 
 _RUNNER = (
-    "from genoray import SparseVar2\n"
+    "from genoray import SparseVar2, FormatField\n"
     "SparseVar2.from_vcf_list({out!r}, {paths!r}, {ref}, "
-    "no_reference={noref}, overwrite=True, threads={threads})\n"
+    "no_reference={noref}, overwrite=True, threads={threads}, "
+    "format_fields=[FormatField(n) for n in {fields!r}])\n"
 )
 
 
 def _subprocess_src(
-    out: str, paths: list[str], reference: str | None, threads: int | None
+    out: str,
+    paths: list[str],
+    reference: str | None,
+    threads: int | None,
+    fields: list[str],
 ) -> str:
     ref = repr(reference) if reference else "None"
     noref = reference is None
-    return _RUNNER.format(out=out, paths=paths, ref=ref, noref=noref, threads=threads)
+    return _RUNNER.format(
+        out=out, paths=paths, ref=ref, noref=noref, threads=threads, fields=fields
+    )
 
 
 def main() -> None:
@@ -35,13 +42,23 @@ def main() -> None:
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument(
         "--chrom",
-        default="chr1",
-        help="the manifest's contig (informational; the Python from_vcf_list path "
-        "processes the whole manifest -- restrict at cohort-generation time)",
+        dest="chroms",
+        action="append",
+        default=None,
+        help="the manifest's contig(s), repeatable (informational; the Python "
+        "from_vcf_list path processes the whole manifest -- restrict at "
+        "cohort-generation time)",
     )
     ap.add_argument("--reference", type=Path, default=None)
     ap.add_argument("--subset", type=int, default=None, help="use first K files")
     ap.add_argument("--threads", type=int, default=None)
+    ap.add_argument(
+        "--format-field",
+        dest="format_fields",
+        action="append",
+        default=[],
+        help="repeatable FORMAT field to request from SparseVar2.from_vcf_list",
+    )
     ap.add_argument("--profiler", choices=["time", "memray", "none"], default="time")
     ap.add_argument("--results", type=Path, default=Path("results.csv"))
     a = ap.parse_args()
@@ -50,7 +67,11 @@ def main() -> None:
     if a.subset is not None:
         paths = paths[: a.subset]
     src = _subprocess_src(
-        str(a.out), paths, str(a.reference) if a.reference else None, a.threads
+        str(a.out),
+        paths,
+        str(a.reference) if a.reference else None,
+        a.threads,
+        a.format_fields,
     )
 
     with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as fh:
@@ -95,13 +116,16 @@ def main() -> None:
     finally:
         Path(runner).unlink(missing_ok=True)
 
+    n_fields = len(a.format_fields)
     new = not a.results.exists()
     with open(a.results, "a", newline="") as fh:
         w = csv.writer(fh)
         if new:
-            w.writerow(["n_files", "wall_s", "maxrss_kb", "profiler"])
-        w.writerow([len(paths), wall_s, maxrss_kb, a.profiler])
-    print(f"n_files={len(paths)} wall_s={wall_s} maxrss_kb={maxrss_kb}")
+            w.writerow(["n_files", "fields", "wall_s", "maxrss_kb", "profiler"])
+        w.writerow([len(paths), n_fields, wall_s, maxrss_kb, a.profiler])
+    print(
+        f"n_files={len(paths)} fields={n_fields} wall_s={wall_s} maxrss_kb={maxrss_kb}"
+    )
 
 
 if __name__ == "__main__":
