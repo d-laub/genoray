@@ -1,4 +1,4 @@
-# `from_vcf_list` memory: allocation churn, not live data
+# `from_vcf_list`: retire the dense round-trip
 
 Design for issue #120 (`from_vcf_list` OOMs on large cohorts) and the deferred Phase 3
 work from PR #121.
@@ -11,14 +11,26 @@ fields** and ran **one contig**. Every one of them is corrected below.
 ## 1. What actually happens
 
 `SparseVar2.from_vcf_list` merges N single-sample VCFs. For a **somatic** cohort, nearly
-every union variant has exactly **one carrier**. The pipeline nevertheless materializes
-FORMAT values for **all N samples at every union variant**, three times over. Those
-materializations are short-lived, so they barely register in peak *live* heap — but they
-are allocated and freed once per record, producing tens of millions of small O(N)
-allocations that shred the glibc arenas. Peak RSS is then dominated by memory glibc has
-freed but cannot return to the OS.
+every union variant has exactly **one carrier**.
 
-The failure is **allocation churn**, not a leak and not a large live set.
+The k-way merge **already knows exactly which columns carry each record** — that is what
+the frontier group in `next_record` *is*. The pipeline then throws that information away:
+it expands each record to width N, packs it into a presence grid that is 99.993% zeros,
+and finally **brute-force scans the whole grid to re-derive the carrier list it just
+discarded**. Every cost in this document descends from that single round-trip.
+
+It has two consequences, one for memory and one for time:
+
+- **Memory.** Widening to N happens *per record*, so it allocates and frees an O(N)
+  buffer tens of millions of times. Those allocations are short-lived and barely register
+  in peak *live* heap, but the churn shreds the glibc arenas; peak RSS is then dominated
+  by memory glibc has freed and cannot return. **The OOM is allocation churn — not a
+  leak, not a large live set.**
+- **Time.** Expanding to N and scanning back is **O(V×N)** where both V and N grow with
+  cohort size, i.e. **O(N²)**, to recover O(N) worth of carriers.
+
+Neither is inherent to the problem: input is Θ(N × v_per_file), output is Θ(N ×
+v_per_file). **Only the intermediate is quadratic.** §3.1 removes it.
 
 ### Measured on the real cohort
 
@@ -59,6 +71,11 @@ genoray 3.0.0 that OOMed), F = the production 7 FORMAT fields:
 Within one contig, RSS is linear in N (**RSS ≈ 0.66 GB + 3.7 MB × N**, → ~27 GB for chr1
 at N=7089), but the **arena share grows superlinearly**: 1.78 GB (41% of peak) at N=1000
 → 11.54 GB (**75%**) at N=4000; heaps 88 → 396.
+
+**Wall-clock is superlinear too, and independently confirms the O(V×N):** 4× the files
+(1000 → 4000, same contig) costs **11.9× the time** (399 s → 4,729 s), i.e. ~N^1.8 —
+between linear and the N² of a pure V×N scan, which is what you expect when part of the
+run is I/O-bound. A linear pipeline would have cost ~1,600 s.
 
 Across contigs, RSS **ratchets and never falls**:
 
@@ -176,6 +193,43 @@ never unmapped. The threads buy nothing: the read phase is pinned at `read≈99%
 core). rust-htslib's `set_threads` asserts `n_threads > 0` (`bcf/mod.rs:171`), so the
 call must be **skipped**, not passed 0.
 
+### The same round-trip, in time: three O(V×N) sites
+
+The widening is not one mistake but three, all recovering (or discarding) the same
+carrier list:
+
+| # | site | cost | what it does |
+|---|---|---|---|
+| 1 | `vcf_list_reader.rs:465` | O(N)/record | `let mut gt = vec![0i32; num_samples * ploidy]` — widen the frontier group to N |
+| 2 | `chunk_assembler.rs:66` `pack_row` | O(N)/variant | `while col < columns { ... }` — scan all N columns to pack presence bits |
+| 3 | `rvk.rs:348` | **O(V×N)** | scan every (variant, column) slot to find the carriers |
+
+Site #3 is the worst, and is the merge's #1 CPU cost today:
+
+```rust
+for (each column: s in 0..num_samples, p in 0..ploidy) {   // outer: N × P
+    for v in 0..v_variants {                               // inner: V
+        let flat_idx = (v * stride) + base_idx;
+        let word = unsafe { *words.get_unchecked(flat_idx >> 6) };
+        if (word >> (flat_idx & 63)) & 1 == 0 {
+            continue;                                      // taken 99.993% of the time
+        }
+        ...
+    }
+}
+```
+
+At N=7089 genome-wide (V ≈ 37M, columns = 14,178) that is **~524 billion bit-tests to
+find ~37M carriers** — efficiency 7×10⁻⁵. It is also a strided walk: consecutive `v`
+jumps `columns` bits = 1,772 bytes, so it misses cache on essentially every slot. This is
+why PR #121's perf run found `dense2sparse_vk` had *become* the #1 self-time symbol
+(10.75%) once the frontier min-heap retired the old bottleneck — that profile was already
+pointing here.
+
+Note the grid is **write-sparse but read-dense**: `BitGrid3::zeros` is a lazy calloc and
+`pack_presence_seq` only visits real atoms, so the grid exists purely as a lossy
+transport from "the reader knew the carriers" to "`rvk` needs the carriers".
+
 **Site #5 — `python/genoray/_svar2.py:1690-1702`.** `_auto_chunk_size` budgets only the
 bit grid:
 
@@ -192,16 +246,19 @@ At N=7089 the grid is 42.3 MiB while `format_staged` is 4.96 GB — the budgeted
 
 ## 3. Design
 
-### 3.1 Carry FORMAT carrier-sparsely (the fix)
+### 3.1 Carrier lists end-to-end: route before densifying (the fix)
 
-Replace the N-wide representation across the reader→assembler seam with a
-carrier-indexed one. Invalid states — "a value for a sample that has no call" — become
-unrepresentable rather than defaulted.
+One change fixes both the churn and the O(N²), because they are the same round-trip. The
+carrier list the merge already computes is carried **all the way to `rvk`** instead of
+being widened to N and scanned back.
+
+**The representation.** Invalid states — "a value for a sample that has no call" — become
+unrepresentable rather than defaulted:
 
 ```rust
-/// FORMAT values for one merged record, one entry per carrying column.
-/// Length is the carrier count (≈1 for somatic), not `num_samples`.
-pub struct FormatCalls {
+/// The carriers of one merged record: which columns called it, and their field
+/// values. Length is the carrier count (≈1 for somatic), never `num_samples`.
+pub struct Carriers {
     /// Merged column index per carrier, ascending.
     cols: Vec<u32>,
     /// `vals[i * n_fields + j]` = field j for carrier i.
@@ -210,15 +267,46 @@ pub struct FormatCalls {
 }
 ```
 
-- `next_record` fills `FormatCalls` directly from the frontier group it already walks —
-  no N-wide intermediate, no per-carrier 1-element `Vec`.
-- `AtomMeta` carries `FormatCalls` instead of an F×N `Vec<f64>`.
-- Non-carriers resolve to the field default **at materialization** (when a dense column
-  is actually written), not at staging.
-- Both structs are reused across records via a cleared buffer, so steady-state
-  allocation per record is ~zero rather than O(N).
+- `next_record` fills `Carriers` directly from the frontier group it already walks — no
+  N-wide `gt`, no N-wide `per_sample`, no per-carrier 1-element `Vec` (**retires site #1
+  for both memory and time**).
+- `AtomMeta` carries `Carriers` instead of an F×N `Vec<f64>`.
+- Buffers are reused across records, so steady-state allocation per record is ~zero
+  rather than O(N).
 
-Expected: sites #1 and #2 (**67% of churn**) drop by ~N×, and churn stops scaling as N².
+**The inversion.** `rvk.rs:241` already classifies each variant `VarKey` (sparse) vs
+`Dense` in a pre-pass — the pipeline simply densifies *first* and routes *second*. Invert
+that order:
+
+- **Sparse-routed variants never touch the grid.** Their calls are emitted straight from
+  `Carriers`. No `pack_row`, no V×N scan, no `format_staged`.
+- **Dense-routed variants** are expanded to N columns exactly as today. For them the grid
+  is the correct representation and the O(N) expansion is the real work.
+
+Cost becomes **O(total_carriers + V_dense × N)**. Somatic ⇒ `V_dense ≈ 0` ⇒ **linear in
+cohort size**. Germline ⇒ unchanged, because those variants genuinely want dense storage.
+The routing threshold, not the cohort, decides.
+
+**The wrinkle worth designing for.** The sparse streams are **sample-major** (`push_call`
+per column, `sample_lengths` per chunk) — that is *why* the loop at `rvk.rs:341` is
+column-outer, and it is a real constraint on the store layout, not an accident. Emitting
+sample-major output from a variant-major carrier list needs a **counting sort by column
+per chunk**: O(carriers_in_chunk + columns), using the bucket counts as the
+`sample_lengths` row directly.
+
+Expected at N=7089 genome-wide: **~524 billion strided bit-tests → ~58M operations
+(~9,000×)**, and churn sites #1+#2 (**67% of all allocation churn**) drop by ~N×.
+
+### 3.1a Rejected alternative: two-pass, sample-parallel
+
+Build the union var_key index first (heap merge, O(V log N)), then emit each sample's
+calls independently from its own file (O(v_per_file) each, embarrassingly parallel).
+Genuinely linear and parallel, and it would retire the all-files-open design outright.
+
+**Rejected for now**: it reads every input twice and is a rewrite of the orchestrator
+rather than a change to the seam, while §3.1 reaches the same asymptote by extending work
+already required for the memory fix. Worth revisiting if the per-sample fan-out is ever
+wanted for other reasons.
 
 ### 3.2 Stop the per-contig thread storm
 
@@ -236,20 +324,32 @@ becomes inline on the reading thread, which is where the work already happens.
 ### 3.3 Reserve dense staging on the dense count
 
 `rvk.rs:218-222`: reserve `n_dense_variants * num_samples`, and only for classes that
-have variants. Reclaims ~10 GB of address space per chunk at N=7089.
+have variants. Under §3.1 the dense count is known before staging (routing now precedes
+densifying), so this is the natural formulation rather than a patch — but call it out,
+because the current `v_variants`-for-both-classes reserve is a standalone bug worth ~10 GB
+of address space per chunk at N=7089 even after §3.1 lands.
 
 ### 3.4 Field-aware `chunk_size`, then `max_mem` (revived Task 8)
 
-Make `_auto_chunk_size` budget the real per-chunk cost:
+Make `_auto_chunk_size` budget the real per-chunk cost instead of the bit grid alone:
 
 ```
 bytes_per_variant ≈ n_samples * ploidy / 8            # bit grid
-                  + n_format_fields * n_samples * 4    # staged FORMAT
+                  + n_format_fields * n_samples * 4    # staged FORMAT (dense-routed only)
 ```
 
 Then `max_mem` sizes `chunk_size` against that. The baseline doc called this "a knob that
-does nothing" — that verdict was an artifact of `fields = []`. With F=7 it is the
-dominant per-chunk lever.
+does nothing" — that verdict was an artifact of `fields = []`. With F=7 the FORMAT term is
+**112× the grid term**, so it is what a memory budget must actually count.
+
+**Note the interaction with §3.1.** Once sparse-routed variants stop staging FORMAT, the
+somatic case consumes far less than this budget — but the dense fraction is not knowable
+when `chunk_size` is chosen (it is a per-chunk, data-dependent routing outcome). So the
+formula must stay **worst-case (all-dense)**, which makes `max_mem` a genuine *ceiling*
+rather than an estimate: somatic cohorts will simply come in under it. Do not try to
+predict the dense fraction — under-budgeting reintroduces the OOM, while over-budgeting
+only costs a smaller `chunk_size`, which §6 notes has its own (mild) cost via the
+`sample_lengths` term.
 
 ### 3.5 Fix the bench (non-negotiable)
 
@@ -313,6 +413,12 @@ policy is the caller's to set.
   top-5.
 - **End-to-end:** 3-contig N=1000 trace. Today: **9.20 GB peak, +2.3 GB/contig ratchet**.
   Target: flat across contigs.
+- **Asymptote:** the point of §3.1 is a slope change, so measure a **sweep, not a point**.
+  Wall-clock and churn at N ∈ {250, 500, 1000, 2000, 4000} on one contig must go from
+  quadratic to linear. Anchors measured today (single contig, chr1, F=7): N=1000 → 399 s
+  / 4.36 GB; N=4000 → **4,729 s** / 15.44 GB. Note 4× the files cost **11.9× the wall** —
+  that superlinearity *is* the O(V×N), and it is the headline number this design must
+  move. `dense2sparse_vk` should also leave the top of `perf` (it is #1 today at 10.75%).
 - **The real thing:** re-run the 7089-file cohort and compare against the 132 GB
   baseline. This is the only test that exercises N=7089 × 24 contigs.
 
@@ -328,10 +434,18 @@ policy is the caller's to set.
   and measure wall-clock before/after on the bench.
 - **Public API.** `max_mem` on `from_vcf_list` is a new public kwarg ⇒
   `skills/genoray-api/SKILL.md` must be updated in the same PR (repo rule).
-- **N² is still N².** Carrier-sparse removes the O(N) *per record* factor, but total work
-  remains O(V×N) = O(N²) in records-touched for a fully private cohort. This design makes
-  the constant tiny and stops the allocator pathology; it does not change the asymptote.
-  A cohort 10× larger again will need the merge itself rethought.
+- **The residual quadratic term.** §3.1 removes the O(V×N) data path, but the
+  sample-major layout still writes one `sample_lengths` entry per (chunk, column),
+  i.e. **Θ(V × N / chunk_size)**. That is genuinely quadratic in cohort size — but
+  divided by 25,000 and tunable via `chunk_size`, and it is the ledger already measured
+  at **13.6 MB** at N=7089. It is bookkeeping, not a wall. If it ever bites, store
+  `sample_lengths` sparsely (only columns with ≥1 call in the chunk) — though note that
+  at chunk_size=25,000 and N=7089 most columns *do* carry a call, so the dense row is
+  currently the right choice.
+- **Routing threshold now has teeth.** With sparse and dense paths diverging in cost, the
+  `VarKey`-vs-`Dense` decision at `rvk.rs:241` stops being a storage detail and becomes a
+  performance cliff: a cohort that misroutes many variants to `Dense` pays the old O(V×N).
+  Confirm the threshold's behaviour on a germline cohort, not just somatic.
 
 ## Reproducing
 
