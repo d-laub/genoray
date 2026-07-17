@@ -78,7 +78,7 @@ def main() -> None:
         fh.write(src)
         runner = fh.name
 
-    wall_s = maxrss_kb = None
+    wall_s = cpu_s = maxrss_kb = None
     try:
         if a.profiler == "memray":
             subprocess.run(["memray", "run", "-o", "bench.memray", runner], check=True)
@@ -99,12 +99,17 @@ def main() -> None:
                     r"Maximum resident set size \(kbytes\): (\d+)", proc.stderr
                 )
                 e = re.search(r"Elapsed \(wall clock\).*?:\s*([\d:.]+)", proc.stderr)
+                u = re.search(r"User time \(seconds\):\s*([\d.]+)", proc.stderr)
+                s = re.search(r"System time \(seconds\):\s*([\d.]+)", proc.stderr)
                 # Fail loud rather than write a blank row: a silent None here would
-                # look like a real zero-cost measurement in a multi-N sweep.
-                if m is None or e is None:
+                # look like a real zero-cost measurement in a multi-N sweep. Same
+                # reasoning applies to CPU time -- a silently-zero cpu_s would
+                # corrupt an exponent fit exactly the way a blank wall_s would.
+                if m is None or e is None or u is None or s is None:
                     raise RuntimeError(
-                        "could not parse MaxRSS/Elapsed from /usr/bin/time -v output; "
-                        "refusing to append a blank results row"
+                        "could not parse MaxRSS/Elapsed/User/System from "
+                        "/usr/bin/time -v output; refusing to append a blank "
+                        "results row"
                     )
                 maxrss_kb = int(m.group(1))
                 parts = [float(x) for x in e.group(1).split(":")]
@@ -113,6 +118,7 @@ def main() -> None:
                     + (parts[-2] * 60 if len(parts) > 1 else 0)
                     + (parts[-3] * 3600 if len(parts) > 2 else 0)
                 )
+                cpu_s = float(u.group(1)) + float(s.group(1))
     finally:
         Path(runner).unlink(missing_ok=True)
 
@@ -121,10 +127,13 @@ def main() -> None:
     with open(a.results, "a", newline="") as fh:
         w = csv.writer(fh)
         if new:
-            w.writerow(["n_files", "fields", "wall_s", "maxrss_kb", "profiler"])
-        w.writerow([len(paths), n_fields, wall_s, maxrss_kb, a.profiler])
+            w.writerow(
+                ["n_files", "fields", "wall_s", "cpu_s", "maxrss_kb", "profiler"]
+            )
+        w.writerow([len(paths), n_fields, wall_s, cpu_s, maxrss_kb, a.profiler])
     print(
-        f"n_files={len(paths)} fields={n_fields} wall_s={wall_s} maxrss_kb={maxrss_kb}"
+        f"n_files={len(paths)} fields={n_fields} wall_s={wall_s} cpu_s={cpu_s} "
+        f"maxrss_kb={maxrss_kb}"
     )
 
 

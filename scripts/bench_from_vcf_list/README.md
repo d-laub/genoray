@@ -35,7 +35,10 @@ contigs at cohort-generation time (step 1) if you need a subset. Pass
 this is what makes the harness see the FORMAT-field cost that a
 zero-FORMAT-field run misses.
 
-`results.csv` gets one `n_files,wall_s,maxrss_kb,profiler` row per run.
+`results.csv` gets one `n_files,fields,wall_s,cpu_s,maxrss_kb,profiler` row per
+run. This box is shared and often under heavy load from other tenants, so
+`wall_s` is indicative only -- fit scaling exponents against `cpu_s` (user +
+sys), which is load-robust since this workload is single-core-bound.
 
 ## 3. Python allocations (memray)
 
