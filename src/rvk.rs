@@ -598,6 +598,16 @@ pub fn dense2sparse_vk(
         return dense2sparse_vk_by_scan(chunk, bank, sidecar_bits_enabled, fields);
     };
 
+    debug_assert!(
+        chunk.format_by_carrier.is_some()
+            || fields.iter().all(|f| f.category != FieldCategory::Format),
+        "carrier-bearing chunk must carry format_by_carrier whenever FORMAT fields are requested"
+    );
+    debug_assert!(
+        chunk.format_staged.is_empty() || chunk.format_by_carrier.is_none(),
+        "carrier-bearing chunk must not also stage a dense FORMAT grid"
+    );
+
     let (v_variants, num_samples, ploidy) = chunk.genos.shape;
     let columns = num_samples * ploidy;
     debug_assert_eq!(
@@ -784,33 +794,40 @@ mod tests {
     // sample `i % s`'s first ploidy slot (SNP A->C, source_alt_index 1
     // throughout) -- with `genos` and `carriers` populated as two consistent
     // encodings of the same presence data, per the differential test's
-    // premise. Also stages two FORMAT columns' worth of deterministic values
-    // so a test that requests `two_format_fields()` has real data to push;
-    // harmless (unread) for a test that passes no fields.
+    // premise. Also populates `format_by_carrier` with two fields' worth of
+    // deterministic values (DP = v*n_samples+s, GQ = 2*(v*n_samples+s), for
+    // the variant's sole carrier sample `s`) so a test that requests
+    // `two_format_fields()` has real data to push; harmless (unread) for a
+    // test that passes no fields. `format_staged` is left empty -- per Task
+    // 3, a carrier-bearing chunk never stages the dense FORMAT grid, so this
+    // mirrors what `ChunkAssembler::read_next_chunk` actually produces.
     fn private_chunk(v_variants: usize, n_samples: usize) -> DenseChunk {
+        use crate::record_source::{CarrierFormat, FormatVals};
+        use std::sync::Arc;
+
         let ploidy = 2usize;
         let columns = n_samples * ploidy;
         let refs: Vec<&[u8]> = vec![b"A"; v_variants];
         let alts: Vec<&[u8]> = vec![b"C"; v_variants];
         let mut bit_pattern = vec![false; v_variants * columns];
         let mut carriers = Vec::with_capacity(v_variants);
+        let mut format_by_carrier: Vec<Arc<FormatVals>> = Vec::with_capacity(v_variants);
         for i in 0..v_variants {
             let hap = (i % n_samples) * ploidy; // p = 0
             bit_pattern[i * columns + hap] = true;
             let mut c = Carriers::new();
             c.push(hap as u32, 1);
             carriers.push(c);
+
+            let s = i % n_samples;
+            let flat = (i * n_samples + s) as f64;
+            let mut cf = CarrierFormat::new(2);
+            cf.push_sample(s as u32, &[flat, flat * 2.0]);
+            format_by_carrier.push(Arc::new(FormatVals::ByCarrier(cf)));
         }
         let mut chunk = build_test_chunk(v_variants, n_samples, ploidy, &refs, &alts, &bit_pattern);
         chunk.carriers = Some(carriers);
-        chunk.format_staged = vec![
-            StagedColumn::Int((0..v_variants * n_samples).map(|i| i as i32).collect()),
-            StagedColumn::Int(
-                (0..v_variants * n_samples)
-                    .map(|i| (i * 2) as i32)
-                    .collect(),
-            ),
-        ];
+        chunk.format_by_carrier = Some(format_by_carrier);
         chunk
     }
 
@@ -928,9 +945,14 @@ mod tests {
     }
 
     // The carrier path must resolve FORMAT from `format_by_carrier`, NOT the
-    // `format_staged` grid. Build a carrier-bearing chunk whose grid is
-    // deliberately wrong and whose carrier FORMAT is correct; the emitted
-    // field values must match the carrier FORMAT.
+    // `format_staged` grid. Build a carrier-bearing chunk whose carrier
+    // FORMAT is correct; the emitted field values must match it. Per Task 3,
+    // a carrier-bearing chunk's `format_staged` is always empty (structurally
+    // enforced by the `debug_assert!`s at the top of `dense2sparse_vk`), so
+    // "poisoning the grid" is no longer a representable state to test against
+    // -- `private_chunk` already leaves `format_staged` empty, which is the
+    // strongest possible proof against a stray read: there is nothing there
+    // to read.
     #[test]
     fn carrier_format_read_prefers_format_by_carrier() {
         use crate::record_source::{CarrierFormat, FormatVals};
@@ -952,12 +974,7 @@ mod tests {
             fbc.push(Arc::new(FormatVals::ByCarrier(cf)));
         }
         chunk.format_by_carrier = Some(fbc);
-
-        // Poison the grid so a stray read from it is caught.
-        chunk.format_staged = vec![
-            StagedColumn::Int(vec![-1; v_variants * n_samples]),
-            StagedColumn::Int(vec![-1; v_variants * n_samples]),
-        ];
+        debug_assert!(chunk.format_staged.is_empty());
 
         let mut bank = make_bank();
         let out = dense2sparse_vk(&chunk, &mut bank, false, &two_format_fields());
@@ -972,7 +989,7 @@ mod tests {
         };
         assert!(
             dp.iter().all(|&x| x != -1),
-            "read leaked from poisoned grid: {dp:?}"
+            "resolved value was the -1 default sentinel, not a carrier value: {dp:?}"
         );
         assert_eq!(dp.len(), v_variants);
         // Emission is column-major; every value is 100 + (its variant index).

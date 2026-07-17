@@ -264,7 +264,9 @@ pub(crate) fn resolve_format(
 // not a per-sample buffer) because FORMAT resolution is now lazy: the metadata
 // pass in `read_next_chunk` needs it to resolve `format_vals`'s `Dense` arm
 // (see `resolve_format`) the same way `decompose_raw_record` used to, eagerly,
-// per atom.
+// per atom. Carrier-bearing chunks never run that resolution here: their
+// `format_vals` is moved wholesale into `DenseChunk::format_by_carrier` and
+// resolved in `rvk` per carrier instead.
 struct AtomMeta {
     pos: u32,
     ilen: i32,
@@ -709,11 +711,18 @@ impl ChunkAssembler {
             .iter()
             .map(|spec| StagedColumn::with_capacity(spec.stage_is_float(), v))
             .collect();
-        let mut format_staged: Vec<StagedColumn> = self
-            .format_fields
-            .iter()
-            .map(|spec| StagedColumn::with_capacity(spec.stage_is_float(), v * num_samples))
-            .collect();
+        // A chunk is carrier-bearing iff its first atom carries (uniformity is
+        // asserted below). Decide once, up front, so FORMAT staging can be
+        // skipped entirely for carrier-bearing chunks.
+        let carrier_bearing = metas.first().is_some_and(|a| a.carriers.is_some());
+        let mut format_staged: Vec<StagedColumn> = if carrier_bearing {
+            Vec::new()
+        } else {
+            self.format_fields
+                .iter()
+                .map(|spec| StagedColumn::with_capacity(spec.stage_is_float(), v * num_samples))
+                .collect()
+        };
 
         // Sequential metadata pass (cheap, ordering-preserving).
         let mut off = 0u32;
@@ -729,21 +738,23 @@ impl ChunkAssembler {
             for (i, col) in info_staged.iter_mut().enumerate() {
                 col.push_f64(a.info_vals[i]);
             }
-            // Stage every sample's value for every atom here (F x N per atom,
-            // unconditional on how the variant will eventually route) --
-            // `rvk` decides dense vs. sparse/VarKey downstream and only dense
-            // variants end up reading the per-sample columns, but that
-            // decision isn't made yet at staging time. `max_mem` bounds this
-            // term rather than the staging itself being made conditional.
-            for (j, col) in format_staged.iter_mut().enumerate() {
-                for s in 0..num_samples {
-                    col.push_f64(resolve_format(
-                        &a.format_vals,
-                        &self.format_fields[j],
-                        a.source_alt_index,
-                        s,
-                        j,
-                    ));
+            // Dense-source chunks stage every sample's value per atom (F x N):
+            // for these, `genos`/`format_staged` IS the representation and the
+            // per-sample column is the real work. Carrier-bearing chunks skip
+            // this entirely -- their FORMAT rides `format_by_carrier` and `rvk`
+            // resolves it per carrier (route-before-densify), so the old
+            // unconditional F x N staging (the from_vcf_list O(N^2)) is gone.
+            if !carrier_bearing {
+                for (j, col) in format_staged.iter_mut().enumerate() {
+                    for s in 0..num_samples {
+                        col.push_f64(resolve_format(
+                            &a.format_vals,
+                            &self.format_fields[j],
+                            a.source_alt_index,
+                            s,
+                            j,
+                        ));
+                    }
                 }
             }
             format_arcs.push(Arc::clone(&a.format_vals));
