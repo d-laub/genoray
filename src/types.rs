@@ -1,4 +1,6 @@
+use crate::record_source::{Carriers, FormatVals};
 use crate::streams::StreamMap;
+use std::sync::Arc;
 
 // Key-layout constants now live in the `svar2-codec` crate (single source of
 // layout truth). Re-exported so existing `crate::types::{MIN_I31,
@@ -11,6 +13,7 @@ pub use svar2_codec::{MAX_INLINE_ALT_LEN, MIN_I31};
 // position `idx & 63`. 8x smaller than `Vec<bool>` (1 byte/entry → 1 bit/entry),
 // keeping the inner transpose loop's stride-by-(S*P) pattern intact at 1/8
 // the cache footprint.
+#[derive(Clone)]
 pub struct BitGrid3 {
     pub words: Vec<u64>,
     pub shape: (usize, usize, usize), // (V, S, P)
@@ -96,6 +99,7 @@ impl BitGrid3 {
 // reader path never boxes/dyn-dispatches per value. `Int` also carries Flag
 // columns (staged as 0/1). Values are always produced from `f64` (the common
 // currency `FieldSpec` resolution works in) and narrowed on push.
+#[derive(Debug, Clone, PartialEq)]
 pub enum StagedColumn {
     Int(Vec<i32>),
     Float(Vec<f32>),
@@ -116,11 +120,20 @@ impl StagedColumn {
             StagedColumn::Float(x) => x.push(v as f32),
         }
     }
+
+    /// The inner `Vec`'s capacity -- reservation tests only, not a hot path.
+    pub fn capacity(&self) -> usize {
+        match self {
+            StagedColumn::Int(x) => x.capacity(),
+            StagedColumn::Float(x) => x.capacity(),
+        }
+    }
 }
 
 // Defines DenseChunk and SparseChunk structs. All other files import from here.
 
 // The struct produced by the VCF Reader and consumed by the Compute Thread (variant key)
+#[derive(Clone)]
 pub struct DenseChunk {
     pub chunk_id: usize,
 
@@ -143,11 +156,32 @@ pub struct DenseChunk {
     // then sample-minor: index `variant * num_samples + sample`.
     pub info_staged: Vec<StagedColumn>,
     pub format_staged: Vec<StagedColumn>,
+
+    /// Per-variant carrier lists, one entry per variant in chunk order. `Some`
+    /// only when the record source produced carriers (the k-way merge over
+    /// single-sample VCFs); `None` for natively dense sources (a multi-sample
+    /// VCF, PGEN), whose carriers `rvk` recovers from `genos` instead. Each
+    /// `Carriers` holds exactly the columns whose allele equals that variant's
+    /// own atom's `source_alt_index` -- i.e. exactly the bits `pack_row` set
+    /// for it, so it and `genos` are two encodings of the same presence data.
+    pub carriers: Option<Vec<Carriers>>,
+
+    /// Per-variant FORMAT values, carrier-sparse, one entry per variant in
+    /// chunk order. `Some` iff `carriers.is_some()` (the k-way merge over
+    /// single-sample VCFs); `None` for natively dense sources (multi-sample
+    /// VCF, PGEN), which keep `format_staged`. `carriers` and this are two
+    /// carrier-sparse encodings of the same chunk, keyed differently:
+    /// `carriers` by haplotype column (genotype presence), this by sample
+    /// (FORMAT is per-sample, not per-haplotype). When `Some`, `format_staged`
+    /// is left empty (see chunk_assembler.rs) and `rvk` resolves FORMAT from
+    /// here instead.
+    pub format_by_carrier: Option<Vec<Arc<FormatVals>>>,
 }
 
 // One position-sorted sub-stream of calls with byte-erased keys (`key_bytes`
 // wide, little-endian). Type erasure lets streams of differing widths live in
 // a single `StreamMap`.
+#[derive(Debug, PartialEq)]
 pub struct SparseSubStream {
     // Per-call data, sample-major (sample, ploid, ~variant).
     pub call_positions: Vec<u32>,
@@ -184,6 +218,7 @@ impl SparseSubStream {
 // Per-class dense payload for one chunk: the hap-major 1-bit genotype block
 // plus the per-variant table (positions + keys). Built by `dense2sparse_vk`,
 // consumed by the writer, transposed/concatenated by dense_merge.
+#[derive(Debug, PartialEq)]
 pub struct DenseSubChunk {
     pub key_bytes: usize,
     pub n_dense_variants: usize,
@@ -219,6 +254,7 @@ impl DenseSubChunk {
 // The transposed, sparse packet produced by the Compute Thread and consumed by
 // the Writer Thread — one `SparseSubStream` per active `StreamTag` (see
 // data-model.md#on-disk-layout).
+#[derive(Debug, PartialEq)]
 pub struct SparseChunk {
     pub chunk_id: usize,
     pub streams: StreamMap<SparseSubStream>,

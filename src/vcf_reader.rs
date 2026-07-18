@@ -295,12 +295,16 @@ impl VcfRecordSource {
             ))
         })?;
 
-        reader
-            .set_threads(htslib_threads)
-            .map_err(|e| ConversionError::Io {
-                context: format!("allocating {htslib_threads} HTSlib background threads"),
-                source: std::io::Error::other(e.to_string()),
-            })?;
+        // rust-htslib asserts n_threads > 0, so 0 must skip the call entirely rather
+        // than pass through. 0 => htslib decompresses inline on the reading thread.
+        if htslib_threads > 0 {
+            reader
+                .set_threads(htslib_threads)
+                .map_err(|e| ConversionError::Io {
+                    context: format!("allocating {htslib_threads} HTSlib background threads"),
+                    source: std::io::Error::other(e.to_string()),
+                })?;
+        }
 
         let header = reader.header().clone();
 
@@ -501,9 +505,9 @@ impl VcfRecordSource {
             pos,
             reference,
             alts,
-            gt,
+            calls: crate::record_source::Calls::Dense(gt),
             info_raw,
-            format_raw,
+            format_vals: crate::record_source::FormatVals::Dense(format_raw),
         }))
     }
 }
@@ -511,6 +515,76 @@ impl VcfRecordSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rust_htslib::bcf::record::GenotypeAllele;
+    use rust_htslib::bcf::{Format, Header, Writer};
+
+    // One-sample, CSI-indexed BCF fixture: `records` are (0-based pos, REF,
+    // ALT, GT string e.g. "1/1"). Mirrors `vcf_list_reader::tests::write_ss_vcf`
+    // but keyed by an inline GT string rather than a pre-split allele Vec, and
+    // always on contig "1". Returns the path as a `String` so callers can pass
+    // `&path` directly where a `&str` is expected (deref coercion).
+    fn write_one_sample_vcf(
+        dir: &std::path::Path,
+        sample: &str,
+        records: &[(u32, &str, &str, &str)],
+    ) -> String {
+        let path = dir.join("one_sample.bcf");
+        let mut header = Header::new();
+        header.push_record(b"##contig=<ID=1,length=1000>");
+        header.push_record(b"##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">");
+        header.push_sample(sample.as_bytes());
+        {
+            let mut writer =
+                Writer::from_path(&path, &header, false, Format::Bcf).expect("open BCF writer");
+            for &(pos, r, a, gt) in records {
+                let mut record = writer.empty_record();
+                record.set_rid(Some(0));
+                record.set_pos(pos as i64);
+                record
+                    .set_alleles(&[r.as_bytes(), a.as_bytes()])
+                    .expect("set alleles");
+                let alleles: Vec<GenotypeAllele> = gt
+                    .split(['/', '|'])
+                    .map(|tok| {
+                        if tok == "." {
+                            GenotypeAllele::PhasedMissing
+                        } else {
+                            GenotypeAllele::Phased(tok.parse().expect("genotype allele index"))
+                        }
+                    })
+                    .collect();
+                record.push_genotypes(&alleles).expect("push genotypes");
+                writer.write(&record).expect("write record");
+            }
+        }
+        rust_htslib::bcf::index::build(&path, None, 0, rust_htslib::bcf::index::Type::Csi(14))
+            .expect("build BCF index");
+        path.to_str().expect("utf8 path").to_string()
+    }
+
+    #[test]
+    fn zero_htslib_threads_opens_without_a_decode_pool() {
+        // rust-htslib's set_threads asserts n_threads > 0 (bcf/mod.rs:171), so 0 must mean
+        // "skip the call", not "pass 0". from_vcf_list holds N files open per contig, so a
+        // per-file thread is N threads per contig -- the arena driver behind #120.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_one_sample_vcf(dir.path(), "s0", &[(100u32, "A", "T", "1/1")]);
+        let src = VcfRecordSource::new(
+            &path,
+            "1",
+            &["s0"],
+            0,
+            2,
+            &[],
+            Vec::new(),
+            crate::svar2_view::OverlapMode::Pos,
+        );
+        assert!(
+            src.is_ok(),
+            "htslib_threads = 0 must open cleanly: {:?}",
+            src.err()
+        );
+    }
 
     #[test]
     fn shard_planner_covers_owned_ranges_with_padded_fetches() {

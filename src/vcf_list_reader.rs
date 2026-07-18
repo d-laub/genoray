@@ -13,11 +13,12 @@
 //! each carrier contributing its own file's value and non-carriers falling back
 //! to the field's default downstream.
 
-use crate::chunk_assembler::resolve_scalar;
 use crate::error::ConversionError;
 use crate::field::{FieldCategory, FieldSpec};
 use crate::normalize::{L_MAX, atomize_to_vcf_biallelic};
-use crate::record_source::{RawRecord, RecordSource};
+use crate::record_source::{
+    Calls, CarrierFormat, Carriers, FormatVals, RawRecord, RecordSource, resolve_scalar,
+};
 use crate::vcf_reader::VcfRecordSource;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, VecDeque};
@@ -163,7 +164,7 @@ impl FileCursor {
                         let k = br.source_alt_index as i32;
                         let mut ploid_codes = vec![0i32; ploidy];
                         for (p, code) in ploid_codes.iter_mut().enumerate() {
-                            let g = rec.gt[p];
+                            let g = rec.calls.allele_at(p);
                             *code = if g == -1 {
                                 -1
                             } else if g == k {
@@ -174,7 +175,7 @@ impl FileCursor {
                         }
 
                         // Resolve this atom's field values against THIS file's raw
-                        // record buffer now, while `rec.info_raw`/`rec.format_raw`
+                        // record buffer now, while `rec.info_raw`/`rec.format_vals`
                         // (and `br.source_alt_index`) are still in scope — the merge
                         // heap only ever sees the pre-resolved scalars from here on.
                         let info_vals: Vec<f64> = info_specs
@@ -184,10 +185,17 @@ impl FileCursor {
                                 resolve_scalar(raw.as_deref(), br.source_alt_index, spec)
                             })
                             .collect();
+                        // `rec` comes from a per-file `VcfRecordSource`, which always
+                        // produces `Dense` (one single-sample VCF's own record is the
+                        // dense representation for that one sample -- there is no
+                        // narrower carrier list to build here).
+                        let FormatVals::Dense(format_raw) = &rec.format_vals else {
+                            unreachable!("VcfRecordSource always produces Dense FormatVals")
+                        };
                         // Single sample per file ⇒ always inner index 0.
                         let format_vals: Vec<f64> = format_specs
                             .iter()
-                            .zip(rec.format_raw.iter())
+                            .zip(format_raw.iter())
                             .map(|(spec, raw)| {
                                 let sample_vals = raw.as_ref().map(|v| v[0].as_slice());
                                 resolve_scalar(sample_vals, br.source_alt_index, spec)
@@ -248,16 +256,33 @@ impl Ord for HeapEntry {
     }
 }
 
+/// Frontier-heap key: which live cursor to advance next.
+///
+/// The derived `Ord` compares `frontier` then `col`, and `Option`'s own `Ord`
+/// puts `None` before every `Some(_)` — so a min-heap of these reproduces the
+/// old O(N) `min_by_key(|c| c.frontier)` scan exactly, including its
+/// first-min-wins tiebreak (equal frontiers → smallest column wins).
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct FrontierKey {
+    frontier: Option<u32>,
+    col: usize,
+}
+
 /// K-way merge of N single-sample VCFs (with possibly disjoint site lists) into
 /// one biallelic, hom-ref-filled `RawRecord` stream.
 pub struct VcfListRecordSource {
     cursors: Vec<FileCursor>,
     heap: BinaryHeap<Reverse<HeapEntry>>,
+    /// One entry per *live* cursor, keyed by its frontier — makes selecting the
+    /// cursor to advance O(log N) instead of an O(N) scan over `cursors`.
+    /// Invariant: exactly one entry per non-eof cursor, maintained by popping the
+    /// advanced cursor's entry and pushing its updated frontier back (an eof'd
+    /// cursor is simply never re-pushed).
+    frontier_heap: BinaryHeap<Reverse<FrontierKey>>,
     ref_seq: Option<Vec<u8>>,
     ploidy: usize,
     skip_out_of_scope: bool,
     check_ref: crate::normalize::CheckRef,
-    num_samples: usize,
     info_specs: Vec<FieldSpec>,
     format_specs: Vec<FieldSpec>,
 }
@@ -342,14 +367,27 @@ impl VcfListRecordSource {
             .filter(|f| f.category == FieldCategory::Format)
             .cloned()
             .collect();
+        // Seed the frontier heap with every live cursor (all unstarted, so all
+        // `frontier == None`); a file whose header lacks `chrom` is already eof
+        // and never participates.
+        let frontier_heap: BinaryHeap<Reverse<FrontierKey>> = cursors
+            .iter()
+            .filter(|c| !c.eof)
+            .map(|c| {
+                Reverse(FrontierKey {
+                    frontier: c.frontier,
+                    col: c.col,
+                })
+            })
+            .collect();
         Ok(Self {
             cursors,
             heap: BinaryHeap::new(),
+            frontier_heap,
             ref_seq: ref_seq.map(|s| s.to_vec()),
             ploidy,
             skip_out_of_scope,
             check_ref,
-            num_samples: vcf_paths.len(),
             info_specs,
             format_specs,
         })
@@ -379,7 +417,10 @@ impl VcfListRecordSource {
     // Build the merged `RawRecord` for a group of same-key `(col, NormAtom)`
     // pairs: one biallelic record whose REF/ALT come from the first atom (they
     // agree by construction — same key), with every column not present in the
-    // group left hom-ref (`0`, the `gt` vec's fill value).
+    // group left hom-ref by omission from the `Carriers` list `Calls::Sparse`
+    // carries (see below) — `group` already names every haplotype that isn't
+    // hom-ref for this atom, so there's no need to widen to `num_samples *
+    // ploidy` and scan it back downstream.
     fn build_record(
         &self,
         key: &(u32, i32, Vec<u8>),
@@ -430,10 +471,89 @@ impl VcfListRecordSource {
             }
         }
         let alt = group[0].1.alt.clone();
-        let mut gt = vec![0i32; self.num_samples * self.ploidy];
-        for (col, atom) in &group {
-            let base = col * self.ploidy;
-            gt[base..base + self.ploidy].copy_from_slice(&atom.ploid_codes);
+        // The frontier `group` is already exactly the carrier list: one entry per file
+        // whose next record is at this key. Build `Carriers` from it directly rather
+        // than materialising an N-wide vector and scanning it back downstream — this
+        // retires churn site #1 (70.66 GB / 11.8M blocks while never holding more than
+        // 43 MB live, per dhat).
+        //
+        // `group` is ascending in `col` ONLY across DISTINCT files: each `FileCursor`
+        // owns a unique `col`, so two entries from different files can never tie.
+        // But `col` is NOT unique across the whole group — a single multiallelic
+        // record can atomize (`normalize::atomize_biallelic`) into more than one
+        // sub-atom sharing the same elementary `(pos, ilen, alt)` key (e.g. REF
+        // `AGC` ALT `TGC,TGA` both contribute a `pos+0, SNV A>T` sub-atom), and
+        // `FileCursor::advance` buffers those sub-atoms one at a time, so the SAME
+        // cursor's `col` can be re-pushed onto `self.heap` more than once before a
+        // group is drained — see `multiallelic_key_collision_collapses_last_write_wins`
+        // below, which reproduces exactly this case and would panic on the old
+        // "no two atoms share a col" assumption. So `group` can contain more than one
+        // `(col, atom)` pair for the same `col`, and `Carriers::push` requires
+        // strictly ascending, UNIQUE columns — collapse duplicates before pushing.
+        //
+        // Collapse with last-write-wins per `col`, in `group` iteration order: this
+        // matches the pre-Task-5 dense `build_record`, which looped `for (col, atom)
+        // in &group { gt[base..base+ploidy].copy_from_slice(&atom.ploid_codes) }` —
+        // a later atom for the same `col` fully overwrote an earlier one's ploidy
+        // block.
+        //
+        // A `BTreeMap` reproduces that (overwrite-on-repeat-key, ascending
+        // iteration) but allocates a node on every insert -- paid on every
+        // emitted record, including the overwhelming common case of zero
+        // collisions, which is exactly the allocation churn #120 exists to
+        // remove. `group` is popped off `self.heap` -- a `BinaryHeap` of
+        // `Reverse<HeapEntry>`, i.e. a min-heap over `HeapEntry::cmp`, which
+        // orders by `(key, col)` ascending (see `HeapEntry::key`/`Ord` above)
+        // -- one entry at a time in the group-drain loop, so `group` is
+        // non-decreasing in `col`: any repeated `col` is a CONTIGUOUS run.
+        // Walk `group` collapsing each such run to its last element (the
+        // run's last atom is also the last atom for that `col` in overall
+        // `group` order, since later cols can't sort back before it) --
+        // same last-write-wins result as the `BTreeMap`, with no allocation
+        // beyond `Carriers`'s own buffers.
+        // FORMAT: per-sample, built in the SAME collapse pass as `carriers` below.
+        // A file's presence in `group` at all (regardless of its `ploid_codes`)
+        // is what makes it a FORMAT member here -- matching the pre-existing
+        // dense semantics, which set `per_sample[*col]` for every `(col, atom)`
+        // in `group` unconditionally. `CarrierFormat::push_sample` requires
+        // strictly ascending, UNIQUE sample indices, same as `Carriers::push`
+        // requires for columns -- so it needs the identical duplicate-`col`
+        // collapse (last-write-wins) as the carrier loop just below, not a
+        // second, independent walk of `group`.
+        let mut cf = CarrierFormat::new(self.format_specs.len());
+
+        let mut carriers = Carriers::new();
+        let mut i = 0;
+        while i < group.len() {
+            let col = group[i].0;
+            let mut j = i;
+            while j + 1 < group.len() && group[j + 1].0 == col {
+                j += 1;
+            }
+            // `group[j]` is the run's last atom == the last-write-wins winner
+            // for this `col`.
+            let winner = &group[j].1;
+            if !self.format_specs.is_empty() {
+                cf.push_sample(col as u32, &winner.format_vals);
+            }
+            let ploid_codes = &winner.ploid_codes;
+            let base = (col * self.ploidy) as u32;
+            for (p, &code) in ploid_codes.iter().enumerate() {
+                // `ploid_codes`: -1 missing, 1 carries this atom's source ALT, 0 other
+                // (incl. REF). Only non-zero codes are carriers; 0 means REF, which
+                // `Calls::Sparse` represents by absence.
+                if code != 0 {
+                    // `NormAtom` has no `source_alt_index` field of its own (unlike
+                    // `PendingAtom` downstream): every merged `RawRecord` this function
+                    // returns is single-ALT (`alts: vec![alt]`, just below), so once
+                    // `chunk_assembler::decompose_raw_record` re-atomizes it, the
+                    // resulting `PendingAtom::source_alt_index` is deterministically
+                    // `1` — matching the `1` a carrier gets here.
+                    let allele = if code < 0 { -1 } else { 1 };
+                    carriers.push(base + p as u32, allele);
+                }
+            }
+            i = j + 1;
         }
 
         // INFO: first-carrier wins. `group` is popped off the heap in
@@ -445,27 +565,13 @@ impl VcfListRecordSource {
             .map(|i| Some(vec![group[0].1.info_vals[i]]))
             .collect();
 
-        // FORMAT: per-sample. Each carrier column supplies its own file's
-        // value; a non-carrier column is left an empty buffer, which
-        // `resolve_scalar` downstream (in `ChunkAssembler`) resolves to the
-        // field's default — same contract as a record-absent field.
-        let format_raw: Vec<Option<Vec<Vec<f64>>>> = (0..self.format_specs.len())
-            .map(|j| {
-                let mut per_sample: Vec<Vec<f64>> = vec![Vec::new(); self.num_samples];
-                for (col, atom) in &group {
-                    per_sample[*col] = vec![atom.format_vals[j]];
-                }
-                Some(per_sample)
-            })
-            .collect();
-
         Ok(RawRecord {
             pos: key.0,
             reference,
             alts: vec![alt],
-            gt,
+            calls: Calls::Sparse(carriers),
             info_raw,
-            format_raw,
+            format_vals: FormatVals::ByCarrier(cf),
         })
     }
 }
@@ -473,41 +579,32 @@ impl VcfListRecordSource {
 impl RecordSource for VcfListRecordSource {
     fn next_record(&mut self) -> Result<Option<RawRecord>, ConversionError> {
         loop {
-            // One pass over the cursors computes every liveness aggregate AND
-            // the advance target at once. This inner `loop` runs once per atom
-            // read plus once per record emitted, so at N files it was
-            // O((atoms + records) * N) with a fresh `Vec<Option<u32>>`
-            // allocated every iteration (both the top-of-loop `live_frontiers`
-            // collect and the separate `min_by_key` argmin scan showed up as
-            // the dominant cost under `perf`). Fusing them keeps the algorithm
-            // O(N) per iteration but drops the per-iteration allocation and
-            // three of the four scans. (A frontier heap would make selection
-            // O(log N) — deferred; the constant-factor win here is the easy
-            // one and leaves behaviour identical.)
-            let mut any_live = false;
-            let mut all_started = true;
-            let mut min_started: Option<u32> = None;
-            // The live cursor with the smallest frontier, `None` (unstarted)
-            // sorting before every `Some(_)` — matches the old
-            // `min_by_key(|c| c.frontier)`, including its first-min-wins
-            // tiebreak (strict `<` keeps the earliest index on ties).
-            let mut advance_idx: Option<usize> = None;
-            let mut advance_key: Option<Option<u32>> = None;
-            for (i, c) in self.cursors.iter().enumerate() {
-                if c.eof {
-                    continue;
-                }
-                any_live = true;
-                match c.frontier {
-                    None => all_started = false,
-                    Some(f) => min_started = Some(min_started.map_or(f, |m| m.min(f))),
-                }
-                if advance_key.is_none_or(|best| c.frontier < best) {
-                    advance_key = Some(c.frontier);
-                    advance_idx = Some(i);
-                }
-            }
-            let all_eof = !any_live;
+            // Selection is O(log N) via `frontier_heap` (one entry per live
+            // cursor), replacing the old O(N) scan over `cursors` — which this
+            // inner `loop` ran once per atom read *plus* once per record
+            // emitted, i.e. O((atoms + records) * N) overall, and which `perf`
+            // measured at ~35% of total conversion self-time at N=500 (a share
+            // that grows linearly in N).
+            //
+            // Every aggregate the release gate needs falls out of the heap's
+            // top, because `FrontierKey` orders `None` (unstarted) before every
+            // `Some(_)`:
+            //   - empty heap             => no live cursors => all_eof
+            //   - top.frontier.is_some() => no unstarted live cursor left
+            //                               => all_started
+            //
+            // `min_frontier` is exactly the heap top — the minimum frontier over
+            // all LIVE cursors. Under `all_started` (every live frontier `Some`)
+            // it therefore equals the old scan's "min *started* frontier", which
+            // is the only condition the gate below reads it under (the `&&`
+            // short-circuits). It is deliberately NOT that quantity when an
+            // unstarted cursor exists — it is `None` there — so do not read it
+            // outside the `all_started` guard.
+            let (all_eof, all_started, min_frontier, advance_idx) = match self.frontier_heap.peek()
+            {
+                None => (true, true, None, None),
+                Some(Reverse(top)) => (false, top.frontier.is_some(), top.frontier, Some(top.col)),
+            };
 
             // Unstarted cursors (`frontier == None`) must be read before anything
             // can release — otherwise a not-yet-opened file's first record could
@@ -515,7 +612,7 @@ impl RecordSource for VcfListRecordSource {
             let releasable = all_eof
                 || (all_started
                     && self.heap.peek().is_some_and(|Reverse(e)| {
-                        min_started.is_some_and(|m| e.atom.pos < m.saturating_sub(L_MAX))
+                        min_frontier.is_some_and(|m| e.atom.pos < m.saturating_sub(L_MAX))
                     }));
 
             if releasable {
@@ -546,10 +643,22 @@ impl RecordSource for VcfListRecordSource {
                 };
             }
 
-            // Advance the live cursor with the smallest frontier (computed in
-            // the single pass above).
+            // Advance the live cursor with the smallest frontier (the frontier
+            // heap's top). Drop its entry first, then re-insert its updated
+            // frontier afterwards, so the heap keeps exactly one entry per live
+            // cursor; a cursor that just hit eof is simply not re-pushed.
             match advance_idx {
                 Some(i) => {
+                    // `i` came from `FrontierKey::col`, so the frontier heap
+                    // indexes `cursors` by `col` — which only works because the
+                    // constructor builds one cursor per `enumerate()` index (see
+                    // `new`). Pin that or a reordered `cursors` would silently
+                    // advance the wrong file.
+                    debug_assert_eq!(
+                        self.cursors[i].col, i,
+                        "frontier heap indexes cursors by col"
+                    );
+                    self.frontier_heap.pop();
                     let ref_seq = self.ref_seq.as_deref();
                     if let Some(atom) = self.cursors[i].advance(
                         ref_seq,
@@ -563,6 +672,12 @@ impl RecordSource for VcfListRecordSource {
                         // (see `HeapEntry::key`) — no separate key to allocate.
                         let col = self.cursors[i].col;
                         self.heap.push(Reverse(HeapEntry { col, atom }));
+                    }
+                    if !self.cursors[i].eof {
+                        self.frontier_heap.push(Reverse(FrontierKey {
+                            frontier: self.cursors[i].frontier,
+                            col: self.cursors[i].col,
+                        }));
                     }
                 }
                 // No live cursors: `all_eof` was already true above, which forces
@@ -581,6 +696,17 @@ mod tests {
     use rust_htslib::bcf::{Format, Header, Writer};
     use std::path::{Path, PathBuf};
     use tempfile::tempdir;
+
+    // Build the `Calls::Sparse` `next_record` now emits from `(col, allele)` pairs,
+    // ascending by col -- shorthand for the N-wide `Calls::Dense(vec![...])` literals
+    // every test below used before the merge stopped widening to N.
+    fn sparse(pairs: &[(u32, i32)]) -> Calls {
+        let mut c = Carriers::new();
+        for &(col, allele) in pairs {
+            c.push(col, allele);
+        }
+        Calls::Sparse(c)
+    }
 
     // One synthetic single-sample record: 0-based pos, REF, ALTs, and a flat
     // per-haplotype genotype (allele index, or -1 for missing), length ploidy.
@@ -714,11 +840,11 @@ mod tests {
         let r1 = src.next_record().unwrap().unwrap();
         assert_eq!(r1.pos, 2);
         assert_eq!(r1.alts, vec![b"G".to_vec()]);
-        assert_eq!(r1.gt, vec![1, 0, /* SB */ 0, 0]);
+        assert_eq!(r1.calls, sparse(&[/* SA hap0 */ (0, 1)]));
 
         let r2 = src.next_record().unwrap().unwrap();
         assert_eq!(r2.pos, 6);
-        assert_eq!(r2.gt, vec![/* SA */ 0, 0, /* SB */ 0, 1]);
+        assert_eq!(r2.calls, sparse(&[/* SB hap1 */ (3, 1)]));
 
         assert!(src.next_record().unwrap().is_none());
         assert_eq!(src.dropped_out_of_scope(), 0);
@@ -778,7 +904,7 @@ mod tests {
         let r1 = src.next_record().unwrap().unwrap();
         assert_eq!(r1.pos, 2);
         assert_eq!(r1.alts, vec![b"G".to_vec()]);
-        assert_eq!(r1.gt, vec![1, 0, 0, 1]);
+        assert_eq!(r1.calls, sparse(&[(0, 1), (3, 1)]));
         assert!(src.next_record().unwrap().is_none());
     }
 
@@ -821,12 +947,82 @@ mod tests {
         let r1 = src.next_record().unwrap().unwrap();
         assert_eq!(r1.pos, 2);
         assert_eq!(r1.alts, vec![b"G".to_vec()]);
-        assert_eq!(r1.gt, vec![1, 0]);
+        assert_eq!(r1.calls, sparse(&[(0, 1)]));
 
         let r2 = src.next_record().unwrap().unwrap();
         assert_eq!(r2.pos, 2);
         assert_eq!(r2.alts, vec![b"T".to_vec()]);
-        assert_eq!(r2.gt, vec![0, 1]);
+        assert_eq!(r2.calls, sparse(&[(1, 1)]));
+
+        assert!(src.next_record().unwrap().is_none());
+    }
+
+    // Reviewer finding: a single multiallelic record can atomize into two
+    // sub-atoms sharing the same elementary `(pos, ilen, alt)` merge key --
+    // here REF `AGC` ALT `TGC,TGA`: ALT1 (`TGC`) atomizes to one SNV at pos+0
+    // (A>T); ALT2 (`TGA`) atomizes to an interior SNV at pos+0 (A>T -- the
+    // SAME key as ALT1's atom) plus a boundary SNV at pos+2 (C>A). Both pos+0
+    // sub-atoms come from the SAME file/cursor (`col`), so the merge frontier
+    // `group` for that key holds two `(col, atom)` pairs with an IDENTICAL
+    // `col` -- proven by this test to panic pre-fix (`Carriers::push`'s
+    // debug_assert "carrier columns must be pushed strictly ascending" fires,
+    // since the old code assumed one atom per `col` per group). GT `2|1`
+    // makes the two colliding sub-atoms genuinely divergent (ALT1's atom
+    // carries hap1 only, ploid_codes `[0, 1]`; ALT2's atom carries hap0 only,
+    // `[1, 0]`), so this also exercises the last-write-wins collapse, not
+    // just a no-op dedup of identical values.
+    #[test]
+    fn multiallelic_key_collision_collapses_last_write_wins() {
+        let tmp = tempdir().unwrap();
+        let a = write_ss_vcf(
+            tmp.path(),
+            "a",
+            "chr1",
+            100,
+            "SA",
+            &[SsRec {
+                pos: 2,
+                r: b"AGC",
+                alts: vec![b"TGC", b"TGA"],
+                gt: vec![2, 1],
+            }],
+        );
+        let ref_seq = make_ref(tmp.path(), "chr1", 100, &[(2, b"AGC")]);
+
+        let paths = vec![a.to_str().unwrap().to_string()];
+        let samples = vec!["SA"];
+        let mut src = VcfListRecordSource::new(
+            &paths,
+            &samples,
+            "chr1",
+            Some(&ref_seq),
+            2,
+            1,
+            false,
+            CheckRef::Error,
+            &[],
+            Vec::new(),
+            crate::svar2_view::OverlapMode::Pos,
+        )
+        .unwrap();
+
+        // The colliding key (pos 2, A>T) releases as one merged record. Per
+        // the group-drain order (buffer order == ALT order: ALT1's atom
+        // first, ALT2's atom last), last-write-wins picks ALT2's atom
+        // (`ploid_codes [1, 0]`) -- exactly what the pre-Task-5 dense
+        // `build_record`'s `copy_from_slice`, run over the same `group`
+        // order, would also have produced for this `col`'s whole ploidy
+        // block: `gt[0..2] = [1, 0]`, i.e. hap0 carries, hap1 does not.
+        let r1 = src.next_record().unwrap().unwrap();
+        assert_eq!(r1.pos, 2);
+        assert_eq!(r1.alts, vec![b"T".to_vec()]);
+        assert_eq!(r1.calls, sparse(&[(0, 1)]));
+
+        // The non-colliding boundary atom (pos 4, C>A) is unaffected.
+        let r2 = src.next_record().unwrap().unwrap();
+        assert_eq!(r2.pos, 4);
+        assert_eq!(r2.alts, vec![b"A".to_vec()]);
+        assert_eq!(r2.calls, sparse(&[(0, 1)]));
 
         assert!(src.next_record().unwrap().is_none());
     }
@@ -869,7 +1065,7 @@ mod tests {
 
         let r1 = src.next_record().unwrap().unwrap();
         assert_eq!(r1.pos, 2);
-        assert_eq!(r1.gt, vec![-1, 1]);
+        assert_eq!(r1.calls, sparse(&[(0, -1), (1, 1)]));
         assert!(src.next_record().unwrap().is_none());
     }
 
@@ -935,7 +1131,7 @@ mod tests {
 
         let r1 = src.next_record().unwrap().unwrap();
         assert_eq!(r1.pos, 2);
-        assert_eq!(r1.gt, vec![1, 0, /* SB, filled hom-ref */ 0, 0]);
+        assert_eq!(r1.calls, sparse(&[/* SA hap0 */ (0, 1)]));
         assert!(src.next_record().unwrap().is_none());
     }
 
@@ -1050,7 +1246,14 @@ mod tests {
         let r1 = src.next_record().unwrap().unwrap();
         assert_eq!(r1.pos, 10);
         assert_eq!(r1.alts, vec![b"G".to_vec()]);
-        assert_eq!(r1.gt, vec![/* SA */ 1, 0, /* SB */ 0, 0, /* SC */ 1, 1]);
+        assert_eq!(
+            r1.calls,
+            sparse(&[
+                /* SA hap0 */ (0, 1),
+                /* SC hap0 */ (4, 1),
+                /* SC hap1 */ (5, 1)
+            ])
+        );
 
         // Discriminator: this record can only have been released through the
         // FRONTIER gate, not the `all_eof` drain — SA and SB are still live
@@ -1076,7 +1279,10 @@ mod tests {
         let r2 = src.next_record().unwrap().unwrap();
         assert_eq!(r2.pos, 1500);
         assert_eq!(r2.alts, vec![b"G".to_vec()]);
-        assert_eq!(r2.gt, vec![/* SA */ 1, 0, /* SB */ 0, 1, /* SC */ 0, 0]);
+        assert_eq!(
+            r2.calls,
+            sparse(&[/* SA hap0 */ (0, 1), /* SB hap1 */ (3, 1)])
+        );
 
         // Records 3 & 4: pos 4000 stays as TWO separate records — SB's DEL
         // (ilen -1) sorts before SA's SNP (ilen 0) under the `(pos, ilen,
@@ -1086,13 +1292,13 @@ mod tests {
         assert_eq!(r3.pos, 4000);
         assert_eq!(r3.reference, b"AT".to_vec());
         assert_eq!(r3.alts, vec![b"A".to_vec()]);
-        assert_eq!(r3.gt, vec![/* SA */ 0, 0, /* SB */ 0, 1, /* SC */ 0, 0]);
+        assert_eq!(r3.calls, sparse(&[/* SB hap1 */ (3, 1)]));
 
         let r4 = src.next_record().unwrap().unwrap();
         assert_eq!(r4.pos, 4000);
         assert_eq!(r4.reference, b"A".to_vec());
         assert_eq!(r4.alts, vec![b"G".to_vec()]);
-        assert_eq!(r4.gt, vec![/* SA */ 1, 0, /* SB */ 0, 0, /* SC */ 0, 0]);
+        assert_eq!(r4.calls, sparse(&[/* SA hap0 */ (0, 1)]));
 
         // SC's early EOF didn't strand or truncate anything downstream.
         assert!(src.next_record().unwrap().is_none());
@@ -1154,21 +1360,135 @@ mod tests {
         path
     }
 
+    // Write one single-sample, CSI-indexed BCF per `(sample, records)` pair, all on
+    // contig "1", where each record is `(0-based pos, REF, ALT, gt)` and `gt` is a
+    // '/'- or '|'-separated string of allele indices (or `.` for missing) -- e.g.
+    // `"1/1"`. Phasing in the separator is cosmetic here (`NormAtom::ploid_codes`
+    // only cares about the allele index, not phase), so every genotype is written
+    // `Phased` regardless of which separator the caller used, matching the only
+    // `GenotypeAllele` variants this module already relies on elsewhere
+    // (`Phased`/`PhasedMissing`). A sample with no records gets a header-only file
+    // (mirrors `contig_in_header_but_no_records_is_hom_ref_filled_not_errored`),
+    // exercising the merge's most common real shape: N per-sample files sharing a
+    // contig, most of which have zero calls on any given variant.
+    #[allow(clippy::type_complexity)]
+    fn write_single_sample_vcfs(
+        dir: &Path,
+        specs: &[(&str, &[(u32, &str, &str, &str)])],
+    ) -> Vec<String> {
+        let chrom_len: u64 = 10_000;
+        specs
+            .iter()
+            .enumerate()
+            .map(|(i, (sample, records))| {
+                let path = dir.join(format!("s{i}.bcf"));
+                let mut header = Header::new();
+                header.push_record(format!("##contig=<ID=1,length={chrom_len}>").as_bytes());
+                header
+                    .push_record(b"##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">");
+                header.push_sample(sample.as_bytes());
+                {
+                    let mut writer = Writer::from_path(&path, &header, false, Format::Bcf)
+                        .expect("open BCF writer");
+                    for &(pos, r, alt, gt) in records.iter() {
+                        let mut record = writer.empty_record();
+                        record.set_rid(Some(0));
+                        record.set_pos(pos as i64);
+                        record
+                            .set_alleles(&[r.as_bytes(), alt.as_bytes()])
+                            .expect("set alleles");
+                        let gt_alleles: Vec<GenotypeAllele> = gt
+                            .split(['/', '|'])
+                            .map(|tok| {
+                                if tok == "." {
+                                    GenotypeAllele::PhasedMissing
+                                } else {
+                                    GenotypeAllele::Phased(
+                                        tok.parse().expect("gt token must be an int or '.'"),
+                                    )
+                                }
+                            })
+                            .collect();
+                        record.push_genotypes(&gt_alleles).expect("push genotypes");
+                        writer.write(&record).expect("write record");
+                    }
+                }
+                rust_htslib::bcf::index::build(
+                    &path,
+                    None,
+                    0,
+                    rust_htslib::bcf::index::Type::Csi(14),
+                )
+                .expect("build BCF index");
+                path.to_str().unwrap().to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn merged_record_calls_are_sparse_and_name_only_carriers() {
+        // The merge already knows which columns carry a record -- the frontier group
+        // IS the carrier list. Widening it to N and scanning it back is the O(V x N)
+        // that issue #120 traces to.
+        let dir = tempdir().unwrap();
+        // 3 single-sample files; only sample 1 carries the variant at pos 100.
+        let paths = write_single_sample_vcfs(
+            dir.path(),
+            &[
+                ("s0", &[]),
+                ("s1", &[(100u32, "A", "T", "1/1")]),
+                ("s2", &[]),
+            ],
+        );
+        let samples = ["s0", "s1", "s2"];
+        let mut src = VcfListRecordSource::new(
+            &paths,
+            &samples,
+            "1",
+            None,
+            2,
+            // htslib_threads: every other test in this module uses 1, not 0 -- `0`
+            // panics inside rust-htslib's `set_threads` ("n_threads must be > 0";
+            // production never passes 0 either, see `budget::MIN_HTSLIB_THREADS`).
+            1,
+            false,
+            // `ref_seq` is `None` here, so `check_ref` never actually gates anything
+            // (see `FileCursor::advance`); `Error` is the simplest valid variant --
+            // `CheckRef` has no `Skip`.
+            CheckRef::Error,
+            &[],
+            Vec::new(),
+            crate::svar2_view::OverlapMode::Pos,
+        )
+        .unwrap();
+
+        let rec = src.next_record().unwrap().unwrap();
+        assert!(
+            matches!(rec.calls, Calls::Sparse(_)),
+            "the k-way merge must not widen to N"
+        );
+        // sample 1, ploidy 2 => columns 2 and 3, both ALT1.
+        let got: Vec<(u32, i32)> = rec.calls.iter_non_ref().collect();
+        assert_eq!(got, vec![(2, 1), (3, 1)]);
+        assert_eq!(rec.calls.allele_at(0), 0, "non-carriers read as REF");
+        assert_eq!(rec.calls.len_dense(), None);
+    }
+
     #[test]
     fn info_first_carrier_and_format_per_sample_with_non_carrier_default() {
         // Two files: a shared SNP@pos2 that BOTH carry (proves INFO
         // first-carrier-wins across two DIFFERENT AF values, and FORMAT
         // per-sample carrying each file's own DP), plus a second SNP@pos20
-        // that ONLY file A carries (proves the non-carrier column's
-        // `format_raw` entry is the empty `vec![]` the design contract
-        // promises -- NOT file A's carrier value leaking across columns,
-        // and NOT some other placeholder).
+        // that ONLY file A carries (proves the non-carrier sample's
+        // `CarrierFormat::value` is `None`, the design contract promises --
+        // NOT file A's carrier value leaking across samples, and NOT some
+        // other placeholder).
         //
         // This is deliberately tested at the `RawRecord` layer rather than
         // through `SparseVar2.decode()`: `decode()`'s Ragged output only
         // ever emits ALT-carrying (sample, ploid) cells (see
         // `test_from_vcf_list_missing_hap_is_unobservable_in_decode` for the
-        // analogous genotype-side limitation), so a non-carrier column's
+        // analogous genotype-side limitation), so a non-carrier sample's
         // resolved value never surfaces through it -- the `RawRecord` this
         // merge produces is the only place the empty-vs-populated buffer
         // contract is directly observable.
@@ -1244,24 +1564,29 @@ mod tests {
             vec![Some(vec![0.1_f32 as f64])],
             "INFO AF must be SA's (first-carrier/col0) value 0.1, not SB's 0.9"
         );
+        let FormatVals::ByCarrier(cf1) = &r1.format_vals else {
+            panic!("the k-way merge must produce ByCarrier FormatVals")
+        };
         assert_eq!(
-            r1.format_raw,
-            vec![Some(vec![vec![10.0], vec![20.0]])],
+            (cf1.value(0, 0), cf1.value(1, 0)),
+            (Some(10.0), Some(20.0)),
             "FORMAT DP must be per-sample: SA's own 10, SB's own 20"
         );
 
         // pos20: only SA carries it -- SB's column is a non-member (not just
-        // a genotype non-carrier), so its FORMAT buffer must be the empty
-        // `vec![]` the design contract calls for (-> downstream default),
-        // not SA's 77 leaking across columns.
+        // a genotype non-carrier), so `CarrierFormat::value` must be `None`
+        // (-> downstream default), not SA's 77 leaking across columns.
         let r2 = src.next_record().unwrap().unwrap();
         assert_eq!(r2.pos, 20);
         assert_eq!(r2.info_raw, vec![Some(vec![0.4_f32 as f64])]);
+        let FormatVals::ByCarrier(cf2) = &r2.format_vals else {
+            panic!("the k-way merge must produce ByCarrier FormatVals")
+        };
         assert_eq!(
-            r2.format_raw,
-            vec![Some(vec![vec![77.0], vec![]])],
-            "SB is not a member at pos20 -- its FORMAT DP buffer must be \
-             empty, not SA's carrier value"
+            (cf2.value(0, 0), cf2.value(1, 0)),
+            (Some(77.0), None),
+            "SB is not a member at pos20 -- its FORMAT DP value must be \
+             None, not SA's carrier value"
         );
 
         assert!(src.next_record().unwrap().is_none());
@@ -1444,8 +1769,111 @@ mod tests {
 
         let r1 = src.next_record().unwrap().unwrap();
         assert_eq!(r1.pos, 2);
-        assert_eq!(r1.gt, vec![1, 0, /* SB, hom-ref filled */ 0, 0]);
+        assert_eq!(r1.calls, sparse(&[/* SA hap0 */ (0, 1)]));
         assert!(src.next_record().unwrap().is_none());
         assert_eq!(src.dropped_out_of_scope(), 0);
+    }
+
+    /// `next_record` used to pick the cursor to advance with an O(N) argmin scan
+    /// over `cursors`; it now peeks a `FrontierKey` min-heap. The two must agree
+    /// exactly — same cursor, same liveness aggregates — or the merge's release
+    /// gate changes and the emitted record stream (and therefore the store bytes)
+    /// changes with it. Fuzz both over many random frontier configurations,
+    /// including ties, unstarted (`None`) cursors, and eof'd cursors.
+    ///
+    /// Scope: this covers the *derivation* (ordering + aggregates) off a heap
+    /// top. The heap's *maintenance* (one entry per live cursor via
+    /// pop-then-push, never re-pushing an eof'd cursor, and the seeding filter
+    /// that keeps born-eof cursors out) is exercised by the tests that drive the
+    /// real `next_record`: `file_without_contig_is_skipped` (born eof),
+    /// `contig_in_header_but_no_records_is_hom_ref_filled_not_errored`
+    /// (immediate eof), `multiallelic_in_one_file_splits_across_records`
+    /// (frontier unchanged while draining a record's atom buffer),
+    /// `streaming_release_before_full_drain` (the release gate), and end-to-end
+    /// by `tests/test_svar2_from_vcf_list_parity.py`'s byte-identical fixture.
+    #[test]
+    fn frontier_heap_matches_naive_scan() {
+        // (all_eof, all_started, min_started, advance_idx)
+        type Sel = (bool, bool, Option<u32>, Option<usize>);
+
+        // The pre-refactor scan, verbatim in spirit: `None` sorts before every
+        // `Some(_)`, strict `<` keeps the earliest index on ties.
+        fn naive(states: &[(Option<u32>, bool)]) -> Sel {
+            let mut any_live = false;
+            let mut all_started = true;
+            let mut min_started: Option<u32> = None;
+            let mut advance_idx: Option<usize> = None;
+            let mut advance_key: Option<Option<u32>> = None;
+            for (i, (frontier, eof)) in states.iter().enumerate() {
+                if *eof {
+                    continue;
+                }
+                any_live = true;
+                match frontier {
+                    None => all_started = false,
+                    Some(f) => min_started = Some(min_started.map_or(*f, |m| m.min(*f))),
+                }
+                if advance_key.is_none_or(|best| *frontier < best) {
+                    advance_key = Some(*frontier);
+                    advance_idx = Some(i);
+                }
+            }
+            (!any_live, all_started, min_started, advance_idx)
+        }
+
+        // Exactly the derivation `next_record` performs off the frontier heap.
+        fn heap_based(states: &[(Option<u32>, bool)]) -> Sel {
+            let fh: BinaryHeap<Reverse<FrontierKey>> = states
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, eof))| !*eof)
+                .map(|(i, (frontier, _))| {
+                    Reverse(FrontierKey {
+                        frontier: *frontier,
+                        col: i,
+                    })
+                })
+                .collect();
+            match fh.peek() {
+                None => (true, true, None, None),
+                Some(Reverse(top)) => (false, top.frontier.is_some(), top.frontier, Some(top.col)),
+            }
+        }
+
+        fn xorshift(seed: &mut u64) -> u64 {
+            *seed ^= *seed << 13;
+            *seed ^= *seed >> 7;
+            *seed ^= *seed << 17;
+            *seed
+        }
+
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        for _ in 0..5000 {
+            let n = (xorshift(&mut seed) % 12) as usize + 1;
+            // Small frontier range => frequent ties, which is where a wrong
+            // tiebreak would hide.
+            let states: Vec<(Option<u32>, bool)> = (0..n)
+                .map(|_| {
+                    let eof = xorshift(&mut seed).is_multiple_of(5);
+                    let frontier = if xorshift(&mut seed).is_multiple_of(4) {
+                        None
+                    } else {
+                        Some((xorshift(&mut seed) % 7) as u32)
+                    };
+                    (frontier, eof)
+                })
+                .collect();
+            let a = naive(&states);
+            let b = heap_based(&states);
+            assert_eq!(a.0, b.0, "all_eof mismatch for {states:?}");
+            assert_eq!(a.1, b.1, "all_started mismatch for {states:?}");
+            assert_eq!(a.3, b.3, "advance_idx mismatch for {states:?}");
+            // `min_started` is only ever read under `all_started` (the release
+            // gate short-circuits on it), which is exactly where the heap top is
+            // guaranteed to be the minimum *started* frontier.
+            if a.1 && !a.0 {
+                assert_eq!(a.2, b.2, "min_started mismatch for {states:?}");
+            }
+        }
     }
 }

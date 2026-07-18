@@ -287,6 +287,94 @@ def test_from_vcf_list_no_reference_matches_bcftools_merge_oracle(tmp_path: Path
     assert ro["allele"].to_ak().tolist() == rl["allele"].to_ak().tolist()
 
 
+def test_from_vcf_list_fields_multicontig_matches_dense_oracle(tmp_path: Path):
+    """Carrier-path FORMAT (`from_vcf_list`) must byte-match dense-path FORMAT
+    (`from_vcf` over a `bcftools merge`), across >1 contig, for requested
+    FORMAT fields. This is the end-to-end gate for route-before-densify: it
+    fails if carrier-sparse FORMAT resolution diverges from the dense grid
+    on any (sample, field) -- the prior tests in this file only exercised
+    genotype-level (pos/ilen/allele) parity or FORMAT on a single contig.
+
+    Restricted to SNPs on two contigs (`chr1`, `chr2`), matching the
+    `no_reference` oracle's SNP restriction above (no reference FASTA is
+    needed, but atoms aren't left-aligned, so only SNPs are safe to compare
+    across independently-authored files).
+    """
+    header = (
+        "##fileformat=VCFv4.2\n"
+        "##contig=<ID=chr1,length=1000>\n"
+        "##contig=<ID=chr2,length=1000>\n"
+        '##FORMAT=<ID=GT,Number=1,Type=String,Description="GT">\n'
+        '##FORMAT=<ID=DP,Number=1,Type=Integer,Description="Depth">\n'
+        '##FORMAT=<ID=VAF,Number=A,Type=Float,Description="Alt frac">\n'
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t{s}\n"
+    )
+
+    def ss(name: str, sample: str, rows: str) -> Path:
+        plain = tmp_path / f"{name}.vcf"
+        plain.write_text(header.format(s=sample) + rows)
+        gz = tmp_path / f"{name}.vcf.gz"
+        with open(gz, "wb") as fh:
+            subprocess.run(["bgzip", "-c", str(plain)], check=True, stdout=fh)
+        subprocess.run(["bcftools", "index", str(gz)], check=True)
+        return gz
+
+    a = ss(
+        "a",
+        "SA",
+        "chr1\t3\t.\tA\tG\t.\t.\t.\tGT:DP:VAF\t1|0:30:0.5\n"  # shared chr1 SNP
+        "chr1\t12\t.\tG\tC\t.\t.\t.\tGT:DP:VAF\t0|1:22:0.9\n"  # private chr1
+        "chr2\t5\t.\tT\tA\t.\t.\t.\tGT:DP:VAF\t1|0:11:0.3\n",  # private chr2
+    )
+    b = ss(
+        "b",
+        "SB",
+        "chr1\t3\t.\tA\tG\t.\t.\t.\tGT:DP:VAF\t0|1:18:0.4\n"  # shared chr1 SNP
+        "chr2\t5\t.\tT\tA\t.\t.\t.\tGT:DP:VAF\t0|1:27:0.7\n",  # shared chr2 SNP
+    )
+    paths = [a, b]
+
+    merge = subprocess.run(
+        ["bcftools", "merge", "-0", *map(str, paths)],
+        check=True,
+        stdout=subprocess.PIPE,
+    )
+    merged = tmp_path / "merged.vcf.gz"
+    with open(merged, "wb") as fh:
+        subprocess.run(["bgzip", "-c"], input=merge.stdout, check=True, stdout=fh)
+    subprocess.run(["bcftools", "index", str(merged)], check=True)
+
+    fields = dict(format_fields=["DP", "VAF"])
+    dense_out, list_out = tmp_path / "dense", tmp_path / "list"
+    SparseVar2.from_vcf(dense_out, merged, no_reference=True, threads=1, **fields)
+    dropped = SparseVar2.from_vcf_list(
+        list_out, paths, no_reference=True, threads=1, **fields
+    )
+    assert dropped == 0
+
+    dense = SparseVar2(dense_out).with_fields(["DP", "VAF"])
+    native = SparseVar2(list_out).with_fields(["DP", "VAF"])
+    assert dense.available_samples == native.available_samples == ["SA", "SB"]
+
+    for contig, length in [("chr1", 1000), ("chr2", 1000)]:
+        region = [(0, length)]
+        d = dense.decode(contig, region)
+        n = native.decode(contig, region)
+        # Genotype-level parity (positions) AND FORMAT parity. Compare every
+        # array the decode returns; the FORMAT field arrays (DP, VAF) are the
+        # ones this change touches -- DP (int) and VAF (float, Number=A) are
+        # both simple decimal literals (0.5, 0.9, ...) that round-trip
+        # exactly through float32, so exact equality is the right bar (not
+        # allclose) -- a genuine carrier-vs-grid resolution divergence should
+        # not be masked by a tolerance.
+        for key in ("pos", "DP", "VAF"):
+            np.testing.assert_array_equal(
+                np.asarray(d[key].data),
+                np.asarray(n[key].data),
+                err_msg=f"{contig}:{key} diverged between dense and carrier paths",
+            )
+
+
 def test_from_vcf_list_matches_bcftools_merge_oracle(tmp_path: Path):
     """Oracle parity: `bcftools merge -0` (missing -> hom-ref, exactly our
     semantics) -> `from_vcf` must equal the native `from_vcf_list` k-way merge.
@@ -658,3 +746,45 @@ def test_from_vcf_list_check_ref_exclude_continues(tmp_path: Path):
     sv = SparseVar2(out)
     counts = sv.region_counts("chr1", [(0, 40)])
     assert int(counts.sum()) == 1  # only a's clean pos-3 record survives
+
+
+def test_from_vcf_list_auto_chunk_size(tmp_path, monkeypatch):
+    """chunk_size=None (default) wires in the budget-derived _auto_chunk_size;
+    an explicit int passes through unchanged (back-compat).
+
+    Note: _auto_chunk_size(2, 2) == 25_000 == the old fixed default, so only a
+    sentinel return value distinguishes "wired the budget path" from "kept the
+    old constant". We patch _auto_chunk_size to a sentinel and assert the
+    pipeline receives it.
+    """
+    import genoray._svar2 as sv2
+
+    seen = {}
+    real_pipeline = sv2._core.run_vcf_list_conversion_pipeline
+
+    def spy(paths, ref, contigs, out, samples, chunk_size, *rest):
+        seen["chunk_size"] = chunk_size
+        return real_pipeline(paths, ref, contigs, out, samples, chunk_size, *rest)
+
+    monkeypatch.setattr(sv2._core, "run_vcf_list_conversion_pipeline", spy)
+    monkeypatch.setattr(
+        sv2,
+        "_auto_chunk_size",
+        lambda n_samples, ploidy=2, n_format_fields=0, max_mem=None: 7777,
+    )
+
+    a = _ss(tmp_path, "a", "S0", "chr1\t5\t.\tA\tC\t.\tPASS\t.\tGT\t1/1\n")
+    b = _ss(tmp_path, "b", "S1", "chr1\t5\t.\tA\tC\t.\tPASS\t.\tGT\t1/1\n")
+
+    # default: chunk_size omitted -> budget-derived path used (not the old 25_000)
+    SparseVar2.from_vcf_list(
+        tmp_path / "out", [a, b], no_reference=True, overwrite=True
+    )
+    assert seen["chunk_size"] == 7777
+
+    # explicit override still passes through verbatim
+    seen.clear()
+    SparseVar2.from_vcf_list(
+        tmp_path / "out2", [a, b], no_reference=True, overwrite=True, chunk_size=321
+    )
+    assert seen["chunk_size"] == 321

@@ -1,3 +1,47 @@
+## 3.2.0 (2026-07-17)
+
+### Feat
+
+- **svar1**: PySvar1Reader bindings (ungated, numpy-dict contract)
+- **svar1**: ungated cartesian find_ranges (Stage B) via partition_point
+- **svar1**: ungated Svar1Reader (mmap variant_idxs, resident offsets)
+- **svar1**: ungated var_ranges (Stage A) over search::overlap_range
+- **svar2**: make chunk_size field-aware and add a max_mem ceiling
+- **svar2**: add Carriers/Calls, a carrier-sparse genotype representation
+- **bench**: from_vcf_list driver (time/memray) + profiler README
+- **bench**: native run_vcf_list bench binary with dhat-heap feature
+- **bench**: synthetic single-sample cohort generator for from_vcf_list
+
+### Fix
+
+- **svar1**: fail-fast on corrupt offsets + guard find_ranges range order
+- **svar2**: move FORMAT resolution to un-gated record_source for query-core build
+- **svar2**: correct rvk/chunk_assembler comments and close a Sparse+word_base gap
+- **svar2**: collapse duplicate cols in from_vcf_list carrier merge
+- **bench**: repair Task 1 review findings for from_vcf_list harness
+- **bench**: position-deterministic REF/ALT so large cohorts avoid cross-file REF disagreement
+- **bench**: fail loud on /usr/bin/time parse miss, clean up temp runner in run_bench
+
+### Refactor
+
+- **svar2**: carry format_by_carrier on DenseChunk (unused)
+- **svar2**: extract the duplicated dense2sparse_vk routing pre-pass
+- **svar2**: carry RawRecord genotypes as Calls instead of Vec<i32>
+
+### Perf
+
+- **svar2**: skip dense FORMAT staging for carrier chunks — kills the O(N^2)
+- **svar2**: resolve FORMAT from format_by_carrier in rvk
+- **svar2**: stop spawning one htslib thread per file per contig
+- **svar2**: reserve dense field staging on the dense count, not the chunk
+- **svar2**: route before densifying so sparse variants skip the grid scan
+- **svar2**: carry FORMAT values per carrier instead of F x N per atom
+- **svar2**: collapse duplicate carrier cols without a per-record BTreeMap
+- **svar2**: build carriers from the frontier group instead of widening to N
+- **bench**: capture CPU time in from_vcf_list bench for load-robust scaling fits
+- **svar2**: frontier min-heap makes from_vcf_list merge selection O(log N)
+- **svar2**: budget-derive from_vcf_list chunk_size so dense RAM is flat in N
+
 ## 3.1.0 (2026-07-16)
 
 ### Feat

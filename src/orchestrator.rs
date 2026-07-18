@@ -972,10 +972,11 @@ pub fn run_vcf_list(
     region_ranges: Vec<(String, u32, u32)>,
     overlap: crate::svar2_view::OverlapMode,
 ) -> Result<u64, ConversionError> {
-    // Each open input file uses its own small, fixed HTSlib thread allocation
-    // (there are N files open at once per contig, unlike the single-file
-    // `Vcf` path) -- the hardware budget below only sizes `processing_threads`.
-    const VCF_LIST_HTSLIB_THREADS: usize = 1;
+    // `from_vcf_list` holds every input open at once, per contig, so a per-file decode
+    // thread is N threads per contig -- 7,089 on the #120 cohort, recreated 24 times.
+    // Each wave takes fresh glibc arenas whose 64 MB heaps are never unmapped. They buy
+    // nothing: the read phase is single-core-bound (`read~99% exec=0%`). 0 => inline.
+    const VCF_LIST_HTSLIB_THREADS: usize = 0;
 
     let sample_refs: Vec<&str> = samples.iter().map(|s| s.as_str()).collect();
 

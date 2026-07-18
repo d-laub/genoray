@@ -27,3 +27,6 @@ memray_flamegraphs/
 
 # Claude Code worktrees
 .claude/worktrees/
+
+# dhat heap profiles emitted by `--features dhat-heap` benches into CWD
+dhat-heap.json
