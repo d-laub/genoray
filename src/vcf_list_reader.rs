@@ -290,8 +290,18 @@ pub struct VcfListRecordSource {
 impl VcfListRecordSource {
     /// `vcf_paths[i]` is a single-sample file whose sample is `samples[i]` and
     /// whose merged column is `i`. `ref_seq` is the contig sequence (`None` ⇒
-    /// no-reference mode). Files without `chrom` in their header are skipped
-    /// (their column is filled hom-ref for every merged record).
+    /// no-reference mode).
+    ///
+    /// `members[i]` is `false` when file `i` has NO records on `chrom` (as
+    /// determined Python-side by the same cyvcf2 probe that builds the contig
+    /// union). Non-member files are never opened for this contig — their column
+    /// is filled hom-ref for every merged record. This is essential, not just an
+    /// optimization: a file whose shared pipeline header declares `chrom` but
+    /// whose index has no entry for it makes rust-htslib's seek RAISE (issue
+    /// #122 — cyvcf2 instead warns and returns empty, which is why the probe
+    /// drops it and the union still carries the contig via other files). Files
+    /// whose header omits `chrom` entirely (`name2rid` fails) are ALSO skipped,
+    /// as a defensive fallback for any residual header/probe disagreement.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         vcf_paths: &[String],
@@ -305,6 +315,7 @@ impl VcfListRecordSource {
         fields: &[FieldSpec],
         regions: Vec<(u32, u32)>,
         overlap: crate::svar2_view::OverlapMode,
+        members: &[bool],
     ) -> Result<Self, ConversionError> {
         if vcf_paths.len() != samples.len() {
             return Err(ConversionError::Input(format!(
@@ -314,8 +325,36 @@ impl VcfListRecordSource {
                 samples.len()
             )));
         }
+        if members.len() != vcf_paths.len() {
+            return Err(ConversionError::Input(format!(
+                "members must be parallel to vcf_paths (one membership flag per \
+                 file): got {} flags and {} paths",
+                members.len(),
+                vcf_paths.len()
+            )));
+        }
+        // A hom-ref-filled, never-opened cursor for a file that has no records
+        // on this contig.
+        let absent_cursor = |col: usize, path: &str| FileCursor {
+            vcf: None,
+            buf: VecDeque::new(),
+            frontier: None,
+            eof: true,
+            col,
+            dropped: 0,
+            ref_excluded: 0,
+            path: path.to_string(),
+        };
         let mut cursors = Vec::with_capacity(vcf_paths.len());
         for (col, (path, &sample)) in vcf_paths.iter().zip(samples.iter()).enumerate() {
+            // File has no records on this contig (per Python's cyvcf2 probe):
+            // never open/seek it -- fill its column hom-ref. Skipping the open
+            // is what avoids the issue #122 seek-raise on a header-declared but
+            // index-absent contig.
+            if !members[col] {
+                cursors.push(absent_cursor(col, path));
+                continue;
+            }
             let single_sample = [sample];
             match VcfRecordSource::new(
                 path,
@@ -341,20 +380,22 @@ impl VcfListRecordSource {
                 // matched on the typed variant (not a message substring, which
                 // would silently stop matching if `vcf_reader.rs`'s wording
                 // ever changed) -- skip it, filling its column hom-ref for
-                // every merged record on this contig.
+                // every merged record on this contig. (With correct `members`
+                // this is unreachable, but keep it as a defensive fallback.)
                 Err(ConversionError::ContigNotInHeader { .. }) => {
-                    cursors.push(FileCursor {
-                        vcf: None,
-                        buf: VecDeque::new(),
-                        frontier: None,
-                        eof: true,
-                        col,
-                        dropped: 0,
-                        ref_excluded: 0,
-                        path: path.clone(),
-                    });
+                    cursors.push(absent_cursor(col, path));
                 }
-                Err(e) => return Err(e),
+                // Any other open/seek failure on a file that IS supposed to
+                // carry this contig is a genuine error (corrupt index, NFS
+                // transient, ...). Surface it WITH the file path -- the seek
+                // site in `vcf_reader.rs` only has the contig string, so
+                // without this the error names the contig but not which of N
+                // files failed (issue #122's secondary ask).
+                Err(e) => {
+                    return Err(ConversionError::Input(format!(
+                        "{path}: failed to open/seek contig {chrom:?}: {e}"
+                    )));
+                }
             }
         }
         let info_specs: Vec<FieldSpec> = fields
@@ -834,6 +875,7 @@ mod tests {
             &[],
             Vec::new(),
             crate::svar2_view::OverlapMode::Pos,
+            &vec![true; samples.len()],
         )
         .unwrap();
 
@@ -898,6 +940,7 @@ mod tests {
             &[],
             Vec::new(),
             crate::svar2_view::OverlapMode::Pos,
+            &vec![true; samples.len()],
         )
         .unwrap();
 
@@ -941,6 +984,7 @@ mod tests {
             &[],
             Vec::new(),
             crate::svar2_view::OverlapMode::Pos,
+            &vec![true; samples.len()],
         )
         .unwrap();
 
@@ -1003,6 +1047,7 @@ mod tests {
             &[],
             Vec::new(),
             crate::svar2_view::OverlapMode::Pos,
+            &vec![true; samples.len()],
         )
         .unwrap();
 
@@ -1060,6 +1105,7 @@ mod tests {
             &[],
             Vec::new(),
             crate::svar2_view::OverlapMode::Pos,
+            &vec![true; samples.len()],
         )
         .unwrap();
 
@@ -1126,6 +1172,7 @@ mod tests {
             &[],
             Vec::new(),
             crate::svar2_view::OverlapMode::Pos,
+            &vec![true; samples.len()],
         )
         .unwrap();
 
@@ -1239,6 +1286,7 @@ mod tests {
             &[],
             Vec::new(),
             crate::svar2_view::OverlapMode::Pos,
+            &vec![true; samples.len()],
         )
         .unwrap();
 
@@ -1459,6 +1507,7 @@ mod tests {
             &[],
             Vec::new(),
             crate::svar2_view::OverlapMode::Pos,
+            &vec![true; samples.len()],
         )
         .unwrap();
 
@@ -1548,6 +1597,7 @@ mod tests {
             &fields,
             Vec::new(),
             crate::svar2_view::OverlapMode::Pos,
+            &vec![true; samples.len()],
         )
         .unwrap();
 
@@ -1684,6 +1734,7 @@ mod tests {
             &[],
             Vec::new(),
             crate::svar2_view::OverlapMode::Pos,
+            &vec![true; samples.len()],
         )
         .unwrap();
 
@@ -1764,12 +1815,170 @@ mod tests {
             &[],
             Vec::new(),
             crate::svar2_view::OverlapMode::Pos,
+            &vec![true; samples.len()],
         )
         .unwrap();
 
         let r1 = src.next_record().unwrap().unwrap();
         assert_eq!(r1.pos, 2);
         assert_eq!(r1.calls, sparse(&[/* SA hap0 */ (0, 1)]));
+        assert!(src.next_record().unwrap().is_none());
+        assert_eq!(src.dropped_out_of_scope(), 0);
+    }
+
+    // Write a single-sample, CSI-indexed BCF declaring EVERY `header_contigs`
+    // entry in its header, but carrying records only on the contigs named in
+    // `records` (a map from contig to that contig's `SsRec`s). This is the
+    // shape a real cohort-shared pipeline header produces: every file declares
+    // every contig, yet a given sample has zero calls on some of them (e.g. a
+    // female sample has no somatic chrY records). `rid` is assigned by header
+    // declaration order, so `records` keys must appear in `header_contigs`.
+    fn write_multi_contig_ss_vcf(
+        dir: &Path,
+        name: &str,
+        header_contigs: &[(&str, u64)],
+        sample: &str,
+        records: &[(&str, &[SsRec])],
+    ) -> PathBuf {
+        // A bgzipped VCF (not BCF): htslib's seek to a header-declared contig
+        // that has no index entry RAISES for a bgzf-VCF+CSI/tabix index (the
+        // issue #122 shape), whereas the same seek over a BCF+CSI returns an
+        // empty iterator -- so the reproduction only holds for the VCF form.
+        let path = dir.join(format!("{name}.vcf.gz"));
+        let mut header = Header::new();
+        for (chrom, len) in header_contigs {
+            header.push_record(format!("##contig=<ID={chrom},length={len}>").as_bytes());
+        }
+        header.push_record(b"##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">");
+        header.push_sample(sample.as_bytes());
+        let rid_of = |chrom: &str| {
+            header_contigs
+                .iter()
+                .position(|(c, _)| *c == chrom)
+                .expect("record contig must be declared in header") as u32
+        };
+        {
+            let mut writer =
+                Writer::from_path(&path, &header, false, Format::Vcf).expect("open VCF writer");
+            for (chrom, recs) in records {
+                for rec in recs.iter() {
+                    let mut record = writer.empty_record();
+                    record.set_rid(Some(rid_of(chrom)));
+                    record.set_pos(rec.pos);
+                    let mut alleles: Vec<&[u8]> = Vec::with_capacity(1 + rec.alts.len());
+                    alleles.push(rec.r);
+                    alleles.extend(rec.alts.iter().copied());
+                    record.set_alleles(&alleles).expect("set alleles");
+                    let gt_alleles: Vec<GenotypeAllele> = rec
+                        .gt
+                        .iter()
+                        .map(|&g| {
+                            if g < 0 {
+                                GenotypeAllele::PhasedMissing
+                            } else {
+                                GenotypeAllele::Phased(g)
+                            }
+                        })
+                        .collect();
+                    record.push_genotypes(&gt_alleles).expect("push genotypes");
+                    writer.write(&record).expect("write record");
+                }
+            }
+        }
+        rust_htslib::bcf::index::build(&path, None, 0, rust_htslib::bcf::index::Type::Csi(14))
+            .expect("build BCF index");
+        path
+    }
+
+    // Issue #122: a file that declares the queried contig in its header but has
+    // records on a DIFFERENT contig (and none on the queried one) is the real
+    // crash shape -- distinct from `contig_in_header_but_no_records_...` above,
+    // where the file has ZERO records total and htslib's `fetch` happens to
+    // succeed (empty). Here `name2rid` succeeds but the index has no entry for
+    // the queried contig, so rust-htslib's `fetch`/seek RAISES (cyvcf2 instead
+    // warns + returns empty, which is why Python's per-file contig probe drops
+    // it and the union still carries the contig via the other file). The merge
+    // must treat this column as a non-member (hom-ref fill), not crash.
+    #[test]
+    fn contig_absent_from_index_but_in_header_is_filled_hom_ref() {
+        let tmp = tempdir().unwrap();
+        // file A: declares chr1 & chr2, has records on BOTH.
+        let a = write_multi_contig_ss_vcf(
+            tmp.path(),
+            "a",
+            &[("chr1", 100), ("chr2", 100)],
+            "SA",
+            &[
+                (
+                    "chr1",
+                    &[SsRec {
+                        pos: 2,
+                        r: b"A",
+                        alts: vec![b"G"],
+                        gt: vec![1, 0],
+                    }],
+                ),
+                (
+                    "chr2",
+                    &[SsRec {
+                        pos: 5,
+                        r: b"A",
+                        alts: vec![b"G"],
+                        gt: vec![1, 1],
+                    }],
+                ),
+            ],
+        );
+        // file B: declares chr1 & chr2 (shared pipeline header) but has records
+        // ONLY on chr1 -- its index has no chr2 entry, so fetching chr2 raises.
+        let b = write_multi_contig_ss_vcf(
+            tmp.path(),
+            "b",
+            &[("chr1", 100), ("chr2", 100)],
+            "SB",
+            &[(
+                "chr1",
+                &[SsRec {
+                    pos: 2,
+                    r: b"A",
+                    alts: vec![b"G"],
+                    gt: vec![0, 1],
+                }],
+            )],
+        );
+        let ref_seq = make_ref(tmp.path(), "chr2", 100, &[(5, b"A")]);
+
+        let paths = vec![
+            a.to_str().unwrap().to_string(),
+            b.to_str().unwrap().to_string(),
+        ];
+        let samples = vec!["SA", "SB"];
+        // Membership on chr2: A carries records (true), B does not (false) --
+        // exactly what Python's per-file cyvcf2 probe computes.
+        let members = vec![true, false];
+        let mut src = VcfListRecordSource::new(
+            &paths,
+            &samples,
+            "chr2",
+            Some(&ref_seq),
+            2,
+            1,
+            false,
+            CheckRef::Error,
+            &[],
+            Vec::new(),
+            crate::svar2_view::OverlapMode::Pos,
+            &members,
+        )
+        .unwrap();
+
+        // Only A's chr2 record; B's column is hom-ref filled (no crash).
+        let r1 = src.next_record().unwrap().unwrap();
+        assert_eq!(r1.pos, 5);
+        assert_eq!(
+            r1.calls,
+            sparse(&[/* SA hap0 */ (0, 1), /* SA hap1 */ (1, 1)])
+        );
         assert!(src.next_record().unwrap().is_none());
         assert_eq!(src.dropped_out_of_scope(), 0);
     }
