@@ -235,8 +235,11 @@ def _id83_codes_for_contig(
     alt_s: NDArray[np.int64],
     alt_len: NDArray[np.int64],
 ) -> NDArray[np.int16]:
-    """ID-83 codes for indels on one contig. May return ``_REF_MISMATCH``
-    entries, which the caller maps to UNCLASSIFIED with a warning."""
+    """ID-83 codes for indels on one contig.
+
+    May return ``_REF_MISMATCH`` entries, which the caller maps to UNCLASSIFIED
+    with a warning.
+    """
     out = np.empty(len(p0), dtype=np.int16)
     _id83_kernel(
         np.ascontiguousarray(seq),
@@ -260,8 +263,10 @@ def _id83_codes_for_contig(
 
 
 def _build_dbs_table() -> np.ndarray:
-    """tbl[r0, r1, a0, a1] -> DBS-78 code or UNCLASSIFIED for doublets not in
-    the (folded) catalogue. Bases encoded A=0,C=1,G=2,T=3."""
+    """tbl[r0, r1, a0, a1] -> DBS-78 code or UNCLASSIFIED for doublets not in the (folded) catalogue.
+
+    Bases encoded A=0,C=1,G=2,T=3.
+    """
     tbl = np.full((4, 4, 4, 4), Sentinel.UNCLASSIFIED, dtype=np.int16)
     bases = b"ACGT"
     for r0 in range(4):

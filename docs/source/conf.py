@@ -42,8 +42,8 @@ intersphinx_mapping = {
     "numpy": ("https://numpy.org/doc/stable/", None),
 }
 
-napoleon_google_docstring = False
-napoleon_numpy_docstring = True
+napoleon_google_docstring = True
+napoleon_numpy_docstring = False
 napoleon_use_param = True
 # napoleon_type_aliases = {
 #     "Path": ":py:class:`Path <pathlib.Path>`",

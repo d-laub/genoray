@@ -33,8 +33,7 @@ def _nb_count_kept(
     kept_var_idxs: NDArray[np.int32],
     out_lengths: NDArray[np.int64],
 ):
-    """Pass 1: count, per output (sample, ploidy) slot, how many source variant
-    indices fall in `kept_var_idxs`."""
+    """Pass 1: count, per output (sample, ploidy) slot, how many source variant indices fall in `kept_var_idxs`."""
     n_out = src_sample_idxs.shape[0]
     n_kept = kept_var_idxs.shape[0]
     for i in nb.prange(n_out):  # type: ignore[not-iterable]
@@ -61,9 +60,10 @@ def _nb_count_mac_per_kept(
     kept_var_idxs: NDArray[np.int32],
     mac_out: NDArray[np.int64],
 ):
-    """Count, per kept variant, the number of non-ref entries across (sample, ploidy)
-    in the output. Outer prange is over kept variants so each writes its own slot —
-    no atomics needed."""
+    """Count, per kept variant, the number of non-ref entries across (sample, ploidy) in the output.
+
+    Outer prange is over kept variants so each writes its own slot — no atomics needed.
+    """
     n_kept = kept_var_idxs.shape[0]
     n_samples = src_sample_idxs.shape[0]
     for k in nb.prange(n_kept):  # type: ignore[not-iterable]
@@ -200,23 +200,15 @@ def _find_starts_ends(
 ):
     """Find the start and end offsets of the sparse genotypes for each range.
 
-    Parameters
-    ----------
-    genos
-        Sparse genotypes
-    geno_offsets
-        Genotype offsets
-    var_ranges
-        Shape = (ranges 2) Variant index ranges.
-    sample_idxs
-        Sample indices
-    ploidy
-        Ploidy
-    out_offsets
-        Output array to write to. If None, a new array will be created.
+    Args:
+        genos: Sparse genotypes
+        geno_offsets: Genotype offsets
+        var_ranges: Shape = (ranges 2) Variant index ranges.
+        sample_idxs: Sample indices
+        ploidy: Ploidy
+        out_offsets: Output array to write to. If None, a new array will be created.
 
-    Returns
-    -------
+    Returns:
         Shape: (ranges samples ploidy 2). The first column is the start index of the variant
         and the second column is the end index of the variant.
     """
@@ -258,11 +250,12 @@ def _length_walk_n_keep(
     q_start: POS_TYPE,
     q_end: POS_TYPE,
 ) -> int:
-    """Number of leading variants in ``sp_genos[start_idx:max_idx]`` to include
-    so one haplotype reaches ``q_end - q_start`` in length, extending past
-    ``q_end`` only as needed. Variants strictly inside ``[q_start, q_end)`` are
-    always included; the length budget only gates extension past ``q_end``.
-    Returns a count in ``[0, max_idx - start_idx]``."""
+    """Number of leading variants in ``sp_genos[start_idx:max_idx]`` to include so one haplotype reaches ``q_end - q_start`` in length, extending past ``q_end`` only as needed.
+
+    Variants strictly inside ``[q_start, q_end)`` are always included; the length
+    budget only gates extension past ``q_end``. Returns a count in
+    ``[0, max_idx - start_idx]``.
+    """
     q_len = q_end - q_start
     last_v_end = q_start
     written_len = 0
@@ -328,8 +321,7 @@ def _dense2sparse_fill(
     out_dose: NDArray[DOSAGE_TYPE],
     has_dose: bool,
 ) -> None:
-    """Pass 2: emit the first ``out_lengths[s, p]`` carried ALT calls per
-    haplotype into the disjoint output range ``[flat_offsets[slot], ...)``."""
+    """Pass 2: emit the first ``out_lengths[s, p]`` carried ALT calls per haplotype into the disjoint output range ``[flat_offsets[slot], ...)``."""
     n_samples, ploidy, n_var = genos.shape
     for s in nb.prange(n_samples):  # type: ignore[not-iterable]
         for p in range(ploidy):
@@ -364,27 +356,29 @@ def _find_starts_ends_with_length(
 ):
     """Find the start and end offsets of the sparse genotypes for each range.
 
-    Parameters
-    ----------
-    genos
-        Sparse genotypes
-    geno_offsets
-        Genotype offsets
-    var_ranges
-        Shape = (ranges 2) Variant index ranges.
+    Args:
+        genos: Sparse genotypes
+        geno_offsets: Genotype offsets
+        q_starts: 0-based start positions of the query ranges.
+        q_ends: 0-based, exclusive end positions of the query ranges.
+        var_ranges: Shape = (ranges 2) Variant index ranges.
+        v_starts: 0-based start positions of the variants.
+        ilens: Indel lengths (ILEN) of the variants.
+        sample_idxs: Sample indices
+        ploidy: Ploidy
+        contig_max_idx: Maximum variant index on the contig.
+        out: Output array to write to. If None, a new array will be created.
 
-    Notes
-    -----
-    Correctness requires that ``argsort(q_starts) == argsort(var_ranges[:, 0])``,
-    i.e. that the per-range query positions and variant-index ranges are
-    co-monotone in input order. This holds whenever ``var_ranges`` is derived
-    from ``(q_starts, q_ends)`` (e.g. via ``SparseVar.var_ranges``). The
-    function sorts ``var_ranges`` internally but indexes ``q_starts`` /
-    ``q_ends`` by the same sorted position, so violating this invariant will
-    produce results aligned to the wrong query.
+    Notes:
+        Correctness requires that ``argsort(q_starts) == argsort(var_ranges[:, 0])``,
+        i.e. that the per-range query positions and variant-index ranges are
+        co-monotone in input order. This holds whenever ``var_ranges`` is derived
+        from ``(q_starts, q_ends)`` (e.g. via ``SparseVar.var_ranges``). The
+        function sorts ``var_ranges`` internally but indexes ``q_starts`` /
+        ``q_ends`` by the same sorted position, so violating this invariant will
+        produce results aligned to the wrong query.
 
-    Returns
-    -------
+    Returns:
         Shape: (2 ranges samples ploidy). The first column is the start index of the variant
         and the second column is the end index of the variant.
     """

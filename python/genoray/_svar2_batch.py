@@ -109,9 +109,9 @@ class _BatchQueryMixin:
         samples: "ArrayLike | None" = None,
         out: Mapping[str, "np.ndarray"] | None = None,
     ) -> RangesBundle:
-        """Search-only step: returns a compact ranges bundle to be replayed by
-        ``_gather_ranges``, doing no per-element gather. ``starts``/``ends`` and
-        ``samples`` behave as in ``read_ranges``.
+        """Search-only step: returns a compact ranges bundle to be replayed by ``_gather_ranges``, doing no per-element gather.
+
+        ``starts``/``ends`` and ``samples`` behave as in ``read_ranges``.
 
         If ``out`` is given, it must be a dict of preallocated arrays keyed by
         the bundle's field names (e.g. ``dense_range``, ``region_starts``,
@@ -144,9 +144,7 @@ class _BatchQueryMixin:
         ranges: dict[str, Any],
         samples: "ArrayLike | None" = None,
     ) -> BatchResult:
-        """Tree-free gather step: replay a ``_find_ranges`` bundle into the same
-        dict contract as ``_overlap_batch``/``read_ranges``, with no further
-        search-tree work.
+        """Tree-free gather step: replay a ``_find_ranges`` bundle into the same dict contract as ``_overlap_batch``/``read_ranges``, with no further search-tree work.
 
         ``samples`` is accepted only for call-signature symmetry with
         ``read_ranges``/``_find_ranges``: the sample subset is already fixed by

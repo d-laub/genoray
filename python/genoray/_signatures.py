@@ -114,41 +114,30 @@ def fit_signatures(
 ) -> pl.DataFrame:
     """Refit a mutation catalogue against reference signatures.
 
-    Parameters
-    ----------
-    catalogue
-        A ``mutation_matrix``-shaped frame: a ``MutationType`` column followed by
-        one numeric column per sample.
-    reference
-        A ``MutationType`` column followed by one column per reference signature.
-        Columns need not be pre-normalized; each is scaled to sum 1 so reported
-        activities are in mutation-count units.
-    max_delta
-        Minimum cosine-similarity improvement to keep adding a signature
-        (forward-selection stop criterion).
-    min_activity
-        Minimum fractional contribution; signatures below this are pruned.
-    n_jobs
-        Number of parallel workers for the per-sample refit (passed to
-        ``joblib.Parallel``). ``1`` (default) runs serially; ``-1`` uses all
-        cores. Results are identical regardless of ``n_jobs``.
-    backend
-        ``joblib`` backend (default ``"loky"``, process-based). Samples are
-        refit independently, so a process backend avoids GIL contention from
-        the forward-selection orchestration.
+    Args:
+        catalogue: A ``mutation_matrix``-shaped frame: a ``MutationType`` column followed by
+            one numeric column per sample.
+        reference: A ``MutationType`` column followed by one column per reference signature.
+            Columns need not be pre-normalized; each is scaled to sum 1 so reported
+            activities are in mutation-count units.
+        max_delta: Minimum cosine-similarity improvement to keep adding a signature
+            (forward-selection stop criterion).
+        min_activity: Minimum fractional contribution; signatures below this are pruned.
+        n_jobs: Number of parallel workers for the per-sample refit (passed to
+            ``joblib.Parallel``). ``1`` (default) runs serially; ``-1`` uses all
+            cores. Results are identical regardless of ``n_jobs``.
+        backend: ``joblib`` backend (default ``"loky"``, process-based). Samples are
+            refit independently, so a process backend avoids GIL contention from
+            the forward-selection orchestration.
 
-    Returns
-    -------
-    pl.DataFrame
-        One row per sample: a ``Sample`` column, one Float column per reference
+    Returns:
+        pl.DataFrame: One row per sample: a ``Sample`` column, one Float column per reference
         signature (activities, 0.0 if unselected), and a ``cosine_similarity``
         column for the final reconstruction.
 
-    Raises
-    ------
-    ValueError
-        If a ``MutationType`` present in the catalogue is missing from the
-        reference (rows cannot be aligned).
+    Raises:
+        ValueError: If a ``MutationType`` present in the catalogue is missing from the
+            reference (rows cannot be aligned).
     """
     if "MutationType" not in catalogue.columns:
         raise ValueError("catalogue must have a 'MutationType' column.")
@@ -249,20 +238,14 @@ def cosmic_signatures(
 ) -> pl.DataFrame:
     """Fetch (and cache) the COSMIC reference signatures for ``kind``.
 
-    Parameters
-    ----------
-    kind
-        One of ``"SBS96"``, ``"DBS78"``, ``"ID83"``.
-    version
-        COSMIC signature release (default ``"3.4"``).
-    genome
-        Reference build for SBS/DBS (``"GRCh37"`` or ``"GRCh38"``). Ignored for
-        ID83 (indel signatures are build-independent in the COSMIC release).
+    Args:
+        kind: One of ``"SBS96"``, ``"DBS78"``, ``"ID83"``.
+        version: COSMIC signature release (default ``"3.4"``).
+        genome: Reference build for SBS/DBS (``"GRCh37"`` or ``"GRCh38"``). Ignored for
+            ID83 (indel signatures are build-independent in the COSMIC release).
 
-    Returns
-    -------
-    pl.DataFrame
-        A ``MutationType`` column (in genoray's canonical codebook order for
+    Returns:
+        pl.DataFrame: A ``MutationType`` column (in genoray's canonical codebook order for
         ``kind``) followed by one column per COSMIC signature, ready to pass to
         :func:`fit_signatures`.
     """

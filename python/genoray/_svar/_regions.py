@@ -55,8 +55,7 @@ def _normalize_regions(
     regions: "str | tuple[str, int, int] | PathLike | object",
     cnorm: ContigNormalizer,
 ) -> pl.DataFrame:
-    """Normalize *regions* to a DataFrame with columns chrom (Utf8), start (Int32),
-    end (Int32) using 0-based, end-exclusive coordinates.
+    """Normalize *regions* to a DataFrame with columns chrom (Utf8), start (Int32), end (Int32) using 0-based, end-exclusive coordinates.
 
     Accepted input types:
 
@@ -145,8 +144,10 @@ def _normalize_samples(
     samples: "str | Sequence[str] | PathLike",
     available: Sequence[str],
 ) -> list[str]:
-    """Normalize `samples` to a list of valid sample names, preserving caller order
-    and deduping by first occurrence. Raises ValueError on unknown samples."""
+    """Normalize `samples` to a list of valid sample names, preserving caller order and deduping by first occurrence.
+
+    Raises ValueError on unknown samples.
+    """
     if isinstance(samples, str):
         candidates: list[str] = [samples]
     elif isinstance(samples, PathLike):
@@ -174,8 +175,7 @@ def _resolve_sample_idxs(
     available: Sequence[str],
     s2i: HashTable,
 ) -> tuple[NDArray, NDArray[np.int64]]:
-    """Validate `samples` against `available`, preserving caller order AND
-    duplicates, and return (name_array, integer_sample_indices).
+    """Validate `samples` against `available`, preserving caller order AND duplicates, and return (name_array, integer_sample_indices).
 
     `None` selects all `available`. A bare `str` is coerced to a single-element
     array first, so it is treated as one sample name (not iterated per-character).
@@ -194,8 +194,11 @@ def _validate_fields(
     fields: "Sequence[str] | None",
     available: "dict[str, np.dtype]",
 ) -> list[str]:
-    """Validate field selection. `None` returns all available fields; a sequence is
-    validated as a subset of `available`. Raises ValueError on unknown fields."""
+    """Validate field selection.
+
+    `None` returns all available fields; a sequence is validated as a subset of
+    `available`. Raises ValueError on unknown fields.
+    """
     if fields is None:
         return list(available)
     fields = list(fields)
@@ -212,37 +215,28 @@ def _resolve_kept_rows(
     mode: Literal["pos", "record", "variant"],
     merge_overlapping: bool,
 ) -> "NDArray[V_IDX_TYPE]":
-    """Return a sorted, deduplicated array of kept row positions (values from the
-    ``index`` column) in *index_df*.
+    """Return a sorted, deduplicated array of kept row positions (values from the ``index`` column) in *index_df*.
 
     *index_df* must have columns ``CHROM`` (Utf8), ``POS`` (Int32), ``ILEN``
     (list[int]) and ``index`` (the id returned for kept rows). Coordinates in
     *regions* are 0-based, half-open (chrom/start/end).
 
-    Parameters
-    ----------
-    index_df
-        Variant index DataFrame with columns ``index``, ``CHROM``, ``POS``, ``ILEN``.
-    c_norm
-        ContigNormalizer for the dataset.
-    regions
-        Normalised BED-like frame with columns ``chrom`` (Utf8), ``start`` (Int32),
-        ``end`` (Int32).  Coordinates are 0-based, half-open.
-    mode
-        ``"variant"`` — any variant whose span (accounting for ILEN) overlaps the
-        region is kept, as returned by ``var_ranges``.
-        ``"pos"`` — keep only variants whose POS-1 (0-based) falls strictly inside
-        ``[start, end)``.
-        ``"record"`` — like ``"pos"`` but widen the end by 1, i.e. POS-1 in
-        ``[start, end + 1)``.
-    merge_overlapping
-        If *True*, overlapping regions are silently merged before querying.
-        If *False* and overlapping regions are detected, raise ``ValueError``.
+    Args:
+        index_df: Variant index DataFrame with columns ``index``, ``CHROM``, ``POS``, ``ILEN``.
+        c_norm: ContigNormalizer for the dataset.
+        regions: Normalised BED-like frame with columns ``chrom`` (Utf8), ``start`` (Int32),
+            ``end`` (Int32).  Coordinates are 0-based, half-open.
+        mode: ``"variant"`` — any variant whose span (accounting for ILEN) overlaps the
+            region is kept, as returned by ``var_ranges``.
+            ``"pos"`` — keep only variants whose POS-1 (0-based) falls strictly inside
+            ``[start, end)``.
+            ``"record"`` — like ``"pos"`` but widen the end by 1, i.e. POS-1 in
+            ``[start, end + 1)``.
+        merge_overlapping: If *True*, overlapping regions are silently merged before querying.
+            If *False* and overlapping regions are detected, raise ``ValueError``.
 
-    Returns
-    -------
-    NDArray[V_IDX_TYPE]
-        Sorted, deduplicated 1-D array of ``index`` column values.
+    Returns:
+        NDArray[V_IDX_TYPE]: Sorted, deduplicated 1-D array of ``index`` column values.
     """
     if regions.height == 0:
         return np.empty(0, dtype=V_IDX_TYPE)

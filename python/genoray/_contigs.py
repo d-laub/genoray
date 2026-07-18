@@ -12,6 +12,7 @@ _MITO_ALIASES = ("M", "MT", "chrM", "chrMT")
 
 class ContigNormalizer:
     """Normalizes contig name(s) to match alternative naming schemes. For example, "chr1" to "1" or "1" to "chr1".
+
     Mitochondrial aliases {M, MT, chrM, chrMT} are treated as mutually equivalent and
     resolve to whichever spelling the reference actually contains.
     """
@@ -46,10 +47,8 @@ class ContigNormalizer:
     def norm(self, contigs: str | list[str]) -> str | None | list[str | None]:
         """Normalize contig name(s) to match the naming scheme of the contig normalizer.
 
-        Parameters
-        ----------
-        contigs
-            Contig name(s) to normalize.
+        Args:
+            contigs: Contig name(s) to normalize.
         """
         if isinstance(contigs, str):
             return self.contig_map.get(contigs, None)
@@ -59,10 +58,8 @@ class ContigNormalizer:
     def c_idxs(self, contigs: ArrayLike) -> NDArray[np.integer]:
         """Map contig names to their indices in the contig normalizer, automatically mapping unnormalized contigs.
 
-        Parameters
-        ----------
-        contigs
-            Contig name(s) to map.
+        Args:
+            contigs: Contig name(s) to map.
         """
         dup_idx = self._c2dup.get(contigs)
         return self.dup2i[dup_idx]

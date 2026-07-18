@@ -113,41 +113,34 @@ class Filter:
 class VCF:
     """Create a VCF reader.
 
-    Parameters
-    ----------
-    path
-        Path to the VCF file.
-    filter
-        A :class:`Filter` bundling a cyvcf2 record predicate with its matching
-        ``.gvi`` polars expression, or ``None`` to disable filtering.
+    Args:
+        path: Path to the VCF file.
+        filter: A :class:`Filter` bundling a cyvcf2 record predicate with its matching
+            ``.gvi`` polars expression, or ``None`` to disable filtering.
 
-        .. note::
-            The ``record`` predicate needs to be tolerant to missing fields. For example, if you
-            access an INFO or FORMAT field, not all variants are guaranteed to have the same fields.
-            The `cyvcf2.Variant <https://brentp.github.io/cyvcf2/docstrings.html#cyvcf2.cyvcf2.Variant>`_
-            API provides the :meth:`.get <dict.get>` method on the INFO and FORMAT attributes. For example,
-            :code:`lambda v: v.INFO.get("AF", 0) > 0.05` will skip any variants with an AF <= 0.05 or a
-            missing AF by treating missing AFs as 0.
+            .. note::
+                The ``record`` predicate needs to be tolerant to missing fields. For example, if you
+                access an INFO or FORMAT field, not all variants are guaranteed to have the same fields.
+                The `cyvcf2.Variant <https://brentp.github.io/cyvcf2/docstrings.html#cyvcf2.cyvcf2.Variant>`_
+                API provides the :meth:`.get <dict.get>` method on the INFO and FORMAT attributes. For example,
+                :code:`lambda v: v.INFO.get("AF", 0) > 0.05` will skip any variants with an AF <= 0.05 or a
+                missing AF by treating missing AFs as 0.
 
-        .. note::
-            The ``expr`` polars expression will be applied to the polars DataFrame returned by
-            :meth:`get_record_info`. It is not applied to the VCF file itself, so it will not be
-            able to use the cyvcf2.Variant API. For example, if you want to filter variants by INFO
-            field, you can use:
-            :code:`pl.col("AF") > 0.05`
-            but you can not use:
-            :code:`lambda v: v.INFO.get("AF", 0) > 0.05`
-            because the expression will be applied to the polars DataFrame, not the VCF file.
-    read_as
-        Type of data to read from the VCF file. Can be VCF.Genos, VCF.Dosages, or VCF.GenosDosages.
-    phasing
-        Whether to include phasing information on genotypes. If True, the ploidy axis will be length 3 such that
-        phasing is indicated by the 3rd value: 0 = unphased, 1 = phased. If False, the ploidy axis will be length 2.
-    dosage_field
-        Name of the dosage field to read from the VCF file. Required if read_as is VCF.Dosages, VCF.Genos8Dosages,
-        or VCF.Genos16Dosages.
-    progress
-        Whether to show a progress bar while reading the VCF file.
+            .. note::
+                The ``expr`` polars expression will be applied to the polars DataFrame returned by
+                :meth:`get_record_info`. It is not applied to the VCF file itself, so it will not be
+                able to use the cyvcf2.Variant API. For example, if you want to filter variants by INFO
+                field, you can use:
+                :code:`pl.col("AF") > 0.05`
+                but you can not use:
+                :code:`lambda v: v.INFO.get("AF", 0) > 0.05`
+                because the expression will be applied to the polars DataFrame, not the VCF file.
+        read_as: Type of data to read from the VCF file. Can be VCF.Genos, VCF.Dosages, or VCF.GenosDosages.
+        phasing: Whether to include phasing information on genotypes. If True, the ploidy axis will be length 3 such that
+            phasing is indicated by the 3rd value: 0 = unphased, 1 = phased. If False, the ploidy axis will be length 2.
+        dosage_field: Name of the dosage field to read from the VCF file. Required if read_as is VCF.Dosages, VCF.Genos8Dosages,
+            or VCF.Genos16Dosages.
+        progress: Whether to show a progress bar while reading the VCF file.
     """
 
     path: Path
@@ -255,9 +248,10 @@ class VCF:
 
     @property
     def nbytes(self) -> int:
-        """Total in-memory footprint, in bytes, of resident (non-mmap'd) data
-        structures held by this reader. Currently this is the gvi variant
-        index (CHROM/POS/REF/ALT/ILEN). Returns 0 before the index is loaded.
+        """Total in-memory footprint, in bytes, of resident (non-mmap'd) data structures held by this reader.
+
+        Currently this is the gvi variant index (CHROM/POS/REF/ALT/ILEN). Returns 0
+        before the index is loaded.
         """
         if self._index is None:
             return 0
@@ -276,13 +270,10 @@ class VCF:
     def set_samples(self, samples: ArrayLike | None) -> Self:
         """Set the samples to read from the VCF file. Modifies the VCF reader in place and returns it.
 
-        Parameters
-        ----------
-        samples
-            List of sample names to read from the VCF file.
+        Args:
+            samples: List of sample names to read from the VCF file.
 
-        Returns
-        -------
+        Returns:
             The VCF reader with the specified samples.
         """
         if samples is not None:
@@ -314,11 +305,9 @@ class VCF:
     def using_pbar(self, pbar: tqdm):
         """Create a context where the given progress bar will be incremented by any calls to a read method.
 
-        Parameters
-        ----------
-        pbar
-            Progress bar to use while reading variants. This will be incremented per variant
-            during any calls to a read function.
+        Args:
+            pbar: Progress bar to use while reading variants. This will be incremented per variant
+                during any calls to a read function.
         """
         self._pbar = pbar
         try:
@@ -334,17 +323,12 @@ class VCF:
     ) -> NDArray[np.uint32]:
         """Return the start and end indices of the variants in the given ranges.
 
-        Parameters
-        ----------
-        contig
-            Contig name.
-        starts
-            0-based start positions of the ranges.
-        ends
-            0-based, exclusive end positions of the ranges.
+        Args:
+            contig: Contig name.
+            starts: 0-based start positions of the ranges.
+            ends: 0-based, exclusive end positions of the ranges.
 
-        Returns
-        -------
+        Returns:
             Shape: :code:`(ranges)`. Number of variants in the given ranges.
         """
         if self._index is None:
@@ -360,17 +344,12 @@ class VCF:
     ) -> NDArray[np.uint32]:
         """Return the start and end indices of the variants in the given ranges.
 
-        Parameters
-        ----------
-        contig
-            Contig name.
-        starts
-            0-based start positions of the ranges.
-        ends
-            0-based, exclusive end positions of the ranges.
+        Args:
+            contig: Contig name.
+            starts: 0-based start positions of the ranges.
+            ends: 0-based, exclusive end positions of the ranges.
 
-        Returns
-        -------
+        Returns:
             Shape: :code:`(ranges)`. Number of variants in the given ranges.
         """
         starts = np.atleast_1d(np.asarray(starts, POS_TYPE)).clip(min=0)
@@ -399,21 +378,14 @@ class VCF:
     ) -> NDArray[np.uint32]:
         """Return the start and end indices of the variants in the given ranges.
 
-        Parameters
-        ----------
-        index
-            Index to use for counting variants.
-        contig
-            Contig name.
-        starts
-            0-based start positions of the ranges.
-        ends
-            0-based, exclusive end positions of the ranges.
+        Args:
+            index: Index to use for counting variants.
+            contig: Contig name.
+            starts: 0-based start positions of the ranges.
+            ends: 0-based, exclusive end positions of the ranges.
 
-        Returns
-        -------
-        n_variants
-            Shape: :code:`(ranges)`. Number of variants in the given ranges.
+        Returns:
+            n_variants: Shape: :code:`(ranges)`. Number of variants in the given ranges.
         """
         if self._index is None:
             raise RuntimeError(
@@ -430,17 +402,12 @@ class VCF:
     ) -> tuple[NDArray[np.integer], NDArray[OFFSET_TYPE]]:
         """Get variant indices and the number of indices per range.
 
-        Parameters
-        ----------
-        contig
-            Contig name.
-        starts
-            0-based start positions of the ranges.
-        ends
-            0-based, exclusive end positions of the ranges.
+        Args:
+            contig: Contig name.
+            starts: 0-based start positions of the ranges.
+            ends: 0-based, exclusive end positions of the ranges.
 
-        Returns
-        -------
+        Returns:
             Shape: (tot_variants). Variant indices for the given ranges.
 
             Shape: (ranges+1). Offsets to get variant indices for each range.
@@ -481,21 +448,14 @@ class VCF:
     ) -> T:
         """Read genotypes and/or dosages for a range.
 
-        Parameters
-        ----------
-        contig
-            Contig name.
-        start
-            0-based start position.
-        end
-            0-based, exclusive end position.
-        mode
-            Type of data to read.
-        out
-            Output array to fill with genotypes and/or dosages. If None, a new array will be created.
+        Args:
+            contig: Contig name.
+            start: 0-based start position.
+            end: 0-based, exclusive end position.
+            mode: Type of data to read.
+            out: Output array to fill with genotypes and/or dosages. If None, a new array will be created.
 
-        Returns
-        -------
+        Returns:
             Genotypes and/or dosages. Genotypes have shape :code:`(samples ploidy variants)` and
             dosages have shape :code:`(samples variants)`. Missing genotypes have value -1 and missing dosages
             have value np.nan. If just using genotypes or dosages, will be a single array, otherwise
@@ -554,22 +514,15 @@ class VCF:
     ) -> Generator[T]:
         """Iterate over genotypes and/or dosages for a range in chunks limited by :code:`max_mem`.
 
-        Parameters
-        ----------
-        contig
-            Contig name.
-        start
-            0-based start position.
-        end
-            0-based, exclusive end position.
-        max_mem
-            Maximum memory to use for each chunk. Can be an integer or a string with a suffix
-            (e.g. "4g", "2 MB").
-        mode
-            Type of data to read.
+        Args:
+            contig: Contig name.
+            start: 0-based start position.
+            end: 0-based, exclusive end position.
+            max_mem: Maximum memory to use for each chunk. Can be an integer or a string with a suffix
+                (e.g. "4g", "2 MB").
+            mode: Type of data to read.
 
-        Returns
-        -------
+        Returns:
             Generator of genotypes and/or dosages. Genotypes have shape :code:`(samples ploidy variants)` and
             dosages have shape :code:`(samples variants)`. Missing genotypes have value -1 and missing dosages
             have value np.nan. If just using genotypes or dosages, will be a single array, otherwise
@@ -669,25 +622,19 @@ class VCF:
         ]
     ]:
         """Read genotypes and/or dosages in chunks approximately limited by :code:`max_mem`.
+
         Will extend the range so that the returned data corresponds to haplotypes that have at least as much
         length as the original range.
 
-        Parameters
-        ----------
-        contig
-            Contig name.
-        start
-            0-based start positions.
-        end
-            0-based, exclusive end positions.
-        max_mem
-            Maximum memory to use for each chunk. Can be an integer or a string with a suffix
-            (e.g. "4g", "2 MB").
-        mode
-            Type of data to read.
+        Args:
+            contig: Contig name.
+            starts: 0-based start positions.
+            ends: 0-based, exclusive end positions.
+            max_mem: Maximum memory to use for each chunk. Can be an integer or a string with a suffix
+                (e.g. "4g", "2 MB").
+            mode: Type of data to read.
 
-        Returns
-        -------
+        Returns:
             Generator of chunks of genotypes and/or dosages and the 0-based end position of the final variant
             in the chunk. Genotypes have shape :code:`(samples ploidy variants)` and
             dosages have shape :code:`(samples variants)`. Missing genotypes have value -1 and missing dosages
@@ -886,20 +833,17 @@ class VCF:
         lazy: bool = False,
     ) -> pl.DataFrame | pl.LazyFrame:
         """Get a DataFrame of any non-FORMAT fields in the VCF for a given range or the entire VCF.
+
         Will filter variants if the VCF instance has a filter function.
 
-        Parameters
-        ----------
-        contig
-            Contig name. If None, will read the entire VCF.
-        start
-            0-based start position.
-        end
-            0-based, exclusive end position.
-        fields
-            List of non-FORMAT, non-INFO fields to include. Returns all by default.
-        info
-            List of INFO fields to include. Returns all by default.
+        Args:
+            contig: Contig name. If None, will read the entire VCF.
+            start: 0-based start position.
+            end: 0-based, exclusive end position.
+            fields: List of non-FORMAT, non-INFO fields to include. Returns all by default.
+            info: List of INFO fields to include. Returns all by default.
+            lazy: If True, return a :class:`polars.LazyFrame` instead of collecting to a
+                :class:`polars.DataFrame`.
         """
         if (start is not None or end is not None) and contig is None:
             raise ValueError("start and end must be None if no contig is specified.")
@@ -969,10 +913,11 @@ class VCF:
         return [c for c in candidates if c in info_ids]
 
     def _fetch_info_cols(self, info_names: list[str]) -> pl.LazyFrame:
-        """Fetch a set of uppercase INFO field names directly from oxbow and unnest the
-        returned struct, returning a LazyFrame with POS and those INFO columns as
-        top-level columns. POS is retained so the caller can cross-check alignment
-        against the base frame before positional concat.
+        """Fetch uppercase INFO fields directly from oxbow as a LazyFrame.
+
+        Unnests the returned struct, returning a LazyFrame with POS and those INFO
+        columns as top-level columns. POS is retained so the caller can cross-check
+        alignment against the base frame before positional concat.
 
         Returns a LazyFrame with columns: POS, <info_names...>
         """
@@ -1002,20 +947,17 @@ class VCF:
         overwrite: bool = True,
         only_biallelic: bool = False,
     ) -> None:
-        """Writes record information to disk, ignoring any filtering. At a minimum this index will
-        include columns `CHROM`, `POS` (1-based), `REF`, `ALT`, and `ILEN`.
+        """Write record information to disk, ignoring any filtering.
 
-        Parameters
-        ----------
-        fields
-            List of non-FORMAT, non-INFO fields to include. At a minimum this index will include
-            columns `CHROM`, `POS` (1-based), `REF`, `ALT`, and `ILEN`.
-        info
-            List of INFO fields to include.
-        overwrite
-            Whether to overwrite the index file if it exists.
-        only_biallelic
-            Whether to only use the first ALT alleles for each variant (i.e. assume all variants are biallelic). Better compression if True.
+        At a minimum this index will include columns `CHROM`, `POS` (1-based), `REF`,
+        `ALT`, and `ILEN`.
+
+        Args:
+            fields: List of non-FORMAT, non-INFO fields to include. At a minimum this index will include
+                columns `CHROM`, `POS` (1-based), `REF`, `ALT`, and `ILEN`.
+            info: List of INFO fields to include.
+            overwrite: Whether to overwrite the index file if it exists.
+            only_biallelic: Whether to only use the first ALT alleles for each variant (i.e. assume all variants are biallelic). Better compression if True.
         """
         if self._valid_index() and not overwrite:
             raise FileExistsError(
@@ -1098,17 +1040,16 @@ class VCF:
             )
 
     def _load_index(self) -> Self:
-        """Load the index from disk, applying the filter expression if provided. You must
-        ensure that the filter expression is exactly equivalent to the vcf.filter function.
-        If a filter expression is not given and the VCF has a filter function, then one pass
-        over the VCF will be made to infer what records should be filtered.
+        """Load the index from disk, applying the filter expression if provided.
 
-        Parameters
-        ----------
-        filter
-            Filter expression to apply to the index. This should be a pl.Expr object that
-            is equivalent to the VCF filter function. If None, the filter function will be
-            used to filter the index.
+        You must ensure that the filter expression is exactly equivalent to the vcf.filter
+        function. If a filter expression is not given and the VCF has a filter function, then
+        one pass over the VCF will be made to infer what records should be filtered.
+
+        Args:
+            filter: Filter expression to apply to the index. This should be a pl.Expr object that
+                is equivalent to the VCF filter function. If None, the filter function will be
+                used to filter the index.
         """
         if not self._valid_index():
             raise FileNotFoundError(
@@ -1141,8 +1082,10 @@ class VCF:
         return self
 
     def _valid_index(self) -> bool:
-        """Check if the index is valid. Needs to exist and have a modified time greater than
-        the VCF file."""
+        """Check if the index is valid.
+
+        Needs to exist and have a modified time greater than the VCF file.
+        """
         if not self._index_path().exists():
             return False
 
@@ -1364,10 +1307,8 @@ class VCF:
     def _mem_per_variant(self, mode: type[T]) -> int:
         """Calculate the memory required per variant for the given mode.
 
-        Returns
-        -------
-        int
-            Memory required per variant in bytes.
+        Returns:
+            int: Memory required per variant in bytes.
         """
         mem = mode.nbytes_per_variant(self.n_samples, self.ploidy + self.phasing)
         if isinstance(self._s_sorter, np.ndarray):

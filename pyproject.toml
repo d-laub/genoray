@@ -66,6 +66,22 @@ markers = [
 enableTypeIgnoreComments = true
 reportMissingTypeArgument = false
 
+[tool.ruff.lint]
+# Add pydocstyle (`D`) to ruff's defaults (`E4`, `E7`, `E9`, `F`) to enforce
+# Google-style docstrings. `D1xx` (missing-docstring) only fires on *public*
+# names, so private helpers are exempt without extra config.
+extend-select = ["D"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+# Docstring rules target the library's public API; dev/test/doc code is exempt.
+"tests/**" = ["D"]
+"scripts/**" = ["D"]
+"docs/**" = ["D"]
+"notebooks/**" = ["D"]
+
 [tool.maturin]
 python-source = "python"
 module-name = "genoray._core"
