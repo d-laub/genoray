@@ -839,7 +839,7 @@ fn svar2_variant_stats<'py>(
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 #[pyfunction]
-#[pyo3(signature = (vcf_paths, reference_path, chroms, output_dir, samples, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false, signatures=false, info_fields=Vec::new(), format_fields=Vec::new(), check_ref="e".to_string(), region_ranges=Vec::new(), regions_overlap="pos".to_string()))]
+#[pyo3(signature = (vcf_paths, reference_path, chroms, output_dir, samples, contig_membership, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false, signatures=false, info_fields=Vec::new(), format_fields=Vec::new(), check_ref="e".to_string(), region_ranges=Vec::new(), regions_overlap="pos".to_string()))]
 fn run_vcf_list_conversion_pipeline(
     py: Python,
     vcf_paths: Vec<String>,
@@ -847,6 +847,12 @@ fn run_vcf_list_conversion_pipeline(
     chroms: Vec<String>,
     output_dir: String,
     samples: Vec<String>,
+    // `contig_membership[c][i]` == whether `vcf_paths[i]` has records on
+    // `chroms[c]` (computed Python-side via the same cyvcf2 probe that builds
+    // the contig union). Parallel: outer to `chroms`, inner to `vcf_paths`.
+    // Threaded down so a file with no records on a contig is never opened/seeked
+    // for it (issue #122).
+    contig_membership: Vec<Vec<bool>>,
     chunk_size: usize,
     ploidy: usize,
     max_threads: Option<usize>,
@@ -882,6 +888,7 @@ fn run_vcf_list_conversion_pipeline(
             format_fields,
             region_ranges,
             overlap_mode,
+            contig_membership,
         )
     })?;
     Ok(dropped as usize)

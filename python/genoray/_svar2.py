@@ -1242,12 +1242,29 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
                 n_format_fields=len(format_),
                 max_mem=None if max_mem is None else parse_memory(max_mem),
             )
+
+        # Per-contig, per-file membership: `contig_membership[c][i]` is True iff
+        # paths[i] has records on contigs[c]. Built from the SAME cyvcf2 probe
+        # (`per_file_contigs`) that produced the contig union above, so Rust
+        # never opens/seeks a file for a contig it has no records on. This is
+        # what fixes issue #122: a cohort-shared header declares every contig in
+        # every file, but a file with no records on a contig (e.g. a female
+        # sample has no somatic chrY) makes rust-htslib's seek raise -- while
+        # cyvcf2 (hence this probe) just returns empty. `per_file_contigs` is
+        # parallel to `paths` (built in the same order above), so the inner
+        # list is parallel to the paths list passed to Rust.
+        contig_membership = [
+            [contig in file_contigs for _p, file_contigs in per_file_contigs]
+            for contig in contigs
+        ]
+
         return _core.run_vcf_list_conversion_pipeline(
             [str(p) for p in paths],
             None if no_reference else str(reference),
             contigs,
             str(out),
             samples,
+            contig_membership,
             chunk_size,
             ploidy,
             threads,

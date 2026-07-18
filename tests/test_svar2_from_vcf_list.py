@@ -90,6 +90,65 @@ def test_from_vcf_list_disjoint_sites_hom_ref_fill(tmp_path: Path):
     assert counts.tolist() == [1, 0, 0, 1]
 
 
+def test_from_vcf_list_contig_missing_from_some_files_is_hom_ref_filled(
+    tmp_path: Path,
+):
+    """Issue #122: a cohort-shared pipeline header declares every contig in
+    every file, yet a file may have zero records on a given contig (e.g. a
+    female sample has no somatic chrY). rust-htslib's seek RAISES on such a
+    header-declared-but-index-absent contig (cyvcf2 instead returns empty),
+    which used to abort the whole `from_vcf_list` run with an opaque OSError
+    (`error seeking to "<contig>":0 in indexed file`). The conversion must
+    instead skip that file for the contig and hom-ref-fill its column.
+
+    Uses tabix (`.tbi`) indexes to match real PURPLE `*.somatic.vcf.gz` inputs
+    (both `.tbi` and `bcftools index` `.csi` reproduced the crash pre-fix).
+    """
+    ref = tmp_path / "ref.fa"
+    ref.write_text(">chr1\n" + "A" * 40 + "\n>chr2\n" + "A" * 40 + "\n")
+    subprocess.run(["samtools", "faidx", str(ref)], check=True)
+
+    header = (
+        "##fileformat=VCFv4.2\n"
+        "##contig=<ID=chr1,length=40>\n"
+        "##contig=<ID=chr2,length=40>\n"
+        '##FORMAT=<ID=GT,Number=1,Type=String,Description="GT">\n'
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t{s}\n"
+    )
+
+    def ss(name: str, sample: str, rows: str) -> Path:
+        plain = tmp_path / f"{name}.vcf"
+        plain.write_text(header.format(s=sample) + rows)
+        gz = tmp_path / f"{name}.vcf.gz"
+        with open(gz, "wb") as fh:
+            subprocess.run(["bgzip", "-c", str(plain)], check=True, stdout=fh)
+        subprocess.run(["tabix", "-p", "vcf", str(gz)], check=True)
+        return gz
+
+    # file A carries records on BOTH contigs; file B ONLY on chr1 -- its index
+    # has no chr2 entry, so seeking chr2 is exactly the failing operation.
+    a = ss(
+        "a",
+        "SA",
+        "chr1\t3\t.\tA\tG\t.\t.\t.\tGT\t1|0\nchr2\t6\t.\tA\tG\t.\t.\t.\tGT\t1|1\n",
+    )
+    b = ss("b", "SB", "chr1\t3\t.\tA\tG\t.\t.\t.\tGT\t0|1\n")
+
+    out = tmp_path / "store"
+    dropped = SparseVar2.from_vcf_list(out, [a, b], ref, threads=1)
+    assert dropped == 0
+    sv = SparseVar2(out)
+    assert sv.available_samples == ["SA", "SB"]
+
+    # chr2: only SA carries (hom-alt, both haps); SB is hom-ref filled, NOT a
+    # crash. (R,S,P) -> [SA_h0, SA_h1, SB_h0, SB_h1].
+    counts_chr2 = sv.region_counts("chr2", [(0, 40)]).reshape(-1)
+    assert counts_chr2.tolist() == [1, 1, 0, 0]
+    # chr1 is unaffected: both files carry one hap each.
+    counts_chr1 = sv.region_counts("chr1", [(0, 40)]).reshape(-1)
+    assert counts_chr1.tolist() == [1, 0, 0, 1]
+
+
 def test_from_vcf_list_regions_restricts(tmp_path: Path):
     """`regions` restricts the k-way merge to the requested interval, exactly
     as it restricts `from_vcf` -- exercised here through `from_vcf_list`'s
@@ -762,9 +821,11 @@ def test_from_vcf_list_auto_chunk_size(tmp_path, monkeypatch):
     seen = {}
     real_pipeline = sv2._core.run_vcf_list_conversion_pipeline
 
-    def spy(paths, ref, contigs, out, samples, chunk_size, *rest):
+    def spy(paths, ref, contigs, out, samples, contig_membership, chunk_size, *rest):
         seen["chunk_size"] = chunk_size
-        return real_pipeline(paths, ref, contigs, out, samples, chunk_size, *rest)
+        return real_pipeline(
+            paths, ref, contigs, out, samples, contig_membership, chunk_size, *rest
+        )
 
     monkeypatch.setattr(sv2._core, "run_vcf_list_conversion_pipeline", spy)
     monkeypatch.setattr(

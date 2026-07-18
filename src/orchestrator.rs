@@ -96,6 +96,12 @@ pub enum SourceSpec {
         htslib_threads: usize,
         regions: Vec<(u32, u32)>,
         overlap: crate::svar2_view::OverlapMode,
+        /// `members[i]` is `false` when `vcf_paths[i]` has no records on THIS
+        /// contig (Python's per-file cyvcf2 probe). Non-members are never opened
+        /// -- their column is hom-ref filled. This is per-contig, so a fresh
+        /// `Vec` is built for each `process_chromosome` call (see
+        /// `run_vcf_list`). See `VcfListRecordSource::new`.
+        members: Vec<bool>,
     },
     Svar1 {
         svar1_dir: String,
@@ -610,6 +616,7 @@ pub fn process_chromosome(
                         htslib_threads,
                         regions,
                         overlap,
+                        members,
                     } => {
                         let ref_seq_opt: Option<Vec<u8>> = match fasta.as_deref() {
                             Some(f) => Some(crate::vcf_reader::load_contig_seq(f, &chr)?),
@@ -627,6 +634,7 @@ pub fn process_chromosome(
                             &fields_owned,
                             regions,
                             overlap,
+                            &members,
                         )?;
                         Box::new(VcfListDroppedProxy {
                             inner: vcf_list,
@@ -971,7 +979,21 @@ pub fn run_vcf_list(
     format_fields: Vec<(String, String, String, Option<String>, Option<f64>)>,
     region_ranges: Vec<(String, u32, u32)>,
     overlap: crate::svar2_view::OverlapMode,
+    // `contig_membership[c][i]` is `true` when `vcf_paths[i]` has records on
+    // `chroms[c]` (Python's per-file cyvcf2 probe). Outer parallel to `chroms`,
+    // inner parallel to `vcf_paths`. Threaded into each contig's
+    // `SourceSpec::VcfList` so non-member files are never opened for that contig
+    // (issue #122).
+    contig_membership: Vec<Vec<bool>>,
 ) -> Result<u64, ConversionError> {
+    if contig_membership.len() != chroms.len() {
+        return Err(ConversionError::Input(format!(
+            "contig_membership must be parallel to chroms (one row per contig): \
+             got {} rows and {} contigs",
+            contig_membership.len(),
+            chroms.len()
+        )));
+    }
     // `from_vcf_list` holds every input open at once, per contig, so a per-file decode
     // thread is N threads per contig -- 7,089 on the #120 cohort, recreated 24 times.
     // Each wave takes fresh glibc arenas whose 64 MB heaps are never unmapped. They buy
@@ -1019,7 +1041,7 @@ pub fn run_vcf_list(
 
     let fasta_ref = reference_path;
     let mut total_dropped: u64 = 0;
-    for chrom in chroms {
+    for (chrom, members) in chroms.iter().zip(contig_membership) {
         println!("==> Processing {}", chrom);
         let dropped = process_chromosome(
             SourceSpec::VcfList {
@@ -1027,6 +1049,7 @@ pub fn run_vcf_list(
                 htslib_threads: VCF_LIST_HTSLIB_THREADS,
                 regions: ranges_by_chrom.get(chrom).cloned().unwrap_or_default(),
                 overlap,
+                members,
             },
             fasta_ref,
             chrom,

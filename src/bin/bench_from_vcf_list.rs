@@ -8,7 +8,7 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 use genoray_core::normalize::CheckRef;
 use genoray_core::orchestrator::run_vcf_list;
 use genoray_core::svar2_view::OverlapMode;
-use rust_htslib::bcf::{Read, Reader};
+use rust_htslib::bcf::{IndexedReader, Read, Reader};
 use std::fs;
 use std::time::Instant;
 
@@ -21,6 +21,27 @@ fn sample_of(path: &str) -> String {
     let r = Reader::from_path(path).expect("open vcf");
     let s = r.header().samples();
     String::from_utf8_lossy(s[0]).into_owned()
+}
+
+/// Does `path` actually carry at least one record on `chrom`? Mirrors the
+/// cyvcf2 probe `run_vcf_list_conversion_pipeline` runs Python-side: a shared
+/// pipeline header can declare a contig every file lacks records on (e.g. a
+/// female sample has no somatic chrY), so a fetch either seek-raises (VCF.gz +
+/// tabix/CSI) or returns empty (BCF + CSI) -- both mean "not a member". Real
+/// cohorts (issue #120) hit this, so the bench must compute membership rather
+/// than assume every file carries every contig (which would reproduce #122).
+fn file_has_contig(path: &str, chrom: &str) -> bool {
+    let Ok(mut reader) = IndexedReader::from_path(path) else {
+        return false;
+    };
+    let Ok(rid) = reader.header().name2rid(chrom.as_bytes()) else {
+        return false; // contig absent from header entirely
+    };
+    if reader.fetch(rid, 0, None).is_err() {
+        return false; // seek raised => no index entry for this contig
+    }
+    let mut rec = reader.empty_record();
+    matches!(reader.read(&mut rec), Some(Ok(())))
 }
 
 fn main() {
@@ -90,6 +111,14 @@ fn main() {
         reference.unwrap_or("<none>"),
     );
 
+    // Per-contig membership, computed exactly as the Python entrypoint does
+    // (probe each file for records on each contig) so the bench runs on real
+    // cohorts whose shared header declares contigs some files lack (issue #122).
+    let contig_membership: Vec<Vec<bool>> = chroms
+        .iter()
+        .map(|c| vcf_paths.iter().map(|p| file_has_contig(p, c)).collect())
+        .collect();
+
     let t = Instant::now();
     let dropped = run_vcf_list(
         &vcf_paths,
@@ -108,6 +137,7 @@ fn main() {
         format_fields,
         Vec::new(),       // region_ranges: empty => whole contig, as the bench intends
         OverlapMode::Pos, // overlap (inert with no regions; mirrors the default)
+        contig_membership,
     )
     .expect("run_vcf_list");
     eprintln!(
