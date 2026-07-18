@@ -1136,23 +1136,21 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         somatic calls) use considerably less.
 
         For large multi-contig merges, also consider setting
-        ``MALLOC_ARENA_MAX`` in the environment -- see the Notes section
-        below.
+        ``MALLOC_ARENA_MAX`` in the environment -- see the note below.
 
-        Notes
-        -----
-        Peak RSS on very large multi-contig merges is dominated by glibc arena
-        behaviour, not by live data: glibc sizes its arena count from the
-        *machine's* core count (8 x ncores, so 768 on a 96-core node) and
-        never unmaps a heap once created.
+        Note:
+            Peak RSS on very large multi-contig merges is dominated by glibc
+            arena behaviour, not by live data: glibc sizes its arena count from
+            the *machine's* core count (8 x ncores, so 768 on a 96-core node)
+            and never unmaps a heap once created.
 
-        Setting ``MALLOC_ARENA_MAX=2`` in the environment *before* the
-        process starts can help -- measured 9.20 GB -> 6.89 GB peak on a
-        3-contig, 1000-file merge at no time cost. It is **not** a safe
-        default: with thousands of concurrent readers contending on two
-        arena locks the same knob measured 12% *worse* RAM and **73%
-        slower** on a 4000-file single-contig merge. Measure before
-        adopting it.
+            Setting ``MALLOC_ARENA_MAX=2`` in the environment *before* the
+            process starts can help -- measured 9.20 GB -> 6.89 GB peak on a
+            3-contig, 1000-file merge at no time cost. It is **not** a safe
+            default: with thousands of concurrent readers contending on two
+            arena locks the same knob measured 12% *worse* RAM and **73%
+            slower** on a 4000-file single-contig merge. Measure before
+            adopting it.
         """
         from cyvcf2 import VCF as _CyVCF
 
