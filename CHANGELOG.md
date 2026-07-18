@@ -1,3 +1,9 @@
+## 3.2.1 (2026-07-18)
+
+### Fix
+
+- **svar2**: thread per-file contig membership into from_vcf_list merge
+
 ## 3.2.0 (2026-07-17)
 
 ### Feat
