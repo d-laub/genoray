@@ -434,6 +434,93 @@ def test_from_vcf_list_fields_multicontig_matches_dense_oracle(tmp_path: Path):
             )
 
 
+def test_from_vcf_list_fields_multicontig3_matches_dense_oracle(tmp_path: Path):
+    """Sibling of `test_from_vcf_list_fields_multicontig_matches_dense_oracle`,
+    extended to **three** contigs (`chr1`, `chr2`, `chr3`) instead of two.
+
+    This is a characterization test for issue #120 (the `from_vcf_list`
+    cross-contig RSS ratchet): the fix trims the glibc heap arena at the
+    `run_vcf_list` contig-loop boundary, which cannot change output bytes (it
+    only returns already-freed pages to the OS). So this test must pass
+    identically before AND after the fix -- its job is to exercise the fix's
+    per-contig-boundary trim across *multiple* boundaries (2 trims instead of
+    1), not to detect a behavior change.
+    """
+    header = (
+        "##fileformat=VCFv4.2\n"
+        "##contig=<ID=chr1,length=1000>\n"
+        "##contig=<ID=chr2,length=1000>\n"
+        "##contig=<ID=chr3,length=1000>\n"
+        '##FORMAT=<ID=GT,Number=1,Type=String,Description="GT">\n'
+        '##FORMAT=<ID=DP,Number=1,Type=Integer,Description="Depth">\n'
+        '##FORMAT=<ID=VAF,Number=A,Type=Float,Description="Alt frac">\n'
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t{s}\n"
+    )
+
+    def ss(name: str, sample: str, rows: str) -> Path:
+        plain = tmp_path / f"{name}.vcf"
+        plain.write_text(header.format(s=sample) + rows)
+        gz = tmp_path / f"{name}.vcf.gz"
+        with open(gz, "wb") as fh:
+            subprocess.run(["bgzip", "-c", str(plain)], check=True, stdout=fh)
+        subprocess.run(["bcftools", "index", str(gz)], check=True)
+        return gz
+
+    a = ss(
+        "a",
+        "SA",
+        "chr1\t3\t.\tA\tG\t.\t.\t.\tGT:DP:VAF\t1|0:30:0.5\n"  # shared chr1 SNP
+        "chr1\t12\t.\tG\tC\t.\t.\t.\tGT:DP:VAF\t0|1:22:0.9\n"  # private chr1
+        "chr2\t5\t.\tT\tA\t.\t.\t.\tGT:DP:VAF\t1|0:11:0.3\n"  # private chr2
+        "chr3\t8\t.\tC\tT\t.\t.\t.\tGT:DP:VAF\t1|0:14:0.6\n",  # shared chr3 SNP
+    )
+    b = ss(
+        "b",
+        "SB",
+        "chr1\t3\t.\tA\tG\t.\t.\t.\tGT:DP:VAF\t0|1:18:0.4\n"  # shared chr1 SNP
+        "chr2\t5\t.\tT\tA\t.\t.\t.\tGT:DP:VAF\t0|1:27:0.7\n"  # shared chr2 SNP
+        "chr3\t8\t.\tC\tT\t.\t.\t.\tGT:DP:VAF\t0|1:19:0.2\n"  # shared chr3 SNP
+        "chr3\t15\t.\tG\tA\t.\t.\t.\tGT:DP:VAF\t1|0:9:0.8\n",  # private chr3
+    )
+    paths = [a, b]
+
+    merge = subprocess.run(
+        ["bcftools", "merge", "-0", *map(str, paths)],
+        check=True,
+        stdout=subprocess.PIPE,
+    )
+    merged = tmp_path / "merged.vcf.gz"
+    with open(merged, "wb") as fh:
+        subprocess.run(["bgzip", "-c"], input=merge.stdout, check=True, stdout=fh)
+    subprocess.run(["bcftools", "index", str(merged)], check=True)
+
+    fields = dict(format_fields=["DP", "VAF"])
+    dense_out, list_out = tmp_path / "dense", tmp_path / "list"
+    SparseVar2.from_vcf(dense_out, merged, no_reference=True, threads=1, **fields)
+    dropped = SparseVar2.from_vcf_list(
+        list_out, paths, no_reference=True, threads=1, **fields
+    )
+    assert dropped == 0
+
+    dense = SparseVar2(dense_out).with_fields(["DP", "VAF"])
+    native = SparseVar2(list_out).with_fields(["DP", "VAF"])
+    assert dense.available_samples == native.available_samples == ["SA", "SB"]
+
+    for contig, length in [("chr1", 1000), ("chr2", 1000), ("chr3", 1000)]:
+        region = [(0, length)]
+        d = dense.decode(contig, region)
+        n = native.decode(contig, region)
+        # Genotype-level parity (positions) AND FORMAT parity, across all
+        # three contigs -- i.e. across two contig-loop boundaries in
+        # `run_vcf_list`, the site of the arena trim this test guards.
+        for key in ("pos", "DP", "VAF"):
+            np.testing.assert_array_equal(
+                np.asarray(d[key].data),
+                np.asarray(n[key].data),
+                err_msg=f"{contig}:{key} diverged between dense and carrier paths",
+            )
+
+
 def test_from_vcf_list_matches_bcftools_merge_oracle(tmp_path: Path):
     """Oracle parity: `bcftools merge -0` (missing -> hom-ref, exactly our
     semantics) -> `from_vcf` must equal the native `from_vcf_list` k-way merge.

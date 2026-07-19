@@ -2,6 +2,7 @@
 grows ~linearly with the number of files. A fixed position pool makes the union
 asymptote, which hides every O(V x N) cost in the merge (issue #120)."""
 
+import gzip
 import subprocess
 from pathlib import Path
 
@@ -125,6 +126,38 @@ def test_format_fields_are_emitted(tmp_path: Path) -> None:
         ["bcftools", "view", "-H", first], capture_output=True, text=True, check=True
     ).stdout
     assert "GT:VAF:DP" in out, f"FORMAT column missing requested fields:\n{out[:200]}"
+
+
+def _decompressed_records(manifest: Path) -> list[bytes]:
+    """Raw VCF record bytes (post-bgzip, order-preserving) for every file in a manifest."""
+    out = []
+    for gz in Path(manifest).read_text().split():
+        with gzip.open(gz, "rb") as fh:
+            out.append(
+                b"".join(line for line in fh if not line.startswith(b"##fileformat"))
+            )
+    return out
+
+
+def test_parallel_generation_is_byte_identical_to_serial(tmp_path: Path) -> None:
+    kw = dict(
+        n_files=12,
+        n_variants=15,
+        contigs=["1", "2"],
+        contig_len=200_000,
+        shared_frac=0.1,
+        indel_frac=0.1,
+        seed=0,
+        format_fields=["VAF", "DP"],
+    )
+    m1 = generate_cohort(tmp_path / "serial", jobs=1, **kw)
+    m8 = generate_cohort(tmp_path / "par", jobs=8, **kw)
+    names1 = [Path(p).name for p in m1.read_text().split()]
+    names8 = [Path(p).name for p in m8.read_text().split()]
+    assert names1 == names8, "manifest order/names diverged under parallelism"
+    assert _decompressed_records(m1) == _decompressed_records(m8), (
+        "record bytes diverged"
+    )
 
 
 def test_multiple_contigs_present(tmp_path: Path) -> None:

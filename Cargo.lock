@@ -414,6 +414,7 @@ dependencies = [
  "crossbeam-channel",
  "dhat",
  "half",
+ "libc",
  "memmap2",
  "ndarray",
  "ndarray-npy",

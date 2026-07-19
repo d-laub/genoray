@@ -7,10 +7,12 @@ merge actually joins) and the rest private (fan-out). Reproducible by seed.
 
 from __future__ import annotations
 import argparse
+import os
 import random
 import subprocess
 import zlib
 from collections.abc import Sequence
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 _BASES = "ACGT"
@@ -89,6 +91,25 @@ def _contig_salt(contig: str) -> int:
     return zlib.crc32(contig.encode())
 
 
+def _write_bgzip_index(
+    i: int, out_dir: str, sample: str, header: str, body: str
+) -> tuple[int, str]:
+    """Write one file's plain VCF text, bgzip it, index it, and drop the plain
+    file. Runs either in-process (jobs=1) or in a worker process (jobs>1) --
+    receives only plain data (no rng objects) so it's picklable across the
+    process boundary. Returns (i, gz_path) so the caller can re-sort results
+    into original order regardless of completion order."""
+    out = Path(out_dir)
+    plain = out / f"sample_{i:05d}.vcf"
+    plain.write_text(header + body)
+    gz = out / f"sample_{i:05d}.vcf.gz"
+    with open(gz, "wb") as fh:
+        subprocess.run(["bgzip", "-c", str(plain)], check=True, stdout=fh)
+    subprocess.run(["bcftools", "index", str(gz)], check=True)
+    plain.unlink()
+    return i, str(gz)
+
+
 def generate_cohort(
     out_dir: Path,
     n_files: int,
@@ -100,6 +121,7 @@ def generate_cohort(
     indel_frac: float = 0.1,
     seed: int = 0,
     format_fields: Sequence[str] = (),
+    jobs: int | None = None,
 ) -> Path:
     """Write `n_files` single-sample VCF/BCFs plus a manifest to `out_dir`.
 
@@ -148,7 +170,11 @@ def generate_cohort(
             variant_cache[(contig, pos)] = v
         return v
 
-    manifest_paths: list[str] = []
+    # Content generation stays serial and in-process: it's deterministic
+    # (seed + i + contig salts) and shares `variant_cache` across files, so
+    # only the write->bgzip->index->unlink step (the actual bottleneck) is
+    # farmed out.
+    tasks: list[tuple[int, str, str, str, str]] = []
     for i in range(n_files):
         lines: list[str] = []
         for c in contigs:
@@ -169,16 +195,18 @@ def generate_cohort(
                 keys, vals = _sample_col(frng, format_fields)
                 lines.append(f"{c}\t{pos}\t.\t{r}\t{a}\t.\tPASS\t.\t{keys}\t{vals}\n")
         sample = f"S{i:05d}"
-        plain = out_dir / f"sample_{i:05d}.vcf"
-        plain.write_text(
-            _header(sample, contigs, contig_len, format_fields) + "".join(lines)
-        )
-        gz = out_dir / f"sample_{i:05d}.vcf.gz"
-        with open(gz, "wb") as fh:
-            subprocess.run(["bgzip", "-c", str(plain)], check=True, stdout=fh)
-        subprocess.run(["bcftools", "index", str(gz)], check=True)
-        plain.unlink()
-        manifest_paths.append(str(gz))
+        header = _header(sample, contigs, contig_len, format_fields)
+        body = "".join(lines)
+        tasks.append((i, str(out_dir), sample, header, body))
+
+    if jobs == 1:
+        results = [_write_bgzip_index(*t) for t in tasks]
+    else:
+        with ProcessPoolExecutor(max_workers=jobs or os.cpu_count()) as ex:
+            futures = [ex.submit(_write_bgzip_index, *t) for t in tasks]
+            results = [f.result() for f in futures]
+
+    manifest_paths = [gz for _, gz in sorted(results, key=lambda r: r[0])]
     manifest = out_dir / "manifest.txt"
     manifest.write_text("\n".join(manifest_paths) + "\n")
     return manifest
@@ -217,6 +245,12 @@ def main() -> None:
         default=[],
         help="repeatable FORMAT field to emit per-sample (e.g. VAF, DP)",
     )
+    ap.add_argument(
+        "--jobs",
+        type=int,
+        default=None,
+        help="max parallel bgzip+index worker processes; defaults to os.cpu_count()",
+    )
     a = ap.parse_args()
     m = generate_cohort(
         a.out_dir,
@@ -228,6 +262,7 @@ def main() -> None:
         indel_frac=a.indel_frac,
         seed=a.seed,
         format_fields=a.format_fields,
+        jobs=a.jobs,
     )
     print(m)
 

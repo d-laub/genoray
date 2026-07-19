@@ -1065,6 +1065,18 @@ pub fn run_vcf_list(
             &fields,
         )?;
         total_dropped += dropped;
+
+        // glibc keeps freed per-contig arena heaps mapped, so RSS ratchets across the
+        // 24-contig cohort (issue #120). With htslib threads at 0 and one processing
+        // thread, malloc_trim is cheap here (no arena-lock contention) and returns the
+        // freed heaps to the OS between contigs. `malloc_trim` is a glibc extension, so
+        // gate on `target_env = "gnu"` -- it is absent under musl (Alpine source builds)
+        // and on non-Linux; a no-op / compiled-out everywhere but glibc-Linux.
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        // SAFETY: malloc_trim takes no ownership and only releases free top-of-heap memory.
+        unsafe {
+            libc::malloc_trim(0);
+        }
     }
     println!("Cohort Processing Complete.");
 
