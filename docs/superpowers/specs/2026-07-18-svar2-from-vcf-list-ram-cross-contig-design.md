@@ -104,11 +104,14 @@ Goal: peak RSS = `O(largest single contig)` and **flat in contig count**.
    window size, not contig size. Apply **only if** the max single-contig peak is still over
    64 GB after levers 1–2. This is the issue body's original "stream the gather" ask,
    correctly demoted.
-4. **Field-aware `_auto_chunk_size` + memory-budget knob.**
-   `_auto_chunk_size` today budgets only the bit grid — a term ~112× smaller than
-   `format_staged` at F=7 — so it returns the unchanged default and any `max_mem` built on
-   it is inert. Make it field-aware, then (optionally) expose a memory-budget kwarg on
-   `from_vcf_list` so callers can trade wall-clock for a hard RSS ceiling.
+4. **Field-aware `_auto_chunk_size` + memory-budget knob — ALREADY SHIPPED; verify it
+   bites.** As of the current tree `_auto_chunk_size(n_samples, ploidy, n_format_fields,
+   max_mem)` budgets *both* the packed grid and staged FORMAT (`F × n_samples × 4`), and
+   `from_vcf_list` already exposes a public `max_mem` kwarg wired through to it. So lever 4
+   is not new implementation — it is **verification**: confirm that setting `max_mem`
+   actually lowers observed peak RSS (it bounds *per-chunk* dense cost, which is only one
+   term of peak; if peak is dominated by the cross-contig ratchet, `max_mem` alone will not
+   cap it — which is itself a finding worth recording).
 
 ## 5. Harness (Phase 3) — built before optimizing
 
@@ -159,7 +162,8 @@ Baseline = a fresh 3.2.1 sweep on this harness, anchored to the known ~283 GiB @
 3. Apply lever 2 (`malloc_trim` / arena cap at contig boundary) → confirm RSS *falls*
    between contigs. Measure the wall-clock cost; keep only if net-positive.
 4. Apply lever 3 (stream the gather) **only if** max single-contig peak > 64 GB.
-5. Apply lever 4 (field-aware chunk budget + optional memory knob).
+5. Verify lever 4: confirm `max_mem` measurably lowers peak RSS (or record that it cannot,
+   because peak is ratchet-dominated). No new implementation expected here.
 
 Re-run the oracle (byte-identical) and the memory sweep after every change; keep a change
 only if it lowers peak RSS *and* stays byte-identical, else revert. **Stop when** peak RSS
