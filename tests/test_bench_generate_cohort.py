@@ -1,29 +1,27 @@
 # tests/test_bench_generate_cohort.py
 from __future__ import annotations
-import importlib.util
+import importlib
 import sys
 from pathlib import Path
 
 from cyvcf2 import VCF
 
-_SPEC = (
-    Path(__file__).parent.parent
-    / "scripts"
-    / "bench_from_vcf_list"
-    / "generate_cohort.py"
-)
+_SCRIPTS_DIR = Path(__file__).parent.parent / "scripts" / "bench_from_vcf_list"
 
 
 def _load():
-    spec = importlib.util.spec_from_file_location("generate_cohort", _SPEC)
-    mod = importlib.util.module_from_spec(spec)
-    # Register under its module name BEFORE exec so the parallel default
-    # (jobs=None -> ProcessPoolExecutor) can pickle module-level workers like
-    # `_write_bgzip_index` by qualified name; without this, pickling a dynamically
-    # loaded module's functions raises PicklingError.
-    sys.modules[spec.name] = mod
-    spec.loader.exec_module(mod)
-    return mod
+    # Import as a real top-level module (dir on sys.path) rather than via
+    # spec_from_file_location, so the parallel default (jobs=None ->
+    # ProcessPoolExecutor) survives every multiprocessing start method. Under
+    # spawn/forkserver -- the Linux default since Python 3.14 -- each worker is
+    # a fresh interpreter that re-imports the worker function's module BY NAME;
+    # a spec-loaded module isn't importable that way, so the worker dies with
+    # ModuleNotFoundError and the pool breaks (fork only worked because the
+    # child inherited the parent's sys.modules). spawn/forkserver propagate
+    # sys.path to workers, so `import generate_cohort` resolves there too.
+    if str(_SCRIPTS_DIR) not in sys.path:
+        sys.path.insert(0, str(_SCRIPTS_DIR))
+    return importlib.import_module("generate_cohort")
 
 
 def test_generate_cohort_shape(tmp_path: Path):
