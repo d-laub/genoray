@@ -14,7 +14,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        environment: [py310, py311, py312, py313]
+        environment: [py310, py311, py312, py313, py314]
     steps:
       - name: Check out
         uses: actions/checkout@v4
