@@ -10,6 +10,7 @@ py310 = ["py310"]
 py311 = ["py311"]
 py312 = ["py312"]
 py313 = ["py313"]
+py314 = ["py314"]
 sbox = ["sbox", "py310"]
 # isolated env for linting: no editable genoray build (and thus no Rust compile)
 lint = { features = ["lint"], no-default-feature = true }
@@ -45,7 +46,6 @@ clangdev = "18.*"
 # The conda compiler uses the conda sysroot, so source-built pypi deps (e.g. pgenlib)
 # need dev headers from conda rather than the system: zlib provides zlib.h.
 zlib = "*"
-pysam = ">=0.24.0,<0.25"
 
 [activation.env]
 # rust-htslib's bindgen step needs to locate libclang (provided by clangdev).
@@ -57,6 +57,10 @@ plink2 = "*"
 
 [pypi-dependencies]
 genoray = { path = ".", editable = true }
+# Sourced from PyPI (not conda) so py314 envs can resolve: conda-forge has no
+# pysam 3.14 build yet, but the PyPI wheel ships cp314. `samtools faidx` (the
+# conda tool) still builds the SVAR2 test reference .fai independently.
+pysam = ">=0.24.0,<0.25"
 # dev deps
 seaborn = "*"
 pooch = "*"
@@ -151,6 +155,13 @@ python = "3.12.*"
 python = "3.13.*"
 
 [feature.py313.pypi-dependencies]
+numpy = ">=2"
+
+[feature.py314.dependencies]
+python = "3.14.*"
+
+[feature.py314.pypi-dependencies]
+# numpy 1.26 has no cp314 wheels; 3.14 requires numpy>=2 (same as py313).
 numpy = ">=2"
 
 [feature.sbox.pypi-dependencies]
