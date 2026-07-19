@@ -188,3 +188,29 @@ production cohort at much higher variant density push a *single* contig's workin
 past budget, the windowed-gather lever (bound the in-memory gather to `chunk_size`
 variants, flushing per window) remains the documented next step — but it is not needed
 to close #120.
+
+## Task 6: `MALLOC_ARENA_MAX` as a documented complement — **not recommended**
+
+Measured at N=2000 on the fixed `.so` (three arms; default vs. cap of 2 and 4):
+
+| `MALLOC_ARENA_MAX` | MaxRSS (GB) | wall (s) | arena_heaps |
+|:------------------:|------------:|---------:|------------:|
+| (unset / default)  | 3.257       | 537.8    | 50          |
+| 2                  | 3.275       | 536.5    | 18          |
+| 4                  | 3.290       | 536.9    | 43          |
+
+- **No RSS benefit:** peak is within **1%** across all three — capping arenas does not
+  lower peak on top of the `malloc_trim` fix, because the trim already returns freed
+  heap to the OS at each contig boundary. There is nothing left for an arena cap to save.
+- **No wall penalty:** wall is flat (±0.3%). The prior "MALLOC_ARENA_MAX is 73% slower"
+  finding was arena-lock contention at ~4,000 threads; with `VCF_LIST_HTSLIB_THREADS=0`
+  and one processing thread there is no contention, so the cap is now harmless — but
+  also pointless.
+
+**Recommendation: do NOT set or document `MALLOC_ARENA_MAX` for `from_vcf_list`.** It is
+redundant with the boundary trim and confers no measurable benefit. No docstring or
+public-API change is made (the plan's "document only if net-positive" gate is not met).
+
+_(Aside: run-to-run wall varies ~15–20% with OS file-cache warmth — the default arm
+here is 537.8 s vs. 653.8 s in the fix sweep for the identical config — but MaxRSS is
+stable to ~1%, so the RSS conclusions above are robust.)_
