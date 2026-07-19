@@ -214,3 +214,65 @@ public-API change is made (the plan's "document only if net-positive" gate is no
 _(Aside: run-to-run wall varies ~15–20% with OS file-cache warmth — the default arm
 here is 537.8 s vs. 653.8 s in the fix sweep for the identical config — but MaxRSS is
 stable to ~1%, so the RSS conclusions above are robust.)_
+
+## Task 8 close-out
+
+### `max_mem` verification (lever 4 — already shipped) — reader-dominated
+
+`from_vcf_list` accepts `max_mem`, which caps the bytes ONE in-flight dense chunk may
+occupy. Measured at N=2000 on the fixed `.so` (default peak = 3.30 GB):
+
+| `max_mem` | MaxRSS (GB) |
+|:---------:|------------:|
+| default   | 3.30        |
+| 8 GiB     | 3.29        |
+| 1 GiB     | 3.29        |
+| 512 MiB   | 3.26        |
+
+Even a 512 MiB cap — 6× below the natural peak — barely moves MaxRSS (−1%). **`max_mem`
+alone cannot cap `from_vcf_list` peak: the peak is reader/baseline-dominated** (N files
+open at once, htslib decompression buffers, the k-way merge frontier, per-sample
+staging), not dense-chunk-dominated. `max_mem` bounds only the single dense-chunk
+component, a small fraction of the peak here. This matches the known reader-bound
+conversion profile. It remains a valid safety ceiling, but the cross-contig trim (Task 5)
+is what actually moved peak RAM.
+
+### Full-scale validation at N = 7,089 (the #120 close-out)
+
+Full cohort generated with `--jobs $(nproc)` (24 contigs, F=7); one measured conversion
+on the fixed `.so`:
+
+| metric                         | value            |
+|:-------------------------------|:-----------------|
+| **Peak MaxRSS**                | **10.27 GB**     |
+| Extrapolation predicted        | 10.2 GB (spot-on)|
+| Budget (64 GB)                 | **6.2× under**   |
+| Per-contig high-water          | flat: 10.75 GB (contig 1) → 10.73 GB (Y), ratio **1.001×** |
+| wall / cpu                     | 2641.7 s / 2462.4 s |
+
+The per-contig curve is flat across all 24 contigs — **the ratchet is eliminated at
+production scale.** Peak RSS 10.27 GB is comfortably under the 64 GB target.
+
+### Corrected peak-RAM model
+
+- **Before (pre-fix):** `peak ≈ baseline(N) + Σ_{contigs} retained(contig)` — the
+  retained term is glibc freed-but-unreturned heap that accumulates across all 24
+  contigs, giving the superlinear `N^1.162` growth and the 2.72–4.66× ratchet.
+- **After (Task 5 `malloc_trim` at the boundary):** `peak ≈ baseline(N) +
+  max_{contig} working_set(contig)` — freed heap is returned each boundary, so only one
+  contig's working set is ever resident above baseline. Growth drops to `N^0.901`, the
+  ratchet ratio to ≈ 1.00×, and N=7,089 peak from an extrapolated 55 GB (ratchet-
+  inflated) to a measured **10.27 GB**.
+
+### Summary (before → after, this harness)
+
+| N     | before MaxRSS | after MaxRSS | reduction |
+|------:|--------------:|-------------:|----------:|
+| 500   | 2.63 GB       | 0.96 GB      | 2.75×     |
+| 1000  | 5.23 GB       | 1.69 GB      | 3.10×     |
+| 2000  | 13.03 GB      | 3.30 GB      | 3.95×     |
+| 4000  | 28.45 GB      | 6.12 GB      | 4.65×     |
+| 7089  | ~55 GB (extrap.) | 10.27 GB (measured) | ~5.4× |
+
+Wall-clock did not regress at any N (improved 8–27%). Store byte-identical throughout
+(`tests/test_svar2_from_vcf_list.py` 26/26). **#120 closed.**
