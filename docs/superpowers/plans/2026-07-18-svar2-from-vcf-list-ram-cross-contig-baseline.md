@@ -85,4 +85,62 @@ therefore stated as a *shape* KPI, not this harness's absolute:
 
 ## Localization (Phase B — Task 4)
 
-_Appended by Task 4 before any Task-5 code change._
+Three independent lines of evidence, none of them a guess:
+
+### 1. Static: no Rust owner survives the contig loop
+
+`run_vcf_list`'s contig loop (`src/orchestrator.rs:1044-1068`) calls
+`process_chromosome(...)`, which returns **only `u64`** (the dropped-record count).
+No Rust value owning contig-*N*'s buffers survives into contig-(*N*+1)'s iteration —
+all per-contig state is dropped at the end of each call. Therefore the *live* Rust
+heap at the start of every contig is the same baseline; **live memory cannot
+accumulate across contigs.** Any cross-contig RSS growth must be allocator-side
+(freed-but-not-returned), not retained live state.
+
+### 2. Empirical arena signal (from the baseline sweep)
+
+`arena_heaps` (count of 64 MB glibc arena mappings in `/proc/self/smaps`) climbs
+**4 → 6 → 50 → 167** across N=500→4000, tracking the RSS ratchet. Freed per-contig
+allocations are landing in glibc arenas that are not released to the OS.
+
+### 3. Decisive boundary probe: `malloc_trim` reclaims the ratchet to a flat baseline
+
+A temporary probe (reverted before Task 5) instrumented the contig boundary to log
+`VmRSS` immediately after each `process_chromosome`, then call `malloc_trim(0)` and
+log `VmRSS` again. Run on the **N=1000** cohort (F=7, 24 contigs):
+
+| contig | VmRSS before trim (MB) | trim ret | VmRSS after trim (MB) |
+|:------:|-----------------------:|:--------:|----------------------:|
+| 1      | 1659                   | 1        | 426                   |
+| 2      | 1668                   | 1        | 436                   |
+| 3      | 438                    | 1        | 436                   |
+| 4      | 1667                   | 1        | 436                   |
+| 12     | 1668                   | 1        | 436                   |
+| …      | ~439                   | 1        | ~436                  |
+| Y      | 439                    | 1        | 436                   |
+
+(Full 24-contig log in `$CLAUDE_JOB_DIR/tmp` task output.)
+
+- `malloc_trim(0)` returns **1** (memory actually released to the OS) at **every one
+  of the 24 boundaries**.
+- **`VmRSS after trim` is flat at ~426–436 MB across all 24 contigs** — no upward
+  drift. This is the airtight proof: once freed memory is returned, the resident
+  baseline is constant, so there is **no live-memory ratchet**.
+- `VmRSS before trim` sawtooths between ~438 MB and ~1.67 GB. The ~1.2 GB delta is
+  freed-but-unreturned per-contig working memory. Without a trim it accumulates into
+  the ratchet the baseline sweep measured (n1000 MaxRSS 5.23 GB, ratchet 3.14×). Note
+  that in this probe run the trim runs every contig, so the ratchet is *suppressed* —
+  which is exactly why the post-trim baseline stays flat.
+- The probe run stayed **byte-identical** (`dropped == 0`, same as baseline);
+  `malloc_trim` does not alter output.
+
+> **VERDICT: the cross-contig ratchet is glibc freed-but-not-returned heap. The
+> `process_chromosome` boundary already drops all Rust state; the memory is simply
+> held by glibc's allocator. `malloc_trim(0)` at the contig boundary reclaims it in
+> full (post-trim RSS flat at ~436 MB). Task 5's lever is `malloc_trim(0)` at the
+> contig boundary — NOT an explicit Rust `drop` (there is no retained owner to drop).**
+
+(The memray `--native` run reported a 5.9 GB peak-live-heap number, but that is a
+cross-run, instrumentation-inflated single high-watermark that cannot distinguish a
+per-contig working set from a cross-contig ratchet; the direct `VmRSS`-at-boundary
+probe above is the trustworthy measurement and supersedes it.)
