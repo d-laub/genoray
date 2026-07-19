@@ -1,6 +1,7 @@
 # tests/test_bench_generate_cohort.py
 from __future__ import annotations
 import importlib.util
+import sys
 from pathlib import Path
 
 from cyvcf2 import VCF
@@ -16,6 +17,11 @@ _SPEC = (
 def _load():
     spec = importlib.util.spec_from_file_location("generate_cohort", _SPEC)
     mod = importlib.util.module_from_spec(spec)
+    # Register under its module name BEFORE exec so the parallel default
+    # (jobs=None -> ProcessPoolExecutor) can pickle module-level workers like
+    # `_write_bgzip_index` by qualified name; without this, pickling a dynamically
+    # loaded module's functions raises PicklingError.
+    sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
     return mod
 
