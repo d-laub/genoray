@@ -144,3 +144,47 @@ log `VmRSS` again. Run on the **N=1000** cohort (F=7, 24 contigs):
 cross-run, instrumentation-inflated single high-watermark that cannot distinguish a
 per-contig working set from a cross-contig ratchet; the direct `VmRSS`-at-boundary
 probe above is the trustworthy measurement and supersedes it.)
+
+---
+
+## Fix result (Phase C — Task 5: `libc::malloc_trim(0)` at the contig boundary)
+
+Commit `92f5f4f`. Same harness, same cohorts, fixed `.so`:
+
+| N    | baseline MaxRSS (GB) | fixed MaxRSS (GB) | reduction | baseline wall (s) | fixed wall (s) | fixed ratchet ratio (max ÷ c1) |
+|-----:|---------------------:|------------------:|----------:|------------------:|---------------:|-------------------------------:|
+| 500  | 2.63                 | 0.96              | 2.75×     | 192.7             | 140.3          | **1.003×**                     |
+| 1000 | 5.23                 | 1.69              | 3.10×     | 306.3             | 271.3          | **1.014×**                     |
+| 2000 | 13.03                | 3.30              | 3.95×     | 827.1             | 653.8          | **1.012×**                     |
+| 4000 | 28.45                | 6.12              | 4.65×     | 1524.1            | 1293.9         | **1.001×**                     |
+
+- **Ratchet flattened.** The per-contig window-peak ratio drops from 2.72–4.66× to
+  **1.00–1.01×** — every contig now peaks at the same level, i.e. peak =
+  `baseline(N) + one contig's working set`, exactly the target shape.
+- **Peak RSS down 2.75× → 4.65×**, and the reduction *grows with N* (the ratchet's
+  cost grew with N, so removing it helps more at scale).
+- **Peak-RSS exponent: `N^1.162` (superlinear) → `N^0.901` (sublinear).** The
+  `Σ_contigs(retained)` term is gone; what remains is ~linear baseline + max contig.
+- **Wall-clock improved at every N** (140 vs 193 … 1294 vs 1524 s) — the trim is cheap
+  (one processing thread, no arena-lock contention) and *reduces* page-management
+  overhead. No regression; a net speedup.
+- Store stayed **byte-identical**: `tests/test_svar2_from_vcf_list.py` 26/26 pass,
+  including the new 3-contig decode-parity oracle (passes pre- and post-fix).
+
+### Fixed extrapolation to N = 7,089
+
+`0.00347 · 7089^0.901 = 10.2 GB` on this harness — **6× under the 64 GB budget**
+(vs. the pre-fix 55 GB). At production WGS variant density the absolute is higher, but
+the fix's structural change — turning `baseline + Σ_contigs(retained)` into
+`baseline + max_single_contig` — is exactly what carries the 7,089-sample somatic
+cohort (whose ratchet drove the historical ~283 GiB peak) under budget.
+
+## Task 7 (windowed per-contig gather) — decision gate: **N/A**
+
+Task 7 is conditional on the flattened single-contig peak still exceeding 64 GB. It does
+not: the flattened peak extrapolates to **10.2 GB at N=7,089**, 6× under budget, and the
+per-contig curve is already flat (ratio ≈ 1.00×). **Task 7 is skipped.** Should a future
+production cohort at much higher variant density push a *single* contig's working set
+past budget, the windowed-gather lever (bound the in-memory gather to `chunk_size`
+variants, flushing per window) remains the documented next step — but it is not needed
+to close #120.
