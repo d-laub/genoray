@@ -9,6 +9,7 @@ use crate::error::ConversionError;
 use crate::field::FieldSpec;
 
 /// One variant record, decoded to the minimum the conversion spine needs.
+#[derive(Debug, Clone, PartialEq)]
 pub struct RawRecord {
     /// 0-based start position (VCF/pvar POS minus 1).
     pub pos: u32,
