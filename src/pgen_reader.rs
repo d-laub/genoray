@@ -36,6 +36,20 @@ pub struct PgenRecordSource {
     /// per `refill` so `next_record` can serve rows without touching the GIL.
     /// pgenlib's `-9` missing sentinel is already normalized to `-1` here.
     host_buf: Vec<i32>,
+    /// One `pgenlib.PgenReader` per dosage `FieldSpec`, in field order --
+    /// empty when no dosage fields were requested. Not yet read from (see
+    /// module doc); Task 3 fills in `refill`/`next_record` support.
+    #[allow(dead_code)]
+    dosage_readers: Vec<Py<PyAny>>,
+    /// `(batch, num_samples)` f32 scratch buffer per dosage reader, mirroring
+    /// `buf` above but one array per field instead of `2 * num_samples` allele
+    /// columns.
+    #[allow(dead_code)]
+    dosage_bufs: Vec<Py<PyArray2<f32>>>,
+    /// Rust-owned mirror of `dosage_bufs`, one `Vec<f32>` per field, filled in
+    /// bulk by `refill` (Task 3) -- unused until then.
+    #[allow(dead_code)]
+    host_dosages: Vec<Vec<f32>>,
     batch: usize,
     /// OUTPUT sample width -- already the post-`change_sample_subset` column
     /// count `pgenlib` returns (Python passes `len(selected)`), so the buffer
@@ -79,16 +93,29 @@ impl PgenRecordSource {
         regions: Vec<(u32, u32)>,
         overlap: OverlapMode,
         sample_perm: Vec<usize>,
+        dosage_readers: Vec<Py<PyAny>>,
     ) -> Result<Self, ConversionError> {
         let batch = (PGEN_BATCH_BYTES / (2 * num_samples * 4)).clamp(1, chunk_size.max(1));
         let pvar = PvarReader::open(pvar_path, var_start)?;
         let buf = Python::attach(|py| {
             PyArray2::<i32>::zeros(py, [batch, 2 * num_samples], false).unbind()
         });
+        // One `(batch, num_samples)` f32 buffer per dosage reader, mirroring
+        // `buf` above -- not read from yet (Task 3 wires up `refill`).
+        let dosage_bufs: Vec<Py<PyArray2<f32>>> = Python::attach(|py| {
+            dosage_readers
+                .iter()
+                .map(|_| PyArray2::<f32>::zeros(py, [batch, num_samples], false).unbind())
+                .collect()
+        });
+        let host_dosages: Vec<Vec<f32>> = vec![Vec::new(); dosage_readers.len()];
         Ok(Self {
             reader,
             buf,
             host_buf: Vec::with_capacity(batch * 2 * num_samples),
+            dosage_readers,
+            dosage_bufs,
+            host_dosages,
             batch,
             num_samples,
             var_next: var_start,

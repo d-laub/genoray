@@ -78,6 +78,13 @@ pub enum SourceSpec {
         /// this pool holds exactly one reader and the sharded branch below is
         /// dead; kept as intact infrastructure pending a pgenlib GIL fix.)
         readers: Vec<pyo3::Py<pyo3::PyAny>>,
+        /// One `pgenlib.PgenReader` per dosage `FieldSpec`, in field order --
+        /// empty when no dosage fields were requested. Unlike `readers`, this
+        /// is NOT a per-shard pool: PGEN sub-contig sharding is dead at
+        /// runtime (see `readers`'s doc comment above), so the same flat
+        /// per-field set is reused at both `PgenRecordSource::new` call sites
+        /// in `process_chromosome` below.
+        dosage_readers: Vec<pyo3::Py<pyo3::PyAny>>,
         regions: Vec<(u32, u32)>,
         overlap: crate::svar2_view::OverlapMode,
         /// Same permutation for every contig -- one cohort-wide sample
@@ -459,6 +466,7 @@ pub fn process_chromosome(
                         var_start,
                         var_end,
                         readers,
+                        dosage_readers,
                         regions,
                         overlap,
                         sample_perm,
@@ -526,6 +534,7 @@ pub fn process_chromosome(
                                 regions,
                                 overlap,
                                 sample_perm,
+                                dosage_readers,
                             )?)
                         } else {
                             let (ref_seq, has_reference) = match fasta.as_deref() {
@@ -590,6 +599,13 @@ pub fn process_chromosome(
                                         regions.clone(),
                                         overlap,
                                         sample_perm.clone(),
+                                        // Not a per-shard pool (see `SourceSpec::Pgen::dosage_readers`
+                                        // doc comment) -- this dead branch reuses the
+                                        // same flat per-field readers for every shard.
+                                        // `Py<PyAny>` needs the GIL to bump its refcount.
+                                        pyo3::Python::attach(|py| {
+                                            dosage_readers.iter().map(|r| r.clone_ref(py)).collect()
+                                        }),
                                     )?;
                                     Ok(crate::chunk_assembler::ChunkAssembler::with_reference(
                                         Box::new(source),
