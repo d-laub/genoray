@@ -10,6 +10,8 @@ import numpy as np
 if TYPE_CHECKING:
     from numpy.typing import ArrayLike
 
+    from genoray import _core
+
 
 class BatchResult(TypedDict):
     """Two-channel batch-query result contract (see py_query_batch.rs)."""
@@ -52,6 +54,9 @@ class _BatchQueryMixin:
     _readers: dict[str, Any]
     available_samples: list[str]
 
+    def _reader(self, contig: str) -> "_core.PyContigReader":  # host-provided
+        ...
+
     def _overlap_batch(
         self, contig: str, regions: Iterable[tuple[int, int]]
     ) -> BatchResult:
@@ -62,7 +67,7 @@ class _BatchQueryMixin:
         plan). Cross-contig batching is the caller's job (query each contig).
         """
         reg = [(int(s), int(e)) for s, e in regions]
-        return self._readers[contig].overlap_batch(reg)
+        return self._reader(contig).overlap_batch(reg)
 
     @staticmethod
     def _regions(starts: "ArrayLike", ends: "ArrayLike") -> list[tuple[int, int]]:
@@ -99,7 +104,7 @@ class _BatchQueryMixin:
         list of sample names selecting (and reordering) a subset by name.
         """
         reg = self._regions(starts, ends)
-        return self._readers[contig].read_ranges(reg, self._sample_idxs(samples))
+        return self._reader(contig).read_ranges(reg, self._sample_idxs(samples))
 
     def _find_ranges(
         self,
@@ -121,7 +126,7 @@ class _BatchQueryMixin:
         caller-owned memory instead of allocating a new bundle each time.
         """
         reg = self._regions(starts, ends)
-        d = self._readers[contig].find_ranges(reg, self._sample_idxs(samples))
+        d = self._reader(contig).find_ranges(reg, self._sample_idxs(samples))
         if out is not None:
             for k, buf in out.items():
                 src = np.asarray(d[k])
@@ -160,4 +165,4 @@ class _BatchQueryMixin:
                     "samples does not match the bundle's fixed subset "
                     f"(got {want!r}, bundle has {have!r})"
                 )
-        return self._readers[contig].gather_ranges(ranges)
+        return self._reader(contig).gather_ranges(ranges)

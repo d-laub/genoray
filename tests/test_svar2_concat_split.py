@@ -39,7 +39,7 @@ def test_subset_contigs_narrows_meta_and_copies_bytes(two_contig_store, tmp_path
 
 
 def test_subset_contigs_rejects_unknown(two_contig_store, tmp_path):
-    with pytest.raises(ValueError, match="not in store"):
+    with pytest.raises(ValueError, match="not found in store"):
         two_contig_store.subset_contigs(tmp_path / "x.svar2", ["chrZ"])
 
 

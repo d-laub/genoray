@@ -349,6 +349,34 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             for contig in self.contigs
         }
 
+        from genoray._contigs import ContigNormalizer
+
+        self._cnorm = ContigNormalizer(self.contigs)
+
+    # pyrefly: ignore [missing-override-decorator]
+    def _resolve_contig(self, contig: str) -> str:
+        """Resolve a caller-supplied contig name to the store's own spelling.
+
+        Handles ``chr``-prefix and mito-alias differences via the store's
+        :class:`~genoray._contigs.ContigNormalizer` (e.g. ``"1"`` -> ``"chr1"``).
+        Raises ``ValueError`` if no store contig is equivalent.
+        """
+        norm = self._cnorm.norm(contig)
+        if norm is None:
+            raise ValueError(
+                f"Contig {contig!r} not found in store; available contigs: {self.contigs}"
+            )
+        return norm
+
+    def _resolve_contigs(self, contigs: "Sequence[str]") -> list[str]:
+        """Resolve each contig via :meth:`_resolve_contig`, preserving order."""
+        return [self._resolve_contig(c) for c in contigs]
+
+    # pyrefly: ignore [missing-override-decorator]
+    def _reader(self, contig: str) -> "_core.PyContigReader":
+        """The per-contig Rust reader for ``contig``, resolving naming schemes."""
+        return self._readers[self._resolve_contig(contig)]
+
     @property
     def n_samples(self) -> int:
         return len(self.available_samples)
@@ -373,12 +401,10 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         """Write a new SVAR2 store containing only `contigs` (metadata + file copy)."""
         output = Path(output)
         wanted = [contigs] if isinstance(contigs, str) else list(contigs)
-        missing = [c for c in wanted if c not in self.contigs]
-        if missing:
-            raise ValueError(f"contigs not in store: {missing}")
+        resolved = set(self._resolve_contigs(wanted))  # raises ValueError on any miss
         if output.resolve() == self.path.resolve():
             raise ValueError("cannot write a subset in place (output == source)")
-        kept = [c for c in self.contigs if c in set(wanted)]  # preserve source order
+        kept = [c for c in self.contigs if c in resolved]  # preserve source order
         meta = _load_meta(self.path)
         meta["contigs"] = kept
         _write_store(output, {c: self.path for c in kept}, meta, mode, overwrite)
