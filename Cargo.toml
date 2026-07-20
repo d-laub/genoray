@@ -13,6 +13,8 @@ crate-type = ["cdylib", "rlib"]
 # alignment guarantee, so `cast_slice` would panic).
 bytemuck = { version = "1.25.0", features = ["extern_crate_alloc"] }
 crossbeam-channel = "0.5.15"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 half = "2"
 libc = "0.2"
 memmap2 = "0.9.10"
