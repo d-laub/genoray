@@ -12993,6 +12993,7 @@ packages:
   - polars>=1.37.1
   - polars-bio>=0.20.1,<0.34
   - pyranges>=0.1.3
+  - rich>=13
   - typing-extensions>=4.14
   - pyarrow>=21
   - tqdm>=4.65
