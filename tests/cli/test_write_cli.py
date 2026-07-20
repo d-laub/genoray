@@ -5,7 +5,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from genoray import SparseVar, SparseVar2
+from genoray._cli.__main__ import app
 
 _REF = "ACAGTACATGGGTACTAGCTAGGCTAACCGGTTAACCGGT"
 
@@ -73,7 +76,9 @@ def test_write_defaults_to_svar2(tmp_path: Path):
     ref = _ref(tmp_path)
     vcf = _vcf(tmp_path, symbolic=False)
     out = tmp_path / "store"
-    r = _run(["write", str(vcf), str(out), "--reference", str(ref), "--threads", "1"])
+    r = _run(
+        ["write", "vcf", str(vcf), str(out), "--reference", str(ref), "--threads", "1"]
+    )
     assert r.returncode == 0, r.stderr
     sv = SparseVar2(out)
     assert sv.contigs == ["chr1"]
@@ -82,7 +87,7 @@ def test_write_defaults_to_svar2(tmp_path: Path):
 def test_write_no_reference(tmp_path: Path):
     vcf = _vcf(tmp_path, symbolic=False)
     out = tmp_path / "store2"
-    r = _run(["write", str(vcf), str(out), "--no-reference", "--threads", "1"])
+    r = _run(["write", "vcf", str(vcf), str(out), "--no-reference", "--threads", "1"])
     assert r.returncode == 0, r.stderr
     assert (out / "meta.json").exists()
 
@@ -94,6 +99,7 @@ def test_write_svar2_regions_and_samples(tmp_path: Path):
     r = _run(
         [
             "write",
+            "vcf",
             str(vcf),
             str(out),
             "--reference",
@@ -123,6 +129,7 @@ def test_write_svar2_regions_file_and_samples_file(tmp_path: Path):
     r = _run(
         [
             "write",
+            "vcf",
             str(vcf),
             str(out),
             "--reference",
@@ -144,7 +151,7 @@ def test_write_svar2_regions_file_and_samples_file(tmp_path: Path):
 def test_write_requires_reference_xor(tmp_path: Path):
     vcf = _vcf(tmp_path, symbolic=False)
     out = tmp_path / "store3"
-    r = _run(["write", str(vcf), str(out), "--threads", "1"])
+    r = _run(["write", "vcf", str(vcf), str(out), "--threads", "1"])
     assert r.returncode != 0
     assert "reference" in (r.stderr + r.stdout)
 
@@ -156,6 +163,7 @@ def test_write_skip_symbolic(tmp_path: Path):
     r = _run(
         [
             "write",
+            "vcf",
             str(vcf),
             str(out),
             "--reference",
@@ -172,7 +180,7 @@ def test_write_skip_symbolic(tmp_path: Path):
 def test_write_svar2_has_single_skip_flag():
     # --help lists the new collapsed flag. Wide COLUMNS avoids the rich help
     # table wrapping the long flag name across lines.
-    r = _run(["write", "--help"], columns=200)
+    r = _run(["write", "vcf", "--help"], columns=200)
     assert r.returncode == 0, r.stderr
     assert "--skip-symbolics-and-breakends" in r.stdout
     # The docstring's cross-reference note mentions svar1's --no-symbolic /
@@ -188,6 +196,7 @@ def test_write_no_symbolic_removed_from_svar2(tmp_path: Path):
     r = _run(
         [
             "write",
+            "vcf",
             str(vcf),
             str(out),
             "--reference",
@@ -208,6 +217,7 @@ def test_write_no_breakend_removed_from_svar2(tmp_path: Path):
     r = _run(
         [
             "write",
+            "vcf",
             str(vcf),
             str(out),
             "--reference",
@@ -227,13 +237,27 @@ def test_write_dispatches_pgen(tmp_path: Path):
     vcf = _vcf(tmp_path, symbolic=False)
     pgen = _pgen(tmp_path, vcf)
     out = tmp_path / "pgen.svar2"
-    r = _run(["write", str(pgen), str(out), "--reference", str(ref), "--threads", "1"])
+    r = _run(
+        [
+            "write",
+            "pgen",
+            str(pgen),
+            str(out),
+            "--reference",
+            str(ref),
+            "--threads",
+            "1",
+        ]
+    )
     assert r.returncode == 0, r.stderr
     sv = SparseVar2(out)
     assert sv.contigs == ["chr1"]
 
 
-def test_write_pgen_rejects_nondefault_ploidy(tmp_path: Path):
+def test_write_pgen_rejects_ploidy_flag(tmp_path: Path):
+    """`write pgen` drops --ploidy entirely (PGEN is always diploid), so
+    passing it is now an unrecognized-option error rather than the old
+    'diploid' ValueError raised by the merged `write` command."""
     ref = _ref(tmp_path)
     vcf = _vcf(tmp_path, symbolic=False)
     pgen = _pgen(tmp_path, vcf)
@@ -241,6 +265,7 @@ def test_write_pgen_rejects_nondefault_ploidy(tmp_path: Path):
     r = _run(
         [
             "write",
+            "pgen",
             str(pgen),
             str(out),
             "--reference",
@@ -252,7 +277,13 @@ def test_write_pgen_rejects_nondefault_ploidy(tmp_path: Path):
         ]
     )
     assert r.returncode != 0
-    assert "diploid" in (r.stdout + r.stderr).lower()
+
+
+def test_write_pgen_no_ploidy_flag():
+    """`write pgen` drops --ploidy entirely (PGEN is always diploid)."""
+    r = _run(["write", "pgen", "--help"], columns=200)
+    assert r.returncode == 0, r.stderr
+    assert "--ploidy" not in r.stdout
 
 
 def test_write_pgen_regions_dispatch_without_plink(tmp_path: Path):
@@ -267,6 +298,7 @@ def test_write_pgen_regions_dispatch_without_plink(tmp_path: Path):
     r = _run(
         [
             "write",
+            "pgen",
             str(pgen),
             str(out),
             "--no-reference",
@@ -282,7 +314,7 @@ def test_write_pgen_regions_dispatch_without_plink(tmp_path: Path):
 def test_write_svar1_still_works(tmp_path: Path):
     vcf = _vcf(tmp_path, symbolic=False)
     out = tmp_path / "v1.svar"
-    r = _run(["write", "svar1", str(vcf), str(out), "--max-mem", "64m"])
+    r = _run(["write-svar1", str(vcf), str(out), "--max-mem", "64m"])
     assert r.returncode == 0, r.stderr
     sv = SparseVar(out)
     assert sv.n_variants >= 1
@@ -296,6 +328,7 @@ def test_write_pgen_regions_and_samples(tmp_path: Path):
     r = _run(
         [
             "write",
+            "pgen",
             str(pgen),
             str(out),
             "--no-reference",
@@ -336,7 +369,9 @@ def test_write_vcf_list_rejects_samples(tmp_path: Path):
     _single_sample_vcf(vcf_dir, "a", "S0", "chr1\t3\t.\tA\tG\t.\t.\t.\tGT\t1|0\n")
     _single_sample_vcf(vcf_dir, "b", "S1", "chr1\t7\t.\tC\tCAT\t.\t.\t.\tGT\t0|1\n")
     out = tmp_path / "list_out"
-    r = _run(["write", str(vcf_dir), str(out), "--no-reference", "--samples", "S0"])
+    r = _run(
+        ["write", "vcf", str(vcf_dir), str(out), "--no-reference", "--samples", "S0"]
+    )
     assert r.returncode != 0
     assert "not supported for multi-file" in (r.stdout + r.stderr).lower()
 
@@ -351,7 +386,9 @@ def test_write_vcf_list_dispatches(tmp_path: Path):
     _single_sample_vcf(vcf_dir, "a", "S0", "chr1\t3\t.\tA\tG\t.\t.\t.\tGT\t1|0\n")
     _single_sample_vcf(vcf_dir, "b", "S1", "chr1\t7\t.\tC\tCAT\t.\t.\t.\tGT\t0|1\n")
     out = tmp_path / "list_out2"
-    r = _run(["write", str(vcf_dir), str(out), "--no-reference", "--threads", "1"])
+    r = _run(
+        ["write", "vcf", str(vcf_dir), str(out), "--no-reference", "--threads", "1"]
+    )
     assert r.returncode == 0, r.stderr
     sv = SparseVar2(out)
     assert sv.available_samples == ["S0", "S1"]
@@ -359,16 +396,18 @@ def test_write_vcf_list_dispatches(tmp_path: Path):
 
 def test_write_svar1_regions_and_samples(tmp_path: Path):
     """Task 6: --regions/--samples now route through to `from_svar1` for a
-    `.svar` (SVAR1) source."""
+    `.svar` (SVAR1) source. The legacy VCF->SVAR1 writer used to build the
+    `.svar` fixture now lives at the top-level `write-svar1`."""
     vcf = _vcf(tmp_path, symbolic=False)
     v1 = tmp_path / "v1.svar"
-    r = _run(["write", "svar1", str(vcf), str(v1), "--max-mem", "64m"])
+    r = _run(["write-svar1", str(vcf), str(v1), "--max-mem", "64m"])
     assert r.returncode == 0, r.stderr
 
     out = tmp_path / "v1_to_v2.svar2"
     r = _run(
         [
             "write",
+            "svar1",
             str(v1),
             str(out),
             "--no-reference",
@@ -381,3 +420,137 @@ def test_write_svar1_regions_and_samples(tmp_path: Path):
     assert r.returncode == 0, r.stderr
     sv = SparseVar2(out)
     assert sv.available_samples == ["S1"]
+
+
+def test_write_bare_is_removed():
+    # bare `write SOURCE OUT` no longer resolves to a converter now that
+    # `write` has only subcommands (vcf/pgen/svar1): cyclopts treats
+    # "x.vcf.gz" as an unknown subcommand and exits non-zero.
+    with pytest.raises(SystemExit) as exc:
+        app(["write", "x.vcf.gz", "out.svar2", "--no-reference"])
+    assert exc.value.code != 0
+
+
+def test_write_vcf_fields_parsed(tmp_path: Path, monkeypatch):
+    ref = _ref(tmp_path)
+    vcf = _vcf(tmp_path, symbolic=False)
+    captured: dict = {}
+
+    def fake_from_vcf(out, source, reference, **kw):
+        captured.update(kw)
+        return 0
+
+    monkeypatch.setattr(SparseVar2, "from_vcf", staticmethod(fake_from_vcf))
+    with pytest.raises(SystemExit) as exc:
+        app(
+            [
+                "write",
+                "vcf",
+                str(vcf),
+                str(tmp_path / "o.svar2"),
+                "--reference",
+                str(ref),
+                "--fields",
+                "INFO/AF",
+                "--fields",
+                "FMT/AD",
+            ]
+        )
+    assert exc.value.code == 0
+    assert captured["info_fields"] == ["AF"]
+    assert captured["format_fields"] == ["AD"]
+
+
+def test_write_pgen_dosages_parsed(tmp_path: Path, monkeypatch):
+    ref = _ref(tmp_path)
+    vcf = _vcf(tmp_path, symbolic=False)
+    pgen = _pgen(tmp_path, vcf)
+    captured: dict = {}
+
+    def fake_from_pgen(out, source, reference, **kw):
+        captured.update(kw)
+        return 0
+
+    monkeypatch.setattr(SparseVar2, "from_pgen", staticmethod(fake_from_pgen))
+    with pytest.raises(SystemExit) as exc:
+        app(
+            [
+                "write",
+                "pgen",
+                str(pgen),
+                str(tmp_path / "o2.svar2"),
+                "--reference",
+                str(ref),
+                "--dosages",
+                "DS=self",
+                "--dosages",
+                "VAF=/x/vaf.pgen",
+            ]
+        )
+    assert exc.value.code == 0
+    ds = {d.name: str(d.source) for d in captured["dosages"]}
+    assert ds == {"DS": "self", "VAF": "/x/vaf.pgen"}
+
+
+def test_write_dosages_malformed_entry_raises(tmp_path: Path):
+    ref = _ref(tmp_path)
+    vcf = _vcf(tmp_path, symbolic=False)
+    pgen = _pgen(tmp_path, vcf)
+    with pytest.raises(ValueError, match="NAME=self"):
+        app(
+            [
+                "write",
+                "pgen",
+                str(pgen),
+                str(tmp_path / "bad.svar2"),
+                "--reference",
+                str(ref),
+                "--dosages",
+                "not-a-valid-entry",
+            ],
+            exit_on_error=False,
+        )
+
+
+def test_write_svar1_legacy_still_exists(tmp_path: Path, monkeypatch):
+    """`write-svar1` (top-level) is the legacy VCF/PGEN->SVAR1 (v1) writer."""
+    vcf = _vcf(tmp_path, symbolic=False)
+    called: dict = {}
+    monkeypatch.setattr(
+        SparseVar,
+        "from_vcf",
+        staticmethod(lambda *a, **k: called.setdefault("hit", True)),
+    )
+    with pytest.raises(SystemExit) as exc:
+        app(["write-svar1", str(vcf), str(tmp_path / "o.svar")])
+    assert exc.value.code == 0
+    assert called.get("hit")
+
+
+def test_write_from_svar1_fields_and_empty(tmp_path: Path, monkeypatch):
+    """`write svar1` (SVAR1->SVAR2) gains --fields and --empty-fields."""
+    vcf = _vcf(tmp_path, symbolic=False)
+    v1 = tmp_path / "v1.svar"
+    r = _run(["write-svar1", str(vcf), str(v1), "--max-mem", "64m"])
+    assert r.returncode == 0, r.stderr
+
+    captured: dict = {}
+
+    def fake_from_svar1(out, source, reference, **kw):
+        captured.update(kw)
+        return 0
+
+    monkeypatch.setattr(SparseVar2, "from_svar1", staticmethod(fake_from_svar1))
+    with pytest.raises(SystemExit) as exc:
+        app(
+            [
+                "write",
+                "svar1",
+                str(v1),
+                str(tmp_path / "v1_to_v2.svar2"),
+                "--no-reference",
+                "--empty-fields",
+            ]
+        )
+    assert exc.value.code == 0
+    assert captured["fields"] == []

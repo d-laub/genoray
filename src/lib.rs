@@ -293,7 +293,7 @@ fn run_conversion_pipeline(
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 #[pyfunction]
-#[pyo3(signature = (pgen_path, pvar_path, reference_path, chroms, contig_ranges, output_dir, samples, chunk_size, max_threads, long_allele_capacity, skip_out_of_scope, signatures, readers, check_ref, region_ranges, regions_overlap, sample_perm))]
+#[pyo3(signature = (pgen_path, pvar_path, reference_path, chroms, contig_ranges, output_dir, samples, chunk_size, max_threads, long_allele_capacity, skip_out_of_scope, signatures, dosage_fields, readers, dosage_readers, check_ref, region_ranges, regions_overlap, sample_perm))]
 fn run_pgen_conversion_pipeline(
     py: Python,
     pgen_path: String,
@@ -308,7 +308,9 @@ fn run_pgen_conversion_pipeline(
     long_allele_capacity: usize,
     skip_out_of_scope: bool,
     signatures: bool,
+    dosage_fields: Vec<(String, String, String, Option<String>, Option<f64>)>,
     readers: Vec<Vec<Py<PyAny>>>,
+    dosage_readers: Vec<Vec<Vec<Py<PyAny>>>>,
     check_ref: String,
     region_ranges: Vec<(String, u32, u32)>,
     regions_overlap: String,
@@ -319,12 +321,40 @@ fn run_pgen_conversion_pipeline(
             "chroms, contig_ranges, and readers must be the same length",
         ));
     }
+    // Dosage readers mirror `readers`' per-contig shard pool, but with an extra
+    // per-field dimension: `dosage_readers[i][s]` must supply exactly one
+    // reader per parsed dosage `FieldSpec`, in order.
+    if dosage_readers.len() != chroms.len() {
+        return Err(PyValueError::new_err(
+            "dosage_readers must have the same length as chroms",
+        ));
+    }
     let check_ref: crate::normalize::CheckRef = check_ref.parse().map_err(PyValueError::new_err)?;
     let sample_refs: Vec<&str> = samples.iter().map(|s| s.as_str()).collect();
     // PGEN is diploid-only.
     let ploidy = 2usize;
-    // PGEN carries no FORMAT, and .pvar INFO extraction is out of scope.
-    let fields: Vec<crate::field::FieldSpec> = Vec::new();
+    let fields = crate::field::parse_manifest(dosage_fields)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    for (i, per_contig) in dosage_readers.iter().enumerate() {
+        if per_contig.len() != readers[i].len() {
+            return Err(PyValueError::new_err(format!(
+                "dosage_readers[{i}] must have one shard per reader in readers[{i}] \
+                 ({} vs {})",
+                per_contig.len(),
+                readers[i].len()
+            )));
+        }
+        for (s, per_shard) in per_contig.iter().enumerate() {
+            if per_shard.len() != fields.len() {
+                return Err(PyValueError::new_err(format!(
+                    "dosage_readers[{i}][{s}] must supply exactly one reader per \
+                     dosage field ({} vs {})",
+                    per_shard.len(),
+                    fields.len()
+                )));
+            }
+        }
+    }
 
     // Parse the region-overlap mode once, up front, so a bad value raises
     // before any output byte is written -- mirrors `run_conversion_pipeline`.
@@ -338,12 +368,13 @@ fn run_pgen_conversion_pipeline(
 
     // Pair each contig with its own reader pool BEFORE detaching, so the Py
     // handles move into the worker threads (Py<PyAny> is Send; PyAny is not).
-    let jobs: Vec<(String, (usize, usize), Vec<Py<PyAny>>)> = chroms
+    let jobs: Vec<(String, (usize, usize), Vec<Py<PyAny>>, Vec<Vec<Py<PyAny>>>)> = chroms
         .iter()
         .cloned()
         .zip(contig_ranges.iter().copied())
         .zip(readers)
-        .map(|((c, r), rd)| (c, r, rd))
+        .zip(dosage_readers)
+        .map(|(((c, r), rd), drd)| (c, r, rd, drd))
         .collect();
 
     let results: Vec<Result<u64, crate::error::ConversionError>> = py.detach(|| {
@@ -367,7 +398,12 @@ fn run_pgen_conversion_pipeline(
 
         pool.install(|| {
             jobs.into_par_iter()
-                .map(|(chrom, (lo, hi), readers)| {
+                .map(|(chrom, (lo, hi), readers, dosage_readers)| {
+                    // PGEN sub-contig sharding is dead at runtime (see
+                    // `SourceSpec::Pgen::readers` doc comment) -- collapse the
+                    // per-shard dosage-reader pool down to its one live shard's
+                    // per-field readers before handing off to `SourceSpec`.
+                    let dosage_readers = dosage_readers.into_iter().next().unwrap_or_default();
                     orchestrator::process_chromosome(
                         orchestrator::SourceSpec::Pgen {
                             pgen_path: pgen_path.clone(),
@@ -375,6 +411,7 @@ fn run_pgen_conversion_pipeline(
                             var_start: lo,
                             var_end: hi,
                             readers,
+                            dosage_readers,
                             regions: ranges_by_chrom.get(&chrom).cloned().unwrap_or_default(),
                             overlap: overlap_mode,
                             sample_perm: sample_perm.clone(),

@@ -51,8 +51,39 @@ write = App(
 app.command(write)
 
 
-@write.default
-def write_svar2(
+def _resolve_regions_samples(
+    *,
+    regions: str | None,
+    regions_file: Path | None,
+    samples: str | None,
+    samples_file: Path | None,
+) -> tuple[pl.DataFrame | Path | None, list[str] | Path | None]:
+    from ._view_helpers import parse_regions_arg
+
+    if regions is not None and regions_file is not None:
+        raise ValueError("--regions and --regions-file are mutually exclusive")
+    if samples is not None and samples_file is not None:
+        raise ValueError("--samples and --samples-file are mutually exclusive")
+
+    if regions is not None:
+        regions_arg: pl.DataFrame | Path | None = parse_regions_arg(regions)
+    elif regions_file is not None:
+        regions_arg = regions_file
+    else:
+        regions_arg = None
+
+    if samples is not None:
+        samples_arg: list[str] | Path | None = [s for s in samples.split(",") if s]
+    elif samples_file is not None:
+        samples_arg = samples_file
+    else:
+        samples_arg = None
+
+    return regions_arg, samples_arg
+
+
+@write.command(name="vcf")
+def write_vcf(
     source: Path,
     out: Path,
     *,
@@ -76,6 +107,7 @@ def write_svar2(
             validator=validators.Path(exists=True, dir_okay=False, file_okay=True),
         ),
     ] = None,
+    fields: Annotated[list[str] | None, Parameter(name=["--fields", "-f"])] = None,
     merge_overlapping: bool = False,
     regions_overlap: Literal["pos", "record", "variant"] = "pos",
     ploidy: int = 2,
@@ -88,17 +120,14 @@ def write_svar2(
     ] = False,
     check_ref: Annotated[Literal["e", "x"], Parameter(name="--check-ref")] = "e",
 ) -> None:
-    """Convert a bgzipped VCF, BCF, PLINK2 PGEN, or SVAR1 store to an SVAR2 store (the default, better-across-the-board format).
+    """Convert a bgzipped VCF or BCF (or a directory/manifest of single-sample VCFs/BCFs) to an SVAR2 store.
 
     Args:
-        source: Path to a bgzipped VCF (``.vcf.gz``), BCF (``.bcf``), PLINK2 PGEN
-            (``.pgen``, with its ``.pvar``/``.pvar.zst`` and ``.psam`` siblings),
-            or SVAR1 store (a ``*.svar`` directory). VCF/BCF inputs are
-            auto-indexed (``.csi``) if no index is present. A directory (other
-            than a ``.svar`` store) or any other file is treated as the
-            multi-file (vcf-list) form: a directory of single-sample
-            ``*.vcf.gz``/``*.bcf`` files, or a manifest listing them one per
-            line; see :meth:`SparseVar2.from_vcf_list`.
+        source: Path to a bgzipped VCF (``.vcf.gz``) or BCF (``.bcf``). Auto-indexed
+            (``.csi``) if no index is present. A directory or any other file is
+            treated as the multi-file (vcf-list) form: a directory of
+            single-sample ``*.vcf.gz``/``*.bcf`` files, or a manifest listing
+            them one per line; see :meth:`SparseVar2.from_vcf_list`.
         out: Path to the output SVAR2 directory.
         reference: Path to a reference FASTA (with ``.fai``). Used to validate REF and
             left-align indels. Exactly one of ``--reference`` or ``--no-reference``
@@ -108,103 +137,60 @@ def write_svar2(
             inputs.
         regions: Inline region(s): a single ``chrom:start-end`` (1-based inclusive,
             bcftools convention) or a comma-separated list. Mutually exclusive
-            with --regions-file. Supported for every source form, including the
-            multi-file (vcf-list) directory/manifest form.
+            with --regions-file. Supported for the multi-file (vcf-list)
+            directory/manifest form too.
         regions_file: Path to a BED file (0-based half-open) of regions. Mutually exclusive
             with --regions. Same source support as --regions.
         samples: Comma-separated list of sample names to keep, e.g. ``A,B,C``.
-            Mutually exclusive with --samples-file. Supported for VCF/BCF, PGEN,
-            and SVAR1 sources; rejected for the multi-file (vcf-list) form, where
-            each input file already contributes exactly one sample.
+            Mutually exclusive with --samples-file. Rejected for the multi-file
+            (vcf-list) form, where each input file already contributes exactly
+            one sample.
         samples_file: Path to a file of sample names (one per line). Mutually exclusive
             with --samples. Same source support as --samples.
+        fields: INFO/FORMAT fields to carry over, e.g. ``-f INFO/AF -f FORMAT/AD``
+            (``FMT/`` also accepted). Defaults to unset, meaning no fields are
+            carried through (genotypes only).
         merge_overlapping: If set, silently merge overlapping regions instead of raising.
         regions_overlap: How records are matched against regions: ``pos`` (default, POS inside
             the region), ``record`` (POS in ``[start, end+1)``, so an indel at
             the region's last base is kept), or ``variant`` (the anchor-trimmed
             variant extent overlaps the region; a multiallelic record is kept
             whole if any of its alleles truly overlaps).
-        ploidy: Ploidy of the samples. Default 2. VCF/BCF only — PGEN is diploid.
-        chunk_size: Variants per conversion chunk. Defaults to 25000 for VCF/BCF, and to a
-            memory-derived value for PGEN.
+        ploidy: Ploidy of the samples. Default 2.
+        chunk_size: Variants per conversion chunk. Defaults to 25000.
         threads: Number of threads. Defaults to all available cores.
         long_allele_capacity: Advanced: byte budget for the streaming long-allele buffer.
         overwrite: Overwrite the output directory if it exists.
         skip_symbolics_and_breakends: Drop records whose ALT is symbolic (``<DEL>``, ``<INS>``, …) or a
             breakend, instead of erroring. The SVAR2 core cannot expand either
             class into nucleotides, so they are dropped together. (On
-            ``genoray write svar1`` the two classes are filtered independently
+            ``genoray write-svar1`` the two classes are filtered independently
             via ``--no-symbolic`` / ``--no-breakend``.)
         check_ref: REF-vs-reference policy (ignored with ``--no-reference``). ``e``
             (default) aborts on the first REF/FASTA disagreement; ``x`` drops the
             offending record and continues. Mirrors ``bcftools norm --check-ref``.
     """
     from genoray import SparseVar2
+    from genoray._svar2_fields import _parse_cli_field_specs
 
-    from ._view_helpers import parse_regions_arg
+    regions_arg, samples_arg = _resolve_regions_samples(
+        regions=regions,
+        regions_file=regions_file,
+        samples=samples,
+        samples_file=samples_file,
+    )
 
-    if regions is not None and regions_file is not None:
-        raise ValueError("--regions and --regions-file are mutually exclusive")
-    if samples is not None and samples_file is not None:
-        raise ValueError("--samples and --samples-file are mutually exclusive")
-
-    if regions is not None:
-        regions_arg: pl.DataFrame | Path | None = parse_regions_arg(regions)
-    elif regions_file is not None:
-        regions_arg = regions_file
+    if fields:
+        info_fields, format_fields = _parse_cli_field_specs(fields)
     else:
-        regions_arg = None
-
-    if samples is not None:
-        samples_arg: list[str] | Path | None = [s for s in samples.split(",") if s]
-    elif samples_file is not None:
-        samples_arg = samples_file
-    else:
-        samples_arg = None
+        info_fields: list[str] = []
+        format_fields: list[str] = []
 
     skip_out_of_scope = skip_symbolics_and_breakends
     is_single_vcf = source.is_file() and (
         source.name.endswith(".vcf.gz") or source.suffix == ".bcf"
     )
-    if source.suffix == ".pgen":
-        if ploidy != 2:
-            raise ValueError(
-                "PGEN is diploid; --ploidy is only meaningful for VCF/BCF sources."
-            )
-        dropped = SparseVar2.from_pgen(
-            out,
-            source,
-            reference,
-            regions=regions_arg,
-            samples=samples_arg,
-            merge_overlapping=merge_overlapping,
-            regions_overlap=regions_overlap,
-            no_reference=no_reference,
-            skip_out_of_scope=skip_out_of_scope,
-            chunk_size=chunk_size,
-            threads=threads,
-            overwrite=overwrite,
-            long_allele_capacity=long_allele_capacity,
-            check_ref=check_ref,
-        )
-    elif source.suffix == ".svar":
-        dropped = SparseVar2.from_svar1(
-            out,
-            source,
-            reference,
-            regions=regions_arg,
-            samples=samples_arg,
-            merge_overlapping=merge_overlapping,
-            regions_overlap=regions_overlap,
-            no_reference=no_reference,
-            skip_out_of_scope=skip_out_of_scope,
-            chunk_size=chunk_size,
-            threads=threads,
-            overwrite=overwrite,
-            long_allele_capacity=long_allele_capacity,
-            check_ref=check_ref,
-        )
-    elif not is_single_vcf:
+    if not is_single_vcf:
         # Directory of VCFs, or a manifest file listing them (vcf-list form).
         if samples_arg is not None:
             raise ValueError(
@@ -225,6 +211,8 @@ def write_svar2(
             threads=threads,
             overwrite=overwrite,
             long_allele_capacity=long_allele_capacity,
+            info_fields=info_fields,
+            format_fields=format_fields,
             check_ref=check_ref,
         )
     else:
@@ -243,13 +231,247 @@ def write_svar2(
             threads=threads,
             overwrite=overwrite,
             long_allele_capacity=long_allele_capacity,
+            info_fields=info_fields,
+            format_fields=format_fields,
             check_ref=check_ref,
         )
     if skip_out_of_scope:
         print(f"Dropped {dropped} out-of-scope (symbolic/breakend) ALT alleles.")
 
 
+@write.command(name="pgen")
+def write_pgen(
+    source: Path,
+    out: Path,
+    *,
+    reference: Annotated[Path | None, Parameter(name="--reference")] = None,
+    no_reference: Annotated[
+        bool, Parameter(name="--no-reference", negative="")
+    ] = False,
+    regions: Annotated[str | None, Parameter(name=["--regions", "-r"])] = None,
+    regions_file: Annotated[
+        Path | None,
+        Parameter(
+            name=["--regions-file", "-R"],
+            validator=validators.Path(exists=True, dir_okay=False, file_okay=True),
+        ),
+    ] = None,
+    samples: Annotated[str | None, Parameter(name=["--samples", "-s"])] = None,
+    samples_file: Annotated[
+        Path | None,
+        Parameter(
+            name=["--samples-file", "-S"],
+            validator=validators.Path(exists=True, dir_okay=False, file_okay=True),
+        ),
+    ] = None,
+    dosages: Annotated[list[str] | None, Parameter(name="--dosages")] = None,
+    merge_overlapping: bool = False,
+    regions_overlap: Literal["pos", "record", "variant"] = "pos",
+    chunk_size: int | None = None,
+    threads: Annotated[int | None, Parameter(name=["--threads", "-@"])] = None,
+    long_allele_capacity: int = 8 * 1024 * 1024,
+    overwrite: bool = False,
+    skip_symbolics_and_breakends: Annotated[
+        bool, Parameter(name="--skip-symbolics-and-breakends", negative="")
+    ] = False,
+    check_ref: Annotated[Literal["e", "x"], Parameter(name="--check-ref")] = "e",
+) -> None:
+    """Convert a PLINK2 PGEN to an SVAR2 store.
+
+    Args:
+        source: Path to a PLINK2 PGEN (``.pgen``, with its ``.pvar``/``.pvar.zst``
+            and ``.psam`` siblings).
+        out: Path to the output SVAR2 directory.
+        reference: Path to a reference FASTA (with ``.fai``). Used to validate REF and
+            left-align indels. Exactly one of ``--reference`` or ``--no-reference``
+            is required.
+        no_reference: Skip REF validation and indel left-alignment; the input is trusted to be
+            already normalized. Use only for pre-normalized (e.g. ``bcftools norm``)
+            inputs.
+        regions: Inline region(s): a single ``chrom:start-end`` (1-based inclusive,
+            bcftools convention) or a comma-separated list. Mutually exclusive
+            with --regions-file.
+        regions_file: Path to a BED file (0-based half-open) of regions. Mutually exclusive
+            with --regions.
+        samples: Comma-separated list of sample names to keep, e.g. ``A,B,C``.
+            Mutually exclusive with --samples-file.
+        samples_file: Path to a file of sample names (one per line). Mutually exclusive
+            with --samples.
+        dosages: Dosage tracks to carry over as FORMAT fields, each
+            ``NAME=self`` (read dosage from `source` itself) or
+            ``NAME=/path/to/vaf.pgen`` (read from a separate PGEN, e.g. a
+            VAF/CCF file). May be repeated.
+        merge_overlapping: If set, silently merge overlapping regions instead of raising.
+        regions_overlap: How records are matched against regions: ``pos`` (default, POS inside
+            the region), ``record`` (POS in ``[start, end+1)``, so an indel at
+            the region's last base is kept), or ``variant`` (the anchor-trimmed
+            variant extent overlaps the region; a multiallelic record is kept
+            whole if any of its alleles truly overlaps).
+        chunk_size: Variants per conversion chunk. Defaults to a memory-derived value.
+        threads: Number of threads. Defaults to all available cores.
+        long_allele_capacity: Advanced: byte budget for the streaming long-allele buffer.
+        overwrite: Overwrite the output directory if it exists.
+        skip_symbolics_and_breakends: Drop records whose ALT is symbolic (``<DEL>``, ``<INS>``, …) or a
+            breakend, instead of erroring. The SVAR2 core cannot expand either
+            class into nucleotides, so they are dropped together.
+        check_ref: REF-vs-reference policy (ignored with ``--no-reference``). ``e``
+            (default) aborts on the first REF/FASTA disagreement; ``x`` drops the
+            offending record and continues. Mirrors ``bcftools norm --check-ref``.
+    """
+    from genoray import DosageField, SparseVar2
+
+    regions_arg, samples_arg = _resolve_regions_samples(
+        regions=regions,
+        regions_file=regions_file,
+        samples=samples,
+        samples_file=samples_file,
+    )
+
+    dosage_specs: list[DosageField] | None = None
+    if dosages:
+        dosage_specs = []
+        for entry in dosages:
+            name, sep, src = entry.partition("=")
+            if not sep or not name or not src:
+                raise ValueError(
+                    f"--dosages must be NAME=self or NAME=/path.pgen, got {entry!r}"
+                )
+            dosage_specs.append(DosageField(name=name, source=src))
+
+    skip_out_of_scope = skip_symbolics_and_breakends
+    dropped = SparseVar2.from_pgen(
+        out,
+        source,
+        reference,
+        regions=regions_arg,
+        samples=samples_arg,
+        merge_overlapping=merge_overlapping,
+        regions_overlap=regions_overlap,
+        no_reference=no_reference,
+        skip_out_of_scope=skip_out_of_scope,
+        chunk_size=chunk_size,
+        threads=threads,
+        overwrite=overwrite,
+        long_allele_capacity=long_allele_capacity,
+        dosages=dosage_specs,
+        check_ref=check_ref,
+    )
+    if skip_out_of_scope:
+        print(f"Dropped {dropped} out-of-scope (symbolic/breakend) ALT alleles.")
+
+
 @write.command(name="svar1")
+def write_from_svar1(
+    source: Path,
+    out: Path,
+    *,
+    reference: Annotated[Path | None, Parameter(name="--reference")] = None,
+    no_reference: Annotated[
+        bool, Parameter(name="--no-reference", negative="")
+    ] = False,
+    regions: Annotated[str | None, Parameter(name=["--regions", "-r"])] = None,
+    regions_file: Annotated[
+        Path | None,
+        Parameter(
+            name=["--regions-file", "-R"],
+            validator=validators.Path(exists=True, dir_okay=False, file_okay=True),
+        ),
+    ] = None,
+    samples: Annotated[str | None, Parameter(name=["--samples", "-s"])] = None,
+    samples_file: Annotated[
+        Path | None,
+        Parameter(
+            name=["--samples-file", "-S"],
+            validator=validators.Path(exists=True, dir_okay=False, file_okay=True),
+        ),
+    ] = None,
+    fields: list[str] | None = None,
+    empty_fields: Annotated[
+        bool, Parameter(name="--empty-fields", negative="")
+    ] = False,
+    merge_overlapping: bool = False,
+    regions_overlap: Literal["pos", "record", "variant"] = "pos",
+    chunk_size: int | None = None,
+    threads: Annotated[int | None, Parameter(name=["--threads", "-@"])] = None,
+    long_allele_capacity: int = 8 * 1024 * 1024,
+    overwrite: bool = False,
+    skip_symbolics_and_breakends: Annotated[
+        bool, Parameter(name="--skip-symbolics-and-breakends", negative="")
+    ] = False,
+    check_ref: Annotated[Literal["e", "x"], Parameter(name="--check-ref")] = "e",
+) -> None:
+    """Convert a SVAR1 store to an SVAR2 store.
+
+    Args:
+        source: Path to a SVAR1 store (a ``*.svar`` directory).
+        out: Path to the output SVAR2 directory.
+        reference: Path to a reference FASTA (with ``.fai``). Used to validate REF and
+            left-align indels. Exactly one of ``--reference`` or ``--no-reference``
+            is required.
+        no_reference: Skip REF validation and indel left-alignment; the input is trusted to be
+            already normalized. Use only for pre-normalized (e.g. ``bcftools norm``)
+            inputs.
+        regions: Inline region(s): a single ``chrom:start-end`` (1-based inclusive,
+            bcftools convention) or a comma-separated list. Mutually exclusive
+            with --regions-file.
+        regions_file: Path to a BED file (0-based half-open) of regions. Mutually exclusive
+            with --regions.
+        samples: Comma-separated list of sample names to keep, e.g. ``A,B,C``.
+            Mutually exclusive with --samples-file.
+        samples_file: Path to a file of sample names (one per line). Mutually exclusive
+            with --samples.
+        fields: SVAR1 FORMAT fields (e.g. ``dosages``) to carry through. Defaults to
+            all available fields. Use ``--empty-fields`` to carry over none.
+        empty_fields: If set, carry over no SVAR1 FORMAT fields, overriding ``--fields``.
+        merge_overlapping: If set, silently merge overlapping regions instead of raising.
+        regions_overlap: How records are matched against regions: ``pos`` (default, POS inside
+            the region), ``record`` (POS in ``[start, end+1)``, so an indel at
+            the region's last base is kept), or ``variant`` (the anchor-trimmed
+            variant extent overlaps the region; a multiallelic record is kept
+            whole if any of its alleles truly overlaps).
+        chunk_size: Variants per conversion chunk. Defaults to 25000.
+        threads: Number of threads. Defaults to all available cores.
+        long_allele_capacity: Advanced: byte budget for the streaming long-allele buffer.
+        overwrite: Overwrite the output directory if it exists.
+        skip_symbolics_and_breakends: Drop records whose ALT is symbolic (``<DEL>``, ``<INS>``, …) or a
+            breakend, instead of erroring. The SVAR2 core cannot expand either
+            class into nucleotides, so they are dropped together.
+        check_ref: REF-vs-reference policy (ignored with ``--no-reference``). ``e``
+            (default) aborts on the first REF/FASTA disagreement; ``x`` drops the
+            offending record and continues. Mirrors ``bcftools norm --check-ref``.
+    """
+    from genoray import SparseVar2
+
+    regions_arg, samples_arg = _resolve_regions_samples(
+        regions=regions,
+        regions_file=regions_file,
+        samples=samples,
+        samples_file=samples_file,
+    )
+
+    skip_out_of_scope = skip_symbolics_and_breakends
+    dropped = SparseVar2.from_svar1(
+        out,
+        source,
+        reference,
+        regions=regions_arg,
+        samples=samples_arg,
+        merge_overlapping=merge_overlapping,
+        regions_overlap=regions_overlap,
+        no_reference=no_reference,
+        skip_out_of_scope=skip_out_of_scope,
+        chunk_size=chunk_size,
+        threads=threads,
+        overwrite=overwrite,
+        long_allele_capacity=long_allele_capacity,
+        fields=[] if empty_fields else fields,
+        check_ref=check_ref,
+    )
+    if skip_out_of_scope:
+        print(f"Dropped {dropped} out-of-scope (symbolic/breakend) ALT alleles.")
+
+
+@app.command(name="write-svar1")
 def write_svar1(
     source: Path,
     out: Path,
