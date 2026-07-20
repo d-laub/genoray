@@ -1106,6 +1106,123 @@ fn run_svar1_conversion_pipeline(
     Ok(dropped as usize)
 }
 
+#[cfg(feature = "conversion")]
+#[pyclass]
+pub struct PyEventReceiver {
+    tx: crossbeam_channel::Sender<crate::logging::Event>,
+    rx: crossbeam_channel::Receiver<crate::logging::Event>,
+}
+
+#[cfg(feature = "conversion")]
+#[pymethods]
+impl PyEventReceiver {
+    #[new]
+    #[pyo3(signature = (flush_every = 25_000))]
+    fn new(flush_every: u64) -> Self {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let _ = flush_every; // flush_every consumed when the pipeline builds its EventSink
+        PyEventReceiver { tx, rx }
+    }
+
+    /// Block up to `millis` for the next event. GIL is released while parked.
+    /// Returns a decoded tuple, or None on timeout. Raises StopIteration when
+    /// all senders have dropped (channel disconnected).
+    fn recv_timeout(&self, py: Python, millis: u64) -> PyResult<Option<Py<PyAny>>> {
+        use crossbeam_channel::RecvTimeoutError;
+        let res = py.detach(|| {
+            self.rx
+                .recv_timeout(std::time::Duration::from_millis(millis))
+        });
+        match res {
+            Ok(ev) => Ok(Some(encode_event(py, ev)?)),
+            Err(RecvTimeoutError::Timeout) => Ok(None),
+            Err(RecvTimeoutError::Disconnected) => Err(pyo3::exceptions::PyStopIteration::new_err(
+                "event channel closed",
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "conversion")]
+impl PyEventReceiver {
+    /// Build an EventSink that publishes into this receiver's channel.
+    pub fn sink(&self, flush_every: u64) -> crate::logging::EventSink {
+        crate::logging::EventSink::new(self.tx.clone(), flush_every)
+    }
+    /// Drop the internal keep-alive sender so the drain side sees disconnect
+    /// once all pipeline senders drop. Called at end of each pyfunction.
+    pub fn tx_clone(&self) -> crossbeam_channel::Sender<crate::logging::Event> {
+        self.tx.clone()
+    }
+}
+
+#[cfg(feature = "conversion")]
+fn encode_event(py: Python, ev: crate::logging::Event) -> PyResult<Py<PyAny>> {
+    use crate::logging::Event::*;
+    use pyo3::types::PyTuple;
+
+    fn opt_u64<'py>(py: Python<'py>, v: Option<u64>) -> PyResult<Py<PyAny>> {
+        match v {
+            Some(v) => Ok(v.into_pyobject(py)?.into_any().unbind()),
+            None => Ok(py.None()),
+        }
+    }
+    fn opt_str<'py>(py: Python<'py>, v: Option<String>) -> PyResult<Py<PyAny>> {
+        match v {
+            Some(v) => Ok(v.into_pyobject(py)?.into_any().unbind()),
+            None => Ok(py.None()),
+        }
+    }
+    fn s<'py>(py: Python<'py>, v: String) -> PyResult<Py<PyAny>> {
+        Ok(v.into_pyobject(py)?.into_any().unbind())
+    }
+    fn u<'py>(py: Python<'py>, v: u64) -> PyResult<Py<PyAny>> {
+        Ok(v.into_pyobject(py)?.into_any().unbind())
+    }
+
+    let elems: [Py<PyAny>; 5] = match ev {
+        ContigStart { chrom, total } => [
+            s(py, "contig_start".to_string())?,
+            s(py, chrom)?,
+            opt_u64(py, total)?,
+            py.None(),
+            py.None(),
+        ],
+        Progress { chrom, delta } => [
+            s(py, "progress".to_string())?,
+            s(py, chrom)?,
+            u(py, delta)?,
+            py.None(),
+            py.None(),
+        ],
+        ContigDone {
+            chrom,
+            kept,
+            excluded,
+            elapsed_ms,
+        } => [
+            s(py, "contig_done".to_string())?,
+            s(py, chrom)?,
+            u(py, kept)?,
+            u(py, excluded)?,
+            u(py, elapsed_ms)?,
+        ],
+        Log {
+            level,
+            chrom,
+            message,
+            target,
+        } => [
+            s(py, "log".to_string())?,
+            s(py, level.as_str().to_string())?,
+            opt_str(py, chrom)?,
+            s(py, message)?,
+            s(py, target)?,
+        ],
+    };
+    Ok(PyTuple::new(py, elems)?.into_any().unbind())
+}
+
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "conversion")]
@@ -1122,6 +1239,8 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run_svar1_conversion_pipeline, m)?)?;
     #[cfg(feature = "conversion")]
     m.add_function(wrap_pyfunction!(index_vcf, m)?)?;
+    #[cfg(feature = "conversion")]
+    m.add_class::<PyEventReceiver>()?;
     m.add_class::<crate::py_query::PyContigReader>()?;
     m.add_class::<crate::py_svar1_query::PySvar1Reader>()?;
     Ok(())
