@@ -96,6 +96,9 @@ fn resolve_contig_name(fasta_contigs: &[String], query: &str) -> Option<String> 
     // ContigNormalizer.__init__'s dict merge: derived first, exact next
     // (overwrites derived), mito last (overwrites exact for the four aliases).
     let mut m: HashMap<String, String> = HashMap::new();
+    // Single loop (vs Python's two-phase strip|add merge): the strip-derived and
+    // chr-add-derived keys can only collide for a double-"chr" contig (e.g.
+    // "chrchr2"), which no real reference contains, so order-independence holds.
     for c in fasta_contigs {
         if let Some(stripped) = c.strip_prefix("chr") {
             m.insert(stripped.to_string(), c.clone()); // "chr1" registers "1"
