@@ -272,6 +272,12 @@ Signature: `from_vcf(out, source, reference=None, *, regions=None, samples=None,
   indels) or `no_reference=True` (trusts pre-normalized input, skips
   validation/left-align) is required — passing both or neither raises
   `ValueError`.
+- The `reference=` FASTA may use a different contig naming scheme than the
+  variant source (e.g. source `chr1`, FASTA `1`, or either side's mito contig
+  spelled as `M`/`MT`/`chrM`/`chrMT`); genoray resolves the source's contig
+  names against the FASTA's own naming (`chr`-prefix and mito aliases
+  included) before validating REF/left-aligning. The output store keeps the
+  source's contig spelling regardless of the FASTA's.
 - `skip_out_of_scope=False` — when `True`, drops out-of-scope (symbolic
   `<DEL>`/`<INS>`/… and breakend) ALTs instead of erroring; the strict default
   errors on the first one. The two classes are **not** distinguishable at this
@@ -618,6 +624,11 @@ counts = sv.region_counts("chr1", regions)   # np.ndarray, shape (R, S, P)
   (SVAR2 has no unified variant table, so variant *indices* no longer exist).
 - Queries are **per contig** — cross-contig batching is the caller's job. Regions
   are an iterable of `(start, end)` pairs.
+- The `contig` argument to `decode`/`region_counts`/`read_ranges` accepts
+  alternate naming schemes — `chr`-prefixed vs unprefixed (`chr1` ↔ `1`) and
+  the mitochondrial aliases `{M, MT, chrM, chrMT}` — resolved via
+  `ContigNormalizer` to the store's own spelling. An unresolvable contig
+  raises `ValueError`.
 
 The user-facing SVAR2 query API is `decode` / `region_counts` / `read_ranges`
 (above). `read_ranges(contig, starts, ends, samples=None)` is a fused
@@ -699,9 +710,13 @@ act = sv.assign_signatures("SBS96")                  # mutation_matrix + fit_sig
 
 - `annotate_mutations(reference, *, gtf=None, contigs=None) -> None` —
   `reference` is a `genoray.Reference` or a FASTA path; `contigs=None`
-  (default) annotates every contig. Unlike `SparseVar.annotate_mutations`,
-  there is **no `write_back=` toggle** — SVAR2 always persists the sidecar to
-  disk. `gtf=` optionally supplies a GTF/GFF gene model path; when given, each
+  (default) annotates every contig. `contigs=` accepts alternate naming —
+  `chr`-prefixed vs unprefixed and the mitochondrial aliases
+  `{M, MT, chrM, chrMT}` — resolved via `ContigNormalizer` to the store's own
+  spelling; raises `ValueError` if every requested contig fails to resolve.
+  Unlike `SparseVar.annotate_mutations`, there is **no `write_back=` toggle**
+  — SVAR2 always persists the sidecar to disk. `gtf=` optionally supplies a
+  GTF/GFF gene model path; when given, each
   SNV is additionally classified by transcriptional-strand class (from
   `feature == "gene"` footprints) and persisted to a `strand.bin` sidecar,
   which unlocks the `"SBS192"`/`"SBS384"` catalogs below.
@@ -775,12 +790,14 @@ SparseVar2.concat("merged.svar2", ["chr1.svar2", "chr2.svar2"])  # disjoint-cont
 
 - `subset_contigs(output, contigs, *, mode="copy", overwrite=False) -> None` —
   write a new store containing only `contigs` (a single contig name or a
-  sequence of names). Pure metadata rewrite + file copy of the kept contig
-  directories, preserving the source store's contig order. Raises
-  `ValueError` if any name isn't in `self.contigs`, or if `output` resolves
-  to this store's own path (in-place subsetting is rejected, mirroring
-  `write_view`'s in-place guard). Raises `FileExistsError` if `output`
-  exists and `overwrite=False`.
+  sequence of names). `contigs` accepts alternate naming — `chr`-prefixed vs
+  unprefixed and the mitochondrial aliases `{M, MT, chrM, chrMT}` — resolved
+  via `ContigNormalizer` to the store's own spelling. Pure metadata rewrite +
+  file copy of the kept contig directories, preserving the source store's
+  contig order. Raises `ValueError` if any name is unresolvable against
+  `self.contigs`, or if `output` resolves to this store's own path (in-place
+  subsetting is rejected, mirroring `write_view`'s in-place guard). Raises
+  `FileExistsError` if `output` exists and `overwrite=False`.
 - `split_by_contig(out_dir, *, mode="copy", overwrite=False) -> list[Path]` —
   explode into one single-contig store per contig at
   `out_dir/{contig}.svar2`; returns the output paths in `self.contigs`
