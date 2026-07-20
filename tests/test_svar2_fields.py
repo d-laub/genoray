@@ -18,7 +18,13 @@ from pathlib import Path
 import pytest
 from vcfixture import Number, Seq, Type, VcfBuilder
 
-from genoray._svar2_fields import FormatField, _resolve_fields
+from genoray import DosageField
+from genoray._svar2_fields import (
+    FormatField,
+    _dosage_field_to_tuple,
+    _parse_cli_field_specs,
+    _resolve_fields,
+)
 
 
 @pytest.fixture(scope="module")
@@ -371,3 +377,39 @@ def test_from_vcf_signatures_and_fields_compose(tmp_path: Path):
         (out / contig).rglob("*mutcat*")
     )
     assert sidecar, "signatures=True produced no mutcat sidecar next to fields"
+
+
+# --- DosageField spec + CLI field-string parser ---
+
+
+def test_dosage_field_defaults():
+    df = DosageField()
+    assert df.name == "dosage"
+    assert df.source == "self"
+    assert df.dtype == "f32"
+    assert df.default is None
+
+
+def test_dosage_field_to_tuple():
+    df = DosageField(name="VAF", source="vaf.pgen", dtype="f16", default=0.0)
+    assert _dosage_field_to_tuple(df) == ("VAF", "format", "float", "f16", 0.0)
+
+
+def test_dosage_field_rejects_non_float_dtype():
+    with pytest.raises(ValueError, match="dtype"):
+        _dosage_field_to_tuple(DosageField(name="x", dtype="i8"))  # type: ignore[arg-type]
+
+
+def test_parse_cli_field_specs_splits_and_dedups():
+    info, fmt = _parse_cli_field_specs(
+        ["INFO/AF", "FORMAT/AD", "FMT/AD", "INFO/AF", "INFO/AC"]
+    )
+    assert info == ["AF", "AC"]
+    assert fmt == ["AD"]
+
+
+def test_parse_cli_field_specs_rejects_bad_prefix():
+    with pytest.raises(ValueError, match="INFO/ or FORMAT/"):
+        _parse_cli_field_specs(["AF"])
+    with pytest.raises(ValueError, match="INFO/ or FORMAT/"):
+        _parse_cli_field_specs(["GT/x"])

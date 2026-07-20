@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal
 
 import numpy as np
@@ -39,6 +40,65 @@ class FormatField:
     name: str
     dtype: FieldDtype | None = None
     default: float | int | None = None
+
+
+@dataclass(frozen=True)
+class DosageField:
+    """A per-sample dosage track to store in the SVAR2 output as a FORMAT field.
+
+    Dosages come from a PLINK2 ``.pgen`` — either the hardcall file itself
+    (``source="self"``) or a separate ``.pgen`` (e.g. VAF/CCF stored as dosage,
+    kept separate because pgenlib derives hard calls from dosage when present).
+    Stored genotype-aligned like any FORMAT field: under var_key routing a
+    non-carrier's dosage is dropped (fine for VAF/CCF, ~0 for non-carriers).
+    """
+
+    name: str = "dosage"
+    source: str | Path = "self"
+    dtype: Literal["f16", "f32"] = "f32"
+    default: float | None = None
+
+
+def _dosage_field_to_tuple(
+    df: DosageField,
+) -> tuple[str, str, str, str, float | None]:
+    if df.dtype not in _FLOAT_DTYPES:
+        raise ValueError(
+            f"DosageField {df.name!r} dtype must be 'f16' or 'f32', got {df.dtype!r}"
+        )
+    return (df.name, "format", "float", df.dtype, df.default)
+
+
+def _parse_cli_field_specs(specs: Sequence[str]) -> tuple[list[str], list[str]]:
+    """Parse bcftools-style ``INFO/x`` / ``FORMAT/x`` / ``FMT/x`` field strings.
+
+    Returns ``(info_names, format_names)``, de-duplicated with first occurrence
+    winning across both categories.
+    """
+    info: list[str] = []
+    fmt: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    for spec in specs:
+        prefix, sep, name = spec.partition("/")
+        if not sep or not name:
+            raise ValueError(
+                f"field {spec!r} must be prefixed with INFO/ or FORMAT/ (or FMT/)"
+            )
+        upper = prefix.upper()
+        if upper == "INFO":
+            key = ("info", name)
+            bucket = info
+        elif upper in ("FORMAT", "FMT"):
+            key = ("format", name)
+            bucket = fmt
+        else:
+            raise ValueError(
+                f"field {spec!r} must be prefixed with INFO/ or FORMAT/ (or FMT/)"
+            )
+        if key not in seen:
+            seen.add(key)
+            bucket.append(name)
+    return info, fmt
 
 
 def _htslib_type(header_type: str) -> str:
