@@ -81,6 +81,48 @@ fn decode_format_raw(
     }
 }
 
+/// The four mutually-equivalent mitochondrial spellings (mirrors
+/// `genoray._contigs._MITO_ALIASES`).
+const MITO_ALIASES: [&str; 4] = ["M", "MT", "chrM", "chrMT"];
+
+/// Resolve `query` to the FASTA's own spelling of the same contig, mirroring
+/// Python's `ContigNormalizer`: exact match wins, then `chr`-prefix add/strip,
+/// then the {M, MT, chrM, chrMT} mito-alias group. Returns `None` if no contig
+/// in `fasta_contigs` is equivalent. Pure (no I/O) so it is unit-testable.
+fn resolve_contig_name(fasta_contigs: &[String], query: &str) -> Option<String> {
+    use std::collections::HashMap;
+
+    // Build the alias -> canonical map in the SAME precedence order as
+    // ContigNormalizer.__init__'s dict merge: derived first, exact next
+    // (overwrites derived), mito last (overwrites exact for the four aliases).
+    let mut m: HashMap<String, String> = HashMap::new();
+    for c in fasta_contigs {
+        if let Some(stripped) = c.strip_prefix("chr") {
+            m.insert(stripped.to_string(), c.clone()); // "chr1" registers "1"
+        } else {
+            m.insert(format!("chr{c}"), c.clone()); // "1" registers "chr1"
+        }
+    }
+    for c in fasta_contigs {
+        m.insert(c.clone(), c.clone()); // exact spelling wins over derived
+    }
+    if let Some(mito) = fasta_contigs
+        .iter()
+        .find(|c| MITO_ALIASES.contains(&c.as_str()))
+    {
+        for a in MITO_ALIASES {
+            m.insert(a.to_string(), mito.clone()); // mito group wins over exact
+        }
+    }
+    m.get(query).cloned()
+}
+
+/// FASTA-backed wrapper over `resolve_contig_name`.
+fn resolve_fasta_contig(fasta: &rust_htslib::faidx::Reader, query: &str) -> Option<String> {
+    let names = fasta.seq_names().ok()?;
+    resolve_contig_name(&names, query)
+}
+
 /// Load `chrom`'s full sequence from the FASTA at `fasta_path`, uppercased to
 /// ASCII (matching the classifiers'/normalizer's expectation). Shared by
 /// `ChunkAssembler::new` (validate_ref/left_align) and the orchestrator's
@@ -98,9 +140,17 @@ pub(crate) fn load_contig_seq(fasta_path: &str, chrom: &str) -> Result<Vec<u8>, 
             "Failed to open reference FASTA '{fasta_path}' (is there a .fai?): {e}"
         ))
     })?;
+    let resolved = match resolve_fasta_contig(&fasta, chrom) {
+        Some(name) => name,
+        None => {
+            return Err(ConversionError::Input(format!(
+                "Contig '{chrom}' not found in reference FASTA"
+            )));
+        }
+    };
     // htslib's faidx_seq_len returns -1 for an unknown contig, surfaced via
     // rust-htslib as u64::MAX — check explicitly for a clear message.
-    let contig_len_raw = fasta.fetch_seq_len(chrom);
+    let contig_len_raw = fasta.fetch_seq_len(resolved.as_str());
     if contig_len_raw == u64::MAX {
         return Err(ConversionError::Input(format!(
             "Contig '{chrom}' not found in reference FASTA"
@@ -111,7 +161,7 @@ pub(crate) fn load_contig_seq(fasta_path: &str, chrom: &str) -> Result<Vec<u8>, 
         Vec::new()
     } else {
         fasta
-            .fetch_seq(chrom, 0, contig_len - 1)
+            .fetch_seq(resolved.as_str(), 0, contig_len - 1)
             .map_err(|e| ConversionError::Io {
                 context: format!("fetching contig '{chrom}' from reference FASTA"),
                 source: std::io::Error::other(e.to_string()),
@@ -144,8 +194,7 @@ pub(crate) fn validate_contigs_in_fasta(
         ))
     })?;
     for chrom in chroms {
-        // u64::MAX == htslib's -1 for an unknown contig; no sequence is fetched.
-        if fasta.fetch_seq_len(chrom.as_str()) == u64::MAX {
+        if resolve_fasta_contig(&fasta, chrom.as_str()).is_none() {
             return Err(ConversionError::Input(format!(
                 "Contig '{chrom}' not found in reference FASTA"
             )));
@@ -875,5 +924,29 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(0, 25), (25, 50), (50, 75), (75, 100)]
         );
+    }
+
+    // MUST match tests/test_contig_resolver_parity.py::PARITY_CASES verbatim.
+    #[test]
+    fn resolve_contig_name_parity() {
+        let cases: &[(&[&str], &str, Option<&str>)] = &[
+            (&["chr1", "chr2", "chrM"], "1", Some("chr1")),
+            (&["chr1", "chr2", "chrM"], "chr1", Some("chr1")),
+            (&["1", "2", "MT"], "chr1", Some("1")),
+            (&["1", "2", "MT"], "1", Some("1")),
+            (&["chr1", "chrM"], "MT", Some("chrM")),
+            (&["chr1", "chrM"], "chrMT", Some("chrM")),
+            (&["1", "MT"], "chrM", Some("MT")),
+            (&["chr1", "chr2"], "chrZ", None),
+            (&["chr1", "chr2"], "MT", None),
+        ];
+        for (contigs, query, expected) in cases {
+            let owned: Vec<String> = contigs.iter().map(|s| s.to_string()).collect();
+            assert_eq!(
+                super::resolve_contig_name(&owned, query).as_deref(),
+                *expected,
+                "query {query:?} against {contigs:?}"
+            );
+        }
     }
 }
