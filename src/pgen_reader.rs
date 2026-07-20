@@ -300,6 +300,7 @@ impl RecordSource for PgenRecordSource {
                 // limited to the requested dosage fields (`format_raw` above).
                 info_raw: Vec::new(),
                 format_vals: crate::record_source::FormatVals::Dense(format_raw),
+                global_idx: -1, // task 1.2 populates this from PGEN's real global id
             }));
         }
     }

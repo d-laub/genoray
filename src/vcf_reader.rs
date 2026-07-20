@@ -676,6 +676,7 @@ impl VcfRecordSource {
             calls: crate::record_source::Calls::Dense(gt),
             info_raw,
             format_vals: crate::record_source::FormatVals::Dense(format_raw),
+            global_idx: -1,
         }))
     }
 }

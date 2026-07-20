@@ -613,6 +613,7 @@ impl VcfListRecordSource {
             calls: Calls::Sparse(carriers),
             info_raw,
             format_vals: FormatVals::ByCarrier(cf),
+            global_idx: -1,
         })
     }
 }
