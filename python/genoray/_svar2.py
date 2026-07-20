@@ -1322,6 +1322,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         overwrite: bool = False,
         long_allele_capacity: int = 8 * 1024 * 1024,
         signatures: bool = False,
+        fields: "Sequence[str] | None" = None,
         check_ref: Literal["e", "x"] = "e",
     ) -> int:
         """Convert a SVAR1 (``SparseVar``) store to an SVAR2 store natively.
@@ -1335,11 +1336,15 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         number of out-of-scope (symbolic/breakend) ALTs dropped.
 
         Only **biallelic** SVAR1 stores are supported (SVAR1's ``geno==1`` model);
-        multiallelic input raises. All SVAR1 FORMAT fields (e.g. ``dosages``) are
-        carried through; ``mutcat`` is dropped (pass `signatures=True` to recompute
-        signatures from the reference). Because SVAR1 discarded non-carrier FORMAT
-        values, a dense-routed variant's non-carrier cells are filled with the
-        field's default/missing sentinel — field output is byte-identical to
+        multiallelic input raises. `fields` selects which SVAR1 FORMAT fields
+        (e.g. ``dosages``) are carried through: `None` (default) carries all of
+        them, matching prior behavior; `[]` carries none; a subset of names
+        carries only those. An unknown name raises `ValueError` listing the
+        available fields. ``mutcat`` is never selectable this way and is always
+        dropped (pass `signatures=True` to recompute signatures from the
+        reference). Because SVAR1 discarded non-carrier FORMAT values, a
+        dense-routed variant's non-carrier cells are filled with the field's
+        default/missing sentinel — field output is byte-identical to
         :meth:`from_vcf` only for var_key (carrier-only) routing.
 
         check_ref: policy for a record whose REF disagrees with the reference
@@ -1405,7 +1410,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
                 "from_svar1 supports only biallelic SVAR1 stores; this store has "
                 "multiallelic variants. Re-create it biallelically first."
             )
-        meta_samples, ploidy, contigs, fields = _read_svar1_metadata(source)
+        meta_samples, ploidy, contigs, fields_meta = _read_svar1_metadata(source)
         if len(meta_samples) == 0:
             raise ValueError(f"No samples found in {source}.")
 
@@ -1459,7 +1464,18 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             alt_bytes_pc = [alt_bytes_pc[i] for i in keep]
             alt_off_pc = [alt_off_pc[i] for i in keep]
 
-        format_tuples, src_dtypes = _svar1_fields_manifest(fields)
+        if fields is None:
+            selected_fields = fields_meta  # carry all (lossless migration)
+        else:
+            available = [n for n in fields_meta if n != "mutcat"]
+            unknown = [n for n in fields if n not in available]
+            if unknown:
+                raise ValueError(
+                    f"unknown SVAR1 field(s) {unknown}; available: {sorted(available)}"
+                )
+            selected_fields = {n: fields_meta[n] for n in fields}
+
+        format_tuples, src_dtypes = _svar1_fields_manifest(selected_fields)
 
         if chunk_size is None:
             chunk_size = _auto_chunk_size(len(selected_samples), ploidy)

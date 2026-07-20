@@ -226,6 +226,41 @@ def test_from_svar1_carries_dosages(tmp_path: Path):
     )
 
 
+def _build_svar1_with_dosages(tmp_path: Path) -> tuple[Path, Path]:
+    """A (reference, SVAR1 store) pair whose SVAR1 store carries a "dosages"
+    FORMAT field -- same setup as `test_from_svar1_carries_dosages`.
+    """
+    ref = _write_ref(tmp_path)
+    vcf = _write_dosage_vcf(tmp_path)
+    v1_out = tmp_path / "ds.svar"
+    v1 = _V1VCF(str(vcf))
+    v1.dosage_field = "DS"
+    SparseVar.from_vcf(v1_out, v1, max_mem="10m", overwrite=True, with_dosages=True)
+    return ref, v1_out
+
+
+def test_from_svar1_carries_all_fields_by_default(tmp_path: Path):
+    ref, v1_out = _build_svar1_with_dosages(tmp_path)
+    out = tmp_path / "out.svar2"
+    SparseVar2.from_svar1(out, v1_out, ref, threads=1)
+    assert "dosages" in SparseVar2(out).available_fields
+
+
+def test_from_svar1_fields_subset_empty(tmp_path: Path):
+    ref, v1_out = _build_svar1_with_dosages(tmp_path)
+    out = tmp_path / "out.svar2"
+    SparseVar2.from_svar1(out, v1_out, ref, fields=[], threads=1)
+    assert SparseVar2(out).available_fields == {}
+
+
+def test_from_svar1_fields_unknown_raises(tmp_path: Path):
+    ref, v1_out = _build_svar1_with_dosages(tmp_path)
+    with pytest.raises(ValueError, match="nope"):
+        SparseVar2.from_svar1(
+            tmp_path / "out.svar2", v1_out, ref, fields=["nope"], threads=1
+        )
+
+
 def test_from_svar1_no_reference_snp_indel(tmp_path: Path):
     src = _build_svar1(tmp_path)
     out = tmp_path / "noref"
