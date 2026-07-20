@@ -140,8 +140,9 @@ mod tests {
         let sink = EventSink::new(tx, 100);
         sink.contig_start("chr1", Some(250));
         sink.tick("chr1", 60);
-        sink.tick("chr1", 60); // crosses 100 -> emits Progress{delta:120}
-        sink.flush("chr1"); // remainder 0 already flushed? remainder=20 -> emit 20
+        sink.tick("chr1", 60); // crosses 100 -> swap drains buffer, emits Progress{delta:120}
+        sink.tick("chr1", 20); // below threshold -> stays buffered as remainder
+        sink.flush("chr1"); // emits the buffered remainder: Progress{delta:20}
         sink.contig_done("chr1", 230, 20, 1234);
 
         let evs: Vec<Event> = rx.try_iter().collect();
@@ -152,7 +153,7 @@ mod tests {
                 ..
             }
         ));
-        // one Progress of 120, then remainder 20
+        // one Progress of 120 (threshold), then the flushed remainder of 20
         let deltas: Vec<u64> = evs
             .iter()
             .filter_map(|e| match e {
@@ -160,7 +161,8 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(deltas.iter().sum::<u64>(), 120);
+        assert_eq!(deltas, vec![120, 20]);
+        assert_eq!(deltas.iter().sum::<u64>(), 140);
         assert!(matches!(
             evs.last().unwrap(),
             Event::ContigDone {
