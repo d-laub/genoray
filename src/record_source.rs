@@ -30,6 +30,10 @@ pub struct RawRecord {
     /// every sample (a multi-sample VCF, PGEN); `ByCarrier` for a k-way merge of
     /// single-sample files, where only the carrying samples have anything to say.
     pub format_vals: FormatVals,
+    /// Dataset-global variant id, threaded verbatim onto every atom this record
+    /// decomposes into. `-1` for sources that don't have one yet (everything but
+    /// PGEN, for now -- see `pgen_reader.rs`).
+    pub global_idx: i32,
 }
 
 /// A cursor over one contig's variant records, in file order.

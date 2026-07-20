@@ -325,6 +325,7 @@ impl RecordSource for Svar1RecordSource {
                 calls: crate::record_source::Calls::Dense(gt),
                 info_raw: Vec::new(), // SVAR1 has no INFO fields
                 format_vals: crate::record_source::FormatVals::Dense(format_raw),
+                global_idx: -1,
             }));
         }
     }
