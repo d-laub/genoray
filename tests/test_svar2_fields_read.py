@@ -219,3 +219,17 @@ def test_decode_field_values_match_fixture(store_with_fields):
 def test_decode_rejects_unknown_field(store_with_fields):
     with pytest.raises(ValueError, match="NOPE"):
         store_with_fields.with_fields(["NOPE"])
+
+
+def test_decode_with_fields_accepts_unprefixed_contig(store_with_fields):
+    """Aliased decode ('1' for a 'chr1' store) must work on the with-FIELDS path,
+    not just the GT-only path (the with-fields path passes the contig to Rust as a
+    directory name, so it must be resolved to the store's own spelling first)."""
+    sv = store_with_fields.with_fields(["AF", "DS"])
+    native = sv.decode("chr1", [(0, 1_000_000)])
+    alias = sv.decode(
+        "1", [(0, 1_000_000)]
+    )  # before the fix: errors (path {store}/1/... missing)
+    assert set(native.fields) == set(alias.fields)
+    for k in native.fields:
+        assert np.array_equal(np.asarray(native[k].data), np.asarray(alias[k].data))

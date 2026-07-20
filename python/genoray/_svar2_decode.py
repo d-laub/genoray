@@ -26,6 +26,9 @@ class _DecodeMixin:
     def _reader(self, contig: str) -> "_core.PyContigReader":  # host-provided
         ...
 
+    def _resolve_contig(self, contig: str) -> str:  # host-provided
+        ...
+
     def decode(self, contig: str, regions: Iterable[tuple[int, int]]) -> "Ragged":
         """Materialize overlapping variants for ``contig`` into a record ``Ragged``.
 
@@ -45,7 +48,8 @@ class _DecodeMixin:
         from genoray._svar2_fields import _META_DTYPE
 
         reg = [(int(s), int(e)) for s, e in regions]
-        reader = self._reader(contig)
+        resolved = self._resolve_contig(contig)
+        reader = self._readers[resolved]
         if not self._fields:
             d = reader.decode_batch(reg)
         else:
@@ -53,7 +57,7 @@ class _DecodeMixin:
                 reg,
                 [(f.category, f.name, _META_DTYPE[f.dtype]) for f in self._fields],
                 str(self.path),
-                contig,
+                resolved,
             )
 
         shape = (d["n_regions"], d["n_samples"], d["ploidy"], None)

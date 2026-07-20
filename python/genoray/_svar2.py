@@ -353,6 +353,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
 
         self._cnorm = ContigNormalizer(self.contigs)
 
+    # pyrefly: ignore [missing-override-decorator]
     def _resolve_contig(self, contig: str) -> str:
         """Resolve a caller-supplied contig name to the store's own spelling.
 
