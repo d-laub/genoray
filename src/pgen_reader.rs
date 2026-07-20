@@ -98,7 +98,7 @@ impl PgenRecordSource {
             PyArray2::<i32>::zeros(py, [batch, 2 * num_samples], false).unbind()
         });
         // One `(batch, num_samples)` f32 buffer per dosage reader, mirroring
-        // `buf` above -- not read from yet (Task 3 wires up `refill`).
+        // `buf` above.
         let dosage_bufs: Vec<Py<PyArray2<f32>>> = Python::attach(|py| {
             dosage_readers
                 .iter()

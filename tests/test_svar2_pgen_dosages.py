@@ -70,6 +70,60 @@ def _write_mismatched_dosage_vcf(d: Path) -> Path:
     return gz
 
 
+def _write_single_variant_dosage_vcf(d: Path) -> Path:
+    """Same samples/first variant as `_write_dosage_vcf` but only ONE
+    variant, so a `.pvar` built from this does NOT align 1:1 with the
+    two-variant fixture.
+    """
+    body = (
+        "##fileformat=VCFv4.2\n"
+        "##contig=<ID=chr1,length=40>\n"
+        '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n'
+        '##FORMAT=<ID=DS,Number=1,Type=Float,Description="Dosage">\n'
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS0\tS1\n"
+        "chr1\t3\t.\tA\tG\t.\t.\t.\tGT:DS\t1|0:1.0\t0|0:0.0\n"
+    )
+    plain = d / "single.vcf"
+    plain.write_text(body)
+    gz = d / "single.vcf.gz"
+    with open(gz, "wb") as fh:
+        subprocess.run(["bgzip", "-c", str(plain)], check=True, stdout=fh)
+    subprocess.run(["bcftools", "index", str(gz)], check=True)
+    return gz
+
+
+def _write_dosage_vcf_v2(d: Path) -> Path:
+    """Same GT carrier pattern as `_write_dosage_vcf` but distinct DS
+    values, so a second dosage field sourced from this file is
+    distinguishable from the first (`_EXPECTED_DOSAGES`) -- catches a
+    field-ordering/mislabel bug between two `DosageField`s.
+
+    Carrier-only decode order (see `_EXPECTED_DOSAGES` above) yields
+    `[0.3, 0.7, 1.9, 1.9]`. DS values stay in plink2's expected
+    `[0, ploidy]` dosage range (unlike raw allele counts) so plink2 accepts
+    them as valid `DS`, while still being distinct from `_EXPECTED_DOSAGES`.
+    """
+    body = (
+        "##fileformat=VCFv4.2\n"
+        "##contig=<ID=chr1,length=40>\n"
+        '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n'
+        '##FORMAT=<ID=DS,Number=1,Type=Float,Description="Dosage">\n'
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS0\tS1\n"
+        "chr1\t3\t.\tA\tG\t.\t.\t.\tGT:DS\t1|0:0.3\t0|0:0.0\n"
+        "chr1\t7\t.\tC\tCAT\t.\t.\t.\tGT:DS\t0|1:0.7\t1|1:1.9\n"
+    )
+    plain = d / "ds_v2.vcf"
+    plain.write_text(body)
+    gz = d / "ds_v2.vcf.gz"
+    with open(gz, "wb") as fh:
+        subprocess.run(["bgzip", "-c", str(plain)], check=True, stdout=fh)
+    subprocess.run(["bcftools", "index", str(gz)], check=True)
+    return gz
+
+
+_EXPECTED_DOSAGES_V2 = [0.3, 0.7, 1.9, 1.9]
+
+
 def test_from_pgen_self_dosages_round_trip(tmp_path: Path):
     ref = _write_ref(tmp_path)
     vcf = _write_dosage_vcf(tmp_path)
@@ -143,3 +197,108 @@ def test_from_pgen_no_dosages_unchanged(tmp_path: Path):
     SparseVar2.from_pgen(out, pgen, ref, threads=1)
     sv = SparseVar2(out)
     assert sv.available_fields == {}
+
+
+def test_from_pgen_dosage_non_pgen_source_raises(tmp_path: Path):
+    """A dosage `source` must be a `.pgen` path (or the literal `"self"`)."""
+    vcf = _write_dosage_vcf(tmp_path)
+    pgen = _make_pgen(tmp_path, vcf, "badext", dosage=False)
+
+    with pytest.raises(ValueError, match=r"\.pgen"):
+        SparseVar2.from_pgen(
+            tmp_path / "out.svar2",
+            pgen,
+            no_reference=True,
+            dosages=[DosageField(name="x", source="something.txt")],
+            threads=1,
+        )
+
+
+def test_from_pgen_dosage_duplicate_name_raises(tmp_path: Path):
+    vcf = _write_dosage_vcf(tmp_path)
+    pgen = _make_pgen(tmp_path, vcf, "dup", dosage=False)
+
+    with pytest.raises(ValueError, match="duplicate"):
+        SparseVar2.from_pgen(
+            tmp_path / "out.svar2",
+            pgen,
+            no_reference=True,
+            dosages=[
+                DosageField(name="DS", source="self"),
+                DosageField(name="DS", source="self"),
+            ],
+            threads=1,
+        )
+
+
+def test_from_pgen_dosage_reserved_mutcat_name_raises(tmp_path: Path):
+    vcf = _write_dosage_vcf(tmp_path)
+    pgen = _make_pgen(tmp_path, vcf, "mutcat_reserved", dosage=False)
+
+    with pytest.raises(ValueError, match="mutcat"):
+        SparseVar2.from_pgen(
+            tmp_path / "out.svar2",
+            pgen,
+            no_reference=True,
+            dosages=[DosageField(name="mutcat", source="self")],
+            threads=1,
+        )
+
+
+def test_from_pgen_dosage_variant_count_mismatch_raises(tmp_path: Path):
+    """A separate dosage `.pgen` whose `.pvar` has a different variant count
+    than `source`'s cannot align 1:1.
+    """
+    vcf = _write_dosage_vcf(tmp_path)
+    hardcall_pgen = _make_pgen(tmp_path, vcf, "hard_count", dosage=False)
+
+    single_vcf = _write_single_variant_dosage_vcf(tmp_path)
+    mismatched_count_pgen = _make_pgen(
+        tmp_path, single_vcf, "mismatch_count_ds", dosage=True
+    )
+
+    with pytest.raises(ValueError, match="1:1"):
+        SparseVar2.from_pgen(
+            tmp_path / "out.svar2",
+            hardcall_pgen,
+            no_reference=True,
+            dosages=[DosageField(name="VAF", source=mismatched_count_pgen)],
+            threads=1,
+        )
+
+
+def test_from_pgen_multi_dosage_fields_ordering(tmp_path: Path):
+    """Two `DosageField`s -- one `source="self"`, one a separate `.pgen` --
+    must each decode to THEIR OWN values, not get rotated/swapped.
+    """
+    ref = _write_ref(tmp_path)
+    vcf = _write_dosage_vcf(tmp_path)
+    vcf_v2 = _write_dosage_vcf_v2(tmp_path)
+
+    # `source="self"` needs the hardcall file to itself carry a dosage track.
+    hardcall_pgen = _make_pgen(tmp_path, vcf, "multi_self", dosage=True)
+    dose2_pgen = _make_pgen(tmp_path, vcf_v2, "multi_dose2", dosage=True)
+
+    out = tmp_path / "out.svar2"
+    SparseVar2.from_pgen(
+        out,
+        hardcall_pgen,
+        ref,
+        dosages=[
+            DosageField(name="DS", source="self"),
+            DosageField(name="DS2", source=dose2_pgen),
+        ],
+        threads=1,
+    )
+    sv = SparseVar2(out, fields=["DS", "DS2"])
+    assert set(sv.available_fields) == {"DS", "DS2"}
+
+    rag = sv.decode("chr1", [(0, 40)])
+    ds = np.asarray(rag["DS"].data)
+    ds2 = np.asarray(rag["DS2"].data)
+    np.testing.assert_allclose(ds, _EXPECTED_DOSAGES, rtol=1e-5)
+    # PGEN's fixed-point dosage encoding (~1/32768 precision) needs a looser
+    # tolerance for these small fractional values than the integral dosages
+    # above.
+    np.testing.assert_allclose(ds2, _EXPECTED_DOSAGES_V2, atol=1e-3)
+    assert not np.allclose(ds, ds2)
