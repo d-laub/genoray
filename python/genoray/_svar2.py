@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 
     from numpy.typing import NDArray
 
-    from genoray._svar2_fields import FormatField, InfoField
+    from genoray._svar2_fields import DosageField, FormatField, InfoField
 
 
 def _resolve_vcf_sources(sources: "str | Path | Sequence[str | Path]") -> list[Path]:
@@ -809,6 +809,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         overwrite: bool = False,
         long_allele_capacity: int = 8 * 1024 * 1024,
         signatures: bool = False,
+        dosages: "Sequence[DosageField] | None" = None,
         check_ref: Literal["e", "x"] = "e",
     ) -> int:
         """Convert a PLINK2 PGEN to an SVAR2 store.
@@ -847,12 +848,22 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         `available_samples` (and every decoded column) matches that order
         exactly, regardless of each sample's original `.psam` position.
 
+        `dosages` stores one or more ``.pgen`` dosage tracks as SVAR2 FORMAT
+        fields, in addition to (never instead of) the hardcalls read as usual.
+        Each :class:`DosageField` names its ``source``: ``"self"`` reads the
+        dosage track from `source` itself (the same file supplying hardcalls),
+        while a separate ``.pgen`` path reads dosages from that file instead
+        (e.g. a VAF/CCF track kept apart because pgenlib derives hardcalls
+        from dosage when both live in one file). A separate dosage file's
+        ``.psam`` samples must match `source`'s exactly, same names in the
+        same order, and its ``.pvar`` must align 1:1 on variant count with
+        `source`'s. Like every FORMAT field, dosages are
+        genotype-aligned: under var_key routing a non-carrier's dosage is
+        dropped from the store.
+
         Not supported (and silently ignored rather than errored, where noted):
 
-        - **Dosages.** SVAR2 stores no dosages; a ``.pgen`` dosage track is ignored
-          and hardcalls are read as usual.
-        - **INFO/FORMAT fields.** PGEN has no FORMAT; ``.pvar`` INFO extraction is
-          not implemented.
+        - **INFO fields.** ``.pvar`` INFO extraction is not implemented.
 
         Haplotype resolution for *unphased* heterozygotes follows the allele-code
         order ``pgenlib`` returns — the same caveat :meth:`from_vcf` carries for
@@ -867,6 +878,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         """
         from genoray._pgen import _read_psam
         from genoray._svar._regions import _normalize_samples
+        from genoray._svar2_fields import _dosage_field_to_tuple
 
         if regions_overlap not in {"pos", "record", "variant"}:
             raise ValueError(
@@ -923,6 +935,18 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             sample_perm = [pos_in_sorted[i] for i in sel_idx]
             subset_idx = np.asarray(sorted_idx, dtype=np.uint32)
 
+        dosage_specs = list(dosages) if dosages is not None else []
+        # Reject duplicate / reserved names up front, before any reader is
+        # opened -- mirrors the from_vcf/from_vcf_list field-spec guards.
+        seen_names: set[str] = set()
+        for df in dosage_specs:
+            if df.name == "mutcat":
+                raise ValueError("dosage field name 'mutcat' is reserved")
+            if df.name in seen_names:
+                raise ValueError(f"duplicate dosage field name {df.name!r}")
+            seen_names.add(df.name)
+        dosage_field_tuples = [_dosage_field_to_tuple(df) for df in dosage_specs]
+
         contigs, ranges, allele_idx_offsets = _pvar_contig_ranges(pvar)
         if not contigs:
             raise ValueError(f"No variants found in {pvar}.")
@@ -946,7 +970,9 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
 
         if chunk_size is None:
             # from_pgen is diploid-only (no `ploidy=` parameter).
-            chunk_size = _auto_chunk_size(len(selected_samples), 2)
+            chunk_size = _auto_chunk_size(
+                len(selected_samples), 2, n_format_fields=len(dosage_specs)
+            )
 
         import pgenlib
 
@@ -999,6 +1025,61 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
                 for r in pool:
                     r.change_sample_subset(subset_idx)
 
+        # One dosage reader per (contig, shard, dosage_field), parallel to
+        # `readers` ([contig][shard]) with an extra per-field dimension:
+        # `dosage_readers[i][s]` supplies exactly one reader per `dosage_specs`
+        # entry, in spec order.
+        dosage_readers: list[list[list[object]]] = []
+        for _contig in contigs:
+            per_contig: list[list[object]] = []
+            for _shard in range(P):
+                per_shard: list[object] = []
+                for df in dosage_specs:
+                    if df.source == "self":
+                        dpath = source
+                        d_offsets = allele_idx_offsets
+                    else:
+                        dpath = Path(df.source)
+                        if dpath.suffix != ".pgen":
+                            raise ValueError(
+                                f"dosage source for {df.name!r} must be a .pgen, "
+                                f"got {dpath}"
+                            )
+                        if not dpath.exists():
+                            raise FileNotFoundError(dpath)
+                        # Separate dosage file: samples must match `source`'s
+                        # .psam exactly, and variant count must align 1:1 with
+                        # `source`'s .pvar.
+                        dose_psam = dpath.with_suffix(".psam")
+                        if not dose_psam.exists():
+                            raise FileNotFoundError(dose_psam)
+                        dose_samples = _read_psam(dose_psam).tolist()
+                        if dose_samples != all_psam_samples:
+                            raise ValueError(
+                                f"dosage file {dpath} samples do not match "
+                                f"{source} .psam"
+                            )
+                        _dc, _dr, d_offsets = _pvar_contig_ranges(_find_pvar(dpath))
+                        # 1:1 variant alignment: offset arrays are length
+                        # n_variants + 1.
+                        if len(d_offsets) != len(allele_idx_offsets):
+                            raise ValueError(
+                                f"dosage file {dpath} has "
+                                f"{len(d_offsets) - 1} variants; {source} has "
+                                f"{len(allele_idx_offsets) - 1} variants -- "
+                                ".pvar must align 1:1"
+                            )
+                        # (position/allele identity beyond count is a caller
+                        # precondition, not checked here.)
+                    r = pgenlib.PgenReader(
+                        bytes(dpath), n_samples, allele_idx_offsets=d_offsets
+                    )
+                    if subset_idx is not None:
+                        r.change_sample_subset(subset_idx)
+                    per_shard.append(r)
+                per_contig.append(per_shard)
+            dosage_readers.append(per_contig)
+
         _validate_check_ref(check_ref)
         return _core.run_pgen_conversion_pipeline(
             str(source),
@@ -1013,7 +1094,9 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             long_allele_capacity,
             skip_out_of_scope,
             signatures,
+            dosage_field_tuples,
             readers,
+            dosage_readers,
             check_ref,
             region_ranges,
             regions_overlap,

@@ -37,18 +37,15 @@ pub struct PgenRecordSource {
     /// pgenlib's `-9` missing sentinel is already normalized to `-1` here.
     host_buf: Vec<i32>,
     /// One `pgenlib.PgenReader` per dosage `FieldSpec`, in field order --
-    /// empty when no dosage fields were requested. Not yet read from (see
-    /// module doc); Task 3 fills in `refill`/`next_record` support.
-    #[allow(dead_code)]
+    /// empty when no dosage fields were requested.
     dosage_readers: Vec<Py<PyAny>>,
     /// `(batch, num_samples)` f32 scratch buffer per dosage reader, mirroring
     /// `buf` above but one array per field instead of `2 * num_samples` allele
     /// columns.
-    #[allow(dead_code)]
     dosage_bufs: Vec<Py<PyArray2<f32>>>,
     /// Rust-owned mirror of `dosage_bufs`, one `Vec<f32>` per field, filled in
-    /// bulk by `refill` (Task 3) -- unused until then.
-    #[allow(dead_code)]
+    /// bulk by `refill`. pgenlib's `-9` missing dosage sentinel is normalized
+    /// to `f32::NAN` here (matches `genoray/_pgen.py::_read_dosages`).
     host_dosages: Vec<Vec<f32>>,
     batch: usize,
     /// OUTPUT sample width -- already the post-`change_sample_subset` column
@@ -161,6 +158,34 @@ impl PgenRecordSource {
             // pgenlib encodes missing as -9; the conversion spine uses -1.
             self.host_buf
                 .extend(flat[..n].iter().map(|&c| if c < 0 { -1 } else { c }));
+
+            // Same GIL acquisition, same batch range: read every dosage
+            // field's `(batch, num_samples)` scratch buffer and bulk-copy it
+            // into its `host_dosages` mirror, normalizing pgenlib's `-9`
+            // missing sentinel to NaN (matches
+            // `genoray/_pgen.py::_read_dosages`, lines 773-778).
+            for i in 0..self.dosage_readers.len() {
+                self.dosage_readers[i]
+                    .bind(py)
+                    .call_method1(
+                        "read_dosages_range",
+                        (lo as u32, hi as u32, self.dosage_bufs[i].bind(py)),
+                    )
+                    .map_err(|e| {
+                        ConversionError::Input(format!(
+                            "pgenlib read_dosages_range({lo}, {hi}) failed: {e}"
+                        ))
+                    })?;
+                let darr = self.dosage_bufs[i].bind(py).readonly();
+                let dflat = darr.as_slice().expect("pgen dosage buffer is C-contiguous");
+                let dn = (hi - lo) * self.num_samples;
+                self.host_dosages[i].clear();
+                self.host_dosages[i].extend(
+                    dflat[..dn]
+                        .iter()
+                        .map(|&d| if d == -9.0 { f32::NAN } else { d }),
+                );
+            }
             Ok(())
         })?;
         self.var_next = hi;
@@ -249,14 +274,32 @@ impl RecordSource for PgenRecordSource {
                 }
             }
 
+            // Dosage FORMAT values, one entry per requested dosage field (spec
+            // order), each a per-OUTPUT-sample vector. `host_dosages[i]` is in
+            // pgenlib's subset-sorted order, exactly like `host_buf` above, so
+            // the same `sample_perm` gather reorders it into output order --
+            // mirrors `src/svar1_reader.rs`'s `format_raw` shape.
+            let dbase = row * self.num_samples;
+            let format_raw: Vec<Option<Vec<Vec<f64>>>> = (0..self.dosage_readers.len())
+                .map(|i| {
+                    let per_sample: Vec<Vec<f64>> = self
+                        .sample_perm
+                        .iter()
+                        .map(|&src_s| vec![self.host_dosages[i][dbase + src_s] as f64])
+                        .collect();
+                    Some(per_sample)
+                })
+                .collect();
+
             return Ok(Some(RawRecord {
                 pos: meta.pos,
                 reference: meta.reference,
                 alts: meta.alts,
                 calls: crate::record_source::Calls::Dense(gt),
-                // PGEN has no FORMAT, and .pvar INFO extraction is out of scope for v1.
+                // .pvar INFO extraction is out of scope for v1; FORMAT is
+                // limited to the requested dosage fields (`format_raw` above).
                 info_raw: Vec::new(),
-                format_vals: crate::record_source::FormatVals::Dense(Vec::new()),
+                format_vals: crate::record_source::FormatVals::Dense(format_raw),
             }));
         }
     }
