@@ -45,6 +45,8 @@ fn file_has_contig(path: &str, chrom: &str) -> bool {
 }
 
 fn main() {
+    genoray_core::logging::install_fmt_fallback();
+
     #[cfg(feature = "dhat-heap")]
     let _profiler = dhat::Profiler::new_heap();
 
