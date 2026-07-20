@@ -434,3 +434,23 @@ def test_sbs384_strand_correct_across_haplotype_columns(tmp_path: Path):
     # in isolation -- this alone would NOT have caught the bug.
     v96 = sv2.mutation_matrix("SBS96", count="allele")["S0"].to_numpy()
     assert np.array_equal(v384.reshape(4, 96).sum(axis=0), v96)
+
+
+def test_annotate_mutations_contigs_accepts_alias(tmp_path: Path):
+    fa = _write_parity_ref(tmp_path)  # chr1-named FASTA
+    vcf = _write_parity_vcf(tmp_path)  # chr1 VCF
+    out = tmp_path / "v2_alias.svar2"
+    SparseVar2.from_vcf(out, vcf, fa, overwrite=True, threads=1)
+    sv = SparseVar2(out)  # store contig is "chr1"
+    sv.annotate_mutations(fa, contigs=["1"])  # unprefixed alias resolves to chr1
+    assert sv._is_annotated()
+
+
+def test_annotate_mutations_contigs_all_miss_raises(tmp_path: Path):
+    fa = _write_parity_ref(tmp_path)
+    vcf = _write_parity_vcf(tmp_path)
+    out = tmp_path / "v2_miss.svar2"
+    SparseVar2.from_vcf(out, vcf, fa, overwrite=True, threads=1)
+    sv = SparseVar2(out)
+    with pytest.raises(ValueError, match="resolve to a store contig"):
+        sv.annotate_mutations(fa, contigs=["chrZ"])

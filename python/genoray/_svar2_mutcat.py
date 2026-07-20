@@ -36,6 +36,7 @@ class _MutcatMixin:
     contigs: list[str]
     available_samples: list[str]
     _readers: dict[str, Any]
+    _cnorm: ContigNormalizer  # host-provided (SparseVar2._cnorm)
 
     def annotate_mutations(
         self,
@@ -66,17 +67,22 @@ class _MutcatMixin:
         """
         if not isinstance(reference, Reference):
             reference = Reference.from_path(reference)
-        scope = (
-            self.contigs
-            if contigs is None
-            else [c for c in self.contigs if c in set(contigs)]
-        )
+        if contigs is None:
+            scope = self.contigs
+        else:
+            wanted = {n for c in contigs if (n := self._cnorm.norm(c)) is not None}
+            scope = [c for c in self.contigs if c in wanted]
+            if not scope:
+                raise ValueError(
+                    f"None of contigs={list(contigs)} resolve to a store contig; "
+                    f"available contigs: {self.contigs}"
+                )
 
         genes = None
         c_norm = None
         if gtf is not None:
             genes = load_gene_intervals(str(gtf) if isinstance(gtf, Path) else gtf)
-            c_norm = ContigNormalizer(self.contigs)
+            c_norm = self._cnorm
 
         for contig in scope:
             seq = reference.contig_array(contig).astype(np.uint8, copy=False)
