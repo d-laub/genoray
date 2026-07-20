@@ -36,3 +36,16 @@ def test_unknown_contig_raises_valueerror(svar2_store):
     sv = SparseVar2(svar2_store)
     with pytest.raises(ValueError, match="not found in store"):
         sv.decode("chrZ", [(0, 40)])
+
+
+def test_subset_contigs_accepts_unprefixed_contig(tmp_path, svar2_store):
+    sv = SparseVar2(svar2_store)  # store contig is "chr1"
+    out = tmp_path / "subset.svar2"
+    sv.subset_contigs(out, ["1"], overwrite=True)  # unprefixed alias
+    assert SparseVar2(out).contigs == ["chr1"]  # canonical store spelling preserved
+
+
+def test_subset_contigs_unknown_raises(tmp_path, svar2_store):
+    sv = SparseVar2(svar2_store)
+    with pytest.raises(ValueError, match="not found in store"):
+        sv.subset_contigs(tmp_path / "x.svar2", ["chrZ"], overwrite=True)

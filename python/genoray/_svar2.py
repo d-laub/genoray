@@ -400,12 +400,10 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         """Write a new SVAR2 store containing only `contigs` (metadata + file copy)."""
         output = Path(output)
         wanted = [contigs] if isinstance(contigs, str) else list(contigs)
-        missing = [c for c in wanted if c not in self.contigs]
-        if missing:
-            raise ValueError(f"contigs not in store: {missing}")
+        resolved = set(self._resolve_contigs(wanted))  # raises ValueError on any miss
         if output.resolve() == self.path.resolve():
             raise ValueError("cannot write a subset in place (output == source)")
-        kept = [c for c in self.contigs if c in set(wanted)]  # preserve source order
+        kept = [c for c in self.contigs if c in resolved]  # preserve source order
         meta = _load_meta(self.path)
         meta["contigs"] = kept
         _write_store(output, {c: self.path for c in kept}, meta, mode, overwrite)
