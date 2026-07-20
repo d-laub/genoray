@@ -1025,6 +1025,50 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
                 for r in pool:
                     r.change_sample_subset(subset_idx)
 
+        # Resolve each dosage field's (dpath, d_offsets) ONCE, up front -- this
+        # depends only on `df`, not on contig/shard, so doing it inside the
+        # contig/shard loop below would re-validate the `.psam` and re-parse
+        # the entire separate-file `.pvar` once per contig for no reason.
+        # Running this pre-pass unconditionally (even if `contigs` is empty)
+        # is a slight improvement: validation now always fires.
+        dosage_dpath_offsets: list[tuple[Path, object]] = []
+        for df in dosage_specs:
+            if df.source == "self":
+                dpath = source
+                d_offsets = allele_idx_offsets
+            else:
+                dpath = Path(df.source)
+                if dpath.suffix != ".pgen":
+                    raise ValueError(
+                        f"dosage source for {df.name!r} must be a .pgen, got {dpath}"
+                    )
+                if not dpath.exists():
+                    raise FileNotFoundError(dpath)
+                # Separate dosage file: samples must match `source`'s
+                # .psam exactly, and variant count must align 1:1 with
+                # `source`'s .pvar.
+                dose_psam = dpath.with_suffix(".psam")
+                if not dose_psam.exists():
+                    raise FileNotFoundError(dose_psam)
+                dose_samples = _read_psam(dose_psam).tolist()
+                if dose_samples != all_psam_samples:
+                    raise ValueError(
+                        f"dosage file {dpath} samples do not match {source} .psam"
+                    )
+                _dc, _dr, d_offsets = _pvar_contig_ranges(_find_pvar(dpath))
+                # 1:1 variant alignment: offset arrays are length
+                # n_variants + 1.
+                if len(d_offsets) != len(allele_idx_offsets):
+                    raise ValueError(
+                        f"dosage file {dpath} has "
+                        f"{len(d_offsets) - 1} variants; {source} has "
+                        f"{len(allele_idx_offsets) - 1} variants -- "
+                        ".pvar must align 1:1"
+                    )
+                # (position/allele identity beyond count is a caller
+                # precondition, not checked here.)
+            dosage_dpath_offsets.append((dpath, d_offsets))
+
         # One dosage reader per (contig, shard, dosage_field), parallel to
         # `readers` ([contig][shard]) with an extra per-field dimension:
         # `dosage_readers[i][s]` supplies exactly one reader per `dosage_specs`
@@ -1034,43 +1078,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             per_contig: list[list[object]] = []
             for _shard in range(P):
                 per_shard: list[object] = []
-                for df in dosage_specs:
-                    if df.source == "self":
-                        dpath = source
-                        d_offsets = allele_idx_offsets
-                    else:
-                        dpath = Path(df.source)
-                        if dpath.suffix != ".pgen":
-                            raise ValueError(
-                                f"dosage source for {df.name!r} must be a .pgen, "
-                                f"got {dpath}"
-                            )
-                        if not dpath.exists():
-                            raise FileNotFoundError(dpath)
-                        # Separate dosage file: samples must match `source`'s
-                        # .psam exactly, and variant count must align 1:1 with
-                        # `source`'s .pvar.
-                        dose_psam = dpath.with_suffix(".psam")
-                        if not dose_psam.exists():
-                            raise FileNotFoundError(dose_psam)
-                        dose_samples = _read_psam(dose_psam).tolist()
-                        if dose_samples != all_psam_samples:
-                            raise ValueError(
-                                f"dosage file {dpath} samples do not match "
-                                f"{source} .psam"
-                            )
-                        _dc, _dr, d_offsets = _pvar_contig_ranges(_find_pvar(dpath))
-                        # 1:1 variant alignment: offset arrays are length
-                        # n_variants + 1.
-                        if len(d_offsets) != len(allele_idx_offsets):
-                            raise ValueError(
-                                f"dosage file {dpath} has "
-                                f"{len(d_offsets) - 1} variants; {source} has "
-                                f"{len(allele_idx_offsets) - 1} variants -- "
-                                ".pvar must align 1:1"
-                            )
-                        # (position/allele identity beyond count is a caller
-                        # precondition, not checked here.)
+                for dpath, d_offsets in dosage_dpath_offsets:
                     r = pgenlib.PgenReader(
                         bytes(dpath), n_samples, allele_idx_offsets=d_offsets
                     )
