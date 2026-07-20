@@ -2,6 +2,7 @@ use crate::error::ConversionError;
 use crate::field::{FieldCategory, FieldSpec, HtslibType};
 use crate::record_source::{RawRecord, RecordSource};
 use crate::svar2_view::{self, OverlapMode};
+use rust_htslib::bcf::header::HeaderView;
 use rust_htslib::bcf::record::Record;
 use rust_htslib::bcf::{IndexedReader, Read};
 use rust_htslib::errors::Error as HtslibError;
@@ -267,7 +268,121 @@ fn fetch_region(
         })
 }
 
+/// Everything `new` and `with_sample_indices` must do exactly once, before
+/// either diverges on how it resolves `sample_indices`: open the file, spin
+/// up HTSlib threads, resolve the header/rid, coalesce+fetch the first
+/// region, and allocate the empty record buffer. Opening happens exactly
+/// once here — callers must not call this more than once per constructor.
+struct OpenedVcf {
+    reader: IndexedReader,
+    header: HeaderView,
+    rid: u32,
+    regions: Vec<(u32, u32)>,
+    fetch_regions: Vec<(u32, u32)>,
+    overlap: OverlapMode,
+    record: Record,
+}
+
+fn open_vcf(
+    vcf_path: &str,
+    chrom: &str,
+    htslib_threads: usize,
+    regions: Vec<(u32, u32)>,
+    overlap: OverlapMode,
+) -> Result<OpenedVcf, ConversionError> {
+    // A wrong VCF path reaches Rust when the file was removed after Python's
+    // upstream indexing/open; surface it as FileNotFoundError, not a ".tbi?" Input.
+    if !std::path::Path::new(vcf_path).exists() {
+        return Err(ConversionError::MissingFile {
+            path: vcf_path.to_string(),
+        });
+    }
+
+    let mut reader = IndexedReader::from_path(vcf_path).map_err(|e| {
+        ConversionError::Input(format!(
+            "Failed to open VCF/BCF index for '{vcf_path}' \
+             (is there a .tbi or .csi file?): {e}"
+        ))
+    })?;
+
+    // rust-htslib asserts n_threads > 0, so 0 must skip the call entirely rather
+    // than pass through. 0 => htslib decompresses inline on the reading thread.
+    if htslib_threads > 0 {
+        reader
+            .set_threads(htslib_threads)
+            .map_err(|e| ConversionError::Io {
+                context: format!("allocating {htslib_threads} HTSlib background threads"),
+                source: std::io::Error::other(e.to_string()),
+            })?;
+    }
+
+    let header = reader.header().clone();
+
+    let rid =
+        header
+            .name2rid(chrom.as_bytes())
+            .map_err(|_| ConversionError::ContigNotInHeader {
+                chrom: chrom.to_string(),
+            })?;
+
+    // Coalesce the ORIGINAL regions first — this canonical list stays in
+    // `self.regions` and is what the per-record overlap predicate tests.
+    // The fetch bounds are `query_window`-widened per mode (a 1:1 map that
+    // preserves length + order), kept parallel by `current_region`; do NOT
+    // re-coalesce them or the index correspondence breaks.
+    let regions = coalesce_fetch_regions(regions, chrom)?;
+    let fetch_regions = svar2_view::query_window(&regions, overlap);
+    fetch_region(&mut reader, rid, chrom, fetch_regions.first().copied())?;
+
+    let record = reader.empty_record();
+
+    Ok(OpenedVcf {
+        reader,
+        header,
+        rid,
+        regions,
+        fetch_regions,
+        overlap,
+        record,
+    })
+}
+
 impl VcfRecordSource {
+    /// Resolves each of `samples` to its header-column index in `vcf_path`,
+    /// the SAME lookup `new` performs internally (and the same
+    /// `ConversionError::Input` on an unknown name). Opens the VCF/BCF for
+    /// this lookup only — callers that plan to construct a `VcfRecordSource`
+    /// for the same `vcf_path` right after should prefer resolving indices
+    /// once (e.g. per-VCF, not per-window) and passing them to
+    /// `with_sample_indices`, which skips this O(k requested × n header
+    /// samples) walk entirely.
+    pub fn resolve_sample_indices(
+        vcf_path: &str,
+        samples: &[&str],
+    ) -> Result<Vec<usize>, ConversionError> {
+        if !std::path::Path::new(vcf_path).exists() {
+            return Err(ConversionError::MissingFile {
+                path: vcf_path.to_string(),
+            });
+        }
+        let reader = IndexedReader::from_path(vcf_path).map_err(|e| {
+            ConversionError::Input(format!(
+                "Failed to open VCF/BCF index for '{vcf_path}' \
+                 (is there a .tbi or .csi file?): {e}"
+            ))
+        })?;
+        let header = reader.header();
+
+        samples
+            .iter()
+            .map(|name| {
+                header.sample_id(name.as_bytes()).ok_or_else(|| {
+                    ConversionError::Input(format!("Sample '{name}' not found in VCF"))
+                })
+            })
+            .collect()
+    }
+
     // opens the file, applies the sample filter at the C-level, and jumps to the chromosome.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -280,61 +395,62 @@ impl VcfRecordSource {
         regions: Vec<(u32, u32)>,
         overlap: OverlapMode,
     ) -> Result<Self, ConversionError> {
-        // A wrong VCF path reaches Rust when the file was removed after Python's
-        // upstream indexing/open; surface it as FileNotFoundError, not a ".tbi?" Input.
-        if !std::path::Path::new(vcf_path).exists() {
-            return Err(ConversionError::MissingFile {
-                path: vcf_path.to_string(),
-            });
-        }
-
-        let mut reader = IndexedReader::from_path(vcf_path).map_err(|e| {
-            ConversionError::Input(format!(
-                "Failed to open VCF/BCF index for '{vcf_path}' \
-                 (is there a .tbi or .csi file?): {e}"
-            ))
-        })?;
-
-        // rust-htslib asserts n_threads > 0, so 0 must skip the call entirely rather
-        // than pass through. 0 => htslib decompresses inline on the reading thread.
-        if htslib_threads > 0 {
-            reader
-                .set_threads(htslib_threads)
-                .map_err(|e| ConversionError::Io {
-                    context: format!("allocating {htslib_threads} HTSlib background threads"),
-                    source: std::io::Error::other(e.to_string()),
-                })?;
-        }
-
-        let header = reader.header().clone();
-
-        let rid =
-            header
-                .name2rid(chrom.as_bytes())
-                .map_err(|_| ConversionError::ContigNotInHeader {
-                    chrom: chrom.to_string(),
-                })?;
-
-        // Coalesce the ORIGINAL regions first — this canonical list stays in
-        // `self.regions` and is what the per-record overlap predicate tests.
-        // The fetch bounds are `query_window`-widened per mode (a 1:1 map that
-        // preserves length + order), kept parallel by `current_region`; do NOT
-        // re-coalesce them or the index correspondence breaks.
-        let regions = coalesce_fetch_regions(regions, chrom)?;
-        let fetch_regions = svar2_view::query_window(&regions, overlap);
-        fetch_region(&mut reader, rid, chrom, fetch_regions.first().copied())?;
+        let opened = open_vcf(vcf_path, chrom, htslib_threads, regions, overlap)?;
 
         let sample_indices: Vec<usize> = samples
             .iter()
             .map(|name| {
-                header.sample_id(name.as_bytes()).ok_or_else(|| {
+                opened.header.sample_id(name.as_bytes()).ok_or_else(|| {
                     ConversionError::Input(format!("Sample '{name}' not found in VCF"))
                 })
             })
             .collect::<Result<_, _>>()?;
+        let num_samples = samples.len();
 
-        let record = reader.empty_record();
+        Self::from_opened(opened, chrom, ploidy, sample_indices, num_samples, fields)
+    }
 
+    /// Same as `new`, but takes header-column `sample_indices` already
+    /// resolved (via `resolve_sample_indices`) instead of re-deriving them
+    /// from `samples` names on every call. Skips the `header.sample_id`
+    /// lookup entirely — this is the whole point: a caller that constructs
+    /// many `VcfRecordSource`s for the same cohort (e.g. one per streaming
+    /// window) resolves indices once and reuses them here.
+    ///
+    /// Trusts the caller: `sample_indices` must be valid header-column
+    /// indices for `vcf_path` (i.e. resolved via `resolve_sample_indices` on
+    /// this SAME file). Passing indices resolved against a different VCF, or
+    /// out-of-range indices, is undefined as far as this API's contract goes
+    /// — HTSlib will surface out-of-bounds access as a decode error, not a
+    /// clean `ConversionError`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_sample_indices(
+        vcf_path: &str,
+        chrom: &str,
+        sample_indices: Vec<usize>,
+        htslib_threads: usize,
+        ploidy: usize,
+        fields: &[FieldSpec],
+        regions: Vec<(u32, u32)>,
+        overlap: OverlapMode,
+    ) -> Result<Self, ConversionError> {
+        let opened = open_vcf(vcf_path, chrom, htslib_threads, regions, overlap)?;
+        let num_samples = sample_indices.len();
+
+        Self::from_opened(opened, chrom, ploidy, sample_indices, num_samples, fields)
+    }
+
+    /// Shared tail of `new`/`with_sample_indices`: split `fields` into
+    /// INFO/FORMAT and assemble `Self` from an already-`open_vcf`'d reader
+    /// plus the resolved `sample_indices`.
+    fn from_opened(
+        opened: OpenedVcf,
+        chrom: &str,
+        ploidy: usize,
+        sample_indices: Vec<usize>,
+        num_samples: usize,
+        fields: &[FieldSpec],
+    ) -> Result<Self, ConversionError> {
         let info_fields: Vec<FieldSpec> = fields
             .iter()
             .filter(|f| f.category == FieldCategory::Info)
@@ -347,19 +463,19 @@ impl VcfRecordSource {
             .collect();
 
         Ok(Self {
-            inner_reader: reader,
+            inner_reader: opened.reader,
             chrom: chrom.to_string(),
-            rid,
-            regions,
-            fetch_regions,
-            overlap,
+            rid: opened.rid,
+            regions: opened.regions,
+            fetch_regions: opened.fetch_regions,
+            overlap: opened.overlap,
             current_region: 0,
-            num_samples: samples.len(),
+            num_samples,
             ploidy,
             sample_indices,
             info_fields,
             format_fields,
-            record,
+            record: opened.record,
             eof: false,
         })
     }
@@ -560,6 +676,144 @@ mod tests {
         rust_htslib::bcf::index::build(&path, None, 0, rust_htslib::bcf::index::Type::Csi(14))
             .expect("build BCF index");
         path.to_str().expect("utf8 path").to_string()
+    }
+
+    // Multi-sample, CSI-indexed BCF fixture: `records` are (0-based pos, REF,
+    // ALT, per-sample GT strings, ordered/parallel to `samples`). Lets the
+    // `with_sample_indices` equivalence test request a REORDERED SUBSET of
+    // the header's samples, the case `sample_indices` exists to speed up.
+    fn write_multi_sample_vcf(
+        dir: &std::path::Path,
+        samples: &[&str],
+        records: &[(u32, &str, &str, &[&str])],
+    ) -> String {
+        let path = dir.join("multi_sample.bcf");
+        let mut header = Header::new();
+        header.push_record(b"##contig=<ID=1,length=1000>");
+        header.push_record(b"##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">");
+        for s in samples {
+            header.push_sample(s.as_bytes());
+        }
+        {
+            let mut writer =
+                Writer::from_path(&path, &header, false, Format::Bcf).expect("open BCF writer");
+            for &(pos, r, a, gts) in records {
+                assert_eq!(gts.len(), samples.len(), "one GT string per sample");
+                let mut record = writer.empty_record();
+                record.set_rid(Some(0));
+                record.set_pos(pos as i64);
+                record
+                    .set_alleles(&[r.as_bytes(), a.as_bytes()])
+                    .expect("set alleles");
+                let alleles: Vec<GenotypeAllele> = gts
+                    .iter()
+                    .flat_map(|gt| gt.split(['/', '|']))
+                    .map(|tok| {
+                        if tok == "." {
+                            GenotypeAllele::PhasedMissing
+                        } else {
+                            GenotypeAllele::Phased(tok.parse().expect("genotype allele index"))
+                        }
+                    })
+                    .collect();
+                record.push_genotypes(&alleles).expect("push genotypes");
+                writer.write(&record).expect("write record");
+            }
+        }
+        rust_htslib::bcf::index::build(&path, None, 0, rust_htslib::bcf::index::Type::Csi(14))
+            .expect("build BCF index");
+        path.to_str().expect("utf8 path").to_string()
+    }
+
+    // Drains a `VcfRecordSource` fully, using `Debug` on `RawRecord` fields
+    // as the comparison surface (`RawRecord` derives `PartialEq`).
+    fn drain(mut src: VcfRecordSource) -> Vec<RawRecord> {
+        let mut out = Vec::new();
+        while let Some(rec) = src.next_record().expect("next_record") {
+            out.push(rec);
+        }
+        out
+    }
+
+    #[test]
+    fn with_sample_indices_matches_new_byte_identically() {
+        let dir = tempfile::tempdir().unwrap();
+        let samples = ["sB", "sA", "sC", "sD"];
+        let path = write_multi_sample_vcf(
+            dir.path(),
+            &samples,
+            &[
+                (100u32, "A", "T", &["1/1", "0/1", "0/0", "1/0"]),
+                (205u32, "G", "GA", &["0/1", "1/1", "1/0", "0/0"]),
+                (400u32, "C", "A", &["0/0", "0/0", "1/1", "0/1"]),
+            ],
+        );
+
+        // A reordered, non-trivial SUBSET of the header's samples — exactly
+        // the shape a downstream per-window caller re-requests every time.
+        let requested = ["sC", "sB", "sD"];
+
+        let via_new = VcfRecordSource::new(
+            &path,
+            "1",
+            &requested,
+            0,
+            2,
+            &[],
+            Vec::new(),
+            crate::svar2_view::OverlapMode::Pos,
+        )
+        .expect("VcfRecordSource::new");
+
+        let resolved =
+            VcfRecordSource::resolve_sample_indices(&path, &requested).expect("resolve indices");
+        // `sample_indices` are the requested samples' HEADER-column positions
+        // (0-based, in header push order sB=0,sA=1,sC=2,sD=3), NOT the
+        // requested order -- proof this is a real lookup, not an identity passthrough.
+        assert_eq!(resolved, vec![2, 0, 3]);
+
+        let via_precomputed = VcfRecordSource::with_sample_indices(
+            &path,
+            "1",
+            resolved,
+            0,
+            2,
+            &[],
+            Vec::new(),
+            crate::svar2_view::OverlapMode::Pos,
+        )
+        .expect("VcfRecordSource::with_sample_indices");
+
+        let records_new = drain(via_new);
+        let records_precomputed = drain(via_precomputed);
+        assert_eq!(
+            records_new, records_precomputed,
+            "with_sample_indices must produce byte-identical records to new"
+        );
+        assert_eq!(records_new.len(), 3, "sanity: all 3 records were kept");
+    }
+
+    #[test]
+    fn resolve_sample_indices_errors_identically_to_new_on_unknown_sample() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_one_sample_vcf(dir.path(), "s0", &[(100u32, "A", "T", "1/1")]);
+
+        let new_err = VcfRecordSource::new(
+            &path,
+            "1",
+            &["nope"],
+            0,
+            2,
+            &[],
+            Vec::new(),
+            crate::svar2_view::OverlapMode::Pos,
+        )
+        .map(|_| ()) // VcfRecordSource has no Debug impl; expect_err needs Ok: Debug.
+        .expect_err("new must reject an unknown sample name");
+        let resolve_err = VcfRecordSource::resolve_sample_indices(&path, &["nope"])
+            .expect_err("resolve_sample_indices must reject an unknown sample name");
+
+        assert_eq!(format!("{new_err}"), format!("{resolve_err}"));
     }
 
     #[test]
