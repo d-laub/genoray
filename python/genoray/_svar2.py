@@ -349,6 +349,33 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             for contig in self.contigs
         }
 
+        from genoray._contigs import ContigNormalizer
+
+        self._cnorm = ContigNormalizer(self.contigs)
+
+    def _resolve_contig(self, contig: str) -> str:
+        """Resolve a caller-supplied contig name to the store's own spelling.
+
+        Handles ``chr``-prefix and mito-alias differences via the store's
+        :class:`~genoray._contigs.ContigNormalizer` (e.g. ``"1"`` -> ``"chr1"``).
+        Raises ``ValueError`` if no store contig is equivalent.
+        """
+        norm = self._cnorm.norm(contig)
+        if norm is None:
+            raise ValueError(
+                f"Contig {contig!r} not found in store; available contigs: {self.contigs}"
+            )
+        return norm
+
+    def _resolve_contigs(self, contigs: "Sequence[str]") -> list[str]:
+        """Resolve each contig via :meth:`_resolve_contig`, preserving order."""
+        return [self._resolve_contig(c) for c in contigs]
+
+    # pyrefly: ignore [missing-override-decorator]
+    def _reader(self, contig: str) -> "_core.PyContigReader":
+        """The per-contig Rust reader for ``contig``, resolving naming schemes."""
+        return self._readers[self._resolve_contig(contig)]
+
     @property
     def n_samples(self) -> int:
         return len(self.available_samples)

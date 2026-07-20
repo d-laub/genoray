@@ -9,6 +9,8 @@ if TYPE_CHECKING:
     import numpy as np
     from seqpro.rag import Ragged
 
+    from genoray import _core
+
 
 class _DecodeMixin:
     """Decoded-record and decode-free-count query methods."""
@@ -20,6 +22,9 @@ class _DecodeMixin:
     _readers: dict[str, Any]
     _fields: list[Any]
     path: Any
+
+    def _reader(self, contig: str) -> "_core.PyContigReader":  # host-provided
+        ...
 
     def decode(self, contig: str, regions: Iterable[tuple[int, int]]) -> "Ragged":
         """Materialize overlapping variants for ``contig`` into a record ``Ragged``.
@@ -40,7 +45,7 @@ class _DecodeMixin:
         from genoray._svar2_fields import _META_DTYPE
 
         reg = [(int(s), int(e)) for s, e in regions]
-        reader = self._readers[contig]
+        reader = self._reader(contig)
         if not self._fields:
             d = reader.decode_batch(reg)
         else:
@@ -86,6 +91,6 @@ class _DecodeMixin:
         The simplified ``SparseVar.var_ranges`` replacement.
         """
         reg = [(int(s), int(e)) for s, e in regions]
-        flat = self._readers[contig].region_counts(reg)
+        flat = self._reader(contig).region_counts(reg)
         # n_samples/ploidy are @property on the SparseVar2 host (see note above).
         return flat.reshape(len(reg), self.n_samples, self.ploidy)  # type: ignore[missing-attribute]
