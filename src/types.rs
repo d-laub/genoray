@@ -139,6 +139,7 @@ pub struct DenseChunk {
 
     // Variant Metadata
     pub pos: Vec<u32>,
+    pub global_idx: Vec<i32>,
     // pub refe: Vec<u8>,
     // pub ref_offsets: Vec<I>,
     pub ilens: Vec<i32>, // Pre-calculated (ALT len - REF len)

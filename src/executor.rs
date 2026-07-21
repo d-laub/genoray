@@ -93,6 +93,7 @@ mod tests {
         DenseChunk {
             chunk_id: 0,
             pos: vec![100],
+            global_idx: vec![-1],
             ilens: vec![0],
             alt: b"C".to_vec(),
             alt_offsets: vec![0, 1],

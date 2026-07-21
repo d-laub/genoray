@@ -773,10 +773,12 @@ mod tests {
         }
 
         let pos: Vec<u32> = (0..n_variants as u32).map(|i| 100 + i * 10).collect();
+        let global_idx: Vec<i32> = vec![-1; n_variants];
 
         DenseChunk {
             chunk_id: 0,
             pos,
+            global_idx,
             ilens,
             alt: alt_buf,
             alt_offsets,

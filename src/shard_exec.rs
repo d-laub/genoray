@@ -96,6 +96,11 @@ impl ReorderBuffer {
 }
 
 /// One worker's report to the collector.
+// `DenseChunk` legitimately outgrew clippy's large-enum-variant threshold when
+// `global_idx: Vec<i32>` was added alongside `pos`/`ilens`/`alt_offsets`; every
+// worker already streams one owned `DenseChunk` per message on this channel,
+// so boxing it here would just move the allocation rather than avoid one.
+#[allow(clippy::large_enum_variant)]
 enum Msg {
     Chunk {
         unit_ordinal: usize,
