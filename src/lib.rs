@@ -200,14 +200,14 @@ fn run_conversion_pipeline(
             // Step 1 -> HW discovery/override and budgeting
             let available_cores = match max_threads {
                 Some(t) if t > 0 => {
-                    println!("Notice: Using user-provided thread limit: {}", t);
+                    tracing::info!(threads = t, "using user-provided thread limit");
                     t
                 }
                 _ => {
                     let detected = std::thread::available_parallelism().unwrap().get();
-                    println!(
-                        "Notice: No thread limit provided. Hardware Detected: {} cores.",
-                        detected
+                    tracing::info!(
+                        cores = detected,
+                        "no thread limit provided; hardware detected"
                     );
                     detected
                 }
@@ -220,11 +220,13 @@ fn run_conversion_pipeline(
 
             let total_active =
                 concurrent_chroms * (crate::budget::PIPELINE_THREADS_PER_CHROM + htslib_threads);
-            println!("Using: {} cores.", available_cores);
-            println!(
-                "Pipeline Config: {} concurrent chromosomes | {} HTSlib decompression threads each \
-             ({} pipeline/BGZF threads, {} reader-side processing/shard threads).",
-                concurrent_chroms, htslib_threads, total_active, processing_threads,
+            tracing::info!(cores = available_cores, "using cores");
+            tracing::info!(
+                concurrent_chroms,
+                htslib_threads,
+                total_active,
+                processing_threads,
+                "pipeline config"
             );
 
             // Step 2 -> Rayon Pool
@@ -244,7 +246,7 @@ fn run_conversion_pipeline(
                 chroms
                     .par_iter()
                     .map(|chrom| {
-                        println!("==> Processing {}", chrom);
+                        tracing::info!(chrom = %chrom, "processing contig");
                         orchestrator::process_chromosome(
                             orchestrator::SourceSpec::Vcf {
                                 vcf_path: vcf_path.clone(),
@@ -418,9 +420,10 @@ fn run_pgen_conversion_pipeline(
             let plan = crate::budget::plan_thread_budget(available_cores, jobs.len());
             let concurrent_chroms = plan.concurrent_chroms;
             let processing_threads = plan.processing_threads;
-            println!(
-                "Pipeline Config (PGEN): {} concurrent chromosomes | {} processing threads each.",
-                concurrent_chroms, processing_threads
+            tracing::info!(
+                concurrent_chroms,
+                processing_threads,
+                "pipeline config (PGEN)"
             );
 
             let pool = rayon::ThreadPoolBuilder::new()
@@ -1098,9 +1101,10 @@ fn run_svar1_conversion_pipeline(
             let plan = crate::budget::plan_thread_budget(available_cores, jobs.len());
             let concurrent_chroms = plan.concurrent_chroms;
             let processing_threads = plan.processing_threads;
-            println!(
-                "Pipeline Config (SVAR1): {} concurrent chromosomes | {} processing threads each.",
-                concurrent_chroms, processing_threads
+            tracing::info!(
+                concurrent_chroms,
+                processing_threads,
+                "pipeline config (SVAR1)"
             );
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(concurrent_chroms)
