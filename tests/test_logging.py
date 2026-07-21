@@ -105,3 +105,114 @@ def test_from_vcf_emits_summary(tmp_path, capsys):
     SparseVar2.from_vcf(out, src, ref, progress=False, log_level="info")
     captured = capsys.readouterr()
     assert "done" in captured.out.lower()
+
+
+def test_from_pgen_emits_summary(tmp_path, capsys):
+    gz, ref = _tiny_vcf(tmp_path)
+    pgen = tmp_path / "in.pgen"
+    subprocess.run(
+        [
+            "plink2",
+            "--make-pgen",
+            "--output-chr",
+            "chrM",
+            "--vcf",
+            str(gz),
+            "--out",
+            str(tmp_path / "in"),
+        ],
+        check=True,
+    )
+
+    out_info = tmp_path / "out_info.svar2"
+    ret_info = SparseVar2.from_pgen(
+        out_info, pgen, ref, progress=False, log_level="info"
+    )
+    captured = capsys.readouterr()
+    assert "done" in captured.out.lower()
+
+    out_off = tmp_path / "out_off.svar2"
+    ret_off = SparseVar2.from_pgen(out_off, pgen, ref, progress=False, log_level="off")
+
+    assert ret_info == ret_off
+    a = SparseVar2(out_info)
+    b = SparseVar2(out_off)
+    assert a.available_samples == b.available_samples
+    counts_a = a.region_counts("chr1", [(0, 40)])
+    counts_b = b.region_counts("chr1", [(0, 40)])
+    assert counts_a.tolist() == counts_b.tolist()
+
+
+def test_from_vcf_list_emits_summary(tmp_path, capsys):
+    ref_seq = "ACAGTACATGGGTACTAGCTAGGCTAACCGGTTAACCGGT"
+    ref = tmp_path / "ref.fa"
+    ref.write_text(f">chr1\n{ref_seq}\n")
+    subprocess.run(["samtools", "faidx", str(ref)], check=True)
+
+    def _ss(name: str, sample: str, rows: str) -> Path:
+        header = (
+            "##fileformat=VCFv4.2\n"
+            "##contig=<ID=chr1,length=40>\n"
+            '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n'
+            f"#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t{sample}\n"
+        )
+        plain = tmp_path / f"{name}.vcf"
+        plain.write_text(header + rows)
+        gz = tmp_path / f"{name}.vcf.gz"
+        with open(gz, "wb") as fh:
+            subprocess.run(["bgzip", "-c", str(plain)], check=True, stdout=fh)
+        subprocess.run(["bcftools", "index", str(gz)], check=True)
+        return gz
+
+    a = _ss("a", "SA", "chr1\t3\t.\tA\tG\t.\t.\t.\tGT\t1|0\n")
+    b = _ss("b", "SB", "chr1\t7\t.\tC\tCAT\t.\t.\t.\tGT\t0|1\n")
+
+    out_info = tmp_path / "out_info"
+    dropped_info = SparseVar2.from_vcf_list(
+        out_info, [a, b], ref, threads=1, progress=False, log_level="info"
+    )
+    captured = capsys.readouterr()
+    assert "done" in captured.out.lower()
+
+    out_off = tmp_path / "out_off"
+    dropped_off = SparseVar2.from_vcf_list(
+        out_off, [a, b], ref, threads=1, progress=False, log_level="off"
+    )
+
+    assert dropped_info == dropped_off == 0
+    sv_info = SparseVar2(out_info)
+    sv_off = SparseVar2(out_off)
+    assert sv_info.available_samples == sv_off.available_samples
+    counts_info = sv_info.region_counts("chr1", [(0, 40)])
+    counts_off = sv_off.region_counts("chr1", [(0, 40)])
+    assert counts_info.tolist() == counts_off.tolist()
+
+
+def test_from_svar1_emits_summary(tmp_path, capsys):
+    from genoray import SparseVar
+    from genoray import VCF as _V1VCF
+
+    src, ref = _tiny_vcf(tmp_path)
+    v1_out = tmp_path / "in.svar"
+    v1 = _V1VCF(str(src))
+    SparseVar.from_vcf(v1_out, v1, max_mem="10m", overwrite=True)
+
+    out_info = tmp_path / "out_info.svar2"
+    dropped_info = SparseVar2.from_svar1(
+        out_info, v1_out, ref, threads=1, progress=False, log_level="info"
+    )
+    captured = capsys.readouterr()
+    assert "done" in captured.out.lower()
+
+    out_off = tmp_path / "out_off.svar2"
+    dropped_off = SparseVar2.from_svar1(
+        out_off, v1_out, ref, threads=1, progress=False, log_level="off"
+    )
+
+    assert dropped_info == dropped_off == 0
+    sv_info = SparseVar2(out_info)
+    sv_off = SparseVar2(out_off)
+    assert sv_info.available_samples == sv_off.available_samples
+    counts_info = sv_info.region_counts("chr1", [(0, 40)])
+    counts_off = sv_off.region_counts("chr1", [(0, 40)])
+    assert counts_info.tolist() == counts_off.tolist()
