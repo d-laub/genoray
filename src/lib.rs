@@ -103,6 +103,12 @@ pub mod streams;
 pub mod svar2_slice;
 #[cfg(feature = "conversion")]
 pub mod svar2_view;
+// `trace` (GENORAY_TRACE heartbeats, #135 diagnosis) is used only by the
+// conversion-side pipeline modules (shard_exec/executor/orchestrator/monitor),
+// so it's gated the same way; private like `enum_map` -- reachable crate-wide
+// as `crate::trace::...` without needing `pub`.
+#[cfg(feature = "conversion")]
+mod trace;
 pub mod types;
 #[cfg(feature = "conversion")]
 pub mod vcf_list_reader;
