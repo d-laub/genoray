@@ -62,7 +62,10 @@ pub fn run_compute_engine(
         kept_total += n;
     }
 
-    println!("Executor: VCF fully processed. Flushing remaining long alleles...");
+    tracing::debug!(
+        chrom = %chrom,
+        "Executor: VCF fully processed. Flushing remaining long alleles..."
+    );
     let long_allele_offsets: Vec<u64> = bank.finalize();
 
     Phase1Output {

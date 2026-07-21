@@ -550,10 +550,16 @@ impl ChunkAssembler {
                 if source_record_owned {
                     self.ref_excluded += 1;
                     if self.ref_excluded == 1 {
-                        println!(
-                            "Notice: check_ref=x excluding record(s) whose REF disagrees \
-                             with the reference (first: {detail}); further exclusions on \
-                             this contig are counted, not printed."
+                        // Duplicates `report_ref_excluded`'s per-contig info summary
+                        // (chrom + total count) by design: this adds the specific
+                        // first-offender detail that the summary doesn't carry, so
+                        // it's kept at debug rather than dropped outright.
+                        tracing::debug!(
+                            chrom = %self.chrom,
+                            detail = %detail,
+                            "check_ref=x excluding record(s) whose REF disagrees with the \
+                             reference; further exclusions on this contig are counted, not \
+                             logged individually"
                         );
                     }
                 }
