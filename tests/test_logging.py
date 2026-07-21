@@ -1,8 +1,11 @@
 import io
+import subprocess
 import threading
+from pathlib import Path
 
 import genoray._core as core
 import pytest
+from genoray import SparseVar2
 from genoray._logging import ProgressRenderer, resolve_log_level, write_reporting
 from rich.console import Console
 
@@ -70,3 +73,35 @@ def test_write_reporting_drains_and_joins():
         # context exit must drop the sender and join the drain thread.
     # After exit, no leaked drain thread.
     assert threading.active_count() == n_threads_before
+
+
+_REF = "ACAGTACATGGGTACTAGCTAGGCTAACCGGTTAACCGGT"
+
+
+def _tiny_vcf(d: Path) -> tuple[Path, Path]:
+    ref = d / "ref.fa"
+    ref.write_text(f">chr1\n{_REF}\n")
+    subprocess.run(["samtools", "faidx", str(ref)], check=True)
+    body = (
+        "##fileformat=VCFv4.2\n"
+        "##contig=<ID=chr1,length=40>\n"
+        '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n'
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS0\tS1\n"
+        "chr1\t3\t.\tA\tG\t.\t.\t.\tGT\t1|0\t0|0\n"
+        "chr1\t7\t.\tC\tCAT\t.\t.\t.\tGT\t0|1\t1|1\n"
+    )
+    plain = d / "in.vcf"
+    plain.write_text(body)
+    gz = d / "in.vcf.gz"
+    with open(gz, "wb") as fh:
+        subprocess.run(["bgzip", "-c", str(plain)], check=True, stdout=fh)
+    subprocess.run(["bcftools", "index", str(gz)], check=True)
+    return gz, ref
+
+
+def test_from_vcf_emits_summary(tmp_path, capsys):
+    src, ref = _tiny_vcf(tmp_path)
+    out = tmp_path / "out.svar"
+    SparseVar2.from_vcf(out, src, ref, progress=False, log_level="info")
+    captured = capsys.readouterr()
+    assert "done" in captured.out.lower()

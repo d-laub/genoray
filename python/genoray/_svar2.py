@@ -629,6 +629,8 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         info_fields: Sequence[str | InfoField] | None = None,
         format_fields: Sequence[str | FormatField] | None = None,
         check_ref: Literal["e", "x"] = "e",
+        progress: bool = False,
+        log_level: Literal["off", "warning", "info", "debug"] = "info",
     ) -> int:
         """Convert a bgzipped VCF or BCF to an SVAR2 store.
 
@@ -675,6 +677,23 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         the offending record (including a REF that runs past the contig end)
         and continues, logging a per-contig count. Comparison is
         case-insensitive, so soft-masked (lowercase) reference bases match.
+
+        progress: if True, render live write progress. In a terminal or
+        Jupyter, this is a `rich` progress bar (one row per in-flight contig);
+        elsewhere it falls back to compact heartbeat lines ("chr1 42%
+        (12,345/29,000) ..."), throttled to roughly one line every 5s per
+        contig. Regardless of `progress`, a one-line "chrom done: N kept, M
+        excluded (Ts)" summary is printed per contig once it finishes,
+        unless `log_level="off"`. Default False keeps writes silent aside
+        from those summaries.
+
+        log_level: minimum severity for structured write-time log lines —
+        one of `"off"`, `"warning"`, `"info"` (default), or `"debug"`.
+        `"off"` disables all output, including the per-contig summaries and
+        progress rendering (a pure no-op, zero overhead). The environment
+        variable `GENORAY_LOG` overrides this argument when set to one of
+        the same four values (e.g. `GENORAY_LOG=debug` for troubleshooting
+        without touching call sites).
         """
         from cyvcf2 import VCF as _CyVCF
         from genoray._svar._regions import _normalize_samples
@@ -772,24 +791,30 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         info = [t for t in flds if t[1] == "info"]
         format_ = [t for t in flds if t[1] == "format"]
         _validate_check_ref(check_ref)
-        return _core.run_conversion_pipeline(
-            str(source),
-            reference_path,
-            contigs,
-            str(out),
-            selected_samples,
-            chunk_size,
-            ploidy,
-            threads,  # max_threads; None => auto
-            long_allele_capacity,
-            skip_out_of_scope,
-            signatures,
-            info,
-            format_,
-            check_ref,
-            region_ranges,
-            regions_overlap,
-        )
+
+        from ._logging import write_reporting
+
+        with write_reporting(progress, log_level) as rx:
+            return _core.run_conversion_pipeline(
+                str(source),
+                reference_path,
+                contigs,
+                str(out),
+                selected_samples,
+                chunk_size,
+                ploidy,
+                threads,  # max_threads; None => auto
+                long_allele_capacity,
+                skip_out_of_scope,
+                signatures,
+                info,
+                format_,
+                check_ref,
+                region_ranges,
+                regions_overlap,
+                log_level=log_level,
+                receiver=rx,
+            )
 
     @classmethod
     def from_pgen(
