@@ -272,7 +272,7 @@ fn run_conversion_pipeline(
                     .collect::<Vec<_>>()
             });
 
-            println!("Cohort Processing Complete.");
+            tracing::info!("cohort processing complete");
             results
         })
     });
