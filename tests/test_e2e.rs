@@ -108,6 +108,7 @@ fn test_e2e_normalized_bcf_pipeline() {
         1,     // processing_threads
         false, // signatures
         &[],   // fields
+        &genoray_core::logging::EventSink::disabled(),
     )
     .expect("process_chromosome should succeed");
 
@@ -279,6 +280,7 @@ fn test_e2e_max_del_postpass() {
         1,     // processing_threads
         false, // signatures
         &[],   // fields
+        &genoray_core::logging::EventSink::disabled(),
     )
     .expect("conversion");
 
@@ -359,6 +361,7 @@ fn test_e2e_dense_snp_roundtrip() {
         1,     // processing_threads
         false, // signatures
         &[],   // fields
+        &genoray_core::logging::EventSink::disabled(),
     )
     .expect("conversion");
 
@@ -438,6 +441,7 @@ fn test_e2e_mutation_conservation() {
         1,     // processing_threads
         false, // signatures
         &[],   // fields
+        &genoray_core::logging::EventSink::disabled(),
     )
     .expect("process_chromosome should succeed");
 
@@ -897,6 +901,7 @@ fn test_missing_chrom_returns_err() {
         1,     // processing_threads
         false, // signatures
         &[],   // fields
+        &genoray_core::logging::EventSink::disabled(),
     );
 
     // SP-4 final review (M1): a chromosome absent from the VCF header is a
@@ -1006,6 +1011,7 @@ fn regions_overlap_variant_keeps_spanning_deletion_e2e() {
             1,     // processing_threads
             false, // signatures
             &[],   // fields
+            &genoray_core::logging::EventSink::disabled(),
         )
         .expect("conversion");
         indel_positions(&out_dir.join("chr1"))

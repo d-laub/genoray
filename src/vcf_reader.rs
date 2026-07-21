@@ -151,6 +151,10 @@ pub(crate) fn load_contig_seq(fasta_path: &str, chrom: &str) -> Result<Vec<u8>, 
             )));
         }
     };
+    if resolved != chrom {
+        tracing::info!(requested = %chrom, resolved = %resolved,
+            "contig name resolved via normalization");
+    }
     // htslib's faidx_seq_len returns -1 for an unknown contig, surfaced via
     // rust-htslib as u64::MAX — check explicitly for a clear message.
     let contig_len_raw = fasta.fetch_seq_len(resolved.as_str());

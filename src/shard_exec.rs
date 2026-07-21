@@ -111,6 +111,7 @@ enum Msg {
         unit_ordinal: usize,
         dropped: u64,
         ref_excluded: u64,
+        normalized: u64,
     },
     Err(ConversionError),
 }
@@ -125,6 +126,8 @@ pub struct ShardTotals {
     /// tallies only the records it owns, so a padded boundary record is counted
     /// once even when it appears in two shards' fetch windows).
     pub ref_excluded: u64,
+    /// Atoms whose position moved during left-alignment across all shards.
+    pub normalized_total: u64,
 }
 
 /// Distribute `units` across a fixed pool of `workers` threads pulling from a
@@ -141,8 +144,9 @@ pub struct ShardTotals {
 /// unit's shard-region context (see `orchestrator::with_vcf_shard_context`);
 /// this module stays backend-agnostic about how a `WorkUnit` is described.
 ///
-/// Returns the [`ShardTotals`] (summed `dropped_out_of_scope` and `ref_excluded`)
-/// across every unit, or the first error encountered (context-decorated).
+/// Returns the [`ShardTotals`] (summed `dropped_out_of_scope`, `ref_excluded`,
+/// and `normalized_total`) across every unit, or the first error encountered
+/// (context-decorated).
 pub fn run<F, G>(
     units: Vec<WorkUnit>,
     workers: usize,
@@ -160,6 +164,7 @@ where
         return Ok(ShardTotals {
             dropped_out_of_scope: 0,
             ref_excluded: 0,
+            normalized_total: 0,
         });
     }
     let workers = workers.max(1);
@@ -247,6 +252,7 @@ where
                                 unit_ordinal: unit.ordinal,
                                 dropped: asm.dropped_out_of_scope(),
                                 ref_excluded: asm.ref_excluded(),
+                                normalized: asm.normalized_total(),
                             })
                             .is_err()
                         {
@@ -270,6 +276,7 @@ where
         let mut rb = ReorderBuffer::new(n_units);
         let mut total_dropped = 0u64;
         let mut total_ref_excluded = 0u64;
+        let mut total_normalized = 0u64;
         let mut first_err: Option<ConversionError> = None;
         let mut done_count = 0usize;
 
@@ -299,11 +306,13 @@ where
                     unit_ordinal,
                     dropped,
                     ref_excluded,
+                    normalized,
                 } => {
                     done_count += 1;
                     if first_err.is_none() {
                         total_dropped += dropped;
                         total_ref_excluded += ref_excluded;
+                        total_normalized += normalized;
                         rb.push(unit_ordinal, 0, true, &mut |gid, tag| {
                             if let Some(mut c) = pending.remove(&tag) {
                                 c.chunk_id = gid;
@@ -344,6 +353,7 @@ where
         first_err.map(Err).unwrap_or(Ok(ShardTotals {
             dropped_out_of_scope: total_dropped,
             ref_excluded: total_ref_excluded,
+            normalized_total: total_normalized,
         }))
     })
 }

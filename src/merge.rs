@@ -204,7 +204,7 @@ pub fn merge_mini_sc(
     let total_columns = num_samples * ploidy;
     let pos_size = std::mem::size_of::<u32>(); // positions are always u32
 
-    println!("Phase A -> Executing In-Memory Metadata Pass");
+    tracing::debug!("Phase A -> Executing In-Memory Metadata Pass");
 
     // pre-compute global offsets and local chunk offsets using the RAM Ledger
     let (final_offsets, chunk_offsets) = derive_offsets(num_chunks, total_columns, &ram_ledger);
@@ -224,7 +224,7 @@ pub fn merge_mini_sc(
     let pos_total_bytes: u64 = total_items * pos_size as u64;
     let key_total_bytes: u64 = total_items * key_bytes as u64;
 
-    println!("Phase B -> Executing Parallel Tile-Based Interleaving Gather");
+    tracing::debug!("Phase B -> Executing Parallel Tile-Based Interleaving Gather");
 
     // Pre-create the monolithic outputs at full size so worker pwrites land in
     // disjoint byte ranges. set_len doesn't allocate disk space (sparse file)
@@ -272,9 +272,9 @@ pub fn merge_mini_sc(
         })
         .collect::<Result<_, _>>()?;
 
-    println!(
-        "Tile size target: {} MB per tile (adaptive; computed inside gather_columns)",
-        TILE_RAM_BUDGET_BYTES / (1024 * 1024),
+    tracing::debug!(
+        tile_mb = TILE_RAM_BUDGET_BYTES / (1024 * 1024),
+        "Tile size target (adaptive; computed inside gather_columns)"
     );
 
     gather_columns(
@@ -303,13 +303,13 @@ pub fn merge_mini_sc(
     drop(final_pos_file);
     drop(final_key_file);
 
-    println!("Phase C -> Cleaning up temporary chunk files");
+    tracing::debug!("Phase C -> Cleaning up temporary chunk files");
     for c in 0..num_chunks {
         let _ = std::fs::remove_file(layout::chunk_pos(output_dir_path, c));
         let _ = std::fs::remove_file(layout::chunk_key(output_dir_path, c));
     }
 
-    println!("Merge Complete.");
+    tracing::debug!("Merge Complete.");
     Ok(())
 }
 

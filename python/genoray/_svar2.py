@@ -475,6 +475,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         overwrite: bool = False,
         threads: int | None = None,
         progress: bool = False,
+        log_level: Literal["off", "warning", "info", "debug"] = "info",
     ) -> None:
         """Write a region/sample subset of this store to `output`.
 
@@ -516,8 +517,25 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
           the size-optimal re-route otherwise (genotype-only / INFO-only
           views, which have no per-sample slot to lose).
 
-        `progress` is accepted for interface parity with other long-running
-        entry points but is currently a no-op (no progress bar is shown).
+        `progress`: if True, render live write progress. Unlike the other
+        `from_*` writers, `write_view` has no per-record stream to sample --
+        progress here is COARSE, one line per contig (no within-contig bar
+        movement): in a terminal or Jupyter this is a live-updating list of
+        in-flight/finished contigs, elsewhere compact "chrom done" lines as
+        each contig finishes. Regardless of `progress`, a one-line "chrom
+        done: N kept, 0 excluded (Ts)" summary is printed per contig once it
+        finishes, unless `log_level="off"` (slicing never excludes variants,
+        so `excluded` is always 0). Default False keeps writes silent aside
+        from those summaries.
+
+        `log_level`: minimum severity for structured write-time log lines --
+        one of `"off"`, `"warning"`, `"info"` (default), or `"debug"`.
+        `"off"` disables all output, including the per-contig summaries and
+        progress rendering (a pure no-op, zero overhead). The environment
+        variable `GENORAY_LOG` overrides this argument when set to one of
+        the same four values (e.g. `GENORAY_LOG=debug` for troubleshooting
+        without touching call sites).
+
         `threads` caps the number of contigs sliced concurrently (autodetected
         from available CPUs when `None`), same convention as `from_vcf`.
         Peak memory is O(output size) **per in-flight contig** times
@@ -592,20 +610,25 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             (sf.name, sf.category, _META_DTYPE[sf.dtype], sf.default)
             for sf in (self.available_fields[key] for key in fields_to_write)
         ]
-        _core.run_slice_view(
-            str(self.path),
-            str(output),
-            self.contigs,
-            caller_samples,
-            region_tuples,
-            regions_overlap,
-            merge_overlapping,
-            field_tuples,
-            reference_str,
-            reroute,
-            threads,
-            overwrite,
-        )
+        from ._logging import write_reporting
+
+        with write_reporting(progress, log_level) as (rx, level):
+            _core.run_slice_view(
+                str(self.path),
+                str(output),
+                self.contigs,
+                caller_samples,
+                region_tuples,
+                regions_overlap,
+                merge_overlapping,
+                field_tuples,
+                reference_str,
+                reroute,
+                threads,
+                overwrite,
+                log_level=level,
+                receiver=rx,
+            )
 
     @classmethod
     def from_vcf(
@@ -629,6 +652,8 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         info_fields: Sequence[str | InfoField] | None = None,
         format_fields: Sequence[str | FormatField] | None = None,
         check_ref: Literal["e", "x"] = "e",
+        progress: bool = False,
+        log_level: Literal["off", "warning", "info", "debug"] = "info",
     ) -> int:
         """Convert a bgzipped VCF or BCF to an SVAR2 store.
 
@@ -675,6 +700,23 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         the offending record (including a REF that runs past the contig end)
         and continues, logging a per-contig count. Comparison is
         case-insensitive, so soft-masked (lowercase) reference bases match.
+
+        progress: if True, render live write progress. In a terminal or
+        Jupyter, this is a `rich` progress bar (one row per in-flight contig);
+        elsewhere it falls back to compact heartbeat lines ("chr1 42%
+        (12,345/29,000) ..."), throttled to roughly one line every 5s per
+        contig. Regardless of `progress`, a one-line "chrom done: N kept, M
+        excluded (Ts)" summary is printed per contig once it finishes,
+        unless `log_level="off"`. Default False keeps writes silent aside
+        from those summaries.
+
+        log_level: minimum severity for structured write-time log lines —
+        one of `"off"`, `"warning"`, `"info"` (default), or `"debug"`.
+        `"off"` disables all output, including the per-contig summaries and
+        progress rendering (a pure no-op, zero overhead). The environment
+        variable `GENORAY_LOG` overrides this argument when set to one of
+        the same four values (e.g. `GENORAY_LOG=debug` for troubleshooting
+        without touching call sites).
         """
         from cyvcf2 import VCF as _CyVCF
         from genoray._svar._regions import _normalize_samples
@@ -772,24 +814,30 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         info = [t for t in flds if t[1] == "info"]
         format_ = [t for t in flds if t[1] == "format"]
         _validate_check_ref(check_ref)
-        return _core.run_conversion_pipeline(
-            str(source),
-            reference_path,
-            contigs,
-            str(out),
-            selected_samples,
-            chunk_size,
-            ploidy,
-            threads,  # max_threads; None => auto
-            long_allele_capacity,
-            skip_out_of_scope,
-            signatures,
-            info,
-            format_,
-            check_ref,
-            region_ranges,
-            regions_overlap,
-        )
+
+        from ._logging import write_reporting
+
+        with write_reporting(progress, log_level) as (rx, level):
+            return _core.run_conversion_pipeline(
+                str(source),
+                reference_path,
+                contigs,
+                str(out),
+                selected_samples,
+                chunk_size,
+                ploidy,
+                threads,  # max_threads; None => auto
+                long_allele_capacity,
+                skip_out_of_scope,
+                signatures,
+                info,
+                format_,
+                check_ref,
+                region_ranges,
+                regions_overlap,
+                log_level=level,
+                receiver=rx,
+            )
 
     @classmethod
     def from_pgen(
@@ -811,6 +859,8 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         signatures: bool = False,
         dosages: "Sequence[DosageField] | None" = None,
         check_ref: Literal["e", "x"] = "e",
+        progress: bool = False,
+        log_level: Literal["off", "warning", "info", "debug"] = "info",
     ) -> int:
         """Convert a PLINK2 PGEN to an SVAR2 store.
 
@@ -875,6 +925,23 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         the offending record (including a REF that runs past the contig end)
         and continues, logging a per-contig count. Comparison is
         case-insensitive, so soft-masked (lowercase) reference bases match.
+
+        progress: if True, render live write progress. In a terminal or
+        Jupyter, this is a `rich` progress bar (one row per in-flight contig);
+        elsewhere it falls back to compact heartbeat lines ("chr1 42%
+        (12,345/29,000) ..."), throttled to roughly one line every 5s per
+        contig. Regardless of `progress`, a one-line "chrom done: N kept, M
+        excluded (Ts)" summary is printed per contig once it finishes,
+        unless `log_level="off"`. Default False keeps writes silent aside
+        from those summaries.
+
+        log_level: minimum severity for structured write-time log lines --
+        one of `"off"`, `"warning"`, `"info"` (default), or `"debug"`.
+        `"off"` disables all output, including the per-contig summaries and
+        progress rendering (a pure no-op, zero overhead). The environment
+        variable `GENORAY_LOG` overrides this argument when set to one of
+        the same four values (e.g. `GENORAY_LOG=debug` for troubleshooting
+        without touching call sites).
         """
         from genoray._pgen import _read_psam
         from genoray._svar._regions import _normalize_samples
@@ -1089,27 +1156,33 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             dosage_readers.append(per_contig)
 
         _validate_check_ref(check_ref)
-        return _core.run_pgen_conversion_pipeline(
-            str(source),
-            str(pvar),
-            None if no_reference else str(reference),
-            contigs,
-            ranges,
-            str(out),
-            selected_samples,
-            chunk_size,
-            threads,
-            long_allele_capacity,
-            skip_out_of_scope,
-            signatures,
-            dosage_field_tuples,
-            readers,
-            dosage_readers,
-            check_ref,
-            region_ranges,
-            regions_overlap,
-            sample_perm,
-        )
+
+        from ._logging import write_reporting
+
+        with write_reporting(progress, log_level) as (rx, level):
+            return _core.run_pgen_conversion_pipeline(
+                str(source),
+                str(pvar),
+                None if no_reference else str(reference),
+                contigs,
+                ranges,
+                str(out),
+                selected_samples,
+                chunk_size,
+                threads,
+                long_allele_capacity,
+                skip_out_of_scope,
+                signatures,
+                dosage_field_tuples,
+                readers,
+                dosage_readers,
+                check_ref,
+                region_ranges,
+                regions_overlap,
+                sample_perm,
+                log_level=level,
+                receiver=rx,
+            )
 
     @classmethod
     def from_vcf_list(
@@ -1133,6 +1206,8 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         info_fields: "Sequence[str | InfoField] | None" = None,
         format_fields: "Sequence[str | FormatField] | None" = None,
         check_ref: Literal["e", "x"] = "e",
+        progress: bool = False,
+        log_level: Literal["off", "warning", "info", "debug"] = "info",
     ) -> int:
         """Build one SVAR2 store from many **single-sample** VCFs/BCFs via a native k-way merge (no `bcftools merge`, no intermediate multi-sample VCF).
 
@@ -1268,6 +1343,23 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             arena locks the same knob measured 12% *worse* RAM and **73%
             slower** on a 4000-file single-contig merge. Measure before
             adopting it.
+
+        progress: if True, render live write progress. In a terminal or
+        Jupyter, this is a `rich` progress bar (one row per in-flight contig);
+        elsewhere it falls back to compact heartbeat lines ("chr1 42%
+        (12,345/29,000) ..."), throttled to roughly one line every 5s per
+        contig. Regardless of `progress`, a one-line "chrom done: N kept, M
+        excluded (Ts)" summary is printed per contig once it finishes,
+        unless `log_level="off"`. Default False keeps writes silent aside
+        from those summaries.
+
+        log_level: minimum severity for structured write-time log lines --
+        one of `"off"`, `"warning"`, `"info"` (default), or `"debug"`.
+        `"off"` disables all output, including the per-contig summaries and
+        progress rendering (a pure no-op, zero overhead). The environment
+        variable `GENORAY_LOG` overrides this argument when set to one of
+        the same four values (e.g. `GENORAY_LOG=debug` for troubleshooting
+        without touching call sites).
         """
         from cyvcf2 import VCF as _CyVCF
 
@@ -1375,25 +1467,30 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             for contig in contigs
         ]
 
-        return _core.run_vcf_list_conversion_pipeline(
-            [str(p) for p in paths],
-            None if no_reference else str(reference),
-            contigs,
-            str(out),
-            samples,
-            contig_membership,
-            chunk_size,
-            ploidy,
-            threads,
-            long_allele_capacity,
-            skip_out_of_scope,
-            signatures,
-            info,
-            format_,
-            check_ref,
-            region_ranges,
-            regions_overlap,
-        )
+        from ._logging import write_reporting
+
+        with write_reporting(progress, log_level) as (rx, level):
+            return _core.run_vcf_list_conversion_pipeline(
+                [str(p) for p in paths],
+                None if no_reference else str(reference),
+                contigs,
+                str(out),
+                samples,
+                contig_membership,
+                chunk_size,
+                ploidy,
+                threads,
+                long_allele_capacity,
+                skip_out_of_scope,
+                signatures,
+                info,
+                format_,
+                check_ref,
+                region_ranges,
+                regions_overlap,
+                log_level=level,
+                receiver=rx,
+            )
 
     @classmethod
     def from_svar1(
@@ -1415,6 +1512,8 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         signatures: bool = False,
         fields: "Sequence[str] | None" = None,
         check_ref: Literal["e", "x"] = "e",
+        progress: bool = False,
+        log_level: Literal["off", "warning", "info", "debug"] = "info",
     ) -> int:
         """Convert a SVAR1 (``SparseVar``) store to an SVAR2 store natively.
 
@@ -1468,6 +1567,23 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         caller order and de-duplicating first occurrences -- the store's
         `available_samples` (and every decoded column) matches that order
         exactly, regardless of each sample's original SVAR1 position.
+
+        progress: if True, render live write progress. In a terminal or
+        Jupyter, this is a `rich` progress bar (one row per in-flight contig);
+        elsewhere it falls back to compact heartbeat lines ("chr1 42%
+        (12,345/29,000) ..."), throttled to roughly one line every 5s per
+        contig. Regardless of `progress`, a one-line "chrom done: N kept, M
+        excluded (Ts)" summary is printed per contig once it finishes,
+        unless `log_level="off"`. Default False keeps writes silent aside
+        from those summaries.
+
+        log_level: minimum severity for structured write-time log lines --
+        one of `"off"`, `"warning"`, `"info"` (default), or `"debug"`.
+        `"off"` disables all output, including the per-contig summaries and
+        progress rendering (a pure no-op, zero overhead). The environment
+        variable `GENORAY_LOG` overrides this argument when set to one of
+        the same four values (e.g. `GENORAY_LOG=debug` for troubleshooting
+        without touching call sites).
         """
         from genoray._svar import SparseVar
         from genoray._svar._regions import _normalize_samples
@@ -1573,32 +1689,38 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
 
         out.parent.mkdir(parents=True, exist_ok=True)
         _validate_check_ref(check_ref)
-        return _core.run_svar1_conversion_pipeline(
-            str(source),
-            None if no_reference else str(reference),
-            contigs,
-            starts,
-            lens,
-            str(out),
-            selected_samples,
-            ploidy,
-            chunk_size,
-            threads,
-            long_allele_capacity,
-            skip_out_of_scope,
-            signatures,
-            pos_pc,
-            ref_bytes_pc,
-            ref_off_pc,
-            alt_bytes_pc,
-            alt_off_pc,
-            format_tuples,
-            src_dtypes,
-            check_ref,
-            region_ranges,
-            regions_overlap,
-            sample_idx,
-        )
+
+        from ._logging import write_reporting
+
+        with write_reporting(progress, log_level) as (rx, level):
+            return _core.run_svar1_conversion_pipeline(
+                str(source),
+                None if no_reference else str(reference),
+                contigs,
+                starts,
+                lens,
+                str(out),
+                selected_samples,
+                ploidy,
+                chunk_size,
+                threads,
+                long_allele_capacity,
+                skip_out_of_scope,
+                signatures,
+                pos_pc,
+                ref_bytes_pc,
+                ref_off_pc,
+                alt_bytes_pc,
+                alt_off_pc,
+                format_tuples,
+                src_dtypes,
+                check_ref,
+                region_ranges,
+                regions_overlap,
+                sample_idx,
+                log_level=level,
+                receiver=rx,
+            )
 
 
 def _find_pvar(pgen: Path) -> Path:

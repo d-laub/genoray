@@ -247,7 +247,7 @@ dropped = SparseVar2.from_vcf(
 dropped = SparseVar2.from_vcf("out.svar2", "file.vcf.gz", no_reference=True)
 ```
 
-Signature: `from_vcf(out, source, reference=None, *, regions=None, samples=None, merge_overlapping=False, regions_overlap="pos", no_reference=False, skip_out_of_scope=False, ploidy=2, chunk_size=25_000, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False, info_fields=None, format_fields=None, check_ref="e") -> int`
+Signature: `from_vcf(out, source, reference=None, *, regions=None, samples=None, merge_overlapping=False, regions_overlap="pos", no_reference=False, skip_out_of_scope=False, ploidy=2, chunk_size=25_000, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False, info_fields=None, format_fields=None, check_ref="e", progress=False, log_level="info") -> int`
 
 - `source` — a bgzipped VCF (`.vcf.gz`) or BCF (`.bcf`). Auto-indexes (`.csi`) if
   no `.csi`/`.tbi` is found. For a PLINK2 PGEN source, use `from_pgen` instead
@@ -356,6 +356,24 @@ Signature: `from_vcf(out, source, reference=None, *, regions=None, samples=None,
   - **Read path:** see "Reading INFO/FORMAT fields (SVAR2)" below —
     `SparseVar2(path, fields=…)` / `.with_fields(…)` / `.available_fields`
     opt into decoding these back out via `decode()`.
+- **`progress=False`/`log_level="info"`** — write-time progress/logging,
+  shared by `from_vcf`/`from_pgen`/`from_vcf_list`/`from_svar1`/`write_view`.
+  `progress=True` renders live progress: in a terminal or Jupyter, a `rich`
+  bar (one row per in-flight contig); elsewhere, compact heartbeat lines
+  throttled to roughly one per 5s per contig (`"chr1 42% (12,345/29,000)
+  ..."`). Regardless of `progress`, a one-line `"[svar2] chrom done: N kept,
+  M excluded (Ts)"` summary prints per contig once it finishes, unless
+  `log_level="off"`. `log_level` is the minimum severity for structured
+  write-time log lines — `"off"` (disables everything, including the
+  per-contig summaries and progress rendering — a pure no-op, zero
+  overhead), `"warning"`, `"info"` (default; also includes thread-budget
+  selection, per-contig start/finish, and contig-name resolution against the
+  reference when it differs from the source's own spelling), or `"debug"`
+  (additionally surfaces per-record detail: a record excluded for a
+  REF/FASTA mismatch, and each indel that gets left-aligned). The
+  `GENORAY_LOG` environment variable overrides the `log_level` argument when
+  set to one of the same four values (e.g. `GENORAY_LOG=debug`), without
+  touching call sites.
 
 ### Conversion from PGEN
 
@@ -368,7 +386,7 @@ dropped = SparseVar2.from_pgen(
 )
 ```
 
-Signature: `from_pgen(out, source, reference=None, *, regions=None, samples=None, merge_overlapping=False, regions_overlap="pos", no_reference=False, skip_out_of_scope=False, chunk_size=None, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False, dosages=None, check_ref="e") -> int`
+Signature: `from_pgen(out, source, reference=None, *, regions=None, samples=None, merge_overlapping=False, regions_overlap="pos", no_reference=False, skip_out_of_scope=False, chunk_size=None, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False, dosages=None, check_ref="e", progress=False, log_level="info") -> int`
 
 - `source` — a `.pgen` file. Variant metadata is read from the sibling
   `.pvar`/`.pvar.zst`, sample names from the sibling `.psam`.
@@ -427,6 +445,7 @@ Signature: `from_pgen(out, source, reference=None, *, regions=None, samples=None
   ```
 - Unphased heterozygotes resolve haplotypes in the allele-code order
   `pgenlib` returns — the same caveat `from_vcf` carries for unphased `GT`.
+- **`progress=False`/`log_level="info"`** — same as `from_vcf` (above).
 
 ### Conversion from a list of single-sample VCFs
 
@@ -444,7 +463,7 @@ dropped = SparseVar2.from_vcf_list("out.svar2", "vcfs/", "ref.fa")
 dropped = SparseVar2.from_vcf_list("out.svar2", "manifest.txt", "ref.fa")
 ```
 
-Signature: `from_vcf_list(out, sources, reference=None, *, regions=None, merge_overlapping=False, regions_overlap="pos", no_reference=False, skip_out_of_scope=False, ploidy=2, chunk_size=None, max_mem=None, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False, info_fields=None, format_fields=None, check_ref="e") -> int`
+Signature: `from_vcf_list(out, sources, reference=None, *, regions=None, merge_overlapping=False, regions_overlap="pos", no_reference=False, skip_out_of_scope=False, ploidy=2, chunk_size=None, max_mem=None, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False, info_fields=None, format_fields=None, check_ref="e", progress=False, log_level="info") -> int`
 
 Builds **one** SVAR2 store from **N single-sample** VCFs/BCFs with different
 site lists, via a native k-way merge — no `bcftools merge`, no intermediate
@@ -559,6 +578,7 @@ multi-sample VCF.
   when `no_reference=True`): under `"x"`, a bad record is excluded from its
   own file only (not the whole merged site), and the per-contig log reports
   the total excluded across every input file.
+- **`progress=False`/`log_level="info"`** — same as `from_vcf` (above).
 
 ### Conversion from SVAR1
 
@@ -571,7 +591,7 @@ dropped = SparseVar2.from_svar1(
 )
 ```
 
-Signature: `from_svar1(out, source, reference=None, *, regions=None, samples=None, merge_overlapping=False, regions_overlap="pos", no_reference=False, skip_out_of_scope=False, chunk_size=None, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False, fields=None, check_ref="e") -> int`
+Signature: `from_svar1(out, source, reference=None, *, regions=None, samples=None, merge_overlapping=False, regions_overlap="pos", no_reference=False, skip_out_of_scope=False, chunk_size=None, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False, fields=None, check_ref="e", progress=False, log_level="info") -> int`
 
 Migrates an existing SVAR 1.0 (`SparseVar`) store to SVAR2 natively — reads no
 VCF and no htslib; SVAR1 is already sparse, so this reconstructs variant
@@ -615,6 +635,7 @@ records from SVAR1's arrays and reuses the same conversion spine as `from_vcf`.
   routing.
 - **No `info_fields=`/`format_fields=` kwargs** — those names are VCF-specific;
   use `fields=` (above) instead to select which SVAR1 fields carry.
+- **`progress=False`/`log_level="info"`** — same as `from_vcf` (above).
 
 ### Range queries
 
@@ -893,9 +914,13 @@ All three `write` subcommands share `--regions`/`-r`, `--regions-file`/`-R`,
 flag (maps to `skip_out_of_scope=`; the SVAR2 core can't expand either
 symbolic ALTs (`<DEL>`, `<INS>`, …) or breakends into nucleotides, so they're
 dropped together and print a `Dropped {n} out-of-scope (symbolic/breakend) ALT
-alleles.` line when set), and `--check-ref {e,x}` (default `e`, ignored with
+alleles.` line when set), `--check-ref {e,x}` (default `e`, ignored with
 `--no-reference`; `e` aborts on the first REF/FASTA disagreement, `x` drops
-the offending record and continues — mirrors `bcftools norm --check-ref`).
+the offending record and continues — mirrors `bcftools norm --check-ref`), and
+`--progress`/`--no-progress` + `--log-level {off,warning,info,debug}` (map to
+`progress=`/`log_level=`; see "Conversion" above for behavior — default
+`--no-progress --log-level info`). `write vcf`'s vcf-list form forwards both
+to `from_vcf_list`; its single-file form forwards both to `from_vcf`.
 
 - `genoray write vcf` (`SparseVar2.from_vcf`/`from_vcf_list`): `source` is a
   single `.vcf.gz`/`.bcf` → `from_vcf`; anything else (a directory, or a file
@@ -926,7 +951,9 @@ the offending record and continues — mirrors `bcftools norm --check-ref`).
   `--no-breakend` (independent flags here, unlike the SVAR2 `write`
   subcommands' single `--skip-symbolics-and-breakends`), `--threads`/`-@`,
   `--overwrite`. No `--regions`/`--samples`/`--fields`/`--reference`/
-  `--check-ref` — those are SVAR2-`write`-only.
+  `--check-ref`/`--progress`/`--log-level` — those are SVAR2-`write`-only
+  (the legacy `SparseVar.from_vcf`/`from_pgen` backends don't accept
+  `progress=`/`log_level=`).
 
 ### `genoray view`
 
@@ -944,10 +971,13 @@ genoray view svar1 in.svar out.svar -r chr1:1-1000 -s A,B --progress
 
 Both subcommands share the same `-r/--regions`, `-R/--regions-file`,
 `-s/--samples`, `-S/--samples-file`, `-f/--fields`, `--merge-overlapping`,
-`--regions-overlap`, `--overwrite`, `-@/--threads`, `--progress` options and
-the same no-op guard (at least one of regions/samples is required) and mutex
-checks (`--regions`/`--regions-file` and `--samples`/`--samples-file` are each
-mutually exclusive).
+`--regions-overlap`, `--overwrite`, `-@/--threads`, `--progress`/
+`--no-progress` options and the same no-op guard (at least one of
+regions/samples is required) and mutex checks (`--regions`/`--regions-file`
+and `--samples`/`--samples-file` are each mutually exclusive). `genoray view`
+(SVAR2) additionally has `--log-level {off,warning,info,debug}`; `genoray
+view svar1` does not — its `SparseVar.write_view` backend has no
+`log_level=` kwarg.
 
 - `genoray view` (SVAR2, thin wrapper over `SparseVar2.write_view`): when
   `--regions`/`--regions-file` is omitted, "all variants" defaults to one
@@ -979,15 +1009,17 @@ mutually exclusive).
   `-@/--threads` (caps contigs sliced concurrently; autodetected when
   omitted) are real on both `--reroute` and `--no-reroute` — there is no
   longer an "accepted but ignored/unused" caveat on either path. `--progress`
-  is accepted for parity but is currently a no-op on this path (see below).
-  `write_view`'s underlying `reroute=` kwarg only accepts `"auto"`, `True`,
-  or `False` — any other value (e.g. `reroute=1`) raises `ValueError` rather
-  than silently falling through to the `reroute=False` slicer.
+  and `--log-level` are both real here — see "`write_view` progress bar"
+  below for the coarse, one-line-per-contig rendering and log-level
+  semantics. `write_view`'s underlying `reroute=` kwarg only accepts
+  `"auto"`, `True`, or `False` — any other value (e.g. `reroute=1`) raises
+  `ValueError` rather than silently falling through to the `reroute=False`
+  slicer.
 - `genoray view svar1`: unchanged SVAR 1.0 behavior — "all variants" defaults
   from `SparseVar`'s `_contig_stats` (`[0, pos_max + 1)` per contig); `--fields`
   defaults to all available fields (use an explicit empty selection to carry
-  none); no `--reference`/`--reroute` options; `--progress` shows a real
-  phase-level bar (see below).
+  none); no `--reference`/`--reroute`/`--log-level` options; `--progress`
+  shows a real phase-level bar (see below).
 
 ### `genoray concat` / `genoray split`
 
@@ -1138,9 +1170,21 @@ genoray view svar1 in.svar out.svar -r chr1:1-1000 -s A,B --progress
 The bar is cosmetic: output bytes, schema, and dtypes are identical whether or
 not it is enabled.
 
-`SparseVar2.write_view` also accepts `progress=`/`--progress` for interface
-parity, but it is currently a no-op there (no bar shown) — see the `genoray
-view` CLI section above.
+`SparseVar2.write_view(..., progress=False, log_level="info")` renders live
+write progress the same way the `from_*` writers do (see "Conversion" above),
+with one difference: unlike the `from_*` writers, `write_view` has no
+per-record stream to sample from, so its progress is COARSE — one line per
+contig, no within-contig bar movement. In a terminal or Jupyter, `progress=True`
+shows a live-updating list of in-flight/finished contigs; elsewhere, a compact
+"chrom done" line prints as each contig finishes. Regardless of `progress`, a
+one-line `"[svar2] chrom done: N kept, 0 excluded (Ts)"` summary prints per
+contig once it finishes, unless `log_level="off"` (slicing never excludes
+variants, so `excluded` is always `0`). `log_level` and the `GENORAY_LOG` env
+override behave identically to the `from_*` writers. The `genoray view` CLI
+exposes both as `--progress`/`--no-progress` and `--log-level` (see the
+`genoray view` CLI section above); `genoray view svar1` (SVAR 1.0) exposes
+only `--progress` — its `SparseVar.write_view` backend (above) has no
+`log_level` kwarg.
 
 ### Atomic crash-safe writes
 

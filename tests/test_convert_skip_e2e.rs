@@ -59,6 +59,7 @@ fn convert(
         1,     // processing_threads
         false, // signatures
         &[],   // fields
+        &genoray_core::logging::EventSink::disabled(),
     )
 }
 

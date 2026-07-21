@@ -45,6 +45,8 @@ fn file_has_contig(path: &str, chrom: &str) -> bool {
 }
 
 fn main() {
+    genoray_core::logging::install_fmt_fallback();
+
     #[cfg(feature = "dhat-heap")]
     let _profiler = dhat::Profiler::new_heap();
 
@@ -138,6 +140,7 @@ fn main() {
         Vec::new(),       // region_ranges: empty => whole contig, as the bench intends
         OverlapMode::Pos, // overlap (inert with no regions; mirrors the default)
         contig_membership,
+        &genoray_core::logging::EventSink::disabled(),
     )
     .expect("run_vcf_list");
     eprintln!(
