@@ -104,10 +104,28 @@ def _tiny_vcf(d: Path) -> tuple[Path, Path]:
 
 def test_from_vcf_emits_summary(tmp_path, capsys):
     src, ref = _tiny_vcf(tmp_path)
-    out = tmp_path / "out.svar"
-    SparseVar2.from_vcf(out, src, ref, progress=False, log_level="info")
+
+    out_info = tmp_path / "out_info.svar2"
+    dropped_info = SparseVar2.from_vcf(
+        out_info, src, ref, progress=False, log_level="info"
+    )
     captured = capsys.readouterr()
     assert "done" in captured.out.lower()
+
+    out_off = tmp_path / "out_off.svar2"
+    dropped_off = SparseVar2.from_vcf(
+        out_off, src, ref, progress=False, log_level="off"
+    )
+
+    # Logging is a pure side channel: the written store is identical
+    # regardless of log_level.
+    assert dropped_info == dropped_off
+    a = SparseVar2(out_info)
+    b = SparseVar2(out_off)
+    assert a.available_samples == b.available_samples
+    counts_a = a.region_counts("chr1", [(0, 40)])
+    counts_b = b.region_counts("chr1", [(0, 40)])
+    assert counts_a.tolist() == counts_b.tolist()
 
 
 def test_from_pgen_emits_summary(tmp_path, capsys):
