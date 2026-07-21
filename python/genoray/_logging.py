@@ -106,10 +106,12 @@ def resolve_log_level(log_level: str) -> str:
 
 
 @contextmanager
-def write_reporting(progress: bool, log_level: str) -> Iterator[object | None]:
+def write_reporting(
+    progress: bool, log_level: str
+) -> Iterator[tuple[object | None, str]]:
     level = resolve_log_level(log_level)
     if not progress and level == "off":
-        yield None
+        yield None, level
         return
 
     from genoray import _core
@@ -146,7 +148,7 @@ def write_reporting(progress: bool, log_level: str) -> Iterator[object | None]:
     t = threading.Thread(target=_drain, name="genoray-log-drain", daemon=True)
     t.start()
     try:
-        yield rx
+        yield rx, level
     finally:
         stop.set()
         # Dropping the Rust-side pipeline senders triggers StopIteration in the

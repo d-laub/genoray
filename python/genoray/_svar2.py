@@ -612,7 +612,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         ]
         from ._logging import write_reporting
 
-        with write_reporting(progress, log_level) as rx:
+        with write_reporting(progress, log_level) as (rx, level):
             _core.run_slice_view(
                 str(self.path),
                 str(output),
@@ -626,7 +626,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
                 reroute,
                 threads,
                 overwrite,
-                log_level=log_level,
+                log_level=level,
                 receiver=rx,
             )
 
@@ -817,7 +817,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
 
         from ._logging import write_reporting
 
-        with write_reporting(progress, log_level) as rx:
+        with write_reporting(progress, log_level) as (rx, level):
             return _core.run_conversion_pipeline(
                 str(source),
                 reference_path,
@@ -835,7 +835,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
                 check_ref,
                 region_ranges,
                 regions_overlap,
-                log_level=log_level,
+                log_level=level,
                 receiver=rx,
             )
 
@@ -1159,7 +1159,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
 
         from ._logging import write_reporting
 
-        with write_reporting(progress, log_level) as rx:
+        with write_reporting(progress, log_level) as (rx, level):
             return _core.run_pgen_conversion_pipeline(
                 str(source),
                 str(pvar),
@@ -1180,7 +1180,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
                 region_ranges,
                 regions_overlap,
                 sample_perm,
-                log_level=log_level,
+                log_level=level,
                 receiver=rx,
             )
 
@@ -1469,7 +1469,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
 
         from ._logging import write_reporting
 
-        with write_reporting(progress, log_level) as rx:
+        with write_reporting(progress, log_level) as (rx, level):
             return _core.run_vcf_list_conversion_pipeline(
                 [str(p) for p in paths],
                 None if no_reference else str(reference),
@@ -1488,7 +1488,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
                 check_ref,
                 region_ranges,
                 regions_overlap,
-                log_level=log_level,
+                log_level=level,
                 receiver=rx,
             )
 
@@ -1692,7 +1692,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
 
         from ._logging import write_reporting
 
-        with write_reporting(progress, log_level) as rx:
+        with write_reporting(progress, log_level) as (rx, level):
             return _core.run_svar1_conversion_pipeline(
                 str(source),
                 None if no_reference else str(reference),
@@ -1718,7 +1718,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
                 region_ranges,
                 regions_overlap,
                 sample_idx,
-                log_level=log_level,
+                log_level=level,
                 receiver=rx,
             )
 

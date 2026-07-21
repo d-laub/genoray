@@ -62,14 +62,16 @@ def test_resolve_log_level_validates_and_env(monkeypatch):
 
 
 def test_write_reporting_disabled_yields_none():
-    with write_reporting(progress=False, log_level="off") as rx:
+    with write_reporting(progress=False, log_level="off") as (rx, level):
         assert rx is None
+        assert level == "off"
 
 
 def test_write_reporting_drains_and_joins():
     n_threads_before = threading.active_count()
-    with write_reporting(progress=False, log_level="info") as rx:
+    with write_reporting(progress=False, log_level="info") as (rx, level):
         assert rx is not None
+        assert level == "info"
         # Simulate a producer finishing immediately by not sending anything;
         # context exit must drop the sender and join the drain thread.
     # After exit, no leaked drain thread.
@@ -226,6 +228,69 @@ def test_below_pool_logs_surface_at_debug(tmp_path, capsys):
     lower = captured.out.lower()
     assert "resolv" in lower or "normaliz" in lower, captured.out
     assert "exclud" in lower, captured.out
+
+
+def test_genoray_log_env_overrides_rendered_verbosity(tmp_path, capsys, monkeypatch):
+    """Regression guard for the bug where `GENORAY_LOG` was resolved on the
+    Python side but the RAW `log_level` argument was still forwarded to the
+    Rust `_core.*` call, so the channel/renderer never saw the override.
+
+    Reuses the `check_ref="x"` REF-mismatch fixture from
+    `test_below_pool_logs_surface_at_debug`. That fixture actually fires two
+    "excluded" messages: a per-contig `tracing::info!` summary
+    (`report_ref_excluded` in `orchestrator.rs`, always visible at "info")
+    and a below-pool `tracing::debug!` first-offender detail in
+    `chunk_assembler.rs` ("... further exclusions on this contig are
+    counted, not logged individually") that's genuinely gated by the
+    resolved level. Assert on the latter's unique text, not the generic
+    "exclud" substring, since the info-level summary would make that
+    substring present regardless of the bug.
+
+    Calling with `log_level="info"`:
+    - without `GENORAY_LOG` set, the effective level is "info" -> the debug
+      detail line must NOT reach stdout.
+    - with `GENORAY_LOG=debug`, the effective level must be raised to
+      "debug" -> the debug detail line MUST reach stdout.
+    Fails under the pre-fix code because the raw (unresolved) "info" reaches
+    the Rust channel gate regardless of GENORAY_LOG.
+    """
+    ref = tmp_path / "ref.fa"
+    ref.write_text(f">chr1\n{_REF}\n")
+    subprocess.run(["samtools", "faidx", str(ref)], check=True)
+    body = (
+        "##fileformat=VCFv4.2\n"
+        "##contig=<ID=1,length=40>\n"
+        '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n'
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS0\tS1\n"
+        # pos 3 is really 'A' in _REF -- 'T' here is a deliberate REF mismatch.
+        "1\t3\t.\tT\tG\t.\t.\t.\tGT\t1|0\t0|0\n"
+        "1\t7\t.\tC\tCAT\t.\t.\t.\tGT\t0|1\t1|1\n"
+    )
+    plain = tmp_path / "in.vcf"
+    plain.write_text(body)
+    gz = tmp_path / "in.vcf.gz"
+    with open(gz, "wb") as fh:
+        subprocess.run(["bgzip", "-c", str(plain)], check=True, stdout=fh)
+    subprocess.run(["bcftools", "index", str(gz)], check=True)
+
+    monkeypatch.delenv("GENORAY_LOG", raising=False)
+    out_no_env = tmp_path / "out_no_env.svar2"
+    SparseVar2.from_vcf(
+        out_no_env, gz, ref, check_ref="x", progress=False, log_level="info"
+    )
+    captured = capsys.readouterr()
+    lower = captured.out.lower()
+    assert "done" in lower, captured.out
+    assert "not logged individually" not in lower, captured.out
+
+    monkeypatch.setenv("GENORAY_LOG", "debug")
+    out_with_env = tmp_path / "out_with_env.svar2"
+    SparseVar2.from_vcf(
+        out_with_env, gz, ref, check_ref="x", progress=False, log_level="info"
+    )
+    captured = capsys.readouterr()
+    lower = captured.out.lower()
+    assert "not logged individually" in lower, captured.out
 
 
 def test_from_svar1_emits_summary(tmp_path, capsys):
