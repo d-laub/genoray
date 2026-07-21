@@ -181,6 +181,15 @@ fn report_ref_excluded(chrom: &str, ref_excluded: u64) {
     }
 }
 
+/// Emit the per-contig left-alignment summary (nothing when no atoms moved).
+/// Shared by the single-reader and sub-contig-sharded paths, mirroring
+/// `report_ref_excluded` above.
+fn report_normalized(chrom: &str, normalized_total: u64) {
+    if normalized_total > 0 {
+        tracing::info!(chrom = %chrom, normalized = normalized_total, "left-aligned indels");
+    }
+}
+
 fn with_vcf_shard_context(
     err: ConversionError,
     chrom: &str,
@@ -350,10 +359,11 @@ pub fn process_chromosome(
             let s_owned: Vec<String> = samples.iter().map(|&s| s.to_string()).collect();
             let fields_owned: Vec<crate::field::FieldSpec> = fields.to_vec();
 
-            // Returns `(dropped_out_of_scope, ref_excluded)` so the caller can
-            // feed `EventSink::contig_done`'s `excluded` arg without a second
-            // cross-thread channel.
-            move || -> Result<(u64, u64), ConversionError> {
+            // Returns `(dropped_out_of_scope, ref_excluded, normalized_total)` so
+            // the caller can feed `EventSink::contig_done`'s `excluded` arg (and
+            // the left-alignment summary log) without a second cross-thread
+            // channel.
+            move || -> Result<(u64, u64, u64), ConversionError> {
                 // passing the thread budget down to HTSLib
                 let s_refs: Vec<&str> = s_owned.iter().map(|s| s.as_str()).collect();
                 // Only populated (and only meaningful) for `SourceSpec::VcfList`;
@@ -436,6 +446,7 @@ pub fn process_chromosome(
                                         Box::new(source),
                                         s_refs.len(),
                                         ploidy,
+                                        &chr,
                                         Arc::clone(&ref_seq),
                                         has_reference,
                                         skip_out_of_scope,
@@ -455,7 +466,12 @@ pub fn process_chromosome(
                                 &tx_dense,
                             )?;
                             report_ref_excluded(&chr, totals.ref_excluded);
-                            return Ok((totals.dropped_out_of_scope, totals.ref_excluded));
+                            report_normalized(&chr, totals.normalized_total);
+                            return Ok((
+                                totals.dropped_out_of_scope,
+                                totals.ref_excluded,
+                                totals.normalized_total,
+                            ));
                         }
                         Box::new(crate::vcf_reader::VcfRecordSource::new(
                             &vcf_path,
@@ -619,6 +635,7 @@ pub fn process_chromosome(
                                         Box::new(source),
                                         s_refs.len(),
                                         ploidy,
+                                        &chr,
                                         Arc::clone(&ref_seq),
                                         has_reference,
                                         skip_out_of_scope,
@@ -632,7 +649,12 @@ pub fn process_chromosome(
                                 &tx_dense,
                             )?;
                             report_ref_excluded(&chr, totals.ref_excluded);
-                            return Ok((totals.dropped_out_of_scope, totals.ref_excluded));
+                            report_normalized(&chr, totals.normalized_total);
+                            return Ok((
+                                totals.dropped_out_of_scope,
+                                totals.ref_excluded,
+                                totals.normalized_total,
+                            ));
                         }
                     }
                     SourceSpec::VcfList {
@@ -730,9 +752,11 @@ pub fn process_chromosome(
                 let ref_excluded_total =
                     reader.ref_excluded() + vcf_list_ref_excluded.load(Ordering::Relaxed);
                 report_ref_excluded(&chr, ref_excluded_total);
+                report_normalized(&chr, reader.normalized_total());
                 Ok((
                     reader.dropped_out_of_scope() + vcf_list_dropped.load(Ordering::Relaxed),
                     ref_excluded_total,
+                    reader.normalized_total(),
                 ))
             }
         })
@@ -793,7 +817,10 @@ pub fn process_chromosome(
     let chunk_writer_res = chunk_writer_thread.join();
     let long_allele_writer_res = long_allele_writer_thread.join();
 
-    let (dropped, ref_excluded) = match reader_res {
+    // `_normalized_total` (left-aligned atom count) is already reported via
+    // `report_normalized` inside the reader thread closure above -- kept here
+    // only so the tuple shape stays self-documenting at the call site.
+    let (dropped, ref_excluded, _normalized_total) = match reader_res {
         Ok(r) => r?, // ConversionError propagates with its real message
         Err(_) => {
             return Err(ConversionError::WorkerPanicked {

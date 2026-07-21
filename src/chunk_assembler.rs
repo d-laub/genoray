@@ -40,6 +40,9 @@ struct DecomposedRecord {
     source_pos: u32,
     atoms: Vec<PendingAtom>,
     dropped_out_of_scope: u64,
+    /// Atoms decomposed from this record whose position moved during
+    /// left-alignment.
+    normalized: u64,
     /// `Some(detail)` when this record was dropped by `CheckRef::Exclude`
     /// (its REF disagreed with the reference); `detail` is the mismatch
     /// message, surfaced once for the first exclusion on the contig. The
@@ -275,8 +278,11 @@ pub struct ChunkAssembler {
     owned_range: Option<(u32, u32)>,
     skip_out_of_scope: bool,
     check_ref: crate::normalize::CheckRef,
+    /// Contig label, used only to tag `tracing` events.
+    chrom: String,
     ref_excluded: u64,
     dropped_out_of_scope: u64,
+    normalized_total: u64,
     info_fields: Vec<FieldSpec>,
     format_fields: Vec<FieldSpec>,
     heap: BinaryHeap<Reverse<PendingAtom>>,
@@ -294,6 +300,7 @@ fn decompose_raw_record(
     skip_out_of_scope: bool,
     check_ref: crate::normalize::CheckRef,
     info_fields: &[FieldSpec],
+    chrom: &str,
 ) -> Result<DecomposedRecord, ConversionError> {
     let pos = rec.pos;
     let calls = Arc::new(rec.calls);
@@ -309,10 +316,13 @@ fn decompose_raw_record(
         match crate::normalize::apply_check_ref(check_ref, pos, &rec.reference, ref_seq)? {
             crate::normalize::RefDecision::Keep => {}
             crate::normalize::RefDecision::Exclude(e) => {
+                tracing::debug!(chrom = %chrom, pos = pos, detail = %e,
+                    "excluded record: REF disagrees with reference");
                 return Ok(DecomposedRecord {
                     source_pos: pos,
                     atoms: Vec::new(),
                     dropped_out_of_scope: 0,
+                    normalized: 0,
                     ref_excluded: Some(e.to_string()),
                 });
             }
@@ -329,10 +339,18 @@ fn decompose_raw_record(
         skip_out_of_scope,
     )?;
 
+    let mut normalized = 0u64;
     let mut pending = Vec::with_capacity(atoms.len());
     for (atom_ix, atom) in atoms.into_iter().enumerate() {
         let atom = if has_reference {
-            crate::normalize::left_align(atom, ref_seq, crate::normalize::L_MAX)
+            let pre_pos = atom.pos;
+            let aligned = crate::normalize::left_align(atom, ref_seq, crate::normalize::L_MAX);
+            if aligned.pos != pre_pos {
+                normalized += 1;
+                tracing::debug!(chrom = %chrom, from = pre_pos, to = aligned.pos,
+                    "left-aligned indel");
+            }
+            aligned
         } else {
             atom
         };
@@ -362,6 +380,7 @@ fn decompose_raw_record(
         source_pos: pos,
         atoms: pending,
         dropped_out_of_scope: dropped as u64,
+        normalized,
         ref_excluded: None,
     })
 }
@@ -389,6 +408,7 @@ impl ChunkAssembler {
             source,
             num_samples,
             ploidy,
+            chrom,
             ref_seq,
             has_reference,
             skip_out_of_scope,
@@ -403,6 +423,7 @@ impl ChunkAssembler {
         source: Box<dyn RecordSource + Send>,
         num_samples: usize,
         ploidy: usize,
+        chrom: &str,
         ref_seq: Arc<Vec<u8>>,
         has_reference: bool,
         skip_out_of_scope: bool,
@@ -419,8 +440,10 @@ impl ChunkAssembler {
             owned_range,
             skip_out_of_scope,
             check_ref,
+            chrom: chrom.to_string(),
             ref_excluded: 0,
             dropped_out_of_scope: 0,
+            normalized_total: 0,
             info_fields: fields
                 .iter()
                 .filter(|f| f.category == FieldCategory::Info)
@@ -442,6 +465,12 @@ impl ChunkAssembler {
     /// read loop drains.
     pub fn dropped_out_of_scope(&self) -> u64 {
         self.dropped_out_of_scope
+    }
+
+    /// Total atoms whose position moved during left-alignment so far. Valid
+    /// after the read loop drains.
+    pub fn normalized_total(&self) -> u64 {
+        self.normalized_total
     }
 
     /// Records excluded because their REF disagreed with the reference under
@@ -488,6 +517,7 @@ impl ChunkAssembler {
                             self.skip_out_of_scope,
                             self.check_ref,
                             &self.info_fields,
+                            &self.chrom,
                         )
                     })
                     .collect::<Result<Vec<_>, _>>()
@@ -504,6 +534,7 @@ impl ChunkAssembler {
                         self.skip_out_of_scope,
                         self.check_ref,
                         &self.info_fields,
+                        &self.chrom,
                     )
                 })
                 .collect::<Result<Vec<_>, _>>()?
@@ -530,6 +561,7 @@ impl ChunkAssembler {
             }
             if source_record_owned {
                 self.dropped_out_of_scope += record.dropped_out_of_scope;
+                self.normalized_total += record.normalized;
             }
             for atom in record.atoms {
                 let atom_owned = self
@@ -857,6 +889,7 @@ mod tests {
             false,
             crate::normalize::CheckRef::Error,
             &[],
+            "chr1",
         )
         .unwrap();
         assert_eq!(
