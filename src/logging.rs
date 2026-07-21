@@ -146,16 +146,6 @@ impl EventSink {
     }
 }
 
-pub fn level_from_str(s: &str) -> Option<LevelFilter> {
-    match s {
-        "off" => Some(LevelFilter::OFF),
-        "warning" => Some(LevelFilter::WARN),
-        "info" => Some(LevelFilter::INFO),
-        "debug" => Some(LevelFilter::DEBUG),
-        _ => None,
-    }
-}
-
 fn to_log_level(l: &tracing::Level) -> LogLevel {
     match *l {
         tracing::Level::ERROR | tracing::Level::WARN => LogLevel::Warning,
