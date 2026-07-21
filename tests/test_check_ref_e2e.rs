@@ -1,6 +1,7 @@
 mod common;
 
 use common::{SynthRecord, build_bcf_with_index, build_fasta_with_index};
+use genoray_core::logging::{Event, EventSink};
 use genoray_core::normalize::CheckRef;
 use genoray_core::orchestrator::{SourceSpec, process_chromosome};
 use tempfile::TempDir;
@@ -181,4 +182,83 @@ fn vcf_list_ref_mismatch_excluded_under_x() {
         out.join("meta.json").exists(),
         "merge completed despite the bad record"
     );
+}
+
+// Restores, at the Rust level, the guarantee a removed Python stdout
+// assertion (`test_from_vcf_sharded_check_ref_exclude_counts_owned_record_once`)
+// used to check: a ref-excluded record is counted exactly ONCE in the
+// per-contig summary even when sub-contig sharding causes multiple shards'
+// padded fetch windows to see it. That summary is now `ContigDone.excluded`,
+// a real `EventSink` field (Task 5), so drive `process_chromosome` with a
+// live sink and assert on the emitted event instead of captured stdout.
+//
+// `process_chromosome`'s sharded path (`vcf_reader::plan_vcf_shards` inside
+// `orchestrator.rs`) only activates when `regions` is non-empty (an empty
+// region list disables sharding — see the Python `from_vcf` comment on why
+// it always fills `[0, len)` for whole-contig conversion) and
+// `overlap == OverlapMode::Pos`. Passing the whole-contig range explicitly,
+// a small `chunk_size` (target shard span), and `processing_threads > 1`
+// reproduces the Python test's sharded scenario (there: `threads=16,
+// chunk_size=1`) directly against the Rust entry point.
+#[test]
+fn sharded_ref_excluded_counted_once_in_contig_done() {
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("store");
+    let bcf = tmp.path().join("in.bcf");
+    let fasta = tmp.path().join("in.fa");
+    let samples = ["S0", "S1"];
+    build_bcf_with_index(&bcf, "chr1", 1000, &samples, &bcf_records());
+    build_fasta_with_index(&fasta, "chr1", 1000, &fasta_records());
+    let sample_refs: Vec<&str> = samples.to_vec();
+
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let sink = EventSink::new(tx, 1);
+
+    process_chromosome(
+        SourceSpec::Vcf {
+            vcf_path: bcf.to_str().unwrap().to_string(),
+            htslib_threads: 1,
+            // Non-empty, whole-contig range: required to enable sub-contig
+            // sharding (see comment above).
+            regions: vec![(0, 1000)],
+            overlap: genoray_core::svar2_view::OverlapMode::Pos,
+        },
+        Some(fasta.to_str().unwrap()),
+        "chr1",
+        out.to_str().unwrap(),
+        &sample_refs,
+        1, // chunk_size (target shard span, bp) -- tiny to force many shards
+        2, // ploidy
+        8 * 1024 * 1024,
+        false,             // skip_out_of_scope
+        CheckRef::Exclude, // the pos-200 REF mismatch is dropped, not an error
+        8,                 // processing_threads -- >1 so shards.len() > 1
+        false,             // signatures
+        &[],               // fields
+        &sink,
+    )
+    .expect("process_chromosome should succeed despite the excluded record");
+
+    let events: Vec<Event> = rx.try_iter().collect();
+    let contig_done: Vec<&Event> = events
+        .iter()
+        .filter(|e| matches!(e, Event::ContigDone { .. }))
+        .collect();
+    assert_eq!(
+        contig_done.len(),
+        1,
+        "expected exactly one ContigDone event, got {:?}",
+        contig_done
+    );
+    match contig_done[0] {
+        Event::ContigDone { excluded, .. } => {
+            assert_eq!(
+                *excluded, 1,
+                "the single ref-mismatched record must be counted exactly \
+                 once, even though the sharded path's padded fetch windows \
+                 let multiple shards see it"
+            );
+        }
+        _ => unreachable!(),
+    }
 }
