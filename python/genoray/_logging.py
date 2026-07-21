@@ -151,8 +151,9 @@ def write_reporting(
         yield rx, level
     finally:
         stop.set()
-        # Dropping the Rust-side pipeline senders triggers StopIteration in the
-        # drain loop; the receiver's own internal sender is released when `rx`
-        # is garbage-collected. Give the drain a bounded join.
+        # Setting `stop` makes the drain loop exit within one recv_timeout(100)
+        # tick; the bounded join below reaps it. StopIteration is never relied
+        # on here: `rx` (PyEventReceiver) holds its own keep-alive `tx`, so the
+        # channel never actually reports Disconnected.
         t.join(timeout=5.0)
         renderer.close()

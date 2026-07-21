@@ -1247,11 +1247,6 @@ impl PyEventReceiver {
     pub fn sink(&self, flush_every: u64) -> crate::logging::EventSink {
         crate::logging::EventSink::new(self.tx.clone(), flush_every)
     }
-    /// Drop the internal keep-alive sender so the drain side sees disconnect
-    /// once all pipeline senders drop. Called at end of each pyfunction.
-    pub fn tx_clone(&self) -> crossbeam_channel::Sender<crate::logging::Event> {
-        self.tx.clone()
-    }
 }
 
 #[cfg(feature = "conversion")]
