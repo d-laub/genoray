@@ -157,3 +157,37 @@ Output (one matching line, as expected):
 
 (50 samples `s0`..`s49`, 272,501 records total, generated in ~44s at
 `--target-size 5MB`.)
+
+## Generator usage
+
+Task 2 wraps the mechanism above into a reusable script,
+`scripts/from_vcf_livelock/generate_repro.py`:
+
+```bash
+python scripts/from_vcf_livelock/generate_repro.py \
+    --out <dir> --samples N --contigs chr1,chr2,... \
+    --target-size 100MB --seed K
+```
+
+| Flag | Meaning |
+|---|---|
+| `--out <dir>` | Output directory; writes `<dir>/cohort.bcf` + `<dir>/cohort.bcf.csi` |
+| `--samples N` | Number of samples |
+| `--contigs C` | Comma-separated contig names, e.g. `chr1,chr2,chr3,chr4,chr5,chr6` |
+| `--target-size S` | Approximate output size, e.g. `8MB`, `500MB` |
+| `--seed K` | RNG seed passed to `vcfixture bulk` |
+
+The script resolves the `vcfixture` binary from `PATH` first, then falls
+back to `/tmp/vcfixture-cli/bin/vcfixture` (the Task-1 install location). If
+neither is found, it raises with the install command from this README's
+"Install" section rather than silently reinstalling. It always emits a
+`cohort.bcf` with the `VAF` FORMAT header patched to `Number=A` (applying the
+reheader fallback documented above) and ensures a CSI index exists.
+
+As with all commands here, keep output under `$CLAUDE_JOB_DIR/tmp` (or an
+equivalent non-NFS scratch dir) — never the repo checkout.
+
+Covered by `tests/test_from_vcf_livelock_fixture.py`, which generates a small
+(`--target-size 8MB`, 40 samples, 6 contigs) cohort and asserts the BCF/CSI
+exist, the header carries `VAF Number=A Type=Float` and ≥5 `##contig=`
+lines, and `bcftools index -s` reports ≥5 contigs.
