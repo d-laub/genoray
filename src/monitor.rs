@@ -21,8 +21,9 @@
 // constant factor; relative comparisons across stages remain valid.
 // ─────────────────────────────────────────────────────────────────────────────
 use crossbeam_channel::Sender;
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -87,6 +88,17 @@ pub fn spawn_sampler(
     tx_sparse: Sender<SparseChunk>,
     tx_long: Sender<Vec<u8>>,
     stop: Arc<AtomicBool>,
+    // Per-chrom registry of `shard-worker-*` OS TIDs, populated by
+    // `shard_exec::run` (only the sharded VCF/PGEN branches use it -- stays
+    // empty, and the printed `shard` column stays `n/a`, for the single-reader
+    // fallback path). NOT resolved by matching the `shard-worker-{i}` thread
+    // `comm` name: worker names are pool-local (`shard-worker-0`, `-1`, ...),
+    // not chrom-qualified, so under `concurrent_chroms > 1` (the #135 livelock
+    // repro's regime) two chromosomes' pools both name a thread
+    // `shard-worker-0` -- a comm lookup would resolve to whichever one
+    // `/proc/self/task` iteration finds first, misattributing CPU across
+    // chromosomes. See `shard_exec::run`'s `worker_tids` doc comment.
+    shard_worker_tids: Arc<Mutex<Vec<i32>>>,
 ) -> thread::JoinHandle<()> {
     thread::Builder::new()
         .name(format!("samp-{}", chrom))
@@ -110,6 +122,10 @@ pub fn spawn_sampler(
             let mut tids: Vec<Option<i32>> =
                 names.iter().map(|n| find_thread_tid_by_name(n)).collect();
             let mut prev_ticks: Vec<u64> = vec![0; names.len()];
+            // Per-TID previous tick count for the shard-worker aggregate below
+            // (the fixed four pipeline threads use the parallel `prev_ticks`
+            // Vec instead, since their TIDs are looked up by name once).
+            let mut prev_shard_ticks: HashMap<i32, u64> = HashMap::new();
 
             // Channel capacities (bounded() guarantees Some(cap)).
             let dense_cap = tx_dense.capacity().unwrap_or(0);
@@ -143,6 +159,31 @@ pub fn spawn_sampler(
                     .collect();
                 prev_ticks = cur;
 
+                // De-lie `read=`: in the sharded VCF/PGEN path, `read-{chrom}`
+                // (sampled above via `cpu_pcts[0]`) just blocks in
+                // `thread::scope` waiting for the shard-worker pool, so it
+                // reads 0% even while the pool is pegged. Aggregate CPU
+                // across every registered `shard-worker-*` TID for THIS
+                // chrom instead (see `shard_worker_tids`'s doc comment above)
+                // and print it as its own `shard=` column -- `n/a` when the
+                // registry is empty (single-reader fallback path, nothing to
+                // sample).
+                let shard_tids: Vec<i32> = shard_worker_tids.lock().unwrap().clone();
+                let shard_pct = if shard_tids.is_empty() {
+                    None
+                } else {
+                    let mut dt_ticks = 0f64;
+                    let mut next_prev = HashMap::with_capacity(shard_tids.len());
+                    for tid in &shard_tids {
+                        let cur_ticks = read_thread_cpu_ticks(*tid);
+                        let prev_ticks = prev_shard_ticks.get(tid).copied().unwrap_or(0);
+                        dt_ticks += cur_ticks.saturating_sub(prev_ticks) as f64;
+                        next_prev.insert(*tid, cur_ticks);
+                    }
+                    prev_shard_ticks = next_prev;
+                    Some(100.0 * dt_ticks / CLK_TCK_HZ / interval.as_secs_f64())
+                };
+
                 let fmt =
                     |o: Option<f64>| o.map_or_else(|| "n/a".to_string(), |v| format!("{:.0}%", v));
                 let elapsed = start.elapsed().as_secs();
@@ -153,7 +194,11 @@ pub fn spawn_sampler(
                     dense = tx_dense.len(), dense_cap = dense_cap,
                     sparse = tx_sparse.len(), sparse_cap = sparse_cap,
                     long = tx_long.len(), long_cap = long_cap,
+                    // `cpu_read` reads 0% in the sharded path (the reader thread
+                    // just blocks on the shard-worker pool); `cpu_shard` is the
+                    // de-lied aggregate CPU across this chrom's shard workers.
                     cpu_read = %fmt(cpu_pcts[0]),
+                    cpu_shard = %fmt(shard_pct),
                     cpu_exec = %fmt(cpu_pcts[1]),
                     cpu_cw = %fmt(cpu_pcts[2]),
                     cpu_lw = %fmt(cpu_pcts[3]),

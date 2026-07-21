@@ -10,6 +10,7 @@ use crate::enum_map::EnumKey;
 use crate::error::ConversionError;
 use crate::nrvk::LongAlleleTableWriter;
 use crate::streams::{REGISTRY, StreamMap, StreamTag};
+use crate::trace::trace_ll;
 use crate::{executor, merge, monitor, writer};
 
 /*
@@ -337,6 +338,13 @@ pub fn process_chromosome(
     let (tx_sparse, rx_sparse) = bounded::<crate::types::SparseChunk>(8);
     let (tx_long, rx_long) = bounded::<Vec<u8>>(2);
 
+    // Registry of `shard-worker-*` OS TIDs for THIS contig, populated by
+    // `shard_exec::run` (sharded VCF/PGEN branches only) and read by the
+    // monitor sampler below to de-lie its `read=0%` column -- see
+    // `shard_exec::run`'s `worker_tids` doc comment for why a shared registry
+    // is required instead of matching threads by `comm` name.
+    let shard_worker_tids: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
+
     // Periodic monitoring sampler. Owns Sender clones for read-only len()/capacity()
     // introspection. The clones drop when the sampler joins, allowing the executor's
     // rx_dense.recv() to see channel-close once the reader's Sender also drops.
@@ -347,6 +355,7 @@ pub fn process_chromosome(
         tx_sparse.clone(),
         tx_long.clone(),
         stop_sampler.clone(),
+        Arc::clone(&shard_worker_tids),
     );
 
     // Step 1 -> The Producer
@@ -358,6 +367,7 @@ pub fn process_chromosome(
             // Convert references into owned Strings that can safely live forever in the thread
             let s_owned: Vec<String> = samples.iter().map(|&s| s.to_string()).collect();
             let fields_owned: Vec<crate::field::FieldSpec> = fields.to_vec();
+            let shard_worker_tids = Arc::clone(&shard_worker_tids);
 
             // Returns `(dropped_out_of_scope, ref_excluded, normalized_total)` so
             // the caller can feed `EventSink::contig_done`'s `excluded` arg (and
@@ -423,7 +433,13 @@ pub fn process_chromosome(
                                     ordinal: s.ordinal,
                                 })
                                 .collect();
+                            trace_ll!(
+                                "[plan {chr}] workers={} shards={}",
+                                processing_threads,
+                                units.len()
+                            );
                             let totals = crate::shard_exec::run(
+                                &chr,
                                 units,
                                 processing_threads,
                                 |unit| {
@@ -464,6 +480,7 @@ pub fn process_chromosome(
                                 },
                                 chunk_size,
                                 &tx_dense,
+                                &shard_worker_tids,
                             )?;
                             report_ref_excluded(&chr, totals.ref_excluded);
                             report_normalized(&chr, totals.normalized_total);
@@ -599,7 +616,13 @@ pub fn process_chromosome(
                             // `readers.len()` above.
                             let readers_pool: Vec<Mutex<Option<pyo3::Py<pyo3::PyAny>>>> =
                                 readers.into_iter().map(|r| Mutex::new(Some(r))).collect();
+                            trace_ll!(
+                                "[plan {chr}] workers={} shards={}",
+                                processing_threads,
+                                units.len()
+                            );
                             let totals = crate::shard_exec::run(
+                                &chr,
                                 units,
                                 processing_threads,
                                 |unit| {
@@ -647,6 +670,7 @@ pub fn process_chromosome(
                                 |e, unit| with_pgen_shard_context(e, &chr, unit),
                                 chunk_size,
                                 &tx_dense,
+                                &shard_worker_tids,
                             )?;
                             report_ref_excluded(&chr, totals.ref_excluded);
                             report_normalized(&chr, totals.normalized_total);

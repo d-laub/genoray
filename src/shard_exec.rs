@@ -17,14 +17,26 @@
 
 use crossbeam_channel::{Sender, bounded, unbounded};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crate::chunk_assembler::ChunkAssembler;
 use crate::error::ConversionError;
 use crate::shard::WorkUnit;
+use crate::trace::trace_ll;
 use crate::types::DenseChunk;
+
+/// Current OS thread id (Linux `gettid`, distinct from the process pid and
+/// from Rust's internal `std::thread::ThreadId`). Used ONLY to populate
+/// `worker_tids` for `monitor.rs`'s per-chrom CPU sampling -- see that
+/// param's doc comment on [`run`] for why a shared TID registry is needed
+/// instead of matching threads by `comm` name.
+#[cfg(target_os = "linux")]
+fn current_tid() -> i32 {
+    // SAFETY: SYS_gettid takes no arguments and cannot fail.
+    unsafe { libc::syscall(libc::SYS_gettid) as i32 }
+}
 
 /// Pure ordering oracle: decides WHEN a `(ordinal, local)` tag may be handed
 /// the next global id, given shards can finish (or even stream their own
@@ -144,16 +156,37 @@ pub struct ShardTotals {
 /// unit's shard-region context (see `orchestrator::with_vcf_shard_context`);
 /// this module stays backend-agnostic about how a `WorkUnit` is described.
 ///
+/// `chrom` labels the `GENORAY_TRACE` heartbeats emitted at the reader
+/// assembly and `tx_dense`-forward seams (see `trace_ll!` call sites below);
+/// it is not otherwise used when tracing is off.
+///
+/// `worker_tids` is a per-chrom registry each spawned `shard-worker-*`
+/// thread pushes its own OS TID into on startup, for `monitor.rs` to sample.
+/// A shared registry -- rather than resolving TIDs by matching the
+/// `shard-worker-{i}` thread `comm` name -- is required because worker
+/// names are NOT namespaced by chrom (just the pool-local index `i`): when
+/// multiple chromosomes run concurrently (`concurrent_chroms > 1`, the
+/// livelock repro's regime), each chromosome's pool spawns its own
+/// `shard-worker-0`, `shard-worker-1`, ... independently, so e.g. two
+/// concurrent single-worker pools BOTH name their one thread
+/// `shard-worker-0` -- a `comm`-name lookup would resolve to whichever one
+/// `/proc/self/task` iteration happens to find first, misattributing CPU
+/// across chromosomes. The caller creates a fresh registry per
+/// `process_chromosome` call and hands the same `Arc` to `monitor::spawn_sampler`.
+///
 /// Returns the [`ShardTotals`] (summed `dropped_out_of_scope`, `ref_excluded`,
 /// and `normalized_total`) across every unit, or the first error encountered
 /// (context-decorated).
+#[allow(clippy::too_many_arguments)]
 pub fn run<F, G>(
+    chrom: &str,
     units: Vec<WorkUnit>,
     workers: usize,
     make_assembler: F,
     err_context: G,
     chunk_size: usize,
     tx_dense: &Sender<DenseChunk>,
+    worker_tids: &Mutex<Vec<i32>>,
 ) -> Result<ShardTotals, ConversionError>
 where
     F: Fn(&WorkUnit) -> Result<ChunkAssembler, ConversionError> + Sync,
@@ -198,6 +231,18 @@ where
             let handle = thread::Builder::new()
                 .name(name.clone())
                 .spawn_scoped(scope, move || {
+                    // Register this OS thread's TID once at startup so
+                    // `monitor.rs` can sample its CPU under the OWNING
+                    // chrom (see `worker_tids`'s doc comment on `run` for
+                    // why comm-name matching alone can't do this). Linux
+                    // only (no `/proc`, and no portable `gettid`, elsewhere
+                    // -- `monitor.rs`'s CPU columns already print `n/a` on
+                    // those platforms). The `let _` keeps the capture used
+                    // on every platform so non-Linux builds don't warn on
+                    // an otherwise-unused closure capture.
+                    let _ = &worker_tids;
+                    #[cfg(target_os = "linux")]
+                    worker_tids.lock().unwrap().push(current_tid());
                     while !cancel.load(Ordering::Relaxed) {
                         let unit = match rx_work.recv() {
                             Ok(u) => u,
@@ -226,6 +271,12 @@ where
                             }
                             match asm.read_next_chunk(chunk_size, local, None) {
                                 Ok(Some(chunk)) => {
+                                    trace_ll!(
+                                        "[trace {chrom}] reader: shard {i} assembled chunk \
+                                         (unit ordinal {}) local={local} rows={}",
+                                        unit.ordinal,
+                                        chunk.pos.len()
+                                    );
                                     if tx_res
                                         .send(Msg::Chunk {
                                             unit_ordinal: unit.ordinal,
@@ -297,6 +348,9 @@ where
                         rb.push(unit_ordinal, local, false, &mut |gid, tag| {
                             if let Some(mut c) = pending.remove(&tag) {
                                 c.chunk_id = gid;
+                                trace_ll!(
+                                    "[trace {chrom}] reader: forwarded ordinal {gid} to tx_dense"
+                                );
                                 tx_dense.send(c).ok();
                             }
                         });
@@ -316,6 +370,9 @@ where
                         rb.push(unit_ordinal, 0, true, &mut |gid, tag| {
                             if let Some(mut c) = pending.remove(&tag) {
                                 c.chunk_id = gid;
+                                trace_ll!(
+                                    "[trace {chrom}] reader: forwarded ordinal {gid} to tx_dense"
+                                );
                                 tx_dense.send(c).ok();
                             }
                         });
