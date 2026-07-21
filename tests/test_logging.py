@@ -1,3 +1,4 @@
+import hashlib
 import io
 import subprocess
 import threading
@@ -255,3 +256,53 @@ def test_from_svar1_emits_summary(tmp_path, capsys):
     counts_info = sv_info.region_counts("chr1", [(0, 40)])
     counts_off = sv_off.region_counts("chr1", [(0, 40)])
     assert counts_info.tolist() == counts_off.tolist()
+
+
+def _dir_digest(root: Path) -> dict[str, str]:
+    """Content hash of every file under `root` except `meta.json` (see
+    `tests/test_svar2_write_view.py::_dir_digest` -- `meta.json` is excluded
+    there too, keeping this comparison purely about sidecar bytes)."""
+    return {
+        str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
+        for p in sorted(root.rglob("*"))
+        if p.is_file() and p.name != "meta.json"
+    }
+
+
+def test_write_view_emits_summary(svar2_store, tmp_path, capsys):
+    """`write_view`'s progress/log_level plumbing (unlike the other four
+    `from_*` writers, `run_slice_view` was not wired for Task 11 -- this is
+    Task 12's write_view leg). Reuses the shared `svar2_store` fixture
+    (`tests/conftest.py`) rather than building a fresh store, mirroring how
+    `tests/test_svar2_write_view.py` slices that same fixture."""
+    sv = SparseVar2(svar2_store)
+
+    out_info = tmp_path / "view_info.svar2"
+    sv.write_view(
+        (sv.contigs[0], 0, 40),
+        sv.available_samples,
+        out_info,
+        progress=False,
+        log_level="info",
+    )
+    captured = capsys.readouterr()
+    assert "done" in captured.out.lower()
+
+    out_off = tmp_path / "view_off.svar2"
+    sv.write_view(
+        (sv.contigs[0], 0, 40),
+        sv.available_samples,
+        out_off,
+        progress=False,
+        log_level="off",
+    )
+    captured_off = capsys.readouterr()
+    assert captured_off.out == ""
+
+    # Logging is a pure side channel: the sliced output is byte-identical
+    # regardless of log_level.
+    assert _dir_digest(out_info) == _dir_digest(out_off)
+    a = SparseVar2(out_info)
+    b = SparseVar2(out_off)
+    assert a.available_samples == b.available_samples
+    assert a.contigs == b.contigs

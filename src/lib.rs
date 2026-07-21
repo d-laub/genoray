@@ -592,7 +592,7 @@ fn merge_regions(mut regions: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
 #[allow(clippy::type_complexity)]
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (store_path, out_dir, contigs, samples, regions, regions_overlap, merge_overlapping, fields, reference=None, reroute=false, max_threads=None, overwrite=false))]
+#[pyo3(signature = (store_path, out_dir, contigs, samples, regions, regions_overlap, merge_overlapping, fields, reference=None, reroute=false, max_threads=None, overwrite=false, log_level="info".to_string(), receiver=None))]
 pub fn run_slice_view(
     py: Python,
     store_path: String,
@@ -607,6 +607,8 @@ pub fn run_slice_view(
     reroute: bool,
     max_threads: Option<usize>,
     overwrite: bool,
+    log_level: String,
+    receiver: Option<Py<PyEventReceiver>>,
 ) -> PyResult<()> {
     use crate::error::ConversionError;
     use crate::field::{FieldCategory, FieldSpec, HtslibType, StorageDtype};
@@ -656,6 +658,13 @@ pub fn run_slice_view(
     if out_contigs.is_empty() {
         return Err(ConversionError::Input("no regions selected any contig".to_string()).into());
     }
+    // Contigs named in `contigs` but with no matching region: silently
+    // filtered from `out_contigs` above. Logged (not warned — this is
+    // expected, not an error) once the channel subscriber is live below.
+    let skipped_contigs: Vec<&String> = contigs
+        .iter()
+        .filter(|c| !out_contigs.contains(c))
+        .collect();
 
     // Source meta -> subset sample column indices + inherited ploidy.
     let (src_samples, ploidy) = read_store_meta(&store_path)?;
@@ -785,70 +794,91 @@ pub fn run_slice_view(
     // `reference=` each in-flight contig also holds that contig's reference
     // sequence resident (~250 MB for chr1) for its mutcat recompute.
     let n_subset = samples_orig_idx.len();
+    // See `run_conversion_pipeline`'s sink-construction comment: `EventSink`'s
+    // progress buffer is keyed per-chrom, so it's safe under this slicer's
+    // concurrent per-contig dispatch too.
+    let sink = match &receiver {
+        Some(r) => r.borrow(py).sink(1), // coarse: no per-record ticks here, flush_every irrelevant
+        None => crate::logging::EventSink::disabled(),
+    };
+    let level = log_level.clone();
     let results: Vec<Result<usize, ConversionError>> = py.detach(|| {
-        let available_cores = match max_threads {
-            Some(t) if t > 0 => t,
-            _ => std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1),
-        };
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(available_cores.min(out_contigs.len()).max(1))
-            .thread_name(|i| format!("slice-{i}"))
-            .build()
-            .unwrap();
-        pool.install(|| {
-            out_contigs
-                .par_iter()
-                .map(|chrom| {
-                    let mut chrom_regions =
-                        by_contig.get(chrom.as_str()).cloned().unwrap_or_default();
-                    if merge_overlapping {
-                        chrom_regions = merge_regions(chrom_regions);
-                    }
-                    let n = crate::svar2_slice::slice_contig(
-                        &store_path,
-                        &out_dir,
-                        chrom,
-                        &samples_orig_idx,
-                        ploidy,
-                        &chrom_regions,
-                        overlap_mode,
-                        &fields_spec,
-                        routing,
-                        sidecar_bits_enabled,
-                        info_bits,
-                        format_bits,
-                    )?;
+        crate::logging::with_channel_subscriber(sink.clone(), &level, || {
+            for c in &skipped_contigs {
+                tracing::debug!(chrom = %c, "contig has no regions; skipped");
+            }
+            let available_cores = match max_threads {
+                Some(t) if t > 0 => t,
+                _ => std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1),
+            };
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(available_cores.min(out_contigs.len()).max(1))
+                .thread_name(|i| format!("slice-{i}"))
+                .build()
+                .unwrap();
+            let sink = &sink;
+            pool.install(|| {
+                out_contigs
+                    .par_iter()
+                    .map(|chrom| {
+                        let started = std::time::Instant::now();
+                        sink.contig_start(chrom, None);
+                        let mut chrom_regions =
+                            by_contig.get(chrom.as_str()).cloned().unwrap_or_default();
+                        if merge_overlapping {
+                            chrom_regions = merge_regions(chrom_regions);
+                        }
+                        let n = crate::svar2_slice::slice_contig(
+                            &store_path,
+                            &out_dir,
+                            chrom,
+                            &samples_orig_idx,
+                            ploidy,
+                            &chrom_regions,
+                            overlap_mode,
+                            &fields_spec,
+                            routing,
+                            sidecar_bits_enabled,
+                            info_bits,
+                            format_bits,
+                        )?;
 
-                    // Mutcat is detected purely from `mutcat/*/code.bin` on disk (see
-                    // Python's `_is_annotated`), so recompute it over the sliced output
-                    // when a reference is given -- nothing is stamped into meta.json.
-                    // The reference was validated up front (see the fail-fast band), so
-                    // this loads lazily: peak O(1 contig) resident PER IN-FLIGHT TASK,
-                    // dropped once that task's (single) contig is annotated.
-                    if let Some(fasta) = reference.as_deref() {
-                        let ref_seq = crate::vcf_reader::load_contig_seq(fasta, chrom)?;
-                        let reader =
-                            crate::query::ContigReader::open(&out_dir, chrom, n_subset, ploidy)
-                                .map_err(|e| ConversionError::Io {
-                                    context: format!("{out_dir}/{chrom}"),
-                                    source: e,
-                                })?;
-                        let paths = crate::layout::ContigPaths::new(&out_dir, chrom);
-                        // Views are strand-free (write_view takes no `gtf=`,
-                        // mirroring write-time `signatures=True`): no
-                        // StrandIntervals, so SBS192/384 are unavailable on a
-                        // sliced view, same as a `from_vcf(signatures=True)` store.
-                        crate::mutcat::annotate::annotate_contig(&reader, &paths, &ref_seq, None)
+                        // Mutcat is detected purely from `mutcat/*/code.bin` on disk (see
+                        // Python's `_is_annotated`), so recompute it over the sliced output
+                        // when a reference is given -- nothing is stamped into meta.json.
+                        // The reference was validated up front (see the fail-fast band), so
+                        // this loads lazily: peak O(1 contig) resident PER IN-FLIGHT TASK,
+                        // dropped once that task's (single) contig is annotated.
+                        if let Some(fasta) = reference.as_deref() {
+                            let ref_seq = crate::vcf_reader::load_contig_seq(fasta, chrom)?;
+                            let reader =
+                                crate::query::ContigReader::open(&out_dir, chrom, n_subset, ploidy)
+                                    .map_err(|e| ConversionError::Io {
+                                        context: format!("{out_dir}/{chrom}"),
+                                        source: e,
+                                    })?;
+                            let paths = crate::layout::ContigPaths::new(&out_dir, chrom);
+                            // Views are strand-free (write_view takes no `gtf=`,
+                            // mirroring write-time `signatures=True`): no
+                            // StrandIntervals, so SBS192/384 are unavailable on a
+                            // sliced view, same as a `from_vcf(signatures=True)` store.
+                            crate::mutcat::annotate::annotate_contig(
+                                &reader, &paths, &ref_seq, None,
+                            )
                             .map_err(|e| ConversionError::Io {
-                            context: format!("annotate mutcat {out_dir}/{chrom}"),
-                            source: e,
-                        })?;
-                    }
-                    Ok(n)
-                })
-                .collect()
+                                context: format!("annotate mutcat {out_dir}/{chrom}"),
+                                source: e,
+                            })?;
+                        }
+                        // Slicing excludes nothing (it's a pure subset of an
+                        // already-finished store) -- `excluded` is always 0.
+                        sink.contig_done(chrom, n as u64, 0, started.elapsed().as_millis() as u64);
+                        Ok(n)
+                    })
+                    .collect()
+            })
         })
     });
     for r in results {
