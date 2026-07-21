@@ -2,7 +2,8 @@
 use crossbeam_channel::Sender;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Mutex, Once};
 use tracing::field::{Field, Visit};
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::layer::{Context, Layer};
@@ -187,51 +188,162 @@ impl Visit for FieldGrab {
     }
 }
 
-pub struct ChannelLayer {
-    sink: EventSink,
+// --- Process-global routing state --------------------------------------
+//
+// `tracing::subscriber::with_default` is THREAD-LOCAL: it does not propagate
+// to OS threads spawned below a rayon pool (reader/executor/writer threads
+// inside `process_chromosome`), so events emitted there were silently
+// dropped. `tracing`'s cross-thread propagation only works through the
+// process-global default subscriber (`set_global_default`), so instead of
+// scoping the *subscriber*, we install ONE global subscriber for the whole
+// process and scope only the *destination* (which `EventSink` is currently
+// "live", and at what verbosity) via these globals.
+//
+// Which sink (if any) `ChannelLayer` routes to right now. Set for the
+// duration of a write via `with_channel_subscriber`; `None` otherwise (e.g.
+// pure-Rust bench runs, or between writes).
+static CURRENT_SINK: Mutex<Option<EventSink>> = Mutex::new(None);
+// Current channel log level as a rank: off=0, warning=1, info=2, debug=3.
+static CURRENT_LEVEL: AtomicU8 = AtomicU8::new(2); // info
+
+fn level_rank(s: &str) -> u8 {
+    match s {
+        "off" => 0,
+        "warning" => 1,
+        "info" => 2,
+        "debug" => 3,
+        _ => 2,
+    }
 }
+
+fn event_rank(l: &tracing::Level) -> u8 {
+    match *l {
+        tracing::Level::ERROR | tracing::Level::WARN => 1,
+        tracing::Level::INFO => 2,
+        // TRACE is treated as debug for channel gating, but TRACE events
+        // never reach `on_event` in the first place: the channel layer is
+        // filtered to max DEBUG at install time (see `ensure_global_subscriber`)
+        // so `genoray::monitor`'s trace-level sampler stays GENORAY_LOG-only.
+        tracing::Level::DEBUG | tracing::Level::TRACE => 3,
+    }
+}
+
+pub struct ChannelLayer;
 impl ChannelLayer {
-    pub fn new(sink: EventSink) -> Self {
-        Self { sink }
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for ChannelLayer {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 impl<S: tracing::Subscriber> Layer<S> for ChannelLayer {
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
-        let mut g = FieldGrab::default();
-        event.record(&mut g);
-        self.sink.send_log(
-            to_log_level(event.metadata().level()),
-            g.chrom.as_deref(),
-            event.metadata().target(),
-            g.message,
-        );
+        // Channel-level gate: drop events more verbose than the active level,
+        // and drop everything when level is "off" (rank 0).
+        let active = CURRENT_LEVEL.load(Ordering::Relaxed);
+        let lvl = event.metadata().level();
+        if active == 0 || event_rank(lvl) > active {
+            return;
+        }
+        // Clone the sink (Arc-backed, cheap) out of the guard and drop the
+        // lock before sending, so the critical section is just the clone.
+        let sink = { CURRENT_SINK.lock().unwrap().clone() };
+        if let Some(sink) = sink {
+            let mut g = FieldGrab::default();
+            event.record(&mut g);
+            sink.send_log(
+                to_log_level(lvl),
+                g.chrom.as_deref(),
+                event.metadata().target(),
+                g.message,
+            );
+        }
     }
 }
 
-pub fn with_channel_subscriber<R>(sink: EventSink, level: &str, f: impl FnOnce() -> R) -> R {
-    let filter = level_from_str(level).unwrap_or(LevelFilter::INFO);
-    let subscriber =
-        tracing_subscriber::registry().with(ChannelLayer::new(sink).with_filter(filter));
-    tracing::subscriber::with_default(subscriber, f)
+static INSTALL: Once = Once::new();
+
+/// Install the single process-global tracing subscriber, at most once per
+/// process. Combines the channel layer (routes to `CURRENT_SINK`, gated by
+/// `CURRENT_LEVEL`) with an optional stderr fmt layer driven by `GENORAY_LOG`.
+/// A library installing a global default is impolite but REQUIRED for
+/// cross-thread routing (see module-level comment above); if the host
+/// process already installed a global default, `set_global_default` fails
+/// and we ignore the error — channel logging degrades gracefully (the
+/// progress bar is unaffected: it uses direct `EventSink` sends, not
+/// `tracing`).
+fn ensure_global_subscriber() {
+    INSTALL.call_once(|| {
+        // Channel layer is filtered to max DEBUG so `on_event` ever sees
+        // debug events at all; the real per-write gate is `CURRENT_LEVEL`
+        // inside `on_event`. TRACE stays out of the channel entirely.
+        let channel = ChannelLayer::new().with_filter(LevelFilter::DEBUG);
+        // Optional stderr fmt layer, only active when GENORAY_LOG is set.
+        let fmt_filter = tracing_subscriber::EnvFilter::try_from_env("GENORAY_LOG").ok();
+        let fmt = fmt_filter.map(|f| {
+            tracing_subscriber::fmt::layer()
+                .with_target(true)
+                .compact()
+                .with_writer(std::io::stderr)
+                .with_filter(f)
+        });
+        let subscriber = tracing_subscriber::registry().with(channel).with(fmt);
+        let _ = tracing::subscriber::set_global_default(subscriber);
+    });
 }
 
-static FMT_INIT: std::sync::Once = std::sync::Once::new();
+/// Route `tracing::` events emitted during `f` (from ANY thread, including
+/// OS threads spawned below a rayon pool) to `sink` at `level`.
+///
+/// NOTE on concurrency: `CURRENT_SINK`/`CURRENT_LEVEL` are process-global
+/// slots, not thread-local or call-scoped. Nested/sequential calls on one
+/// thread compose correctly (each restores the caller's previous
+/// sink/level on exit, RAII-style, even on panic). But two *concurrent*
+/// `with_channel_subscriber` calls in the same process (e.g. two Python
+/// threads each calling `from_vcf` at once) share the one global slot —
+/// last writer wins. This is an accepted limitation: the progress bar is
+/// unaffected (it sends directly to its `EventSink`, bypassing `tracing`),
+/// and concurrent in-process writes are not a supported logging scenario.
+pub fn with_channel_subscriber<R>(sink: EventSink, level: &str, f: impl FnOnce() -> R) -> R {
+    ensure_global_subscriber();
+    let prev_level = CURRENT_LEVEL.swap(level_rank(level), Ordering::Relaxed);
+    let prev_sink = {
+        let mut g = CURRENT_SINK.lock().unwrap();
+        g.replace(sink)
+    };
 
-/// Install a global stderr fmt subscriber driven by `GENORAY_LOG`, at most once
-/// per process. Called by pure-Rust entry points (bench bin) — NOT by the
-/// Python pipeline, which uses `with_channel_subscriber` instead.
+    struct Restore {
+        prev_level: u8,
+        prev_sink: Option<EventSink>,
+    }
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CURRENT_LEVEL.store(self.prev_level, Ordering::Relaxed);
+            *CURRENT_SINK.lock().unwrap() = self.prev_sink.take();
+        }
+    }
+    let _restore = Restore {
+        prev_level,
+        prev_sink,
+    };
+
+    f()
+}
+
+/// Install the global tracing subscriber, at most once per process, so a
+/// pure-Rust entry point (bench bin) gets the `GENORAY_LOG` stderr fmt layer.
+/// Called by `src/bin/bench_from_vcf_list.rs` — NOT by the Python pipeline,
+/// which uses `with_channel_subscriber` instead. Since `CURRENT_SINK` stays
+/// `None` outside of a `with_channel_subscriber` scope, only the fmt layer
+/// fires here (when `GENORAY_LOG` is set) — same observable behavior as the
+/// old thread-local-only fallback.
 pub fn install_fmt_fallback() {
-    FMT_INIT.call_once(|| {
-        let filter = tracing_subscriber::EnvFilter::try_from_env("GENORAY_LOG")
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_target(true)
-            .compact()
-            .with_writer(std::io::stderr)
-            .try_init();
-    });
+    ensure_global_subscriber();
 }
 
 #[cfg(test)]
@@ -325,9 +437,19 @@ mod tests {
         sink.contig_done("chr1", 1, 0, 1); // must not panic
     }
 
+    // `CURRENT_SINK`/`CURRENT_LEVEL` are process-global (that's the whole point
+    // of the fix — cross-thread propagation), which means the tests below that
+    // call `with_channel_subscriber` share that global state. `cargo test` runs
+    // tests in parallel threads by default, so without serializing them here
+    // they could interleave and cross-talk (exactly the documented "concurrent
+    // in-process writes: last writer wins" limitation) — flaky, not a real bug.
+    // A test-only lock keeps this file's tests deterministic.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn channel_layer_routes_events_at_level() {
         use crossbeam_channel::unbounded;
+        let _guard = TEST_LOCK.lock().unwrap();
         let (tx, rx) = unbounded();
         let sink = EventSink::new(tx, 1);
         with_channel_subscriber(sink, "info", || {
@@ -344,5 +466,41 @@ mod tests {
         assert_eq!(logs.len(), 1);
         assert_eq!(logs[0].0, "chr1");
         assert!(logs[0].1.contains("excluded 12"));
+    }
+
+    /// Regression guard for the global-subscriber fix: events emitted from an
+    /// OS thread spawned *inside* `with_channel_subscriber` (standing in for
+    /// the reader/executor/writer threads `process_chromosome` spawns below a
+    /// rayon pool) must still reach the channel. Under the old thread-local
+    /// `tracing::subscriber::with_default` mechanism this FAILS (the spawned
+    /// thread has no subscriber at all, so the event is dropped); under the
+    /// process-global mechanism it PASSES.
+    #[test]
+    fn global_subscriber_routes_from_spawned_thread() {
+        use crossbeam_channel::unbounded;
+        let _guard = TEST_LOCK.lock().unwrap();
+        let (tx, rx) = unbounded();
+        let sink = EventSink::new(tx, 1);
+        with_channel_subscriber(sink, "debug", || {
+            std::thread::spawn(|| {
+                tracing::info!(chrom = "chrX", "from worker");
+            })
+            .join()
+            .unwrap();
+        });
+        let logs: Vec<(String, String)> = rx
+            .try_iter()
+            .filter_map(|e| match e {
+                Event::Log { chrom, message, .. } => Some((chrom.unwrap_or_default(), message)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            logs.len(),
+            1,
+            "expected exactly one Log event from the spawned thread"
+        );
+        assert_eq!(logs[0].0, "chrX");
+        assert!(logs[0].1.contains("from worker"));
     }
 }

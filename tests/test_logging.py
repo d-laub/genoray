@@ -188,6 +188,45 @@ def test_from_vcf_list_emits_summary(tmp_path, capsys):
     assert counts_info.tolist() == counts_off.tolist()
 
 
+def test_below_pool_logs_surface_at_debug(tmp_path, capsys):
+    """Regression guard for the process-global tracing subscriber fix.
+
+    `resolve_fasta_contig`/`load_contig_seq` (contig-name resolution) and the
+    check_ref=x exclusion path both run INSIDE `process_chromosome`, below
+    the rayon pool `from_vcf` dispatches onto -- exactly the code path that
+    was silently dropped under the old thread-local `tracing` subscriber.
+    Trigger both: a VCF whose #CHROM is "1" against a FASTA contig "chr1"
+    (forces contig-name normalization), plus a record whose REF disagrees
+    with the reference under check_ref="x" (forces a below-pool exclusion
+    log). If either below-pool message goes missing, the fix regressed.
+    """
+    ref = tmp_path / "ref.fa"
+    ref.write_text(f">chr1\n{_REF}\n")
+    subprocess.run(["samtools", "faidx", str(ref)], check=True)
+    body = (
+        "##fileformat=VCFv4.2\n"
+        "##contig=<ID=1,length=40>\n"
+        '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n'
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS0\tS1\n"
+        # pos 3 is really 'A' in _REF -- 'T' here is a deliberate REF mismatch.
+        "1\t3\t.\tT\tG\t.\t.\t.\tGT\t1|0\t0|0\n"
+        "1\t7\t.\tC\tCAT\t.\t.\t.\tGT\t0|1\t1|1\n"
+    )
+    plain = tmp_path / "in.vcf"
+    plain.write_text(body)
+    gz = tmp_path / "in.vcf.gz"
+    with open(gz, "wb") as fh:
+        subprocess.run(["bgzip", "-c", str(plain)], check=True, stdout=fh)
+    subprocess.run(["bcftools", "index", str(gz)], check=True)
+
+    out = tmp_path / "out.svar2"
+    SparseVar2.from_vcf(out, gz, ref, check_ref="x", progress=False, log_level="debug")
+    captured = capsys.readouterr()
+    lower = captured.out.lower()
+    assert "resolv" in lower or "normaliz" in lower, captured.out
+    assert "exclud" in lower, captured.out
+
+
 def test_from_svar1_emits_summary(tmp_path, capsys):
     from genoray import SparseVar
     from genoray import VCF as _V1VCF
