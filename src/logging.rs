@@ -1,7 +1,8 @@
 //! SVAR2 write-path logging & progress events bridged to Python.
 use crossbeam_channel::Sender;
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use tracing::field::{Field, Visit};
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::layer::{Context, Layer};
@@ -55,7 +56,10 @@ pub struct EventSink {
 
 struct SinkInner {
     tx: Sender<Event>,
-    pending: AtomicU64,
+    // Keyed by chrom so ticks from concurrently-dispatched contigs (rayon
+    // fan-out over chroms) never accumulate into a shared counter and get
+    // flushed under the wrong chrom's label.
+    pending: Mutex<HashMap<String, u64>>,
     flush_every: u64,
 }
 
@@ -64,7 +68,7 @@ impl EventSink {
         EventSink {
             inner: Some(Arc::new(SinkInner {
                 tx,
-                pending: AtomicU64::new(0),
+                pending: Mutex::new(HashMap::new()),
                 flush_every: flush_every.max(1),
             })),
         }
@@ -84,23 +88,31 @@ impl EventSink {
 
     pub fn tick(&self, chrom: &str, n: u64) {
         if let Some(i) = &self.inner {
-            let prev = i.pending.fetch_add(n, Ordering::Relaxed) + n;
-            if prev >= i.flush_every {
-                // Take whatever is currently buffered and emit it.
-                let take = i.pending.swap(0, Ordering::Relaxed);
-                if take > 0 {
-                    let _ = i.tx.send(Event::Progress {
-                        chrom: chrom.to_string(),
-                        delta: take,
-                    });
+            let take = {
+                let mut map = i.pending.lock().unwrap();
+                let entry = map.entry(chrom.to_string()).or_insert(0);
+                *entry += n;
+                if *entry >= i.flush_every {
+                    std::mem::replace(entry, 0)
+                } else {
+                    0
                 }
+            };
+            if take > 0 {
+                let _ = i.tx.send(Event::Progress {
+                    chrom: chrom.to_string(),
+                    delta: take,
+                });
             }
         }
     }
 
     pub fn flush(&self, chrom: &str) {
         if let Some(i) = &self.inner {
-            let take = i.pending.swap(0, Ordering::Relaxed);
+            let take = {
+                let mut map = i.pending.lock().unwrap();
+                map.remove(chrom).unwrap_or(0)
+            };
             if take > 0 {
                 let _ = i.tx.send(Event::Progress {
                     chrom: chrom.to_string(),
@@ -265,6 +277,45 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn tick_attributes_per_chrom_under_interleaving() {
+        let (tx, rx) = unbounded();
+        let sink = EventSink::new(tx, 100);
+
+        sink.tick("chrA", 60);
+        sink.tick("chrB", 60);
+        sink.tick("chrA", 60); // chrA now 120 >= 100 -> emits Progress{chrom:"chrA", delta:120}
+        sink.flush("chrA"); // chrA remainder 0 -> nothing
+        sink.flush("chrB"); // chrB 60 -> emits Progress{chrom:"chrB", delta:60}
+
+        let progress: Vec<(String, u64)> = rx
+            .try_iter()
+            .filter_map(|e| match e {
+                Event::Progress { chrom, delta } => Some((chrom, delta)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(progress.len(), 2, "expected exactly two Progress events");
+        assert!(progress.contains(&("chrA".to_string(), 120)));
+        assert!(progress.contains(&("chrB".to_string(), 60)));
+
+        // No Progress event may mix counts across chroms: totals per chrom
+        // must equal exactly what was ticked for that chrom.
+        let chr_a_total: u64 = progress
+            .iter()
+            .filter(|(c, _)| c == "chrA")
+            .map(|(_, d)| d)
+            .sum();
+        let chr_b_total: u64 = progress
+            .iter()
+            .filter(|(c, _)| c == "chrB")
+            .map(|(_, d)| d)
+            .sum();
+        assert_eq!(chr_a_total, 120);
+        assert_eq!(chr_b_total, 60);
     }
 
     #[test]

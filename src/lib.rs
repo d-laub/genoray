@@ -183,14 +183,12 @@ fn run_conversion_pipeline(
 
     // `receiver` is `None` unless the Python caller opted in (Task 11/12), in
     // which case `sink` publishes into its channel; otherwise a disabled sink
-    // is a pure no-op. NOTE: `EventSink`'s progress buffer is a SINGLE shared
-    // counter, not keyed by chrom -- safe only when at most one
-    // `process_chromosome` call is ticking it at a time. This pipeline
-    // dispatches chroms CONCURRENTLY (`concurrent_chroms` via
-    // `plan_thread_budget`, can exceed 1), so ticks from different chroms can
-    // interleave into the same buffered counter and get flushed under the
-    // wrong chrom label. Fine while `receiver=None` (disabled sink is a
-    // no-op); revisit before exposing progress here for real.
+    // is a pure no-op. `EventSink`'s progress buffer is keyed per-chrom (a
+    // `Mutex<HashMap<chrom, pending>>`), so it's safe even though this
+    // pipeline dispatches chroms CONCURRENTLY (`concurrent_chroms` via
+    // `plan_thread_budget`, can exceed 1): ticks from different chroms
+    // accumulate independently and are never flushed under the wrong chrom
+    // label.
     let sink = match &receiver {
         Some(r) => r.borrow(py).sink(chunk_size as u64),
         None => crate::logging::EventSink::disabled(),
@@ -401,9 +399,10 @@ fn run_pgen_conversion_pipeline(
         .map(|(((c, r), rd), drd)| (c, r, rd, drd))
         .collect();
 
-    // See `run_conversion_pipeline`'s sink-construction comment: the same
-    // shared-counter-under-concurrent-dispatch caveat applies here too (this
-    // pipeline also dispatches chroms concurrently via rayon).
+    // See `run_conversion_pipeline`'s sink-construction comment: `EventSink`'s
+    // progress buffer is keyed per-chrom, so it's safe under this pipeline's
+    // concurrent chrom dispatch too (this pipeline also dispatches chroms
+    // concurrently via rayon).
     let sink = match &receiver {
         Some(r) => r.borrow(py).sink(chunk_size as u64),
         None => crate::logging::EventSink::disabled(),
@@ -946,9 +945,9 @@ fn run_vcf_list_conversion_pipeline(
     let overlap_mode = crate::svar2_view::parse_overlap_mode(&regions_overlap)?;
 
     // `run_vcf_list` processes contigs SEQUENTIALLY (a plain loop, see its own
-    // docs), so — unlike `run_conversion_pipeline`/`run_pgen_conversion_pipeline`
-    // — the shared-counter invariant genuinely holds here: at most one
-    // `process_chromosome` call ticks this sink at a time.
+    // docs). `EventSink`'s progress buffer is keyed per-chrom, so this is
+    // safe here too -- and would remain safe even if this pipeline were later
+    // made concurrent like `run_conversion_pipeline`/`run_pgen_conversion_pipeline`.
     let sink = match &receiver {
         Some(r) => r.borrow(py).sink(chunk_size as u64),
         None => crate::logging::EventSink::disabled(),
@@ -1080,9 +1079,10 @@ fn run_svar1_conversion_pipeline(
         ));
     }
 
-    // See `run_conversion_pipeline`'s sink-construction comment: the same
-    // shared-counter-under-concurrent-dispatch caveat applies here too (this
-    // pipeline also dispatches chroms concurrently via rayon).
+    // See `run_conversion_pipeline`'s sink-construction comment: `EventSink`'s
+    // progress buffer is keyed per-chrom, so it's safe under this pipeline's
+    // concurrent chrom dispatch too (this pipeline also dispatches chroms
+    // concurrently via rayon).
     let sink = match &receiver {
         Some(r) => r.borrow(py).sink(chunk_size as u64),
         None => crate::logging::EventSink::disabled(),
