@@ -908,10 +908,20 @@ def test_from_vcf_list_auto_chunk_size(tmp_path, monkeypatch):
     seen = {}
     real_pipeline = sv2._core.run_vcf_list_conversion_pipeline
 
-    def spy(paths, ref, contigs, out, samples, contig_membership, chunk_size, *rest):
+    def spy(
+        paths, ref, contigs, out, samples, contig_membership, chunk_size, *rest, **kw
+    ):
         seen["chunk_size"] = chunk_size
         return real_pipeline(
-            paths, ref, contigs, out, samples, contig_membership, chunk_size, *rest
+            paths,
+            ref,
+            contigs,
+            out,
+            samples,
+            contig_membership,
+            chunk_size,
+            *rest,
+            **kw,
         )
 
     monkeypatch.setattr(sv2._core, "run_vcf_list_conversion_pipeline", spy)

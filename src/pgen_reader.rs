@@ -203,6 +203,11 @@ impl RecordSource for PgenRecordSource {
             }
 
             // .pvar and .pgen advance in lockstep -- one metadata row per genotype row.
+            // Capture the absolute `.pvar` row index BEFORE calling
+            // `next_variant`: `vidx` is incremented inside that call before it
+            // returns, so this is the only point where it equals the row
+            // about to be returned rather than the one after it.
+            let gidx = self.pvar.current_vidx() as i32;
             let Some(meta) = self.pvar.next_variant()? else {
                 return Err(ConversionError::Input(
                     "pvar ran out of variants before the .pgen did; \
@@ -300,6 +305,7 @@ impl RecordSource for PgenRecordSource {
                 // limited to the requested dosage fields (`format_raw` above).
                 info_raw: Vec::new(),
                 format_vals: crate::record_source::FormatVals::Dense(format_raw),
+                global_idx: gidx, // absolute .pvar row index; survives region-overlap gaps
             }));
         }
     }

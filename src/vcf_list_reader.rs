@@ -127,10 +127,15 @@ impl FileCursor {
                             crate::normalize::RefDecision::Exclude(e) => {
                                 self.ref_excluded += 1;
                                 if self.ref_excluded == 1 {
-                                    println!(
-                                        "Notice: check_ref=x excluding record(s) in {} \
-                                         whose REF disagrees with the reference (first: {e}).",
-                                        self.path
+                                    // Duplicates the cohort-level `report_ref_excluded`
+                                    // summary by design: this adds the per-file path and
+                                    // first-offender detail the summary doesn't carry.
+                                    tracing::debug!(
+                                        path = %self.path,
+                                        detail = %e,
+                                        "check_ref=x excluding record(s) whose REF disagrees \
+                                         with the reference; further exclusions in this file \
+                                         are counted, not logged individually"
                                     );
                                 }
                                 // This record contributes no atoms; fall through to
@@ -613,6 +618,7 @@ impl VcfListRecordSource {
             calls: Calls::Sparse(carriers),
             info_raw,
             format_vals: FormatVals::ByCarrier(cf),
+            global_idx: -1,
         })
     }
 }

@@ -174,10 +174,20 @@ impl crate::record_source::RecordSource for VcfListDroppedProxy {
 /// report the same line; the sharded path sums the count across shards first.
 fn report_ref_excluded(chrom: &str, ref_excluded: u64) {
     if ref_excluded > 0 {
-        println!(
-            "[{chrom}] check_ref=x: excluded {ref_excluded} record(s) whose REF \
-             disagreed with the reference FASTA."
+        tracing::info!(
+            chrom = %chrom,
+            excluded = ref_excluded,
+            "check_ref=x: excluded records whose REF disagreed with the reference FASTA"
         );
+    }
+}
+
+/// Emit the per-contig left-alignment summary (nothing when no atoms moved).
+/// Shared by the single-reader and sub-contig-sharded paths, mirroring
+/// `report_ref_excluded` above.
+fn report_normalized(chrom: &str, normalized_total: u64) {
+    if normalized_total > 0 {
+        tracing::info!(chrom = %chrom, normalized = normalized_total, "left-aligned indels");
     }
 }
 
@@ -273,7 +283,11 @@ pub fn process_chromosome(
     processing_threads: usize,
     signatures: bool,
     fields: &[crate::field::FieldSpec],
+    sink: &crate::logging::EventSink,
 ) -> Result<u64, ConversionError> {
+    let contig_started = std::time::Instant::now();
+    sink.contig_start(chrom, None); // streaming: total unknown
+
     // Directory Formatting: svar2/{contig}/var_key/{snp,indel}
     let paths = crate::layout::ContigPaths::new(base_out_dir, chrom);
 
@@ -355,7 +369,11 @@ pub fn process_chromosome(
             let fields_owned: Vec<crate::field::FieldSpec> = fields.to_vec();
             let shard_worker_tids = Arc::clone(&shard_worker_tids);
 
-            move || -> Result<u64, ConversionError> {
+            // Returns `(dropped_out_of_scope, ref_excluded, normalized_total)` so
+            // the caller can feed `EventSink::contig_done`'s `excluded` arg (and
+            // the left-alignment summary log) without a second cross-thread
+            // channel.
+            move || -> Result<(u64, u64, u64), ConversionError> {
                 // passing the thread budget down to HTSLib
                 let s_refs: Vec<&str> = s_owned.iter().map(|s| s.as_str()).collect();
                 // Only populated (and only meaningful) for `SourceSpec::VcfList`;
@@ -444,6 +462,7 @@ pub fn process_chromosome(
                                         Box::new(source),
                                         s_refs.len(),
                                         ploidy,
+                                        &chr,
                                         Arc::clone(&ref_seq),
                                         has_reference,
                                         skip_out_of_scope,
@@ -464,7 +483,12 @@ pub fn process_chromosome(
                                 &shard_worker_tids,
                             )?;
                             report_ref_excluded(&chr, totals.ref_excluded);
-                            return Ok(totals.dropped_out_of_scope);
+                            report_normalized(&chr, totals.normalized_total);
+                            return Ok((
+                                totals.dropped_out_of_scope,
+                                totals.ref_excluded,
+                                totals.normalized_total,
+                            ));
                         }
                         Box::new(crate::vcf_reader::VcfRecordSource::new(
                             &vcf_path,
@@ -634,6 +658,7 @@ pub fn process_chromosome(
                                         Box::new(source),
                                         s_refs.len(),
                                         ploidy,
+                                        &chr,
                                         Arc::clone(&ref_seq),
                                         has_reference,
                                         skip_out_of_scope,
@@ -648,7 +673,12 @@ pub fn process_chromosome(
                                 &shard_worker_tids,
                             )?;
                             report_ref_excluded(&chr, totals.ref_excluded);
-                            return Ok(totals.dropped_out_of_scope);
+                            report_normalized(&chr, totals.normalized_total);
+                            return Ok((
+                                totals.dropped_out_of_scope,
+                                totals.ref_excluded,
+                                totals.normalized_total,
+                            ));
                         }
                     }
                     SourceSpec::VcfList {
@@ -743,30 +773,36 @@ pub fn process_chromosome(
                     tx_dense.send(dense_chunk).unwrap();
                     chunk_id += 1;
                 }
-                report_ref_excluded(
-                    &chr,
-                    reader.ref_excluded() + vcf_list_ref_excluded.load(Ordering::Relaxed),
-                );
-                Ok(reader.dropped_out_of_scope() + vcf_list_dropped.load(Ordering::Relaxed))
+                let ref_excluded_total =
+                    reader.ref_excluded() + vcf_list_ref_excluded.load(Ordering::Relaxed);
+                report_ref_excluded(&chr, ref_excluded_total);
+                report_normalized(&chr, reader.normalized_total());
+                Ok((
+                    reader.dropped_out_of_scope() + vcf_list_dropped.load(Ordering::Relaxed),
+                    ref_excluded_total,
+                    reader.normalized_total(),
+                ))
             }
         })
         .expect("spawn reader");
 
     // Step 2 -> The Executor
     let fields_exec: Vec<crate::field::FieldSpec> = fields.to_vec();
-    let chrom_exec = chrom.to_string();
     let executor_thread = thread::Builder::new()
         .name(format!("exec-{}", chrom))
         .spawn({
+            let exec_sink = sink.clone();
+            let exec_chrom = chrom.to_string();
             move || {
                 let bank = LongAlleleTableWriter::new(tx_long, long_allele_capacity);
                 executor::run_compute_engine(
-                    &chrom_exec,
                     rx_dense,
                     tx_sparse,
                     bank,
                     signatures,
                     &fields_exec,
+                    &exec_chrom,
+                    &exec_sink,
                 )
             }
         })
@@ -805,7 +841,10 @@ pub fn process_chromosome(
     let chunk_writer_res = chunk_writer_thread.join();
     let long_allele_writer_res = long_allele_writer_thread.join();
 
-    let dropped = match reader_res {
+    // `_normalized_total` (left-aligned atom count) is already reported via
+    // `report_normalized` inside the reader thread closure above -- kept here
+    // only so the tuple shape stays self-documenting at the call site.
+    let (dropped, ref_excluded, _normalized_total) = match reader_res {
         Ok(r) => r?, // ConversionError propagates with its real message
         Err(_) => {
             return Err(ConversionError::WorkerPanicked {
@@ -823,6 +862,7 @@ pub fn process_chromosome(
         var_key_ledgers: ledgers,
         dense_ledgers,
         long_allele_offsets,
+        kept_total,
     } = phase1;
     match chunk_writer_res {
         Ok(r) => r?,
@@ -841,10 +881,7 @@ pub fn process_chromosome(
         }
     }
 
-    println!(
-        "[{}] Phase 1 Complete. Triggering Phase 2 In-Memory Merge...",
-        chrom
-    );
+    tracing::debug!(chrom = %chrom, "Phase 1 complete; triggering in-memory merge");
 
     // Long-allele offsets belong to the indel stream.
     let offsets_array = ndarray::Array1::from_vec(long_allele_offsets);
@@ -991,7 +1028,15 @@ pub fn process_chromosome(
         })?;
     }
 
-    println!("[{}] Pipeline Execution Finished Successfully.", chrom);
+    tracing::info!(chrom = %chrom, "pipeline execution finished successfully");
+
+    sink.flush(chrom);
+    sink.contig_done(
+        chrom,
+        kept_total,
+        ref_excluded + dropped,
+        contig_started.elapsed().as_millis() as u64,
+    );
 
     Ok(dropped)
 }
@@ -1033,6 +1078,7 @@ pub fn run_vcf_list(
     // `SourceSpec::VcfList` so non-member files are never opened for that contig
     // (issue #122).
     contig_membership: Vec<Vec<bool>>,
+    sink: &crate::logging::EventSink,
 ) -> Result<u64, ConversionError> {
     if contig_membership.len() != chroms.len() {
         return Err(ConversionError::Input(format!(
@@ -1061,36 +1107,19 @@ pub fn run_vcf_list(
     }
 
     let available_cores = match max_threads {
-        Some(t) if t > 0 => {
-            println!("Notice: Using user-provided thread limit: {}", t);
-            t
-        }
-        _ => {
-            let detected = std::thread::available_parallelism().unwrap().get();
-            println!(
-                "Notice: No thread limit provided. Hardware Detected: {} cores.",
-                detected
-            );
-            detected
-        }
+        Some(t) if t > 0 => t,
+        _ => std::thread::available_parallelism().unwrap().get(),
     };
     // concurrent_chroms is forced to 1 (sequential loop below) regardless of
     // what the plan suggests -- only `processing_threads` is consumed here.
     let plan = crate::budget::plan_thread_budget(available_cores, 1);
     let processing_threads = plan.processing_threads;
-    println!(
-        "Pipeline Config (from_vcf_list): {} contigs sequentially | {} HTSlib decompression \
-         threads per file ({} files open at once) | {} processing threads.",
-        chroms.len(),
-        VCF_LIST_HTSLIB_THREADS,
-        vcf_paths.len(),
-        processing_threads,
-    );
+    tracing::info!(threads = processing_threads, "pipeline configured");
 
     let fasta_ref = reference_path;
     let mut total_dropped: u64 = 0;
     for (chrom, members) in chroms.iter().zip(contig_membership) {
-        println!("==> Processing {}", chrom);
+        tracing::info!(chrom = %chrom, "processing contig");
         let dropped = process_chromosome(
             SourceSpec::VcfList {
                 vcf_paths: vcf_paths.to_vec(),
@@ -1111,6 +1140,7 @@ pub fn run_vcf_list(
             processing_threads,
             signatures,
             &fields,
+            sink,
         )?;
         total_dropped += dropped;
 
@@ -1126,7 +1156,7 @@ pub fn run_vcf_list(
             libc::malloc_trim(0);
         }
     }
-    println!("Cohort Processing Complete.");
+    tracing::info!("cohort processing complete");
 
     // All contigs staged — resolve each field's global on-disk dtype and
     // rewrite its staged values.bin files to that width.

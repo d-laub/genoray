@@ -14,6 +14,12 @@ pub struct Phase1Output {
     /// every hap contributes the same count, so no per-column matrix.
     pub dense_ledgers: DenseMap<Vec<u32>>,
     pub long_allele_offsets: Vec<u64>,
+    /// Total kept (emitted) variants across every `DenseChunk` this stage
+    /// consumed -- `chunk.pos.len()` summed. This is the single choke point
+    /// EVERY `DenseChunk` passes through regardless of source (single-reader,
+    /// sharded VCF/PGEN, VcfList, Svar1), so it's the simplest place to
+    /// accumulate a cohort-wide "kept" count for `EventSink::contig_done`.
+    pub kept_total: u64,
 }
 
 // Pulls raw chunks, encodes/splits, manages the bank, streams to the writer.
@@ -21,19 +27,22 @@ pub struct Phase1Output {
 // per-column call counts), a scalar ledger per dense class, and the
 // long-allele bank offsets.
 pub fn run_compute_engine(
-    chrom: &str,
     rx_dense: Receiver<DenseChunk>,
     tx_sparse: Sender<SparseChunk>,
     mut bank: LongAlleleTableWriter,
     sidecar_bits_enabled: bool,
     fields: &[crate::field::FieldSpec],
+    chrom: &str,
+    sink: &crate::logging::EventSink,
 ) -> Phase1Output {
     let mut var_key_ledgers: StreamMap<Vec<Vec<u32>>> =
         StreamMap::from_fn(|_| Vec::with_capacity(10_000));
     let mut dense_ledgers: DenseMap<Vec<u32>> = DenseMap::from_fn(|_| Vec::with_capacity(10_000));
+    let mut kept_total: u64 = 0;
 
     while let Ok(chunk) = rx_dense.recv() {
         let chunk_id = chunk.chunk_id;
+        let n = chunk.pos.len() as u64;
         trace_ll!("[trace {chrom}] exec: dense2sparse enter chunk {chunk_id}");
         let sparse_chunk = dense2sparse_vk(&chunk, &mut bank, sidecar_bits_enabled, fields);
         trace_ll!("[trace {chrom}] exec: dense2sparse exit chunk {chunk_id}");
@@ -53,15 +62,22 @@ pub fn run_compute_engine(
             .send(sparse_chunk)
             .expect("Failed to send SparseChunk to Writer");
         trace_ll!("[trace {chrom}] exec: sent SparseChunk {chunk_id}");
+
+        sink.tick(chrom, n);
+        kept_total += n;
     }
 
-    println!("Executor: VCF fully processed. Flushing remaining long alleles...");
+    tracing::debug!(
+        chrom = %chrom,
+        "Executor: VCF fully processed. Flushing remaining long alleles..."
+    );
     let long_allele_offsets: Vec<u64> = bank.finalize();
 
     Phase1Output {
         var_key_ledgers,
         dense_ledgers,
         long_allele_offsets,
+        kept_total,
     }
 }
 
@@ -82,6 +98,7 @@ mod tests {
         DenseChunk {
             chunk_id: 0,
             pos: vec![100],
+            global_idx: vec![-1],
             ilens: vec![0],
             alt: b"C".to_vec(),
             alt_offsets: vec![0, 1],
@@ -102,12 +119,14 @@ mod tests {
         drop(tx_d);
 
         let bank = crate::nrvk::LongAlleleTableWriter::new(tx_l, 1 << 16);
-        let out = run_compute_engine("chrTest", rx_d, tx_s, bank, false, &[]);
+        let sink = crate::logging::EventSink::disabled();
+        let out = run_compute_engine(rx_d, tx_s, bank, false, &[], "chrTest", &sink);
 
         // one chunk processed → one ledger row per stream and per dense class
         assert_eq!(out.var_key_ledgers.get(StreamTag::VarKeySnp).len(), 1);
         assert_eq!(out.dense_ledgers.get(DenseClass::Snp).len(), 1);
         assert_eq!(out.dense_ledgers.get(DenseClass::Indel).len(), 1);
+        assert_eq!(out.kept_total, 1);
         // drain sparse so the channel doesn't leak
         while rx_s.recv().is_ok() {}
     }

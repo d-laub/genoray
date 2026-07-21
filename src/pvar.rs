@@ -28,8 +28,9 @@ pub struct PvarReader {
     pos_col: usize,
     ref_col: usize,
     alt_col: usize,
-    /// Global variant index of the next row to be returned. Only used for error
-    /// messages; the caller tracks its own range.
+    /// Global variant index of the next row to be returned. Used for error
+    /// messages and exposed via `current_vidx` for callers that need the
+    /// absolute `.pvar` row index of the record about to be returned.
     vidx: usize,
     buf: String,
 }
@@ -125,6 +126,11 @@ impl PvarReader {
             me.vidx += 1;
         }
         Ok(me)
+    }
+
+    /// Absolute `.pvar` row index of the NEXT row `next_variant` will return.
+    pub fn current_vidx(&self) -> usize {
+        self.vidx
     }
 
     fn read_line(&mut self) -> Result<usize, ConversionError> {
@@ -287,6 +293,42 @@ chr1\t7\t.\tC\tCAT
         let v = r.next_variant().unwrap().unwrap();
         assert_eq!(v.pos, 11);
         assert!(r.next_variant().unwrap().is_none());
+    }
+
+    #[test]
+    fn current_vidx_is_absolute_index_of_next_row() {
+        // BODY has 3 data rows (absolute indices 0, 1, 2).
+        let dir = write_tmp("x.pvar", BODY);
+        let p = dir.path().join("x.pvar");
+        let mut r = PvarReader::open(p.to_str().unwrap(), 0).unwrap();
+
+        // Before any `next_variant`, the next row to be returned is row 0.
+        assert_eq!(r.current_vidx(), 0);
+
+        // The call that returns row 0's record leaves `current_vidx` at 1 --
+        // the absolute index of the *next* row, not the one just returned.
+        let v = r.next_variant().unwrap().unwrap();
+        assert_eq!(v.pos, 2); // row 0: 1-based POS 3 -> 0-based 2
+        assert_eq!(r.current_vidx(), 1);
+
+        let v = r.next_variant().unwrap().unwrap();
+        assert_eq!(v.pos, 6); // row 1
+        assert_eq!(r.current_vidx(), 2);
+
+        let v = r.next_variant().unwrap().unwrap();
+        assert_eq!(v.pos, 11); // row 2
+        assert_eq!(r.current_vidx(), 3);
+
+        assert!(r.next_variant().unwrap().is_none());
+
+        // With `var_start` skipping to index 2, the accessor reflects the
+        // skip immediately -- i.e. the value captured BEFORE a `next_variant`
+        // call equals the absolute row that call is about to return.
+        let mut r2 = PvarReader::open(p.to_str().unwrap(), 2).unwrap();
+        assert_eq!(r2.current_vidx(), 2);
+        let v = r2.next_variant().unwrap().unwrap();
+        assert_eq!(v.pos, 11); // row 2
+        assert_eq!(r2.current_vidx(), 3);
     }
 
     #[test]

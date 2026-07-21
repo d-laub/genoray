@@ -38,6 +38,7 @@ pub mod field;
 // `py_convert` and `streams` below.
 pub mod field_finalize;
 pub mod layout;
+pub mod logging;
 #[cfg(feature = "conversion")]
 pub mod max_del;
 #[cfg(feature = "conversion")]
@@ -145,7 +146,7 @@ fn index_vcf(path: String) -> PyResult<()> {
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 #[pyfunction]
-#[pyo3(signature = (vcf_path, reference_path, chroms, output_dir, samples, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false, signatures=false, info_fields=Vec::new(), format_fields=Vec::new(), check_ref="e".to_string(), region_ranges=Vec::new(), regions_overlap="pos".to_string()))]
+#[pyo3(signature = (vcf_path, reference_path, chroms, output_dir, samples, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false, signatures=false, info_fields=Vec::new(), format_fields=Vec::new(), check_ref="e".to_string(), region_ranges=Vec::new(), regions_overlap="pos".to_string(), log_level = "info".to_string(), receiver = None))]
 fn run_conversion_pipeline(
     py: Python,
     vcf_path: String,
@@ -164,6 +165,8 @@ fn run_conversion_pipeline(
     check_ref: String,
     region_ranges: Vec<(String, u32, u32)>,
     regions_overlap: String,
+    log_level: String,
+    receiver: Option<Py<PyEventReceiver>>,
 ) -> PyResult<usize> {
     let sample_refs: Vec<&str> = samples.iter().map(|s| s.as_str()).collect();
 
@@ -184,81 +187,100 @@ fn run_conversion_pipeline(
 
     let check_ref: crate::normalize::CheckRef = check_ref.parse().map_err(PyValueError::new_err)?;
 
+    // `receiver` is `None` unless the Python caller opted in (Task 11/12), in
+    // which case `sink` publishes into its channel; otherwise a disabled sink
+    // is a pure no-op. `EventSink`'s progress buffer is keyed per-chrom (a
+    // `Mutex<HashMap<chrom, pending>>`), so it's safe even though this
+    // pipeline dispatches chroms CONCURRENTLY (`concurrent_chroms` via
+    // `plan_thread_budget`, can exceed 1): ticks from different chroms
+    // accumulate independently and are never flushed under the wrong chrom
+    // label.
+    let sink = match &receiver {
+        Some(r) => r.borrow(py).sink(chunk_size as u64),
+        None => crate::logging::EventSink::disabled(),
+    };
+    let level = log_level.clone();
+
     let results: Vec<Result<u64, crate::error::ConversionError>> = py.detach(|| {
-        // Step 1 -> HW discovery/override and budgeting
-        let available_cores = match max_threads {
-            Some(t) if t > 0 => {
-                println!("Notice: Using user-provided thread limit: {}", t);
-                t
-            }
-            _ => {
-                let detected = std::thread::available_parallelism().unwrap().get();
-                println!(
-                    "Notice: No thread limit provided. Hardware Detected: {} cores.",
+        crate::logging::with_channel_subscriber(sink.clone(), &level, || {
+            // Step 1 -> HW discovery/override and budgeting
+            let available_cores = match max_threads {
+                Some(t) if t > 0 => {
+                    tracing::info!(threads = t, "using user-provided thread limit");
+                    t
+                }
+                _ => {
+                    let detected = std::thread::available_parallelism().unwrap().get();
+                    tracing::info!(
+                        cores = detected,
+                        "no thread limit provided; hardware detected"
+                    );
                     detected
-                );
-                detected
-            }
-        };
+                }
+            };
 
-        let plan = crate::budget::plan_thread_budget(available_cores, chroms.len());
-        let concurrent_chroms = plan.concurrent_chroms;
-        let htslib_threads = plan.htslib_threads;
-        let processing_threads = plan.processing_threads;
+            let plan = crate::budget::plan_thread_budget(available_cores, chroms.len());
+            let concurrent_chroms = plan.concurrent_chroms;
+            let htslib_threads = plan.htslib_threads;
+            let processing_threads = plan.processing_threads;
 
-        let total_active =
-            concurrent_chroms * (crate::budget::PIPELINE_THREADS_PER_CHROM + htslib_threads);
-        println!("Using: {} cores.", available_cores);
-        println!(
-            "Pipeline Config: {} concurrent chromosomes | {} HTSlib decompression threads each \
-             ({} pipeline/BGZF threads, {} reader-side processing/shard threads).",
-            concurrent_chroms, htslib_threads, total_active, processing_threads,
-        );
+            let total_active =
+                concurrent_chroms * (crate::budget::PIPELINE_THREADS_PER_CHROM + htslib_threads);
+            tracing::info!(cores = available_cores, "using cores");
+            tracing::info!(
+                concurrent_chroms,
+                htslib_threads,
+                total_active,
+                processing_threads,
+                "pipeline config"
+            );
 
-        // Step 2 -> Rayon Pool
-        // Rayon hosts one task per concurrent chrom; each task spawns its own pipeline
-        // OS threads (reader, executor, writers) plus htslib_threads HTSlib decode threads.
-        // Naming the rayon workers makes them grep-able in `top -H` / pidstat alongside
-        // the per-chrom threads (read-chr1, exec-chr1, etc.).
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(concurrent_chroms)
-            .thread_name(|i| format!("rayon-{}", i))
-            .build()
-            .unwrap();
+            // Step 2 -> Rayon Pool
+            // Rayon hosts one task per concurrent chrom; each task spawns its own pipeline
+            // OS threads (reader, executor, writers) plus htslib_threads HTSlib decode threads.
+            // Naming the rayon workers makes them grep-able in `top -H` / pidstat alongside
+            // the per-chrom threads (read-chr1, exec-chr1, etc.).
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(concurrent_chroms)
+                .thread_name(|i| format!("rayon-{}", i))
+                .build()
+                .unwrap();
 
-        // Step 3 -> Dispatch
-        let fasta_ref: Option<&str> = reference_path.as_deref();
-        let results = pool.install(|| {
-            chroms
-                .par_iter()
-                .map(|chrom| {
-                    println!("==> Processing {}", chrom);
-                    orchestrator::process_chromosome(
-                        orchestrator::SourceSpec::Vcf {
-                            vcf_path: vcf_path.clone(),
-                            htslib_threads,
-                            regions: ranges_by_chrom.get(chrom).cloned().unwrap_or_default(),
-                            overlap: overlap_mode,
-                        },
-                        fasta_ref,
-                        chrom,
-                        &output_dir,
-                        &sample_refs,
-                        chunk_size,
-                        ploidy,
-                        long_allele_capacity,
-                        skip_out_of_scope,
-                        check_ref,
-                        processing_threads,
-                        signatures,
-                        &fields,
-                    )
-                })
-                .collect::<Vec<_>>()
-        });
+            // Step 3 -> Dispatch
+            let fasta_ref: Option<&str> = reference_path.as_deref();
+            let results = pool.install(|| {
+                chroms
+                    .par_iter()
+                    .map(|chrom| {
+                        tracing::info!(chrom = %chrom, "processing contig");
+                        orchestrator::process_chromosome(
+                            orchestrator::SourceSpec::Vcf {
+                                vcf_path: vcf_path.clone(),
+                                htslib_threads,
+                                regions: ranges_by_chrom.get(chrom).cloned().unwrap_or_default(),
+                                overlap: overlap_mode,
+                            },
+                            fasta_ref,
+                            chrom,
+                            &output_dir,
+                            &sample_refs,
+                            chunk_size,
+                            ploidy,
+                            long_allele_capacity,
+                            skip_out_of_scope,
+                            check_ref,
+                            processing_threads,
+                            signatures,
+                            &fields,
+                            &sink,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            });
 
-        println!("Cohort Processing Complete.");
-        results
+            tracing::info!("cohort processing complete");
+            results
+        })
     });
 
     let mut total_dropped: u64 = 0;
@@ -299,7 +321,7 @@ fn run_conversion_pipeline(
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 #[pyfunction]
-#[pyo3(signature = (pgen_path, pvar_path, reference_path, chroms, contig_ranges, output_dir, samples, chunk_size, max_threads, long_allele_capacity, skip_out_of_scope, signatures, dosage_fields, readers, dosage_readers, check_ref, region_ranges, regions_overlap, sample_perm))]
+#[pyo3(signature = (pgen_path, pvar_path, reference_path, chroms, contig_ranges, output_dir, samples, chunk_size, max_threads, long_allele_capacity, skip_out_of_scope, signatures, dosage_fields, readers, dosage_readers, check_ref, region_ranges, regions_overlap, sample_perm, log_level = "info".to_string(), receiver = None))]
 fn run_pgen_conversion_pipeline(
     py: Python,
     pgen_path: String,
@@ -321,6 +343,8 @@ fn run_pgen_conversion_pipeline(
     region_ranges: Vec<(String, u32, u32)>,
     regions_overlap: String,
     sample_perm: Vec<usize>,
+    log_level: String,
+    receiver: Option<Py<PyEventReceiver>>,
 ) -> PyResult<usize> {
     if chroms.len() != contig_ranges.len() || chroms.len() != readers.len() {
         return Err(PyValueError::new_err(
@@ -383,60 +407,74 @@ fn run_pgen_conversion_pipeline(
         .map(|(((c, r), rd), drd)| (c, r, rd, drd))
         .collect();
 
+    // See `run_conversion_pipeline`'s sink-construction comment: `EventSink`'s
+    // progress buffer is keyed per-chrom, so it's safe under this pipeline's
+    // concurrent chrom dispatch too (this pipeline also dispatches chroms
+    // concurrently via rayon).
+    let sink = match &receiver {
+        Some(r) => r.borrow(py).sink(chunk_size as u64),
+        None => crate::logging::EventSink::disabled(),
+    };
+    let level = log_level.clone();
+
     let results: Vec<Result<u64, crate::error::ConversionError>> = py.detach(|| {
-        let available_cores = match max_threads {
-            Some(t) if t > 0 => t,
-            _ => std::thread::available_parallelism().unwrap().get(),
-        };
-        let plan = crate::budget::plan_thread_budget(available_cores, jobs.len());
-        let concurrent_chroms = plan.concurrent_chroms;
-        let processing_threads = plan.processing_threads;
-        println!(
-            "Pipeline Config (PGEN): {} concurrent chromosomes | {} processing threads each.",
-            concurrent_chroms, processing_threads
-        );
+        crate::logging::with_channel_subscriber(sink.clone(), &level, || {
+            let available_cores = match max_threads {
+                Some(t) if t > 0 => t,
+                _ => std::thread::available_parallelism().unwrap().get(),
+            };
+            let plan = crate::budget::plan_thread_budget(available_cores, jobs.len());
+            let concurrent_chroms = plan.concurrent_chroms;
+            let processing_threads = plan.processing_threads;
+            tracing::info!(
+                concurrent_chroms,
+                processing_threads,
+                "pipeline config (PGEN)"
+            );
 
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(concurrent_chroms)
-            .thread_name(|i| format!("chrom-{}", i))
-            .build()
-            .expect("build chrom pool");
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(concurrent_chroms)
+                .thread_name(|i| format!("chrom-{}", i))
+                .build()
+                .expect("build chrom pool");
 
-        pool.install(|| {
-            jobs.into_par_iter()
-                .map(|(chrom, (lo, hi), readers, dosage_readers)| {
-                    // PGEN sub-contig sharding is dead at runtime (see
-                    // `SourceSpec::Pgen::readers` doc comment) -- collapse the
-                    // per-shard dosage-reader pool down to its one live shard's
-                    // per-field readers before handing off to `SourceSpec`.
-                    let dosage_readers = dosage_readers.into_iter().next().unwrap_or_default();
-                    orchestrator::process_chromosome(
-                        orchestrator::SourceSpec::Pgen {
-                            pgen_path: pgen_path.clone(),
-                            pvar_path: pvar_path.clone(),
-                            var_start: lo,
-                            var_end: hi,
-                            readers,
-                            dosage_readers,
-                            regions: ranges_by_chrom.get(&chrom).cloned().unwrap_or_default(),
-                            overlap: overlap_mode,
-                            sample_perm: sample_perm.clone(),
-                        },
-                        reference_path.as_deref(),
-                        &chrom,
-                        &output_dir,
-                        &sample_refs,
-                        chunk_size,
-                        ploidy,
-                        long_allele_capacity,
-                        skip_out_of_scope,
-                        check_ref,
-                        processing_threads,
-                        signatures,
-                        &fields,
-                    )
-                })
-                .collect()
+            pool.install(|| {
+                jobs.into_par_iter()
+                    .map(|(chrom, (lo, hi), readers, dosage_readers)| {
+                        // PGEN sub-contig sharding is dead at runtime (see
+                        // `SourceSpec::Pgen::readers` doc comment) -- collapse the
+                        // per-shard dosage-reader pool down to its one live shard's
+                        // per-field readers before handing off to `SourceSpec`.
+                        let dosage_readers = dosage_readers.into_iter().next().unwrap_or_default();
+                        orchestrator::process_chromosome(
+                            orchestrator::SourceSpec::Pgen {
+                                pgen_path: pgen_path.clone(),
+                                pvar_path: pvar_path.clone(),
+                                var_start: lo,
+                                var_end: hi,
+                                readers,
+                                dosage_readers,
+                                regions: ranges_by_chrom.get(&chrom).cloned().unwrap_or_default(),
+                                overlap: overlap_mode,
+                                sample_perm: sample_perm.clone(),
+                            },
+                            reference_path.as_deref(),
+                            &chrom,
+                            &output_dir,
+                            &sample_refs,
+                            chunk_size,
+                            ploidy,
+                            long_allele_capacity,
+                            skip_out_of_scope,
+                            check_ref,
+                            processing_threads,
+                            signatures,
+                            &fields,
+                            &sink,
+                        )
+                    })
+                    .collect()
+            })
         })
     });
 
@@ -560,7 +598,7 @@ fn merge_regions(mut regions: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
 #[allow(clippy::type_complexity)]
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (store_path, out_dir, contigs, samples, regions, regions_overlap, merge_overlapping, fields, reference=None, reroute=false, max_threads=None, overwrite=false))]
+#[pyo3(signature = (store_path, out_dir, contigs, samples, regions, regions_overlap, merge_overlapping, fields, reference=None, reroute=false, max_threads=None, overwrite=false, log_level="info".to_string(), receiver=None))]
 pub fn run_slice_view(
     py: Python,
     store_path: String,
@@ -575,6 +613,8 @@ pub fn run_slice_view(
     reroute: bool,
     max_threads: Option<usize>,
     overwrite: bool,
+    log_level: String,
+    receiver: Option<Py<PyEventReceiver>>,
 ) -> PyResult<()> {
     use crate::error::ConversionError;
     use crate::field::{FieldCategory, FieldSpec, HtslibType, StorageDtype};
@@ -624,6 +664,13 @@ pub fn run_slice_view(
     if out_contigs.is_empty() {
         return Err(ConversionError::Input("no regions selected any contig".to_string()).into());
     }
+    // Contigs named in `contigs` but with no matching region: silently
+    // filtered from `out_contigs` above. Logged (not warned — this is
+    // expected, not an error) once the channel subscriber is live below.
+    let skipped_contigs: Vec<&String> = contigs
+        .iter()
+        .filter(|c| !out_contigs.contains(c))
+        .collect();
 
     // Source meta -> subset sample column indices + inherited ploidy.
     let (src_samples, ploidy) = read_store_meta(&store_path)?;
@@ -753,70 +800,91 @@ pub fn run_slice_view(
     // `reference=` each in-flight contig also holds that contig's reference
     // sequence resident (~250 MB for chr1) for its mutcat recompute.
     let n_subset = samples_orig_idx.len();
+    // See `run_conversion_pipeline`'s sink-construction comment: `EventSink`'s
+    // progress buffer is keyed per-chrom, so it's safe under this slicer's
+    // concurrent per-contig dispatch too.
+    let sink = match &receiver {
+        Some(r) => r.borrow(py).sink(1), // coarse: no per-record ticks here, flush_every irrelevant
+        None => crate::logging::EventSink::disabled(),
+    };
+    let level = log_level.clone();
     let results: Vec<Result<usize, ConversionError>> = py.detach(|| {
-        let available_cores = match max_threads {
-            Some(t) if t > 0 => t,
-            _ => std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1),
-        };
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(available_cores.min(out_contigs.len()).max(1))
-            .thread_name(|i| format!("slice-{i}"))
-            .build()
-            .unwrap();
-        pool.install(|| {
-            out_contigs
-                .par_iter()
-                .map(|chrom| {
-                    let mut chrom_regions =
-                        by_contig.get(chrom.as_str()).cloned().unwrap_or_default();
-                    if merge_overlapping {
-                        chrom_regions = merge_regions(chrom_regions);
-                    }
-                    let n = crate::svar2_slice::slice_contig(
-                        &store_path,
-                        &out_dir,
-                        chrom,
-                        &samples_orig_idx,
-                        ploidy,
-                        &chrom_regions,
-                        overlap_mode,
-                        &fields_spec,
-                        routing,
-                        sidecar_bits_enabled,
-                        info_bits,
-                        format_bits,
-                    )?;
+        crate::logging::with_channel_subscriber(sink.clone(), &level, || {
+            for c in &skipped_contigs {
+                tracing::debug!(chrom = %c, "contig has no regions; skipped");
+            }
+            let available_cores = match max_threads {
+                Some(t) if t > 0 => t,
+                _ => std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1),
+            };
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(available_cores.min(out_contigs.len()).max(1))
+                .thread_name(|i| format!("slice-{i}"))
+                .build()
+                .unwrap();
+            let sink = &sink;
+            pool.install(|| {
+                out_contigs
+                    .par_iter()
+                    .map(|chrom| {
+                        let started = std::time::Instant::now();
+                        sink.contig_start(chrom, None);
+                        let mut chrom_regions =
+                            by_contig.get(chrom.as_str()).cloned().unwrap_or_default();
+                        if merge_overlapping {
+                            chrom_regions = merge_regions(chrom_regions);
+                        }
+                        let n = crate::svar2_slice::slice_contig(
+                            &store_path,
+                            &out_dir,
+                            chrom,
+                            &samples_orig_idx,
+                            ploidy,
+                            &chrom_regions,
+                            overlap_mode,
+                            &fields_spec,
+                            routing,
+                            sidecar_bits_enabled,
+                            info_bits,
+                            format_bits,
+                        )?;
 
-                    // Mutcat is detected purely from `mutcat/*/code.bin` on disk (see
-                    // Python's `_is_annotated`), so recompute it over the sliced output
-                    // when a reference is given -- nothing is stamped into meta.json.
-                    // The reference was validated up front (see the fail-fast band), so
-                    // this loads lazily: peak O(1 contig) resident PER IN-FLIGHT TASK,
-                    // dropped once that task's (single) contig is annotated.
-                    if let Some(fasta) = reference.as_deref() {
-                        let ref_seq = crate::vcf_reader::load_contig_seq(fasta, chrom)?;
-                        let reader =
-                            crate::query::ContigReader::open(&out_dir, chrom, n_subset, ploidy)
-                                .map_err(|e| ConversionError::Io {
-                                    context: format!("{out_dir}/{chrom}"),
-                                    source: e,
-                                })?;
-                        let paths = crate::layout::ContigPaths::new(&out_dir, chrom);
-                        // Views are strand-free (write_view takes no `gtf=`,
-                        // mirroring write-time `signatures=True`): no
-                        // StrandIntervals, so SBS192/384 are unavailable on a
-                        // sliced view, same as a `from_vcf(signatures=True)` store.
-                        crate::mutcat::annotate::annotate_contig(&reader, &paths, &ref_seq, None)
+                        // Mutcat is detected purely from `mutcat/*/code.bin` on disk (see
+                        // Python's `_is_annotated`), so recompute it over the sliced output
+                        // when a reference is given -- nothing is stamped into meta.json.
+                        // The reference was validated up front (see the fail-fast band), so
+                        // this loads lazily: peak O(1 contig) resident PER IN-FLIGHT TASK,
+                        // dropped once that task's (single) contig is annotated.
+                        if let Some(fasta) = reference.as_deref() {
+                            let ref_seq = crate::vcf_reader::load_contig_seq(fasta, chrom)?;
+                            let reader =
+                                crate::query::ContigReader::open(&out_dir, chrom, n_subset, ploidy)
+                                    .map_err(|e| ConversionError::Io {
+                                        context: format!("{out_dir}/{chrom}"),
+                                        source: e,
+                                    })?;
+                            let paths = crate::layout::ContigPaths::new(&out_dir, chrom);
+                            // Views are strand-free (write_view takes no `gtf=`,
+                            // mirroring write-time `signatures=True`): no
+                            // StrandIntervals, so SBS192/384 are unavailable on a
+                            // sliced view, same as a `from_vcf(signatures=True)` store.
+                            crate::mutcat::annotate::annotate_contig(
+                                &reader, &paths, &ref_seq, None,
+                            )
                             .map_err(|e| ConversionError::Io {
-                            context: format!("annotate mutcat {out_dir}/{chrom}"),
-                            source: e,
-                        })?;
-                    }
-                    Ok(n)
-                })
-                .collect()
+                                context: format!("annotate mutcat {out_dir}/{chrom}"),
+                                source: e,
+                            })?;
+                        }
+                        // Slicing excludes nothing (it's a pure subset of an
+                        // already-finished store) -- `excluded` is always 0.
+                        sink.contig_done(chrom, n as u64, 0, started.elapsed().as_millis() as u64);
+                        Ok(n)
+                    })
+                    .collect()
+            })
         })
     });
     for r in results {
@@ -882,7 +950,7 @@ fn svar2_variant_stats<'py>(
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 #[pyfunction]
-#[pyo3(signature = (vcf_paths, reference_path, chroms, output_dir, samples, contig_membership, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false, signatures=false, info_fields=Vec::new(), format_fields=Vec::new(), check_ref="e".to_string(), region_ranges=Vec::new(), regions_overlap="pos".to_string()))]
+#[pyo3(signature = (vcf_paths, reference_path, chroms, output_dir, samples, contig_membership, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false, signatures=false, info_fields=Vec::new(), format_fields=Vec::new(), check_ref="e".to_string(), region_ranges=Vec::new(), regions_overlap="pos".to_string(), log_level = "info".to_string(), receiver = None))]
 fn run_vcf_list_conversion_pipeline(
     py: Python,
     vcf_paths: Vec<String>,
@@ -907,32 +975,47 @@ fn run_vcf_list_conversion_pipeline(
     check_ref: String,
     region_ranges: Vec<(String, u32, u32)>,
     regions_overlap: String,
+    log_level: String,
+    receiver: Option<Py<PyEventReceiver>>,
 ) -> PyResult<usize> {
     let check_ref: crate::normalize::CheckRef = check_ref.parse().map_err(PyValueError::new_err)?;
     // Parse the region-overlap mode once, up front, so a bad value raises
     // before any output byte is written -- mirrors `run_conversion_pipeline`.
     let overlap_mode = crate::svar2_view::parse_overlap_mode(&regions_overlap)?;
 
+    // `run_vcf_list` processes contigs SEQUENTIALLY (a plain loop, see its own
+    // docs). `EventSink`'s progress buffer is keyed per-chrom, so this is
+    // safe here too -- and would remain safe even if this pipeline were later
+    // made concurrent like `run_conversion_pipeline`/`run_pgen_conversion_pipeline`.
+    let sink = match &receiver {
+        Some(r) => r.borrow(py).sink(chunk_size as u64),
+        None => crate::logging::EventSink::disabled(),
+    };
+    let level = log_level.clone();
+
     let dropped: u64 = py.detach(|| {
-        orchestrator::run_vcf_list(
-            &vcf_paths,
-            reference_path.as_deref(),
-            &chroms,
-            &output_dir,
-            &samples,
-            chunk_size,
-            ploidy,
-            max_threads,
-            long_allele_capacity,
-            skip_out_of_scope,
-            check_ref,
-            signatures,
-            info_fields,
-            format_fields,
-            region_ranges,
-            overlap_mode,
-            contig_membership,
-        )
+        crate::logging::with_channel_subscriber(sink.clone(), &level, || {
+            orchestrator::run_vcf_list(
+                &vcf_paths,
+                reference_path.as_deref(),
+                &chroms,
+                &output_dir,
+                &samples,
+                chunk_size,
+                ploidy,
+                max_threads,
+                long_allele_capacity,
+                skip_out_of_scope,
+                check_ref,
+                signatures,
+                info_fields,
+                format_fields,
+                region_ranges,
+                overlap_mode,
+                contig_membership,
+                &sink,
+            )
+        })
     })?;
     Ok(dropped as usize)
 }
@@ -958,7 +1041,7 @@ fn run_vcf_list_conversion_pipeline(
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 #[pyfunction]
-#[pyo3(signature = (svar1_dir, reference_path, chroms, contig_starts, contig_lens, output_dir, samples, ploidy, chunk_size, max_threads, long_allele_capacity, skip_out_of_scope, signatures, pos_per_contig, ref_bytes_per_contig, ref_offsets_per_contig, alt_bytes_per_contig, alt_offsets_per_contig, format_fields, format_src_dtypes, check_ref, region_ranges, regions_overlap, sample_idx))]
+#[pyo3(signature = (svar1_dir, reference_path, chroms, contig_starts, contig_lens, output_dir, samples, ploidy, chunk_size, max_threads, long_allele_capacity, skip_out_of_scope, signatures, pos_per_contig, ref_bytes_per_contig, ref_offsets_per_contig, alt_bytes_per_contig, alt_offsets_per_contig, format_fields, format_src_dtypes, check_ref, region_ranges, regions_overlap, sample_idx, log_level = "info".to_string(), receiver = None))]
 fn run_svar1_conversion_pipeline(
     py: Python,
     svar1_dir: String,
@@ -985,6 +1068,8 @@ fn run_svar1_conversion_pipeline(
     region_ranges: Vec<(String, u32, u32)>,
     regions_overlap: String,
     sample_idx: Vec<usize>,
+    log_level: String,
+    receiver: Option<Py<PyEventReceiver>>,
 ) -> PyResult<usize> {
     let n = chroms.len();
     if [
@@ -1033,58 +1118,72 @@ fn run_svar1_conversion_pipeline(
         ));
     }
 
-    let results: Vec<Result<u64, crate::error::ConversionError>> = py.detach(|| {
-        let available_cores = match max_threads {
-            Some(t) if t > 0 => t,
-            _ => std::thread::available_parallelism().unwrap().get(),
-        };
-        let plan = crate::budget::plan_thread_budget(available_cores, jobs.len());
-        let concurrent_chroms = plan.concurrent_chroms;
-        let processing_threads = plan.processing_threads;
-        println!(
-            "Pipeline Config (SVAR1): {} concurrent chromosomes | {} processing threads each.",
-            concurrent_chroms, processing_threads
-        );
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(concurrent_chroms)
-            .thread_name(|i| format!("chrom-{}", i))
-            .build()
-            .expect("build chrom pool");
+    // See `run_conversion_pipeline`'s sink-construction comment: `EventSink`'s
+    // progress buffer is keyed per-chrom, so it's safe under this pipeline's
+    // concurrent chrom dispatch too (this pipeline also dispatches chroms
+    // concurrently via rayon).
+    let sink = match &receiver {
+        Some(r) => r.borrow(py).sink(chunk_size as u64),
+        None => crate::logging::EventSink::disabled(),
+    };
+    let level = log_level.clone();
 
-        pool.install(|| {
-            jobs.into_par_iter()
-                .map(|(chrom, start, len, pos, rb, ro, ab, ao)| {
-                    orchestrator::process_chromosome(
-                        orchestrator::SourceSpec::Svar1 {
-                            svar1_dir: svar1_dir.clone(),
-                            contig_start: start,
-                            n_local: len,
-                            pos,
-                            ref_bytes: rb,
-                            ref_offsets: ro,
-                            alt_bytes: ab,
-                            alt_offsets: ao,
-                            format_fields: fields.clone(),
-                            format_src_dtypes: format_src_dtypes.clone(),
-                            regions: ranges_by_chrom.get(&chrom).cloned().unwrap_or_default(),
-                            overlap: overlap_mode,
-                            sample_idx: sample_idx.clone(),
-                        },
-                        reference_path.as_deref(),
-                        &chrom,
-                        &output_dir,
-                        &sample_refs,
-                        chunk_size,
-                        ploidy,
-                        long_allele_capacity,
-                        skip_out_of_scope,
-                        check_ref,
-                        processing_threads,
-                        signatures,
-                        &fields,
-                    )
-                })
-                .collect()
+    let results: Vec<Result<u64, crate::error::ConversionError>> = py.detach(|| {
+        crate::logging::with_channel_subscriber(sink.clone(), &level, || {
+            let available_cores = match max_threads {
+                Some(t) if t > 0 => t,
+                _ => std::thread::available_parallelism().unwrap().get(),
+            };
+            let plan = crate::budget::plan_thread_budget(available_cores, jobs.len());
+            let concurrent_chroms = plan.concurrent_chroms;
+            let processing_threads = plan.processing_threads;
+            tracing::info!(
+                concurrent_chroms,
+                processing_threads,
+                "pipeline config (SVAR1)"
+            );
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(concurrent_chroms)
+                .thread_name(|i| format!("chrom-{}", i))
+                .build()
+                .expect("build chrom pool");
+
+            pool.install(|| {
+                jobs.into_par_iter()
+                    .map(|(chrom, start, len, pos, rb, ro, ab, ao)| {
+                        orchestrator::process_chromosome(
+                            orchestrator::SourceSpec::Svar1 {
+                                svar1_dir: svar1_dir.clone(),
+                                contig_start: start,
+                                n_local: len,
+                                pos,
+                                ref_bytes: rb,
+                                ref_offsets: ro,
+                                alt_bytes: ab,
+                                alt_offsets: ao,
+                                format_fields: fields.clone(),
+                                format_src_dtypes: format_src_dtypes.clone(),
+                                regions: ranges_by_chrom.get(&chrom).cloned().unwrap_or_default(),
+                                overlap: overlap_mode,
+                                sample_idx: sample_idx.clone(),
+                            },
+                            reference_path.as_deref(),
+                            &chrom,
+                            &output_dir,
+                            &sample_refs,
+                            chunk_size,
+                            ploidy,
+                            long_allele_capacity,
+                            skip_out_of_scope,
+                            check_ref,
+                            processing_threads,
+                            signatures,
+                            &fields,
+                            &sink,
+                        )
+                    })
+                    .collect()
+            })
         })
     });
 
@@ -1111,6 +1210,118 @@ fn run_svar1_conversion_pipeline(
     Ok(dropped as usize)
 }
 
+#[cfg(feature = "conversion")]
+#[pyclass]
+pub struct PyEventReceiver {
+    tx: crossbeam_channel::Sender<crate::logging::Event>,
+    rx: crossbeam_channel::Receiver<crate::logging::Event>,
+}
+
+#[cfg(feature = "conversion")]
+#[pymethods]
+impl PyEventReceiver {
+    #[new]
+    #[pyo3(signature = (flush_every = 25_000))]
+    fn new(flush_every: u64) -> Self {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let _ = flush_every; // flush_every consumed when the pipeline builds its EventSink
+        PyEventReceiver { tx, rx }
+    }
+
+    /// Block up to `millis` for the next event. GIL is released while parked.
+    /// Returns a decoded tuple, or None on timeout. Raises StopIteration when
+    /// all senders have dropped (channel disconnected).
+    fn recv_timeout(&self, py: Python, millis: u64) -> PyResult<Option<Py<PyAny>>> {
+        use crossbeam_channel::RecvTimeoutError;
+        let res = py.detach(|| {
+            self.rx
+                .recv_timeout(std::time::Duration::from_millis(millis))
+        });
+        match res {
+            Ok(ev) => Ok(Some(encode_event(py, ev)?)),
+            Err(RecvTimeoutError::Timeout) => Ok(None),
+            Err(RecvTimeoutError::Disconnected) => Err(pyo3::exceptions::PyStopIteration::new_err(
+                "event channel closed",
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "conversion")]
+impl PyEventReceiver {
+    /// Build an EventSink that publishes into this receiver's channel.
+    pub fn sink(&self, flush_every: u64) -> crate::logging::EventSink {
+        crate::logging::EventSink::new(self.tx.clone(), flush_every)
+    }
+}
+
+#[cfg(feature = "conversion")]
+fn encode_event(py: Python, ev: crate::logging::Event) -> PyResult<Py<PyAny>> {
+    use crate::logging::Event::*;
+    use pyo3::types::PyTuple;
+
+    fn opt_u64<'py>(py: Python<'py>, v: Option<u64>) -> PyResult<Py<PyAny>> {
+        match v {
+            Some(v) => Ok(v.into_pyobject(py)?.into_any().unbind()),
+            None => Ok(py.None()),
+        }
+    }
+    fn opt_str<'py>(py: Python<'py>, v: Option<String>) -> PyResult<Py<PyAny>> {
+        match v {
+            Some(v) => Ok(v.into_pyobject(py)?.into_any().unbind()),
+            None => Ok(py.None()),
+        }
+    }
+    fn s<'py>(py: Python<'py>, v: String) -> PyResult<Py<PyAny>> {
+        Ok(v.into_pyobject(py)?.into_any().unbind())
+    }
+    fn u<'py>(py: Python<'py>, v: u64) -> PyResult<Py<PyAny>> {
+        Ok(v.into_pyobject(py)?.into_any().unbind())
+    }
+
+    let elems: [Py<PyAny>; 5] = match ev {
+        ContigStart { chrom, total } => [
+            s(py, "contig_start".to_string())?,
+            s(py, chrom)?,
+            opt_u64(py, total)?,
+            py.None(),
+            py.None(),
+        ],
+        Progress { chrom, delta } => [
+            s(py, "progress".to_string())?,
+            s(py, chrom)?,
+            u(py, delta)?,
+            py.None(),
+            py.None(),
+        ],
+        ContigDone {
+            chrom,
+            kept,
+            excluded,
+            elapsed_ms,
+        } => [
+            s(py, "contig_done".to_string())?,
+            s(py, chrom)?,
+            u(py, kept)?,
+            u(py, excluded)?,
+            u(py, elapsed_ms)?,
+        ],
+        Log {
+            level,
+            chrom,
+            message,
+            target,
+        } => [
+            s(py, "log".to_string())?,
+            s(py, level.as_str().to_string())?,
+            opt_str(py, chrom)?,
+            s(py, message)?,
+            s(py, target)?,
+        ],
+    };
+    Ok(PyTuple::new(py, elems)?.into_any().unbind())
+}
+
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "conversion")]
@@ -1127,6 +1338,8 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run_svar1_conversion_pipeline, m)?)?;
     #[cfg(feature = "conversion")]
     m.add_function(wrap_pyfunction!(index_vcf, m)?)?;
+    #[cfg(feature = "conversion")]
+    m.add_class::<PyEventReceiver>()?;
     m.add_class::<crate::py_query::PyContigReader>()?;
     m.add_class::<crate::py_svar1_query::PySvar1Reader>()?;
     Ok(())

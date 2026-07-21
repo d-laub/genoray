@@ -119,6 +119,12 @@ def write_vcf(
         bool, Parameter(name="--skip-symbolics-and-breakends", negative="")
     ] = False,
     check_ref: Annotated[Literal["e", "x"], Parameter(name="--check-ref")] = "e",
+    progress: Annotated[
+        bool, Parameter(name="--progress", negative="--no-progress")
+    ] = False,
+    log_level: Annotated[
+        Literal["off", "warning", "info", "debug"], Parameter(name="--log-level")
+    ] = "info",
 ) -> None:
     """Convert a bgzipped VCF or BCF (or a directory/manifest of single-sample VCFs/BCFs) to an SVAR2 store.
 
@@ -169,6 +175,11 @@ def write_vcf(
         check_ref: REF-vs-reference policy (ignored with ``--no-reference``). ``e``
             (default) aborts on the first REF/FASTA disagreement; ``x`` drops the
             offending record and continues. Mirrors ``bcftools norm --check-ref``.
+        progress: If set, show live write progress (a ``rich`` bar in a terminal, compact
+            heartbeat lines otherwise).
+        log_level: Minimum severity for write-time log lines: ``off``, ``warning``,
+            ``info`` (default), or ``debug``. Overridden by the ``GENORAY_LOG`` env var
+            when set to one of the same values.
     """
     from genoray import SparseVar2
     from genoray._svar2_fields import _parse_cli_field_specs
@@ -214,6 +225,8 @@ def write_vcf(
             info_fields=info_fields,
             format_fields=format_fields,
             check_ref=check_ref,
+            progress=progress,
+            log_level=log_level,
         )
     else:
         dropped = SparseVar2.from_vcf(
@@ -234,6 +247,8 @@ def write_vcf(
             info_fields=info_fields,
             format_fields=format_fields,
             check_ref=check_ref,
+            progress=progress,
+            log_level=log_level,
         )
     if skip_out_of_scope:
         print(f"Dropped {dropped} out-of-scope (symbolic/breakend) ALT alleles.")
@@ -275,6 +290,12 @@ def write_pgen(
         bool, Parameter(name="--skip-symbolics-and-breakends", negative="")
     ] = False,
     check_ref: Annotated[Literal["e", "x"], Parameter(name="--check-ref")] = "e",
+    progress: Annotated[
+        bool, Parameter(name="--progress", negative="--no-progress")
+    ] = False,
+    log_level: Annotated[
+        Literal["off", "warning", "info", "debug"], Parameter(name="--log-level")
+    ] = "info",
 ) -> None:
     """Convert a PLINK2 PGEN to an SVAR2 store.
 
@@ -317,6 +338,11 @@ def write_pgen(
         check_ref: REF-vs-reference policy (ignored with ``--no-reference``). ``e``
             (default) aborts on the first REF/FASTA disagreement; ``x`` drops the
             offending record and continues. Mirrors ``bcftools norm --check-ref``.
+        progress: If set, show live write progress (a ``rich`` bar in a terminal, compact
+            heartbeat lines otherwise).
+        log_level: Minimum severity for write-time log lines: ``off``, ``warning``,
+            ``info`` (default), or ``debug``. Overridden by the ``GENORAY_LOG`` env var
+            when set to one of the same values.
     """
     from genoray import DosageField, SparseVar2
 
@@ -355,6 +381,8 @@ def write_pgen(
         long_allele_capacity=long_allele_capacity,
         dosages=dosage_specs,
         check_ref=check_ref,
+        progress=progress,
+        log_level=log_level,
     )
     if skip_out_of_scope:
         print(f"Dropped {dropped} out-of-scope (symbolic/breakend) ALT alleles.")
@@ -399,6 +427,12 @@ def write_from_svar1(
         bool, Parameter(name="--skip-symbolics-and-breakends", negative="")
     ] = False,
     check_ref: Annotated[Literal["e", "x"], Parameter(name="--check-ref")] = "e",
+    progress: Annotated[
+        bool, Parameter(name="--progress", negative="--no-progress")
+    ] = False,
+    log_level: Annotated[
+        Literal["off", "warning", "info", "debug"], Parameter(name="--log-level")
+    ] = "info",
 ) -> None:
     """Convert a SVAR1 store to an SVAR2 store.
 
@@ -439,6 +473,11 @@ def write_from_svar1(
         check_ref: REF-vs-reference policy (ignored with ``--no-reference``). ``e``
             (default) aborts on the first REF/FASTA disagreement; ``x`` drops the
             offending record and continues. Mirrors ``bcftools norm --check-ref``.
+        progress: If set, show live write progress (a ``rich`` bar in a terminal, compact
+            heartbeat lines otherwise).
+        log_level: Minimum severity for write-time log lines: ``off``, ``warning``,
+            ``info`` (default), or ``debug``. Overridden by the ``GENORAY_LOG`` env var
+            when set to one of the same values.
     """
     from genoray import SparseVar2
 
@@ -466,6 +505,8 @@ def write_from_svar1(
         long_allele_capacity=long_allele_capacity,
         fields=[] if empty_fields else fields,
         check_ref=check_ref,
+        progress=progress,
+        log_level=log_level,
     )
     if skip_out_of_scope:
         print(f"Dropped {dropped} out-of-scope (symbolic/breakend) ALT alleles.")
@@ -620,7 +661,12 @@ def view_svar2(
     reroute: bool | None = None,
     overwrite: bool = False,
     threads: Annotated[int | None, Parameter(name=["--threads", "-@"])] = None,
-    progress: bool = False,
+    progress: Annotated[
+        bool, Parameter(name="--progress", negative="--no-progress")
+    ] = False,
+    log_level: Annotated[
+        Literal["off", "warning", "info", "debug"], Parameter(name="--log-level")
+    ] = "info",
 ) -> None:
     """Write a region/sample subset of an SVAR2 store.
 
@@ -665,6 +711,9 @@ def view_svar2(
         overwrite: Overwrite the output directory if it already exists.
         threads: Number of threads. Defaults to all available CPUs.
         progress: If set, show a phase-level progress bar while writing the view.
+        log_level: Minimum severity for write-time log lines: ``off``, ``warning``,
+            ``info`` (default), or ``debug``. Overridden by the ``GENORAY_LOG`` env var
+            when set to one of the same values.
     """
     import polars as pl
 
@@ -729,6 +778,7 @@ def view_svar2(
         overwrite=overwrite,
         threads=threads,
         progress=progress,
+        log_level=log_level,
     )
 
 

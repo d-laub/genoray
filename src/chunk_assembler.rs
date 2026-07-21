@@ -19,6 +19,7 @@ struct PendingAtom {
     source_alt_index: u16,
     calls: Arc<Calls>, // shared across the atoms decomposed from one record
     seq: u64,          // stable tiebreak for equal positions
+    global_idx: i32,   // threaded verbatim from the source record
 
     // INFO is resolved eagerly (already indexed by source_alt_index where the
     // underlying VCF field is Number=A) since it's already O(1) per atom -- one
@@ -40,6 +41,9 @@ struct DecomposedRecord {
     source_pos: u32,
     atoms: Vec<PendingAtom>,
     dropped_out_of_scope: u64,
+    /// Atoms decomposed from this record whose position moved during
+    /// left-alignment.
+    normalized: u64,
     /// `Some(detail)` when this record was dropped by `CheckRef::Exclude`
     /// (its REF disagreed with the reference); `detail` is the mismatch
     /// message, surfaced once for the first exclusion on the contig. The
@@ -187,6 +191,7 @@ struct AtomMeta {
     source_alt_index: u16,
     info_vals: Vec<f64>,
     format_vals: Arc<FormatVals>,
+    global_idx: i32,
     /// Columns whose allele is this atom's `source_alt_index` -- i.e. exactly the
     /// bits `pack_row` sets for this atom. `None` when the source is natively
     /// dense, where recovering carriers from the grid is correct and cheaper than
@@ -260,6 +265,7 @@ fn flush_window(
             source_alt_index: a.source_alt_index,
             info_vals: a.info_vals,
             format_vals: a.format_vals,
+            global_idx: a.global_idx,
             carriers,
         });
     }
@@ -275,8 +281,11 @@ pub struct ChunkAssembler {
     owned_range: Option<(u32, u32)>,
     skip_out_of_scope: bool,
     check_ref: crate::normalize::CheckRef,
+    /// Contig label, used only to tag `tracing` events.
+    chrom: String,
     ref_excluded: u64,
     dropped_out_of_scope: u64,
+    normalized_total: u64,
     info_fields: Vec<FieldSpec>,
     format_fields: Vec<FieldSpec>,
     heap: BinaryHeap<Reverse<PendingAtom>>,
@@ -294,6 +303,7 @@ fn decompose_raw_record(
     skip_out_of_scope: bool,
     check_ref: crate::normalize::CheckRef,
     info_fields: &[FieldSpec],
+    chrom: &str,
 ) -> Result<DecomposedRecord, ConversionError> {
     let pos = rec.pos;
     let calls = Arc::new(rec.calls);
@@ -309,10 +319,13 @@ fn decompose_raw_record(
         match crate::normalize::apply_check_ref(check_ref, pos, &rec.reference, ref_seq)? {
             crate::normalize::RefDecision::Keep => {}
             crate::normalize::RefDecision::Exclude(e) => {
+                tracing::debug!(chrom = %chrom, pos = pos, detail = %e,
+                    "excluded record: REF disagrees with reference");
                 return Ok(DecomposedRecord {
                     source_pos: pos,
                     atoms: Vec::new(),
                     dropped_out_of_scope: 0,
+                    normalized: 0,
                     ref_excluded: Some(e.to_string()),
                 });
             }
@@ -329,10 +342,18 @@ fn decompose_raw_record(
         skip_out_of_scope,
     )?;
 
+    let mut normalized = 0u64;
     let mut pending = Vec::with_capacity(atoms.len());
     for (atom_ix, atom) in atoms.into_iter().enumerate() {
         let atom = if has_reference {
-            crate::normalize::left_align(atom, ref_seq, crate::normalize::L_MAX)
+            let pre_pos = atom.pos;
+            let aligned = crate::normalize::left_align(atom, ref_seq, crate::normalize::L_MAX);
+            if aligned.pos != pre_pos {
+                normalized += 1;
+                tracing::debug!(chrom = %chrom, from = pre_pos, to = aligned.pos,
+                    "left-aligned indel");
+            }
+            aligned
         } else {
             atom
         };
@@ -355,13 +376,18 @@ fn decompose_raw_record(
             seq,
             info_vals,
             format_vals: Arc::clone(&format_vals),
+            global_idx: rec.global_idx,
         });
     }
+    // No per-record atom-count invariant here: multiallelic records legitimately
+    // atomize to >1 atom (see the ALT C,G test below). `global_idx` is threaded
+    // onto every atom a record produces, not asserted to produce exactly one.
 
     Ok(DecomposedRecord {
         source_pos: pos,
         atoms: pending,
         dropped_out_of_scope: dropped as u64,
+        normalized,
         ref_excluded: None,
     })
 }
@@ -389,6 +415,7 @@ impl ChunkAssembler {
             source,
             num_samples,
             ploidy,
+            chrom,
             ref_seq,
             has_reference,
             skip_out_of_scope,
@@ -403,6 +430,7 @@ impl ChunkAssembler {
         source: Box<dyn RecordSource + Send>,
         num_samples: usize,
         ploidy: usize,
+        chrom: &str,
         ref_seq: Arc<Vec<u8>>,
         has_reference: bool,
         skip_out_of_scope: bool,
@@ -419,8 +447,10 @@ impl ChunkAssembler {
             owned_range,
             skip_out_of_scope,
             check_ref,
+            chrom: chrom.to_string(),
             ref_excluded: 0,
             dropped_out_of_scope: 0,
+            normalized_total: 0,
             info_fields: fields
                 .iter()
                 .filter(|f| f.category == FieldCategory::Info)
@@ -442,6 +472,12 @@ impl ChunkAssembler {
     /// read loop drains.
     pub fn dropped_out_of_scope(&self) -> u64 {
         self.dropped_out_of_scope
+    }
+
+    /// Total atoms whose position moved during left-alignment so far. Valid
+    /// after the read loop drains.
+    pub fn normalized_total(&self) -> u64 {
+        self.normalized_total
     }
 
     /// Records excluded because their REF disagreed with the reference under
@@ -488,6 +524,7 @@ impl ChunkAssembler {
                             self.skip_out_of_scope,
                             self.check_ref,
                             &self.info_fields,
+                            &self.chrom,
                         )
                     })
                     .collect::<Result<Vec<_>, _>>()
@@ -504,6 +541,7 @@ impl ChunkAssembler {
                         self.skip_out_of_scope,
                         self.check_ref,
                         &self.info_fields,
+                        &self.chrom,
                     )
                 })
                 .collect::<Result<Vec<_>, _>>()?
@@ -519,10 +557,16 @@ impl ChunkAssembler {
                 if source_record_owned {
                     self.ref_excluded += 1;
                     if self.ref_excluded == 1 {
-                        println!(
-                            "Notice: check_ref=x excluding record(s) whose REF disagrees \
-                             with the reference (first: {detail}); further exclusions on \
-                             this contig are counted, not printed."
+                        // Duplicates `report_ref_excluded`'s per-contig info summary
+                        // (chrom + total count) by design: this adds the specific
+                        // first-offender detail that the summary doesn't carry, so
+                        // it's kept at debug rather than dropped outright.
+                        tracing::debug!(
+                            chrom = %self.chrom,
+                            detail = %detail,
+                            "check_ref=x excluding record(s) whose REF disagrees with the \
+                             reference; further exclusions on this contig are counted, not \
+                             logged individually"
                         );
                     }
                 }
@@ -530,6 +574,7 @@ impl ChunkAssembler {
             }
             if source_record_owned {
                 self.dropped_out_of_scope += record.dropped_out_of_scope;
+                self.normalized_total += record.normalized;
             }
             for atom in record.atoms {
                 let atom_owned = self
@@ -615,6 +660,7 @@ impl ChunkAssembler {
 
         let num_samples = self.num_samples;
         let mut pos = Vec::with_capacity(v);
+        let mut global_idx: Vec<i32> = Vec::with_capacity(v);
         let mut ilens = Vec::with_capacity(v);
         let mut alt = Vec::with_capacity(v * 2);
         let mut alt_offsets = Vec::with_capacity(v + 1);
@@ -643,6 +689,7 @@ impl ChunkAssembler {
         let mut format_arcs: Vec<Arc<FormatVals>> = Vec::with_capacity(metas.len());
         for a in metas.iter_mut() {
             pos.push(a.pos);
+            global_idx.push(a.global_idx);
             ilens.push(a.ilen);
             alt.extend_from_slice(&a.alt);
             off += a.alt.len() as u32;
@@ -704,6 +751,7 @@ impl ChunkAssembler {
         Ok(Some(DenseChunk {
             chunk_id,
             pos,
+            global_idx,
             ilens,
             alt,
             alt_offsets,
@@ -756,6 +804,7 @@ mod tests {
             seq: 0,
             info_vals: Vec::new(),
             format_vals: Arc::new(FormatVals::Dense(Vec::new())),
+            global_idx: -1,
         }
     }
 
@@ -769,6 +818,7 @@ mod tests {
             seq: pos as u64,
             info_vals: Vec::new(),
             format_vals: Arc::new(FormatVals::Dense(Vec::new())),
+            global_idx: -1,
         }
     }
 
@@ -791,6 +841,7 @@ mod tests {
             seq: 0,
             info_vals: Vec::new(),
             format_vals: Arc::new(FormatVals::Dense(Vec::new())),
+            global_idx: -1,
         }
     }
 
@@ -848,6 +899,7 @@ mod tests {
             calls: Calls::Dense(vec![1, 2]), // irrelevant to FORMAT resolution
             info_raw: Vec::new(),
             format_vals: FormatVals::Dense(vec![Some(vec![vec![10.0, 20.0]])]),
+            global_idx: -1,
         };
         let decomposed = decompose_raw_record(
             rec,
@@ -857,6 +909,7 @@ mod tests {
             false,
             crate::normalize::CheckRef::Error,
             &[],
+            "chr1",
         )
         .unwrap();
         assert_eq!(
@@ -886,6 +939,38 @@ mod tests {
     }
 
     #[test]
+    fn decompose_threads_record_global_idx_onto_each_atom() {
+        // A single biallelic SNP record tagged global id 7 must yield exactly one
+        // atom whose global_idx == 7 (the 1:1 record<->atom contract).
+        let rec = RawRecord {
+            pos: 0,
+            reference: b"A".to_vec(),
+            alts: vec![b"C".to_vec()], // biallelic SNP -> 1 atom
+            calls: Calls::Dense(vec![1]),
+            info_raw: Vec::new(),
+            format_vals: FormatVals::Dense(vec![Some(vec![vec![10.0]])]),
+            global_idx: 7,
+        };
+        let decomposed = decompose_raw_record(
+            rec,
+            0,
+            &[],
+            false,
+            false,
+            crate::normalize::CheckRef::Error,
+            &[],
+            "chr1",
+        )
+        .unwrap();
+        assert_eq!(
+            decomposed.atoms.len(),
+            1,
+            "REF A / ALT C must atomize to exactly one SNV atom"
+        );
+        assert_eq!(decomposed.atoms[0].global_idx, 7);
+    }
+
+    #[test]
     fn pack_row_dense_calls_matches_the_raw_gt_loop() {
         // Guards the Task 4 migration: packing from Calls::Dense must reproduce, bit for
         // bit, what the old `&a.gt` loop produced. Any drift here is a store diff.
@@ -909,6 +994,7 @@ mod tests {
             seq: 0,
             info_vals: Vec::new(),
             format_vals: Arc::new(FormatVals::Dense(Vec::new())),
+            global_idx: -1,
         };
 
         let mut got = vec![0u64; 1];
@@ -940,6 +1026,7 @@ mod tests {
             seq: 0,
             info_vals: Vec::new(),
             format_vals: Arc::new(FormatVals::Dense(Vec::new())),
+            global_idx: -1,
         };
 
         let mut dense_bits = vec![0u64; 1];
@@ -990,6 +1077,7 @@ mod tests {
             seq: 0,
             info_vals: Vec::new(),
             format_vals: Arc::new(FormatVals::Dense(Vec::new())),
+            global_idx: -1,
         };
         let words = (columns * 2).div_ceil(64);
 

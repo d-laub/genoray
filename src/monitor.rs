@@ -187,22 +187,22 @@ pub fn spawn_sampler(
                 let fmt =
                     |o: Option<f64>| o.map_or_else(|| "n/a".to_string(), |v| format!("{:.0}%", v));
                 let elapsed = start.elapsed().as_secs();
-                eprintln!(
-                    "[{} t={}s] tx_dense={}/{} tx_sparse={}/{} tx_long={}/{} | \
-                     cpu read={} shard={} exec={} cw={} lw={}",
-                    chrom,
-                    elapsed,
-                    tx_dense.len(),
-                    dense_cap,
-                    tx_sparse.len(),
-                    sparse_cap,
-                    tx_long.len(),
-                    long_cap,
-                    fmt(cpu_pcts[0]),
-                    fmt(shard_pct),
-                    fmt(cpu_pcts[1]),
-                    fmt(cpu_pcts[2]),
-                    fmt(cpu_pcts[3]),
+                tracing::trace!(
+                    target: "genoray::monitor",
+                    chrom = %chrom,
+                    elapsed_s = elapsed,
+                    dense = tx_dense.len(), dense_cap = dense_cap,
+                    sparse = tx_sparse.len(), sparse_cap = sparse_cap,
+                    long = tx_long.len(), long_cap = long_cap,
+                    // `cpu_read` reads 0% in the sharded path (the reader thread
+                    // just blocks on the shard-worker pool); `cpu_shard` is the
+                    // de-lied aggregate CPU across this chrom's shard workers.
+                    cpu_read = %fmt(cpu_pcts[0]),
+                    cpu_shard = %fmt(shard_pct),
+                    cpu_exec = %fmt(cpu_pcts[1]),
+                    cpu_cw = %fmt(cpu_pcts[2]),
+                    cpu_lw = %fmt(cpu_pcts[3]),
+                    "pipeline sampler"
                 );
             }
             // tx_dense, tx_sparse, tx_long Sender clones drop here as the closure ends —
