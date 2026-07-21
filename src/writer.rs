@@ -55,7 +55,7 @@ pub fn run_io_writer(
         }
     }
 
-    println!("Writer Thread: Channel closed. All chunks safely committed to SSD.");
+    tracing::debug!("writer thread: all chunks committed");
     Ok(())
 }
 
@@ -86,10 +86,7 @@ pub fn run_long_allele_writer(
         context: format!("flushing {}", out_path.display()),
         source: e,
     })?;
-    println!(
-        "[{}] Long Allele Writer: All buffer data safely committed.",
-        chrom_label
-    );
+    tracing::debug!(chrom = %chrom_label, "long-allele writer: buffers committed");
     Ok(())
 }
 

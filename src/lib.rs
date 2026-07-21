@@ -140,7 +140,7 @@ fn index_vcf(path: String) -> PyResult<()> {
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 #[pyfunction]
-#[pyo3(signature = (vcf_path, reference_path, chroms, output_dir, samples, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false, signatures=false, info_fields=Vec::new(), format_fields=Vec::new(), check_ref="e".to_string(), region_ranges=Vec::new(), regions_overlap="pos".to_string()))]
+#[pyo3(signature = (vcf_path, reference_path, chroms, output_dir, samples, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false, signatures=false, info_fields=Vec::new(), format_fields=Vec::new(), check_ref="e".to_string(), region_ranges=Vec::new(), regions_overlap="pos".to_string(), log_level = "info".to_string(), receiver = None))]
 fn run_conversion_pipeline(
     py: Python,
     vcf_path: String,
@@ -159,6 +159,8 @@ fn run_conversion_pipeline(
     check_ref: String,
     region_ranges: Vec<(String, u32, u32)>,
     regions_overlap: String,
+    log_level: String,
+    receiver: Option<Py<PyEventReceiver>>,
 ) -> PyResult<usize> {
     let sample_refs: Vec<&str> = samples.iter().map(|s| s.as_str()).collect();
 
@@ -179,81 +181,100 @@ fn run_conversion_pipeline(
 
     let check_ref: crate::normalize::CheckRef = check_ref.parse().map_err(PyValueError::new_err)?;
 
+    // `receiver` is `None` unless the Python caller opted in (Task 11/12), in
+    // which case `sink` publishes into its channel; otherwise a disabled sink
+    // is a pure no-op. NOTE: `EventSink`'s progress buffer is a SINGLE shared
+    // counter, not keyed by chrom -- safe only when at most one
+    // `process_chromosome` call is ticking it at a time. This pipeline
+    // dispatches chroms CONCURRENTLY (`concurrent_chroms` via
+    // `plan_thread_budget`, can exceed 1), so ticks from different chroms can
+    // interleave into the same buffered counter and get flushed under the
+    // wrong chrom label. Fine while `receiver=None` (disabled sink is a
+    // no-op); revisit before exposing progress here for real.
+    let sink = match &receiver {
+        Some(r) => r.borrow(py).sink(chunk_size as u64),
+        None => crate::logging::EventSink::disabled(),
+    };
+    let level = log_level.clone();
+
     let results: Vec<Result<u64, crate::error::ConversionError>> = py.detach(|| {
-        // Step 1 -> HW discovery/override and budgeting
-        let available_cores = match max_threads {
-            Some(t) if t > 0 => {
-                println!("Notice: Using user-provided thread limit: {}", t);
-                t
-            }
-            _ => {
-                let detected = std::thread::available_parallelism().unwrap().get();
-                println!(
-                    "Notice: No thread limit provided. Hardware Detected: {} cores.",
+        crate::logging::with_channel_subscriber(sink.clone(), &level, || {
+            // Step 1 -> HW discovery/override and budgeting
+            let available_cores = match max_threads {
+                Some(t) if t > 0 => {
+                    println!("Notice: Using user-provided thread limit: {}", t);
+                    t
+                }
+                _ => {
+                    let detected = std::thread::available_parallelism().unwrap().get();
+                    println!(
+                        "Notice: No thread limit provided. Hardware Detected: {} cores.",
+                        detected
+                    );
                     detected
-                );
-                detected
-            }
-        };
+                }
+            };
 
-        let plan = crate::budget::plan_thread_budget(available_cores, chroms.len());
-        let concurrent_chroms = plan.concurrent_chroms;
-        let htslib_threads = plan.htslib_threads;
-        let processing_threads = plan.processing_threads;
+            let plan = crate::budget::plan_thread_budget(available_cores, chroms.len());
+            let concurrent_chroms = plan.concurrent_chroms;
+            let htslib_threads = plan.htslib_threads;
+            let processing_threads = plan.processing_threads;
 
-        let total_active =
-            concurrent_chroms * (crate::budget::PIPELINE_THREADS_PER_CHROM + htslib_threads);
-        println!("Using: {} cores.", available_cores);
-        println!(
-            "Pipeline Config: {} concurrent chromosomes | {} HTSlib decompression threads each \
+            let total_active =
+                concurrent_chroms * (crate::budget::PIPELINE_THREADS_PER_CHROM + htslib_threads);
+            println!("Using: {} cores.", available_cores);
+            println!(
+                "Pipeline Config: {} concurrent chromosomes | {} HTSlib decompression threads each \
              ({} pipeline/BGZF threads, {} reader-side processing/shard threads).",
-            concurrent_chroms, htslib_threads, total_active, processing_threads,
-        );
+                concurrent_chroms, htslib_threads, total_active, processing_threads,
+            );
 
-        // Step 2 -> Rayon Pool
-        // Rayon hosts one task per concurrent chrom; each task spawns its own pipeline
-        // OS threads (reader, executor, writers) plus htslib_threads HTSlib decode threads.
-        // Naming the rayon workers makes them grep-able in `top -H` / pidstat alongside
-        // the per-chrom threads (read-chr1, exec-chr1, etc.).
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(concurrent_chroms)
-            .thread_name(|i| format!("rayon-{}", i))
-            .build()
-            .unwrap();
+            // Step 2 -> Rayon Pool
+            // Rayon hosts one task per concurrent chrom; each task spawns its own pipeline
+            // OS threads (reader, executor, writers) plus htslib_threads HTSlib decode threads.
+            // Naming the rayon workers makes them grep-able in `top -H` / pidstat alongside
+            // the per-chrom threads (read-chr1, exec-chr1, etc.).
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(concurrent_chroms)
+                .thread_name(|i| format!("rayon-{}", i))
+                .build()
+                .unwrap();
 
-        // Step 3 -> Dispatch
-        let fasta_ref: Option<&str> = reference_path.as_deref();
-        let results = pool.install(|| {
-            chroms
-                .par_iter()
-                .map(|chrom| {
-                    println!("==> Processing {}", chrom);
-                    orchestrator::process_chromosome(
-                        orchestrator::SourceSpec::Vcf {
-                            vcf_path: vcf_path.clone(),
-                            htslib_threads,
-                            regions: ranges_by_chrom.get(chrom).cloned().unwrap_or_default(),
-                            overlap: overlap_mode,
-                        },
-                        fasta_ref,
-                        chrom,
-                        &output_dir,
-                        &sample_refs,
-                        chunk_size,
-                        ploidy,
-                        long_allele_capacity,
-                        skip_out_of_scope,
-                        check_ref,
-                        processing_threads,
-                        signatures,
-                        &fields,
-                    )
-                })
-                .collect::<Vec<_>>()
-        });
+            // Step 3 -> Dispatch
+            let fasta_ref: Option<&str> = reference_path.as_deref();
+            let results = pool.install(|| {
+                chroms
+                    .par_iter()
+                    .map(|chrom| {
+                        println!("==> Processing {}", chrom);
+                        orchestrator::process_chromosome(
+                            orchestrator::SourceSpec::Vcf {
+                                vcf_path: vcf_path.clone(),
+                                htslib_threads,
+                                regions: ranges_by_chrom.get(chrom).cloned().unwrap_or_default(),
+                                overlap: overlap_mode,
+                            },
+                            fasta_ref,
+                            chrom,
+                            &output_dir,
+                            &sample_refs,
+                            chunk_size,
+                            ploidy,
+                            long_allele_capacity,
+                            skip_out_of_scope,
+                            check_ref,
+                            processing_threads,
+                            signatures,
+                            &fields,
+                            &sink,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            });
 
-        println!("Cohort Processing Complete.");
-        results
+            println!("Cohort Processing Complete.");
+            results
+        })
     });
 
     let mut total_dropped: u64 = 0;
@@ -294,7 +315,7 @@ fn run_conversion_pipeline(
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 #[pyfunction]
-#[pyo3(signature = (pgen_path, pvar_path, reference_path, chroms, contig_ranges, output_dir, samples, chunk_size, max_threads, long_allele_capacity, skip_out_of_scope, signatures, dosage_fields, readers, dosage_readers, check_ref, region_ranges, regions_overlap, sample_perm))]
+#[pyo3(signature = (pgen_path, pvar_path, reference_path, chroms, contig_ranges, output_dir, samples, chunk_size, max_threads, long_allele_capacity, skip_out_of_scope, signatures, dosage_fields, readers, dosage_readers, check_ref, region_ranges, regions_overlap, sample_perm, log_level = "info".to_string(), receiver = None))]
 fn run_pgen_conversion_pipeline(
     py: Python,
     pgen_path: String,
@@ -316,6 +337,8 @@ fn run_pgen_conversion_pipeline(
     region_ranges: Vec<(String, u32, u32)>,
     regions_overlap: String,
     sample_perm: Vec<usize>,
+    log_level: String,
+    receiver: Option<Py<PyEventReceiver>>,
 ) -> PyResult<usize> {
     if chroms.len() != contig_ranges.len() || chroms.len() != readers.len() {
         return Err(PyValueError::new_err(
@@ -378,60 +401,72 @@ fn run_pgen_conversion_pipeline(
         .map(|(((c, r), rd), drd)| (c, r, rd, drd))
         .collect();
 
+    // See `run_conversion_pipeline`'s sink-construction comment: the same
+    // shared-counter-under-concurrent-dispatch caveat applies here too (this
+    // pipeline also dispatches chroms concurrently via rayon).
+    let sink = match &receiver {
+        Some(r) => r.borrow(py).sink(chunk_size as u64),
+        None => crate::logging::EventSink::disabled(),
+    };
+    let level = log_level.clone();
+
     let results: Vec<Result<u64, crate::error::ConversionError>> = py.detach(|| {
-        let available_cores = match max_threads {
-            Some(t) if t > 0 => t,
-            _ => std::thread::available_parallelism().unwrap().get(),
-        };
-        let plan = crate::budget::plan_thread_budget(available_cores, jobs.len());
-        let concurrent_chroms = plan.concurrent_chroms;
-        let processing_threads = plan.processing_threads;
-        println!(
-            "Pipeline Config (PGEN): {} concurrent chromosomes | {} processing threads each.",
-            concurrent_chroms, processing_threads
-        );
+        crate::logging::with_channel_subscriber(sink.clone(), &level, || {
+            let available_cores = match max_threads {
+                Some(t) if t > 0 => t,
+                _ => std::thread::available_parallelism().unwrap().get(),
+            };
+            let plan = crate::budget::plan_thread_budget(available_cores, jobs.len());
+            let concurrent_chroms = plan.concurrent_chroms;
+            let processing_threads = plan.processing_threads;
+            println!(
+                "Pipeline Config (PGEN): {} concurrent chromosomes | {} processing threads each.",
+                concurrent_chroms, processing_threads
+            );
 
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(concurrent_chroms)
-            .thread_name(|i| format!("chrom-{}", i))
-            .build()
-            .expect("build chrom pool");
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(concurrent_chroms)
+                .thread_name(|i| format!("chrom-{}", i))
+                .build()
+                .expect("build chrom pool");
 
-        pool.install(|| {
-            jobs.into_par_iter()
-                .map(|(chrom, (lo, hi), readers, dosage_readers)| {
-                    // PGEN sub-contig sharding is dead at runtime (see
-                    // `SourceSpec::Pgen::readers` doc comment) -- collapse the
-                    // per-shard dosage-reader pool down to its one live shard's
-                    // per-field readers before handing off to `SourceSpec`.
-                    let dosage_readers = dosage_readers.into_iter().next().unwrap_or_default();
-                    orchestrator::process_chromosome(
-                        orchestrator::SourceSpec::Pgen {
-                            pgen_path: pgen_path.clone(),
-                            pvar_path: pvar_path.clone(),
-                            var_start: lo,
-                            var_end: hi,
-                            readers,
-                            dosage_readers,
-                            regions: ranges_by_chrom.get(&chrom).cloned().unwrap_or_default(),
-                            overlap: overlap_mode,
-                            sample_perm: sample_perm.clone(),
-                        },
-                        reference_path.as_deref(),
-                        &chrom,
-                        &output_dir,
-                        &sample_refs,
-                        chunk_size,
-                        ploidy,
-                        long_allele_capacity,
-                        skip_out_of_scope,
-                        check_ref,
-                        processing_threads,
-                        signatures,
-                        &fields,
-                    )
-                })
-                .collect()
+            pool.install(|| {
+                jobs.into_par_iter()
+                    .map(|(chrom, (lo, hi), readers, dosage_readers)| {
+                        // PGEN sub-contig sharding is dead at runtime (see
+                        // `SourceSpec::Pgen::readers` doc comment) -- collapse the
+                        // per-shard dosage-reader pool down to its one live shard's
+                        // per-field readers before handing off to `SourceSpec`.
+                        let dosage_readers = dosage_readers.into_iter().next().unwrap_or_default();
+                        orchestrator::process_chromosome(
+                            orchestrator::SourceSpec::Pgen {
+                                pgen_path: pgen_path.clone(),
+                                pvar_path: pvar_path.clone(),
+                                var_start: lo,
+                                var_end: hi,
+                                readers,
+                                dosage_readers,
+                                regions: ranges_by_chrom.get(&chrom).cloned().unwrap_or_default(),
+                                overlap: overlap_mode,
+                                sample_perm: sample_perm.clone(),
+                            },
+                            reference_path.as_deref(),
+                            &chrom,
+                            &output_dir,
+                            &sample_refs,
+                            chunk_size,
+                            ploidy,
+                            long_allele_capacity,
+                            skip_out_of_scope,
+                            check_ref,
+                            processing_threads,
+                            signatures,
+                            &fields,
+                            &sink,
+                        )
+                    })
+                    .collect()
+            })
         })
     });
 
@@ -877,7 +912,7 @@ fn svar2_variant_stats<'py>(
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 #[pyfunction]
-#[pyo3(signature = (vcf_paths, reference_path, chroms, output_dir, samples, contig_membership, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false, signatures=false, info_fields=Vec::new(), format_fields=Vec::new(), check_ref="e".to_string(), region_ranges=Vec::new(), regions_overlap="pos".to_string()))]
+#[pyo3(signature = (vcf_paths, reference_path, chroms, output_dir, samples, contig_membership, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false, signatures=false, info_fields=Vec::new(), format_fields=Vec::new(), check_ref="e".to_string(), region_ranges=Vec::new(), regions_overlap="pos".to_string(), log_level = "info".to_string(), receiver = None))]
 fn run_vcf_list_conversion_pipeline(
     py: Python,
     vcf_paths: Vec<String>,
@@ -902,32 +937,47 @@ fn run_vcf_list_conversion_pipeline(
     check_ref: String,
     region_ranges: Vec<(String, u32, u32)>,
     regions_overlap: String,
+    log_level: String,
+    receiver: Option<Py<PyEventReceiver>>,
 ) -> PyResult<usize> {
     let check_ref: crate::normalize::CheckRef = check_ref.parse().map_err(PyValueError::new_err)?;
     // Parse the region-overlap mode once, up front, so a bad value raises
     // before any output byte is written -- mirrors `run_conversion_pipeline`.
     let overlap_mode = crate::svar2_view::parse_overlap_mode(&regions_overlap)?;
 
+    // `run_vcf_list` processes contigs SEQUENTIALLY (a plain loop, see its own
+    // docs), so — unlike `run_conversion_pipeline`/`run_pgen_conversion_pipeline`
+    // — the shared-counter invariant genuinely holds here: at most one
+    // `process_chromosome` call ticks this sink at a time.
+    let sink = match &receiver {
+        Some(r) => r.borrow(py).sink(chunk_size as u64),
+        None => crate::logging::EventSink::disabled(),
+    };
+    let level = log_level.clone();
+
     let dropped: u64 = py.detach(|| {
-        orchestrator::run_vcf_list(
-            &vcf_paths,
-            reference_path.as_deref(),
-            &chroms,
-            &output_dir,
-            &samples,
-            chunk_size,
-            ploidy,
-            max_threads,
-            long_allele_capacity,
-            skip_out_of_scope,
-            check_ref,
-            signatures,
-            info_fields,
-            format_fields,
-            region_ranges,
-            overlap_mode,
-            contig_membership,
-        )
+        crate::logging::with_channel_subscriber(sink.clone(), &level, || {
+            orchestrator::run_vcf_list(
+                &vcf_paths,
+                reference_path.as_deref(),
+                &chroms,
+                &output_dir,
+                &samples,
+                chunk_size,
+                ploidy,
+                max_threads,
+                long_allele_capacity,
+                skip_out_of_scope,
+                check_ref,
+                signatures,
+                info_fields,
+                format_fields,
+                region_ranges,
+                overlap_mode,
+                contig_membership,
+                &sink,
+            )
+        })
     })?;
     Ok(dropped as usize)
 }
@@ -953,7 +1003,7 @@ fn run_vcf_list_conversion_pipeline(
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 #[pyfunction]
-#[pyo3(signature = (svar1_dir, reference_path, chroms, contig_starts, contig_lens, output_dir, samples, ploidy, chunk_size, max_threads, long_allele_capacity, skip_out_of_scope, signatures, pos_per_contig, ref_bytes_per_contig, ref_offsets_per_contig, alt_bytes_per_contig, alt_offsets_per_contig, format_fields, format_src_dtypes, check_ref, region_ranges, regions_overlap, sample_idx))]
+#[pyo3(signature = (svar1_dir, reference_path, chroms, contig_starts, contig_lens, output_dir, samples, ploidy, chunk_size, max_threads, long_allele_capacity, skip_out_of_scope, signatures, pos_per_contig, ref_bytes_per_contig, ref_offsets_per_contig, alt_bytes_per_contig, alt_offsets_per_contig, format_fields, format_src_dtypes, check_ref, region_ranges, regions_overlap, sample_idx, log_level = "info".to_string(), receiver = None))]
 fn run_svar1_conversion_pipeline(
     py: Python,
     svar1_dir: String,
@@ -980,6 +1030,8 @@ fn run_svar1_conversion_pipeline(
     region_ranges: Vec<(String, u32, u32)>,
     regions_overlap: String,
     sample_idx: Vec<usize>,
+    log_level: String,
+    receiver: Option<Py<PyEventReceiver>>,
 ) -> PyResult<usize> {
     let n = chroms.len();
     if [
@@ -1028,58 +1080,70 @@ fn run_svar1_conversion_pipeline(
         ));
     }
 
-    let results: Vec<Result<u64, crate::error::ConversionError>> = py.detach(|| {
-        let available_cores = match max_threads {
-            Some(t) if t > 0 => t,
-            _ => std::thread::available_parallelism().unwrap().get(),
-        };
-        let plan = crate::budget::plan_thread_budget(available_cores, jobs.len());
-        let concurrent_chroms = plan.concurrent_chroms;
-        let processing_threads = plan.processing_threads;
-        println!(
-            "Pipeline Config (SVAR1): {} concurrent chromosomes | {} processing threads each.",
-            concurrent_chroms, processing_threads
-        );
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(concurrent_chroms)
-            .thread_name(|i| format!("chrom-{}", i))
-            .build()
-            .expect("build chrom pool");
+    // See `run_conversion_pipeline`'s sink-construction comment: the same
+    // shared-counter-under-concurrent-dispatch caveat applies here too (this
+    // pipeline also dispatches chroms concurrently via rayon).
+    let sink = match &receiver {
+        Some(r) => r.borrow(py).sink(chunk_size as u64),
+        None => crate::logging::EventSink::disabled(),
+    };
+    let level = log_level.clone();
 
-        pool.install(|| {
-            jobs.into_par_iter()
-                .map(|(chrom, start, len, pos, rb, ro, ab, ao)| {
-                    orchestrator::process_chromosome(
-                        orchestrator::SourceSpec::Svar1 {
-                            svar1_dir: svar1_dir.clone(),
-                            contig_start: start,
-                            n_local: len,
-                            pos,
-                            ref_bytes: rb,
-                            ref_offsets: ro,
-                            alt_bytes: ab,
-                            alt_offsets: ao,
-                            format_fields: fields.clone(),
-                            format_src_dtypes: format_src_dtypes.clone(),
-                            regions: ranges_by_chrom.get(&chrom).cloned().unwrap_or_default(),
-                            overlap: overlap_mode,
-                            sample_idx: sample_idx.clone(),
-                        },
-                        reference_path.as_deref(),
-                        &chrom,
-                        &output_dir,
-                        &sample_refs,
-                        chunk_size,
-                        ploidy,
-                        long_allele_capacity,
-                        skip_out_of_scope,
-                        check_ref,
-                        processing_threads,
-                        signatures,
-                        &fields,
-                    )
-                })
-                .collect()
+    let results: Vec<Result<u64, crate::error::ConversionError>> = py.detach(|| {
+        crate::logging::with_channel_subscriber(sink.clone(), &level, || {
+            let available_cores = match max_threads {
+                Some(t) if t > 0 => t,
+                _ => std::thread::available_parallelism().unwrap().get(),
+            };
+            let plan = crate::budget::plan_thread_budget(available_cores, jobs.len());
+            let concurrent_chroms = plan.concurrent_chroms;
+            let processing_threads = plan.processing_threads;
+            println!(
+                "Pipeline Config (SVAR1): {} concurrent chromosomes | {} processing threads each.",
+                concurrent_chroms, processing_threads
+            );
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(concurrent_chroms)
+                .thread_name(|i| format!("chrom-{}", i))
+                .build()
+                .expect("build chrom pool");
+
+            pool.install(|| {
+                jobs.into_par_iter()
+                    .map(|(chrom, start, len, pos, rb, ro, ab, ao)| {
+                        orchestrator::process_chromosome(
+                            orchestrator::SourceSpec::Svar1 {
+                                svar1_dir: svar1_dir.clone(),
+                                contig_start: start,
+                                n_local: len,
+                                pos,
+                                ref_bytes: rb,
+                                ref_offsets: ro,
+                                alt_bytes: ab,
+                                alt_offsets: ao,
+                                format_fields: fields.clone(),
+                                format_src_dtypes: format_src_dtypes.clone(),
+                                regions: ranges_by_chrom.get(&chrom).cloned().unwrap_or_default(),
+                                overlap: overlap_mode,
+                                sample_idx: sample_idx.clone(),
+                            },
+                            reference_path.as_deref(),
+                            &chrom,
+                            &output_dir,
+                            &sample_refs,
+                            chunk_size,
+                            ploidy,
+                            long_allele_capacity,
+                            skip_out_of_scope,
+                            check_ref,
+                            processing_threads,
+                            signatures,
+                            &fields,
+                            &sink,
+                        )
+                    })
+                    .collect()
+            })
         })
     });
 

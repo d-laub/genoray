@@ -74,6 +74,7 @@ fn vcf_list_e2e_two_samples_one_store() {
         genoray_core::svar2_view::OverlapMode::Pos,
         // Every file declares chr1 and has records on it -> all members.
         vec![vec![true; vcf_paths.len()]; chroms.len()],
+        &genoray_core::logging::EventSink::disabled(),
     )
     .expect("run_vcf_list should succeed");
 
@@ -278,6 +279,7 @@ fn vcf_list_e2e_regions_restricts_merge() {
         genoray_core::svar2_view::OverlapMode::Pos,
         // Every file declares chr1 and has records on it -> all members.
         vec![vec![true; vcf_paths.len()]; chroms.len()],
+        &genoray_core::logging::EventSink::disabled(),
     )
     .expect("run_vcf_list should succeed");
 

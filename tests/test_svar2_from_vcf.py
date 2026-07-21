@@ -473,7 +473,7 @@ def test_from_vcf_check_ref_exclude_continues(tmp_path: Path):
 
 
 def test_from_vcf_sharded_check_ref_exclude_counts_owned_record_once(
-    tmp_path: Path, capfd: pytest.CaptureFixture[str]
+    tmp_path: Path,
 ):
     """check_ref=x must survive sub-contig sharding: the excluded record is
     dropped (byte-identical to the serial exclude above) AND counted exactly
@@ -485,8 +485,19 @@ def test_from_vcf_sharded_check_ref_exclude_counts_owned_record_once(
     (over-decomposed VCF units) on this tiny input; the count is aggregated
     across shards by ``shard_exec::run`` -> ``ShardTotals.ref_excluded`` and
     reported once via ``orchestrator::report_ref_excluded``. Ported from PR #115
-    (which #119 supersedes) to keep its coverage. ``capfd`` (not ``capsys``)
-    because the summary is a Rust ``println!`` on fd 1.
+    (which #119 supersedes) to keep its coverage.
+
+    NOTE: this used to assert the "excluded 1 record(s)" summary on captured
+    stdout (a Rust ``println!``). The SVAR2 write-logging rework routes that
+    summary through ``tracing::info!`` instead, and `from_vcf` doesn't yet
+    accept a `receiver=` kwarg to observe it structurally (that lands with the
+    Python-side event-channel wiring) -- so there is currently no
+    Python-visible signal of the *reported* excluded count, only of the
+    *effective* one below. If double-counting across the shard boundary crept
+    back in, the summary would over-report but the actual write path is
+    unaffected either way, so `region_counts` is the correctness oracle that
+    matters here: the pos-10 record must be excluded exactly once (not
+    dropped twice, not kept twice) regardless of how many shards see it.
     """
     ref = _write_ref(tmp_path)
     vcf = _write_vcf_bad_ref(tmp_path)
@@ -494,7 +505,6 @@ def test_from_vcf_sharded_check_ref_exclude_counts_owned_record_once(
 
     SparseVar2.from_vcf(out, vcf, ref, check_ref="x", threads=16, chunk_size=1)
 
-    assert "excluded 1 record(s)" in capfd.readouterr().out
     counts = SparseVar2(out).region_counts("chr1", [(0, 40)])
     assert int(counts.sum()) == 4
 

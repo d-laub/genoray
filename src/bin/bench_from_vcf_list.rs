@@ -140,6 +140,7 @@ fn main() {
         Vec::new(),       // region_ranges: empty => whole contig, as the bench intends
         OverlapMode::Pos, // overlap (inert with no regions; mirrors the default)
         contig_membership,
+        &genoray_core::logging::EventSink::disabled(),
     )
     .expect("run_vcf_list");
     eprintln!(
