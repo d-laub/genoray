@@ -1,7 +1,9 @@
 import io
+import threading
 
 import genoray._core as core
-from genoray._logging import ProgressRenderer
+import pytest
+from genoray._logging import ProgressRenderer, resolve_log_level, write_reporting
 from rich.console import Console
 
 
@@ -44,3 +46,27 @@ def test_progress_false_suppresses_percent_lines():
     # summaries still present, but no "%" throttled progress line
     assert "chr1 done" in out
     assert "%" not in out
+
+
+def test_resolve_log_level_validates_and_env(monkeypatch):
+    assert resolve_log_level("info") == "info"
+    monkeypatch.setenv("GENORAY_LOG", "debug")
+    assert resolve_log_level("info") == "debug"
+    monkeypatch.delenv("GENORAY_LOG", raising=False)
+    with pytest.raises(ValueError):
+        resolve_log_level("loud")
+
+
+def test_write_reporting_disabled_yields_none():
+    with write_reporting(progress=False, log_level="off") as rx:
+        assert rx is None
+
+
+def test_write_reporting_drains_and_joins():
+    n_threads_before = threading.active_count()
+    with write_reporting(progress=False, log_level="info") as rx:
+        assert rx is not None
+        # Simulate a producer finishing immediately by not sending anything;
+        # context exit must drop the sender and join the drain thread.
+    # After exit, no leaked drain thread.
+    assert threading.active_count() == n_threads_before

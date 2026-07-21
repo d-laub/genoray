@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import os
+import threading
 import time
-from typing import Literal
+from contextlib import contextmanager
+from typing import Iterator, Literal
 
 from rich.console import Console
 from rich.progress import BarColumn, Progress, TaskID, TextColumn, TimeElapsedColumn
@@ -91,3 +94,63 @@ class ProgressRenderer:
         if self._progress is not None:
             self._progress.stop()
             self._progress = None
+
+
+def resolve_log_level(log_level: str) -> str:
+    if log_level not in LOG_LEVELS:
+        raise ValueError(f"log_level must be one of {LOG_LEVELS}; got {log_level!r}")
+    env = os.environ.get("GENORAY_LOG", "").strip().lower()
+    if env in LOG_LEVELS:
+        return env
+    return log_level
+
+
+@contextmanager
+def write_reporting(progress: bool, log_level: str) -> Iterator[object | None]:
+    level = resolve_log_level(log_level)
+    if not progress and level == "off":
+        yield None
+        return
+
+    from genoray import _core
+
+    console = Console()
+    renderer = ProgressRenderer(console, show_bar=progress)
+    rx = _core.PyEventReceiver()
+    stop = threading.Event()
+
+    def _drain() -> None:
+        while not stop.is_set():
+            try:
+                ev = rx.recv_timeout(100)
+            except StopIteration:
+                break
+            if ev is not None:
+                try:
+                    renderer.handle(ev)
+                except Exception:
+                    pass  # never let rendering crash the write
+        # drain any straggling events after disconnect
+        while True:
+            try:
+                ev = rx.recv_timeout(0)
+            except StopIteration:
+                break
+            if ev is None:
+                break
+            try:
+                renderer.handle(ev)
+            except Exception:
+                pass
+
+    t = threading.Thread(target=_drain, name="genoray-log-drain", daemon=True)
+    t.start()
+    try:
+        yield rx
+    finally:
+        stop.set()
+        # Dropping the Rust-side pipeline senders triggers StopIteration in the
+        # drain loop; the receiver's own internal sender is released when `rx`
+        # is garbage-collected. Give the drain a bounded join.
+        t.join(timeout=5.0)
+        renderer.close()
