@@ -1,3 +1,62 @@
+## 3.3.0 (2026-07-22)
+
+### Feat
+
+- **pgen**: tag record-stream survivors with true .pvar global row index
+- **chunk**: carry per-variant global_idx through DenseChunk assembly
+- **cli**: --progress/--log-level on write subcommands
+- **svar2**: functional progress/log_level on write_view
+- **svar2**: functional progress/log_level on from_pgen/from_vcf_list/from_svar1
+- **svar2**: functional progress/log_level on from_vcf
+- **logging**: drain-thread write_reporting context manager
+- **logging**: rich ProgressRenderer with heartbeat fallback
+- **logging**: report contig names resolved via normalization
+- **logging**: per-event debug + summary info for excluded/normalized variants
+- **logging**: emit contig/progress events and route milestones through tracing
+- **logging**: PyEventReceiver binding with GIL-releasing recv_timeout
+- **logging**: tracing ChannelLayer, scoped subscriber, GENORAY_LOG fmt fallback
+- **logging**: add Event enum and buffered EventSink
+- **svar2**: GENORAY_TRACE heartbeats + shard-worker CPU sampling for #135 diagnosis
+- **svar2**: synthetic multi-contig VAF cohort generator for the #135 repro
+- **cli**: split write into per-source subcommands; rename legacy writer to write-svar1
+- **svar2**: read PGEN dosages as FORMAT fields in from_pgen
+- **svar2**: add field selection to from_svar1 (default carries all)
+- **svar2**: thread dosage field specs and reader pools into PGEN pipeline
+- **svar2**: add DosageField spec and CLI field-string parser
+- **svar2**: normalize contigs= in annotate_mutations; raise on all-miss
+- **svar2**: normalize contig names in subset_contigs
+- **svar2**: normalize contig names in reader query methods
+- **vcf**: VcfRecordSource::with_sample_indices + resolve_sample_indices for precomputed sample lookup
+- **bench**: record per-contig RSS high-water + arena-heap count
+- support Python 3.14 (raise ceiling to <3.15)
+
+### Fix
+
+- **logging**: forward the GENORAY_LOG-resolved level to the channel gate
+- **logging**: install a process-global tracing subscriber so pipeline-thread events reach the channel
+- **logging**: key progress buffer per-chrom to fix concurrent-contig misattribution
+- **svar2**: split livelock regression cohorts + fix unset-env skip guard
+- **svar2**: resolve contig for decode_batch_fields path arg
+- **svar2**: normalize contig names against reference FASTA in conversion
+- **bench**: import generate_cohort by name so parallel default survives forkserver
+- **bench**: register dynamically-loaded generate_cohort in sys.modules so the parallel default is picklable
+- **svar2**: gate from_vcf_list malloc_trim on glibc (target_env=gnu) for musl source builds
+
+### Refactor
+
+- **logging**: remove dead PyEventReceiver::tx_clone and fix stale drain comment
+- **logging**: drop dead level_from_str superseded by level_rank
+- **logging**: route remaining pipeline milestone prints through tracing
+- **logging**: demote pipeline sampler to trace target
+- **logging**: route cohort-complete milestone through tracing
+- **logging**: route remaining lib.rs milestone prints through tracing
+- **svar2**: hoist separate dosage-source validation out of from_pgen contig loop
+
+### Perf
+
+- **svar2**: trim glibc arenas between contigs to stop the from_vcf_list RSS ratchet (#120)
+- **bench**: parallelize from_vcf_list cohort generation across cores
+
 ## 3.2.1 (2026-07-18)
 
 ### Fix
