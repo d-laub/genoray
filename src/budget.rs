@@ -4,6 +4,10 @@
 
 // 4 fixed OS threads per chrom: reader + executor + chunk_writer + long_allele_writer.
 pub const PIPELINE_THREADS_PER_CHROM: usize = 4;
+// Independent indexed VCF shard readers decompress in their worker thread.
+// Giving each one an HTSlib background pool would multiply the process-wide
+// thread budget by the shard count.
+pub const SHARDED_VCF_HTSLIB_THREADS_PER_READER: usize = 0;
 // Floor for HTSlib decode threads — below this the executor channel starves.
 const MIN_HTSLIB_THREADS: usize = 2;
 // Ceiling for HTSlib decode threads. Bumped 4→8 for single-/few-contig
@@ -18,10 +22,13 @@ const MIN_THREADS_PER_CHROM: usize = PIPELINE_THREADS_PER_CHROM + MIN_HTSLIB_THR
 pub struct ThreadPlan {
     pub concurrent_chroms: usize,
     pub htslib_threads: usize,
+    // Indexed VCF shard readers per concurrent contig. Unlike
+    // `processing_threads`, this budget reclaims the monolithic reader's
+    // HTSlib pool because each shard decompresses inline.
+    pub reader_workers: usize,
     // Cores left idle after the pipeline + htslib threads across all concurrent
-    // chroms. For splittable VCF contigs this caps concurrent shard readers;
-    // otherwise it sizes the reader-side processing pool used for bounded
-    // normalization batches plus intra-chunk presence packing.
+    // chroms. This sizes the non-sharded reader-side processing pool used for
+    // bounded normalization batches plus intra-chunk presence packing.
     pub processing_threads: usize,
 }
 
@@ -40,6 +47,7 @@ pub fn plan_thread_budget(available_cores: usize, n_chroms: usize) -> ThreadPlan
         ThreadPlan {
             concurrent_chroms: 1,
             htslib_threads: htslib,
+            reader_workers: reader_workers(usable_cores, 1),
             processing_threads: processing,
         }
     } else {
@@ -53,6 +61,7 @@ pub fn plan_thread_budget(available_cores: usize, n_chroms: usize) -> ThreadPlan
         ThreadPlan {
             concurrent_chroms: concurrent,
             htslib_threads: htslib,
+            reader_workers: reader_workers(usable_cores, concurrent),
             processing_threads: processing,
         }
     }
@@ -63,6 +72,21 @@ pub fn plan_thread_budget(available_cores: usize, n_chroms: usize) -> ThreadPlan
 fn processing_threads(usable_cores: usize, concurrent: usize, htslib: usize) -> usize {
     let active = concurrent * (PIPELINE_THREADS_PER_CHROM + htslib);
     usable_cores.saturating_sub(active).max(1)
+}
+
+/// Per-contig worker count for the indexed/sharded VCF backend.
+///
+/// Shard readers replace the monolithic reader's HTSlib pool rather than
+/// running alongside it, so split the usable process budget evenly across
+/// active contigs and spend the remainder after their fixed pipeline threads.
+fn reader_workers(usable_cores: usize, concurrent: usize) -> usize {
+    let cores_per_chrom = usable_cores / concurrent.max(1);
+    let worker_cost = 1 + SHARDED_VCF_HTSLIB_THREADS_PER_READER;
+    cores_per_chrom
+        .saturating_sub(PIPELINE_THREADS_PER_CHROM)
+        .checked_div(worker_cost)
+        .unwrap_or(0)
+        .max(1)
 }
 
 #[cfg(test)]
@@ -76,6 +100,7 @@ mod tests {
             ThreadPlan {
                 concurrent_chroms: 1,
                 htslib_threads: 1,
+                reader_workers: 1,
                 processing_threads: 1,
             }
         );
@@ -88,6 +113,7 @@ mod tests {
             ThreadPlan {
                 concurrent_chroms: 1,
                 htslib_threads: 1,
+                reader_workers: 1,
                 processing_threads: 1,
             }
         );
@@ -100,6 +126,7 @@ mod tests {
             ThreadPlan {
                 concurrent_chroms: 10,
                 htslib_threads: 2,
+                reader_workers: 2,
                 processing_threads: 4,
             }
         );
@@ -140,6 +167,34 @@ mod tests {
         // processing = max(1, 32 - 12) = 20.
         let plan = plan_thread_budget(33, 1);
         assert_eq!(plan.processing_threads, 20);
+    }
+
+    #[test]
+    fn test_sharded_vcf_reclaims_unused_htslib_budget_for_reader_workers() {
+        // Sharded VCF readers each use one inline HTSlib thread, so the separate
+        // 8-thread HTSlib decode pool is not active on this backend. A 16-core,
+        // one-contig run therefore has 15 usable cores: 4 fixed pipeline threads
+        // plus 11 independent shard readers.
+        let plan = plan_thread_budget(16, 1);
+        assert_eq!(plan.reader_workers, 11);
+        assert_eq!(
+            plan.concurrent_chroms
+                * (PIPELINE_THREADS_PER_CHROM
+                    + plan.reader_workers * (1 + SHARDED_VCF_HTSLIB_THREADS_PER_READER)),
+            15
+        );
+    }
+
+    #[test]
+    fn test_sharded_vcf_reader_workers_are_bounded_across_concurrent_contigs() {
+        // 65 cores → 64 usable; 10 concurrent contigs × (4 fixed + 2 readers)
+        // = 60 active sharded-path threads, leaving four cores of headroom.
+        let plan = plan_thread_budget(65, 22);
+        let active = plan.concurrent_chroms
+            * (PIPELINE_THREADS_PER_CHROM
+                + plan.reader_workers * (1 + SHARDED_VCF_HTSLIB_THREADS_PER_READER));
+        assert_eq!(plan.reader_workers, 2);
+        assert!(active <= 64);
     }
 
     #[test]

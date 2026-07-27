@@ -222,15 +222,21 @@ fn run_conversion_pipeline(
             let plan = crate::budget::plan_thread_budget(available_cores, chroms.len());
             let concurrent_chroms = plan.concurrent_chroms;
             let htslib_threads = plan.htslib_threads;
+            let reader_workers = plan.reader_workers;
             let processing_threads = plan.processing_threads;
 
-            let total_active =
+            let monolithic_reader_active =
                 concurrent_chroms * (crate::budget::PIPELINE_THREADS_PER_CHROM + htslib_threads);
+            let sharded_vcf_active = concurrent_chroms
+                * (crate::budget::PIPELINE_THREADS_PER_CHROM
+                    + reader_workers * (1 + crate::budget::SHARDED_VCF_HTSLIB_THREADS_PER_READER));
             tracing::info!(cores = available_cores, "using cores");
             tracing::info!(
                 concurrent_chroms,
                 htslib_threads,
-                total_active,
+                monolithic_reader_active,
+                reader_workers,
+                sharded_vcf_active,
                 processing_threads,
                 "pipeline config"
             );
@@ -257,6 +263,7 @@ fn run_conversion_pipeline(
                             orchestrator::SourceSpec::Vcf {
                                 vcf_path: vcf_path.clone(),
                                 htslib_threads,
+                                reader_workers,
                                 regions: ranges_by_chrom.get(chrom).cloned().unwrap_or_default(),
                                 overlap: overlap_mode,
                             },

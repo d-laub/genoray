@@ -70,6 +70,7 @@ fn convert(
         SourceSpec::Vcf {
             vcf_path: bcf.to_str().unwrap().to_string(),
             htslib_threads: 1,
+            reader_workers: 1,
             regions: Vec::new(),
             overlap: genoray_core::svar2_view::OverlapMode::Pos,
         },
@@ -197,7 +198,7 @@ fn vcf_list_ref_mismatch_excluded_under_x() {
 // region list disables sharding — see the Python `from_vcf` comment on why
 // it always fills `[0, len)` for whole-contig conversion) and
 // `overlap == OverlapMode::Pos`. Passing the whole-contig range explicitly,
-// a small `chunk_size` (target shard span), and `processing_threads > 1`
+// a small `chunk_size` (target shard span), and `reader_workers > 1`
 // reproduces the Python test's sharded scenario (there: `threads=16,
 // chunk_size=1`) directly against the Rust entry point.
 #[test]
@@ -218,6 +219,7 @@ fn sharded_ref_excluded_counted_once_in_contig_done() {
         SourceSpec::Vcf {
             vcf_path: bcf.to_str().unwrap().to_string(),
             htslib_threads: 1,
+            reader_workers: 8,
             // Non-empty, whole-contig range: required to enable sub-contig
             // sharding (see comment above).
             regions: vec![(0, 1000)],
