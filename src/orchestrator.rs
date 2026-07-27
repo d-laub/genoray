@@ -63,6 +63,9 @@ pub enum SourceSpec {
     Vcf {
         vcf_path: String,
         htslib_threads: usize,
+        /// Independent indexed shard readers for this contig. These replace
+        /// the monolithic reader's HTSlib pool on the sharded path.
+        reader_workers: usize,
         regions: Vec<(u32, u32)>,
         overlap: crate::svar2_view::OverlapMode,
     },
@@ -384,6 +387,7 @@ pub fn process_chromosome(
                     SourceSpec::Vcf {
                         vcf_path,
                         htslib_threads,
+                        reader_workers,
                         regions,
                         overlap,
                     } => {
@@ -409,7 +413,7 @@ pub fn process_chromosome(
                             crate::vcf_reader::plan_vcf_shards(
                                 &regions,
                                 &chr,
-                                processing_threads.saturating_mul(OVERSHARD_FACTOR),
+                                reader_workers.saturating_mul(OVERSHARD_FACTOR),
                                 chunk_size as u32,
                             )?
                         } else {
@@ -435,19 +439,19 @@ pub fn process_chromosome(
                                 .collect();
                             trace_ll!(
                                 "[plan {chr}] workers={} shards={}",
-                                processing_threads,
+                                reader_workers,
                                 units.len()
                             );
                             let totals = crate::shard_exec::run(
                                 &chr,
                                 units,
-                                processing_threads,
+                                reader_workers,
                                 |unit| {
                                     let source = crate::vcf_reader::VcfRecordSource::new(
                                         &vcf_path,
                                         &chr,
                                         &s_refs,
-                                        1, // htslib_threads: many concurrent shard readers, keep each small
+                                        crate::budget::SHARDED_VCF_HTSLIB_THREADS_PER_READER,
                                         ploidy,
                                         &fields_owned,
                                         // The shard's padded fetch window IS the
@@ -748,8 +752,9 @@ pub fn process_chromosome(
                 // Dedicated rayon pool for reader-side CPU work: bounded per-record
                 // normalization batches plus intra-chunk presence packing. The
                 // sharded VCF branch above returns before this point because its
-                // independent indexed readers consume the same `processing_threads`
-                // budget directly; building both would double-reserve cores.
+                // independent indexed readers consume the backend-specific
+                // `reader_workers` budget directly; building both would
+                // double-reserve cores.
                 let pool = rayon::ThreadPoolBuilder::new()
                     .num_threads(processing_threads.max(1))
                     .thread_name(|i| format!("pack-{}", i))
