@@ -1,7 +1,9 @@
+import re
 import subprocess
 
 import pytest
 
+from scripts.bench_svar2 import scale_corpus
 from scripts.bench_svar2.scale_corpus import generate, size_corpus
 
 pytestmark = pytest.mark.bench
@@ -163,3 +165,47 @@ def test_positions_are_sorted_and_unique_across_short_final_block(tmp_path):
     assert pos == sorted(pos)
     assert len(set(pos)) == len(pos)
     assert pos[-1] <= DEFAULT_CONTIG_LEN
+
+
+def test_pos_stays_within_declared_length_when_stride_floors_to_one(
+    tmp_path, monkeypatch
+):
+    """When per_contig exceeds DEFAULT_CONTIG_LEN, `stride` floors to 1 and
+    positions run essentially consecutively -- past the declared ##contig
+    length -- unless the header reports the true span. Patch
+    DEFAULT_CONTIG_LEN down so this regime is reachable without generating
+    tens of millions of records; the invariant under test does not depend on
+    the constant's actual value. Reads the declared length back out of the
+    header rather than hardcoding a number, so this checks the real
+    contig-truthfulness invariant, not a hand-computed expectation."""
+    monkeypatch.setattr(scale_corpus, "DEFAULT_CONTIG_LEN", 2_000)
+    generate(
+        tmp_path / "h.vcf.gz",
+        samples=2,
+        variants=2_800,
+        contigs=["chr22"],
+        format_fields=(),
+        seed=13,
+        procs=2,
+        bgzip_threads=1,
+    )
+
+    hdr = subprocess.run(
+        ["bcftools", "view", "-h", str(tmp_path / "h.vcf.gz")],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    m = re.search(r"##contig=<ID=chr22,length=(\d+)>", hdr)
+    assert m is not None
+    declared_len = int(m.group(1))
+
+    out = subprocess.run(
+        ["bcftools", "query", "-f", "%POS\n", str(tmp_path / "h.vcf.gz")],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.split()
+    pos = [int(x) for x in out]
+    assert len(pos) == 2_800
+    assert max(pos) <= declared_len
