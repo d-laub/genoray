@@ -132,9 +132,24 @@ def generate(
     contigs = list(contigs)
     n_format = len(format_fields)
 
+    per_contig = variants // len(contigs)
+    total = per_contig * len(contigs)
+    # Run-level stride derived from the per-contig total (not BLOCK_VARIANTS)
+    # so positions stay within the declared contig length regardless of how
+    # many blocks a contig is split into.
+    stride = max(1, DEFAULT_CONTIG_LEN // max(per_contig, 1))
+    n_blocks = -(-per_contig // BLOCK_VARIANTS) if per_contig else 0  # ceil div
+    # When stride floors to 1 (per_contig > DEFAULT_CONTIG_LEN), positions run
+    # past DEFAULT_CONTIG_LEN. Declare a truthful length instead of rejecting
+    # the input -- a small-cohort/high-variant corpus is a legitimate ask.
+    # The last block's stripe ends at n_blocks * BLOCK_VARIANTS * stride, so
+    # this bound is always >= the actual max POS, and collapses to
+    # DEFAULT_CONTIG_LEN in every regime that already worked.
+    contig_len = max(DEFAULT_CONTIG_LEN, n_blocks * BLOCK_VARIANTS * stride + 1)
+
     header = ["##fileformat=VCFv4.2"]
     for c in contigs:
-        header.append(f"##contig=<ID={c},length={DEFAULT_CONTIG_LEN}>")
+        header.append(f"##contig=<ID={c},length={contig_len}>")
     header.append('##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">')
     if n_format:
         header.append('##FORMAT=<ID=DP,Number=1,Type=Integer,Description="Depth">')
@@ -150,12 +165,6 @@ def generate(
         + "\t".join(sample_names)
     )
 
-    per_contig = variants // len(contigs)
-    total = per_contig * len(contigs)
-    # Run-level stride derived from the per-contig total (not BLOCK_VARIANTS)
-    # so positions stay within the declared contig length regardless of how
-    # many blocks a contig is split into.
-    stride = max(1, DEFAULT_CONTIG_LEN // max(per_contig, 1))
     tasks: list[tuple[str, int, int]] = []
     for c in contigs:
         remaining = per_contig
