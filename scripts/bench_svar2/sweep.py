@@ -32,12 +32,35 @@ def pending_points(plan: Sequence[SweepPoint], results_path: Path) -> list[Sweep
     return [p for p in plan if p.point_id not in done]
 
 
-def check_oracle(records: Sequence[ProbeRecord]) -> str | None:
-    """Every successful configuration must produce a byte-identical store.
-    Returns an error message, or None when all digests agree."""
-    digests = {r.digest for r in records if r.ok and r.digest}
-    if len(digests) > 1:
-        return f"digest mismatch across configurations: {sorted(digests)}"
+def check_oracle(
+    records: Sequence[ProbeRecord], plan: Sequence[SweepPoint]
+) -> str | None:
+    """Every successful configuration WITHIN THE SAME CORPUS must produce a
+    byte-identical store -- sharding is byte-identical, so the store hash
+    must not move across configurations of one corpus. Different corpora
+    hold different variant data and legitimately produce different digests,
+    so the check is grouped by corpus, not pooled across the whole sweep.
+
+    `records` alone carry no corpus (that's a `SweepPoint` field, not a
+    `ProbeRecord` field), so the point_id -> corpus mapping is rebuilt from
+    `plan` on every call. A record whose `point_id` is no longer in `plan`
+    (the plan was edited between runs) is skipped rather than crashing --
+    there is nothing to attribute it to.
+
+    Returns an error message naming the offending corpus, or None when every
+    corpus's digests agree."""
+    corpus_by_point = {p.point_id: p.corpus for p in plan}
+    digests_by_corpus: dict[str, set[str]] = {}
+    for r in records:
+        if not (r.ok and r.digest):
+            continue
+        corpus = corpus_by_point.get(r.point_id)
+        if corpus is None:
+            continue
+        digests_by_corpus.setdefault(corpus, set()).add(r.digest)
+    for corpus, digests in digests_by_corpus.items():
+        if len(digests) > 1:
+            return f"digest mismatch within corpus {corpus!r}: {sorted(digests)}"
     return None
 
 
@@ -70,9 +93,19 @@ def run_sweep(
             f"| {status}",
             flush=True,
         )
+        # Fail fast, not just at the end: `append_ndjson` already fsynced
+        # this record, so nothing is at risk by checking now -- the results
+        # file keeps exactly what it would have kept either way. A genuine
+        # within-corpus digest divergence is systematic and will recur at
+        # every remaining point of that corpus, so catching it here saves
+        # the rest of a preemptible overnight sweep instead of burning it
+        # before the failure is even reported.
+        problem = check_oracle(read_ndjson(results_path, ProbeRecord), plan)
+        if problem:
+            raise RuntimeError(problem)
 
     records = read_ndjson(results_path, ProbeRecord)
-    problem = check_oracle(records)
+    problem = check_oracle(records, plan)
     if problem:
         raise RuntimeError(problem)
     return records
