@@ -9,6 +9,11 @@
 set -euo pipefail
 
 WT=/carter/users/dlaub/projects/genoray/.claude/worktrees/bench-pr140-reader-workers
+# Slurm's default cwd is the *submission* directory, not this script's location,
+# but every `python -m scripts.bench_svar2.<module>` below needs cwd = repo root
+# to resolve as a package. Without this, resubmitting from anywhere but $WT dies
+# on the first command with ModuleNotFoundError.
+cd "$WT"
 JD="${CLAUDE_JOB_DIR:?set CLAUDE_JOB_DIR}"/tmp
 PX="pixi run --manifest-path $WT/pixi.toml"
 CELLS=1400000000

@@ -26,8 +26,11 @@ pixi run bench-regression            # ~2 min, guards against regressions
 sbatch scripts/bench_svar2/sweep_scale.sbatch   # overnight, full scale sweep
 ```
 
-Corpora and results are regenerated from seeds and never committed: a
-500,000-sample point is ~420 MB and its seed is 8 bytes.
+Corpora and results are never committed. Corpora are seed-deterministic --
+regenerating from the same seed reproduces byte-identical input (a
+500,000-sample point is ~420 MB and its seed is 8 bytes). Results are runtime
+measurements (`wall_s`, `maxrss_mb`, ...); they are not reproducible from a
+seed, only re-obtainable by rerunning the probe.
 
 ## Gotchas
 
