@@ -137,7 +137,10 @@ loguru = "==0.7.*"
 attrs = "*"
 awkward = "*"
 numba = "*"
-seqpro = "==0.21.1"
+# Exception to this block's min-version convention: pinned to the new ceiling
+# (0.22.0), not the pyproject.toml floor (0.21.1). The floor is covered by
+# the py311-py314 envs, whose locked seqpro stayed at 0.21.1.
+seqpro = "==0.22.0"
 zstandard = "*"
 pydantic = "*"
 oxbow = "==0.5.*"

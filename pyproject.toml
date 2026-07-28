@@ -7,7 +7,7 @@ readme = "README.md"
 license = { file = "LICENSE.txt" }
 requires-python = ">=3.10,<3.15"
 dependencies = [
-    "seqpro>=0.21.1,<0.22",
+    "seqpro>=0.21.1,<0.23",
     "numpy>=1.26",
     "pandas>=2.2.3",
     "hirola>=0.3.0",
