@@ -31,9 +31,14 @@ sbatch scripts/bench_svar2/regression_record.sbatch  # re-record the baselines
 Re-record baselines through `regression_record.sbatch`, not by running
 `bench-regression-record` on a login node. The tier's corpus is ~140 KB, so its
 wall time is mostly process startup: the same three points recorded 68/54/119 s
-on a busy login node and 7.2/6.2/5.5 s on a dedicated allocation. Only
+on a busy login node and 5.3/5.3/5.2 s on a dedicated allocation. Only
 `maxrss_mb` gates; `wall_s` is printed as a trend signal and is deliberately not
 a hard gate (see the comment on `HARD_METRICS`).
+
+The baseline file records the `threads` (allocation width) it was taken at, and
+a check run at a different width is refused rather than silently compared --
+`threads` reaches the conversion as `-@ N` and sizes a rayon pool, so it moves
+the `maxrss_mb` that gates. Re-record if you change `--cpus-per-task`.
 
 Corpora and results are never committed. Corpora are seed-deterministic --
 regenerating from the same seed reproduces byte-identical input (a

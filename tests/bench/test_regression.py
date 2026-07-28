@@ -12,6 +12,7 @@ from scripts.bench_svar2.regression import (
     corpus_is_current,
     wall_deltas,
 )
+from scripts.bench_svar2.scale_corpus import GENERATOR_VERSION
 
 pytestmark = pytest.mark.bench
 
@@ -74,8 +75,11 @@ def test_failed_run_is_always_a_regression():
 
 
 def _manifest(tmp_path: Path, **overrides) -> Path:
+    """A manifest plus the corpus file it describes, as `generate` leaves them."""
+    vcf = tmp_path / "reg.vcf.gz"
+    vcf.write_bytes(b"")
     fields = {
-        "path": str(tmp_path / "reg.vcf.gz"),
+        "path": str(vcf),
         "samples": CORPUS["samples"],
         "variants": CORPUS["variants"],
         "contigs": tuple(CORPUS["contigs"]),
@@ -84,7 +88,7 @@ def _manifest(tmp_path: Path, **overrides) -> Path:
         "cells": 1,
         "compressed_bytes": 1,
         "seed": CORPUS["seed"],
-        "generator_version": 1,
+        "generator_version": GENERATOR_VERSION,
         **overrides,
     }
     path = tmp_path / "reg.manifest.json"
@@ -98,6 +102,33 @@ def test_absent_corpus_is_not_current(tmp_path: Path):
 
 def test_matching_corpus_is_current(tmp_path: Path):
     assert corpus_is_current(_manifest(tmp_path))
+
+
+def test_manifest_without_its_corpus_is_not_current(tmp_path: Path):
+    # N4: the workdir defaults to scratch under $CLAUDE_JOB_DIR, which gets
+    # cleaned. A manifest describing a corpus that is no longer on disk must
+    # regenerate, not sail through and crash inside run_point.
+    path = _manifest(tmp_path)
+    (tmp_path / "reg.vcf.gz").unlink()
+    assert not corpus_is_current(path)
+
+
+def test_generator_version_bump_invalidates(tmp_path: Path):
+    # N3: GENERATOR_VERSION exists to say "the generation logic changed, the
+    # bytes differ". Ignoring it is the same vacuous pass as ignoring CORPUS.
+    assert not corpus_is_current(
+        _manifest(tmp_path, generator_version=GENERATOR_VERSION + 1)
+    )
+
+
+def test_floored_variant_count_still_counts_as_current(tmp_path: Path):
+    # N5: generate() writes floor(variants / n_contigs) * n_contigs records, so
+    # a manifest legitimately reports fewer variants than CORPUS requested.
+    # Comparing against the unfloored request would regenerate the corpus on
+    # every single invocation, forever, for any non-divisible CORPUS.
+    contigs = list(CORPUS["contigs"])
+    floored = (CORPUS["variants"] // len(contigs)) * len(contigs)
+    assert corpus_is_current(_manifest(tmp_path, variants=floored))
 
 
 @pytest.mark.parametrize(
@@ -143,8 +174,8 @@ def test_baseline_keyed_by_workers_survives_a_workdir_change():
     ids_b = {pt.point_id for pt in points_b}
     assert ids_a.isdisjoint(ids_b)
 
-    baselines_a = _baselines_by_point_id(points_a, WORKERS, raw)
-    baselines_b = _baselines_by_point_id(points_b, WORKERS, raw)
+    baselines_a = _baselines_by_point_id(points_a, raw)
+    baselines_b = _baselines_by_point_id(points_b, raw)
 
     # Both sessions recover a baseline for every point despite the point_id
     # mismatch, and the underlying values are identical (re-keyed, not
@@ -163,3 +194,33 @@ def test_baseline_keyed_by_workers_survives_a_workdir_change():
     ]
     problems = check(records_a, baselines_a, tolerance=0.25)
     assert not any("no baseline" in p for p in problems)
+
+
+def test_pairing_follows_reader_workers_not_position():
+    # N6: the pairing reads reader_workers off each point instead of zipping
+    # against a parallel WORKERS sequence. Reordering the points must move the
+    # baselines with them -- under the old positional zip, a reversed list
+    # silently handed the w=7 point the w=1 baseline, and because the gate is
+    # one-sided a mispaired baseline never fails, it just stops gating.
+    raw = {
+        "1": {"wall_s": 10.0, "maxrss_mb": 100.0},
+        "3": {"wall_s": 8.0, "maxrss_mb": 110.0},
+        "7": {"wall_s": 6.0, "maxrss_mb": 120.0},
+    }
+    points = _points(Path("/job/aaaa/tmp/bench_reg/reg.manifest.json"), threads=8)
+    forward = _baselines_by_point_id(points, raw)
+    reversed_ = _baselines_by_point_id(list(reversed(points)), raw)
+    assert forward == reversed_
+    for pt in points:
+        assert forward[pt.point_id] == raw[str(pt.reader_workers)]
+
+
+def test_unknown_worker_count_gets_no_baseline():
+    # A point whose reader_workers is absent from the file must fall through
+    # to check()'s "no baseline recorded" path, never to another point's row.
+    points = _points(Path("/job/aaaa/tmp/bench_reg/reg.manifest.json"), threads=8)
+    partial = _baselines_by_point_id(points, {"3": {"wall_s": 8.0, "maxrss_mb": 110.0}})
+    assert len(partial) == 1
+    records = [_rec(pt.point_id, 8.0) for pt in points]
+    problems = check(records, partial, tolerance=0.25)
+    assert sum("no baseline" in p for p in problems) == len(points) - 1

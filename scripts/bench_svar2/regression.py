@@ -4,11 +4,12 @@ Guards the small-scale behaviour the cluster sweeps are too expensive to
 re-run. Baselines are wall time and peak RSS at a handful of worker counts, and
 a regression is a one-sided band -- getting faster is never a failure.
 
-Measured (Slurm job 13332508, dedicated 8-CPU carter-compute allocation, via
-`scripts/bench_svar2/regression_record.sbatch`): 65 s to record from cold
-including corpus generation, and 58 s for a warm `pixi run bench-regression`.
-The same work on a contended login node took 12+ minutes, so treat ~1 minute as
-the number for a dedicated allocation and expect worse anywhere shared.
+Measured (Slurm job 13332630, dedicated 8-CPU carter-compute allocation, via
+`scripts/bench_svar2/regression_record.sbatch` -- the job that recorded the
+committed baselines): 50 s to record from cold including corpus generation, and
+50 s for a warm `pixi run bench-regression`. The same work on a contended login
+node took 12+ minutes, so treat ~1 minute as the number for a dedicated
+allocation and expect worse anywhere shared.
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ from scripts.bench_svar2.records import (
     SweepPoint,
     from_json,
 )
-from scripts.bench_svar2.scale_corpus import generate
+from scripts.bench_svar2.scale_corpus import GENERATOR_VERSION, generate
 
 BASELINE_PATH = Path(__file__).parent / "baselines" / "regression.json"
 # Shrunk in fix round 1 (Finding 3) from 20_000 variants to 2_000. The tier is
@@ -46,11 +47,17 @@ DEFAULT_TOLERANCE = 0.25
 #     and 198/250/302 s another, for a corpus 10x SMALLER the second time. A
 #     25% band on top of a baseline like that absorbs a genuine 30-60%
 #     slowdown whole and still prints "within tolerance" -- a false PASS.
-#   - Recording on a dedicated 8-CPU allocation does not rescue it. Job
-#     13332508 recorded 7.2/6.2/5.5 s and an immediate re-check on that same
-#     idle node, same code, same corpus, returned -24%/-9%/+13%. At a ~140 KB
-#     corpus, wall_s is mostly process startup, so run-to-run noise already
-#     fills most of a 25% band even under ideal conditions.
+#   - Recording on a dedicated 8-CPU allocation does not rescue it. Two such
+#     recordings of IDENTICAL code, same corpus, same node type, disagree by
+#     more than the band itself: job 13332508 recorded 7.2/6.2/5.5 s and job
+#     13332630 recorded 5.3/5.3/5.2 s, i.e. the w=1 baseline moved -27% purely
+#     between recordings. Immediate re-checks within each job swung -24%/-9%/
+#     +13% and +6%/-1%/+0% respectively. At a ~140 KB corpus wall_s is mostly
+#     process startup, so a 25% band is already near the noise floor even with
+#     cores isolated. (Both jobs were dedicated 8-CPU cgroups on nodes at
+#     loadavg ~22-31 per the job logs -- isolated cores, not idle machines. A
+#     truly idle node would presumably be tighter, but nothing here has
+#     measured one, so do not assume it.)
 #
 # So do NOT promote wall_s to HARD_METRICS on the strength of a dedicated
 # allocation alone; the noise floor, not the contention, is what disqualifies
@@ -125,7 +132,6 @@ def _worker_key(reader_workers: int) -> str:
 
 def _baselines_by_point_id(
     points: Sequence[SweepPoint],
-    workers: Sequence[int],
     raw: dict[str, dict[str, float]],
 ) -> dict[str, dict[str, float]]:
     """Re-key a reader_workers-keyed baseline file onto this session's point_ids.
@@ -139,15 +145,19 @@ def _baselines_by_point_id(
     cores, zero code change, would report "no baseline recorded" for every
     point. reader_workers is the actual axis this tier guards and is stable
     across sessions, so the committed file is keyed by reader_workers and
-    paired back onto whatever point_ids this session's `_points()` produced,
-    by position (both `WORKERS` and `_points()` iterate the same tuple in the
-    same order).
+    paired back onto whatever point_ids this session's `_points()` produced.
+
+    The pairing reads `reader_workers` off each point rather than zipping
+    against a parallel `WORKERS` sequence (fix round 2, N6): a positional zip
+    is a second source of truth for a fact the point already carries, and
+    since the gate is one-sided, a mispaired baseline never fails loudly -- it
+    just silently stops gating that point.
     """
     out: dict[str, dict[str, float]] = {}
-    for pt, w in zip(points, workers):
-        key = _worker_key(w)
-        if key in raw:
-            out[pt.point_id] = raw[key]
+    for pt in points:
+        base = raw.get(_worker_key(pt.reader_workers))
+        if base is not None:
+            out[pt.point_id] = base
     return out
 
 
@@ -165,12 +175,29 @@ def corpus_is_current(manifest_path: Path) -> bool:
     if not manifest_path.exists():
         return False
     m = from_json(CorpusManifest, manifest_path.read_text())
+    # The manifest is written last, so its presence implies generation
+    # finished -- but the workdir defaults to scratch under $CLAUDE_JOB_DIR,
+    # which gets cleaned. Confirm the corpus it describes is still there (N4),
+    # otherwise the tier crashes inside run_point instead of regenerating.
+    if not Path(m.path).exists():
+        return False
+    # `generate` writes floor(variants / n_contigs) * n_contigs records, so
+    # comparing the request against the manifest is only valid once floored
+    # (N5). Without this, any future CORPUS whose variants are not divisible
+    # by the contig count regenerates on EVERY invocation, forever.
+    contigs = list(CORPUS["contigs"])
+    want_variants = (CORPUS["variants"] // len(contigs)) * len(contigs)
     return (
         m.samples == CORPUS["samples"]
-        and m.variants == CORPUS["variants"]
-        and list(m.contigs) == list(CORPUS["contigs"])
+        and m.variants == want_variants
+        and list(m.contigs) == contigs
         and m.seed == CORPUS["seed"]
         and list(m.format_fields) == []
+        # GENERATOR_VERSION exists to say "the generation logic changed, the
+        # bytes differ" (N3). Ignoring it is the exact vacuous-pass this
+        # function was written to prevent, just triggered by a code change
+        # rather than a CORPUS change.
+        and m.generator_version == GENERATOR_VERSION
     )
 
 
@@ -228,18 +255,56 @@ def main() -> None:
     records = [run_point(pt, manifest, a.workdir, warm=True) for pt in points]
 
     if a.record:
+        # Never record from a failed run (N1). `run_point` returns ok=False
+        # records that still carry a maxrss_mb from the crashed child, and
+        # recording happens unattended via sbatch, so a bad number would be
+        # committed with nobody watching. Because the gate is one-sided, a
+        # baseline inflated by a crash can never be exceeded again -- the tier
+        # silently stops gating -- while one deflated by an early crash fails
+        # every healthy run afterwards.
+        failed = [
+            (pt.reader_workers, r.error) for pt, r in zip(points, records) if not r.ok
+        ]
+        if failed:
+            for w, err in failed:
+                print(f"FAILED: reader_workers={w}: {err}", file=sys.stderr)
+            print(
+                f"{len(failed)}/{len(records)} points failed -- "
+                f"{BASELINE_PATH} left unchanged",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         BASELINE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        baselines = {
-            _worker_key(w): {"wall_s": r.wall_s, "maxrss_mb": r.maxrss_mb}
-            for w, r in zip(WORKERS, records)
+        payload = {
+            "threads": threads,
+            "points": {
+                _worker_key(pt.reader_workers): {
+                    "wall_s": r.wall_s,
+                    "maxrss_mb": r.maxrss_mb,
+                }
+                for pt, r in zip(points, records)
+            },
         }
-        BASELINE_PATH.write_text(json.dumps(baselines, indent=2, sort_keys=True))
+        BASELINE_PATH.write_text(json.dumps(payload, indent=2, sort_keys=True))
         print(f"recorded {len(records)} baselines to {BASELINE_PATH}")
         return
 
-    raw_baselines = json.loads(BASELINE_PATH.read_text())
-    baselines = _baselines_by_point_id(points, WORKERS, raw_baselines)
+    raw = json.loads(BASELINE_PATH.read_text())
+    baselines = _baselines_by_point_id(points, raw["points"])
     problems = check(records, baselines, a.tolerance)
+    # `threads` reaches the conversion as `-@ N` and sizes a rayon pool, so it
+    # moves maxrss_mb -- the metric that gates (N2). Before baselines were
+    # re-keyed off point_id, a width change showed up as a loud "no baseline
+    # recorded"; now it would compare silently. Refuse instead: a number taken
+    # at another width is not a baseline for this run, and the one-sided gate
+    # means a too-wide baseline fails open rather than loudly.
+    if raw["threads"] != threads:
+        problems.append(
+            f"baselines were recorded at threads={raw['threads']} but this run has "
+            f"threads={threads} (allocation width); maxrss_mb is not comparable "
+            f"across widths -- re-record with "
+            f"`sbatch scripts/bench_svar2/regression_record.sbatch`"
+        )
     for msg in problems:
         print(f"REGRESSION: {msg}", file=sys.stderr)
     for msg in wall_deltas(records, baselines):
