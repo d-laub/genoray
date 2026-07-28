@@ -17,14 +17,23 @@ Design: `docs/superpowers/specs/2026-07-28-svar2-scale-bench-harness-design.md`
 | `regression.py` | fast tier against committed baselines |
 | `plans/build_plans.py` | generates the sweep plans from the spec's scale points |
 | `sweep_scale.sbatch` | the overnight cluster job |
+| `regression_record.sbatch` | re-records the fast-tier baselines on a dedicated allocation |
 | `legacy_pr140/` | the original PR #140 sharded-reader harness and its findings |
 
 ## Running
 
 ```bash
-pixi run bench-regression            # ~2 min, guards against regressions
-sbatch scripts/bench_svar2/sweep_scale.sbatch   # overnight, full scale sweep
+pixi run bench-regression            # ~1 min on a dedicated 8-CPU allocation
+sbatch scripts/bench_svar2/sweep_scale.sbatch        # overnight, full scale sweep
+sbatch scripts/bench_svar2/regression_record.sbatch  # re-record the baselines
 ```
+
+Re-record baselines through `regression_record.sbatch`, not by running
+`bench-regression-record` on a login node. The tier's corpus is ~140 KB, so its
+wall time is mostly process startup: the same three points recorded 68/54/119 s
+on a busy login node and 7.2/6.2/5.5 s on a dedicated allocation. Only
+`maxrss_mb` gates; `wall_s` is printed as a trend signal and is deliberately not
+a hard gate (see the comment on `HARD_METRICS`).
 
 Corpora and results are never committed. Corpora are seed-deterministic --
 regenerating from the same seed reproduces byte-identical input (a
