@@ -57,6 +57,15 @@ parallel memory architecture.
 /// `SourceSpec::Pgen` branch below for the unchanged `max_shards` calc.
 pub(crate) const OVERSHARD_FACTOR: usize = 4;
 
+/// BENCH-ONLY: read a `usize` sweep override from the environment.
+///
+/// Lets one build sweep the sharded-VCF `(reader_workers, per-shard HTSlib
+/// threads, overshard factor)` space instead of rebuilding per configuration.
+/// Unset or unparseable leaves the planner's value in place.
+fn bench_env(key: &str) -> Option<usize> {
+    std::env::var(key).ok()?.parse::<usize>().ok()
+}
+
 /// Which backend a contig's records come from. Everything downstream of
 /// `ChunkAssembler` is identical for both.
 pub enum SourceSpec {
@@ -409,11 +418,21 @@ pub fn process_chromosome(
                         // reproduces the whole-contig split byte-for-byte
                         // (`query_window(Pos)` is identity; `keeps(Pos, ..)` is the
                         // half-open POS test the pre-region sharded reader used).
+                        // BENCH-ONLY sweep hooks (see scripts/bench_sharded_vcf).
+                        // Absent env vars leave the planner's values untouched.
+                        let reader_workers = bench_env("GENORAY_READER_WORKERS")
+                            .unwrap_or(reader_workers)
+                            .max(1);
+                        let shard_htslib = bench_env("GENORAY_SHARD_HTSLIB")
+                            .unwrap_or(crate::budget::SHARDED_VCF_HTSLIB_THREADS_PER_READER);
+                        let overshard = bench_env("GENORAY_OVERSHARD")
+                            .unwrap_or(OVERSHARD_FACTOR)
+                            .max(1);
                         let shards = if overlap == crate::svar2_view::OverlapMode::Pos {
                             crate::vcf_reader::plan_vcf_shards(
                                 &regions,
                                 &chr,
-                                reader_workers.saturating_mul(OVERSHARD_FACTOR),
+                                reader_workers.saturating_mul(overshard),
                                 chunk_size as u32,
                             )?
                         } else {
@@ -451,7 +470,7 @@ pub fn process_chromosome(
                                         &vcf_path,
                                         &chr,
                                         &s_refs,
-                                        crate::budget::SHARDED_VCF_HTSLIB_THREADS_PER_READER,
+                                        shard_htslib,
                                         ploidy,
                                         &fields_owned,
                                         // The shard's padded fetch window IS the
