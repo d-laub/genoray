@@ -209,3 +209,40 @@ def test_pos_stays_within_declared_length_when_stride_floors_to_one(
     pos = [int(x) for x in out]
     assert len(pos) == 2_800
     assert max(pos) <= declared_len
+
+
+def test_declared_contig_length_is_not_inflated_in_a_normal_regime(tmp_path):
+    """In the normal regime (per_contig * stride <= DEFAULT_CONTIG_LEN, e.g.
+    this repo's own variants=1000 single-contig case, same as
+    test_positions_are_sorted_and_unique), the declared ##contig length must
+    be *exactly* DEFAULT_CONTIG_LEN -- not merely >= it. A prior version of
+    the contig_len formula multiplied by nominal block *capacity*
+    (n_blocks * BLOCK_VARIANTS) rather than the actual per-contig record
+    count, so any per_contig not an exact multiple of BLOCK_VARIANTS
+    (variants=1000 with BLOCK_VARIANTS=2_000 gives a single short block)
+    silently inflated the declared length to roughly 2x DEFAULT_CONTIG_LEN.
+    Nothing crashed and no other test caught it, because the error was in
+    the conservative direction and no prior test asserted the header value
+    directly."""
+    from scripts.bench_svar2.scale_corpus import DEFAULT_CONTIG_LEN
+
+    generate(
+        tmp_path / "i.vcf.gz",
+        samples=2,
+        variants=1000,
+        contigs=["chr22"],
+        format_fields=(),
+        seed=9,
+        procs=2,
+        bgzip_threads=1,
+    )
+    hdr = subprocess.run(
+        ["bcftools", "view", "-h", str(tmp_path / "i.vcf.gz")],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    m = re.search(r"##contig=<ID=chr22,length=(\d+)>", hdr)
+    assert m is not None
+    declared_len = int(m.group(1))
+    assert declared_len == DEFAULT_CONTIG_LEN

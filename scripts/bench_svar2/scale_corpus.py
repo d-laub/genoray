@@ -138,14 +138,17 @@ def generate(
     # so positions stay within the declared contig length regardless of how
     # many blocks a contig is split into.
     stride = max(1, DEFAULT_CONTIG_LEN // max(per_contig, 1))
-    n_blocks = -(-per_contig // BLOCK_VARIANTS) if per_contig else 0  # ceil div
     # When stride floors to 1 (per_contig > DEFAULT_CONTIG_LEN), positions run
     # past DEFAULT_CONTIG_LEN. Declare a truthful length instead of rejecting
     # the input -- a small-cohort/high-variant corpus is a legitimate ask.
-    # The last block's stripe ends at n_blocks * BLOCK_VARIANTS * stride, so
-    # this bound is always >= the actual max POS, and collapses to
+    # Block b starts at b * BLOCK_VARIANTS * stride + 1 and adds at most
+    # n_b * stride, where n_b is that block's record count; block sizes sum
+    # to per_contig by construction (tasks below split per_contig into
+    # blocks of at most BLOCK_VARIANTS). So the true upper bound on POS
+    # across all blocks is per_contig * stride, independent of how per_contig
+    # happens to be chunked into blocks. This collapses to exactly
     # DEFAULT_CONTIG_LEN in every regime that already worked.
-    contig_len = max(DEFAULT_CONTIG_LEN, n_blocks * BLOCK_VARIANTS * stride + 1)
+    contig_len = max(DEFAULT_CONTIG_LEN, per_contig * stride + 1)
 
     header = ["##fileformat=VCFv4.2"]
     for c in contigs:
