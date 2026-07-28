@@ -72,6 +72,8 @@ test = { cmd = "pytest tests", depends-on = "gen" }
 typecheck = "pyrefly check python/genoray"
 prek-install = "prek install -t pre-commit -t pre-push -t commit-msg"
 bump-dry = "cz bump --dry-run"
+bench-regression = "python -m scripts.bench_svar2.regression"
+bench-regression-record = "python -m scripts.bench_svar2.regression --record"
 
 [feature.lint.dependencies]
 prek = "*"
