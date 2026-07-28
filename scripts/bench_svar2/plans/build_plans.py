@@ -58,10 +58,15 @@ def build(corpus_dir: Path, threads: int) -> dict[str, list[SweepPoint]]:
 
     # Contig axis at fixed cohort: hold TOTAL readers constant (12) and vary the
     # split, which is what separates "too few readers" from "wrong contig".
+    # `sorted({1, min(c, 4)})` (not the tuple `(1, min(c, 4))`) so c == 1 yields
+    # exactly one point instead of two identical ones: with a single contig,
+    # concurrent_chroms > 1 is physically meaningless -- there is no second
+    # contig to split onto -- so the "high-split" counterfactual this axis is
+    # probing is inherently absent at c == 1, not something the loop can supply.
     _, cs = size_corpus(4_000, CELLS_BUDGET)
     for c in CONTIG_COUNTS:
         corpus = corpus_dir / f"s4000_c{c}.manifest.json"
-        for concurrent in (1, min(c, 4)):
+        for concurrent in sorted({1, min(c, 4)}):
             workers = max(1, 12 // concurrent)
             contig.append(_point(corpus, workers, cs, threads, concurrent=concurrent))
 
