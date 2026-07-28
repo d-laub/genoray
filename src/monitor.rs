@@ -22,7 +22,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 use crossbeam_channel::Sender;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -82,6 +82,32 @@ fn sample_interval_secs() -> u64 {
         .unwrap_or(5)
 }
 
+/// High-water gauge for the shard collector's reorder backlog.
+///
+/// `shard_exec`'s `pending` map is unbounded by construction: a fast shard's
+/// chunks accumulate while the reorder head waits on a slow one. That backlog
+/// is a second peak-RSS term alongside the in-flight `workers * chunk_bytes`,
+/// and it is otherwise invisible -- nothing else observes the map.
+///
+/// High-water rather than instantaneous: the sampler ticks on a multi-second
+/// interval and would routinely miss the transient peak that actually sets
+/// peak RSS.
+#[derive(Debug, Default)]
+pub struct PendingGauge {
+    pub len_highwater: AtomicUsize,
+    pub bytes_highwater: AtomicU64,
+}
+
+impl PendingGauge {
+    /// Record the collector's current backlog. Monotonic in both dimensions;
+    /// `Relaxed` is sufficient because these are diagnostics with no
+    /// happens-before obligation to any other state.
+    pub fn observe(&self, len: usize, bytes: u64) {
+        self.len_highwater.fetch_max(len, Ordering::Relaxed);
+        self.bytes_highwater.fetch_max(bytes, Ordering::Relaxed);
+    }
+}
+
 pub fn spawn_sampler(
     chrom: String,
     tx_dense: Sender<DenseChunk>,
@@ -99,6 +125,9 @@ pub fn spawn_sampler(
     // `/proc/self/task` iteration finds first, misattributing CPU across
     // chromosomes. See `shard_exec::run`'s `worker_tids` doc comment.
     shard_worker_tids: Arc<Mutex<Vec<i32>>>,
+    // Reorder-backlog high-water for THIS chrom, updated by the shard
+    // collector. Stays zero on the single-reader fallback path.
+    pending_gauge: Arc<PendingGauge>,
 ) -> thread::JoinHandle<()> {
     thread::Builder::new()
         .name(format!("samp-{}", chrom))
@@ -194,6 +223,8 @@ pub fn spawn_sampler(
                     dense = tx_dense.len(), dense_cap = dense_cap,
                     sparse = tx_sparse.len(), sparse_cap = sparse_cap,
                     long = tx_long.len(), long_cap = long_cap,
+                    pending = pending_gauge.len_highwater.load(Ordering::Relaxed),
+                    pending_bytes = pending_gauge.bytes_highwater.load(Ordering::Relaxed),
                     // `cpu_read` reads 0% in the sharded path (the reader thread
                     // just blocks on the shard-worker pool); `cpu_shard` is the
                     // de-lied aggregate CPU across this chrom's shard workers.
@@ -209,4 +240,38 @@ pub fn spawn_sampler(
             // letting the executor / writer rx ends close once the original Senders also drop.
         })
         .expect("spawn sampler")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PendingGauge;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn gauge_records_len_highwater_not_current() {
+        let g = PendingGauge::default();
+        g.observe(3, 300);
+        g.observe(7, 700);
+        g.observe(1, 100);
+        assert_eq!(g.len_highwater.load(Ordering::Relaxed), 7);
+        assert_eq!(g.bytes_highwater.load(Ordering::Relaxed), 700);
+    }
+
+    #[test]
+    fn gauge_starts_at_zero() {
+        let g = PendingGauge::default();
+        assert_eq!(g.len_highwater.load(Ordering::Relaxed), 0);
+        assert_eq!(g.bytes_highwater.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn gauge_tracks_bytes_independently_of_len() {
+        // A single very large chunk must raise the byte high-water even though
+        // the length high-water is already higher from an earlier tick.
+        let g = PendingGauge::default();
+        g.observe(9, 90);
+        g.observe(1, 5_000);
+        assert_eq!(g.len_highwater.load(Ordering::Relaxed), 9);
+        assert_eq!(g.bytes_highwater.load(Ordering::Relaxed), 5_000);
+    }
 }

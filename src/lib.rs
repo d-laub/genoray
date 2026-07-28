@@ -220,7 +220,7 @@ fn run_conversion_pipeline(
             };
 
             let plan = crate::budget::plan_thread_budget(available_cores, chroms.len());
-            let concurrent_chroms = plan.concurrent_chroms;
+            let concurrent_chroms = orchestrator::bench_concurrent_chroms(plan.concurrent_chroms);
             let htslib_threads = plan.htslib_threads;
             let reader_workers = plan.reader_workers;
             let processing_threads = plan.processing_threads;
@@ -431,7 +431,7 @@ fn run_pgen_conversion_pipeline(
                 _ => std::thread::available_parallelism().unwrap().get(),
             };
             let plan = crate::budget::plan_thread_budget(available_cores, jobs.len());
-            let concurrent_chroms = plan.concurrent_chroms;
+            let concurrent_chroms = orchestrator::bench_concurrent_chroms(plan.concurrent_chroms);
             let processing_threads = plan.processing_threads;
             tracing::info!(
                 concurrent_chroms,
@@ -1142,7 +1142,7 @@ fn run_svar1_conversion_pipeline(
                 _ => std::thread::available_parallelism().unwrap().get(),
             };
             let plan = crate::budget::plan_thread_budget(available_cores, jobs.len());
-            let concurrent_chroms = plan.concurrent_chroms;
+            let concurrent_chroms = orchestrator::bench_concurrent_chroms(plan.concurrent_chroms);
             let processing_threads = plan.processing_threads;
             tracing::info!(
                 concurrent_chroms,

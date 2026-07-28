@@ -66,6 +66,22 @@ fn bench_env(key: &str) -> Option<usize> {
     std::env::var(key).ok()?.parse::<usize>().ok()
 }
 
+/// BENCH-ONLY: override the planner's contig concurrency via
+/// `GENORAY_CONCURRENT_CHROMS`. Required to hold TOTAL reader workers constant
+/// while varying how they are partitioned across contigs --
+/// `GENORAY_READER_WORKERS` alone cannot separate "too few readers" from
+/// "readers on the wrong contig".
+///
+/// Lives here beside the other `GENORAY_*` sweep hooks, but is applied by the
+/// callers in `lib.rs` that size the per-run rayon chrom pool: `plan` is not in
+/// scope inside `process_chromosome`, which sees one contig at a time.
+/// Unset or unparseable leaves `planned` in place.
+pub(crate) fn bench_concurrent_chroms(planned: usize) -> usize {
+    bench_env("GENORAY_CONCURRENT_CHROMS")
+        .unwrap_or(planned)
+        .max(1)
+}
+
 /// Which backend a contig's records come from. Everything downstream of
 /// `ChunkAssembler` is identical for both.
 pub enum SourceSpec {
@@ -357,6 +373,13 @@ pub fn process_chromosome(
     // is required instead of matching threads by `comm` name.
     let shard_worker_tids: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
 
+    // Reorder-backlog high-water for THIS contig: written by
+    // `shard_exec::run`'s collector, read by the sampler below. Stays zero on
+    // the single-reader fallback path (nothing inserts into a `pending` map
+    // there).
+    let pending_gauge: Arc<crate::monitor::PendingGauge> =
+        Arc::new(crate::monitor::PendingGauge::default());
+
     // Periodic monitoring sampler. Owns Sender clones for read-only len()/capacity()
     // introspection. The clones drop when the sampler joins, allowing the executor's
     // rx_dense.recv() to see channel-close once the reader's Sender also drops.
@@ -368,6 +391,7 @@ pub fn process_chromosome(
         tx_long.clone(),
         stop_sampler.clone(),
         Arc::clone(&shard_worker_tids),
+        Arc::clone(&pending_gauge),
     );
 
     // Step 1 -> The Producer
@@ -380,6 +404,7 @@ pub fn process_chromosome(
             let s_owned: Vec<String> = samples.iter().map(|&s| s.to_string()).collect();
             let fields_owned: Vec<crate::field::FieldSpec> = fields.to_vec();
             let shard_worker_tids = Arc::clone(&shard_worker_tids);
+            let pending_gauge = Arc::clone(&pending_gauge);
 
             // Returns `(dropped_out_of_scope, ref_excluded, normalized_total)` so
             // the caller can feed `EventSink::contig_done`'s `excluded` arg (and
@@ -504,6 +529,7 @@ pub fn process_chromosome(
                                 chunk_size,
                                 &tx_dense,
                                 &shard_worker_tids,
+                                &pending_gauge,
                             )?;
                             report_ref_excluded(&chr, totals.ref_excluded);
                             report_normalized(&chr, totals.normalized_total);
@@ -694,6 +720,7 @@ pub fn process_chromosome(
                                 chunk_size,
                                 &tx_dense,
                                 &shard_worker_tids,
+                                &pending_gauge,
                             )?;
                             report_ref_excluded(&chr, totals.ref_excluded);
                             report_normalized(&chr, totals.normalized_total);

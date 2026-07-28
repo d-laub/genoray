@@ -174,6 +174,11 @@ pub struct ShardTotals {
 /// across chromosomes. The caller creates a fresh registry per
 /// `process_chromosome` call and hands the same `Arc` to `monitor::spawn_sampler`.
 ///
+/// `pending_gauge` is the same per-chrom high-water gauge the sampler reads:
+/// the collector's reorder backlog (`pending`) is unbounded and otherwise
+/// unobservable, yet it is a real peak-RSS term. Updated on every insert; the
+/// running byte total is maintained incrementally beside the map.
+///
 /// Returns the [`ShardTotals`] (summed `dropped_out_of_scope`, `ref_excluded`,
 /// and `normalized_total`) across every unit, or the first error encountered
 /// (context-decorated).
@@ -187,6 +192,7 @@ pub fn run<F, G>(
     chunk_size: usize,
     tx_dense: &Sender<DenseChunk>,
     worker_tids: &Mutex<Vec<i32>>,
+    pending_gauge: &crate::monitor::PendingGauge,
 ) -> Result<ShardTotals, ConversionError>
 where
     F: Fn(&WorkUnit) -> Result<ChunkAssembler, ConversionError> + Sync,
@@ -248,6 +254,7 @@ where
                             Ok(u) => u,
                             Err(_) => break, // queue drained, no more work
                         };
+                        let unit_start = std::time::Instant::now();
                         // Reader reuse note: a fresh `ChunkAssembler` (and
                         // therefore a fresh indexed-fetch `RecordSource`) is
                         // built per unit rather than re-fetching an existing
@@ -298,6 +305,15 @@ where
                                 }
                             }
                         }
+                        // Per-unit wall time. Shard skew is what distinguishes
+                        // "too few readers" from "readers unevenly loaded", and
+                        // it cannot be inferred from aggregate CPU.
+                        tracing::trace!(
+                            target: "genoray::monitor",
+                            unit_ordinal = unit.ordinal,
+                            unit_secs = unit_start.elapsed().as_secs_f64(),
+                            "shard unit done"
+                        );
                         if tx_res
                             .send(Msg::Done {
                                 unit_ordinal: unit.ordinal,
@@ -324,6 +340,9 @@ where
         drop(tx_res);
 
         let mut pending: HashMap<(usize, usize), DenseChunk> = HashMap::new();
+        // Running total of `pending`'s chunk bytes, maintained incrementally so
+        // the gauge costs O(1) per insert/remove rather than O(|pending|).
+        let mut pending_bytes: u64 = 0;
         let mut rb = ReorderBuffer::new(n_units);
         let mut total_dropped = 0u64;
         let mut total_ref_excluded = 0u64;
@@ -343,10 +362,13 @@ where
                     // `ordinal == head` fast path, or buffered and later
                     // flushed on a `Done`) -- a `Done` never emits a chunk
                     // tag, so `pending.remove` below always finds its entry.
+                    pending_bytes += chunk.approx_bytes();
                     pending.insert((unit_ordinal, local), chunk);
+                    pending_gauge.observe(pending.len(), pending_bytes);
                     if first_err.is_none() {
                         rb.push(unit_ordinal, local, false, &mut |gid, tag| {
                             if let Some(mut c) = pending.remove(&tag) {
+                                pending_bytes = pending_bytes.saturating_sub(c.approx_bytes());
                                 c.chunk_id = gid;
                                 trace_ll!(
                                     "[trace {chrom}] reader: forwarded ordinal {gid} to tx_dense"
@@ -369,6 +391,7 @@ where
                         total_normalized += normalized;
                         rb.push(unit_ordinal, 0, true, &mut |gid, tag| {
                             if let Some(mut c) = pending.remove(&tag) {
+                                pending_bytes = pending_bytes.saturating_sub(c.approx_bytes());
                                 c.chunk_id = gid;
                                 trace_ll!(
                                     "[trace {chrom}] reader: forwarded ordinal {gid} to tx_dense"
