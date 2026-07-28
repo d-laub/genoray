@@ -93,6 +93,11 @@ impl BitGrid3 {
         }
         count as usize
     }
+
+    /// Heap bytes held by the packed grid.
+    pub fn approx_bytes(&self) -> u64 {
+        (self.words.len() * std::mem::size_of::<u64>()) as u64
+    }
 }
 
 // A single staged INFO/FORMAT field column, monomorphic per column so the hot
@@ -126,6 +131,14 @@ impl StagedColumn {
         match self {
             StagedColumn::Int(x) => x.capacity(),
             StagedColumn::Float(x) => x.capacity(),
+        }
+    }
+
+    /// Heap bytes held by this staged column.
+    pub fn approx_bytes(&self) -> u64 {
+        match self {
+            StagedColumn::Int(v) => (v.len() * std::mem::size_of::<i32>()) as u64,
+            StagedColumn::Float(v) => (v.len() * std::mem::size_of::<f32>()) as u64,
         }
     }
 }
@@ -177,6 +190,28 @@ pub struct DenseChunk {
     /// is left empty (see chunk_assembler.rs) and `rvk` resolves FORMAT from
     /// here instead.
     pub format_by_carrier: Option<Vec<Arc<FormatVals>>>,
+}
+
+impl DenseChunk {
+    /// Approximate heap bytes held by this chunk.
+    ///
+    /// Used only by the benchmark gauge, so it counts the dominant allocations
+    /// (the packed grid, the variant metadata vectors, and staged field
+    /// columns) and ignores per-Vec overhead.
+    pub fn approx_bytes(&self) -> u64 {
+        let meta = (self.pos.len() * 4
+            + self.global_idx.len() * 4
+            + self.ilens.len() * 4
+            + self.alt.len()
+            + self.alt_offsets.len() * 4) as u64;
+        let staged: u64 = self
+            .info_staged
+            .iter()
+            .chain(self.format_staged.iter())
+            .map(|c| c.approx_bytes())
+            .sum();
+        meta + self.genos.approx_bytes() + staged
+    }
 }
 
 // One position-sorted sub-stream of calls with byte-erased keys (`key_bytes`
