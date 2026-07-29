@@ -92,6 +92,24 @@ fn sample_interval_secs() -> u64 {
 /// High-water rather than instantaneous: the sampler ticks on a multi-second
 /// interval and would routinely miss the transient peak that actually sets
 /// peak RSS.
+///
+/// # Counting convention
+///
+/// `observe` is called from `shard_exec`'s single insert site BEFORE the
+/// arriving chunk is added, so a high-water of `n` means `n` chunks were
+/// ALREADY waiting when the next one arrived. An in-order stream -- every
+/// chunk landing on the reorder head and releasing immediately -- therefore
+/// reports 0, not a permanent 1.
+///
+/// This is load-bearing, not a detail. Downstream analysis
+/// (`scripts/bench_svar2`) reads 0 as "no backlog exists"; a `+1` floor here
+/// reads instead as a real second peak-RSS term that is present in every run,
+/// which is enough on its own to decide the reader-budget question the
+/// benchmark exists to answer.
+///
+/// Remove sites deliberately do NOT observe: `observe` is a `fetch_max` and a
+/// remove can only lower both values, so observing after one is a provable
+/// no-op.
 #[derive(Debug, Default)]
 pub struct PendingGauge {
     pub len_highwater: AtomicUsize,

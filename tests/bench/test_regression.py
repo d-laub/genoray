@@ -380,3 +380,47 @@ def test_unknown_worker_count_gets_no_baseline():
     records = [_rec(pt.point_id, 8.0) for pt in points]
     problems = check(records, points, partial, tolerance=0.25)
     assert sum("no baseline" in p for p in problems) == len(points) - 1
+
+
+# --- Minor 13: absolute peak-RSS backstop ----------------------------------
+
+
+def test_uniform_rss_regression_is_caught_even_though_the_delta_is_flat():
+    """The delta gate subtracts the reader_workers=1 point off every other
+    point, so it is blind by construction to a regression that shifts ALL
+    worker counts by the same amount -- a bigger shared buffer, an extra copy
+    of the dense grid, a leak scaling with variants rather than readers. With
+    absolute maxrss_mb reporting-only (Finding I8), such a change passed the
+    hard gate no matter how large it was.
+
+    Plant exactly that: every point up by 400 MB on a ~440 MB baseline, so
+    the worker-attributable deltas are IDENTICAL to baseline and the delta
+    gate is silent. The absolute backstop must still fail the build.
+    """
+    points = _points(Path("/job/gggg/tmp/bench_reg/reg.manifest.json"), threads=8)
+    baselines = {
+        pt.point_id: {"wall_s": 5.0, "maxrss_mb": 440.0 + 10.0 * i}
+        for i, pt in enumerate(points)
+    }
+    records = [
+        _rec_for(pt, 5.0, 440.0 + 10.0 * i + 400.0) for i, pt in enumerate(points)
+    ]
+
+    problems = check(records, points, baselines, tolerance=0.25)
+
+    assert problems, "a uniform +400 MB shift must not pass the hard gate"
+    assert all("absolute" in p for p in problems)
+    # ...and the delta gate really was silent, i.e. the backstop is what
+    # caught it rather than the test accidentally moving the deltas.
+    assert not any("delta" in p for p in problems)
+
+
+def test_absolute_backstop_ignores_run_to_run_noise():
+    """The backstop is a doubling detector, not a drift detector: it must not
+    reintroduce the Finding I8 sensitivity problem it was added alongside.
+    Two dedicated recordings of identical code moved absolute RSS by
+    single-digit MB, well inside this band."""
+    points = _points(Path("/job/hhhh/tmp/bench_reg/reg.manifest.json"), threads=8)
+    baselines = {pt.point_id: {"wall_s": 5.0, "maxrss_mb": 440.0} for pt in points}
+    records = [_rec_for(pt, 5.0, 446.0) for pt in points]
+    assert check(records, points, baselines, tolerance=0.25) == []

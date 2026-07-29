@@ -55,12 +55,19 @@ def parse_trace(text: str) -> dict:
         pb = _field(line, "pending_bytes")
         if pb is not None:
             pending_bytes_hw = max(pending_bytes_hw, int(pb))
-        for key, sink in (("cpu_shard", shard), ("cpu_exec", execp)):
-            v = _field(line, key)
-            # `n/a` on the single-reader fallback path -- skip, do not zero,
-            # or the median in `knee_from_probe` gets dragged down.
-            if v is not None and v != "n/a":
-                sink.append(float(v.rstrip("%")))
+        # `n/a` on the single-reader fallback path -- skip, do not zero, or the
+        # median in `knee_from_probe` gets dragged down. Append only as a
+        # PAIR: `model._median_costs` ZIPS these two tuples, so appending to
+        # one list without the other does not merely lose a sample, it shifts
+        # every later `cpu_exec` sample against a DIFFERENT line's `cpu_shard`
+        # sample -- silently corrupting `c_read / c_exec` and the knee derived
+        # from it. Both fields are emitted on the same `pipeline sampler` line
+        # (src/monitor.rs), and nothing downstream reads either series alone,
+        # so a tick missing one is unusable rather than half-usable.
+        sv, ev = _field(line, "cpu_shard"), _field(line, "cpu_exec")
+        if sv is not None and ev is not None and sv != "n/a" and ev != "n/a":
+            shard.append(float(sv.rstrip("%")))
+            execp.append(float(ev.rstrip("%")))
 
     return {
         "phase1_s": phase1,
@@ -205,9 +212,22 @@ def _is_oom_failure(status: int, err: str, maxrss_mb: float, ceiling_mb: int) ->
       allocation of N bytes failed" -- what `std::alloc::handle_alloc_error`
       prints before aborting), or the OS's ENOMEM text ("Cannot allocate
       memory").
-    - the child was killed by SIGKILL, which is how the Linux OOM killer
-      (cgroup or physical memory exhaustion) terminates a process, as
-      opposed to e.g. a SIGSEGV/SIGABRT from an ordinary crash or panic.
+    - the child was killed by SIGKILL *and* had grown to at least half the
+      ceiling. SIGKILL is how the Linux OOM killer terminates a process, but
+      it is also how Slurm ends a preempted or time-limited job and how an
+      operator kills a run by hand, so on its own it does not distinguish
+      memory exhaustion from the very preemption case this function exists
+      to exclude. Under this harness's own configuration the bare signal is
+      in fact near-certainly NOT an OOM: `rss_ceiling_mb` is installed as
+      RLIMIT_AS (60 GB by default, see `OOM_PROBE_CEILING_MB`) while the
+      sweep's Slurm cgroup allows 120 GB, so a run that genuinely exhausts
+      memory trips RLIMIT_AS first and dies via `malloc` returning NULL ->
+      `handle_alloc_error` -> SIGABRT with the message the regex above
+      catches. The cgroup OOM killer cannot fire until twice the ceiling,
+      which RLIMIT_AS makes unreachable. Requiring corroborating RSS keeps
+      the branch meaningful if that relationship is ever reconfigured
+      (ceiling above the cgroup limit) without minting OOM data from job
+      preemption in the meantime.
     - `maxrss_mb` is within 10% of the configured ceiling -- the process was
       genuinely close to the limit when it died even if neither signature
       above fired (e.g. it was killed by something other than SIGKILL, or
@@ -220,7 +240,7 @@ def _is_oom_failure(status: int, err: str, maxrss_mb: float, ceiling_mb: int) ->
     if _OOM_STDERR_RE.search(err):
         return True
     if os.WIFSIGNALED(status) and os.WTERMSIG(status) == signal.SIGKILL:
-        return True
+        return maxrss_mb >= 0.5 * ceiling_mb
     return maxrss_mb >= 0.9 * ceiling_mb
 
 

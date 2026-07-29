@@ -50,16 +50,46 @@ def test_parses_shard_unit_times():
     assert parse_trace(SAMPLE)["shard_unit_secs"] == (1.5, 2.5)
 
 
-def test_handles_na_cpu_columns():
-    """cpu_shard reads n/a on the single-reader fallback path."""
-    line = (
-        "TRACE genoray::monitor: pipeline sampler chrom=chr1 elapsed_s=1 dense=0 "
-        "dense_cap=6 sparse=0 sparse_cap=4 long=0 long_cap=2 pending=0 pending_bytes=0 "
-        "cpu_read=0% cpu_shard=n/a cpu_exec=10% cpu_cw=0% cpu_lw=0%"
+def _sampler_line(elapsed: int, shard: str, execp: str) -> str:
+    return (
+        f"TRACE genoray::monitor: pipeline sampler chrom=chr1 elapsed_s={elapsed} "
+        "dense=0 dense_cap=6 sparse=0 sparse_cap=4 long=0 long_cap=2 pending=0 "
+        f"pending_bytes=0 cpu_read=0% cpu_shard={shard} cpu_exec={execp}% "
+        "cpu_cw=0% cpu_lw=0%"
     )
-    t = parse_trace(line)
+
+
+def test_handles_na_cpu_columns():
+    """cpu_shard reads n/a on the single-reader fallback path. The tick is
+    dropped from BOTH series, not just the one that was n/a."""
+    t = parse_trace(_sampler_line(1, "n/a", "10"))
     assert t["cpu_shard_pct"] == ()
-    assert t["cpu_exec_pct"] == (10.0,)
+    assert t["cpu_exec_pct"] == ()
+
+
+def test_na_in_one_cpu_column_does_not_misalign_the_other_series():
+    """Minor 10: `model._median_costs` ZIPS cpu_shard_pct against
+    cpu_exec_pct, so these tuples are only meaningful index-aligned.
+
+    Appending each column to its own list independently means a single `n/a`
+    in one column shifts every LATER sample of the other column against the
+    wrong tick's value -- and the corruption is silent, because both tuples
+    still look well-formed. Here the middle tick has no cpu_shard: under the
+    old per-column append the pairs would come out (100, 10) and (200, 30),
+    inventing a 200/30 tick that never happened and losing the real 200/40
+    one. Correct behaviour drops the middle tick entirely.
+    """
+    text = "\n".join(
+        [
+            _sampler_line(1, "100%", "10"),
+            _sampler_line(2, "n/a", "30"),
+            _sampler_line(3, "200%", "40"),
+        ]
+    )
+    t = parse_trace(text)
+    assert t["cpu_shard_pct"] == (100.0, 200.0)
+    assert t["cpu_exec_pct"] == (10.0, 40.0)
+    assert len(t["cpu_shard_pct"]) == len(t["cpu_exec_pct"])
 
 
 def test_empty_input_yields_zeroed_trace():
@@ -163,15 +193,35 @@ def test_is_oom_failure_detects_rust_allocator_abort():
     )
 
 
-def test_is_oom_failure_detects_sigkill():
+def test_is_oom_failure_detects_sigkill_when_the_process_had_actually_grown():
     # POSIX wait-status encoding: a raw status whose low 7 bits equal the
     # signal number is exactly what os.wait4 returns for a signal-terminated
-    # child. SIGKILL is how the Linux OOM killer (cgroup or physical memory
-    # exhaustion) terminates a process -- unlike a SIGSEGV/SIGABRT crash.
+    # child. SIGKILL is how the Linux OOM killer terminates a process, but it
+    # only counts as OOM here with corroborating RSS -- see the rejection
+    # test below.
     status = signal.SIGKILL
     assert os.WIFSIGNALED(status)
     assert os.WTERMSIG(status) == signal.SIGKILL
-    assert _is_oom_failure(status=status, err="", maxrss_mb=100.0, ceiling_mb=60_000)
+    assert _is_oom_failure(status=status, err="", maxrss_mb=40_000.0, ceiling_mb=60_000)
+
+
+def test_is_oom_failure_rejects_sigkill_on_a_small_process():
+    """Minor 9: the docstring's own list of cases to exclude names "a
+    preemption signal", but an unconditional SIGKILL branch re-admitted
+    exactly that.
+
+    Slurm ends a preempted or time-limited job with SIGKILL, and so does an
+    operator killing a run by hand. Under this harness's configuration the
+    bare signal is near-certainly NOT memory exhaustion: `rss_ceiling_mb` is
+    installed as RLIMIT_AS (60 GB) while the sweep's cgroup allows 120 GB, so
+    a genuine exhaustion trips RLIMIT_AS first and dies via SIGABRT with the
+    allocator message. A 100 MB process killed at a 60 GB ceiling is a job
+    that got preempted, and recording it as `oom_at_rss_mb` would fabricate
+    the harness's headline "OOMs at scale" finding out of cluster scheduling.
+    """
+    assert not _is_oom_failure(
+        status=signal.SIGKILL, err="", maxrss_mb=100.0, ceiling_mb=60_000
+    )
 
 
 def test_is_oom_failure_detects_near_ceiling_rss_even_without_a_signature():
