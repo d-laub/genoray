@@ -246,3 +246,117 @@ def test_declared_contig_length_is_not_inflated_in_a_normal_regime(tmp_path):
     assert m is not None
     declared_len = int(m.group(1))
     assert declared_len == DEFAULT_CONTIG_LEN
+
+
+# --- plan_blocks: memory bounding must not cost determinism -----------------
+
+
+def test_plan_blocks_leaves_gt_only_corpora_at_the_constant():
+    """Block size sets the position striping and the per-block seed, so it is
+    part of a corpus's identity. Eleven GT-only corpora are already generated
+    for this sweep and the regression tier's baselines are recorded against
+    one of them, so the GT-only path must keep cutting at BLOCK_VARIANTS.
+    Changing it is a GENERATOR_VERSION bump, not a bug fix.
+
+    Covers the full sample axis, including the two shapes whose blocks are
+    largest in memory (S=250,000 and S=500,000).
+    """
+    for samples in (200, 250, 1_000, 4_000, 16_000, 64_000, 250_000, 500_000):
+        variants, _ = size_corpus(samples, 1_400_000_000)
+        block, procs = scale_corpus.plan_blocks(variants, 1, samples, 0, 16)
+        assert block == scale_corpus.BLOCK_VARIANTS, f"S={samples} block moved"
+        assert procs >= 1
+
+
+def test_plan_blocks_shrinks_the_format_path_that_hung_the_sweep():
+    """The hold-out (100,000 samples, 3 FORMAT fields) cut 14 blocks of 2e8
+    cells and ran 14 of them concurrently, OOM-killing pool workers under the
+    cgroup. Peak must now fit POOL_MEMORY_BUDGET."""
+    block, procs = scale_corpus.plan_blocks(28_000, 1, 100_000, 3, 16)
+    assert block < scale_corpus.BLOCK_VARIANTS
+    peak = procs * block * 100_000 * scale_corpus.FMT_PEAK_BYTES_PER_CELL
+    assert peak <= scale_corpus.POOL_MEMORY_BUDGET
+
+
+@pytest.mark.parametrize("n_format", [0, 3])
+def test_plan_blocks_block_size_is_independent_of_procs(n_format):
+    """REGRESSION: block size must not depend on `procs`.
+
+    The first cut of the memory fix derived the per-block budget as a
+    `procs` share of the pool budget. That made `--procs` change the block
+    partitioning, hence the position striping and per-block seeds, hence the
+    output bytes -- so the same corpus request produced different files at
+    different worker counts. `_format_block` seeds per block precisely so
+    that cannot happen; the whole point of the pool is that it is invisible
+    in the output.
+    """
+    sizes = {
+        scale_corpus.plan_blocks(28_000, 1, 100_000, n_format, p)[0]
+        for p in (1, 2, 4, 8, 16, 48)
+    }
+    assert len(sizes) == 1, f"block size varies with procs: {sorted(sizes)}"
+
+
+def test_plan_blocks_raises_rather_than_hanging_when_one_block_cannot_fit():
+    """A block too large for the budget used to be discovered as OOM-killed
+    workers plus an `mp.Pool` that waited forever. Fail loudly with the
+    arithmetic instead."""
+    with pytest.raises(RuntimeError, match="pool budget"):
+        scale_corpus.plan_blocks(10, 1, 10_000_000_000, 0, 1)
+
+
+def test_sub_block_positions_stay_inside_the_declared_contig(tmp_path, monkeypatch):
+    """REGRESSION: `_block_positions` striped at the BLOCK_VARIANTS constant
+    rather than the actual block size.
+
+    With smaller blocks each stripe was mostly empty, so the last block began
+    at `n_blocks * BLOCK_VARIANTS * stride` -- about 20x past the declared
+    contig length for the hold-out. Positions still came out sorted, so
+    nothing looked wrong until `tabix` rejected the finished file, after the
+    entire corpus had been written (21 minutes and 12 GB, in the real case).
+    """
+    monkeypatch.setattr(scale_corpus, "FMT_BLOCK_MEMORY_BUDGET", 20_000_000)
+    samples, variants = 500, 2_000
+    block, procs = scale_corpus.plan_blocks(variants, 1, samples, 3, 16)
+    assert block < scale_corpus.BLOCK_VARIANTS, "vacuous unless blocks shrink"
+
+    out = tmp_path / "fmt.vcf.gz"
+    m = generate(
+        out,
+        samples,
+        variants,
+        ["chr22"],
+        ["DP", "GQ", "AD"],
+        seed=1,
+        procs=procs,
+        bgzip_threads=2,
+    )
+    assert m.variants == variants  # generate's own index check already ran
+
+    text = subprocess.run(
+        ["bcftools", "view", "-H", str(out)],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    pos = [int(line.split("\t")[1]) for line in text.strip().split("\n")]
+    assert len(pos) == variants
+    assert max(pos) <= scale_corpus.DEFAULT_CONTIG_LEN
+    assert pos == sorted(pos) and len(set(pos)) == len(pos)
+
+    # And the pool stays invisible in the output: same request, different
+    # worker count, identical bytes. This is the end-to-end form of the
+    # block-size-independence check above -- it is what caught the `procs`
+    # coupling in the first place.
+    serial = tmp_path / "fmt_serial.vcf.gz"
+    generate(
+        serial,
+        samples,
+        variants,
+        ["chr22"],
+        ["DP", "GQ", "AD"],
+        seed=1,
+        procs=1,
+        bgzip_threads=2,
+    )
+    assert out.read_bytes() == serial.read_bytes()

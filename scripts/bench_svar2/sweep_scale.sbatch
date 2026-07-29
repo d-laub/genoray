@@ -37,14 +37,14 @@ mkdir -p "$JD/corpora" "$JD/plans" "$JD/out"
 # --- corpora -----------------------------------------------------------------
 for S in 250 1000 4000 16000 64000 250000 500000; do
   OUT="$JD/corpora/s${S}.vcf.gz"
-  [ -f "$OUT" ] && { echo "have $OUT"; continue; }
+  [ -f "${OUT%.vcf.gz}.manifest.json" ] && { echo "have $OUT"; continue; }
   $PX python -m scripts.bench_svar2.scale_corpus \
     --out "$OUT" --samples "$S" --cells-budget "$CELLS" --procs 16 --bgzip-threads 8
 done
 
 for C in 2 8 22; do
   OUT="$JD/corpora/s4000_c${C}.vcf.gz"
-  [ -f "$OUT" ] && continue
+  [ -f "${OUT%.vcf.gz}.manifest.json" ] && continue
   CONTIGS=$($PX python -c "print(','.join(f'chr{i}' for i in range(1, $C + 1)))")
   $PX python -m scripts.bench_svar2.scale_corpus \
     --out "$OUT" --samples 4000 --cells-budget "$CELLS" --contigs "$CONTIGS" \
@@ -60,7 +60,7 @@ read -r HOLDOUT_S HOLDOUT_V HOLDOUT_F < <($PX python -c "
 from scripts.bench_svar2.plans.build_plans import HOLDOUT
 print(HOLDOUT['samples'], HOLDOUT['variants'], ','.join(HOLDOUT['format_fields']))
 ")
-[ -f "$JD/corpora/holdout.vcf.gz" ] || $PX python -m scripts.bench_svar2.scale_corpus \
+[ -f "$JD/corpora/holdout.manifest.json" ] || $PX python -m scripts.bench_svar2.scale_corpus \
   --out "$JD/corpora/holdout.vcf.gz" --samples "$HOLDOUT_S" --variants "$HOLDOUT_V" \
   --format-fields "$HOLDOUT_F" --procs 16 --bgzip-threads 8
 
@@ -78,7 +78,7 @@ from scripts.bench_svar2.plans.build_plans import VLINEAR_VARIANTS
 print(' '.join(str(v) for v in VLINEAR_VARIANTS))
 "); do
   OUT="$JD/corpora/vlinear_v${V}.vcf.gz"
-  [ -f "$OUT" ] && { echo "have $OUT"; continue; }
+  [ -f "${OUT%.vcf.gz}.manifest.json" ] && { echo "have $OUT"; continue; }
   $PX python -m scripts.bench_svar2.scale_corpus \
     --out "$OUT" --samples "$VLIN_S" --variants "$V" --procs 16 --bgzip-threads 8
 done
