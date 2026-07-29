@@ -83,15 +83,27 @@ seed, only re-obtainable by rerunning the probe.
   (perfectly in-order, never actually buffered) contributes 0. `pending_hw ==
   0` means no reordering backlog was ever observed for that contig; it is
   no longer floored at 1 in every sharded run.
-- **Any point with an `rss_ceiling_mb` runs with `MALLOC_ARENA_MAX=1`.** The
-  ceiling is enforced with `RLIMIT_AS`, which bounds address space rather than
-  RSS, and glibc's default multi-arena allocator reserves VA the process never
-  touches; pinning to one arena is what keeps the ceiling a usable proxy (see
-  `probe.py:_preexec`). It is a deviation from the production default, so the
-  measured `maxrss_mb` is not strictly the bare production configuration. The
-  effect was measured as ~1% on the `from_vcf_list` cross-contig peak during
-  earlier work; it has NOT been measured on this `from_vcf` path, so treat the
-  deviation as small-but-unquantified here rather than as established.
+- **`pending_hw` still grows with `w` for structural reasons, so it is not by
+  itself evidence of skew.** `ReorderBuffer::push` releases a chunk on arrival
+  only when its ordinal is the head, so the `w - 1` units ahead of the head
+  keep everything they produce buffered until the head unit finishes:
+  `(w - 1) * chunks_per_unit` chunks are resident even with perfectly balanced
+  readers. A real 12-unit, `w=3`, `overshard=4` probe log sustains
+  `pending=5`. `model.py:decide` therefore gates H3(a) on the backlog's BYTE
+  share of measured peak RSS, not on the spec's literal `pending_hw >= w/2`,
+  which every planned sweep row would trip.
+- **Only the production-`chunk_size` points carry an `rss_ceiling_mb`, and
+  those are the only ones that run with `MALLOC_ARENA_MAX=1`.** The ceiling is
+  enforced with `RLIMIT_AS`, which bounds address space rather than RSS, and
+  glibc's default multi-arena allocator reserves VA the process never touches;
+  pinning to one arena is what keeps the ceiling a usable proxy (see
+  `probe.py:_preexec`). It is a deviation from the production default, so those
+  points' `maxrss_mb` and wall times are not the bare production configuration
+  -- which is exactly why the law-fitting points (V-ladder, cost laws, contig
+  counterfactual, knee validation) do NOT set a ceiling: `MALLOC_ARENA_MAX=1`
+  was measured at 73% slower in an earlier multithreaded conversion regime, and
+  those points feed the H2 verdict and every wall time in the sweep. See
+  `build_plans.OOM_PROBE_CEILING_MB`.
 - **`phase1_s` is a SUM of per-contig spans, not a wall clock.** `probe.py`'s
   `RE_PHASE1` matches the renderer's per-contig "done: N kept, M excluded
   (X.Xs)" line and sums every match. At `concurrent_chroms == 1` that sum

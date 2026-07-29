@@ -42,6 +42,22 @@ PROD_CHUNK_SIZE = MAX_CHUNK_SIZE
 # 1_000 * 200_000 = 2e8 cells at S=1_000.
 VLINEAR_SAMPLES = 250
 VLINEAR_VARIANTS = (25_000, 50_000, 100_000, 200_000)
+# RLIMIT_AS installed on the points whose PURPOSE is to find out whether
+# `from_vcf`'s hardcoded chunk_size survives biobank scale. Deliberately NOT on
+# every point (a deviation from the design spec's "each point runs under an
+# explicit RSS ceiling"): `probe.py:_build_env` sets `MALLOC_ARENA_MAX=1`
+# whenever a ceiling exists, and pinning glibc to one arena while running
+# `-@ 48` with up to 11 reader workers is not the production allocator regime.
+# Earlier work in this repo measured `MALLOC_ARENA_MAX=1` at 73% slower in a
+# multithreaded conversion (the later "safe" finding was for the SINGLE-THREADED
+# `from_vcf_list` path, not this one), so applying it to the V-law ladder, both
+# cost laws -- hence the H2 verdict -- and every wall time in the sweep would
+# measure the allocator, not the code. The ceiling only has a job to do where an
+# OOM is physically possible, which is the production-chunk_size points at large
+# S; the law-fitting points run on the production allocator instead. The OOM
+# deliverable is unaffected: it is exactly those points that can produce
+# `oom_at_rss_mb`.
+OOM_PROBE_CEILING_MB = 60_000
 
 
 def _chunk_size_for(variants: int) -> int:
@@ -67,7 +83,11 @@ def _point(
     chunk_size: int,
     threads: int,
     concurrent: int | None = None,
+    rss_ceiling_mb: int | None = None,
 ) -> SweepPoint:
+    """One plan point. `rss_ceiling_mb` defaults to None -- see
+    `OOM_PROBE_CEILING_MB` for why a ceiling is opt-in per point rather than a
+    sweep-wide default."""
     return SweepPoint(
         corpus=str(corpus),
         reader_workers=workers,
@@ -77,7 +97,7 @@ def _point(
         chunk_size=chunk_size,
         threads=threads,
         reps=3,
-        rss_ceiling_mb=60_000,
+        rss_ceiling_mb=rss_ceiling_mb,
     )
 
 
@@ -99,19 +119,36 @@ def build(corpus_dir: Path, threads: int) -> dict[str, list[SweepPoint]]:
         # enough to test it -- chunk_assembler::read_next_chunk allocates the
         # packed grid at the FULL chunk_size up front and only truncates
         # after EOF, so even a corpus whose own V is far smaller than
-        # PROD_CHUNK_SIZE still pays the large allocation. This is also what
-        # keeps these points cheap in wall time: conversion cost tracks V,
-        # which is unchanged, not the (much larger) hypothetical chunk size.
-        # Memory is safe regardless of S: `_point`'s rss_ceiling_mb=60_000 is
-        # an RLIMIT_AS the kernel enforces on the child (see probe.py
-        # `_preexec`), comfortably inside sweep_scale.sbatch's --mem=120G --
-        # a genuine OOM kills only that one child and is recorded as
-        # `oom_at_rss_mb`, never the node. Skipped when cs already equals
-        # PROD_CHUNK_SIZE (S=250, 1_000: size_corpus's own clamp already
-        # lands there), which would otherwise duplicate the point above under
-        # an identical point_id and waste a sweep slot.
+        # PROD_CHUNK_SIZE still reserves the large allocation's ADDRESS SPACE.
+        # (Address space, not RSS: `BitGrid3::zeros` is `vec![0u64; n_words]`
+        # -> alloc_zeroed -> calloc, and pages the reader never writes never
+        # become resident -- measured on this node, a 3 GB zeroed allocation
+        # adds 0 MB to ru_maxrss. So these points probe the RLIMIT_AS ceiling,
+        # and `model.py:_resident_chunk_size` bounds what they contribute to
+        # the RSS law.) This is also what keeps these points cheap in wall
+        # time: conversion cost tracks V, which is unchanged, not the (much
+        # larger) hypothetical chunk size.
+        # `OOM_PROBE_CEILING_MB` is an RLIMIT_AS the kernel enforces on the
+        # child (see probe.py `_preexec`), comfortably inside
+        # sweep_scale.sbatch's --mem=120G -- a genuine OOM kills only that one
+        # child and is recorded as `oom_at_rss_mb`, never the node. These are
+        # the ONLY points that carry it; see `OOM_PROBE_CEILING_MB`.
+        # Skipped when cs already equals PROD_CHUNK_SIZE (S=250, 1_000:
+        # size_corpus's own clamp already lands there), which would otherwise
+        # duplicate the point above and waste a sweep slot. Those two points
+        # are also the two where a 25_000-variant chunk cannot possibly
+        # exhaust memory (1.5 MB of grid at S=250), so nothing is lost by
+        # leaving them on the production allocator.
         if cs != PROD_CHUNK_SIZE:
-            scale.append(_point(corpus, 1, PROD_CHUNK_SIZE, threads))
+            scale.append(
+                _point(
+                    corpus,
+                    1,
+                    PROD_CHUNK_SIZE,
+                    threads,
+                    rss_ceiling_mb=OOM_PROBE_CEILING_MB,
+                )
+            )
 
     # Contig axis at fixed cohort: hold TOTAL readers constant (12) and vary the
     # split, which is what separates "too few readers" from "wrong contig".

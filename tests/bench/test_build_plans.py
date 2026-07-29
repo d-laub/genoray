@@ -4,6 +4,7 @@ import pytest
 
 from scripts.bench_svar2.plans.build_plans import (
     HOLDOUT,
+    OOM_PROBE_CEILING_MB,
     PROD_CHUNK_SIZE,
     SCALE_SAMPLES,
     VLINEAR_CHUNK_SIZE,
@@ -93,8 +94,39 @@ def test_scale_plan_has_exactly_one_production_default_point_per_s():
     corpora = [pt.corpus for pt in prod_points]
     assert len(corpora) == len(SCALE_SAMPLES)
     assert len(set(corpora)) == len(SCALE_SAMPLES)
-    for pt in prod_points:
-        assert pt.rss_ceiling_mb == 60_000
+
+
+def test_only_the_oom_probe_points_carry_a_ceiling():
+    """`probe.py:_build_env` sets `MALLOC_ARENA_MAX=1` on any point with an
+    `rss_ceiling_mb`, which is not the production allocator. Pinning glibc to
+    one arena while running `-@ 48` with up to 11 reader workers was measured
+    at 73% slower in an earlier multithreaded conversion regime, so it must
+    not touch the points the laws are fitted from -- only the dedicated
+    production-chunk_size points, which exist to find the OOM.
+
+    The clamped-S points (S=250, 1_000, where size_corpus already lands on
+    PROD_CHUNK_SIZE) stay ceiling-free: they double as law-fitting points, and
+    a 25_000-variant chunk at S=250 is 1.5 MB of grid, so there is no OOM
+    there to probe.
+    """
+    plans = _build()
+    ceilinged = [pt for points in plans.values() for pt in points if pt.rss_ceiling_mb]
+    dedicated = {
+        f"/corpora/s{s}.manifest.json"
+        for s in SCALE_SAMPLES
+        if size_corpus(s, 1_400_000_000)[1] != PROD_CHUNK_SIZE
+    }
+    assert {pt.corpus for pt in ceilinged} == dedicated
+    for pt in ceilinged:
+        assert pt.rss_ceiling_mb == OOM_PROBE_CEILING_MB
+        assert pt.chunk_size == PROD_CHUNK_SIZE
+        assert pt.reader_workers == 1
+
+    # Everything the laws are fitted from runs on the production allocator.
+    law_points = [pt for name in ("contig", "holdout", "vlinear") for pt in plans[name]]
+    law_points += [pt for pt in plans["scale"] if pt.chunk_size != PROD_CHUNK_SIZE]
+    assert law_points
+    assert all(pt.rss_ceiling_mb is None for pt in law_points)
 
 
 def test_scale_plan_adds_a_dedicated_point_only_where_size_corpus_is_not_clamped():
