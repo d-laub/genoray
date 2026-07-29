@@ -50,30 +50,22 @@ _T95 = {
 PLOIDY = 2
 # Spec thresholds. Changing these changes the verdict, so they are named.
 H1_KNEE_TOLERANCE = 1  # w* varies by less than +/-1 across the S range
-H3_PENDING_FRACTION = 0.5  # pending_hw >= workers/2 makes bytes the invariant
 V_LAW_MIN_R2 = 0.98
 HOLDOUT_ERROR_GATE = 0.25  # spec: >25% predicted-vs-actual error is a model failure
+# Share of measured peak RSS the reorder backlog must account for before H3(a)
+# fires -- see `decide` for why the gate is a BYTE share and not the spec's
+# literal `pending_highwater >= w/2` count.
+#
+# 0.25 is deliberately the same number as `HOLDOUT_ERROR_GATE`: that gate is
+# already this module's definition of "a term this size is not a modelling
+# detail, it is the model", and a backlog worth a quarter of peak RSS cannot
+# be bounded by capping `w` -- it has to be bounded in bytes, which is exactly
+# what H3 claims. One notion of "material" for the whole module.
+H3_BACKLOG_RSS_FRACTION = 0.25
 # fit_v_law's max_extrapolation_factor is always stated relative to this many
 # variants (the biobank target). Keeping it as one constant lets `extrapolate`
 # invert it exactly instead of re-guessing what "1e9" in records.py means.
 _V_LAW_TARGET_VARIANTS = 1e9
-# Backlog counted by `pending_highwater` that is a structural artifact of the
-# instrumentation rather than evidence of reorder skew. `decide`'s H3 gate
-# judges backlog BEYOND this floor.
-#
-# This is 0 because the collector's gauge samples BEFORE inserting the
-# just-read chunk (`PendingBacklog::insert_observing`, shard_exec.rs), so a
-# chunk released the instant it arrives contributes nothing and
-# `pending_highwater == 0` genuinely means "no backlog ever observed".
-#
-# It is kept as a named constant rather than deleted because the gauge USED to
-# sample after the insert, which floored every sharded run at 1 and made the H3
-# gate fire on the floor alone -- a reviewer planted synthetic H1 and H2 data
-# and got H3 both times. If the instrumentation ever regains a floor, this is
-# the one place that has to change, and `decide` already reports the value it
-# used in `evidence["pending_structural_floor"]` so a verdict can be audited
-# against the instrumentation that produced it.
-_PENDING_STRUCTURAL_FLOOR = 0
 
 
 def _t95(df: int) -> float:
@@ -191,6 +183,7 @@ def decide(
     read_law: CostLaw,
     exec_law: CostLaw,
     rows: Sequence[tuple[int, int, int, float]],
+    ram_law: RamLaw | None,
     contig_counterfactual: tuple[float, float] | None = None,
 ) -> Verdict:
     """Apply the spec's falsifiable criteria, in H3-first order.
@@ -198,6 +191,53 @@ def decide(
     H3 supersedes H1/H2: if bytes rather than worker count set peak RSS, or if
     the multi-contig regression is a partitioning artifact, a byte-bounded
     global pool needs no knee prediction at all.
+
+    H3(a) IS NOT THE SPEC'S LITERAL `pending_highwater >= w/2`. That criterion
+    cannot discriminate, because `pending_highwater` grows with `w` for purely
+    structural reasons: `ReorderBuffer::push` (src/shard_exec.rs) releases a
+    chunk on arrival only when its `ordinal == head`, so with `w` workers
+    pulling `w` units concurrently, the `w - 1` units ahead of the head keep
+    every chunk they produce in `PendingBacklog::map` until the head unit's
+    `Done`. Roughly `(w - 1) * chunks_per_unit` chunks are therefore resident
+    at all times even with perfectly balanced readers and zero skew. Measured,
+    not hypothetical: a 12-unit, `w=3`, `overshard=4` probe log in this repo
+    sustains `pending=5` for the whole run, i.e. `pending/w = 1.67`, which
+    clears `w/2` outright -- and the scale plan sweeps `w in {2,3,5,7,11}` and
+    the contig plan `w in {12,6,3}`, so EVERY row of every planned sweep would
+    trip a count-based gate. A gate that always fires is not evidence.
+
+    What H3 actually claims is that in-flight BYTES, not worker count, set peak
+    RSS. So test that directly: take the backlog's modelled contribution to
+    peak RSS from the fitted RAM law (`kappa * pending_hw * chunk_bytes`, the
+    same `kappa` and the same per-row `chunk_bytes` that law was fitted on) and
+    require it to be at least `H3_BACKLOG_RSS_FRACTION` of the peak RSS
+    actually measured on that row.
+
+    This stays REACHABLE precisely where the hypothesis is live: the structural
+    `w - 1` backlog is immaterial when a chunk is small (every small-`S` row of
+    the sweep, where `chunk_bytes` is single-digit MB) and dominant when it is
+    not (at `S=500_000` with `from_vcf`'s hardcoded `chunk_size=25_000` one
+    chunk alone is ~3.1 GB, so even a one-chunk backlog is many times the whole
+    process footprint). That is the same axis H3 argues about -- bytes -- and
+    it is the axis a static worker cap cannot control.
+
+    What this gate does NOT claim is that the backlog is skew-driven. It tests
+    a CONSEQUENCE (is the backlog a first-order term in peak RSS?), not a
+    mechanism, and the structural backlog above is a perfectly good way to get
+    there. That is the honest reading of H3 for this pipeline: peak RSS is set
+    by resident chunk bytes, and `chunk_bytes` spans ~1.5 MB to ~3 GB across
+    the swept `S`, so no single static worker cap bounds memory even where the
+    knee itself is flat. Which is why H1's evidence now rides along on an H3
+    verdict: `knee_spread` of 0 next to a fired H3 reads "a static cap predicts
+    the SPEED knee fine, but memory needs a byte budget", and that is a
+    different -- and more useful -- statement than either verdict alone.
+    `evidence["max_backlog_rss_share_row"]` names the row that fired it.
+
+    A non-positive fitted `kappa` means the RAM law found no per-chunk term at
+    all; the backlog demonstrably is not what sets RSS, so H3(a) correctly
+    cannot fire. `ram_law=None` (fewer than two RAM rows) leaves H3(a)
+    unevaluable rather than silently false; `evidence["max_backlog_rss_share"]`
+    is `None` in that case so a verdict can be audited for it.
     """
     evidence: dict[str, object] = {
         "knees": dict(knees),
@@ -205,22 +245,54 @@ def decide(
         "beta_exec": exec_law.beta,
     }
 
-    # Subtract the gauge's structural floor (see `_PENDING_STRUCTURAL_FLOOR`)
-    # before judging materiality: a single always-present in-flight chunk is
-    # not backlog, and treating it as such made this gate fire on the very
-    # first row of every sweep regardless of what the row actually measured.
-    max_pending_frac = max(
-        (max(0, p - _PENDING_STRUCTURAL_FLOOR) / w for (w, p, _, _) in rows if w > 0),
-        default=0.0,
+    # Computed BEFORE any return so that EVERY verdict -- including both H3
+    # paths -- ships the full evidence. An H3 verdict whose evidence carried
+    # neither the knee spread nor the beta CI left a human unable to tell
+    # whether H1 also held, which is the whole point of reporting evidence.
+    diff_lo = read_law.beta_ci95[0] - exec_law.beta_ci95[1]
+    diff_hi = read_law.beta_ci95[1] - exec_law.beta_ci95[0]
+    evidence["beta_diff_ci95"] = (diff_lo, diff_hi)
+
+    values = list(knees.values())
+    spread = (max(values) - min(values)) if values else 0
+    evidence["knee_spread"] = spread
+
+    # Reported, never gated on: `pending/w` is the count the spec named and is
+    # still worth seeing, and `pending - (w - 1)` is that count against a LOWER
+    # BOUND on its structural baseline (at least one buffered chunk per
+    # non-head unit; the true baseline is `(w - 1) * chunks_per_unit`, which
+    # these rows do not carry). Both are diagnostics for the byte share below.
+    evidence["max_pending_fraction"] = max(
+        (p / w for (w, p, _, _) in rows if w > 0), default=0.0
     )
-    evidence["max_pending_fraction"] = max_pending_frac
-    evidence["pending_structural_floor"] = _PENDING_STRUCTURAL_FLOOR
-    if max_pending_frac >= H3_PENDING_FRACTION:
+    evidence["max_pending_excess_over_structural"] = max(
+        (p - (w - 1) for (w, p, _, _) in rows if w > 0), default=0
+    )
+
+    kappa = max(ram_law.kappa, 0.0) if ram_law is not None else None
+    evidence["ram_law_kappa"] = kappa
+    max_backlog_share: float | None = None
+    if kappa is not None:
+        max_backlog_share = 0.0
+        worst_row: tuple[int, int, int, float] | None = None
+        for row in rows:
+            _, p, cb, rss = row
+            if rss <= 0 or p <= 0:
+                continue
+            share = kappa * p * cb / 1e6 / rss
+            if share > max_backlog_share:
+                max_backlog_share, worst_row = share, row
+        # Name the row so a verdict can be traced back to one measurement
+        # rather than to an aggregate: (workers, pending, chunk_bytes, rss_mb).
+        evidence["max_backlog_rss_share_row"] = worst_row
+    evidence["max_backlog_rss_share"] = max_backlog_share
+    if max_backlog_share is not None and max_backlog_share >= H3_BACKLOG_RSS_FRACTION:
         return Verdict(
             "H3",
             (
-                f"reorder backlog reached {max_pending_frac:.2f} x workers, so in-flight "
-                "bytes rather than worker count set peak RSS"
+                f"the reorder backlog accounts for {max_backlog_share:.0%} of measured "
+                f"peak RSS (gate: {H3_BACKLOG_RSS_FRACTION:.0%}), so in-flight bytes "
+                "rather than worker count set peak RSS"
             ),
             evidence,
         )
@@ -239,14 +311,6 @@ def decide(
                 ),
                 evidence,
             )
-
-    diff_lo = read_law.beta_ci95[0] - exec_law.beta_ci95[1]
-    diff_hi = read_law.beta_ci95[1] - exec_law.beta_ci95[0]
-    evidence["beta_diff_ci95"] = (diff_lo, diff_hi)
-
-    values = list(knees.values())
-    spread = (max(values) - min(values)) if values else 0
-    evidence["knee_spread"] = spread
 
     if spread <= H1_KNEE_TOLERANCE:
         return Verdict(
@@ -268,12 +332,18 @@ def decide(
             evidence,
         )
 
+    h3_note = (
+        f"the backlog is {max_backlog_share:.0%} of peak RSS, under the "
+        f"{H3_BACKLOG_RSS_FRACTION:.0%} gate (so not H3)"
+        if max_backlog_share is not None
+        else "H3(a) could not be evaluated (no fitted RAM law)"
+    )
     return Verdict(
         "none",
         (
             f"w* spread is {spread} (> {H1_KNEE_TOLERANCE}, so not H1) but the "
             f"beta difference CI ({diff_lo:.3f}, {diff_hi:.3f}) includes zero (so not "
-            "H2), and the backlog is immaterial (so not H3). Collect more points."
+            f"H2), and {h3_note}. Collect more points."
         ),
         evidence,
     )
@@ -291,6 +361,7 @@ def extrapolate(
     format_fields: int,
     *,
     v_law_samples: int,
+    cohort_beta: float,
     pending: int = 0,
 ) -> dict[str, float]:
     """Project wall and peak RSS at a target regime.
@@ -307,12 +378,24 @@ def extrapolate(
     per-record parse cost is roughly linear in sample count (2000x more
     genotype text per record at S=500,000 than at S=250). Applying the slope
     unscaled at a different S silently assumes cohort size doesn't matter,
-    which is exactly the question this harness exists to answer. Instead the
-    per-variant term is scaled by the fitted read-cost law's exponent,
-    `(samples / v_law_samples) ** read_law.beta` -- the same cost law that
-    sets `predicted_knee` below, so the correction is consistent with the
-    rest of the projection rather than a separately-invented number. The
-    intercept (`fill_drain`) is NOT scaled: it is pipeline start/drain
+    which is exactly the question this harness exists to answer. The
+    per-variant term is therefore scaled by `(samples / v_law_samples) **
+    cohort_beta`.
+
+    `cohort_beta` MUST come from an ABSOLUTE cost measured against S -- the
+    driver fits `phase1_s / variants ~ a * S**b` over the scale sweep's w=1
+    rows (`fit_cost_law("cohort", ...)`). It deliberately is NOT
+    `read_law.beta`: the cost laws are fitted on `cpu_shard_pct` /
+    `cpu_exec_pct`, CPU UTILIZATION percentages bounded in (0, 100]. At w=1
+    the bottleneck pegs near 100% at every S (conversion is reader-bound), so
+    `c_read(S) ~ 100` for all S and `beta_read ~ 0` -- which made this
+    correction evaluate to `400 ** 0 = 1` at S=500,000, i.e. exactly the
+    "silently assumes cohort size doesn't matter" failure it exists to
+    prevent. The RATIO `c_read/c_exec` is unaffected by that ceiling, so
+    `read_law.beta` stays where it is legitimately used: `predicted_knee`
+    below and the H2 test in `decide`.
+
+    The intercept (`fill_drain`) is NOT scaled: it is pipeline start/drain
     overhead, not per-variant work, and nothing in this harness measures how
     it moves with S -- scaling it too would extrapolate past what's fitted.
     """
@@ -326,9 +409,13 @@ def extrapolate(
     # same per-variant quantity; multiplying by `chunk_size` is that
     # multiplication, done once, in the one place both the RSS and knee
     # projections need it.
+    #
+    # No `min(chunk_size, variants)` here, unlike `_ram_rows`: this projection
+    # is made at V = 10^9 (and, for the hold-out, at a V the caller has already
+    # bounded the chunk against), where a chunk genuinely does fill.
     chunk_bytes = chunk_size * (grid + fmt)
 
-    cohort_scale = (samples / v_law_samples) ** read_law.beta
+    cohort_scale = (samples / v_law_samples) ** cohort_beta
     predicted_wall = (
         v_law.intercept_s + v_law.slope_s_per_variant * variants * cohort_scale
     )
@@ -496,11 +583,25 @@ def _v_law_points(vlinear: _LoadedSweep) -> list[tuple[float, float]]:
 def _cost_and_knee_rows(
     scale: _LoadedSweep,
 ) -> tuple[
-    list[tuple[float, float]], list[tuple[float, float]], dict[int, int], list[str]
+    list[tuple[float, float]],
+    list[tuple[float, float]],
+    list[tuple[float, float]],
+    dict[int, int],
+    list[str],
 ]:
-    """From the w=1 row at each S: (S, c_read), (S, c_exec), and the
-    predicted knee. One run at w=1 is the spec's whole point -- it replaces
-    an O(|w|) sweep at every scale point.
+    """From the w=1 row at each S: (S, c_read), (S, c_exec), (S, per-variant
+    wall), and the predicted knee. One run at w=1 is the spec's whole point --
+    it replaces an O(|w|) sweep at every scale point.
+
+    The third series is the ABSOLUTE cohort cost `phase1_s / variants` that
+    `extrapolate`'s `cohort_beta` is fitted from. It has to be separate from
+    `c_read`: `c_read`/`c_exec` are CPU utilization percentages, capped at
+    100% per thread, so they cannot express "S=500,000 costs 400x more per
+    record than S=250" -- they saturate instead (see `extrapolate`). Rows
+    whose `phase1_s` is 0 (no per-contig span parsed out of the trace) are
+    dropped from this series only: `log(0)` is not a data point. Every row
+    here shares `concurrent_chroms=None`, so summing per-contig spans into
+    `phase1_s` is comparable across them (see README).
 
     The scale plan can carry MORE THAN ONE w=1 point per S (e.g. one at
     `size_corpus`'s derived chunk size plus one at production's
@@ -513,6 +614,7 @@ def _cost_and_knee_rows(
     """
     read_pts: dict[int, float] = {}
     exec_pts: dict[int, float] = {}
+    cohort_pts: dict[int, float] = {}
     knees: dict[int, int] = {}
     excluded: list[str] = []
     for r in scale.records:
@@ -538,12 +640,48 @@ def _cost_and_knee_rows(
         read_pts[m.samples] = c_read
         exec_pts[m.samples] = c_exec
         knees[m.samples] = knee_from_probe(r.cpu_shard_pct, r.cpu_exec_pct)
+        if r.phase1_s > 0 and m.variants > 0:
+            cohort_pts[m.samples] = r.phase1_s / m.variants
+        else:
+            excluded.append(
+                f"scale/{r.point_id}: w=1 row at S={m.samples} has phase1_s="
+                f"{r.phase1_s:g} over {m.variants} variants, dropped from the "
+                "cohort per-variant cost fit"
+            )
     return (
         sorted(read_pts.items()),
         sorted(exec_pts.items()),
+        sorted(cohort_pts.items()),
         knees,
         excluded,
     )
+
+
+def _resident_chunk_size(chunk_size: int, variants: int) -> int:
+    """Variants of a `chunk_size`-variant chunk that are actually RESIDENT.
+
+    A chunk cannot hold more variants than the corpus has, and the part it
+    never fills is never touched, so it never becomes resident:
+    `BitGrid3::zeros` is `vec![0u64; n_words]` (src/types.rs) -> `alloc_zeroed`
+    -> `calloc`, and calloc's untouched pages are served from the zero page.
+    Verified empirically on this node: a 3 GB zeroed allocation adds 0 MB to
+    `ru_maxrss`.
+
+    This matters because `maxrss_mb` is the metric the harness records, and
+    the sweep holds `cells = S * V` fixed, so its large-S corpora are tiny in
+    V: at S=500,000 the corpus is 2,800 variants, and a nominal
+    `chunk_size=25_000` chunk of 3,125 MB has ~350 MB of it touched. Feeding
+    the NOMINAL 3,125 as the regressor put two enormous-leverage points with a
+    local slope of ~0.3 into an OLS whose every other row sits under ~120,
+    dragging `kappa` down roughly 10x from its true ~3 -- and with it the
+    headline projection, which then reported `from_vcf`'s hardcoded
+    `chunk_size=25_000` as SAFE at biobank scale (~1.3 GB instead of ~9.8 GB),
+    the exact reverse of the design spec's arithmetic.
+
+    (The address-space story is the opposite and unchanged: RLIMIT_AS counts
+    the whole reservation, touched or not. See `probe.py:_preexec`.)
+    """
+    return min(chunk_size, variants)
 
 
 def _ram_rows(*sweeps: _LoadedSweep) -> list[tuple[int, int, int, float]]:
@@ -555,7 +693,9 @@ def _ram_rows(*sweeps: _LoadedSweep) -> list[tuple[int, int, int, float]]:
         for r in sweep.records:
             pt = sweep.point_of[r.point_id]
             m = sweep.manifest_of[r.point_id]
-            chunk_bytes = m.chunk_bytes * pt.chunk_size
+            chunk_bytes = m.chunk_bytes * _resident_chunk_size(
+                pt.chunk_size, m.variants
+            )
             rows.append(
                 (pt.reader_workers, r.pending_highwater, chunk_bytes, r.maxrss_mb)
             )
@@ -661,7 +801,9 @@ def main() -> None:
                 "failed, every downstream extrapolation is INVALID"
             )
 
-    read_points, exec_points, knees, cost_excluded = _cost_and_knee_rows(scale)
+    read_points, exec_points, cohort_points, knees, cost_excluded = _cost_and_knee_rows(
+        scale
+    )
     for msg in cost_excluded:
         print(f"  - {msg}")
     read_law = (
@@ -670,8 +812,18 @@ def main() -> None:
     exec_law = (
         fit_cost_law("exec", *zip(*exec_points)) if len(exec_points) >= 2 else None
     )
+    # `phase1_s / variants` against S -- an ABSOLUTE per-variant cost, which is
+    # what `extrapolate` scales its per-variant term by. NOT `read_law.beta`;
+    # see `extrapolate`'s docstring for why a utilization exponent collapses
+    # that correction to a no-op.
+    cohort_law = (
+        fit_cost_law("cohort", *zip(*cohort_points))
+        if len(cohort_points) >= 2
+        else None
+    )
     _print_law("read cost law", read_law)
     _print_law("exec cost law", exec_law)
+    _print_law("cohort per-variant cost law", cohort_law)
     if knees:
         print(f"predicted knees by S: {knees}")
 
@@ -686,6 +838,7 @@ def main() -> None:
             read_law,
             exec_law,
             ram_rows,
+            ram_law,
             contig_counterfactual=_contig_counterfactual(contig),
         )
         print(f"VERDICT: {verdict.hypothesis}")
@@ -698,8 +851,19 @@ def main() -> None:
         )
 
     print()
-    if v_law is None or read_law is None or exec_law is None or ram_law is None:
-        print("EXTRAPOLATION: SKIPPED (missing one of V-law/read/exec/RAM law)")
+    if (
+        v_law is None
+        or read_law is None
+        or exec_law is None
+        or ram_law is None
+        or cohort_law is None
+    ):
+        print(
+            "EXTRAPOLATION: SKIPPED (missing one of V-law/read/exec/cohort/RAM "
+            "law). The cohort law in particular is not optional: without it the "
+            "projection would have to assume cohort size does not move "
+            "per-variant cost, which is the question the sweep exists to answer."
+        )
         return
     assert v_law_samples is not None
 
@@ -707,14 +871,7 @@ def main() -> None:
     # sweep persists at the target scale -- there is no fitted law for
     # `pending` itself, only for peak RSS given `pending`, so this is the most
     # defensible number available rather than the previous silent 0.
-    frac = max(
-        (
-            max(0, p - _PENDING_STRUCTURAL_FLOOR) / w
-            for (w, p, _, _) in ram_rows
-            if w > 0
-        ),
-        default=0.0,
-    )
+    frac = max((p / w for (w, p, _, _) in ram_rows if w > 0), default=0.0)
     target_pending = round(frac * a.target_workers)
     proj = extrapolate(
         v_law,
@@ -727,6 +884,7 @@ def main() -> None:
         workers=a.target_workers,
         format_fields=a.target_format_fields,
         v_law_samples=v_law_samples,
+        cohort_beta=cohort_law.beta,
         pending=target_pending,
     )
     print(
@@ -756,10 +914,15 @@ def main() -> None:
             ram_law,
             samples=m.samples,
             variants=m.variants,
-            chunk_size=pt.chunk_size,
+            # Same touched-prefix bound the RAM law was FITTED under
+            # (`_ram_rows` / `_resident_chunk_size`); a hold-out predicted from
+            # a nominal chunk the corpus is too small to fill would be scored
+            # against a regressor the fit never saw.
+            chunk_size=_resident_chunk_size(pt.chunk_size, m.variants),
             workers=pt.reader_workers,
             format_fields=len(m.format_fields),
             v_law_samples=v_law_samples,
+            cohort_beta=cohort_law.beta,
             pending=r.pending_highwater,
         )
         wall_err = abs(pred["predicted_wall_s"] - r.wall_s) / max(r.wall_s, 1e-9)

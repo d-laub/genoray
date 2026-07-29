@@ -5,6 +5,9 @@ from dataclasses import asdict
 import pytest
 
 from scripts.bench_svar2.model import (
+    _LoadedSweep,
+    _ram_rows,
+    _resident_chunk_size,
     decide,
     extrapolate,
     fit_cost_law,
@@ -72,11 +75,32 @@ def test_ram_law_recovers_planted_slope():
     assert math.isclose(law.base_mb, 100.0, abs_tol=1e-6)
 
 
+# `rows` are (workers, pending_highwater, chunk_bytes, peak_rss_mb). Wherever a
+# test needs a row that is NOT byte-material, it uses a tiny `chunk_bytes`
+# against a realistic peak RSS -- which is also what the small-S rows of the
+# real sweep look like (a few MB of chunk against a ~450 MB process). The
+# `pending` values are the STRUCTURALLY REALISTIC ones for their worker count:
+# `ReorderBuffer` keeps the w-1 non-head units' chunks buffered, so a w=3 run
+# really does sit at pending~5 and a w=7 run higher still. Planting pending=0 at
+# w>1, as these tests used to, is a state the harness cannot produce.
+_KAPPA3 = RamLaw(base_mb=100.0, kappa=3.0, r2=1.0, n_points=5)
+
+
+def _immaterial_rows() -> list[tuple[int, int, int, float]]:
+    """One row per swept worker count, each with a realistic structural
+    backlog but a small chunk: 1 MB is the small-S end of the real sweep
+    (S=250 at chunk_size=25_000 is 1.55 MB of packed grid) against a ~450 MB
+    process. Backlog share peaks at 3 * 21 * 1 MB / 450 MB = 14% at w=11,
+    under the 25% gate -- and 3 * 5 * 1 / 450 = 3.3% at w=3, where the
+    old count-based gate read pending=5 as 1.67x workers and fired."""
+    return [(w, 2 * (w - 1) + 1, 1_000_000, 450.0) for w in (1, 3, 5, 7, 11)]
+
+
 def test_decide_picks_h1_when_knee_is_flat():
     knees = {250: 5, 1_000: 5, 4_000: 5, 16_000: 6, 500_000: 5}
     read = fit_cost_law("read", [250, 1_000, 4_000], [1.0, 1.0, 1.0])
     exec_ = fit_cost_law("exec", [250, 1_000, 4_000], [1.0, 1.0, 1.0])
-    v = decide(knees, read, exec_, rows=[(5, 0, 1, 1.0)])
+    v = decide(knees, read, exec_, _immaterial_rows(), _KAPPA3)
     assert v.hypothesis == "H1"
 
 
@@ -85,17 +109,25 @@ def test_decide_picks_h2_when_knee_trends():
     samples = [250, 1_000, 4_000, 16_000, 64_000]
     read = fit_cost_law("read", samples, [3.0 * s**0.9 for s in samples])
     exec_ = fit_cost_law("exec", samples, [3.0 * s**0.5 for s in samples])
-    v = decide(knees, read, exec_, rows=[(5, 0, 1, 1.0)])
+    v = decide(knees, read, exec_, _immaterial_rows(), _KAPPA3)
     assert v.hypothesis == "H2"
 
 
-def test_decide_picks_h3_when_pending_backlog_is_material():
-    """Pending >= workers/2 means bytes, not worker count, set peak RSS."""
+def test_decide_picks_h3_when_the_backlog_is_byte_material():
+    """H3(a) is a BYTE share of peak RSS, not a chunk count.
+
+    Planted at the regime the harness exists to probe: S=500_000 with
+    `from_vcf`'s hardcoded chunk_size=25_000 is ~3.1 GB per chunk, so even the
+    minimum structural one-chunk backlog at w=2 is many times the whole
+    process footprint.
+    """
     knees = {250: 5, 1_000: 5, 4_000: 5}
     read = fit_cost_law("read", [250, 1_000, 4_000], [1.0, 1.0, 1.0])
     exec_ = fit_cost_law("exec", [250, 1_000, 4_000], [1.0, 1.0, 1.0])
-    v = decide(knees, read, exec_, rows=[(8, 6, 1, 1.0)])
+    rows = [(2, 1, 3_125_000_000, 9_800.0)]
+    v = decide(knees, read, exec_, rows, _KAPPA3)
     assert v.hypothesis == "H3"
+    assert v.evidence["max_backlog_rss_share"] > 0.25
 
 
 def test_decide_returns_none_when_nothing_is_supported():
@@ -104,7 +136,7 @@ def test_decide_returns_none_when_nothing_is_supported():
     samples = [250, 1_000, 4_000]
     read = fit_cost_law("read", samples, [1.0, 5.0, 0.5])
     exec_ = fit_cost_law("exec", samples, [1.0, 0.4, 3.0])
-    v = decide(knees, read, exec_, rows=[(8, 0, 1, 1.0)])
+    v = decide(knees, read, exec_, _immaterial_rows(), _KAPPA3)
     assert v.hypothesis == "none"
 
 
@@ -126,6 +158,7 @@ def test_extrapolate_flags_the_current_default_as_over_budget():
         workers=1,
         format_fields=0,
         v_law_samples=25_000,
+        cohort_beta=0.0,
     )
     assert out["chunk_bytes"] > 3e9
     assert out["predicted_peak_rss_mb"] > 9_000
@@ -161,6 +194,7 @@ def test_extrapolate_includes_the_pending_term():
         workers=2,
         format_fields=0,
         v_law_samples=1_000,
+        cohort_beta=0.0,
     )
     no_pending = extrapolate(**kwargs, pending=0)
     with_pending = extrapolate(**kwargs, pending=6)
@@ -194,6 +228,7 @@ def test_extrapolate_extrapolation_factor_is_variants_over_max_fitted_v():
         workers=0,
         format_fields=0,
         v_law_samples=25_000,
+        cohort_beta=0.0,
     )
     # fit_v_law hardcodes max_extrapolation_factor against 1e9 variants, so at
     # exactly 1e9 the factor must equal max_extrapolation_factor itself:
@@ -211,6 +246,7 @@ def test_extrapolate_extrapolation_factor_is_variants_over_max_fitted_v():
         workers=0,
         format_fields=0,
         v_law_samples=25_000,
+        cohort_beta=0.0,
     )
     assert math.isclose(out_2e9["extrapolation_factor"], 10_000.0)
 
@@ -227,8 +263,8 @@ def test_extrapolate_scales_wall_by_the_cohort_size_ratio():
     cohort). Applying it unscaled at a different target S silently assumes
     per-variant parse cost doesn't depend on cohort size, which the design
     spec explicitly says is false (2000x more genotype text per record at
-    S=500,000 vs S=250). The fix scales the per-variant term by
-    `(samples / v_law_samples) ** read_law.beta`; the intercept (fill/drain
+    S=500,000 vs S=250). The per-variant term is scaled by
+    `(samples / v_law_samples) ** cohort_beta`; the intercept (fill/drain
     overhead) is left unscaled -- nothing here fits how IT moves with S."""
     v_law = VLaw(
         slope_s_per_variant=2.0,
@@ -237,14 +273,13 @@ def test_extrapolate_scales_wall_by_the_cohort_size_ratio():
         n_points=4,
         max_extrapolation_factor=1.0,
     )
-    read = CostLaw(name="read", alpha=1.0, beta=0.5, beta_ci95=(0.4, 0.6), n_points=5)
-    exec_ = CostLaw(name="exec", alpha=1.0, beta=0.5, beta_ci95=(0.4, 0.6), n_points=5)
+    flat = CostLaw(name="x", alpha=1.0, beta=0.0, beta_ci95=(0.0, 0.0), n_points=5)
     ram = RamLaw(base_mb=0.0, kappa=0.0, r2=1.0, n_points=2)
 
     out = extrapolate(
         v_law,
-        read,
-        exec_,
+        flat,
+        flat,
         ram,
         samples=1_000,
         variants=50,
@@ -252,6 +287,7 @@ def test_extrapolate_scales_wall_by_the_cohort_size_ratio():
         workers=1,
         format_fields=0,
         v_law_samples=250,
+        cohort_beta=0.5,
     )
     # cohort_scale = (1000/250)**0.5 = 2.0
     # predicted_wall = 100 + 2.0 * 50 * 2.0 = 300.0 -- intercept untouched,
@@ -261,8 +297,8 @@ def test_extrapolate_scales_wall_by_the_cohort_size_ratio():
 
     same_s = extrapolate(
         v_law,
-        read,
-        exec_,
+        flat,
+        flat,
         ram,
         samples=250,
         variants=50,
@@ -270,9 +306,48 @@ def test_extrapolate_scales_wall_by_the_cohort_size_ratio():
         workers=1,
         format_fields=0,
         v_law_samples=250,
+        cohort_beta=0.5,
     )
     assert math.isclose(same_s["cohort_scale"], 1.0)
     assert math.isclose(same_s["predicted_wall_s"], 100.0 + 2.0 * 50)
+
+
+def test_cohort_scale_does_not_come_from_the_utilization_cost_law():
+    """I3: `read_law.beta` is fitted on `cpu_shard_pct`, a UTILIZATION
+    percentage capped at 100% per thread. At w=1 the reader-bound bottleneck
+    pegs near 100% at every S, so `beta_read ~ 0` and
+    `(500_000/250) ** beta_read = 1` -- the correction silently evaporated at
+    exactly the scale it exists for. `cohort_beta` comes from an absolute
+    per-variant cost instead, so a flat read law must NOT flatten it."""
+    v_law = VLaw(
+        slope_s_per_variant=2.0,
+        intercept_s=0.0,
+        r2=1.0,
+        n_points=4,
+        max_extrapolation_factor=1.0,
+    )
+    # Exactly the degenerate read law a saturated w=1 sweep produces.
+    saturated = CostLaw(
+        name="read", alpha=100.0, beta=0.0, beta_ci95=(0.0, 0.0), n_points=7
+    )
+    ram = RamLaw(base_mb=0.0, kappa=0.0, r2=1.0, n_points=2)
+    out = extrapolate(
+        v_law,
+        saturated,
+        saturated,
+        ram,
+        samples=500_000,
+        variants=1_000,
+        chunk_size=10,
+        workers=1,
+        format_fields=0,
+        v_law_samples=250,
+        cohort_beta=0.9,
+    )
+    # (500_000/250) ** 0.9 = 2000 ** 0.9, ~910x -- not the 1.0x the saturated
+    # read law would have produced.
+    assert math.isclose(out["cohort_scale"], 2_000**0.9)
+    assert out["cohort_scale"] > 100.0
 
 
 # --- minor: degenerate fits must not report zero-width (maximally
@@ -291,27 +366,39 @@ def test_cost_law_degenerate_two_points_has_unbounded_ci():
     assert hi == math.inf
 
 
-# --- C1: the H3 gate must not fire on the pending-gauge's structural floor -
+# --- C1: the H3 gate must not fire on backlog the architecture forces -------
+
+
+def _structural_rows() -> list[tuple[int, int, int, float]]:
+    """What a real sharded run at w in {3, 7} actually produces.
+
+    `ReorderBuffer::push` (src/shard_exec.rs) releases a chunk on arrival only
+    when its ordinal is the head, so the w-1 units ahead of the head hold
+    everything they produce until the head unit's `Done`. A real 12-unit,
+    w=3, overshard=4 probe log in this repo sustains `pending=5` for the whole
+    run; w=7 over the same overshard holds proportionally more. These are the
+    numbers the old `pending >= w/2` gate had to survive and did not:
+    5/3 = 1.67 and 13/7 = 1.86 both clear 0.5, so it fired on every row of
+    every planned sweep. `chunk_bytes` is 1 MB, the small-S end of the sweep.
+    """
+    return [(3, 5, 1_000_000, 450.0), (7, 13, 1_000_000, 450.0)]
 
 
 def test_decide_returns_h1_on_planted_h1_data():
-    """Regression for C1 -- the reviewer's exact repro.
+    """Regression for C1 -- the reviewer's exact repro, re-planted.
 
-    The gauge used to sample AFTER inserting the just-read chunk, so
-    `pending_highwater` floored at 1 on every sharded row even with zero
-    reordering. At w=1 that made `pending/workers == 1.0 >= 0.5`
-    unconditionally, so the H3 gate fired on the first row of every sweep
-    regardless of the H1/H2 evidence: planted H1 data, got H3 anyway.
-
-    The gauge now samples BEFORE the insert, so a no-backlog run reports 0 and
-    the planted hypothesis has to survive on its own evidence.
+    Planted H1 data must come back H1 even though every row carries the
+    structural backlog a w>1 run cannot avoid. The original version of this
+    test planted `pending=0` at w in {1,3,5,7}, which passed only because it
+    is a state the harness can never actually produce.
     """
     knees = {250: 5, 1_000: 5, 4_000: 5, 16_000: 6, 500_000: 5}
     read = fit_cost_law("read", [250, 1_000, 4_000], [1.0, 1.0, 1.0])
     exec_ = fit_cost_law("exec", [250, 1_000, 4_000], [1.0, 1.0, 1.0])
-    rows = [(w, 0, 1, 1.0) for w in (1, 3, 5, 7)]  # no backlog observed
-    v = decide(knees, read, exec_, rows=rows)
+    v = decide(knees, read, exec_, _structural_rows(), _KAPPA3)
     assert v.hypothesis == "H1"
+    # The count-based gate this replaced would have fired on these same rows.
+    assert v.evidence["max_pending_fraction"] >= 0.5
 
 
 def test_decide_returns_h2_on_planted_h2_data():
@@ -320,21 +407,63 @@ def test_decide_returns_h2_on_planted_h2_data():
     samples = [250, 1_000, 4_000, 16_000, 64_000]
     read = fit_cost_law("read", samples, [3.0 * s**0.9 for s in samples])
     exec_ = fit_cost_law("exec", samples, [3.0 * s**0.5 for s in samples])
-    rows = [(w, 0, 1, 1.0) for w in (1, 3, 5, 7)]
-    v = decide(knees, read, exec_, rows=rows)
+    v = decide(knees, read, exec_, _structural_rows(), _KAPPA3)
     assert v.hypothesis == "H2"
+    assert v.evidence["max_pending_fraction"] >= 0.5
 
 
-def test_decide_h3_fires_on_a_genuine_backlog():
-    """H3 must still be reachable. With the corrected 0-based gauge, a
-    `pending_highwater` of 1 at w=1 is a real one-chunk backlog, not an
-    artifact, so it is legitimate H3 evidence -- which is precisely why the
-    same input had to be read as H1/H2 back when 1 was the floor."""
+def test_decide_h3_fires_when_the_same_backlog_is_byte_material():
+    """H3 must stay REACHABLE: the identical structural backlog fires H3 once
+    the chunks are big enough for it to matter.
+
+    Same rows as `_structural_rows`, same `pending`, same worker counts --
+    only `chunk_bytes` changes, from the 1 MB of a small-S corpus to the
+    ~350 MB a resident chunk reaches at S=64,000. That is exactly the
+    distinction H3 is about, and the one a count-based gate cannot see.
+    """
+    knees = {250: 5, 1_000: 5, 4_000: 5, 16_000: 6, 500_000: 5}
+    read = fit_cost_law("read", [250, 1_000, 4_000], [1.0, 1.0, 1.0])
+    exec_ = fit_cost_law("exec", [250, 1_000, 4_000], [1.0, 1.0, 1.0])
+    rows = [(3, 5, 350_000_000, 6_000.0), (7, 13, 350_000_000, 6_000.0)]
+    v = decide(knees, read, exec_, rows, _KAPPA3)
+    assert v.hypothesis == "H3"
+
+
+def test_decide_cannot_evaluate_h3a_without_a_ram_law():
+    """Fewer than two RAM rows means no fitted kappa, so the byte share is
+    unknown -- reported as None, not silently as zero."""
     knees = {250: 5, 1_000: 5, 4_000: 5}
     read = fit_cost_law("read", [250, 1_000, 4_000], [1.0, 1.0, 1.0])
     exec_ = fit_cost_law("exec", [250, 1_000, 4_000], [1.0, 1.0, 1.0])
-    v = decide(knees, read, exec_, rows=[(1, 1, 1, 1.0)])
-    assert v.hypothesis == "H3"
+    v = decide(knees, read, exec_, _structural_rows(), None)
+    assert v.evidence["max_backlog_rss_share"] is None
+    assert v.hypothesis == "H1"
+
+
+def test_every_verdict_carries_the_full_evidence():
+    """An H3 verdict used to ship an evidence dict with no knee spread and no
+    beta CI, because both were computed after the H3 return paths -- a human
+    reading it could not tell whether H1 also held."""
+    knees = {250: 5, 1_000: 5, 4_000: 5}
+    read = fit_cost_law("read", [250, 1_000, 4_000], [1.0, 1.0, 1.0])
+    exec_ = fit_cost_law("exec", [250, 1_000, 4_000], [1.0, 1.0, 1.0])
+    byte_material = [(3, 5, 350_000_000, 6_000.0)]
+    keys = {"knee_spread", "beta_diff_ci95", "max_backlog_rss_share"}
+
+    h3a = decide(knees, read, exec_, byte_material, _KAPPA3)
+    assert h3a.hypothesis == "H3"
+    assert keys <= set(h3a.evidence)
+
+    h3b = decide(
+        knees,
+        read,
+        exec_,
+        _structural_rows(),
+        _KAPPA3,
+        contig_counterfactual=(10.0, 20.0),
+    )
+    assert h3b.hypothesis == "H3"
+    assert keys <= set(h3b.evidence)
 
 
 # --- I1: the missing results.ndjson + manifests -> laws + verdict entry ----
@@ -394,6 +523,62 @@ def _record(point_id: str, **overrides) -> ProbeRecord:
     )
     base.update(overrides)
     return ProbeRecord(**base)
+
+
+# --- C2: the RAM law's regressor is the TOUCHED chunk, not the nominal one --
+
+
+def _sweep_of(rows: list[tuple[CorpusManifest, SweepPoint, ProbeRecord]]):
+    sweep = _LoadedSweep()
+    for m, pt, r in rows:
+        sweep.records.append(r)
+        sweep.point_of[r.point_id] = pt
+        sweep.manifest_of[r.point_id] = m
+    return sweep
+
+
+def test_resident_chunk_size_is_bounded_by_the_corpus():
+    assert _resident_chunk_size(25_000, 2_800) == 2_800  # S=500_000 sweep point
+    assert _resident_chunk_size(25_000, 1_000_000_000) == 25_000  # biobank target
+
+
+def test_ram_rows_do_not_charge_untouched_chunk_tail_to_rss():
+    """`BitGrid3::zeros` is calloc; untouched pages never become resident (a
+    3 GB zeroed allocation adds 0 MB to ru_maxrss on this node). The sweep
+    holds S*V fixed, so its large-S corpora are far smaller than
+    `chunk_size=25_000` and a nominal chunk_bytes is mostly fiction.
+
+    Plant the TRUE law `rss = 100 + 3 * (w + p) * touched_bytes` across the
+    sweep's own S ladder and require the fit to recover kappa=3. Feeding the
+    nominal chunk_bytes instead puts two enormous-leverage points (1,562 and
+    3,125 vs <=400 for every other row) into the OLS and drags kappa to ~0.23
+    -- a ~13x under-estimate, which is what made the harness report
+    `from_vcf`'s hardcoded chunk_size as SAFE at biobank scale.
+    """
+    cells = 1_400_000_000
+    rows = []
+    for s in (250, 64_000, 250_000, 500_000):
+        v = cells // s
+        m = _manifest(f"s{s}.manifest.json", samples=s, variants=v, cells=cells)
+        pt = _point(f"s{s}.manifest.json", workers=1, chunk_size=25_000)
+        touched = m.chunk_bytes * min(25_000, v)
+        rows.append(
+            (m, pt, _record(pt.point_id, maxrss_mb=100.0 + 3.0 * touched / 1e6))
+        )
+
+    ram_rows = _ram_rows(_sweep_of(rows))
+    assert math.isclose(fit_ram_law(ram_rows).kappa, 3.0, rel_tol=1e-9)
+
+    nominal = [
+        (
+            pt.reader_workers,
+            r.pending_highwater,
+            m.chunk_bytes * pt.chunk_size,
+            r.maxrss_mb,
+        )
+        for (m, pt, r) in rows
+    ]
+    assert fit_ram_law(nominal).kappa < 0.5
 
 
 def test_main_end_to_end(tmp_path, capsys, monkeypatch):

@@ -33,13 +33,29 @@ BASELINE_PATH = Path(__file__).parent / "baselines" / "regression.json"
 # Shrunk in fix round 1 (Finding 3) from 20_000 variants to 2_000. The tier is
 # still 3 points * (1 warm-up + 2 timed) = 9 conversions; only the corpus got
 # smaller. Shrink the corpus, not the point list: reader_workers is the axis
-# under test, so dropping a worker count would cost coverage. The corpus size
-# does not limit what the maxrss_mb delta gate can see, because per-reader
-# memory tracks `chunk_size` (allocated up front) rather than the variant
-# count -- see the comment on `HARD_METRICS`.
+# under test, so dropping a worker count would cost coverage. Shrinking it did
+# not cost the maxrss_mb delta gate its signal -- that was measured, both ways,
+# on dedicated allocations; see the comment on `HARD_METRICS`.
 CORPUS = {"samples": 200, "variants": 2_000, "contigs": ["chr22"], "seed": 1234}
 WORKERS = (1, 3, 7)
 DEFAULT_TOLERANCE = 0.25
+# Absolute floor on the maxrss_mb delta band, in MB, added to
+# `tolerance * abs(want)` rather than replacing it.
+#
+# A pure percentage band is narrower than the metric's own reproducibility. Two
+# dedicated 8-CPU recordings of IDENTICAL code disagree by more than 25% of the
+# smaller one: worker-attributable deltas of 4.2 / 21.4 MB (job 13332630) and
+# 6.73 / 27.38 MB (the recording committed to baselines/regression.json), i.e.
+# gaps of 2.53 MB at w=3 and 5.98 MB at w=7. Had the 4.2 MB recording been the
+# committed baseline, the run that actually produced the committed file would
+# have FAILED the gate (6.73 > 4.2 * 1.25 = 5.25): a 60% false positive on
+# unchanged code, on the tier whose whole job is to be trusted when it goes red.
+#
+# 8.0 MB clears the largest observed same-code disagreement (5.98 MB) with ~33%
+# headroom. It costs little sensitivity: the signal this gate reads is ~21-27 MB
+# at w=7, so an added 8 MB is still well under half of it, and any regression
+# that meaningfully multiplies per-reader memory moves the delta by far more.
+DELTA_FLOOR_MB = 8.0
 
 # maxrss_mb gates on the WORKER-ATTRIBUTABLE DELTA, not the absolute value
 # (fix round 2, Finding I8). The fixed interpreter + extension footprint
@@ -56,20 +72,27 @@ DEFAULT_TOLERANCE = 0.25
 # still recorded and printed every run (`INFO_METRICS`) as a trend signal,
 # same treatment as wall_s.
 #
-# `_points` keeps `chunk_size=25_000` -- `from_vcf`'s production default, and
-# also the value that MAXIMIZES the signal this gate reads. A round of review
-# proposed shrinking it to 128 on the theory that a 25_000 chunk over a
+# `_points` keeps `chunk_size=25_000` -- `from_vcf`'s production default, and,
+# as measured, the value that MAXIMIZES the signal this gate reads. A round of
+# review proposed shrinking it to 128 on the theory that a 25_000 chunk over a
 # 2_000-variant corpus "never fills", so the reader axis could not move RSS.
-# That is backwards: `ChunkAssembler::read_next_chunk` allocates
-# `BitGrid3::zeros(chunk_size, ...)` UP FRONT and only calls `truncate_v(v)`
-# after EOF (src/chunk_assembler.rs), so every reader pays the full
-# chunk_size-sized grid no matter how few variants arrive. Measured both ways
-# on a dedicated 8-CPU allocation, worker-attributable delta (w=3 / w=7):
+# Both settings were then measured on dedicated 8-CPU allocations,
+# worker-attributable delta (w=3 / w=7):
 #     chunk_size=25_000 -> 4.2 / 21.4 MB   (job 13332630)
 #     chunk_size=128    -> 3.6 /  7.8 MB   (job 13332816)
-# Shrinking it roughly halved the w=7 signal. Note the delta is small in
-# absolute terms either way, because the tolerance is a fraction OF THE DELTA
-# the band is ~5 MB at w=7, not ~110 MB as it was against absolute RSS.
+# Shrinking it roughly halved the w=7 signal, so 25_000 stays. That is the
+# whole justification: the measurement. An earlier version of this comment
+# explained the result by claiming every reader "pays" the full
+# `BitGrid3::zeros(chunk_size, ...)` allocation that
+# `ChunkAssembler::read_next_chunk` makes up front -- true of ADDRESS SPACE,
+# false of RSS, which is what this gate reads: `BitGrid3::zeros` is
+# `vec![0u64; n_words]` -> alloc_zeroed -> calloc, and untouched pages never
+# become resident (measured on this node: a 3 GB zeroed allocation adds 0 MB to
+# ru_maxrss). Do not restore that mechanism; whatever makes the larger chunk
+# move RSS more here, it is not the untouched tail of the grid. Note the delta
+# is small in absolute terms either way, because the tolerance is a fraction OF
+# THE DELTA -- the band is ~13 MB at w=7 (25% plus DELTA_FLOOR_MB), not ~110 MB
+# as it was against absolute RSS.
 #
 # wall_s is NOT a hard gate (fix round 1, Finding 2), and the reason is
 # stronger than "the box is sometimes busy":
@@ -104,7 +127,9 @@ INFO_METRICS = ("wall_s", "maxrss_mb")
 DELTA_REFERENCE_WORKERS = 1
 
 
-def _delta_regressed(got: float, want: float, tolerance: float) -> bool:
+def _delta_regressed(
+    got: float, want: float, tolerance: float, floor: float = 0.0
+) -> bool:
     """One-sided band around a delta that may sit at or below zero.
 
     `got > want * (1 + tolerance)` is the band used everywhere else, but it
@@ -115,8 +140,13 @@ def _delta_regressed(got: float, want: float, tolerance: float) -> bool:
     free extra reader) could land `want` at or below zero, so anchor the
     relaxation to `abs(want)` instead -- this is identical to the old
     formula whenever `want > 0`.
+
+    `floor` widens the band to at least that many absolute units, for metrics
+    whose run-to-run reproducibility is worse than `tolerance` of a small
+    baseline (see `DELTA_FLOOR_MB`). It defaults to 0, i.e. off, so metrics
+    without a measured noise floor keep the pure percentage band.
     """
-    return got > want + tolerance * abs(want)
+    return got > want + max(tolerance * abs(want), floor)
 
 
 def check(
@@ -133,7 +163,9 @@ def check(
 
     `maxrss_mb` gates on the delta against the `reader_workers=1` point
     within this same `points`/`records` set (see the comment above
-    `HARD_METRICS` for why absolute RSS is the wrong thing to gate on).
+    `HARD_METRICS` for why absolute RSS is the wrong thing to gate on), with
+    a `DELTA_FLOOR_MB` absolute floor under the percentage band because the
+    delta's reproducibility across recordings is worse than `tolerance` of it.
     `points` supplies the `reader_workers` needed to find that reference. If
     no `reader_workers=1` point has both a measured record and a baseline,
     this falls back to the absolute comparison for every point rather than
@@ -169,11 +201,17 @@ def check(
                 got = r.maxrss_mb - ref_record.maxrss_mb
                 want = base["maxrss_mb"] - ref_baseline["maxrss_mb"]
                 label = f"maxrss_mb delta vs reader_workers={DELTA_REFERENCE_WORKERS}"
+                # Only the delta carries a floor: DELTA_FLOOR_MB is derived
+                # from two recordings OF THE DELTA, and the absolute-RSS
+                # fallback below is a ~440 MB number whose 25% band already
+                # dwarfs it.
+                floor = DELTA_FLOOR_MB
             else:
                 got = getattr(r, metric)
                 want = base[metric]
                 label = metric
-            if _delta_regressed(got, want, tolerance):
+                floor = 0.0
+            if _delta_regressed(got, want, tolerance, floor):
                 pct = f" ({100 * (got / want - 1):+.0f}%)" if want else ""
                 problems.append(
                     f"{r.point_id}: {label} regressed {got:.1f} vs baseline "
@@ -300,11 +338,9 @@ def _points(manifest_path: Path, threads: int) -> list[SweepPoint]:
             concurrent_chroms=None,
             shard_htslib=0,
             overshard=4,
-            # 128, not 25_000 (fix round 2, Finding I8): against a
-            # 2_000-variant corpus, 25_000 meant every contig fit in a
-            # single chunk, so reader_workers had almost nothing to do and
-            # the maxrss_mb delta this tier now gates on was barely
-            # measurable. 128 gives ~15 chunks over the corpus.
+            # `from_vcf`'s production default, kept because it measured as the
+            # stronger signal for the maxrss_mb delta gate -- see the numbers
+            # in the comment above `HARD_METRICS`.
             chunk_size=25_000,
             threads=threads,
             reps=2,

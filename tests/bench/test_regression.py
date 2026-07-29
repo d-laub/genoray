@@ -146,6 +146,47 @@ def test_delta_gate_passes_a_run_that_matches_the_baseline_delta():
     assert check(records, points, baselines, tolerance=0.25) == []
 
 
+def test_delta_gate_does_not_fail_on_the_metrics_own_reproducibility():
+    """I5: the two dedicated 8-CPU recordings of IDENTICAL code disagree by
+    more than 25% of the smaller one -- 4.2/21.4 MB (job 13332630) versus the
+    6.73/27.38 MB committed to baselines/regression.json. With a pure
+    percentage band and the 4.2 MB recording as the baseline, the run that
+    produced the committed file would have FAILED (6.73 > 4.2 * 1.25 = 5.25):
+    a false positive on unchanged code. `DELTA_FLOOR_MB` is what stops that.
+    """
+    points = _points(Path("/job/eeee/tmp/bench_reg/reg.manifest.json"), threads=8)
+    baselines = _baselines_by_point_id(points, _DELTA_RAW_BASELINE)
+    by_workers = {pt.reader_workers: pt for pt in points}
+
+    # Baseline deltas are 4.2 / 21.4; measure the other recording's 6.73 / 27.38.
+    records = [
+        _rec_for(by_workers[1], wall=5.3, rss=437.8),
+        _rec_for(by_workers[3], wall=5.3, rss=437.8 + 6.73),
+        _rec_for(by_workers[7], wall=5.2, rss=437.8 + 27.38),
+    ]
+    assert 6.73 > 4.2 * 1.25  # the pure percentage band this would have tripped
+    assert 27.38 > 21.4 * 1.25
+    assert check(records, points, baselines, tolerance=0.25) == []
+
+
+def test_delta_floor_still_catches_a_real_regression():
+    """The floor must not swallow the signal it sits under: the gate is there
+    to catch a change that multiplies per-reader memory, which moves the w=7
+    delta by tens of MB, not by the ~6 MB of recording noise."""
+    points = _points(Path("/job/ffff/tmp/bench_reg/reg.manifest.json"), threads=8)
+    baselines = _baselines_by_point_id(points, _DELTA_RAW_BASELINE)
+    by_workers = {pt.reader_workers: pt for pt in points}
+
+    doubled_w7 = 437.8 + 2 * 21.4
+    records = [
+        _rec_for(by_workers[1], wall=5.3, rss=437.8),
+        _rec_for(by_workers[3], wall=5.3, rss=442.0),
+        _rec_for(by_workers[7], wall=5.2, rss=doubled_w7),
+    ]
+    problems = check(records, points, baselines, tolerance=0.25)
+    assert any("delta" in p and by_workers[7].point_id in p for p in problems), problems
+
+
 def test_delta_gate_ignores_a_uniform_shift_in_the_fixed_footprint():
     # A shift in the fixed interpreter/extension footprint (e.g. a Python
     # point release) moves every point's absolute maxrss_mb by the same
