@@ -113,6 +113,17 @@ seed, only re-obtainable by rerunning the probe.
   the same pair. `phase1_s` is therefore only comparable across rows with the
   same `concurrent_chroms`; use `wall_s`, not `phase1_s`, for the contig
   counterfactual.
+- **The V-law predicts phase 1, so the hold-out is scored against `phase1_s`,
+  never `wall_s`.** `fit_v_law` fits `phase1_s ~ a + b*V`, which is why
+  `extrapolate` returns `predicted_phase1_s` rather than a wall time.
+  `ProbeRecord.wall_s` additionally carries the reader-independent rayon merge
+  tail and process startup and so is always the larger number; scoring the
+  projection against it adds a strictly positive term to every hold-out error,
+  one-sidedly, into a 25% gate that means "the model is invalid". The V-ladder
+  and hold-out corpora are both single-contig, so both sides of that
+  comparison are one uncontended span. If `phase1_s` is 0 (no span in the
+  trace) the time half of the gate is skipped and reported as skipped -- there
+  is no correct fallback to `wall_s`.
 
 ## Prior findings
 

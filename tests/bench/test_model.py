@@ -255,7 +255,7 @@ def test_extrapolate_extrapolation_factor_is_variants_over_max_fitted_v():
     assert not math.isclose(out_1e9["extrapolation_factor"], 2.5e8, rel_tol=0.5)
 
 
-# --- I4: predicted_wall_s must scale the per-variant term with cohort size -
+# --- I4: predicted_phase1_s must scale the per-variant term with cohort size -
 
 
 def test_extrapolate_scales_wall_by_the_cohort_size_ratio():
@@ -293,7 +293,7 @@ def test_extrapolate_scales_wall_by_the_cohort_size_ratio():
     # predicted_wall = 100 + 2.0 * 50 * 2.0 = 300.0 -- intercept untouched,
     # only the slope*variants term is scaled.
     assert math.isclose(out["cohort_scale"], 2.0)
-    assert math.isclose(out["predicted_wall_s"], 300.0)
+    assert math.isclose(out["predicted_phase1_s"], 300.0)
 
     same_s = extrapolate(
         v_law,
@@ -309,7 +309,7 @@ def test_extrapolate_scales_wall_by_the_cohort_size_ratio():
         cohort_beta=0.5,
     )
     assert math.isclose(same_s["cohort_scale"], 1.0)
-    assert math.isclose(same_s["predicted_wall_s"], 100.0 + 2.0 * 50)
+    assert math.isclose(same_s["predicted_phase1_s"], 100.0 + 2.0 * 50)
 
 
 def test_cohort_scale_does_not_come_from_the_utilization_cost_law():
@@ -671,3 +671,223 @@ def test_main_end_to_end(tmp_path, capsys, monkeypatch):
     assert "EXTRAPOLATION" in out
     assert "HOLD-OUT" in out
     assert "MODEL FAILURE" in out
+
+
+# --- Minor 11: H1 needs enough cohort sizes to be a claim about the range ---
+
+
+def _flat_cost_laws():
+    """Cost laws with no S-trend, so H2's CI includes zero and the verdict
+    falls through to the H1 test rather than being decided earlier."""
+    samples = [250, 1_000, 4_000]
+    return (
+        fit_cost_law("read", samples, [1.0, 1.0, 1.0]),
+        fit_cost_law("exec", samples, [1.0, 1.0, 1.0]),
+    )
+
+
+@pytest.mark.parametrize("knees", [{250: 5}, {250: 5, 1_000: 5}])
+def test_decide_refuses_h1_from_too_few_cohort_sizes(knees):
+    """H1 claims w* is FLAT ACROSS THE SAMPLE RANGE. One cohort size has
+    spread 0 by definition and two can only show a difference, never a trend,
+    so neither witnesses that claim -- yet an unguarded `spread <= tolerance`
+    reads both as a confident "a static cap suffices, no autotuner needed".
+
+    This is the shape a partly-failed sweep takes: if most w=1 rows yield no
+    usable cpu ticks, `_cost_points` drops them and `knees` shrinks. The
+    verdict must degrade to `none` and say the flatness is unevaluable, not
+    grow more confident as evidence disappears.
+    """
+    read, exec_ = _flat_cost_laws()
+    v = decide(knees, read, exec_, _immaterial_rows(), _KAPPA3)
+    assert v.hypothesis == "none"
+    assert v.evidence["knee_points"] == len(knees)
+    assert v.evidence["knee_spread"] == 0
+    assert "not evaluable" in v.rationale
+
+
+def test_decide_allows_h1_once_the_minimum_cohort_sizes_are_present():
+    """Guard boundary: the same flat spread that is unevaluable at two cohort
+    sizes IS H1 at three. Without this the guard could pass its own test by
+    simply never returning H1."""
+    read, exec_ = _flat_cost_laws()
+    v = decide({250: 5, 1_000: 5, 4_000: 5}, read, exec_, _immaterial_rows(), _KAPPA3)
+    assert v.hypothesis == "H1"
+    assert v.evidence["knee_points"] == 3
+
+
+def test_decide_reports_knee_support_on_every_verdict():
+    """`knee_spread=0` from one cohort size and from seven are the same
+    number carrying opposite evidence; `knee_points` is what tells them
+    apart, so it must ride along on H2 and H3 too, not just H1."""
+    samples = [250, 1_000, 4_000, 16_000, 64_000]
+    read = fit_cost_law("read", samples, [3.0 * s**0.9 for s in samples])
+    exec_ = fit_cost_law("exec", samples, [3.0 * s**0.5 for s in samples])
+    h2 = decide(
+        {250: 3, 1_000: 5, 4_000: 7, 16_000: 11, 64_000: 17},
+        read,
+        exec_,
+        _immaterial_rows(),
+        _KAPPA3,
+    )
+    assert h2.hypothesis == "H2"
+    assert h2.evidence["knee_points"] == 5
+
+    flat_read, flat_exec = _flat_cost_laws()
+    h3 = decide(
+        {250: 5, 1_000: 5, 4_000: 5},
+        flat_read,
+        flat_exec,
+        [(3, 5, 350_000_000, 6_000.0)],
+        _KAPPA3,
+    )
+    assert h3.hypothesis == "H3"
+    assert h3.evidence["knee_points"] == 3
+
+
+# --- Minor 12: the hold-out gate must score like-for-like ------------------
+
+
+def _driver_dirs(tmp_path, holdout_record):
+    """Minimal scale + vlinear + holdout fixture for `main()`."""
+    manifests_dir, plans_dir, results_dir = (
+        tmp_path / "manifests",
+        tmp_path / "plans",
+        tmp_path / "results",
+    )
+    for d in (manifests_dir, plans_dir, results_dir):
+        d.mkdir()
+
+    scale_points = []
+    for s in (250, 1_000, 4_000):
+        (manifests_dir / f"s{s}.manifest.json").write_text(
+            to_json(_manifest(f"s{s}.manifest.json", samples=s))
+        )
+        pt = _point(f"s{s}.manifest.json", workers=1)
+        scale_points.append(pt)
+        append_ndjson(
+            results_dir / "scale.ndjson",
+            _record(
+                pt.point_id,
+                cpu_shard_pct=(3.0 * s**0.9,),
+                cpu_exec_pct=(3.0 * s**0.5,),
+                pending_highwater=0,
+                maxrss_mb=500.0 + s,
+            ),
+        )
+    (plans_dir / "scale.json").write_text(json.dumps([asdict(p) for p in scale_points]))
+
+    v_points = []
+    for v in (25_000, 50_000):
+        name = f"vlin_v{v}.manifest.json"
+        (manifests_dir / name).write_text(
+            to_json(_manifest(name, samples=250, variants=v))
+        )
+        pt = _point(name, workers=1, chunk_size=64)
+        v_points.append(pt)
+        append_ndjson(
+            results_dir / "vlinear.ndjson",
+            _record(pt.point_id, phase1_s=1.0 + 1e-4 * v, maxrss_mb=300.0),
+        )
+    (plans_dir / "vlinear.json").write_text(json.dumps([asdict(p) for p in v_points]))
+
+    (manifests_dir / "holdout.manifest.json").write_text(
+        to_json(_manifest("holdout.manifest.json", samples=1_000, variants=28_000))
+    )
+    hpt = _point("holdout.manifest.json", workers=1, chunk_size=2_000)
+    (plans_dir / "holdout.json").write_text(json.dumps([asdict(hpt)]))
+    append_ndjson(results_dir / "holdout.ndjson", holdout_record(hpt.point_id))
+    return manifests_dir, plans_dir, results_dir
+
+
+def _run_main(tmp_path, capsys, monkeypatch, holdout_record) -> str:
+    manifests_dir, plans_dir, results_dir = _driver_dirs(tmp_path, holdout_record)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "model.py",
+            "--results",
+            str(results_dir),
+            "--manifests",
+            str(manifests_dir),
+            "--plans",
+            str(plans_dir),
+        ],
+    )
+    main()
+    return capsys.readouterr().out
+
+
+def test_holdout_scores_the_phase1_prediction_against_measured_phase1(
+    tmp_path, capsys, monkeypatch
+):
+    """The V-law is fitted `phase1_s ~ a + b*V`, so the projection is a
+    PHASE-1 time. `wall_s` additionally carries the rayon merge tail and
+    process startup and is therefore always larger, which made every hold-out
+    error one-sidedly inflated -- fed into a 25% gate whose documented
+    meaning is "this invalidates the model".
+
+    Plant a record whose two time fields are far apart and assert the scored
+    actual is the phase-1 one. 8.0 vs 999.0 is unambiguous: no rounding of
+    the wall figure could print as the phase-1 figure.
+    """
+    out = _run_main(
+        tmp_path,
+        capsys,
+        monkeypatch,
+        lambda pid: _record(pid, wall_s=999.0, phase1_s=8.0, maxrss_mb=1_000.0),
+    )
+    holdout_line = next(ln for ln in out.splitlines() if ln.startswith("HOLD-OUT"))
+    assert "phase1 pred=" in holdout_line
+    assert "actual=8.0s" in holdout_line
+    assert "999" not in holdout_line
+
+
+def test_holdout_skips_the_time_gate_rather_than_falling_back_to_wall(
+    tmp_path, capsys, monkeypatch
+):
+    """A trace with no per-contig span leaves `phase1_s` at 0. There is then
+    nothing commensurable to score the phase-1 projection against, and the
+    old fallback -- compare to `wall_s` anyway -- is precisely the
+    incommensurable comparison this fix removes. Say it was skipped instead,
+    and do not let it raise MODEL FAILURE on its own.
+    """
+    out = _run_main(
+        tmp_path,
+        capsys,
+        monkeypatch,
+        # RSS planted on the fitted line so the rss half of the gate is quiet
+        # and any MODEL FAILURE would have to come from the time half.
+        lambda pid: _record(pid, wall_s=999.0, phase1_s=0.0, maxrss_mb=1_000.0),
+    )
+    holdout_line = next(ln for ln in out.splitlines() if ln.startswith("HOLD-OUT"))
+    assert "NOT scored against wall_s" in holdout_line
+    assert "999" not in holdout_line
+
+
+def test_extrapolate_does_not_expose_a_wall_named_key():
+    """Naming is the fix: `predicted_wall_s` invited exactly one wrong
+    comparison and got it. Nothing may reintroduce the name."""
+    law_v = VLaw(
+        intercept_s=1.0,
+        slope_s_per_variant=2.0,
+        r2=1.0,
+        n_points=4,
+        max_extrapolation_factor=1.0,
+    )
+    read, exec_ = _flat_cost_laws()
+    out = extrapolate(
+        law_v,
+        read,
+        exec_,
+        _KAPPA3,
+        samples=250,
+        variants=50,
+        chunk_size=64,
+        workers=1,
+        format_fields=0,
+        v_law_samples=250,
+        cohort_beta=0.0,
+    )
+    assert "predicted_phase1_s" in out
+    assert "predicted_wall_s" not in out

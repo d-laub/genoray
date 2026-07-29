@@ -30,3 +30,7 @@ memray_flamegraphs/
 
 # dhat heap profiles emitted by `--features dhat-heap` benches into CWD
 dhat-heap.json
+
+# Slurm logs from scripts/bench_svar2/*.sbatch (#SBATCH --output=%x_%j.log
+# resolves against the submission directory, which is the repo root).
+svar2-*.log

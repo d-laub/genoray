@@ -20,6 +20,18 @@ CELLS=1400000000
 
 echo "=== node $(hostname) nproc=$(nproc) allocated=$($PX python -c 'import os;print(len(os.sched_getaffinity(0)))') ==="
 
+# Rebuild the Rust extension FIRST. `pixi run` does not rebuild it, so without
+# this the sweep silently measures whatever .so happens to be installed --
+# including one predating the PendingGauge counting change, whose
+# `pending_highwater` means something different. Twenty-four hours of data
+# that answers the question about the wrong binary is worse than no data, and
+# `set -e` makes a build failure abort in the first minute rather than at the
+# end. CARGO_TARGET_DIR must live off NFS or the linker bus-errors.
+export CARGO_TARGET_DIR="$JD/cargo-target"
+export PATH="$HOME/.cargo/bin:$PATH"
+$PX maturin develop --release
+echo "--- built $(find "$WT/python/genoray" -name '*.so' -printf '%p %TY-%Tm-%Td %TH:%TM\n') ---"
+
 mkdir -p "$JD/corpora" "$JD/plans" "$JD/out"
 
 # --- corpora -----------------------------------------------------------------

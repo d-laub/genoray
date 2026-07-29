@@ -125,6 +125,24 @@ INFO_METRICS = ("wall_s", "maxrss_mb")
 # test, so its own delta against itself is trivially 0 -- the reference
 # point isn't usefully self-gated, only the higher-worker points are.
 DELTA_REFERENCE_WORKERS = 1
+# Band for the ABSOLUTE peak-RSS backstop, deliberately much looser than
+# DEFAULT_TOLERANCE.
+#
+# The delta gate above is the sensitive test, but it is sensitive along ONE
+# axis: it asks whether an extra reader costs more RAM than it used to. A
+# change that raises peak RSS by the SAME amount at every worker count --
+# a bigger buffer somewhere shared, an extra copy of the dense grid, a leak
+# proportional to variants rather than readers -- moves every point together
+# and leaves the delta flat. With absolute maxrss_mb reporting-only (Finding
+# I8), such a regression passed the gate silently no matter how large it was.
+#
+# Sensitivity is not the point of this backstop, so it does not reintroduce
+# the I8 problem: at a ~440 MB baseline this band ignores anything under
+# ~220 MB, which is far past run-to-run noise (two dedicated recordings of
+# identical code moved the absolute figure by single-digit MB) and far past
+# the ~5-25 MB the worker axis itself contributes. It exists to catch a
+# doubling, not a drift. The delta gate keeps catching the small stuff.
+ABSOLUTE_RSS_TOLERANCE = 0.5
 
 
 def _delta_regressed(
@@ -170,6 +188,11 @@ def check(
     no `reader_workers=1` point has both a measured record and a baseline,
     this falls back to the absolute comparison for every point rather than
     silently skipping the gate.
+
+    Every point additionally gets an absolute peak-RSS backstop at
+    `ABSOLUTE_RSS_TOLERANCE`, which is the only thing here that can see a
+    regression shifting all worker counts equally -- the delta gate subtracts
+    exactly that component away.
     """
     workers_by_id = {pt.point_id: pt.reader_workers for pt in points}
     ref_id = next(
@@ -217,6 +240,18 @@ def check(
                     f"{r.point_id}: {label} regressed {got:.1f} vs baseline "
                     f"{want:.1f}{pct}"
                 )
+        # Absolute peak-RSS backstop, on every point including the reference.
+        # See ABSOLUTE_RSS_TOLERANCE: the delta gate above cannot see a
+        # regression that shifts every worker count by the same amount,
+        # because subtracting the reference removes exactly that component.
+        abs_want = base["maxrss_mb"]
+        if _delta_regressed(r.maxrss_mb, abs_want, ABSOLUTE_RSS_TOLERANCE):
+            pct = f" ({100 * (r.maxrss_mb / abs_want - 1):+.0f}%)" if abs_want else ""
+            problems.append(
+                f"{r.point_id}: maxrss_mb (absolute) regressed {r.maxrss_mb:.1f} "
+                f"vs baseline {abs_want:.1f}{pct} -- exceeds the "
+                f"{ABSOLUTE_RSS_TOLERANCE:.0%} backstop band"
+            )
     return problems
 
 

@@ -50,6 +50,17 @@ _T95 = {
 PLOIDY = 2
 # Spec thresholds. Changing these changes the verdict, so they are named.
 H1_KNEE_TOLERANCE = 1  # w* varies by less than +/-1 across the S range
+# Minimum number of DISTINCT cohort sizes that must yield a knee before "w*
+# barely varies" is allowed to mean anything. H1's whole claim is that the
+# knee is FLAT ACROSS THE SAMPLE RANGE, and a spread computed over one or two
+# cohort sizes cannot witness that: a single knee has spread 0 by definition,
+# so an unguarded gate returns a confident "a static cap suffices, no
+# autotuner needed" from the one datum that is equally consistent with every
+# hypothesis. Two points are barely better -- they can only ever show a
+# difference, never a trend. The scale plan supplies 7 cohort sizes, so this
+# floor binds only when most of the sweep failed to produce usable ticks,
+# which is exactly when a confident verdict is least warranted.
+H1_MIN_KNEE_POINTS = 3
 V_LAW_MIN_R2 = 0.98
 HOLDOUT_ERROR_GATE = 0.25  # spec: >25% predicted-vs-actual error is a model failure
 # Share of measured peak RSS the reorder backlog must account for before H3(a)
@@ -256,6 +267,11 @@ def decide(
     values = list(knees.values())
     spread = (max(values) - min(values)) if values else 0
     evidence["knee_spread"] = spread
+    # Report the support alongside the spread: `knee_spread=0` from one cohort
+    # size and from seven are the same number carrying opposite amounts of
+    # evidence, and only this field distinguishes them.
+    evidence["knee_points"] = len(values)
+    h1_supported = len(values) >= H1_MIN_KNEE_POINTS
 
     # Reported, never gated on: `pending/w` is the count the spec named and is
     # still worth seeing, and `pending - (w - 1)` is that count against a LOWER
@@ -312,12 +328,12 @@ def decide(
                 evidence,
             )
 
-    if spread <= H1_KNEE_TOLERANCE:
+    if h1_supported and spread <= H1_KNEE_TOLERANCE:
         return Verdict(
             "H1",
             (
-                f"w* varies by {spread} across the full sample range: a static cap "
-                "suffices, no autotuner needed"
+                f"w* varies by {spread} across {len(values)} cohort sizes spanning "
+                "the full sample range: a static cap suffices, no autotuner needed"
             ),
             evidence,
         )
@@ -338,12 +354,23 @@ def decide(
         if max_backlog_share is not None
         else "H3(a) could not be evaluated (no fitted RAM law)"
     )
+    # Distinguish "the knee genuinely moves" from "too few cohort sizes
+    # survived to tell". Both land on `none`, but only the first is a finding;
+    # the second is a broken sweep and the operator needs to know which.
+    h1_note = (
+        f"w* spread is {spread} (> {H1_KNEE_TOLERANCE}, so not H1)"
+        if h1_supported
+        else (
+            f"only {len(values)} cohort size(s) yielded a knee (need "
+            f"{H1_MIN_KNEE_POINTS}), so w*'s flatness across the sample range is "
+            f"not evaluable -- the observed spread of {spread} is unsupported"
+        )
+    )
     return Verdict(
         "none",
         (
-            f"w* spread is {spread} (> {H1_KNEE_TOLERANCE}, so not H1) but the "
-            f"beta difference CI ({diff_lo:.3f}, {diff_hi:.3f}) includes zero (so not "
-            f"H2), and {h3_note}. Collect more points."
+            f"{h1_note} but the beta difference CI ({diff_lo:.3f}, {diff_hi:.3f}) "
+            f"includes zero (so not H2), and {h3_note}. Collect more points."
         ),
         evidence,
     )
@@ -429,7 +456,15 @@ def extrapolate(
     return {
         "chunk_bytes": float(chunk_bytes),
         "cohort_scale": float(cohort_scale),
-        "predicted_wall_s": float(predicted_wall),
+        # NOT named `predicted_wall_s`. The V-law is fitted `phase1_s ~ a +
+        # b*V`, so this quantity is a PHASE-1 prediction and excludes the
+        # reader-independent rayon merge tail and process startup that
+        # `ProbeRecord.wall_s` includes. Under the old name the hold-out check
+        # scored it against `wall_s`, which is strictly larger -- a
+        # one-sided bias charged to the model as error, in a comparison gated
+        # at 25%. The name is the fix: there is no correct way to compare this
+        # against a wall time.
+        "predicted_phase1_s": float(predicted_wall),
         "predicted_peak_rss_mb": float(predicted_rss),
         "predicted_knee": float(
             max(
@@ -925,19 +960,42 @@ def main() -> None:
             cohort_beta=cohort_law.beta,
             pending=r.pending_highwater,
         )
-        wall_err = abs(pred["predicted_wall_s"] - r.wall_s) / max(r.wall_s, 1e-9)
+        # Score the phase-1 prediction against MEASURED phase-1, not against
+        # `wall_s`. `wall_s` also carries the rayon merge tail and process
+        # startup, neither of which the V-law models, so scoring against it
+        # adds a strictly positive term to every error -- a one-sided bias
+        # into a 25% gate that would eventually read as "the model is
+        # invalid" when the only thing wrong was the comparison. When the
+        # trace yielded no per-contig span there is nothing commensurable to
+        # compare against, so the wall half of the gate is skipped and said
+        # to be skipped, rather than silently falling back to `wall_s`.
+        have_phase1 = r.phase1_s > 0
+        phase1_err = (
+            abs(pred["predicted_phase1_s"] - r.phase1_s) / r.phase1_s
+            if have_phase1
+            else None
+        )
         rss_err = abs(pred["predicted_peak_rss_mb"] - r.maxrss_mb) / max(
             r.maxrss_mb, 1e-9
         )
+        phase1_txt = (
+            f"phase1 pred={pred['predicted_phase1_s']:.1f}s "
+            f"actual={r.phase1_s:.1f}s err={phase1_err:.0%}"
+            if phase1_err is not None
+            else (
+                f"phase1 pred={pred['predicted_phase1_s']:.1f}s actual=n/a "
+                "(no per-contig span in trace; NOT scored against wall_s)"
+            )
+        )
         print(
             f"HOLD-OUT {r.point_id} (S={m.samples}, V={m.variants}, "
-            f"F={len(m.format_fields)}): "
-            f"wall pred={pred['predicted_wall_s']:.1f}s actual={r.wall_s:.1f}s "
-            f"err={wall_err:.0%} | "
+            f"F={len(m.format_fields)}): {phase1_txt} | "
             f"rss pred={pred['predicted_peak_rss_mb']:.0f}MB actual={r.maxrss_mb:.0f}MB "
             f"err={rss_err:.0%}"
         )
-        if wall_err > HOLDOUT_ERROR_GATE or rss_err > HOLDOUT_ERROR_GATE:
+        if (phase1_err is not None and phase1_err > HOLDOUT_ERROR_GATE) or (
+            rss_err > HOLDOUT_ERROR_GATE
+        ):
             print(
                 f"  MODEL FAILURE: error exceeds the {HOLDOUT_ERROR_GATE:.0%} gate "
                 "(spec: this invalidates the model, not just this point)"
