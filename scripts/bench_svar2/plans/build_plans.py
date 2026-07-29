@@ -12,7 +12,12 @@ import json
 from pathlib import Path
 
 from scripts.bench_svar2.records import SweepPoint
-from scripts.bench_svar2.scale_corpus import size_corpus
+from scripts.bench_svar2.scale_corpus import (
+    MAX_CHUNK_SIZE,
+    MIN_CHUNK_SIZE,
+    MIN_CHUNKS,
+    size_corpus,
+)
 
 CELLS_BUDGET = 1_400_000_000
 SCALE_SAMPLES = (250, 1_000, 4_000, 16_000, 64_000, 250_000, 500_000)
@@ -20,7 +25,40 @@ SCALE_SAMPLES = (250, 1_000, 4_000, 16_000, 64_000, 250_000, 500_000)
 KNEE_VALIDATION_SAMPLES = (250, 16_000, 500_000)
 KNEE_WORKERS = (1, 2, 3, 5, 7, 11)
 CONTIG_COUNTS = (1, 2, 8, 22)
+# Single source of truth for the hold-out corpus's shape: `sweep_scale.sbatch`
+# reads this back (via `python -c 'from ... import HOLDOUT; ...'`) instead of
+# repeating the numbers, so editing one cannot silently drift from the other.
 HOLDOUT = {"samples": 100_000, "variants": 28_000, "format_fields": ("DP", "GQ", "AD")}
+# `from_vcf` hardcodes exactly this -- the only `from_*` method that skips
+# `_auto_chunk_size`. It happens to equal `size_corpus`'s own upper clamp (see
+# MAX_CHUNK_SIZE's docstring in scale_corpus.py), so reuse that constant
+# rather than duplicate the literal.
+PROD_CHUNK_SIZE = MAX_CHUNK_SIZE
+# V-linearity ladder (design spec "Variants factor out"): fixed small S, V is
+# the ONLY axis varying. S=250 rather than 1_000: it is already the smallest
+# point characterized elsewhere in the harness, and it is the cheapest to
+# generate across the ladder -- generation cost is linear in cells = S*V, so
+# even at the top of the V range that's 250 * 200_000 = 5e7 cells versus
+# 1_000 * 200_000 = 2e8 cells at S=1_000.
+VLINEAR_SAMPLES = 250
+VLINEAR_VARIANTS = (25_000, 50_000, 100_000, 200_000)
+
+
+def _chunk_size_for(variants: int) -> int:
+    """`size_corpus`'s own floor-of->=32-chunks / clamp-at-25_000 rule,
+    applied directly to a known variant count instead of deriving one from a
+    cell budget. Used wherever a plan point's variant count is fixed by hand,
+    so its chunk size still obeys the same invariant rather than being an
+    unrelated literal."""
+    return min(MAX_CHUNK_SIZE, max(MIN_CHUNK_SIZE, variants // MIN_CHUNKS))
+
+
+# Fixed across the whole V-ladder so V is the only thing that varies --
+# re-deriving a chunk size per V (the way size_corpus does per S) would
+# confound wall time with chunk size instead of isolating variant count.
+# Sized off the SMALLEST V so every point in the ladder clears the
+# >=32-chunks floor (larger V only adds more chunks at this same size).
+VLINEAR_CHUNK_SIZE = _chunk_size_for(min(VLINEAR_VARIANTS))
 
 
 def _point(
@@ -44,7 +82,7 @@ def _point(
 
 
 def build(corpus_dir: Path, threads: int) -> dict[str, list[SweepPoint]]:
-    scale, contig, holdout = [], [], []
+    scale, contig, holdout, vlinear = [], [], [], []
 
     for s in SCALE_SAMPLES:
         _, cs = size_corpus(s, CELLS_BUDGET)
@@ -55,6 +93,25 @@ def build(corpus_dir: Path, threads: int) -> dict[str, list[SweepPoint]]:
             for w in KNEE_WORKERS:
                 if w != 1:
                     scale.append(_point(corpus, w, cs, threads))
+        # I5: every point above uses size_corpus's DERIVED chunk size, so
+        # nothing ever measures from_vcf's actual hardcoded default
+        # (PROD_CHUNK_SIZE). Reusing this same, already-generated corpus is
+        # enough to test it -- chunk_assembler::read_next_chunk allocates the
+        # packed grid at the FULL chunk_size up front and only truncates
+        # after EOF, so even a corpus whose own V is far smaller than
+        # PROD_CHUNK_SIZE still pays the large allocation. This is also what
+        # keeps these points cheap in wall time: conversion cost tracks V,
+        # which is unchanged, not the (much larger) hypothetical chunk size.
+        # Memory is safe regardless of S: `_point`'s rss_ceiling_mb=60_000 is
+        # an RLIMIT_AS the kernel enforces on the child (see probe.py
+        # `_preexec`), comfortably inside sweep_scale.sbatch's --mem=120G --
+        # a genuine OOM kills only that one child and is recorded as
+        # `oom_at_rss_mb`, never the node. Skipped when cs already equals
+        # PROD_CHUNK_SIZE (S=250, 1_000: size_corpus's own clamp already
+        # lands there), which would otherwise duplicate the point above under
+        # an identical point_id and waste a sweep slot.
+        if cs != PROD_CHUNK_SIZE:
+            scale.append(_point(corpus, 1, PROD_CHUNK_SIZE, threads))
 
     # Contig axis at fixed cohort: hold TOTAL readers constant (12) and vary the
     # split, which is what separates "too few readers" from "wrong contig".
@@ -70,9 +127,24 @@ def build(corpus_dir: Path, threads: int) -> dict[str, list[SweepPoint]]:
             workers = max(1, 12 // concurrent)
             contig.append(_point(corpus, workers, cs, threads, concurrent=concurrent))
 
-    holdout.append(_point(corpus_dir / "holdout.manifest.json", 1, 2_000, threads))
+    # Hold-out chunk size derived the same way the fitted points' is (from its
+    # own variant count via the shared floor/clamp rule), not an unrelated
+    # literal -- the hold-out exists to test the fitted laws OUT OF SAMPLE, so
+    # it must sit on the same chunk-sizing regime they were fitted under.
+    holdout.append(
+        _point(
+            corpus_dir / "holdout.manifest.json",
+            1,
+            _chunk_size_for(HOLDOUT["variants"]),
+            threads,
+        )
+    )
 
-    return {"scale": scale, "contig": contig, "holdout": holdout}
+    for v in VLINEAR_VARIANTS:
+        corpus = corpus_dir / f"vlinear_v{v}.manifest.json"
+        vlinear.append(_point(corpus, 1, VLINEAR_CHUNK_SIZE, threads))
+
+    return {"scale": scale, "contig": contig, "holdout": holdout, "vlinear": vlinear}
 
 
 def main() -> None:

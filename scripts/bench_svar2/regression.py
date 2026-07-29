@@ -33,15 +33,46 @@ BASELINE_PATH = Path(__file__).parent / "baselines" / "regression.json"
 # Shrunk in fix round 1 (Finding 3) from 20_000 variants to 2_000. The tier is
 # still 3 points * (1 warm-up + 2 timed) = 9 conversions; only the corpus got
 # smaller. Shrink the corpus, not the point list: reader_workers is the axis
-# under test, so dropping a worker count would cost coverage, whereas a corpus
-# 10x smaller costs only resolution the maxrss_mb gate does not need.
+# under test, so dropping a worker count would cost coverage. The corpus size
+# does not limit what the maxrss_mb delta gate can see, because per-reader
+# memory tracks `chunk_size` (allocated up front) rather than the variant
+# count -- see the comment on `HARD_METRICS`.
 CORPUS = {"samples": 200, "variants": 2_000, "contigs": ["chr22"], "seed": 1234}
 WORKERS = (1, 3, 7)
 DEFAULT_TOLERANCE = 0.25
 
-# maxrss_mb is driven by corpus size and the dense-chunk cost model, so it is
-# low-variance and safe as a hard gate. wall_s is NOT a hard gate (fix round 1,
-# Finding 2), and the reason is stronger than "the box is sometimes busy":
+# maxrss_mb gates on the WORKER-ATTRIBUTABLE DELTA, not the absolute value
+# (fix round 2, Finding I8). The fixed interpreter + extension footprint
+# dwarfs the part this tier exists to guard: the committed baselines are
+# 437.8/442.0/459.2 MB for reader_workers=1/3/7, so only ~21 MB out of ~438 is
+# attributable to the reader-worker axis, while 25% of the absolute baseline
+# is ~110 MB. A change that quintuples the worker-attributable slice
+# (21 MB -> 105 MB of extra RSS) still lands well inside a 25%-of-absolute
+# band -- an absolute gate can only ever catch a regression that roughly
+# doubles the WHOLE process footprint, which is not what this tier is for.
+# Gating on `maxrss_mb(w) - maxrss_mb(w=1)` instead -- computed the same way
+# on both the measured run and the baseline, so the fixed footprint cancels
+# out on both sides -- isolates the axis under test. Absolute maxrss_mb is
+# still recorded and printed every run (`INFO_METRICS`) as a trend signal,
+# same treatment as wall_s.
+#
+# `_points` keeps `chunk_size=25_000` -- `from_vcf`'s production default, and
+# also the value that MAXIMIZES the signal this gate reads. A round of review
+# proposed shrinking it to 128 on the theory that a 25_000 chunk over a
+# 2_000-variant corpus "never fills", so the reader axis could not move RSS.
+# That is backwards: `ChunkAssembler::read_next_chunk` allocates
+# `BitGrid3::zeros(chunk_size, ...)` UP FRONT and only calls `truncate_v(v)`
+# after EOF (src/chunk_assembler.rs), so every reader pays the full
+# chunk_size-sized grid no matter how few variants arrive. Measured both ways
+# on a dedicated 8-CPU allocation, worker-attributable delta (w=3 / w=7):
+#     chunk_size=25_000 -> 4.2 / 21.4 MB   (job 13332630)
+#     chunk_size=128    -> 3.6 /  7.8 MB   (job 13332816)
+# Shrinking it roughly halved the w=7 signal. Note the delta is small in
+# absolute terms either way, because the tolerance is a fraction OF THE DELTA
+# the band is ~5 MB at w=7, not ~110 MB as it was against absolute RSS.
+#
+# wall_s is NOT a hard gate (fix round 1, Finding 2), and the reason is
+# stronger than "the box is sometimes busy":
 #
 #   - On a contended login node the three points measured 68/54/119 s one day
 #     and 198/250/302 s another, for a corpus 10x SMALLER the second time. A
@@ -65,11 +96,32 @@ DEFAULT_TOLERANCE = 0.25
 # signal. Gating it would need a materially bigger corpus (which is the
 # cluster sweep's job, not this tier's) or many reps and a median.
 HARD_METRICS = ("maxrss_mb",)
-INFO_METRICS = ("wall_s",)
+INFO_METRICS = ("wall_s", "maxrss_mb")
+# The reader_workers value whose measurement is subtracted off to get the
+# worker-attributable delta. 1 reader worker is the floor of the axis under
+# test, so its own delta against itself is trivially 0 -- the reference
+# point isn't usefully self-gated, only the higher-worker points are.
+DELTA_REFERENCE_WORKERS = 1
+
+
+def _delta_regressed(got: float, want: float, tolerance: float) -> bool:
+    """One-sided band around a delta that may sit at or below zero.
+
+    `got > want * (1 + tolerance)` is the band used everywhere else, but it
+    inverts when `want <= 0`: multiplying a non-positive number by
+    `1 + tolerance` makes it MORE negative, which tightens rather than
+    relaxes the bound. Worker-attributable RSS deltas are expected to be
+    small and non-negative, but baseline-recording noise (or a genuinely
+    free extra reader) could land `want` at or below zero, so anchor the
+    relaxation to `abs(want)` instead -- this is identical to the old
+    formula whenever `want > 0`.
+    """
+    return got > want + tolerance * abs(want)
 
 
 def check(
     records: Sequence[ProbeRecord],
+    points: Sequence[SweepPoint],
     baselines: dict[str, dict[str, float]],
     tolerance: float = DEFAULT_TOLERANCE,
 ) -> list[str]:
@@ -78,7 +130,28 @@ def check(
     Only `HARD_METRICS` can fail the build. A failed run or a missing
     baseline is always reported regardless of metric -- those are never
     silently passed.
+
+    `maxrss_mb` gates on the delta against the `reader_workers=1` point
+    within this same `points`/`records` set (see the comment above
+    `HARD_METRICS` for why absolute RSS is the wrong thing to gate on).
+    `points` supplies the `reader_workers` needed to find that reference. If
+    no `reader_workers=1` point has both a measured record and a baseline,
+    this falls back to the absolute comparison for every point rather than
+    silently skipping the gate.
     """
+    workers_by_id = {pt.point_id: pt.reader_workers for pt in points}
+    ref_id = next(
+        (pid for pid, w in workers_by_id.items() if w == DELTA_REFERENCE_WORKERS),
+        None,
+    )
+    ref_record = (
+        next((r for r in records if r.point_id == ref_id), None) if ref_id else None
+    )
+    ref_baseline = baselines.get(ref_id) if ref_id else None
+    have_reference = (
+        ref_record is not None and ref_record.ok and ref_baseline is not None
+    )
+
     problems: list[str] = []
     for r in records:
         if not r.ok:
@@ -91,20 +164,37 @@ def check(
             )
             continue
         for metric in HARD_METRICS:
-            got = getattr(r, metric)
-            want = base[metric]
-            if got > want * (1 + tolerance):
+            if metric == "maxrss_mb" and have_reference:
+                assert ref_record is not None and ref_baseline is not None
+                got = r.maxrss_mb - ref_record.maxrss_mb
+                want = base["maxrss_mb"] - ref_baseline["maxrss_mb"]
+                label = f"maxrss_mb delta vs reader_workers={DELTA_REFERENCE_WORKERS}"
+            else:
+                got = getattr(r, metric)
+                want = base[metric]
+                label = metric
+            if _delta_regressed(got, want, tolerance):
+                pct = f" ({100 * (got / want - 1):+.0f}%)" if want else ""
                 problems.append(
-                    f"{r.point_id}: {metric} regressed {got:.1f} vs baseline "
-                    f"{want:.1f} (+{100 * (got / want - 1):.0f}%)"
+                    f"{r.point_id}: {label} regressed {got:.1f} vs baseline "
+                    f"{want:.1f}{pct}"
                 )
     return problems
 
 
-def wall_deltas(
+def _fmt_metric(metric: str, value: float) -> str:
+    return f"{value:.1f}s" if metric == "wall_s" else f"{value:.1f}"
+
+
+def info_deltas(
     records: Sequence[ProbeRecord], baselines: dict[str, dict[str, float]]
 ) -> list[str]:
-    """Informational wall_s report. Never fails the gate -- see `INFO_METRICS`.
+    """Informational report for `INFO_METRICS`. Never fails the gate.
+
+    Covers absolute `wall_s` and absolute `maxrss_mb` -- the latter moved
+    here from `HARD_METRICS` in fix round 2 (Finding I8): it's still worth
+    printing as a trend signal, it just isn't sensitive enough on its own to
+    gate the build (see the comment above `HARD_METRICS`).
 
     Skips records that `check` already flags unconditionally (failed runs,
     missing baselines) so the two report streams don't duplicate each other.
@@ -119,9 +209,10 @@ def wall_deltas(
         for metric in INFO_METRICS:
             got = getattr(r, metric)
             want = base[metric]
+            pct = f"{100 * (got / want - 1):+.0f}%" if want else "n/a"
             out.append(
-                f"{r.point_id}: {metric} {got:.1f}s vs baseline {want:.1f}s "
-                f"({100 * (got / want - 1):+.0f}%)"
+                f"{r.point_id}: {metric} {_fmt_metric(metric, got)} vs baseline "
+                f"{_fmt_metric(metric, want)} ({pct})"
             )
     return out
 
@@ -209,6 +300,11 @@ def _points(manifest_path: Path, threads: int) -> list[SweepPoint]:
             concurrent_chroms=None,
             shard_htslib=0,
             overshard=4,
+            # 128, not 25_000 (fix round 2, Finding I8): against a
+            # 2_000-variant corpus, 25_000 meant every contig fit in a
+            # single chunk, so reader_workers had almost nothing to do and
+            # the maxrss_mb delta this tier now gates on was barely
+            # measurable. 128 gives ~15 chunks over the corpus.
             chunk_size=25_000,
             threads=threads,
             reps=2,
@@ -291,7 +387,7 @@ def main() -> None:
 
     raw = json.loads(BASELINE_PATH.read_text())
     baselines = _baselines_by_point_id(points, raw["points"])
-    problems = check(records, baselines, a.tolerance)
+    problems = check(records, points, baselines, a.tolerance)
     # `threads` reaches the conversion as `-@ N` and sizes a rayon pool, so it
     # moves maxrss_mb -- the metric that gates (N2). Before baselines were
     # re-keyed off point_id, a width change showed up as a loud "no baseline
@@ -307,13 +403,14 @@ def main() -> None:
         )
     for msg in problems:
         print(f"REGRESSION: {msg}", file=sys.stderr)
-    for msg in wall_deltas(records, baselines):
+    for msg in info_deltas(records, baselines):
         print(f"INFO: {msg}")
     if problems:
         sys.exit(1)
     print(
         f"{len(records)} points within {a.tolerance:.0%} of baseline "
-        "(maxrss_mb hard gate; wall_s informational)"
+        "(maxrss_mb delta-vs-reader_workers=1 hard gate; "
+        "wall_s and absolute maxrss_mb informational)"
     )
 
 

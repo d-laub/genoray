@@ -11,6 +11,7 @@ import os
 import re
 import resource
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -86,6 +87,40 @@ def digest(store: Path) -> str:
 
 
 def _preexec(rss_ceiling_mb: int | None):
+    """Return a preexec_fn that installs `rss_ceiling_mb` as RLIMIT_AS.
+
+    SEMANTICS (Finding I6, bug 2): RLIMIT_AS caps virtual ADDRESS SPACE, not
+    resident memory. There is no portable, unprivileged way to cap RSS
+    directly on Linux -- `RLIMIT_RSS` is accepted by `setrlimit` but has been
+    unenforced by the kernel since 2.4.30, and a real RSS cap needs a cgroup,
+    which a `Popen(preexec_fn=...)` launcher cannot set up for an
+    unprivileged child without root or a pre-delegated cgroup path (both out
+    of scope for a benchmark harness). `records.py` is frozen, so
+    `rss_ceiling_mb` cannot be renamed to say "address space" either -- the
+    field name and this docstring are the only place that fact can live.
+
+    This matters because glibc's default multi-arena allocator reserves up
+    to `8 * ncores` arenas, and each arena's VA footprint counts against
+    RLIMIT_AS even before anything in it is touched. On a wide node (e.g. 48
+    cores -> up to 384 arenas) a run genuinely using single-digit GB of RSS
+    can trip a 60 GB nominal "ceiling" purely on unused arena headroom --
+    fabricating an OOM datum in the OPPOSITE direction from the usual worry
+    (a run that never came close to the real limit gets recorded as though
+    it did, which would corrupt the same headline finding this harness
+    exists to produce).
+
+    Mitigation, not a full fix: `_build_env` sets `MALLOC_ARENA_MAX=1`
+    whenever a ceiling is configured, pinning glibc to a single arena and
+    closing almost all of that gap (the remaining slack is large individual
+    mmap'd allocations, which correlate with real usage rather than thread
+    count). `rss_ceiling_mb` still bounds address space, not RSS, by
+    construction -- this narrows the two until they track each other
+    closely, it does not make them identical. `run_point`'s
+    `_is_oom_failure` further guards against what's left of the gap by
+    requiring an allocation-failure signature or `maxrss_mb` actually being
+    close to the ceiling before recording `oom_at_rss_mb`, rather than
+    trusting the exit alone.
+    """
     if rss_ceiling_mb is None:
         return None
 
@@ -106,6 +141,13 @@ def _build_env(point: SweepPoint) -> dict[str, str]:
     }
     if point.concurrent_chroms is not None:
         env["GENORAY_CONCURRENT_CHROMS"] = str(point.concurrent_chroms)
+    if point.rss_ceiling_mb is not None:
+        # See `_preexec`: RLIMIT_AS bounds virtual address space, and
+        # glibc's default per-thread arena allocator can reserve VA far
+        # beyond what the process ever touches. Pin to a single arena so the
+        # RLIMIT_AS ceiling tracks actual RSS closely enough to be a
+        # meaningful proxy for it.
+        env["MALLOC_ARENA_MAX"] = "1"
     return env
 
 
@@ -140,6 +182,46 @@ def _tmp_dir(outdir: Path) -> Path:
     base = Path(job_dir) / "tmp" / "bench_probe" if job_dir else outdir / "tmp"
     base.mkdir(parents=True, exist_ok=True)
     return base
+
+
+_OOM_STDERR_RE = re.compile(
+    r"MemoryError|memory allocation of \d+ bytes failed|cannot allocate memory",
+    re.IGNORECASE,
+)
+
+
+def _is_oom_failure(status: int, err: str, maxrss_mb: float, ceiling_mb: int) -> bool:
+    """Whether a failed child's exit looks like genuine memory exhaustion.
+
+    Finding I6, bug 1: every nonzero exit used to be recorded as
+    `oom_at_rss_mb` whenever a ceiling was configured, so a bad
+    `--chunk-size`, a missing corpus, a tabix error, or a preemption signal
+    would fabricate an "OOMs at scale" datum -- a headline finding downstream
+    -- out of an unrelated bug. Require one of three OOM-shaped signals
+    before attributing the failure to memory:
+
+    - stderr carries a known allocation-failure message: Python's
+      `MemoryError`, Rust's global allocator abort message ("memory
+      allocation of N bytes failed" -- what `std::alloc::handle_alloc_error`
+      prints before aborting), or the OS's ENOMEM text ("Cannot allocate
+      memory").
+    - the child was killed by SIGKILL, which is how the Linux OOM killer
+      (cgroup or physical memory exhaustion) terminates a process, as
+      opposed to e.g. a SIGSEGV/SIGABRT from an ordinary crash or panic.
+    - `maxrss_mb` is within 10% of the configured ceiling -- the process was
+      genuinely close to the limit when it died even if neither signature
+      above fired (e.g. it was killed by something other than SIGKILL, or
+      wrote nothing recognizable to stderr).
+
+    Anything else -- a plain nonzero exit with an ordinary error message,
+    far below the ceiling, not signal-killed -- leaves `oom_at_rss_mb` unset
+    and lets `ProbeRecord.error` carry the real cause.
+    """
+    if _OOM_STDERR_RE.search(err):
+        return True
+    if os.WIFSIGNALED(status) and os.WTERMSIG(status) == signal.SIGKILL:
+        return True
+    return maxrss_mb >= 0.9 * ceiling_mb
 
 
 def _run_child(
@@ -202,9 +284,19 @@ def run_point(
 
         maxrss_mb = ru.ru_maxrss / 1024.0
         if status != 0:
-            oom = maxrss_mb if point.rss_ceiling_mb else None
-            # An OOM at a known ceiling is a legitimate datum: proving the
-            # current chunk_size cannot survive biobank scale is a deliverable.
+            # A genuine OOM at a known ceiling is a legitimate datum: proving
+            # the current chunk_size cannot survive biobank scale is a
+            # deliverable. But only when the failure actually looks like
+            # memory exhaustion (Finding I6, bug 1) -- see
+            # `_is_oom_failure` for the rule and its rationale. Everything
+            # else (bad args, missing corpus, tabix errors, ...) leaves
+            # `oom_at_rss_mb` unset and surfaces via `error` instead.
+            oom = (
+                maxrss_mb
+                if point.rss_ceiling_mb
+                and _is_oom_failure(status, err, maxrss_mb, point.rss_ceiling_mb)
+                else None
+            )
             return ProbeRecord(
                 point_id=point.point_id,
                 ok=False,

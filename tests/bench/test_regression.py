@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from scripts.bench_svar2.records import CorpusManifest, ProbeRecord, to_json
+from scripts.bench_svar2.records import CorpusManifest, ProbeRecord, SweepPoint, to_json
 from scripts.bench_svar2.regression import (
     CORPUS,
     WORKERS,
@@ -10,7 +10,7 @@ from scripts.bench_svar2.regression import (
     _points,
     check,
     corpus_is_current,
-    wall_deltas,
+    info_deltas,
 )
 from scripts.bench_svar2.scale_corpus import GENERATOR_VERSION
 
@@ -36,42 +36,157 @@ def _rec(pid: str, wall: float, rss: float = 100.0) -> ProbeRecord:
     )
 
 
+def _rec_for(pt: SweepPoint, wall: float, rss: float) -> ProbeRecord:
+    """Like `_rec`, but keyed to a real `SweepPoint.point_id` -- needed
+    whenever a test exercises the maxrss_mb delta gate, which looks up the
+    reader_workers=1 sibling by point_id via `points`."""
+    return _rec(pt.point_id, wall, rss)
+
+
 BASE = {"p0": {"wall_s": 10.0, "maxrss_mb": 100.0}}
+
+# These tests use a bare "p0" point_id with no matching SweepPoint, so
+# `check`'s delta gate can't find a reader_workers=1 reference and falls
+# back to the absolute comparison (see `check`'s docstring). That fallback
+# is exactly the pre-Finding-I8 behaviour, so passing `points=[]` here
+# doubles as coverage for the fallback path itself.
 
 
 def test_within_tolerance_reports_nothing():
-    assert check([_rec("p0", 11.0)], BASE, tolerance=0.25) == []
+    assert check([_rec("p0", 11.0)], [], BASE, tolerance=0.25) == []
 
 
 def test_wall_regression_alone_is_not_a_hard_failure():
     # wall_s is informational only (fix round 1, Finding 2): baselines are
     # recorded under whatever contention happens to be on the box at record
     # time, so a wall-time-only regression must not fail the gate.
-    assert check([_rec("p0", 14.0)], BASE, tolerance=0.25) == []
+    assert check([_rec("p0", 14.0)], [], BASE, tolerance=0.25) == []
 
 
 def test_wall_delta_is_still_reported_informationally():
-    msgs = wall_deltas([_rec("p0", 14.0)], BASE)
+    msgs = info_deltas([_rec("p0", 14.0)], BASE)
     assert any("wall_s" in m for m in msgs)
 
 
-def test_rss_regression_is_reported():
-    problems = check([_rec("p0", 10.0, rss=200.0)], BASE, tolerance=0.25)
+def test_absolute_maxrss_is_still_reported_informationally():
+    # Finding I8: maxrss_mb moved from HARD_METRICS to INFO_METRICS (as an
+    # absolute value, not a delta) -- it must still show up as a trend
+    # signal even though it no longer gates.
+    msgs = info_deltas([_rec("p0", 10.0, rss=150.0)], BASE)
+    assert any("maxrss_mb" in m for m in msgs)
+
+
+def test_rss_regression_is_reported_via_absolute_fallback():
+    # No reader_workers=1 reference available (points=[]) -> falls back to
+    # the absolute comparison, so this is the same shape of gate that
+    # predates Finding I8, just reached through the fallback path.
+    problems = check([_rec("p0", 10.0, rss=200.0)], [], BASE, tolerance=0.25)
     assert any("maxrss_mb" in p for p in problems)
 
 
 def test_improvement_is_not_a_regression():
-    assert check([_rec("p0", 4.0, rss=10.0)], BASE, tolerance=0.25) == []
+    assert check([_rec("p0", 4.0, rss=10.0)], [], BASE, tolerance=0.25) == []
 
 
 def test_missing_baseline_is_reported_not_silently_passed():
-    problems = check([_rec("unknown", 10.0)], BASE, tolerance=0.25)
+    problems = check([_rec("unknown", 10.0)], [], BASE, tolerance=0.25)
     assert any("no baseline" in p for p in problems)
 
 
 def test_failed_run_is_always_a_regression():
     bad = ProbeRecord(**{**_rec("p0", 10.0).__dict__, "ok": False, "error": "boom"})
-    assert check([bad], BASE, tolerance=0.25) != []
+    assert check([bad], [], BASE, tolerance=0.25) != []
+
+
+# --- Finding I8: the maxrss_mb hard gate is a worker-attributable delta -----
+
+# Baseline numbers straight from the finding writeup: 437.8/442.0/459.2 MB
+# for reader_workers=1/3/7, i.e. only ~4.2/21.4 MB is worker-attributable
+# out of a ~438 MB absolute baseline.
+_DELTA_RAW_BASELINE = {
+    "1": {"wall_s": 5.3, "maxrss_mb": 437.8},
+    "3": {"wall_s": 5.3, "maxrss_mb": 442.0},
+    "7": {"wall_s": 5.2, "maxrss_mb": 459.2},
+}
+
+
+def test_delta_gate_catches_a_worker_attributable_blowup_the_absolute_gate_missed():
+    points = _points(Path("/job/aaaa/tmp/bench_reg/reg.manifest.json"), threads=8)
+    baselines = _baselines_by_point_id(points, _DELTA_RAW_BASELINE)
+    by_workers = {pt.reader_workers: pt for pt in points}
+
+    # Quintuple the worker-attributable delta for reader_workers=7
+    # (21.4 MB -> ~107 MB) while staying comfortably inside the OLD
+    # 25%-of-absolute band (459.2 * 1.25 = 574.0 MB) -- proof this is a case
+    # the pre-fix absolute gate would have passed.
+    blown_up_w7_rss = 437.8 + 5 * (459.2 - 437.8)
+    assert blown_up_w7_rss < 459.2 * 1.25
+
+    records = [
+        _rec_for(by_workers[1], wall=5.3, rss=437.8),
+        _rec_for(by_workers[3], wall=5.3, rss=442.0),
+        _rec_for(by_workers[7], wall=5.2, rss=blown_up_w7_rss),
+    ]
+
+    problems = check(records, points, baselines, tolerance=0.25)
+    assert any("delta" in p and by_workers[7].point_id in p for p in problems), problems
+
+
+def test_delta_gate_passes_a_run_that_matches_the_baseline_delta():
+    points = _points(Path("/job/bbbb/tmp/bench_reg/reg.manifest.json"), threads=8)
+    baselines = _baselines_by_point_id(points, _DELTA_RAW_BASELINE)
+    by_workers = {pt.reader_workers: pt for pt in points}
+
+    records = [
+        _rec_for(by_workers[1], wall=5.3, rss=437.8),
+        _rec_for(by_workers[3], wall=5.3, rss=442.0),
+        _rec_for(by_workers[7], wall=5.2, rss=459.2),
+    ]
+
+    assert check(records, points, baselines, tolerance=0.25) == []
+
+
+def test_delta_gate_ignores_a_uniform_shift_in_the_fixed_footprint():
+    # A shift in the fixed interpreter/extension footprint (e.g. a Python
+    # point release) moves every point's absolute maxrss_mb by the same
+    # amount but must not move the worker-attributable delta, since it
+    # cancels out of both the measured and baseline subtraction.
+    points = _points(Path("/job/cccc/tmp/bench_reg/reg.manifest.json"), threads=8)
+    baselines = _baselines_by_point_id(points, _DELTA_RAW_BASELINE)
+    by_workers = {pt.reader_workers: pt for pt in points}
+
+    shift = 50.0
+    records = [
+        _rec_for(by_workers[1], wall=5.3, rss=437.8 + shift),
+        _rec_for(by_workers[3], wall=5.3, rss=442.0 + shift),
+        _rec_for(by_workers[7], wall=5.2, rss=459.2 + shift),
+    ]
+
+    assert check(records, points, baselines, tolerance=0.25) == []
+
+
+def test_delta_gate_still_reports_a_failed_run_and_a_missing_baseline():
+    points = _points(Path("/job/dddd/tmp/bench_reg/reg.manifest.json"), threads=8)
+    baselines = _baselines_by_point_id(points, _DELTA_RAW_BASELINE)
+    by_workers = {pt.reader_workers: pt for pt in points}
+
+    ok_records = [
+        _rec_for(by_workers[1], wall=5.3, rss=437.8),
+        _rec_for(by_workers[3], wall=5.3, rss=442.0),
+    ]
+    bad = ProbeRecord(
+        **{
+            **_rec_for(by_workers[7], wall=5.2, rss=459.2).__dict__,
+            "ok": False,
+            "error": "boom",
+        }
+    )
+    problems = check([*ok_records, bad], points, baselines, tolerance=0.25)
+    assert any("run failed" in p for p in problems)
+
+    missing_baseline_problems = check(ok_records, points, {}, tolerance=0.25)
+    assert all("no baseline" in p for p in missing_baseline_problems)
+    assert len(missing_baseline_problems) == len(ok_records)
 
 
 def _manifest(tmp_path: Path, **overrides) -> Path:
@@ -192,7 +307,7 @@ def test_baseline_keyed_by_workers_survives_a_workdir_change():
     records_a = [
         _rec(pt.point_id, raw[str(w)]["wall_s"]) for pt, w in zip(points_a, WORKERS)
     ]
-    problems = check(records_a, baselines_a, tolerance=0.25)
+    problems = check(records_a, points_a, baselines_a, tolerance=0.25)
     assert not any("no baseline" in p for p in problems)
 
 
@@ -222,5 +337,5 @@ def test_unknown_worker_count_gets_no_baseline():
     partial = _baselines_by_point_id(points, {"3": {"wall_s": 8.0, "maxrss_mb": 110.0}})
     assert len(partial) == 1
     records = [_rec(pt.point_id, 8.0) for pt in points]
-    problems = check(records, partial, tolerance=0.25)
+    problems = check(records, points, partial, tolerance=0.25)
     assert sum("no baseline" in p for p in problems) == len(points) - 1

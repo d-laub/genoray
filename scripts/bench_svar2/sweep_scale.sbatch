@@ -40,16 +40,42 @@ for C in 2 8 22; do
 done
 cp "$JD/corpora/s4000.manifest.json" "$JD/corpora/s4000_c1.manifest.json"
 
-# Hold-out: off-grid in S, unfitted in F, 2x the fitted cell count.
+# Hold-out: off-grid in S, unfitted in F, 2x the fitted cell count. Shape
+# comes from plans/build_plans.py's HOLDOUT dict (the single source of
+# truth) rather than being repeated here, so this corpus cannot silently
+# drift out of sync with the plan point built against it.
+read -r HOLDOUT_S HOLDOUT_V HOLDOUT_F < <($PX python -c "
+from scripts.bench_svar2.plans.build_plans import HOLDOUT
+print(HOLDOUT['samples'], HOLDOUT['variants'], ','.join(HOLDOUT['format_fields']))
+")
 [ -f "$JD/corpora/holdout.vcf.gz" ] || $PX python -m scripts.bench_svar2.scale_corpus \
-  --out "$JD/corpora/holdout.vcf.gz" --samples 100000 --variants 28000 \
-  --format-fields DP,GQ,AD --procs 16 --bgzip-threads 8
+  --out "$JD/corpora/holdout.vcf.gz" --samples "$HOLDOUT_S" --variants "$HOLDOUT_V" \
+  --format-fields "$HOLDOUT_F" --procs 16 --bgzip-threads 8
+
+# V-linearity ladder (C2): fixed small S, V varies alone. Shape comes from
+# plans/build_plans.py's VLINEAR_SAMPLES/VLINEAR_VARIANTS -- same
+# single-source-of-truth reasoning as the hold-out above. This is the ladder
+# the spec calls "the only reason 500,000 samples is reachable": every other
+# scale point extrapolates variant count off the line these four points fit.
+read -r VLIN_S < <($PX python -c "
+from scripts.bench_svar2.plans.build_plans import VLINEAR_SAMPLES
+print(VLINEAR_SAMPLES)
+")
+for V in $($PX python -c "
+from scripts.bench_svar2.plans.build_plans import VLINEAR_VARIANTS
+print(' '.join(str(v) for v in VLINEAR_VARIANTS))
+"); do
+  OUT="$JD/corpora/vlinear_v${V}.vcf.gz"
+  [ -f "$OUT" ] && { echo "have $OUT"; continue; }
+  $PX python -m scripts.bench_svar2.scale_corpus \
+    --out "$OUT" --samples "$VLIN_S" --variants "$V" --procs 16 --bgzip-threads 8
+done
 
 # --- plans and sweeps --------------------------------------------------------
 $PX python -m scripts.bench_svar2.plans.build_plans \
   --corpus-dir "$JD/corpora" --out-dir "$JD/plans" --threads 48
 
-for NAME in scale contig holdout; do
+for NAME in scale contig holdout vlinear; do
   $PX python -m scripts.bench_svar2.sweep \
     --plan "$JD/plans/$NAME.json" \
     --results "$JD/out/$NAME.ndjson" \

@@ -77,10 +77,30 @@ seed, only re-obtainable by rerunning the probe.
   indistinguishable from a genuine zero backlog. Small-`S` sweep points are
   exactly where this bites; don't read a zero there as "no backlog observed"
   when it may mean "never measured."
-- **`pending_hw` has a floor of 1 in any sharded run.** Even a perfectly
-  ordered chunk is inserted into the reorder map before it is drained, so the
-  H3 RAM model's `(workers + pending_hw)` term always carries a constant `+1`
-  that is not real backlog.
+- **`pending_hw` is the high-water of chunks already waiting, excluding the
+  one currently arriving.** The gauge is sampled before a chunk is inserted
+  into the reorder map, not after, so a chunk released the instant it arrives
+  (perfectly in-order, never actually buffered) contributes 0. `pending_hw ==
+  0` means no reordering backlog was ever observed for that contig; it is
+  no longer floored at 1 in every sharded run.
+- **Any point with an `rss_ceiling_mb` runs with `MALLOC_ARENA_MAX=1`.** The
+  ceiling is enforced with `RLIMIT_AS`, which bounds address space rather than
+  RSS, and glibc's default multi-arena allocator reserves VA the process never
+  touches; pinning to one arena is what keeps the ceiling a usable proxy (see
+  `probe.py:_preexec`). It is a deviation from the production default, so the
+  measured `maxrss_mb` is not strictly the bare production configuration. The
+  effect was measured as ~1% on the `from_vcf_list` cross-contig peak during
+  earlier work; it has NOT been measured on this `from_vcf` path, so treat the
+  deviation as small-but-unquantified here rather than as established.
+- **`phase1_s` is a SUM of per-contig spans, not a wall clock.** `probe.py`'s
+  `RE_PHASE1` matches the renderer's per-contig "done: N kept, M excluded
+  (X.Xs)" line and sums every match. At `concurrent_chroms == 1` that sum
+  equals wall time, but the contig axis also runs `concurrent_chroms =
+  min(c, 4)`, where up to four contigs' spans overlap in wall time -- so
+  `phase1_s` overstates by up to 4x versus the `concurrent_chroms == 1` row of
+  the same pair. `phase1_s` is therefore only comparable across rows with the
+  same `concurrent_chroms`; use `wall_s`, not `phase1_s`, for the contig
+  counterfactual.
 
 ## Prior findings
 
