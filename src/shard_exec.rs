@@ -107,6 +107,54 @@ impl ReorderBuffer {
     }
 }
 
+/// The collector's reorder backlog: chunks that have arrived but are not yet
+/// releasable (their ordinal is ahead of `ReorderBuffer::head`), plus a
+/// running byte total.
+///
+/// The ONLY insert site ([`PendingBacklog::insert_observing`]) observes the
+/// gauge BEFORE adding the arriving chunk, so the high-water reflects the
+/// backlog that was already waiting, excluding the chunk currently arriving.
+/// A chunk that lands on `ReorderBuffer::head` and is released immediately
+/// (an in-order stream never buffers anything) therefore contributes 0, not a
+/// permanent `+1` -- see [`crate::monitor::PendingGauge`]'s doc comment.
+///
+/// Remove sites deliberately do NOT observe: `PendingGauge::observe` is a
+/// `fetch_max`, and a remove can only lower `len()`/`bytes`, so a post-remove
+/// observe would be a provable no-op.
+struct PendingBacklog {
+    map: HashMap<(usize, usize), DenseChunk>,
+    bytes: u64,
+}
+
+impl PendingBacklog {
+    fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+            bytes: 0,
+        }
+    }
+
+    /// Record the backlog already waiting (excluding `chunk`), then insert
+    /// `chunk` under `tag`.
+    fn insert_observing(
+        &mut self,
+        tag: (usize, usize),
+        chunk: DenseChunk,
+        gauge: &crate::monitor::PendingGauge,
+    ) {
+        gauge.observe(self.map.len(), self.bytes);
+        self.bytes += chunk.approx_bytes();
+        self.map.insert(tag, chunk);
+    }
+
+    /// Remove a released chunk, if present (a `Done` tag has none to remove).
+    fn remove(&mut self, tag: &(usize, usize)) -> Option<DenseChunk> {
+        let chunk = self.map.remove(tag)?;
+        self.bytes = self.bytes.saturating_sub(chunk.approx_bytes());
+        Some(chunk)
+    }
+}
+
 /// One worker's report to the collector.
 // `DenseChunk` legitimately outgrew clippy's large-enum-variant threshold when
 // `global_idx: Vec<i32>` was added alongside `pos`/`ilens`/`alt_offsets`; every
@@ -176,8 +224,11 @@ pub struct ShardTotals {
 ///
 /// `pending_gauge` is the same per-chrom high-water gauge the sampler reads:
 /// the collector's reorder backlog (`pending`) is unbounded and otherwise
-/// unobservable, yet it is a real peak-RSS term. Updated on every insert; the
-/// running byte total is maintained incrementally beside the map.
+/// unobservable, yet it is a real peak-RSS term. Observed on every insert via
+/// [`PendingBacklog::insert_observing`], which reads the backlog BEFORE
+/// adding the arriving chunk -- so `pending_hw` measures chunks already
+/// waiting, not the arriving one, and an in-order stream that never buffers
+/// anything records 0.
 ///
 /// Returns the [`ShardTotals`] (summed `dropped_out_of_scope`, `ref_excluded`,
 /// and `normalized_total`) across every unit, or the first error encountered
@@ -339,10 +390,7 @@ where
         drop(rx_work);
         drop(tx_res);
 
-        let mut pending: HashMap<(usize, usize), DenseChunk> = HashMap::new();
-        // Running total of `pending`'s chunk bytes, maintained incrementally so
-        // the gauge costs O(1) per insert/remove rather than O(|pending|).
-        let mut pending_bytes: u64 = 0;
+        let mut pending = PendingBacklog::new();
         let mut rb = ReorderBuffer::new(n_units);
         let mut total_dropped = 0u64;
         let mut total_ref_excluded = 0u64;
@@ -362,13 +410,13 @@ where
                     // `ordinal == head` fast path, or buffered and later
                     // flushed on a `Done`) -- a `Done` never emits a chunk
                     // tag, so `pending.remove` below always finds its entry.
-                    pending_bytes += chunk.approx_bytes();
-                    pending.insert((unit_ordinal, local), chunk);
-                    pending_gauge.observe(pending.len(), pending_bytes);
+                    // `insert_observing` reads the gauge BEFORE adding this
+                    // chunk, so the head-fast-path case (never actually
+                    // waits) contributes 0 to `pending_hw`.
+                    pending.insert_observing((unit_ordinal, local), chunk, pending_gauge);
                     if first_err.is_none() {
                         rb.push(unit_ordinal, local, false, &mut |gid, tag| {
                             if let Some(mut c) = pending.remove(&tag) {
-                                pending_bytes = pending_bytes.saturating_sub(c.approx_bytes());
                                 c.chunk_id = gid;
                                 trace_ll!(
                                     "[trace {chrom}] reader: forwarded ordinal {gid} to tx_dense"
@@ -391,7 +439,6 @@ where
                         total_normalized += normalized;
                         rb.push(unit_ordinal, 0, true, &mut |gid, tag| {
                             if let Some(mut c) = pending.remove(&tag) {
-                                pending_bytes = pending_bytes.saturating_sub(c.approx_bytes());
                                 c.chunk_id = gid;
                                 trace_ll!(
                                     "[trace {chrom}] reader: forwarded ordinal {gid} to tx_dense"
@@ -440,7 +487,97 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::ReorderBuffer;
+    use super::{PendingBacklog, ReorderBuffer};
+    use crate::monitor::PendingGauge;
+    use crate::types::{BitGrid3, DenseChunk};
+    use std::sync::atomic::Ordering;
+
+    /// A trivially small, distinctly-non-empty chunk -- just enough that
+    /// `approx_bytes()` is nonzero so the byte high-water is exercisable too.
+    fn tiny_chunk() -> DenseChunk {
+        let mut genos = BitGrid3::zeros(1, 1, 2);
+        genos.or_bit(0, true);
+        genos.or_bit(1, true);
+        DenseChunk {
+            chunk_id: 0,
+            pos: vec![100],
+            global_idx: vec![-1],
+            ilens: vec![0],
+            alt: b"C".to_vec(),
+            alt_offsets: vec![0, 1],
+            genos,
+            info_staged: Vec::new(),
+            format_staged: Vec::new(),
+            carriers: None,
+            format_by_carrier: None,
+        }
+    }
+
+    #[test]
+    fn pending_hw_zero_for_in_order_stream() {
+        // Two shards, both streamed strictly in (ordinal, local) order --
+        // exactly the "perfectly ordered" case the bug made impossible to
+        // observe as zero. Every chunk lands on `ReorderBuffer::head` and is
+        // released via the `ordinal == head` fast path, so it should never
+        // sit in `pending` at all.
+        let gauge = PendingGauge::default();
+        let mut pending = PendingBacklog::new();
+        let mut rb = ReorderBuffer::new(2);
+
+        for ordinal in [0usize, 1] {
+            for local in [0usize, 1] {
+                pending.insert_observing((ordinal, local), tiny_chunk(), &gauge);
+                rb.push(ordinal, local, false, &mut |_gid, tag| {
+                    pending.remove(&tag);
+                });
+            }
+            pending_done(&mut rb, &mut pending, ordinal);
+        }
+
+        assert_eq!(
+            gauge.len_highwater.load(Ordering::Relaxed),
+            0,
+            "an in-order stream never buffers anything -- pending_hw must be 0, not floored at 1"
+        );
+        assert_eq!(gauge.bytes_highwater.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn pending_hw_positive_for_out_of_order_stream() {
+        // Shard 1 races ahead of shard 0 (same arrival pattern as
+        // `emits_in_ordinal_order_despite_out_of_order_arrival` below): its
+        // chunks must sit in `pending` until shard 0 finishes, so the
+        // high-water must reflect that real backlog.
+        let gauge = PendingGauge::default();
+        let mut pending = PendingBacklog::new();
+        let mut rb = ReorderBuffer::new(2);
+
+        pending.insert_observing((1, 0), tiny_chunk(), &gauge);
+        rb.push(1, 0, false, &mut |_gid, tag| {
+            pending.remove(&tag);
+        });
+        pending.insert_observing((1, 1), tiny_chunk(), &gauge);
+        rb.push(1, 1, false, &mut |_gid, tag| {
+            pending.remove(&tag);
+        });
+        pending_done(&mut rb, &mut pending, 1);
+
+        assert!(
+            gauge.len_highwater.load(Ordering::Relaxed) >= 1,
+            "shard 1's chunks genuinely wait on shard 0 -- pending_hw must be > 0"
+        );
+        assert!(gauge.bytes_highwater.load(Ordering::Relaxed) > 0);
+
+        pending_done(&mut rb, &mut pending, 0);
+    }
+
+    /// Drive a shard's `Done` signal through the same reorder-then-release
+    /// dance the collector loop uses for `Msg::Done`.
+    fn pending_done(rb: &mut ReorderBuffer, pending: &mut PendingBacklog, ordinal: usize) {
+        rb.push(ordinal, 0, true, &mut |_gid, tag| {
+            pending.remove(&tag);
+        });
+    }
 
     #[test]
     fn emits_in_ordinal_order_despite_out_of_order_arrival() {
