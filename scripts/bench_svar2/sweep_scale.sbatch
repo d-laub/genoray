@@ -2,8 +2,12 @@
 #SBATCH --job-name=svar2-scale
 #SBATCH --partition=carter-compute
 #SBATCH --cpus-per-task=48
-#SBATCH --mem=120G
-#SBATCH --time=24:00:00
+#SBATCH --mem=64G
+# 24h was self-imposed and too tight: the partition allows 14 days, and the
+# s500000 ladder alone projects to ~18h on top of ~6h for everything below it.
+# A wall-clock kill mid-point is recoverable (see the resume note below) but
+# costs a queue round-trip for nothing.
+#SBATCH --time=72:00:00
 #SBATCH --output=%x_%j.log
 
 set -euo pipefail
@@ -18,7 +22,26 @@ JD="${CLAUDE_JOB_DIR:?set CLAUDE_JOB_DIR}"/tmp
 PX="pixi run --manifest-path $WT/pixi.toml"
 CELLS=1400000000
 
-echo "=== node $(hostname) nproc=$(nproc) allocated=$($PX python -c 'import os;print(len(os.sched_getaffinity(0)))') ==="
+# `-@ THREADS` is the conversion's TOTAL thread budget and reader workers are
+# carved out of it (probe.py `_build_cmd` passes `--threads`, `_build_env` sets
+# GENORAY_READER_WORKERS). So threads and cpus-per-task must move together:
+# hardcoding 48 here while lowering `--cpus-per-task` would oversubscribe the
+# allocation, and the reader knee -- which is precisely the reader-vs-executor
+# balance -- would be measured against a pool the job does not own. Deriving it
+# from the actual affinity mask makes `--cpus-per-task` the single knob.
+#
+# NOTE: changing --cpus-per-task changes the REGIME, not just the cost. At 48
+# threads the top of the ladder (KNEE_WORKERS max = 11) leaves 37 threads for
+# the executor; at 16 it leaves 5, which starves the consumer and moves the
+# knee. Results measured at different widths answer different questions and
+# must not be pooled (see regression.py, which keys baselines by worker count).
+#
+# --mem=64G is measured, not guessed: peak MaxRSS across the ladder is ~3 GB
+# (RAM grows ~215 MB/worker), and the deliberate scale probes bound ADDRESS
+# SPACE via RLIMIT_AS=60 GB, which BitGrid3's calloc never makes resident.
+THREADS=$($PX python -c 'import os;print(len(os.sched_getaffinity(0)))')
+
+echo "=== node $(hostname) nproc=$(nproc) allocated=$THREADS ==="
 
 # Rebuild the Rust extension FIRST. `pixi run` does not rebuild it, so without
 # this the sweep silently measures whatever .so happens to be installed --
@@ -85,9 +108,27 @@ done
 
 # --- plans and sweeps --------------------------------------------------------
 $PX python -m scripts.bench_svar2.plans.build_plans \
-  --corpus-dir "$JD/corpora" --out-dir "$JD/plans" --threads 48
+  --corpus-dir "$JD/corpora" --out-dir "$JD/plans" --threads "$THREADS"
 
-for NAME in scale contig holdout vlinear; do
+# Order is CHEAPEST-AND-MOST-LOAD-BEARING FIRST, deliberately.
+#
+# `scale`'s s500000 ladder dominates the whole sweep: measured phase-1 time at
+# w=1 and fixed cell count runs 41s (S=4k), 44s (16k), 113s (64k), 1134s
+# (250k) -- an accelerating curve whose log-log slope has already reached 1.69,
+# so the seven remaining 500k points are ~18h of the budget on their own.
+#
+# Running that first is what nearly cost this study its answer. `vlinear` is
+# ~10 minutes and fits the V-law; the V-law is the ONLY reason 500,000 samples
+# is reachable at all, so a timeout inside `scale` would have left the model
+# unable to produce ANY verdict despite ~24h of measurement. `holdout` (the
+# out-of-sample check) and `contig` are likewise hours cheaper than `scale`.
+#
+# Safe to reorder because `run_sweep` resumes: `pending_points` skips any
+# point already fsynced to the results ndjson, so a resubmit continues rather
+# than repeats. That also means point_id must stay stable -- it hashes every
+# SweepPoint field including `threads` and `reps`, so changing
+# --cpus-per-task invalidates resume as well as the regime.
+for NAME in vlinear contig holdout scale; do
   $PX python -m scripts.bench_svar2.sweep \
     --plan "$JD/plans/$NAME.json" \
     --results "$JD/out/$NAME.ndjson" \
