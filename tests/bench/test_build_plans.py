@@ -66,6 +66,50 @@ def test_vlinear_chunk_size_clears_min_chunks_floor_at_smallest_v():
     assert min(VLINEAR_VARIANTS) // VLINEAR_CHUNK_SIZE >= 32
 
 
+def test_vlinear_is_fitted_at_the_chunk_size_extrapolate_predicts():
+    """The V-law is only usable at the chunk size it was fitted under.
+
+    The first ladder was fitted at chunk_size=781 (derived from the smallest V)
+    while `extrapolate` targets PROD_CHUNK_SIZE=25_000. Because phase-1 cost at
+    S=250 is dominated by per-CHUNK overhead rather than per-variant work, that
+    slope was a per-chunk artifact: it predicted 740.5s at V=5_600_000 where
+    62.9s was measured (11.8x high), which became a 2820% hold-out error.
+    """
+    assert VLINEAR_CHUNK_SIZE == PROD_CHUNK_SIZE
+    plans = _build()
+    for pt in plans["vlinear"]:
+        assert pt.chunk_size == PROD_CHUNK_SIZE
+
+
+def test_vlinear_ladder_sits_in_the_many_chunk_regime():
+    """Every rung must be deep enough into chunk-count that per-chunk fixed cost
+    cannot dominate the fitted slope -- the failure that falsified the first
+    ladder, whose per-variant cost was still falling monotonically at its top
+    rung (3.04e-4 -> 1.61e-4 s/variant) and fell a further 14x by V=5.6e6."""
+    for v in VLINEAR_VARIANTS:
+        assert v // VLINEAR_CHUNK_SIZE >= 32, (
+            f"V={v:,} is only {v // VLINEAR_CHUNK_SIZE} chunks at "
+            f"chunk_size={VLINEAR_CHUNK_SIZE:,}"
+        )
+
+
+def test_vlinear_top_rung_bounds_the_extrapolation_stretch_to_1e9():
+    """`extrapolate`'s target is V=1e9, and the V-law's credibility is the ratio
+    of that to the largest V actually measured. The original ladder topped out
+    at 200_000 -- a 5000x stretch, which the model itself flagged. Keep the top
+    rung within a stretch the harness can defend."""
+    assert 1_000_000_000 / max(VLINEAR_VARIANTS) <= 200
+
+
+def test_vlinear_rungs_are_affordable_at_the_fixed_cohort_size():
+    """The ladder is only cheap because S is pinned small; the top rung is the
+    binding cost. Generation cost is linear in cells = S*V, and the largest
+    scale corpus in this harness is 1.4e9 cells, so no rung may exceed it."""
+    from scripts.bench_svar2.plans.build_plans import VLINEAR_SAMPLES
+
+    assert max(VLINEAR_VARIANTS) * VLINEAR_SAMPLES <= 1_400_000_000
+
+
 def test_chunk_size_for_matches_size_corpus_at_the_same_variant_count():
     """`_chunk_size_for` must be the same rule `size_corpus` applies, not a
     parallel implementation that can drift."""

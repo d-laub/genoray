@@ -38,10 +38,33 @@ PROD_CHUNK_SIZE = MAX_CHUNK_SIZE
 # the ONLY axis varying. S=250 rather than 1_000: it is already the smallest
 # point characterized elsewhere in the harness, and it is the cheapest to
 # generate across the ladder -- generation cost is linear in cells = S*V, so
-# even at the top of the V range that's 250 * 200_000 = 5e7 cells versus
-# 1_000 * 200_000 = 2e8 cells at S=1_000.
+# even at the top of the V range that's 250 * 5_600_000 = 1.4e9 cells versus
+# 1_000 * 5_600_000 = 5.6e9 cells at S=1_000.
+#
+# The V range is set in the ASYMPTOTIC regime, not the cheapest one. The first
+# ladder (25_000 .. 200_000 at chunk_size=781) was measured and FALSIFIED by
+# data already in the sweep, at the same S=250, so no cohort scaling was even
+# involved: per-variant phase-1 cost fell monotonically across every rung
+# (3.04e-4, 2.94e-4, 1.81e-4, 1.61e-4 s/variant) and reached 1.12e-5 at the
+# scale sweep's own S=250 point (V=5_600_000) -- still falling, i.e. the ladder
+# never left the fixed-cost-dominated regime. Fitting a LINE there and
+# stretching it to V=1e9 predicted 740.5s at V=5_600_000 where 62.9s was
+# measured: 11.8x high. Downstream that became a 2820% hold-out error and a
+# 4.0e9-second projection.
+#
+# The mechanism was per-CHUNK cost, not per-variant work: at chunk_size=781 the
+# V=200_000 rung is 257 chunks/32.1s, while the V=5_600_000 point at
+# chunk_size=25_000 is 224 chunks/62.9s -- near-identical chunk counts, 28x the
+# data, 2x the time. So the fitted "per-variant slope" was a per-chunk cost
+# divided by 781, then applied at a 32x larger chunk size.
+#
+# Starting at 800_000 is forced: it is the smallest V clearing _chunk_size_for's
+# >=MIN_CHUNKS floor at PROD_CHUNK_SIZE (32 * 25_000). The top rung also cuts
+# the V-law's extrapolation stretch to 1e9 from ~5000x to ~179x, and matches the
+# s250 corpus shape exactly, so it cross-checks against that independently
+# measured point.
 VLINEAR_SAMPLES = 250
-VLINEAR_VARIANTS = (25_000, 50_000, 100_000, 200_000)
+VLINEAR_VARIANTS = (800_000, 1_400_000, 2_800_000, 5_600_000)
 # RLIMIT_AS installed on the points whose PURPOSE is to find out whether
 # `from_vcf`'s hardcoded chunk_size survives biobank scale. Deliberately NOT on
 # every point (a deviation from the design spec's "each point runs under an
@@ -72,9 +95,29 @@ def _chunk_size_for(variants: int) -> int:
 # Fixed across the whole V-ladder so V is the only thing that varies --
 # re-deriving a chunk size per V (the way size_corpus does per S) would
 # confound wall time with chunk size instead of isolating variant count.
-# Sized off the SMALLEST V so every point in the ladder clears the
-# >=32-chunks floor (larger V only adds more chunks at this same size).
-VLINEAR_CHUNK_SIZE = _chunk_size_for(min(VLINEAR_VARIANTS))
+#
+# Pinned to PROD_CHUNK_SIZE, the regime `extrapolate` actually targets, NOT
+# sized off the smallest V. Deriving it from min(VLINEAR_VARIANTS) is what put
+# the whole ladder at chunk_size=781, 32x below the target, and since phase-1
+# cost at S=250 is dominated by per-chunk overhead rather than per-variant
+# work, the fitted slope was a per-chunk artifact that over-predicted by 11.8x
+# (see VLINEAR_VARIANTS). A V-law is only usable at the chunk size it was
+# fitted under, so the ladder must be fitted under the one being predicted.
+#
+# `_chunk_size_for(min(VLINEAR_VARIANTS))` now returns this same value anyway
+# (800_000 // 32 == 25_000 == MAX_CHUNK_SIZE), but stating PROD_CHUNK_SIZE
+# directly makes the requirement explicit rather than an arithmetic
+# coincidence that a future V change could silently break -- the assertion
+# below is what keeps the >=MIN_CHUNKS floor honest if it does.
+VLINEAR_CHUNK_SIZE = PROD_CHUNK_SIZE
+if min(VLINEAR_VARIANTS) < MIN_CHUNKS * VLINEAR_CHUNK_SIZE:
+    raise ValueError(
+        f"VLINEAR_VARIANTS starts at {min(VLINEAR_VARIANTS):,}, below the "
+        f"{MIN_CHUNKS * VLINEAR_CHUNK_SIZE:,} needed for >={MIN_CHUNKS} chunks at "
+        f"chunk_size={VLINEAR_CHUNK_SIZE:,}. Raise the smallest rung; lowering "
+        "the chunk size instead re-introduces the per-chunk-cost confound that "
+        "made the V-law over-predict by 11.8x."
+    )
 
 
 def _point(
