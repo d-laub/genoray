@@ -550,7 +550,7 @@ fn slice_genos_inner(
         regions,
         &query_regions,
         overlap,
-        |col_src, _s_orig, _p, qsw, qew| reader.vk_snp_overlap(col_src, qsw, qew),
+        |col_src, _s_orig, _p, qsw, qew| reader.vk_snp_index(col_src).overlap(qsw, qew),
         |i| snp_code_to_key(unpack_snp_key_at(vk_snp_keys, i)),
         |i| vk_snp_positions[i] + 1,
     );
@@ -568,7 +568,7 @@ fn slice_genos_inner(
         // bound — `sample` here must be the ORIGINAL column
         // (`vk_indel_max_del` is indexed by the source cohort, not the
         // subset), mirroring `find_ranges`'s `orig_s` usage.
-        |col_src, s_orig, p, qsw, qew| reader.vk_indel_overlap(col_src, s_orig, p, qsw, qew),
+        |_col_src, s_orig, p, qsw, qew| reader.vk_indel_index(s_orig, p).overlap(qsw, qew),
         |i| vk_indel_keys[i],
         |i| vk_indel_positions[i] + 1 + deletion_len(vk_indel_keys[i]),
     );

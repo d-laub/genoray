@@ -237,52 +237,97 @@ impl ContigReader {
     }
 }
 
+/// Region-independent per-column search state for one var_key channel.
+///
+/// Built ONCE per column, then queried per region. Hoisting this out of the old
+/// per-`(region, column)` `vk_*_overlap` methods is what turns `find_ranges`
+/// from O(regions x columns) tree builds into O(columns): the packed store is
+/// swept once instead of once per region.
+pub(crate) struct VkColumnIndex {
+    /// Absolute base offset of this column in the channel's packed arrays.
+    pub(crate) o0: usize,
+    /// `None` for an empty column — `SearchTree`/`overlap_range` are not
+    /// defined over an empty position array, matching the old early return.
+    inner: Option<(SearchTree, Vec<u32>)>,
+    max_del: u32,
+}
+
+impl VkColumnIndex {
+    /// Absolute `[start, end)` into the channel's packed positions/keys for one
+    /// region. Every element of the returned range truly overlaps
+    /// `[q_start, q_end)` — `overlap_range` does the left-overlap sub-scan.
+    pub(crate) fn overlap(&self, q_start: u32, q_end: u32) -> Range<usize> {
+        let Some((tree, v_ends)) = &self.inner else {
+            return self.o0..self.o0;
+        };
+        let (s, e) = overlap_range(tree, v_ends, self.max_del, q_start, q_end);
+        (self.o0 + s)..(self.o0 + e)
+    }
+}
+
 impl ContigReader {
-    /// Absolute `[start, end)` into `vk_snp`'s packed positions/keys for
-    /// `(col, region)` — the SNP channel's search half (`max_region_length =
-    /// 0`, since a SNP always spans exactly one base). No gather.
-    pub(crate) fn vk_snp_overlap(&self, col: usize, q_start: u32, q_end: u32) -> Range<usize> {
+    /// SNP-channel column index. SNP `v_end = pos + 1` and `max_region_length =
+    /// 0`, since a SNP spans exactly one base.
+    pub(crate) fn vk_snp_index(&self, col: usize) -> VkColumnIndex {
         let vk_range = self.vk_snp.column(col);
         let (o0, o1) = (vk_range.start, vk_range.end);
         let positions = &self.vk_snp.positions()[o0..o1];
         if positions.is_empty() {
-            return o0..o0;
+            return VkColumnIndex {
+                o0,
+                inner: None,
+                max_del: 0,
+            };
         }
         let v_ends: Vec<u32> = positions.iter().map(|&p| p + 1).collect();
-        let tree = SearchTree::new(positions);
-        let (s, e) = overlap_range(&tree, &v_ends, 0, q_start, q_end);
-        (o0 + s)..(o0 + e)
+        VkColumnIndex {
+            o0,
+            inner: Some((SearchTree::new(positions), v_ends)),
+            max_del: 0,
+        }
     }
 
-    /// Absolute `[start, end)` into `vk_indel`'s packed positions/keys for
-    /// `(col, region)` — the indel channel's search half (per-column
-    /// `max_del` bound). No gather.
-    pub(crate) fn vk_indel_overlap(
-        &self,
-        col: usize,
-        sample: usize,
-        p: usize,
-        q_start: u32,
-        q_end: u32,
-    ) -> Range<usize> {
+    /// Indel-channel column index for `(sample, p)`. `v_end = pos + 1 +
+    /// deletion_len(key)`; the search bound is this column's `max_del`.
+    pub(crate) fn vk_indel_index(&self, sample: usize, p: usize) -> VkColumnIndex {
+        let col = sample * self.ploidy + p;
         let vk_range = self.vk_indel.column(col);
         let (o0, o1) = (vk_range.start, vk_range.end);
         let positions = &self.vk_indel.positions()[o0..o1];
         if positions.is_empty() {
-            return o0..o0;
+            return VkColumnIndex {
+                o0,
+                inner: None,
+                max_del: 0,
+            };
         }
         let keys = &as_u32(&self.vk_indel.keys)[o0..o1];
-        let max_del = self.vk_indel_max_del[[sample, p]];
         let v_ends: Vec<u32> = positions
             .iter()
             .enumerate()
             .map(|(i, &pos)| pos + 1 + rvk::deletion_len(keys[i]))
             .collect();
-        let tree = SearchTree::new(positions);
-        let (s, e) = overlap_range(&tree, &v_ends, max_del, q_start, q_end);
-        (o0 + s)..(o0 + e)
+        VkColumnIndex {
+            o0,
+            inner: Some((SearchTree::new(positions), v_ends)),
+            max_del: self.vk_indel_max_del[[sample, p]],
+        }
     }
+}
 
+impl ContigReader {
+    /// The largest deletion span on this contig across both the per-hap indel
+    /// channel and the dense union. Callers packing max-end keys must check
+    /// `1 + max_deletion_len() < (1 << MAX_END_SHIFT)` before doing so — a
+    /// pathological >~2 Mb deletion footprint would otherwise silently corrupt
+    /// the packed key.
+    pub fn max_deletion_len(&self) -> u32 {
+        let vk = self.vk_indel_max_del.iter().copied().max().unwrap_or(0);
+        vk.max(self.dense_union().max_del())
+    }
+}
+
+impl ContigReader {
     /// Absolute `[s, e)` into `dense/snp`'s positions/keys for one region.
     /// SNP v_end = pos + 1 (max_region_length = 0). `(0, 0)` if no snp table.
     pub(crate) fn dense_snp_overlap(&self, q_start: u32, q_end: u32) -> Range<usize> {
