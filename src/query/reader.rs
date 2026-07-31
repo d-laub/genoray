@@ -267,8 +267,8 @@ impl VkColumnIndex {
     /// Absolute index of the highest-position variant overlapping the region,
     /// or `None` when the region is empty for this column. Positions are sorted
     /// within a column and the range is contiguous, so that is its last element.
-    /// Not yet called within this crate — exposed for a follow-up consumer.
-    #[allow(dead_code)]
+    /// Used by `find_ranges_haps`'s per-region max-end sweep, alongside the
+    /// `overlap` call it already makes for the range channel.
     pub(crate) fn last_overlapping(&self, q_start: u32, q_end: u32) -> Option<usize> {
         let r = self.overlap(q_start, q_end);
         (r.end > r.start).then(|| r.end - 1)
@@ -322,6 +322,18 @@ impl ContigReader {
             inner: Some((SearchTree::new(positions), v_ends)),
             max_del: self.vk_indel_max_del[[sample, p]],
         }
+    }
+}
+
+impl ContigReader {
+    /// The largest deletion span on this contig across both the per-hap indel
+    /// channel and the dense union. Callers packing max-end keys must check
+    /// `1 + max_deletion_len() < (1 << MAX_END_SHIFT)` before doing so — a
+    /// pathological >~2 Mb deletion footprint would otherwise silently corrupt
+    /// the packed key.
+    pub fn max_deletion_len(&self) -> u32 {
+        let vk = self.vk_indel_max_del.iter().copied().max().unwrap_or(0);
+        vk.max(self.dense_union().max_del())
     }
 }
 

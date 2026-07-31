@@ -5,7 +5,10 @@ mod common;
 
 use common::{SynthRecord, build_contig};
 use genoray_core::py_query::PyContigReader;
-use genoray_core::query::{ContigReader, find_ranges, gather_ranges, overlap_batch, read_ranges};
+use genoray_core::query::{
+    ContigReader, MAX_END_SHIFT, dense_max_end_keys, find_ranges, find_ranges_haps, gather_ranges,
+    overlap_batch, read_ranges,
+};
 use genoray_core::search;
 use numpy::{PyArray1, PyArray2, PyArrayMethods};
 use pyo3::prelude::*;
@@ -344,4 +347,98 @@ fn test_py_gather_of_find_matches_read_dict() {
         let d_read = pr.read_ranges(py, regions.clone(), None).unwrap();
         assert_payload_dicts_eq(&d_gather, &d_read);
     });
+}
+
+fn unpack_end(key: u64) -> u32 {
+    ((key >> MAX_END_SHIFT) + (key & ((1 << MAX_END_SHIFT) - 1))) as u32
+}
+
+/// The per-region max end must be the end of the HIGHEST-POSITION overlapping
+/// variant (ties broken by the larger end), not the largest end overall — this
+/// is the SVAR1-parity rule GenVarLoader's `_svar2_region_max_ends` implements.
+#[test]
+fn test_max_end_keys_pick_highest_position_variant() {
+    let tmp = tempdir().unwrap();
+    let out = tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let reader = synth_reader(&out);
+
+    // Region covering all three variants; the DEL at 300 is highest-position.
+    let regions = vec![(0u32, 1_000u32)];
+    let sample_cols: Vec<usize> = (0..2).collect();
+    let h = 2 * reader.ploidy();
+    let mut snp = vec![0i64; h * 2];
+    let mut indel = vec![0i64; h * 2];
+    let vk_keys = find_ranges_haps(&reader, &regions, &sample_cols, 0, h, &mut snp, &mut indel);
+
+    // `dense_union`/`DenseUnion::overlap` are pub(crate); this integration
+    // test crate is external to `genoray_core`, so the per-region dense range
+    // is obtained via `find_ranges`'s public `dense_range` field instead —
+    // it's computed the same way (`reader.dense_union().overlap(qs, qe)`),
+    // independent of the sample subset.
+    let dense_range = find_ranges(&reader, &regions, None).dense_range;
+    let dense_keys = dense_max_end_keys(&reader, &regions, &dense_range, &sample_cols, true);
+
+    let key = vk_keys[0].max(dense_keys[0]);
+    assert_ne!(key, 0, "region has variants, so the key must be non-zero");
+    assert_eq!(
+        unpack_end(key),
+        302,
+        "DEL@300 with deletion_len 1 ends at 302"
+    );
+}
+
+/// A region containing only the SNP must report that SNP's end, and an empty
+/// region must report the 0 sentinel so the caller keeps its original chromEnd.
+#[test]
+fn test_max_end_keys_snp_only_and_empty_region() {
+    let tmp = tempdir().unwrap();
+    let out = tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let reader = synth_reader(&out);
+
+    let regions = vec![(90u32, 110u32), (900u32, 950u32)];
+    let sample_cols: Vec<usize> = (0..2).collect();
+    let h = 2 * reader.ploidy();
+    let mut snp = vec![0i64; h * regions.len() * 2];
+    let mut indel = vec![0i64; h * regions.len() * 2];
+    let vk_keys = find_ranges_haps(&reader, &regions, &sample_cols, 0, h, &mut snp, &mut indel);
+
+    let dense_range = find_ranges(&reader, &regions, None).dense_range;
+    let dense_keys = dense_max_end_keys(&reader, &regions, &dense_range, &sample_cols, true);
+
+    let k0 = vk_keys[0].max(dense_keys[0]);
+    assert_eq!(unpack_end(k0), 101, "SNP@100 ends at 101");
+    assert_eq!(
+        vk_keys[1].max(dense_keys[1]),
+        0,
+        "no variants in [900, 950)"
+    );
+}
+
+/// Splitting the hap axis must not change the reduced result — the writer
+/// reduces per-chunk keys with an elementwise max.
+#[test]
+fn test_max_end_keys_reduce_across_hap_slices() {
+    let tmp = tempdir().unwrap();
+    let out = tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let reader = synth_reader(&out);
+
+    let regions = vec![(0u32, 1_000u32)];
+    let sample_cols: Vec<usize> = (0..2).collect();
+    let h = 2 * reader.ploidy();
+
+    let mut snp = vec![0i64; h * 2];
+    let mut indel = vec![0i64; h * 2];
+    let whole = find_ranges_haps(&reader, &regions, &sample_cols, 0, h, &mut snp, &mut indel);
+
+    let mut reduced = vec![0u64; 1];
+    for lo in (0..h).step_by(1) {
+        let mut s = vec![0i64; 2];
+        let mut i = vec![0i64; 2];
+        let part = find_ranges_haps(&reader, &regions, &sample_cols, lo, lo + 1, &mut s, &mut i);
+        reduced[0] = reduced[0].max(part[0]);
+    }
+    assert_eq!(whole, reduced);
 }

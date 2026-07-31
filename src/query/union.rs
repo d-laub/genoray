@@ -5,6 +5,7 @@
 use std::ops::Range;
 
 use crate::dense::DenseClass;
+use crate::query::gather::MAX_END_SHIFT;
 use crate::rvk;
 use crate::search::{SearchTree, overlap_range};
 use crate::spine::KeyRef;
@@ -35,6 +36,11 @@ impl DenseUnion {
         let tree = SearchTree::new(&self.positions);
         let (s, e) = overlap_range(&tree, &self.v_ends, self.max_del, q_start, q_end);
         s..e
+    }
+
+    /// The per-contig dense deletion bound, for the caller's overflow preflight.
+    pub(crate) fn max_del(&self) -> u32 {
+        self.max_del
     }
 }
 
@@ -85,4 +91,69 @@ impl ContigReader {
             max_del: self.dense_indel_max_del,
         }
     }
+}
+
+/// Per-region max `(pos << MAX_END_SHIFT) | ext` over the DENSE channel,
+/// restricted to variants carried by at least one selected hap. `0` when the
+/// region has no such variant.
+///
+/// The dense genotype matrix is hap-major (`hap * n_dense_variants + col`), so a
+/// "is this variant carried by anyone selected?" probe is strided across haps.
+/// Two things keep that cheap:
+///
+/// * The walk runs BACKWARD from the end of the region's dense window and stops
+///   once it drops below the position of the first carried variant it found.
+///   Dense variants are common by construction, so this almost always terminates
+///   on the first index.
+/// * `all_samples` skips the carriage probe entirely: every dense variant in the
+///   store has at least one carrier among all samples, so the last truly
+///   overlapping variant is the answer. This is the path `gvl.write` takes.
+///
+/// The whole tied run at the winning position is scanned rather than stopping at
+/// the first hit: within a class the table's order is not by `ext`, so a later
+/// same-position variant can carry a longer deletion.
+pub fn dense_max_end_keys(
+    reader: &ContigReader,
+    regions: &[(u32, u32)],
+    dense_range: &[Range<usize>],
+    sample_cols: &[usize],
+    all_samples: bool,
+) -> Vec<u64> {
+    let ploidy = reader.ploidy;
+    let dense = reader.dense_union();
+    let mut out = vec![0u64; regions.len()];
+
+    for (ri, &(qs, _)) in regions.iter().enumerate() {
+        let (ds, de) = (dense_range[ri].start, dense_range[ri].end);
+        let mut best = 0u64;
+        let mut best_pos: Option<u32> = None;
+        let mut j = de;
+        while j > ds {
+            j -= 1;
+            let pos = dense.refs[j].position;
+            if let Some(bp) = best_pos
+                && pos < bp
+            {
+                break; // every remaining index has a lower position
+            }
+            if dense.v_ends[j] <= qs {
+                continue; // no true left-overlap
+            }
+            let carried = all_samples || {
+                let (class, dcol) = dense.src[j];
+                let view = reader.dense_view(class).expect("dense src implies table");
+                sample_cols
+                    .iter()
+                    .any(|&s| (0..ploidy).any(|p| view.carried(s * ploidy + p, dcol)))
+            };
+            if !carried {
+                continue;
+            }
+            let ext = (dense.v_ends[j] - pos) as u64;
+            best = best.max(((pos as u64) << MAX_END_SHIFT) | ext);
+            best_pos = Some(pos);
+        }
+        out[ri] = best;
+    }
+    out
 }

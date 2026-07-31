@@ -338,7 +338,16 @@ pub struct RangesBundle {
 /// keeps `search::search_tree_build_count` (a thread-local) observable in tests.
 pub const PAR_COLUMN_THRESHOLD: usize = 64;
 
-/// Fill hap-major `[hap_lo, hap_hi)` slices of the two var_key range channels.
+/// Bit width reserved for `ext` in the packed max-end key `(pos << SHIFT) | ext`,
+/// where `ext = 1 + deletion_len` so that `end = pos + ext`. Packing the small,
+/// bounded `ext` (rather than the absolute end) makes an integer max over the
+/// key order by position first and end second — the SVAR1 tie-break rule. Fixed
+/// by GenVarLoader's existing `_svar2_region_max_ends`; do not change.
+pub const MAX_END_SHIFT: u32 = 21;
+
+/// Fill hap-major `[hap_lo, hap_hi)` slices of the two var_key range channels,
+/// and return the per-region max `(pos << MAX_END_SHIFT) | ext` composite key
+/// over this hap slice (`0` when a region has no variant).
 ///
 /// `out_snp` / `out_indel` are `(hap_hi - hap_lo, R, 2)` row-major `i64` — one
 /// contiguous `R * 2` run per hap, which is exactly what lets rayon hand each
@@ -347,7 +356,10 @@ pub const PAR_COLUMN_THRESHOLD: usize = 64;
 /// sample-major-then-ploid order `find_ranges` has always produced.
 ///
 /// Column-outer / region-inner, so each column's `VkColumnIndex` is built
-/// exactly once.
+/// exactly once. The max-end key rides along in the same sweep: `VkColumnIndex`
+/// keeps positions sorted within a column with a contiguous overlap range, so
+/// the last element of each channel's range is the highest-position overlapping
+/// variant for that channel — no extra decode needed.
 pub fn find_ranges_haps(
     reader: &ContigReader,
     regions: &[(u32, u32)],
@@ -356,7 +368,7 @@ pub fn find_ranges_haps(
     hap_hi: usize,
     out_snp: &mut [i64],
     out_indel: &mut [i64],
-) {
+) -> Vec<u64> {
     let ploidy = reader.ploidy;
     let r = regions.len();
     let n_haps = hap_hi - hap_lo;
@@ -371,15 +383,18 @@ pub fn find_ranges_haps(
         "out_indel must be (n_haps, R, 2)"
     );
     if n_haps == 0 || r == 0 {
-        return;
+        return vec![0u64; r];
     }
 
-    let fill = |h_off: usize, snp_row: &mut [i64], indel_row: &mut [i64]| {
+    let fill = |h_off: usize, snp_row: &mut [i64], indel_row: &mut [i64], acc: &mut [u64]| {
         let h = hap_lo + h_off;
         let s = sample_cols[h / ploidy];
         let p = h % ploidy;
         let snp_ix = reader.vk_snp_index(s * ploidy + p);
         let indel_ix = reader.vk_indel_index(s, p);
+        let snp_pos = reader.vk_snp.positions();
+        let indel_pos = reader.vk_indel.positions();
+        let indel_keys = as_u32(&reader.vk_indel.keys);
         for (ri, &(qs, qe)) in regions.iter().enumerate() {
             let a = snp_ix.overlap(qs, qe);
             snp_row[ri * 2] = a.start as i64;
@@ -387,23 +402,54 @@ pub fn find_ranges_haps(
             let b = indel_ix.overlap(qs, qe);
             indel_row[ri * 2] = b.start as i64;
             indel_row[ri * 2 + 1] = b.end as i64;
+
+            // Positions are sorted within a column and the range is contiguous,
+            // so the last element is the highest-position overlapping variant.
+            let mut k = 0u64;
+            if let Some(i) = snp_ix.last_overlapping(qs, qe) {
+                let pos = snp_pos[i] as u64;
+                k = k.max((pos << MAX_END_SHIFT) | 1); // SNP/INS: ext = 1
+            }
+            if let Some(i) = indel_ix.last_overlapping(qs, qe) {
+                let pos = indel_pos[i] as u64;
+                let ext = 1 + rvk::deletion_len(indel_keys[i]) as u64;
+                k = k.max((pos << MAX_END_SHIFT) | ext);
+            }
+            acc[ri] = acc[ri].max(k);
         }
     };
 
     if n_haps < PAR_COLUMN_THRESHOLD {
+        let mut acc = vec![0u64; r];
         for (h_off, (snp_row, indel_row)) in out_snp
             .chunks_mut(r * 2)
             .zip(out_indel.chunks_mut(r * 2))
             .enumerate()
         {
-            fill(h_off, snp_row, indel_row);
+            fill(h_off, snp_row, indel_row, &mut acc);
         }
+        acc
     } else {
         out_snp
             .par_chunks_mut(r * 2)
             .zip(out_indel.par_chunks_mut(r * 2))
             .enumerate()
-            .for_each(|(h_off, (snp_row, indel_row))| fill(h_off, snp_row, indel_row));
+            .fold(
+                || vec![0u64; r],
+                |mut acc, (h_off, (snp_row, indel_row))| {
+                    fill(h_off, snp_row, indel_row, &mut acc);
+                    acc
+                },
+            )
+            .reduce(
+                || vec![0u64; r],
+                |mut a, b| {
+                    for i in 0..r {
+                        a[i] = a[i].max(b[i]);
+                    }
+                    a
+                },
+            )
     }
 }
 
@@ -450,7 +496,11 @@ pub fn find_ranges(
     // bundle at all.
     let mut snp_flat = vec![0i64; h * n_regions * 2];
     let mut indel_flat = vec![0i64; h * n_regions * 2];
-    find_ranges_haps(
+    // `find_ranges` (the tree-driven `RangesBundle` path) has no use yet for
+    // the per-region max-end keys `find_ranges_haps` now also computes;
+    // `dense_max_end_keys`'s caller combines them with this hap-major sweep's
+    // keys separately (see the writer's per-chunk reduction).
+    let _ = find_ranges_haps(
         reader,
         regions,
         &sample_cols,
