@@ -212,6 +212,42 @@ fn test_py_read_ranges_dict_matches_overlap_batch_dict() {
     });
 }
 
+/// `find_ranges` must build a bounded number of search trees regardless of how
+/// many regions are queried. Before the column-outer rewrite this was
+/// O(regions x columns): each `vk_*_overlap` call rebuilt the column's tree.
+///
+/// The fixture is deliberately small (2 samples x 2 ploidy = 4 columns, well
+/// under `PAR_COLUMN_THRESHOLD`) so the serial path runs on this thread and
+/// `search::search_tree_build_count` — a thread-local — stays observable.
+#[test]
+fn test_find_ranges_tree_builds_do_not_scale_with_regions() {
+    let tmp = tempdir().unwrap();
+    let out = tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let reader = synth_reader(&out);
+
+    let one = vec![(0u32, 1_000_000u32)];
+    let many: Vec<(u32, u32)> = (0..16).map(|i| (i * 20, i * 20 + 1_000_000)).collect();
+
+    let b0 = search::search_tree_build_count();
+    let _ = find_ranges(&reader, &one, None);
+    let cost_one = search::search_tree_build_count() - b0;
+
+    let b1 = search::search_tree_build_count();
+    let _ = find_ranges(&reader, &many, None);
+    let cost_many = search::search_tree_build_count() - b1;
+
+    // Per-region dense-union/dense-snp/dense-indel trees are still built once
+    // per region (3 per region, cheap and cohort-shared). The var_key channels
+    // — the R*H term that made this O(regions x total_variants) — must not grow.
+    let dense_growth = 3 * (many.len() - one.len());
+    assert!(
+        cost_many <= cost_one + dense_growth,
+        "tree builds grew with region count: {cost_one} -> {cost_many} \
+         (allowed growth {dense_growth})"
+    );
+}
+
 #[test]
 fn test_py_gather_of_find_matches_read_dict() {
     let tmp = tempdir().unwrap();

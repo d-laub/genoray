@@ -6,6 +6,8 @@
 
 use std::ops::Range;
 
+use rayon::prelude::*;
+
 use crate::bits;
 use crate::rvk;
 use crate::spine::{self, KeyRef, SrcKeyRef, VkElem};
@@ -331,6 +333,80 @@ pub struct RangesBundle {
     pub dense_indel_range: Vec<Range<usize>>,
 }
 
+/// Below this many columns the serial path runs instead of rayon's: fork/join
+/// overhead dominates for small batches, and staying on the caller's thread
+/// keeps `search::search_tree_build_count` (a thread-local) observable in tests.
+pub const PAR_COLUMN_THRESHOLD: usize = 64;
+
+/// Fill hap-major `[hap_lo, hap_hi)` slices of the two var_key range channels.
+///
+/// `out_snp` / `out_indel` are `(hap_hi - hap_lo, R, 2)` row-major `i64` — one
+/// contiguous `R * 2` run per hap, which is exactly what lets rayon hand each
+/// column a disjoint `par_chunks_mut` slice. The hap axis indexes the SELECTED
+/// samples: hap `h` is `(sample_cols[h / ploidy], h % ploidy)`, matching the
+/// sample-major-then-ploid order `find_ranges` has always produced.
+///
+/// Column-outer / region-inner, so each column's `VkColumnIndex` is built
+/// exactly once.
+pub fn find_ranges_haps(
+    reader: &ContigReader,
+    regions: &[(u32, u32)],
+    sample_cols: &[usize],
+    hap_lo: usize,
+    hap_hi: usize,
+    out_snp: &mut [i64],
+    out_indel: &mut [i64],
+) {
+    let ploidy = reader.ploidy;
+    let r = regions.len();
+    let n_haps = hap_hi - hap_lo;
+    assert_eq!(
+        out_snp.len(),
+        n_haps * r * 2,
+        "out_snp must be (n_haps, R, 2)"
+    );
+    assert_eq!(
+        out_indel.len(),
+        n_haps * r * 2,
+        "out_indel must be (n_haps, R, 2)"
+    );
+    if n_haps == 0 || r == 0 {
+        return;
+    }
+
+    let fill = |h_off: usize, snp_row: &mut [i64], indel_row: &mut [i64]| {
+        let h = hap_lo + h_off;
+        let s = sample_cols[h / ploidy];
+        let p = h % ploidy;
+        let snp_ix = reader.vk_snp_index(s * ploidy + p);
+        let indel_ix = reader.vk_indel_index(s, p);
+        for (ri, &(qs, qe)) in regions.iter().enumerate() {
+            let a = snp_ix.overlap(qs, qe);
+            snp_row[ri * 2] = a.start as i64;
+            snp_row[ri * 2 + 1] = a.end as i64;
+            let b = indel_ix.overlap(qs, qe);
+            indel_row[ri * 2] = b.start as i64;
+            indel_row[ri * 2 + 1] = b.end as i64;
+        }
+    };
+
+    if n_haps < PAR_COLUMN_THRESHOLD {
+        for (h_off, (snp_row, indel_row)) in out_snp
+            .chunks_mut(r * 2)
+            .zip(out_indel.chunks_mut(r * 2))
+            .enumerate()
+        {
+            fill(h_off, snp_row, indel_row);
+        }
+    } else {
+        out_snp
+            .par_chunks_mut(r * 2)
+            .zip(out_indel.par_chunks_mut(r * 2))
+            .enumerate()
+            .for_each(|(h_off, (snp_row, indel_row))| fill(h_off, snp_row, indel_row));
+    }
+}
+
 /// Search-only pass: run every `SearchTree::new` up front and record the
 /// resulting index ranges. `find_ranges` owns ALL tree builds for the batch
 /// query (region-level dense union overlap + per-hap var_key overlap);
@@ -366,15 +442,31 @@ pub fn find_ranges(
         .map(|&(qs, qe)| reader.dense_indel_overlap(qs, qe))
         .collect();
 
+    // `find_ranges_haps` fills hap-major because that is the layout rayon can
+    // split into disjoint slices. `RangesBundle` is region-major and is replayed
+    // by `gather_ranges` unchanged, so transpose here. This costs one extra copy
+    // of the payload; `find_ranges` is the small-batch read-path entry point,
+    // while the population-scale writer uses the chunked API and never builds a
+    // bundle at all.
+    let mut snp_flat = vec![0i64; h * n_regions * 2];
+    let mut indel_flat = vec![0i64; h * n_regions * 2];
+    find_ranges_haps(
+        reader,
+        regions,
+        &sample_cols,
+        0,
+        h,
+        &mut snp_flat,
+        &mut indel_flat,
+    );
+
     let mut vk_snp_range: Vec<Range<usize>> = Vec::with_capacity(n_regions * h);
     let mut vk_indel_range: Vec<Range<usize>> = Vec::with_capacity(n_regions * h);
-    for &(qs, qe) in regions {
-        for &orig_s in &sample_cols {
-            for p in 0..ploidy {
-                let col = orig_s * ploidy + p;
-                vk_snp_range.push(reader.vk_snp_overlap(col, qs, qe));
-                vk_indel_range.push(reader.vk_indel_overlap(col, orig_s, p, qs, qe));
-            }
+    for ri in 0..n_regions {
+        for hh in 0..h {
+            let k = (hh * n_regions + ri) * 2;
+            vk_snp_range.push(snp_flat[k] as usize..snp_flat[k + 1] as usize);
+            vk_indel_range.push(indel_flat[k] as usize..indel_flat[k + 1] as usize);
         }
     }
 
