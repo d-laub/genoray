@@ -263,16 +263,6 @@ impl VkColumnIndex {
         let (s, e) = overlap_range(tree, v_ends, self.max_del, q_start, q_end);
         (self.o0 + s)..(self.o0 + e)
     }
-
-    /// Absolute index of the highest-position variant overlapping the region,
-    /// or `None` when the region is empty for this column. Positions are sorted
-    /// within a column and the range is contiguous, so that is its last element.
-    /// Used by `find_ranges_haps`'s per-region max-end sweep, alongside the
-    /// `overlap` call it already makes for the range channel.
-    pub(crate) fn last_overlapping(&self, q_start: u32, q_end: u32) -> Option<usize> {
-        let r = self.overlap(q_start, q_end);
-        (r.end > r.start).then(|| r.end - 1)
-    }
 }
 
 impl ContigReader {

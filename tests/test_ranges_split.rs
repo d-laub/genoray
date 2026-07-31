@@ -6,8 +6,8 @@ mod common;
 use common::{SynthRecord, build_contig};
 use genoray_core::py_query::PyContigReader;
 use genoray_core::query::{
-    ContigReader, MAX_END_SHIFT, dense_max_end_keys, find_ranges, find_ranges_haps, gather_ranges,
-    overlap_batch, read_ranges,
+    ContigReader, MAX_END_SHIFT, PAR_COLUMN_THRESHOLD, dense_max_end_keys, find_ranges,
+    find_ranges_haps, gather_ranges, overlap_batch, read_ranges,
 };
 use genoray_core::search;
 use numpy::{PyArray1, PyArray2, PyArrayMethods};
@@ -142,6 +142,144 @@ fn synth_reader_wide(out: &std::path::Path) -> ContigReader {
     ];
     build_contig(out, "chr1", &samples, 2, &records);
     ContigReader::open(out.to_str().unwrap(), "chr1", 2, 2).unwrap()
+}
+
+/// Built specifically to distinguish the SVAR1 tie-break rule (max by
+/// POSITION first, end second) from a buggy "max by absolute end" rule that
+/// `test_max_end_keys_pick_highest_position_variant` cannot catch — on
+/// `synth_reader`, position and end rise together across all three variants
+/// (100/101, 200/201, 300/302), so both rules agree there.
+///
+/// Here a DEL@200 with a long deletion (ext = 1 + 150 = 151, end = 351) sits
+/// at a LOWER position than a SNP@300 (ext = 1, end = 301) whose own end is
+/// smaller. The correct packed-key ordering `(pos << SHIFT) | ext` picks the
+/// SNP (higher position) — unpacked end 301; a "max by absolute end" bug
+/// would instead return 351 (the DEL's larger end, at a lower position).
+///
+/// The DEL's ref allele is 151 'A's with the LAST byte forced to 'T'
+/// (`del_ref[150] = b'T'`), not a pure homopolymer: `normalize::left_align`
+/// rolls a deletion left while `ref_seq[pos] == ref_seq[pos + ndel]`, and a
+/// pure 151 x 'A' run trivially satisfies that against itself (position 350,
+/// the deleted span's last base, is also 'A'), silently shifting the variant
+/// to pos 199 instead of the intended 200. Breaking the last byte makes
+/// `ref_seq[200] != ref_seq[350]`, so the deletion stays put. (Found by this
+/// test failing with an off-by-one before the fix — see the fix commit.)
+///
+/// Each variant is single-carrier (`x_calls = 1`), so per `cost_model`'s
+/// `np = n_samples * ploidy = 4`: indel dense_bits = 68 > var_key_bits = 64,
+/// SNP dense_bits = 38 > var_key_bits = 34 — both stay `VarKey`, so this
+/// fixture only exercises `find_ranges_haps`, like `synth_reader`.
+///
+/// Used ONLY by the tie-break test below — do not extend `synth_reader`
+/// itself for this purpose.
+fn synth_reader_tiebreak(out: &std::path::Path) -> ContigReader {
+    let samples = ["S0", "S1"];
+    let mut del_ref = vec![b'A'; 151];
+    del_ref[150] = b'T'; // break the homopolymer so left-align doesn't roll it
+    let records = vec![
+        SynthRecord {
+            pos: 200,
+            ref_allele: &del_ref,
+            alts: vec![&b"A"[..]],
+            gt: vec![1, 0, 0, 0],
+        },
+        SynthRecord {
+            pos: 300,
+            ref_allele: b"A",
+            alts: vec![&b"C"[..]],
+            gt: vec![0, 1, 0, 0],
+        },
+    ];
+    build_contig(out, "chr1", &samples, 2, &records);
+    ContigReader::open(out.to_str().unwrap(), "chr1", 2, 2).unwrap()
+}
+
+/// Two indel variants at the SAME position (200), both routed to `Dense`
+/// (`x_calls = 2` each, `np = 4`: indel dense_bits = 68 < var_key_bits = 128),
+/// with different deletion lengths — for exercising
+/// `dense_max_end_keys`'s claim that it scans the WHOLE tied run at a winning
+/// position rather than stopping at the first carried hit.
+///
+/// File order (and therefore dense-table column order: `rvk`'s per-chunk
+/// classify loop pushes dense variants in encounter order, and
+/// `DenseUnion`'s position sort is stable, so same-position ties keep that
+/// order) is: the LONGER deletion (ref "ATCG" -> alt "A", deletion_len 3,
+/// ext 4, end 204) FIRST, then the SHORTER one (ref "AT" -> alt "A",
+/// deletion_len 1, ext 2, end 202) SECOND. `dense_max_end_keys`'s backward
+/// walk visits the HIGHER table index first, i.e. the shorter/later one —
+/// so a scan that stopped at that first hit would report 202 instead of the
+/// correct 204.
+///
+/// Deliberately NOT a homopolymer run (unlike a first draft of this fixture,
+/// which used all-'A' refs): `normalize::left_align` rolls a deletion left
+/// while `ref_seq[pos] == ref_seq[pos + ndel]`, which a homopolymer run
+/// trivially satisfies against its own last base, silently shifting both
+/// variants' positions by 1 (see `synth_reader_tiebreak`'s doc comment for
+/// the same gotcha). "ATCG" and "AT" both start with 'A' but each ends on a
+/// distinct base different from the anchor, so neither rolls. Both records
+/// still agree on the reference at every position they share ("AT" is a
+/// prefix of "ATCG"), so `build_fasta_with_index`'s last-record-wins
+/// stamping never conflicts.
+fn synth_reader_dense_tie(out: &std::path::Path) -> ContigReader {
+    let samples = ["S0", "S1"];
+    let records = vec![
+        SynthRecord {
+            pos: 200,
+            ref_allele: b"ATCG",
+            alts: vec![&b"A"[..]],
+            gt: vec![1, 1, 0, 0],
+        },
+        SynthRecord {
+            pos: 200,
+            ref_allele: b"AT",
+            alts: vec![&b"A"[..]],
+            gt: vec![0, 0, 1, 1],
+        },
+    ];
+    build_contig(out, "chr1", &samples, 2, &records);
+    ContigReader::open(out.to_str().unwrap(), "chr1", 2, 2).unwrap()
+}
+
+/// `n_samples` samples at `ploidy` (flat gt layout `[s0_p0, s0_p1, ...]`),
+/// carrying three variants scattered across the hap axis (first hap, an
+/// interior hap, last hap) so per-hap max-end keys actually vary. Built for
+/// `test_max_end_keys_parallel_matches_serial_reduction`, which needs
+/// `n_samples * ploidy >= PAR_COLUMN_THRESHOLD` to force
+/// `find_ranges_haps`'s rayon `fold`/`reduce` branch.
+fn synth_reader_many_haps(out: &std::path::Path, n_samples: usize, ploidy: usize) -> ContigReader {
+    let sample_names: Vec<String> = (0..n_samples).map(|i| format!("S{i}")).collect();
+    let samples: Vec<&str> = sample_names.iter().map(String::as_str).collect();
+    let h = n_samples * ploidy;
+
+    let mut gt_snp = vec![0i32; h];
+    gt_snp[0] = 1; // hap 0
+    let mut gt_ins = vec![0i32; h];
+    gt_ins[h / 2] = 1; // an interior hap
+    let mut gt_del = vec![0i32; h];
+    gt_del[h - 1] = 1; // last hap
+
+    let records = vec![
+        SynthRecord {
+            pos: 100,
+            ref_allele: b"A",
+            alts: vec![&b"C"[..]],
+            gt: gt_snp,
+        },
+        SynthRecord {
+            pos: 200,
+            ref_allele: b"A",
+            alts: vec![&b"AT"[..]],
+            gt: gt_ins,
+        },
+        SynthRecord {
+            pos: 300,
+            ref_allele: b"AT",
+            alts: vec![&b"A"[..]],
+            gt: gt_del,
+        },
+    ];
+    build_contig(out, "chr1", &samples, ploidy, &records);
+    ContigReader::open(out.to_str().unwrap(), "chr1", n_samples, ploidy).unwrap()
 }
 
 #[test]
@@ -441,4 +579,104 @@ fn test_max_end_keys_reduce_across_hap_slices() {
         reduced[0] = reduced[0].max(part[0]);
     }
     assert_eq!(whole, reduced);
+}
+
+/// The per-region max end must order by POSITION first, end second — not by
+/// absolute end. `synth_reader_tiebreak`'s DEL@200 has a larger end (351)
+/// than its SNP@300 (301), but the SNP is at the higher position, so it must
+/// win. A "max by absolute end" bug would report 351 here; this fixture (see
+/// its doc comment) is specifically built so that bug and the correct rule
+/// disagree, unlike `test_max_end_keys_pick_highest_position_variant`'s
+/// `synth_reader`, where they happen to coincide.
+#[test]
+fn test_max_end_keys_position_beats_larger_end_at_lower_position() {
+    let tmp = tempdir().unwrap();
+    let out = tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let reader = synth_reader_tiebreak(&out);
+
+    let regions = vec![(0u32, 1_000u32)];
+    let sample_cols: Vec<usize> = (0..2).collect();
+    let h = 2 * reader.ploidy();
+    let mut snp = vec![0i64; h * 2];
+    let mut indel = vec![0i64; h * 2];
+    let vk_keys = find_ranges_haps(&reader, &regions, &sample_cols, 0, h, &mut snp, &mut indel);
+
+    let dense_range = find_ranges(&reader, &regions, None).dense_range;
+    let dense_keys = dense_max_end_keys(&reader, &regions, &dense_range, &sample_cols, true);
+
+    let key = vk_keys[0].max(dense_keys[0]);
+    assert_eq!(
+        unpack_end(key),
+        301,
+        "SNP@300 (higher position) must win over DEL@200's larger end (351)"
+    );
+}
+
+/// `dense_max_end_keys` must scan the WHOLE tied run at a winning position,
+/// not stop at the first carried hit it finds — see `synth_reader_dense_tie`'s
+/// doc comment for the exact table-order argument. A scan that stopped early
+/// would report 202 (the shorter deletion, hit first by the backward walk);
+/// the correct answer is 204 (the longer one, filed earlier in the table but
+/// visited second).
+#[test]
+fn test_dense_max_end_keys_scans_full_tied_run() {
+    let tmp = tempdir().unwrap();
+    let out = tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let reader = synth_reader_dense_tie(&out);
+
+    let regions = vec![(0u32, 1_000u32)];
+    let sample_cols: Vec<usize> = (0..2).collect();
+    let dense_range = find_ranges(&reader, &regions, None).dense_range;
+    let dense_keys = dense_max_end_keys(&reader, &regions, &dense_range, &sample_cols, true);
+
+    assert_eq!(
+        unpack_end(dense_keys[0]),
+        204,
+        "must pick the longer deletion (ext=4, end=204), not the shorter tied \
+         one (ext=2, end=202) the backward walk hits first"
+    );
+}
+
+/// The rayon `fold`/`reduce` accumulation of per-region max-end keys (taken
+/// when `n_haps >= PAR_COLUMN_THRESHOLD`) must agree with the serial
+/// single-hap-slice reduction the smaller fixtures above exercise. 32 samples
+/// x ploidy 2 = 64 haps forces the parallel branch for the whole-slice call;
+/// each single-hap call (`hap_hi = hap_lo + 1`) has `n_haps = 1`, well under
+/// the threshold, so it takes the serial path — this compares the two
+/// branches directly instead of trusting the fold/reduce closures by
+/// inspection.
+#[test]
+fn test_max_end_keys_parallel_matches_serial_reduction() {
+    let tmp = tempdir().unwrap();
+    let out = tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let n_samples = 32;
+    let ploidy = 2;
+    let reader = synth_reader_many_haps(&out, n_samples, ploidy);
+
+    let regions = vec![(0u32, 1_000u32)];
+    let sample_cols: Vec<usize> = (0..n_samples).collect();
+    let h = n_samples * ploidy;
+    assert!(
+        h >= PAR_COLUMN_THRESHOLD,
+        "fixture must exercise the parallel branch"
+    );
+
+    let mut snp = vec![0i64; h * 2];
+    let mut indel = vec![0i64; h * 2];
+    let whole = find_ranges_haps(&reader, &regions, &sample_cols, 0, h, &mut snp, &mut indel);
+
+    let mut reduced = vec![0u64; 1];
+    for lo in 0..h {
+        let mut s = vec![0i64; 2];
+        let mut i = vec![0i64; 2];
+        let part = find_ranges_haps(&reader, &regions, &sample_cols, lo, lo + 1, &mut s, &mut i);
+        reduced[0] = reduced[0].max(part[0]);
+    }
+    assert_eq!(whole, reduced);
+    // Sanity: the fixture actually carries a variant in [0, 1000), so this
+    // isn't vacuously comparing two zero vectors.
+    assert_ne!(whole[0], 0);
 }

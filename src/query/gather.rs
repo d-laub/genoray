@@ -405,12 +405,16 @@ pub fn find_ranges_haps(
 
             // Positions are sorted within a column and the range is contiguous,
             // so the last element is the highest-position overlapping variant.
+            // Reuses `a`/`b` (just computed above) instead of re-searching via
+            // `VkColumnIndex::last_overlapping` — that would double the
+            // `overlap()` calls in this hot loop for no benefit.
             let mut k = 0u64;
-            if let Some(i) = snp_ix.last_overlapping(qs, qe) {
-                let pos = snp_pos[i] as u64;
+            if a.end > a.start {
+                let pos = snp_pos[a.end - 1] as u64;
                 k = k.max((pos << MAX_END_SHIFT) | 1); // SNP/INS: ext = 1
             }
-            if let Some(i) = indel_ix.last_overlapping(qs, qe) {
+            if b.end > b.start {
+                let i = b.end - 1;
                 let pos = indel_pos[i] as u64;
                 let ext = 1 + rvk::deletion_len(indel_keys[i]) as u64;
                 k = k.max((pos << MAX_END_SHIFT) | ext);
