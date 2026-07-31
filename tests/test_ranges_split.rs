@@ -78,6 +78,69 @@ fn synth_reader(out: &std::path::Path) -> ContigReader {
     ContigReader::open(out.to_str().unwrap(), "chr1", 2, 2).unwrap()
 }
 
+/// Like `synth_reader`, but with three extra single-carrier SNPs (positions
+/// 10, 20, 30 — each carried by exactly one distinct hap) so that all 4
+/// `vk_snp` columns are non-empty instead of just column 0.
+///
+/// `synth_reader` alone can't distinguish the region-outer bug from the fix:
+/// with only column 0 populated, the old code's var_key tree-build growth is
+/// 1/region, which happens to exactly match this test's dense-tree allowance
+/// (a tie passes `<=`). Widening carrier coverage across all columns while
+/// keeping each new record single-carrier (so the cost model still routes it
+/// `VarKey`, not `Dense` — 3 carriers flips the routing, see
+/// `cost_model::choose_representation`) makes the var_key term actually show
+/// up in the old code's growth.
+///
+/// Positions 10/20/30 are deliberately below 100/200/300 and outside
+/// `[90, 110)` / `[900, 950)`, so a reader who later reuses this fixture
+/// won't disturb `synth_reader`'s own max-end / empty-region expectations
+/// (Task 2 depends on those). Used ONLY by
+/// `test_find_ranges_tree_builds_do_not_scale_with_regions` — do not extend
+/// `synth_reader` itself for this purpose, it's shared by other tests here.
+fn synth_reader_wide(out: &std::path::Path) -> ContigReader {
+    let samples = ["S0", "S1"];
+    let records = vec![
+        SynthRecord {
+            pos: 10,
+            ref_allele: b"A",
+            alts: vec![&b"C"[..]],
+            gt: vec![0, 1, 0, 0],
+        },
+        SynthRecord {
+            pos: 20,
+            ref_allele: b"A",
+            alts: vec![&b"C"[..]],
+            gt: vec![0, 0, 1, 0],
+        },
+        SynthRecord {
+            pos: 30,
+            ref_allele: b"A",
+            alts: vec![&b"C"[..]],
+            gt: vec![0, 0, 0, 1],
+        },
+        SynthRecord {
+            pos: 100,
+            ref_allele: b"A",
+            alts: vec![&b"C"[..]],
+            gt: vec![1, 0, 0, 0],
+        },
+        SynthRecord {
+            pos: 200,
+            ref_allele: b"A",
+            alts: vec![&b"AT"[..]],
+            gt: vec![0, 1, 1, 1],
+        },
+        SynthRecord {
+            pos: 300,
+            ref_allele: b"AT",
+            alts: vec![&b"A"[..]],
+            gt: vec![1, 1, 0, 1],
+        },
+    ];
+    build_contig(out, "chr1", &samples, 2, &records);
+    ContigReader::open(out.to_str().unwrap(), "chr1", 2, 2).unwrap()
+}
+
 #[test]
 fn test_find_ranges_dense_range_matches_overlap_batch() {
     let tmp = tempdir().unwrap();
@@ -216,6 +279,22 @@ fn test_py_read_ranges_dict_matches_overlap_batch_dict() {
 /// many regions are queried. Before the column-outer rewrite this was
 /// O(regions x columns): each `vk_*_overlap` call rebuilt the column's tree.
 ///
+/// Uses `synth_reader_wide`, NOT `synth_reader`: `synth_reader` populates only
+/// one of the four `vk_snp` columns (the other three are empty and early-
+/// return without ever calling `SearchTree::new`), so on that fixture the old
+/// code's growth is exactly 1 (dense union) + 1 (dense indel) + 1 (the one
+/// populated `vk_snp` column) = 3/region — which exactly *ties* a `3 *
+/// Δregions` allowance instead of exceeding it, so the guard would pass even
+/// against the unfixed region-outer code. `synth_reader_wide` gives all 4
+/// `vk_snp` columns a variant, so the old code's growth is 4 (var_key columns)
+/// plus 1 (dense union) plus 1 (dense indel) = 6/region (this fixture builds
+/// no dense-snp tree at all — nothing routes Dense-SNP — so there are only 2
+/// legitimate per-region dense trees, not 3). Over the 15 extra regions below
+/// that's 90 actual tree builds against an allowance of 30: a real ~3x
+/// separation, not a tie. After the column-outer fix, var_key columns are
+/// built once total (hoisted out of the region loop), so growth is only the
+/// 2 dense trees/region = 30, comfortably within the allowance.
+///
 /// The fixture is deliberately small (2 samples x 2 ploidy = 4 columns, well
 /// under `PAR_COLUMN_THRESHOLD`) so the serial path runs on this thread and
 /// `search::search_tree_build_count` — a thread-local — stays observable.
@@ -224,7 +303,7 @@ fn test_find_ranges_tree_builds_do_not_scale_with_regions() {
     let tmp = tempdir().unwrap();
     let out = tmp.path().join("out");
     std::fs::create_dir_all(&out).unwrap();
-    let reader = synth_reader(&out);
+    let reader = synth_reader_wide(&out);
 
     let one = vec![(0u32, 1_000_000u32)];
     let many: Vec<(u32, u32)> = (0..16).map(|i| (i * 20, i * 20 + 1_000_000)).collect();
@@ -237,10 +316,11 @@ fn test_find_ranges_tree_builds_do_not_scale_with_regions() {
     let _ = find_ranges(&reader, &many, None);
     let cost_many = search::search_tree_build_count() - b1;
 
-    // Per-region dense-union/dense-snp/dense-indel trees are still built once
-    // per region (3 per region, cheap and cohort-shared). The var_key channels
-    // — the R*H term that made this O(regions x total_variants) — must not grow.
-    let dense_growth = 3 * (many.len() - one.len());
+    // Only the per-region dense-union and dense-indel trees are legitimately
+    // per-region (this fixture builds no dense-snp tree, since nothing routes
+    // Dense-SNP). The var_key channels — the R*H term that made this
+    // O(regions x total_variants) — must not grow at all after the fix.
+    let dense_growth = 2 * (many.len() - one.len());
     assert!(
         cost_many <= cost_one + dense_growth,
         "tree builds grew with region count: {cost_one} -> {cost_many} \
