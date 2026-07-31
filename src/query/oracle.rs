@@ -52,7 +52,7 @@ pub fn overlap_sample(
     let ploidy = reader.ploidy;
     let lut = reader.lut.as_ref();
     let dense = reader.dense_union();
-    let d_range = dense.overlap(q_start, q_end);
+    let d_range = dense.index().overlap(q_start, q_end);
     let (ds, de) = (d_range.start, d_range.end);
 
     let mut per_hap = Vec::with_capacity(ploidy);

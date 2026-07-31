@@ -232,9 +232,11 @@ fn overlap_batch_impl<T: DenseSrcElem>(
 
     let dense = reader.dense_union();
     // Per-region dense index ranges — shared across all samples in the region.
+    // One index for the whole batch: `SearchTree::new` runs once, not per region.
+    let dense_ix = dense.index();
     let ranges: Vec<Range<usize>> = regions
         .iter()
-        .map(|&(qs, qe)| dense.overlap(qs, qe))
+        .map(|&(qs, qe)| dense_ix.overlap(qs, qe))
         .collect();
 
     let mut vk: Vec<T> = Vec::new();
@@ -475,21 +477,25 @@ pub fn find_ranges(
     let n_regions = regions.len();
     let h = n_samples * ploidy;
 
-    // Region-independent union; `overlap` builds one SearchTree per region.
+    // Region-independent union and dense class indices, each built ONCE for the
+    // whole batch — this is the O(regions x channels) -> O(channels) fix.
     let dense = reader.dense_union();
+    let dense_ix = dense.index();
     let dense_range: Vec<Range<usize>> = regions
         .iter()
-        .map(|&(qs, qe)| dense.overlap(qs, qe))
+        .map(|&(qs, qe)| dense_ix.overlap(qs, qe))
         .collect();
     let region_starts: Vec<u32> = regions.iter().map(|&(qs, _)| qs).collect();
 
+    let dense_snp_ix = reader.dense_snp_index();
     let dense_snp_range: Vec<Range<usize>> = regions
         .iter()
-        .map(|&(qs, qe)| reader.dense_snp_overlap(qs, qe))
+        .map(|&(qs, qe)| dense_snp_ix.overlap(qs, qe))
         .collect();
+    let dense_indel_ix = reader.dense_indel_index();
     let dense_indel_range: Vec<Range<usize>> = regions
         .iter()
-        .map(|&(qs, qe)| reader.dense_indel_overlap(qs, qe))
+        .map(|&(qs, qe)| dense_indel_ix.overlap(qs, qe))
         .collect();
 
     // `find_ranges_haps` fills hap-major because that is the layout rayon can

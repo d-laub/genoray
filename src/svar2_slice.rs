@@ -573,6 +573,10 @@ fn slice_genos_inner(
         |i| vk_indel_positions[i] + 1 + deletion_len(vk_indel_keys[i]),
     );
 
+    // One index per dense class for the whole request — `gather_dense` calls
+    // `region_hits` once per class, so building here is what keeps the
+    // per-region loop inside it tree-free.
+    let d_snp_ix = reader.dense_snp_index();
     let d_snp_g = gather_dense(
         reader.dense_snp.as_ref(),
         true,
@@ -581,9 +585,10 @@ fn slice_genos_inner(
         regions,
         &query_regions,
         overlap,
-        |qsw, qew| reader.dense_snp_overlap(qsw, qew),
+        |qsw, qew| d_snp_ix.overlap(qsw, qew),
     );
 
+    let d_indel_ix = reader.dense_indel_index();
     let d_indel_g = gather_dense(
         reader.dense_indel.as_ref(),
         false,
@@ -592,7 +597,7 @@ fn slice_genos_inner(
         regions,
         &query_regions,
         overlap,
-        |qsw, qew| reader.dense_indel_overlap(qsw, qew),
+        |qsw, qew| d_indel_ix.overlap(qsw, qew),
     );
 
     // ---- route ----

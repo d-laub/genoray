@@ -351,44 +351,40 @@ impl ContigReader {
 }
 
 impl ContigReader {
-    /// Absolute `[s, e)` into `dense/snp`'s positions/keys for one region.
-    /// SNP v_end = pos + 1 (max_region_length = 0). `(0, 0)` if no snp table.
-    pub(crate) fn dense_snp_overlap(&self, q_start: u32, q_end: u32) -> Range<usize> {
-        let d = match &self.dense_snp {
-            Some(d) => d,
-            None => return 0..0,
+    /// Dense SNP class index, over `dense/snp`'s positions/keys. SNP `v_end =
+    /// pos + 1` (`max_region_length = 0`). Empty if there is no snp table.
+    pub(crate) fn dense_snp_index(&self) -> OverlapIndex<'static> {
+        let Some(d) = &self.dense_snp else {
+            return OverlapIndex::empty(0);
         };
         let positions = d.positions();
         if positions.is_empty() {
-            return 0..0;
+            return OverlapIndex::empty(0);
         }
         let v_ends: Vec<u32> = positions.iter().map(|&p| p + 1).collect();
-        let tree = SearchTree::new(positions);
-        let (s, e) = overlap_range(&tree, &v_ends, 0, q_start, q_end);
-        s..e
+        OverlapIndex::new(0, positions, Cow::Owned(v_ends), 0)
     }
 
-    /// Absolute `[s, e)` into `dense/indel`'s positions/keys for one region.
-    /// Indel v_end = pos + 1 + deletion_len(key); per-contig dense max_del bound.
-    pub(crate) fn dense_indel_overlap(&self, q_start: u32, q_end: u32) -> Range<usize> {
-        let d = match &self.dense_indel {
-            Some(d) => d,
-            None => return 0..0,
+    /// Dense indel class index, over `dense/indel`'s positions/keys. `v_end =
+    /// pos + 1 + deletion_len(key)`; the search bound is the per-contig dense
+    /// max_del. Empty if there is no indel table.
+    pub(crate) fn dense_indel_index(&self) -> OverlapIndex<'static> {
+        let Some(d) = &self.dense_indel else {
+            return OverlapIndex::empty(0);
         };
         let positions = d.positions();
         if positions.is_empty() {
-            return 0..0;
+            return OverlapIndex::empty(0);
         }
         let keys = as_u32(&d.keys);
+        // Fail fast on a corrupt sidecar rather than silently truncating.
         debug_assert_eq!(positions.len(), keys.len());
         let v_ends: Vec<u32> = positions
             .iter()
             .zip(keys.iter())
             .map(|(&pos, &key)| pos + 1 + rvk::deletion_len(key))
             .collect();
-        let tree = SearchTree::new(positions);
-        let (s, e) = overlap_range(&tree, &v_ends, self.dense_indel_max_del, q_start, q_end);
-        s..e
+        OverlapIndex::new(0, positions, Cow::Owned(v_ends), self.dense_indel_max_del)
     }
 }
 
