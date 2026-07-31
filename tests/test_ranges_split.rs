@@ -442,6 +442,16 @@ fn test_py_read_ranges_dict_matches_overlap_batch_dict() {
 /// The fixture is deliberately small (2 samples x 2 ploidy = 4 columns, well
 /// under `PAR_COLUMN_THRESHOLD`) so the serial path runs on this thread and
 /// `search::search_tree_build_count` — a thread-local — stays observable.
+///
+/// Coverage gap: `synth_reader_wide` has no multi-carrier SNP, so it builds
+/// no dense-SNP table, and both of its indels are multi-carrier and route
+/// Dense, so `vk_indel` is never populated either. `dense_snp_index()` and
+/// all four `vk_indel_index()` calls therefore return `OverlapIndex::empty`
+/// without ever building a tree, and this guard would NOT catch a regression
+/// that moved `reader.dense_snp_index()` (or a `vk_indel_index()` call) back
+/// inside the per-region loop in `find_ranges`. `slice_tree_builds_do_not_scale_with_regions`
+/// in `tests/test_svar2_slice.rs` covers both dense-class constructors on a
+/// fixture (`wide_fixture_records`) that populates them.
 #[test]
 fn test_find_ranges_tree_builds_do_not_scale_with_regions() {
     let tmp = tempdir().unwrap();
@@ -464,6 +474,7 @@ fn test_find_ranges_tree_builds_do_not_scale_with_regions() {
     // var_key columns, the dense union and the two dense class tables are each
     // swept once per call. So this is exact equality, not an allowance — a
     // budget here is what let the dense leak survive #144.
+    assert!(cost_one > 0, "fixture must build trees at all");
     assert_eq!(
         cost_many, cost_one,
         "tree builds grew with region count: {cost_one} -> {cost_many}"
