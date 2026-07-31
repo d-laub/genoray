@@ -17,13 +17,16 @@ use std::ops::Range;
 
 use ndarray::Array2;
 use numpy::{PyArray1, PyArray2, PyArrayMethods, ToPyArray};
-use pyo3::exceptions::{PyKeyError, PyTypeError};
+use pyo3::exceptions::{PyKeyError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyDictMethods};
 
 use crate::py_convert::{u8_to_pyarray, u32_to_i32_pyarray, usize_to_i64_pyarray};
 use crate::py_query::PyContigReader;
-use crate::query::{BatchResult, RangesBundle, find_ranges, gather_ranges, read_ranges};
+use crate::query::{
+    BatchResult, MAX_END_SHIFT, RangesBundle, dense_max_end_keys, find_ranges, find_ranges_haps,
+    gather_ranges, read_ranges,
+};
 
 /// Identical to `py_query_batch.rs::overlap_batch`'s dict assembly — the whole
 /// point of the search/gather split is that `read_ranges`/`gather_ranges`
@@ -249,5 +252,139 @@ impl PyContigReader {
         let rb = bundle_from_dict(&bundle)?;
         let br = gather_ranges(&self.inner, &rb);
         batch_result_to_dict(py, self.inner.lut_arrays(), &br)
+    }
+
+    /// Region-level half of a chunked `find_ranges`: everything whose size is
+    /// O(regions) rather than O(regions * samples * ploidy), plus the dense
+    /// channel's max-end contribution. Cheap enough to compute eagerly.
+    pub fn find_ranges_header<'py>(
+        &self,
+        py: Python<'py>,
+        regions: Vec<(u32, u32)>,
+        samples: Option<Vec<usize>>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        // Fail fast rather than silently corrupting a packed key. `ext` is
+        // 1 + deletion_len and must fit below the position field.
+        let max_del = self.inner.max_deletion_len();
+        if (1u64 + max_del as u64) >= (1u64 << MAX_END_SHIFT) {
+            return Err(PyValueError::new_err(
+                "variant footprint exceeds tie-break packing width",
+            ));
+        }
+
+        let all_samples = samples.is_none();
+        let sample_cols: Vec<usize> = match &samples {
+            Some(s) => s.clone(),
+            None => (0..self.inner.n_samples).collect(),
+        };
+
+        let dense = self.inner.dense_union();
+        let dense_range: Vec<Range<usize>> = regions
+            .iter()
+            .map(|&(qs, qe)| dense.overlap(qs, qe))
+            .collect();
+        let dense_snp_range: Vec<Range<usize>> = regions
+            .iter()
+            .map(|&(qs, qe)| self.inner.dense_snp_overlap(qs, qe))
+            .collect();
+        let dense_indel_range: Vec<Range<usize>> = regions
+            .iter()
+            .map(|&(qs, qe)| self.inner.dense_indel_overlap(qs, qe))
+            .collect();
+        let region_starts: Vec<u32> = regions.iter().map(|&(qs, _)| qs).collect();
+        let dmax = dense_max_end_keys(
+            &self.inner,
+            &regions,
+            &dense_range,
+            &sample_cols,
+            all_samples,
+        );
+
+        let pairs_i32 = |v: &[Range<usize>]| -> Vec<i32> {
+            let mut o = Vec::with_capacity(v.len() * 2);
+            for r in v {
+                o.push(r.start as i32);
+                o.push(r.end as i32);
+            }
+            o
+        };
+        let to2d = |v: Vec<i32>| {
+            Array2::from_shape_vec((regions.len(), 2), v)
+                .expect("region pair shape")
+                .to_pyarray(py)
+        };
+
+        let d = PyDict::new(py);
+        d.set_item("dense_range", to2d(pairs_i32(&dense_range)))?;
+        d.set_item("dense_snp_range", to2d(pairs_i32(&dense_snp_range)))?;
+        d.set_item("dense_indel_range", to2d(pairs_i32(&dense_indel_range)))?;
+        d.set_item("region_starts", u32_to_i32_pyarray(py, &region_starts))?;
+        let cols: Vec<i64> = sample_cols.iter().map(|&x| x as i64).collect();
+        d.set_item("sample_cols", PyArray1::from_slice(py, &cols))?;
+        let dmax_i64: Vec<i64> = dmax.iter().map(|&x| x as i64).collect();
+        d.set_item("dense_max_end_keys", PyArray1::from_slice(py, &dmax_i64))?;
+        d.set_item("n_regions", regions.len())?;
+        d.set_item("n_samples", sample_cols.len())?;
+        d.set_item("ploidy", self.inner.ploidy)?;
+        Ok(d)
+    }
+
+    /// One hap slice `[hap_lo, hap_hi)` of a chunked `find_ranges`. Fills freshly
+    /// allocated numpy arrays IN PLACE, so the payload exists exactly once —
+    /// unlike `find_ranges`, whose `Vec<Range<usize>>` -> `Vec<i64>` ->
+    /// `ToPyArray` chain holds three copies at peak. Releases the GIL for the
+    /// search so rayon and the caller's progress bar can both run.
+    ///
+    /// `vk_snp_range` / `vk_indel_range` come back hap-major, shape
+    /// `(n_haps * R, 2)`; reshape to `(n_haps_samples, ploidy, R, 2)` in Python.
+    pub fn find_ranges_chunk<'py>(
+        &self,
+        py: Python<'py>,
+        regions: Vec<(u32, u32)>,
+        samples: Option<Vec<usize>>,
+        hap_lo: usize,
+        hap_hi: usize,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let sample_cols: Vec<usize> = match &samples {
+            Some(s) => s.clone(),
+            None => (0..self.inner.n_samples).collect(),
+        };
+        let h_total = sample_cols.len() * self.inner.ploidy;
+        if hap_lo > hap_hi || hap_hi > h_total {
+            return Err(PyValueError::new_err(format!(
+                "hap slice [{hap_lo}, {hap_hi}) out of bounds for {h_total} haps"
+            )));
+        }
+        let n_haps = hap_hi - hap_lo;
+        let r = regions.len();
+
+        let snp = PyArray2::<i64>::zeros(py, [n_haps * r, 2], false);
+        let indel = PyArray2::<i64>::zeros(py, [n_haps * r, 2], false);
+        let max_keys = {
+            let mut snp_rw = snp.readwrite();
+            let mut indel_rw = indel.readwrite();
+            let snp_s = snp_rw.as_slice_mut()?;
+            let indel_s = indel_rw.as_slice_mut()?;
+            py.detach(|| {
+                find_ranges_haps(
+                    &self.inner,
+                    &regions,
+                    &sample_cols,
+                    hap_lo,
+                    hap_hi,
+                    snp_s,
+                    indel_s,
+                )
+            })
+        };
+
+        let keys_i64: Vec<i64> = max_keys.iter().map(|&x| x as i64).collect();
+        let d = PyDict::new(py);
+        d.set_item("vk_snp_range", snp)?;
+        d.set_item("vk_indel_range", indel)?;
+        d.set_item("max_end_keys", PyArray1::from_slice(py, &keys_i64))?;
+        d.set_item("hap_lo", hap_lo)?;
+        d.set_item("hap_hi", hap_hi)?;
+        Ok(d)
     }
 }

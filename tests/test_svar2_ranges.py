@@ -95,3 +95,43 @@ def test_find_ranges_out_streaming(svar2_store: Path):
         np.testing.assert_array_equal(np.asarray(ranges2[k]), np.asarray(ranges[k]))
         # out= wrote in place: returned array shares the buffer.
         assert np.asarray(ranges2[k]).base is out[k] or ranges2[k] is out[k]
+
+
+def test_find_ranges_chunk_matches_find_ranges(svar2_store: Path):
+    """Chunked hap slices must reassemble into the region-major bundle exactly."""
+    sv = SparseVar2(svar2_store)
+    starts, ends = [0, 5], [40, 20]
+    reg = list(zip(starts, ends))
+    reader = sv._reader("chr1")
+    bundle = sv._find_ranges("chr1", starts, ends)
+
+    R = len(reg)
+    P = sv.ploidy
+    S = sv.n_samples
+    H = S * P
+
+    header = reader.find_ranges_header(reg, None)
+    np.testing.assert_array_equal(
+        np.asarray(header["dense_snp_range"]), np.asarray(bundle["dense_snp_range"])
+    )
+    np.testing.assert_array_equal(
+        np.asarray(header["sample_cols"]), np.asarray(bundle["sample_cols"])
+    )
+
+    # One hap per call: the most adversarial chunking.
+    snp = np.empty((H, R, 2), np.int64)
+    indel = np.empty((H, R, 2), np.int64)
+    for h in range(H):
+        d = reader.find_ranges_chunk(reg, None, h, h + 1)
+        snp[h] = np.asarray(d["vk_snp_range"]).reshape(1, R, 2)
+        indel[h] = np.asarray(d["vk_indel_range"]).reshape(1, R, 2)
+
+    # bundle vk ranges are region-major (R*H, 2); ours are hap-major (H, R, 2).
+    np.testing.assert_array_equal(
+        snp.transpose(1, 0, 2).reshape(R * H, 2),
+        np.asarray(bundle["vk_snp_range"]),
+    )
+    np.testing.assert_array_equal(
+        indel.transpose(1, 0, 2).reshape(R * H, 2),
+        np.asarray(bundle["vk_indel_range"]),
+    )
