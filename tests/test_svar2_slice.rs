@@ -19,6 +19,7 @@ use genoray_core::mutcat::annotate::annotate_contig;
 use genoray_core::query::field::{FieldValue, FieldView};
 use genoray_core::query::{ContigReader, oracle::overlap_sample};
 use genoray_core::run_slice_view;
+use genoray_core::search;
 use genoray_core::svar2_slice::{Routing, slice_contig, slice_contig_genos};
 use genoray_core::svar2_view::OverlapMode;
 use pyo3::Python;
@@ -79,6 +80,71 @@ fn build_fixture_store(dir: &Path, samples: &[&str]) {
     // real value too for the full-coverage byte-parity check below to be
     // meaningful — recompute it here to undo the fixture's conservative
     // overwrite.
+    genoray_core::max_del::write_max_del(&dir.join("chr1"), samples.len(), 2).unwrap();
+    write_meta(
+        dir,
+        FORMAT_VERSION,
+        &samples.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        &["chr1".to_string()],
+        2,
+        &[],
+    )
+    .unwrap();
+}
+
+/// Ten records at n=2, ploidy=2 (np=4, flat gt order `[s0p0, s0p1, s1p0,
+/// s1p1]`) chosen so the tree-build guard below is actually discriminating:
+///
+/// * four single-carrier SNPs and four single-carrier indels, one per hap, so
+///   ALL FOUR columns of BOTH var_key channels are non-empty. An empty column
+///   early-returns without building a tree, so a fixture that populates only
+///   one column (as `fixture_records` does) barely moves the counter.
+/// * one x=2 SNP and one x=2 indel so both DENSE class tables exist. Without
+///   them the dense channels early-return and the guard would silently stop
+///   covering the dense hoist.
+///
+/// Single carrier vs. x=2 is what picks the route: at np=4 with no sidecar or
+/// field bits, `cost_model::choose_representation` keeps x=1 in VarKey and
+/// flips x=2 to Dense.
+///
+/// Used ONLY by `slice_tree_builds_do_not_scale_with_regions` — do not extend
+/// `fixture_records` for this, it is pinned by the byte-parity tests.
+fn wide_fixture_records() -> Vec<SynthRecord<'static>> {
+    let snp = |pos: i64, gt: Vec<i32>| SynthRecord {
+        pos,
+        ref_allele: b"A",
+        alts: vec![&b"C"[..]],
+        gt,
+    };
+    let del = |pos: i64, gt: Vec<i32>| SynthRecord {
+        pos,
+        ref_allele: b"ATG",
+        alts: vec![&b"A"[..]], // pure DEL, ilen = -2
+        gt,
+    };
+    vec![
+        // one single-carrier (VarKey) SNP per hap column
+        snp(10, vec![1, 0, 0, 0]),
+        snp(20, vec![0, 1, 0, 0]),
+        snp(30, vec![0, 0, 1, 0]),
+        snp(40, vec![0, 0, 0, 1]),
+        // one single-carrier (VarKey) indel per hap column
+        del(50, vec![1, 0, 0, 0]),
+        del(60, vec![0, 1, 0, 0]),
+        del(70, vec![0, 0, 1, 0]),
+        del(80, vec![0, 0, 0, 1]),
+        // x=2 => Dense, one per class, so both dense tables exist
+        snp(90, vec![1, 1, 0, 0]),
+        del(100, vec![0, 0, 1, 1]),
+    ]
+}
+
+fn build_wide_fixture_store(dir: &Path, samples: &[&str]) {
+    std::fs::create_dir_all(dir).unwrap();
+    let records = wide_fixture_records();
+    build_contig(dir, "chr1", samples, 2, &records);
+    // Same reason as `build_fixture_store`: `build_contig` overwrites max_del
+    // with a conservative fixture, so recompute the real routing-aware value.
     genoray_core::max_del::write_max_del(&dir.join("chr1"), samples.len(), 2).unwrap();
     write_meta(
         dir,
@@ -1875,4 +1941,64 @@ fn multi_contig_slice_is_thread_invariant() {
     for chrom in ["chr1", "chr2", "chr3"] {
         assert_sidecars_byte_equal(&out_a, &out_b, chrom);
     }
+}
+
+/// `gather_var_key` is column-outer, but until #145 the closure it handed
+/// `region_hits` built a fresh `OverlapIndex` — `SearchTree::new` and all —
+/// INSIDE the per-region loop, for every column. That is the same
+/// O(regions x columns) shape #144 removed from `find_ranges`.
+///
+/// After the fix no channel in the slice path builds a tree per region: eight
+/// var_key columns (four per class, all populated by `wide_fixture_records`)
+/// and two dense classes are each swept once per request. So this asserts
+/// EXACT equality, not an allowance.
+///
+/// `src/svar2_slice.rs` contains no rayon, so the whole slice runs on this
+/// thread and `search::search_tree_build_count` — a thread-local — stays
+/// observable. Each call gets its own output directory because a slice writes
+/// `{out}/chr1` and would otherwise overwrite the previous run.
+#[test]
+fn slice_tree_builds_do_not_scale_with_regions() {
+    let tmp = tempdir().unwrap();
+    let src = tmp.path().join("src");
+    let samples = ["S0", "S1"];
+    build_wide_fixture_store(&src, &samples);
+
+    let slice_with = |out: &Path, regions: &[(u32, u32)]| {
+        std::fs::create_dir_all(out).unwrap();
+        slice_contig_genos(
+            src.to_str().unwrap(),
+            out.to_str().unwrap(),
+            "chr1",
+            &(0..samples.len()).collect::<Vec<_>>(),
+            2,
+            regions,
+            OverlapMode::Variant,
+            Routing::Preserve,
+        )
+        .unwrap()
+    };
+
+    let one = vec![(0u32, 1_000u32)];
+    let many: Vec<(u32, u32)> = (0..16).map(|i| (i * 5, i * 5 + 1_000)).collect();
+
+    let out_one = tmp.path().join("out_one");
+    let b0 = search::search_tree_build_count();
+    let n_one = slice_with(&out_one, &one);
+    let cost_one = search::search_tree_build_count() - b0;
+
+    let out_many = tmp.path().join("out_many");
+    let b1 = search::search_tree_build_count();
+    let n_many = slice_with(&out_many, &many);
+    let cost_many = search::search_tree_build_count() - b1;
+
+    // Both region sets cover every fixture variant, so this is the same slice
+    // twice — any difference in tree builds is pure region-count overhead.
+    assert_eq!(n_one, 10, "the 1-region slice must keep all 10 variants");
+    assert_eq!(n_many, 10, "the 16-region slice must keep all 10 variants");
+    assert!(cost_one > 0, "fixture must build trees at all");
+    assert_eq!(
+        cost_many, cost_one,
+        "tree builds grew with region count: {cost_one} -> {cost_many}"
+    );
 }

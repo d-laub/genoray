@@ -2,22 +2,22 @@
 //! position-sorted, used by the union-based (non-read-bound) query paths
 //! (`oracle::overlap_sample`, `gather::overlap_batch`, `gather::gather_ranges`).
 
+use std::borrow::Cow;
 use std::ops::Range;
 
 use crate::dense::DenseClass;
 use crate::query::gather::MAX_END_SHIFT;
 use crate::rvk;
-use crate::search::{SearchTree, overlap_range};
 use crate::spine::KeyRef;
 
-use super::reader::ContigReader;
+use super::reader::{ContigReader, OverlapIndex};
 use super::sidecar::{as_bytes, as_u32};
 
 /// The per-contig dense table unioned across `snp`+`indel`, position-sorted,
 /// carrying uniform keys plus the `(DenseClass, col)` needed to test carriage.
-/// Region-independent — built once per query; `overlap` derives each region's
-/// index range from it. `src[i] = (DenseClass, col)` addresses the original
-/// dense class table for the genotype-bit test.
+/// Region-independent and tree-free — built once per query; `index()` adds
+/// the search state for callers that range-query it. `src[i] = (DenseClass,
+/// col)` addresses the original dense class table for the genotype-bit test.
 pub(crate) struct DenseUnion {
     pub(crate) refs: Vec<KeyRef>,
     pub(crate) src: Vec<(DenseClass, usize)>,
@@ -27,15 +27,24 @@ pub(crate) struct DenseUnion {
 }
 
 impl DenseUnion {
-    /// `[s, e)` into `refs`/`src` for `[q_start, q_end)`, deletion-aware. Builds a
-    /// fresh search tree over `positions` (cheap; one per region in a batch).
-    pub(crate) fn overlap(&self, q_start: u32, q_end: u32) -> Range<usize> {
+    /// Region-independent search state over the union, built once by the
+    /// callers that actually search it.
+    ///
+    /// This is deliberately NOT built inside `dense_union()`: `gather_ranges`,
+    /// `dense_max_end_keys` and `ContigReader::max_deletion_len` all construct
+    /// a `DenseUnion` without ever overlapping it, and must not be charged a
+    /// `SearchTree::new` they never use. Borrows `v_ends`, so building an index
+    /// copies nothing.
+    pub(crate) fn index(&self) -> OverlapIndex<'_> {
         if self.refs.is_empty() {
-            return 0..0;
+            return OverlapIndex::empty(0);
         }
-        let tree = SearchTree::new(&self.positions);
-        let (s, e) = overlap_range(&tree, &self.v_ends, self.max_del, q_start, q_end);
-        s..e
+        OverlapIndex::new(
+            0,
+            &self.positions,
+            Cow::Borrowed(self.v_ends.as_slice()),
+            self.max_del,
+        )
     }
 
     /// The per-contig dense deletion bound, for the caller's overflow preflight.

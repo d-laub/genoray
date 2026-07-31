@@ -432,13 +432,26 @@ fn test_py_read_ranges_dict_matches_overlap_batch_dict() {
 /// no dense-snp tree at all — nothing routes Dense-SNP — so there are only 2
 /// legitimate per-region dense trees, not 3). Over the 15 extra regions below
 /// that's 90 actual tree builds against an allowance of 30: a real ~3x
-/// separation, not a tie. After the column-outer fix, var_key columns are
-/// built once total (hoisted out of the region loop), so growth is only the
-/// 2 dense trees/region = 30, comfortably within the allowance.
+/// separation, not a tie.
+///
+/// After the dense hoist (#145) NO channel builds a tree per region: the
+/// var_key columns, the dense union and the two dense class tables are each
+/// swept once per call, so `cost_many` must equal `cost_one` exactly — zero
+/// growth across all channels, not just the var_key ones.
 ///
 /// The fixture is deliberately small (2 samples x 2 ploidy = 4 columns, well
 /// under `PAR_COLUMN_THRESHOLD`) so the serial path runs on this thread and
 /// `search::search_tree_build_count` — a thread-local — stays observable.
+///
+/// Coverage gap: `synth_reader_wide` has no multi-carrier SNP, so it builds
+/// no dense-SNP table, and both of its indels are multi-carrier and route
+/// Dense, so `vk_indel` is never populated either. `dense_snp_index()` and
+/// all four `vk_indel_index()` calls therefore return `OverlapIndex::empty`
+/// without ever building a tree, and this guard would NOT catch a regression
+/// that moved `reader.dense_snp_index()` (or a `vk_indel_index()` call) back
+/// inside the per-region loop in `find_ranges`. `slice_tree_builds_do_not_scale_with_regions`
+/// in `tests/test_svar2_slice.rs` covers both dense-class constructors on a
+/// fixture (`wide_fixture_records`) that populates them.
 #[test]
 fn test_find_ranges_tree_builds_do_not_scale_with_regions() {
     let tmp = tempdir().unwrap();
@@ -457,15 +470,14 @@ fn test_find_ranges_tree_builds_do_not_scale_with_regions() {
     let _ = find_ranges(&reader, &many, None);
     let cost_many = search::search_tree_build_count() - b1;
 
-    // Only the per-region dense-union and dense-indel trees are legitimately
-    // per-region (this fixture builds no dense-snp tree, since nothing routes
-    // Dense-SNP). The var_key channels — the R*H term that made this
-    // O(regions x total_variants) — must not grow at all after the fix.
-    let dense_growth = 2 * (many.len() - one.len());
-    assert!(
-        cost_many <= cost_one + dense_growth,
-        "tree builds grew with region count: {cost_one} -> {cost_many} \
-         (allowed growth {dense_growth})"
+    // After the dense hoist (#145) NO channel builds a tree per region: the
+    // var_key columns, the dense union and the two dense class tables are each
+    // swept once per call. So this is exact equality, not an allowance — a
+    // budget here is what let the dense leak survive #144.
+    assert!(cost_one > 0, "fixture must build trees at all");
+    assert_eq!(
+        cost_many, cost_one,
+        "tree builds grew with region count: {cost_one} -> {cost_many}"
     );
 }
 
@@ -509,10 +521,10 @@ fn test_max_end_keys_pick_highest_position_variant() {
     let mut indel = vec![0i64; h * 2];
     let vk_keys = find_ranges_haps(&reader, &regions, &sample_cols, 0, h, &mut snp, &mut indel);
 
-    // `dense_union`/`DenseUnion::overlap` are pub(crate); this integration
+    // `dense_union`/`DenseUnion::index` are pub(crate); this integration
     // test crate is external to `genoray_core`, so the per-region dense range
     // is obtained via `find_ranges`'s public `dense_range` field instead —
-    // it's computed the same way (`reader.dense_union().overlap(qs, qe)`),
+    // it's computed the same way (`reader.dense_union().index().overlap(qs, qe)`),
     // independent of the sample subset.
     let dense_range = find_ranges(&reader, &regions, None).dense_range;
     let dense_keys = dense_max_end_keys(&reader, &regions, &dense_range, &sample_cols, true);

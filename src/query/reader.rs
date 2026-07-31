@@ -2,6 +2,7 @@
 //! provides the per-hap var_key slice + search-range helpers that back both
 //! the union (`union.rs`) and gather (`gather.rs`) query paths.
 
+use std::borrow::Cow;
 use std::ops::Range;
 use std::path::Path;
 
@@ -237,22 +238,55 @@ impl ContigReader {
     }
 }
 
-/// Region-independent per-column search state for one var_key channel.
+/// Region-independent search state for one channel: a `SearchTree` over its
+/// positions, the parallel `v_ends` extents, and the deletion bound
+/// `overlap_range` needs.
 ///
-/// Built ONCE per column, then queried per region. Hoisting this out of the old
-/// per-`(region, column)` `vk_*_overlap` methods is what turns `find_ranges`
-/// from O(regions x columns) tree builds into O(columns): the packed store is
-/// swept once instead of once per region.
-pub(crate) struct VkColumnIndex {
-    /// Absolute base offset of this column in the channel's packed arrays.
+/// Built ONCE per channel, then queried per region. Hoisting this out of the
+/// old per-region `vk_*_overlap` / `dense_*_overlap` methods is what turns
+/// `find_ranges` and `svar2_slice`'s gather from O(regions x channels) tree
+/// builds into O(channels): each packed store is swept once instead of once
+/// per region.
+///
+/// `v_ends` is a `Cow` because the two kinds of channel differ in who owns the
+/// extents: the var_key columns and the dense class tables COMPUTE theirs
+/// (`pos + 1`, `pos + 1 + deletion_len(key)`) and must own the result, while
+/// `DenseUnion` already stores its own and can lend them — which is what keeps
+/// `DenseUnion::index` from copying an O(dense variants) array per query.
+pub(crate) struct OverlapIndex<'a> {
+    /// Absolute base offset of this channel in the packed arrays. `0` for the
+    /// dense class tables and the dense union, whose ranges are already
+    /// absolute; the var_key columns pass their column's start offset.
     pub(crate) o0: usize,
-    /// `None` for an empty column — `SearchTree`/`overlap_range` are not
+    /// `None` for an empty channel — `SearchTree`/`overlap_range` are not
     /// defined over an empty position array, matching the old early return.
-    inner: Option<(SearchTree, Vec<u32>)>,
+    inner: Option<(SearchTree, Cow<'a, [u32]>)>,
     max_del: u32,
 }
 
-impl VkColumnIndex {
+impl<'a> OverlapIndex<'a> {
+    /// Build the search state for a NON-EMPTY channel. `positions` must be
+    /// ascending and `v_ends[i]` must be the right extent of `positions[i]`.
+    pub(crate) fn new(o0: usize, positions: &[u32], v_ends: Cow<'a, [u32]>, max_del: u32) -> Self {
+        debug_assert!(!positions.is_empty(), "use OverlapIndex::empty instead");
+        debug_assert_eq!(positions.len(), v_ends.len());
+        OverlapIndex {
+            o0,
+            inner: Some((SearchTree::new(positions), v_ends)),
+            max_del,
+        }
+    }
+
+    /// An index over an empty channel: `overlap` always returns `o0..o0`, and
+    /// no `SearchTree` is built.
+    pub(crate) fn empty(o0: usize) -> Self {
+        OverlapIndex {
+            o0,
+            inner: None,
+            max_del: 0,
+        }
+    }
+
     /// Absolute `[start, end)` into the channel's packed positions/keys for one
     /// region. Every element of the returned range truly overlaps
     /// `[q_start, q_end)` — `overlap_range` does the left-overlap sub-scan.
@@ -268,38 +302,26 @@ impl VkColumnIndex {
 impl ContigReader {
     /// SNP-channel column index. SNP `v_end = pos + 1` and `max_region_length =
     /// 0`, since a SNP spans exactly one base.
-    pub(crate) fn vk_snp_index(&self, col: usize) -> VkColumnIndex {
+    pub(crate) fn vk_snp_index(&self, col: usize) -> OverlapIndex<'static> {
         let vk_range = self.vk_snp.column(col);
         let (o0, o1) = (vk_range.start, vk_range.end);
         let positions = &self.vk_snp.positions()[o0..o1];
         if positions.is_empty() {
-            return VkColumnIndex {
-                o0,
-                inner: None,
-                max_del: 0,
-            };
+            return OverlapIndex::empty(o0);
         }
         let v_ends: Vec<u32> = positions.iter().map(|&p| p + 1).collect();
-        VkColumnIndex {
-            o0,
-            inner: Some((SearchTree::new(positions), v_ends)),
-            max_del: 0,
-        }
+        OverlapIndex::new(o0, positions, Cow::Owned(v_ends), 0)
     }
 
     /// Indel-channel column index for `(sample, p)`. `v_end = pos + 1 +
     /// deletion_len(key)`; the search bound is this column's `max_del`.
-    pub(crate) fn vk_indel_index(&self, sample: usize, p: usize) -> VkColumnIndex {
+    pub(crate) fn vk_indel_index(&self, sample: usize, p: usize) -> OverlapIndex<'static> {
         let col = sample * self.ploidy + p;
         let vk_range = self.vk_indel.column(col);
         let (o0, o1) = (vk_range.start, vk_range.end);
         let positions = &self.vk_indel.positions()[o0..o1];
         if positions.is_empty() {
-            return VkColumnIndex {
-                o0,
-                inner: None,
-                max_del: 0,
-            };
+            return OverlapIndex::empty(o0);
         }
         let keys = &as_u32(&self.vk_indel.keys)[o0..o1];
         let v_ends: Vec<u32> = positions
@@ -307,11 +329,12 @@ impl ContigReader {
             .enumerate()
             .map(|(i, &pos)| pos + 1 + rvk::deletion_len(keys[i]))
             .collect();
-        VkColumnIndex {
+        OverlapIndex::new(
             o0,
-            inner: Some((SearchTree::new(positions), v_ends)),
-            max_del: self.vk_indel_max_del[[sample, p]],
-        }
+            positions,
+            Cow::Owned(v_ends),
+            self.vk_indel_max_del[[sample, p]],
+        )
     }
 }
 
@@ -328,44 +351,40 @@ impl ContigReader {
 }
 
 impl ContigReader {
-    /// Absolute `[s, e)` into `dense/snp`'s positions/keys for one region.
-    /// SNP v_end = pos + 1 (max_region_length = 0). `(0, 0)` if no snp table.
-    pub(crate) fn dense_snp_overlap(&self, q_start: u32, q_end: u32) -> Range<usize> {
-        let d = match &self.dense_snp {
-            Some(d) => d,
-            None => return 0..0,
+    /// Dense SNP class index, over `dense/snp`'s positions/keys. SNP `v_end =
+    /// pos + 1` (`max_region_length = 0`). Empty if there is no snp table.
+    pub(crate) fn dense_snp_index(&self) -> OverlapIndex<'static> {
+        let Some(d) = &self.dense_snp else {
+            return OverlapIndex::empty(0);
         };
         let positions = d.positions();
         if positions.is_empty() {
-            return 0..0;
+            return OverlapIndex::empty(0);
         }
         let v_ends: Vec<u32> = positions.iter().map(|&p| p + 1).collect();
-        let tree = SearchTree::new(positions);
-        let (s, e) = overlap_range(&tree, &v_ends, 0, q_start, q_end);
-        s..e
+        OverlapIndex::new(0, positions, Cow::Owned(v_ends), 0)
     }
 
-    /// Absolute `[s, e)` into `dense/indel`'s positions/keys for one region.
-    /// Indel v_end = pos + 1 + deletion_len(key); per-contig dense max_del bound.
-    pub(crate) fn dense_indel_overlap(&self, q_start: u32, q_end: u32) -> Range<usize> {
-        let d = match &self.dense_indel {
-            Some(d) => d,
-            None => return 0..0,
+    /// Dense indel class index, over `dense/indel`'s positions/keys. `v_end =
+    /// pos + 1 + deletion_len(key)`; the search bound is the per-contig dense
+    /// max_del. Empty if there is no indel table.
+    pub(crate) fn dense_indel_index(&self) -> OverlapIndex<'static> {
+        let Some(d) = &self.dense_indel else {
+            return OverlapIndex::empty(0);
         };
         let positions = d.positions();
         if positions.is_empty() {
-            return 0..0;
+            return OverlapIndex::empty(0);
         }
         let keys = as_u32(&d.keys);
+        // Fail fast on a corrupt sidecar rather than silently truncating.
         debug_assert_eq!(positions.len(), keys.len());
         let v_ends: Vec<u32> = positions
             .iter()
             .zip(keys.iter())
             .map(|(&pos, &key)| pos + 1 + rvk::deletion_len(key))
             .collect();
-        let tree = SearchTree::new(positions);
-        let (s, e) = overlap_range(&tree, &v_ends, self.dense_indel_max_del, q_start, q_end);
-        s..e
+        OverlapIndex::new(0, positions, Cow::Owned(v_ends), self.dense_indel_max_del)
     }
 }
 

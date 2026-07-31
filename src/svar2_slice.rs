@@ -46,6 +46,7 @@ use crate::layout::{self, ContigPaths, FieldSub};
 use crate::max_del;
 use crate::query::ContigReader;
 use crate::query::field::FieldView;
+use crate::query::reader::OverlapIndex;
 use crate::query::sidecar::{DenseView, as_bytes, as_u32};
 use crate::rvk::{deletion_len, pack_snp_keys, unpack_snp_key_at};
 use crate::svar2_view::{OverlapMode, keeps, query_window, read_n_samples};
@@ -550,7 +551,7 @@ fn slice_genos_inner(
         regions,
         &query_regions,
         overlap,
-        |col_src, _s_orig, _p, qsw, qew| reader.vk_snp_index(col_src).overlap(qsw, qew),
+        |s_orig, p| reader.vk_snp_index(s_orig * ploidy + p),
         |i| snp_code_to_key(unpack_snp_key_at(vk_snp_keys, i)),
         |i| vk_snp_positions[i] + 1,
     );
@@ -565,14 +566,18 @@ fn slice_genos_inner(
         &query_regions,
         overlap,
         // The indel channel's tree search needs a per-(sample, ploid) max_del
-        // bound — `sample` here must be the ORIGINAL column
+        // bound — `s_orig` here must be the ORIGINAL column
         // (`vk_indel_max_del` is indexed by the source cohort, not the
         // subset), mirroring `find_ranges`'s `orig_s` usage.
-        |_col_src, s_orig, p, qsw, qew| reader.vk_indel_index(s_orig, p).overlap(qsw, qew),
+        |s_orig, p| reader.vk_indel_index(s_orig, p),
         |i| vk_indel_keys[i],
         |i| vk_indel_positions[i] + 1 + deletion_len(vk_indel_keys[i]),
     );
 
+    // One index per dense class for the whole request — `gather_dense` calls
+    // `region_hits` once per class, so building here is what keeps the
+    // per-region loop inside it tree-free.
+    let d_snp_ix = reader.dense_snp_index();
     let d_snp_g = gather_dense(
         reader.dense_snp.as_ref(),
         true,
@@ -581,9 +586,10 @@ fn slice_genos_inner(
         regions,
         &query_regions,
         overlap,
-        |qsw, qew| reader.dense_snp_overlap(qsw, qew),
+        |qsw, qew| d_snp_ix.overlap(qsw, qew),
     );
 
+    let d_indel_ix = reader.dense_indel_index();
     let d_indel_g = gather_dense(
         reader.dense_indel.as_ref(),
         false,
@@ -592,7 +598,7 @@ fn slice_genos_inner(
         regions,
         &query_regions,
         overlap,
-        |qsw, qew| reader.dense_indel_overlap(qsw, qew),
+        |qsw, qew| d_indel_ix.overlap(qsw, qew),
     );
 
     // ---- route ----
@@ -683,9 +689,9 @@ fn slice_genos_inner(
 }
 
 /// Region-overlap hit indices into `positions` (ascending, deduped): for each
-/// region, narrow via `overlap_range` (the tree-based windowed search over
-/// `query_regions[i]`'s widened bounds — identical to what `find_ranges` uses
-/// for this same region/column/class), then keep the calls that pass BOTH the
+/// region, narrow via `overlap_range` (one region's window from the column's
+/// prebuilt `OverlapIndex` — identical to what `find_ranges` uses for this
+/// same region/column/class), then keep the calls that pass BOTH the
 /// `keeps` POS-precision filter (against the ORIGINAL, unwidened region bounds)
 /// AND the per-element left-extent re-check `q_start < v_end`. Multiple regions
 /// may re-discover the same call; `dedup` after sorting collapses that (mirrors
@@ -729,10 +735,12 @@ fn region_hits(
 /// reads the source call's key into the uniform 32-bit key space (a SNP code
 /// re-expanded via `snp_code_to_key`, or an indel key verbatim); `v_end_of(i)`
 /// its right extent. Column order is the OUTPUT order (`sample_orig_idx` x
-/// ploidy) so the CSR emit stays a simple scan. `overlap_range` takes `(col_src,
-/// s_orig, p, q_start_widened, q_end_widened)` — the SNP caller ignores
-/// `s_orig`/`p` (its window doesn't depend on them), the indel caller needs
-/// both for the per-(sample, ploid) `max_del` bound.
+/// ploidy) so the CSR emit stays a simple scan.
+///
+/// `column_index(s_orig, p)` builds that column's search state ONCE, before the
+/// per-region loop; the SNP caller derives its flat column as `s_orig * ploidy
+/// + p`, the indel caller passes `(s_orig, p)` straight through because its
+/// `max_del` bound is per-(sample, ploid).
 #[allow(clippy::too_many_arguments)]
 fn gather_var_key(
     positions: &[u32],
@@ -741,21 +749,23 @@ fn gather_var_key(
     regions: &[(u32, u32)],
     query_regions: &[(u32, u32)],
     overlap: OverlapMode,
-    overlap_range: impl Fn(usize, usize, usize, u32, u32) -> Range<usize>,
+    column_index: impl Fn(usize, usize) -> OverlapIndex<'static>,
     key_of: impl Fn(usize) -> u32,
     v_end_of: impl Fn(usize) -> u32,
 ) -> Vec<GatheredCall> {
     let mut out = Vec::new();
     for (s_out, &s_orig) in sample_orig_idx.iter().enumerate() {
         for p in 0..ploidy {
-            let col_src = s_orig * ploidy + p;
             let col_out = s_out * ploidy + p;
+            // ONE index per column, built above the region loop inside
+            // `region_hits` — the #145 fix. Mirrors `find_ranges_haps`.
+            let ix = column_index(s_orig, p);
             let hits = region_hits(
                 positions,
                 regions,
                 query_regions,
                 overlap,
-                |qsw, qew| overlap_range(col_src, s_orig, p, qsw, qew),
+                |qsw, qew| ix.overlap(qsw, qew),
                 &v_end_of,
             );
             for i in hits {

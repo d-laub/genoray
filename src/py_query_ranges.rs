@@ -279,17 +279,20 @@ impl PyContigReader {
         };
 
         let dense = self.inner.dense_union();
+        let dense_ix = dense.index();
         let dense_range: Vec<Range<usize>> = regions
             .iter()
-            .map(|&(qs, qe)| dense.overlap(qs, qe))
+            .map(|&(qs, qe)| dense_ix.overlap(qs, qe))
             .collect();
+        let dense_snp_ix = self.inner.dense_snp_index();
         let dense_snp_range: Vec<Range<usize>> = regions
             .iter()
-            .map(|&(qs, qe)| self.inner.dense_snp_overlap(qs, qe))
+            .map(|&(qs, qe)| dense_snp_ix.overlap(qs, qe))
             .collect();
+        let dense_indel_ix = self.inner.dense_indel_index();
         let dense_indel_range: Vec<Range<usize>> = regions
             .iter()
-            .map(|&(qs, qe)| self.inner.dense_indel_overlap(qs, qe))
+            .map(|&(qs, qe)| dense_indel_ix.overlap(qs, qe))
             .collect();
         let region_starts: Vec<u32> = regions.iter().map(|&(qs, _)| qs).collect();
         let dmax = dense_max_end_keys(
