@@ -1,3 +1,21 @@
+## 3.4.0 (2026-07-31)
+
+### Feat
+
+- **svar2**: add _find_ranges_chunked memory-bounded stream API
+- **query**: add chunked find_ranges bindings
+- **query**: compute per-region max-end keys during the range sweep
+
+### Refactor
+
+- **query**: generalize VkColumnIndex into a Cow-backed OverlapIndex
+
+### Perf
+
+- **svar2**: build each var_key column's search tree once per slice
+- **query**: build each dense channel's search tree once per request
+- **query**: build each var_key column's search tree once
+
 ## 3.3.1 (2026-07-29)
 
 ### Fix
