@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, TypedDict
 
 import numpy as np
@@ -11,6 +12,57 @@ if TYPE_CHECKING:
     from numpy.typing import ArrayLike
 
     from genoray import _core
+
+#: Bit width reserved for ``ext`` in a packed max-end key. Mirrors Rust's
+#: ``query::MAX_END_SHIFT``; consumers unpack with
+#: ``end = (key >> MAX_END_SHIFT) + (key & ((1 << MAX_END_SHIFT) - 1))``.
+MAX_END_SHIFT = 21
+
+
+@dataclass(frozen=True)
+class RangesChunk:
+    """One hap slice of a chunked ``_find_ranges``.
+
+    Attributes:
+        sample_start: Offset of this chunk on the SELECTED sample axis.
+        n_samples: Number of selected samples in this chunk.
+        vk_snp_range: Shape ``(n_samples, ploidy, n_regions, 2)``, hap-major.
+        vk_indel_range: Shape ``(n_samples, ploidy, n_regions, 2)``, hap-major.
+        max_end_keys: Shape ``(n_regions,)``. Packed ``(pos << MAX_END_SHIFT) |
+            ext`` maxima over this chunk's haps; ``0`` means no variant. Reduce
+            across chunks with an elementwise maximum BEFORE unpacking -- the
+            ordering rule is position first, end second, so reducing unpacked
+            ends would pick the wrong variant.
+    """
+
+    sample_start: int
+    n_samples: int
+    vk_snp_range: "np.ndarray"
+    vk_indel_range: "np.ndarray"
+    max_end_keys: "np.ndarray"
+
+
+@dataclass(frozen=True)
+class RangesStream:
+    """Memory-bounded, chunked form of ``_find_ranges``.
+
+    The ``O(n_regions)`` arrays are computed eagerly; the
+    ``O(n_regions * n_samples * ploidy)`` payload arrives via ``chunks``.
+    ``n_samples`` is the progress denominator and each ``RangesChunk`` reports
+    how many samples it advanced by.
+    """
+
+    n_regions: int
+    n_samples: int
+    ploidy: int
+    samples_per_chunk: int
+    region_starts: "np.ndarray"
+    dense_range: "np.ndarray"
+    dense_snp_range: "np.ndarray"
+    dense_indel_range: "np.ndarray"
+    sample_cols: "np.ndarray"
+    dense_max_end_keys: "np.ndarray"
+    chunks: "Iterator[RangesChunk]"
 
 
 class BatchResult(TypedDict):
@@ -166,3 +218,95 @@ class _BatchQueryMixin:
                     f"(got {want!r}, bundle has {have!r})"
                 )
         return self._reader(contig).gather_ranges(ranges)
+
+    def _find_ranges_chunked(
+        self,
+        contig: str,
+        starts: "ArrayLike",
+        ends: "ArrayLike",
+        samples: "ArrayLike | None" = None,
+        *,
+        max_mem: int | None = None,
+    ) -> RangesStream:
+        """Chunked, memory-bounded ``_find_ranges``.
+
+        ``starts``/``ends`` and ``samples`` behave as in :meth:`read_ranges`.
+
+        The var_key payload is ``n_regions * n_samples * ploidy * 2`` int64
+        pairs per channel, which is tens of GiB at cohort scale. This splits it
+        along the SAMPLE axis -- not the region axis -- because the search is
+        column-outer: chunking regions would re-sweep the whole packed store per
+        chunk, while chunking samples keeps a single sweep.
+
+        Args:
+            contig: Contig name.
+            starts: 0-based start positions of the query regions.
+            ends: 0-based, exclusive end positions of the query regions.
+            samples: Sample names selecting (and reordering) a subset.
+            max_mem: Approximate byte budget for one chunk's payload. ``None``
+                yields a single chunk covering every sample.
+
+        Returns:
+            A :class:`RangesStream` whose ``chunks`` generator yields
+            :class:`RangesChunk` in ascending ``sample_start`` order.
+
+        Raises:
+            ValueError: If ``max_mem`` cannot fit a single sample's payload, or
+                if the contig's largest deletion overflows the max-end key
+                packing width.
+        """
+        reg = self._regions(starts, ends)
+        sample_idxs = self._sample_idxs(samples)
+        reader = self._reader(contig)
+        header = reader.find_ranges_header(reg, sample_idxs)
+
+        n_regions = int(header["n_regions"])
+        n_samples = int(header["n_samples"])
+        ploidy = int(header["ploidy"])
+
+        # Both channels, 2 endpoints, int64. The 2x is slop for the transient
+        # the binding holds while handing the arrays back.
+        bytes_per_sample = n_regions * ploidy * 2 * 8 * 2
+        if max_mem is None:
+            per = max(n_samples, 1)
+        else:
+            per = (
+                int(max_mem) // (2 * bytes_per_sample)
+                if bytes_per_sample
+                else n_samples
+            )
+            if per < 1:
+                raise ValueError(
+                    f"max_mem ({int(max_mem)} bytes) is too small for even one "
+                    f"sample of {n_regions} regions at ploidy {ploidy}: needs at "
+                    f"least {2 * bytes_per_sample} bytes."
+                )
+            per = min(per, max(n_samples, 1))
+
+        def _gen() -> "Iterator[RangesChunk]":
+            for s0 in range(0, n_samples, per):
+                s1 = min(s0 + per, n_samples)
+                d = reader.find_ranges_chunk(reg, sample_idxs, s0 * ploidy, s1 * ploidy)
+                cs = s1 - s0
+                shape = (cs, ploidy, n_regions, 2)
+                yield RangesChunk(
+                    sample_start=s0,
+                    n_samples=cs,
+                    vk_snp_range=np.asarray(d["vk_snp_range"]).reshape(shape),
+                    vk_indel_range=np.asarray(d["vk_indel_range"]).reshape(shape),
+                    max_end_keys=np.asarray(d["max_end_keys"], np.int64),
+                )
+
+        return RangesStream(
+            n_regions=n_regions,
+            n_samples=n_samples,
+            ploidy=ploidy,
+            samples_per_chunk=per,
+            region_starts=np.asarray(header["region_starts"]),
+            dense_range=np.asarray(header["dense_range"]),
+            dense_snp_range=np.asarray(header["dense_snp_range"]),
+            dense_indel_range=np.asarray(header["dense_indel_range"]),
+            sample_cols=np.asarray(header["sample_cols"]),
+            dense_max_end_keys=np.asarray(header["dense_max_end_keys"], np.int64),
+            chunks=_gen(),
+        )

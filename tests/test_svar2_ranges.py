@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from genoray import SparseVar2
+from genoray._svar2_batch import MAX_END_SHIFT
 
 
 def _assert_dicts_equal(a: dict[str, Any], b: dict[str, Any], keys: Iterable[str]):
@@ -134,4 +135,74 @@ def test_find_ranges_chunk_matches_find_ranges(svar2_store: Path):
     np.testing.assert_array_equal(
         indel.transpose(1, 0, 2).reshape(R * H, 2),
         np.asarray(bundle["vk_indel_range"]),
+    )
+
+
+def _reassemble(stream) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    R, P, S = stream.n_regions, stream.ploidy, stream.n_samples
+    snp = np.empty((S, P, R, 2), np.int64)
+    indel = np.empty((S, P, R, 2), np.int64)
+    keys = stream.dense_max_end_keys.copy()
+    for ch in stream.chunks:
+        s0, s1 = ch.sample_start, ch.sample_start + ch.n_samples
+        snp[s0:s1] = ch.vk_snp_range
+        indel[s0:s1] = ch.vk_indel_range
+        np.maximum(keys, ch.max_end_keys, out=keys)
+    return snp, indel, keys
+
+
+@pytest.mark.parametrize("max_mem", [None, 1 << 30, 1])
+def test_chunked_matches_find_ranges(svar2_store: Path, max_mem):
+    """Every chunking, including one sample per chunk, reassembles identically."""
+    sv = SparseVar2(svar2_store)
+    starts, ends = [0, 5], [40, 20]
+    bundle = sv._find_ranges("chr1", starts, ends)
+    R, P, S = 2, sv.ploidy, sv.n_samples
+
+    if max_mem == 1:
+        # 1 byte cannot fit a sample; the API must say so rather than silently
+        # producing a zero-sized chunk.
+        with pytest.raises(ValueError, match="max_mem"):
+            sv._find_ranges_chunked("chr1", starts, ends, max_mem=max_mem)
+        return
+
+    stream = sv._find_ranges_chunked("chr1", starts, ends, max_mem=max_mem)
+    snp, indel, _ = _reassemble(stream)
+    np.testing.assert_array_equal(
+        snp.reshape(S * P, R, 2).transpose(1, 0, 2).reshape(R * S * P, 2),
+        np.asarray(bundle["vk_snp_range"]),
+    )
+    np.testing.assert_array_equal(
+        indel.reshape(S * P, R, 2).transpose(1, 0, 2).reshape(R * S * P, 2),
+        np.asarray(bundle["vk_indel_range"]),
+    )
+
+
+def test_chunked_max_end_keys_unpack_to_variant_ends(svar2_store: Path):
+    """The reduced key unpacks to the end of the highest-position variant.
+
+    The fixture's chr1 carries SNP@2, INS@6 and DEL@11 (ilen -2, so it ends at
+    11 + 1 + 2 = 14). Region [0, 40) therefore ends at 14; region [0, 5) sees
+    only SNP@2, which ends at 3.
+    """
+    sv = SparseVar2(svar2_store)
+    stream = sv._find_ranges_chunked("chr1", [0, 0], [40, 5])
+    _, _, keys = _reassemble(stream)
+    mask = (1 << MAX_END_SHIFT) - 1
+    ends = (keys >> MAX_END_SHIFT) + (keys & mask)
+    assert keys[0] != 0 and keys[1] != 0
+    assert int(ends[0]) == 14
+    assert int(ends[1]) == 3
+
+
+def test_chunked_sample_subset(svar2_store: Path):
+    """A sample subset takes the carriage-probing dense path, not the fast path."""
+    sub = [SparseVar2(svar2_store).available_samples[1]]
+    sv = SparseVar2(svar2_store)
+    bundle = sv._find_ranges("chr1", [0], [40], samples=sub)
+    stream = sv._find_ranges_chunked("chr1", [0], [40], samples=sub)
+    assert stream.n_samples == 1
+    snp, _, _ = _reassemble(stream)
+    np.testing.assert_array_equal(
+        snp.reshape(-1, 2), np.asarray(bundle["vk_snp_range"])
     )
