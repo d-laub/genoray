@@ -30,11 +30,10 @@ impl DenseUnion {
     /// Region-independent search state over the union, built once by the
     /// callers that actually search it.
     ///
-    /// This is deliberately NOT built inside `dense_union()`: `gather_ranges`,
-    /// `dense_max_end_keys` and `ContigReader::max_deletion_len` all construct
-    /// a `DenseUnion` without ever overlapping it, and must not be charged a
-    /// `SearchTree::new` they never use. Borrows `v_ends`, so building an index
-    /// copies nothing.
+    /// This is deliberately NOT built inside `dense_union()`: `gather_ranges`
+    /// and `dense_max_end_keys` both take a `DenseUnion` without ever
+    /// overlapping it, and must not be charged a `SearchTree::new` they never
+    /// use. Borrows `v_ends`, so building an index copies nothing.
     pub(crate) fn index(&self) -> OverlapIndex<'_> {
         if self.refs.is_empty() {
             return OverlapIndex::empty(0);
@@ -45,11 +44,6 @@ impl DenseUnion {
             Cow::Borrowed(self.v_ends.as_slice()),
             self.max_del,
         )
-    }
-
-    /// The per-contig dense deletion bound, for the caller's overflow preflight.
-    pub(crate) fn max_del(&self) -> u32 {
-        self.max_del
     }
 }
 

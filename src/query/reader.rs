@@ -149,6 +149,13 @@ impl ContigReader {
     /// Generic over `T: VkElem` so the no-provenance (`KeyRef`) and
     /// provenance-carrying (`SrcKeyRef`) callers share one body; `T = KeyRef`
     /// is zero-cost (`KeyRef::make` discards the provenance args).
+    ///
+    /// Search and gather are FUSED here: each call rebuilds the column's
+    /// `SearchTree` via `spine::gather_keys`. That is correct for the single
+    /// region `oracle::overlap_sample` asks for — now the only caller — and
+    /// deliberately independent of the optimized `find_ranges`/`gather_ranges`
+    /// path it cross-checks. Do NOT call it inside a region loop: that is the
+    /// `O(regions x columns)` shape #148 removed from `overlap_batch`.
     pub(crate) fn vk_slice<T: spine::VkElem>(
         &self,
         col: usize,
@@ -340,13 +347,21 @@ impl ContigReader {
 
 impl ContigReader {
     /// The largest deletion span on this contig across both the per-hap indel
-    /// channel and the dense union. Callers packing max-end keys must check
-    /// `1 + max_deletion_len() < (1 << MAX_END_SHIFT)` before doing so — a
-    /// pathological >~2 Mb deletion footprint would otherwise silently corrupt
-    /// the packed key.
+    /// channel and the dense class tables. Callers packing max-end keys must
+    /// check `1 + max_deletion_len() < (1 << MAX_END_SHIFT)` before doing so —
+    /// a pathological >~2 Mb deletion footprint would otherwise silently
+    /// corrupt the packed key.
+    ///
+    /// Reads `dense_indel_max_del` directly rather than going through
+    /// `dense_union().max_del()`: `DenseUnion::max_del` is unconditionally a
+    /// copy of this same field (`union.rs`), so the union build was an
+    /// `O(dense variants log dense variants)` sort over the whole contig for a
+    /// value already resident. That mattered on the chunked write path, where
+    /// `find_ranges_header` calls this for its overflow preflight and then
+    /// builds a union of its own for the real work.
     pub fn max_deletion_len(&self) -> u32 {
         let vk = self.vk_indel_max_del.iter().copied().max().unwrap_or(0);
-        vk.max(self.dense_union().max_del())
+        vk.max(self.dense_indel_max_del)
     }
 }
 

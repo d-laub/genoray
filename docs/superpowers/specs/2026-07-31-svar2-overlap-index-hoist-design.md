@@ -223,5 +223,13 @@ precisely.
 
 - `src/spine.rs:141` and `src/svar1_query.rs:60` build trees on the SVAR1 /
   spine paths, which have a different call shape and are not region-looped here.
+
+  **Correction (#148, 2026-07-31):** the second half of that sentence is wrong
+  for `spine.rs:141`. `overlap_batch_impl` *was* region-looped around
+  `vk_slice` -> `spine::gather_keys`, so it kept an `O(regions x columns)` tree
+  build after this PR. Excluding it was still right for this PR's scope; the
+  stated reason was not. Fixed in
+  `2026-07-31-searchtree-construction-audit-design.md`. (`svar1_query.rs:60` is
+  correctly described — it builds one tree per contig batch.)
 - No public Python surface changes — `OverlapIndex` and every constructor are
   `pub(crate)`. `skills/genoray-api/SKILL.md` needs no update.
