@@ -240,6 +240,41 @@ fn synth_reader_dense_tie(out: &std::path::Path) -> ContigReader {
     ContigReader::open(out.to_str().unwrap(), "chr1", 2, 2).unwrap()
 }
 
+/// Two dense-routed indel variants (`x_calls = 2` each, so both stay `Dense`
+/// per `cost_model` at `np = 4`), each carried EXCLUSIVELY by one of the two
+/// samples -- unlike every other fixture in this file, where every dense
+/// variant is carried by both samples, which means a carriage probe that
+/// silently ignored `sample_cols` (or used the wrong per-sample hap stride)
+/// would coincidentally still agree with the correct one. See
+/// `test_dense_max_end_keys_excludes_uncarried_sample`'s doc comment.
+///
+/// INS@200 (ref "A" -> "AT", ext 1, end 201) is carried by S1 alone (both
+/// haps: `gt = [0, 0, 1, 1]`). DEL@300 (ref "AT" -> "A", ext 2, end 302) is
+/// carried by S0 alone (`gt = [1, 1, 0, 0]`). Neither ref allele is a
+/// homopolymer run (`normalize::left_align` rolls a deletion left only while
+/// `ref_seq[pos] == ref_seq[pos + ndel]`; "AT" has no repeated base to
+/// trigger that -- see `synth_reader_tiebreak`'s doc comment for the case
+/// where this bites), so both positions stay exactly where placed.
+fn synth_reader_carrier_subset(out: &std::path::Path) -> ContigReader {
+    let samples = ["S0", "S1"];
+    let records = vec![
+        SynthRecord {
+            pos: 200,
+            ref_allele: b"A",
+            alts: vec![&b"AT"[..]],
+            gt: vec![0, 0, 1, 1],
+        },
+        SynthRecord {
+            pos: 300,
+            ref_allele: b"AT",
+            alts: vec![&b"A"[..]],
+            gt: vec![1, 1, 0, 0],
+        },
+    ];
+    build_contig(out, "chr1", &samples, 2, &records);
+    ContigReader::open(out.to_str().unwrap(), "chr1", 2, 2).unwrap()
+}
+
 /// `n_samples` samples at `ploidy` (flat gt layout `[s0_p0, s0_p1, ...]`),
 /// carrying three variants scattered across the hap axis (first hap, an
 /// interior hap, last hap) so per-hap max-end keys actually vary. Built for
@@ -648,6 +683,51 @@ fn test_dense_max_end_keys_scans_full_tied_run() {
         204,
         "must pick the longer deletion (ext=4, end=204), not the shorter tied \
          one (ext=2, end=202) the backward walk hits first"
+    );
+}
+
+/// `dense_max_end_keys`'s `all_samples = false` carriage-probe branch must
+/// actually restrict to the selected samples, not just execute the same code
+/// path and land on `all_samples`'s answer anyway. Every other fixture in
+/// this file has each dense variant carried by both samples, so a probe that
+/// silently ignored `sample_cols` -- or one with the wrong per-sample hap
+/// stride (`s * ploidy + p`) -- would coincidentally still agree with the
+/// correct one there; this is the only test (Rust or Python) that can tell
+/// the difference.
+///
+/// Selecting ONLY S1 (`sample_cols = [1]`) must exclude DEL@300 (S0-exclusive,
+/// the higher position) and fall back to INS@200's end (201). Selecting ONLY
+/// S0 is the mirror image. Selecting both is a sanity check that the fixture
+/// behaves like every other one here when nothing is excluded.
+#[test]
+fn test_dense_max_end_keys_excludes_uncarried_sample() {
+    let tmp = tempdir().unwrap();
+    let out = tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let reader = synth_reader_carrier_subset(&out);
+
+    let regions = vec![(0u32, 1_000u32)];
+    let dense_range = find_ranges(&reader, &regions, None).dense_range;
+
+    let both = dense_max_end_keys(&reader, &regions, &dense_range, &[0usize, 1usize], false);
+    assert_eq!(
+        unpack_end(both[0]),
+        302,
+        "with no exclusion, DEL@300 (higher position) wins, as in every other fixture here"
+    );
+
+    let s1_only = dense_max_end_keys(&reader, &regions, &dense_range, &[1usize], false);
+    assert_eq!(
+        unpack_end(s1_only[0]),
+        201,
+        "S1 does not carry DEL@300; the probe must fall back to its own INS@200"
+    );
+
+    let s0_only = dense_max_end_keys(&reader, &regions, &dense_range, &[0usize], false);
+    assert_eq!(
+        unpack_end(s0_only[0]),
+        302,
+        "S0 does not carry INS@200, but does carry DEL@300"
     );
 }
 
