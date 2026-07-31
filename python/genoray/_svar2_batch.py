@@ -264,8 +264,11 @@ class _BatchQueryMixin:
         n_samples = int(header["n_samples"])
         ploidy = int(header["ploidy"])
 
-        # Both channels, 2 endpoints, int64. The 2x is slop for the transient
-        # the binding holds while handing the arrays back.
+        # `bytes_per_sample` is the real per-sample payload: both channels
+        # (snp + indel) x 2 endpoints x int64 x ploidy x regions. The extra
+        # `2 *` in the division below -- not this factor -- is the safety
+        # margin, covering the transient the binding holds while handing the
+        # freshly filled arrays back.
         bytes_per_sample = n_regions * ploidy * 2 * 8 * 2
         if max_mem is None:
             per = max(n_samples, 1)

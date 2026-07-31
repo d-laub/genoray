@@ -202,7 +202,19 @@ def test_chunked_sample_subset(svar2_store: Path):
     bundle = sv._find_ranges("chr1", [0], [40], samples=sub)
     stream = sv._find_ranges_chunked("chr1", [0], [40], samples=sub)
     assert stream.n_samples == 1
-    snp, _, _ = _reassemble(stream)
+    snp, _, keys = _reassemble(stream)
     np.testing.assert_array_equal(
         snp.reshape(-1, 2), np.asarray(bundle["vk_snp_range"])
     )
+
+    # Pins the subset path's max-end output to a fixture-derived constant, so
+    # a gross regression in the carriage-probe branch (e.g. it stops firing,
+    # or returns garbage) doesn't go unnoticed. This does NOT verify genuine
+    # per-sample carrier filtering: on this fixture both dense-routed variants
+    # (INS@6, DEL@11) are carried by BOTH samples, so a probe that ignored
+    # `sample_cols` entirely would produce this exact same value. Real
+    # carrier-filtering coverage -- a fixture where the excluded sample's
+    # variant actually differs from the included one's -- lives in
+    # tests/test_ranges_split.rs::test_dense_max_end_keys_excludes_uncarried_sample.
+    expected_key = (11 << MAX_END_SHIFT) | 3  # DEL@11: ext = 1 + del_len(2) = 3, end 14
+    assert int(keys[0]) == expected_key
