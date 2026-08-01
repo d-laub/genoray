@@ -15,6 +15,7 @@ use crate::spine::{self, KeyRef, SrcKeyRef, VkElem};
 use super::decode::{HapCalls, decode_keyref};
 use super::reader::ContigReader;
 use super::sidecar::{as_bytes, as_u32};
+use super::union::DenseUnion;
 
 /// CSR presence-bitmask accumulator: owns the `(bits, offsets)` pair, one row of
 /// `nbits` bits appended per hap. `offsets` starts `[0]`; after each `push_hap`,
@@ -180,14 +181,23 @@ pub(crate) fn gather_vk<T: VkElem>(
 }
 
 /// Batched multi-region × whole-cohort query. `regions` is a list of half-open
-/// `[q_start, q_end)`. Single-threaded; `rayon` over the H hap-slices and dense-
-/// window subsetting are M6b concerns (see the design spec's open questions).
+/// `[q_start, q_end)`.
 ///
-/// The no-provenance, zero-cost path (`T = KeyRef`; byte-identical to before
-/// `overlap_batch_impl` was introduced — `vk_src` stays empty and `KeyRef::make`
-/// discards the provenance args, so `spine::pack_vk_src` never runs).
+/// The no-provenance path (`T = KeyRef`): `vk_src` stays empty and
+/// `KeyRef::make` discards the provenance args, so `spine::pack_vk_src` never
+/// runs.
+///
+/// Exactly `read_ranges(reader, regions, None)` — the whole-cohort case of the
+/// search/gather split, which is what this has always been *documented* to be
+/// byte-identical to. It used to be a second, independent region-outer loop
+/// calling `vk_slice` per (region, sample, ploid), which rebuilt each column's
+/// `SearchTree` once per region (#148). Routing it through `find_ranges`
+/// instead of hoisting inside a duplicated loop is what drops that to one build
+/// per column AND removes the duplicate. Note the search half fans out over
+/// rayon above `PAR_COLUMN_THRESHOLD` haps, so this is no longer
+/// single-threaded.
 pub fn overlap_batch(reader: &ContigReader, regions: &[(u32, u32)]) -> BatchResult {
-    overlap_batch_impl::<KeyRef>(reader, regions)
+    batch_impl::<KeyRef>(reader, regions, None)
 }
 
 /// As `overlap_batch`, but additionally populates `vk_src` so a consumer can
@@ -195,7 +205,7 @@ pub fn overlap_batch(reader: &ContigReader, regions: &[(u32, u32)]) -> BatchResu
 /// index)` and index a `FieldView`. This is the entry point
 /// `decode_batch_fields` uses to read fields over the whole-cohort batch path.
 pub fn overlap_batch_src(reader: &ContigReader, regions: &[(u32, u32)]) -> BatchResult {
-    overlap_batch_impl::<SrcKeyRef>(reader, regions)
+    batch_impl::<SrcKeyRef>(reader, regions, None)
 }
 
 /// Local extension of `spine::VkElem` (kept in `gather.rs` rather than
@@ -217,91 +227,23 @@ impl DenseSrcElem for SrcKeyRef {
     const CARRIES_SRC: bool = true;
 }
 
-/// Shared body of `overlap_batch`/`overlap_batch_src`, generic over `T: VkElem`
-/// the same way `gather_haps_readbound_impl` is (see that function's doc
-/// comment). The only difference from the original monomorphic
-/// `overlap_batch` is `reader.vk_slice::<T>(...)`, the final `T::split(vk)`,
-/// and (for `dense_src`) `T::CARRIES_SRC`.
-fn overlap_batch_impl<T: DenseSrcElem>(
+/// Shared body of `overlap_batch`/`overlap_batch_src`/`read_ranges`: the fused
+/// search+gather, generic over `T: DenseSrcElem` the same way
+/// `gather_haps_readbound_impl` is (see that function's doc comment).
+///
+/// The `DenseUnion` is built HERE, exactly once, and lent to the search half
+/// before being handed to the gather half by value. Letting `find_ranges` and
+/// `gather_ranges` each build their own — which is what the public wrappers do,
+/// since they are separately callable — costs a second
+/// `O(dense variants log dense variants)` sort per query.
+fn batch_impl<T: DenseSrcElem>(
     reader: &ContigReader,
     regions: &[(u32, u32)],
+    samples: Option<&[usize]>,
 ) -> BatchResult {
-    let ploidy = reader.ploidy;
-    let n_samples = reader.n_samples;
-    let n_regions = regions.len();
-
     let dense = reader.dense_union();
-    // Per-region dense index ranges — shared across all samples in the region.
-    // One index for the whole batch: `SearchTree::new` runs once, not per region.
-    let dense_ix = dense.index();
-    let ranges: Vec<Range<usize>> = regions
-        .iter()
-        .map(|&(qs, qe)| dense_ix.overlap(qs, qe))
-        .collect();
-
-    let mut vk: Vec<T> = Vec::new();
-    let mut vk_off: Vec<usize> = vec![0];
-    let mut presence = PresenceBitWriter::new();
-
-    for (r, &(qs, qe)) in regions.iter().enumerate() {
-        let (ds, de) = (ranges[r].start, ranges[r].end);
-        for s in 0..n_samples {
-            for p in 0..ploidy {
-                let col = s * ploidy + p;
-
-                // var_key channel slice for (region r, sample s, ploid p).
-                let slice: Vec<T> = reader.vk_slice(col, s, p, qs, qe);
-                vk.extend_from_slice(&slice);
-                vk_off.push(vk.len());
-
-                // dense presence bits over dense[ds..de].
-                let nbits = de - ds;
-                presence.push_hap(nbits, |k| {
-                    let j = ds + k;
-                    let (class, dcol) = dense.src[j];
-                    let carried = reader
-                        .dense_view(class)
-                        .expect("dense src implies table")
-                        .carried(col, dcol);
-                    carried && dense.v_ends[j] > qs
-                });
-            }
-        }
-    }
-
-    let (dense_present, dense_present_off) = presence.into_parts();
-    // Project the generic element back into the frozen (vk, vk_src) contract
-    // — see `gather_haps_readbound_impl`'s identical final step.
-    let (vk, vk_src) = T::split(vk);
-
-    // Capture dense provenance ONCE, here, where `dense` (the whole-contig
-    // union) is already built exactly once per query — this is what lets
-    // `decode_hap_src` avoid ever calling `dense_union()` itself. Only paid
-    // for on the provenance-carrying path (`T::CARRIES_SRC`); the plain path
-    // stays a `Vec::new()`.
-    let dense_src: Vec<(bool, u32)> = if T::CARRIES_SRC {
-        dense
-            .src
-            .iter()
-            .map(|&(class, col)| (matches!(class, crate::dense::DenseClass::Indel), col as u32))
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    BatchResult {
-        n_regions,
-        n_samples,
-        ploidy,
-        vk,
-        vk_off,
-        vk_src,
-        dense: dense.refs,
-        dense_range: ranges,
-        dense_present,
-        dense_present_off,
-        dense_src,
-    }
+    let rb = find_ranges_with(reader, regions, samples, &dense);
+    gather_ranges_impl::<T>(reader, &rb, dense)
 }
 
 /// Search-only half of the batch query: every `SearchTree::new` runs here, and
@@ -468,6 +410,19 @@ pub fn find_ranges(
     regions: &[(u32, u32)],
     samples: Option<&[usize]>,
 ) -> RangesBundle {
+    find_ranges_with(reader, regions, samples, &reader.dense_union())
+}
+
+/// `find_ranges` over a caller-supplied `DenseUnion`. Split out so `batch_impl`
+/// can build the union once and hand the SAME one to the gather half; the
+/// public `find_ranges` above builds its own, since it is separately callable
+/// (`_find_ranges` on the Python side) and its bundle is replayed later.
+fn find_ranges_with(
+    reader: &ContigReader,
+    regions: &[(u32, u32)],
+    samples: Option<&[usize]>,
+    dense: &DenseUnion,
+) -> RangesBundle {
     let ploidy = reader.ploidy;
     let sample_cols: Vec<usize> = match samples {
         Some(s) => s.to_vec(),
@@ -479,7 +434,6 @@ pub fn find_ranges(
 
     // Region-independent union and dense class indices, each built ONCE for the
     // whole batch — this is the O(regions x channels) -> O(channels) fix.
-    let dense = reader.dense_union();
     let dense_ix = dense.index();
     let dense_range: Vec<Range<usize>> = regions
         .iter()
@@ -544,23 +498,38 @@ pub fn find_ranges(
     }
 }
 
-/// Tree-free gather: replay a `RangesBundle` into the same `BatchResult` that
-/// `overlap_batch` produces. Contains NO `SearchTree::new` — the search
-/// already happened in `find_ranges`. Mirrors `overlap_batch`'s inner loop
-/// exactly, except the var_key channel is replayed from the precomputed
-/// ranges (no per-column `SearchTree` rebuild, no per-element `carried` test
-/// — `vk_slice`'s `carried` closure is `|_| true` for both channels, so only
-/// the `q_start < v_end` left-overlap re-check remains) and the loop runs
-/// over the *selected* sample slots.
+/// Tree-free gather: replay a `RangesBundle` into a `BatchResult`. Contains NO
+/// `SearchTree::new` — the search already happened in `find_ranges`. The
+/// var_key channel is replayed from the precomputed ranges (no per-column
+/// `SearchTree` rebuild, no per-element `carried` test — the oracle's
+/// `vk_slice` passes `|_| true` for both channels, so only the `q_start <
+/// v_end` left-overlap re-check remains), and the loop runs over the
+/// *selected* sample slots.
 pub fn gather_ranges(reader: &ContigReader, rb: &RangesBundle) -> BatchResult {
+    let dense = reader.dense_union();
+    gather_ranges_impl::<KeyRef>(reader, rb, dense)
+}
+
+/// Shared body of `gather_ranges` / the gather half of `batch_impl`, generic
+/// over `T: DenseSrcElem` exactly as `gather_haps_readbound_impl` is: `T =
+/// KeyRef` leaves `vk_src`/`dense_src` empty and compiles the provenance away,
+/// `T = SrcKeyRef` populates both.
+///
+/// Takes the `DenseUnion` BY VALUE: `BatchResult::dense` is `dense.refs` moved
+/// out, so borrowing here would force an `O(dense variants)` clone. The search
+/// half only ever needs `&DenseUnion`, and it always runs first, so
+/// lend-then-hand-over is the natural ordering.
+fn gather_ranges_impl<T: DenseSrcElem>(
+    reader: &ContigReader,
+    rb: &RangesBundle,
+    dense: DenseUnion,
+) -> BatchResult {
     let ploidy = rb.ploidy;
     let n_samples = rb.n_samples;
     let n_regions = rb.n_regions;
     let hpr = n_samples * ploidy; // haps per region
 
-    let dense = reader.dense_union();
-
-    let mut vk: Vec<KeyRef> = Vec::new();
+    let mut vk: Vec<T> = Vec::new();
     let mut vk_off: Vec<usize> = vec![0];
     let mut presence = PresenceBitWriter::new();
 
@@ -584,7 +553,7 @@ pub fn gather_ranges(reader: &ContigReader, rb: &RangesBundle) -> BatchResult {
                 vk.extend_from_slice(&merged);
                 vk_off.push(vk.len());
 
-                // --- dense presence bits (verbatim from overlap_batch) ---
+                // --- dense presence bits ---
                 let nbits = de - ds;
                 presence.push_hap(nbits, |k| {
                     let j = ds + k;
@@ -600,6 +569,24 @@ pub fn gather_ranges(reader: &ContigReader, rb: &RangesBundle) -> BatchResult {
     }
 
     let (dense_present, dense_present_off) = presence.into_parts();
+    // Project the generic element back into the frozen (vk, vk_src) contract
+    // — see `gather_haps_readbound_impl`'s identical final step.
+    let (vk, vk_src) = T::split(vk);
+
+    // Capture dense provenance ONCE, here, where `dense` (the whole-contig
+    // union) is already built exactly once per query — this is what lets
+    // `decode_hap_src` avoid ever calling `dense_union()` itself. Only paid
+    // for on the provenance-carrying path (`T::CARRIES_SRC`); the plain path
+    // stays a `Vec::new()`.
+    let dense_src: Vec<(bool, u32)> = if T::CARRIES_SRC {
+        dense
+            .src
+            .iter()
+            .map(|&(class, col)| (matches!(class, crate::dense::DenseClass::Indel), col as u32))
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     BatchResult {
         n_regions,
@@ -607,12 +594,12 @@ pub fn gather_ranges(reader: &ContigReader, rb: &RangesBundle) -> BatchResult {
         ploidy,
         vk,
         vk_off,
-        vk_src: Vec::new(),
+        vk_src,
         dense: dense.refs,
         dense_range: rb.dense_range.clone(),
         dense_present,
         dense_present_off,
-        dense_src: Vec::new(),
+        dense_src,
     }
 }
 
@@ -940,15 +927,19 @@ pub fn dense_abs_row(on_disk: &Range<usize>, out: &Range<usize>, i: usize) -> us
     on_disk.start + (i - out.start)
 }
 
-/// Fused search+gather: `find_ranges` then `gather_ranges` in one call. The
+/// Fused search+gather: the search half then the gather half in one call. The
 /// public/live-query analog of the split; byte-identical to `overlap_batch`
-/// when `samples = None`, and the parity oracle for sample subsetting.
+/// when `samples = None` — literally the same code path — and the parity oracle
+/// for sample subsetting.
+///
+/// Not `gather_ranges(reader, &find_ranges(..))`: that spelling builds the
+/// `DenseUnion` twice, once in each half. `batch_impl` builds it once.
 pub fn read_ranges(
     reader: &ContigReader,
     regions: &[(u32, u32)],
     samples: Option<&[usize]>,
 ) -> BatchResult {
-    gather_ranges(reader, &find_ranges(reader, regions, samples))
+    batch_impl::<KeyRef>(reader, regions, samples)
 }
 
 impl BatchResult {

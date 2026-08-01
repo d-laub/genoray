@@ -3,9 +3,13 @@
 //! `gather_keys` and `merge_keys` are the pure half of what M5's `query.rs`
 //! did inline: overlap-resolve a position run into undecoded `(position, key)`
 //! pairs, and merge already-sorted runs. They carry **uniform 32-bit keys** and
-//! never touch alleles or the LUT — decoding is the consumer's job. Splitting
-//! them out lets both `overlap_sample` and the batched `overlap_batch` share one
-//! gather/merge and one uniform-key convention.
+//! never touch alleles or the LUT — decoding is the consumer's job.
+//!
+//! `merge_by_position` is shared by every query path. `gather_keys` is NOT: it
+//! fuses a `SearchTree` build into each call, which only suits a single-region
+//! query, so since #148 its one caller is `ContigReader::vk_slice` ->
+//! `oracle::overlap_sample`. The batched paths hoist the search into
+//! `find_ranges` and replay it with `gather_vk`.
 
 use crate::search::{SearchTree, overlap_range};
 

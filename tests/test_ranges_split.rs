@@ -5,6 +5,7 @@ mod common;
 
 use common::{SynthRecord, build_contig};
 use genoray_core::py_query::PyContigReader;
+use genoray_core::query::gather::overlap_batch_src;
 use genoray_core::query::{
     ContigReader, MAX_END_SHIFT, PAR_COLUMN_THRESHOLD, dense_max_end_keys, find_ranges,
     find_ranges_haps, gather_ranges, overlap_batch, read_ranges,
@@ -771,4 +772,165 @@ fn test_max_end_keys_parallel_matches_serial_reduction() {
     // Sanity: the fixture actually carries a variant in [0, 1000), so this
     // isn't vacuously comparing two zero vectors.
     assert_ne!(whole[0], 0);
+}
+
+/// Companion to `test_find_ranges_tree_builds_do_not_scale_with_regions` for
+/// the batch entry point (#148). `overlap_batch` used to run its OWN
+/// region-outer loop calling `vk_slice` per (region, sample, ploid), and
+/// `vk_slice` -> `spine::gather_keys` rebuilds the column's `SearchTree` on
+/// every call — so tree builds were `O(regions x columns)` here long after
+/// #144/#145 had removed that shape from `find_ranges` and `svar2_slice`.
+///
+/// Same fixture and same reasoning as the `find_ranges` guard: `synth_reader`
+/// populates only one of the four `vk_snp` columns, which lets the unfixed
+/// growth tie a per-region allowance, so this uses `synth_reader_wide` (all 4
+/// columns non-empty). 4 columns is well under `PAR_COLUMN_THRESHOLD`, so the
+/// search half stays on this thread and `search::search_tree_build_count` — a
+/// thread-local — remains observable.
+///
+/// Exact equality, not an allowance: no channel may build a tree per region.
+#[test]
+fn test_overlap_batch_tree_builds_do_not_scale_with_regions() {
+    let tmp = tempdir().unwrap();
+    let out = tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let reader = synth_reader_wide(&out);
+
+    let one = vec![(0u32, 1_000_000u32)];
+    let many: Vec<(u32, u32)> = (0..16).map(|i| (i * 20, i * 20 + 1_000_000)).collect();
+
+    let b0 = search::search_tree_build_count();
+    let _ = overlap_batch(&reader, &one);
+    let cost_one = search::search_tree_build_count() - b0;
+
+    let b1 = search::search_tree_build_count();
+    let _ = overlap_batch(&reader, &many);
+    let cost_many = search::search_tree_build_count() - b1;
+
+    assert!(cost_one > 0, "fixture must build trees at all");
+    assert_eq!(
+        cost_many, cost_one,
+        "tree builds grew with region count: {cost_one} -> {cost_many}"
+    );
+}
+
+/// As above for `overlap_batch_src`. It is a separate monomorphization of the
+/// same body, so it needs its own guard: a regression could reintroduce the
+/// per-region search on the provenance path alone.
+#[test]
+fn test_overlap_batch_src_tree_builds_do_not_scale_with_regions() {
+    let tmp = tempdir().unwrap();
+    let out = tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let reader = synth_reader_wide(&out);
+
+    let one = vec![(0u32, 1_000_000u32)];
+    let many: Vec<(u32, u32)> = (0..16).map(|i| (i * 20, i * 20 + 1_000_000)).collect();
+
+    let b0 = search::search_tree_build_count();
+    let _ = overlap_batch_src(&reader, &one);
+    let cost_one = search::search_tree_build_count() - b0;
+
+    let b1 = search::search_tree_build_count();
+    let _ = overlap_batch_src(&reader, &many);
+    let cost_many = search::search_tree_build_count() - b1;
+
+    assert!(cost_one > 0, "fixture must build trees at all");
+    assert_eq!(
+        cost_many, cost_one,
+        "tree builds grew with region count: {cost_one} -> {cost_many}"
+    );
+}
+
+/// `overlap_batch` has always been DOCUMENTED as byte-identical to
+/// `read_ranges(.., None)`; since #148 it is literally the same code path.
+/// Asserted directly on `BatchResult` (which is `PartialEq`) rather than only
+/// through the Python dict comparison in
+/// `test_overlap_batch_matches_read_ranges_all_samples`, so a divergence is
+/// caught on every field of the struct, not just the payload keys the binding
+/// exposes.
+#[test]
+fn test_overlap_batch_equals_read_ranges_all_samples_struct() {
+    let tmp = tempdir().unwrap();
+    let out = tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let reader = synth_reader_wide(&out);
+
+    let regions = vec![(0u32, 250u32), (90u32, 310u32), (900u32, 950u32)];
+    let batch = overlap_batch(&reader, &regions);
+    // Not vacuous: the fixture carries variants in these regions.
+    assert!(!batch.vk.is_empty() || !batch.dense.is_empty());
+    assert_eq!(batch, read_ranges(&reader, &regions, None));
+}
+
+/// `max_deletion_len` must report the max deletion span across BOTH the
+/// per-hap var_key indel channel and the dense indel table. It used to reach
+/// the dense term via `dense_union().max_del()`, which built (and sorted) a
+/// whole-contig union to read a scalar the reader already holds; it now reads
+/// the field. This pins the value so that shortcut cannot silently drop a
+/// channel — `find_ranges_header` uses it as the packed-key overflow preflight,
+/// where under-reporting would corrupt a max-end key rather than fail loudly.
+///
+/// Two fixtures, one per channel, because the answer is a single number: each
+/// puts the LONGER deletion in a different channel. The `find_ranges` bundle
+/// assertions confirm the intended channel is actually populated, so neither
+/// case can pass while exercising only the other term.
+#[test]
+fn test_max_deletion_len_spans_both_indel_channels() {
+    // gt [1, 1, 0, 1] = 3 of 4 haps -> routed Dense; [1, 0, 0, 0] -> VarKey
+    // (see `synth_reader_wide`'s note on `cost_model::choose_representation`).
+    let dense_long = vec![
+        SynthRecord {
+            pos: 100,
+            ref_allele: b"ATTTTTT", // ILEN -6
+            alts: vec![&b"A"[..]],
+            gt: vec![1, 1, 0, 1],
+        },
+        SynthRecord {
+            pos: 200,
+            ref_allele: b"ATT", // ILEN -2
+            alts: vec![&b"A"[..]],
+            gt: vec![1, 0, 0, 0],
+        },
+    ];
+    let vk_long = vec![
+        SynthRecord {
+            pos: 100,
+            ref_allele: b"ATTTTTT", // ILEN -6
+            alts: vec![&b"A"[..]],
+            gt: vec![1, 0, 0, 0],
+        },
+        SynthRecord {
+            pos: 200,
+            ref_allele: b"ATT", // ILEN -2
+            alts: vec![&b"A"[..]],
+            gt: vec![1, 1, 0, 1],
+        },
+    ];
+
+    for (label, records) in [("dense", dense_long), ("var_key", vk_long)] {
+        let tmp = tempdir().unwrap();
+        let out = tmp.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        build_contig(&out, "chr1", &["S0", "S1"], 2, &records);
+        let reader = ContigReader::open(out.to_str().unwrap(), "chr1", 2, 2).unwrap();
+
+        assert_eq!(
+            reader.max_deletion_len(),
+            6,
+            "{label} fixture: longest deletion is 6 bases"
+        );
+
+        // Coverage check: both channels must actually hold an indel, so
+        // neither case is silently testing the other term.
+        let rb = find_ranges(&reader, &[(0u32, 1_000u32)], None);
+        assert!(
+            rb.dense_indel_range.iter().any(|r| r.end > r.start),
+            "{label} fixture: dense indel table must be populated"
+        );
+        assert!(
+            rb.vk_indel_range.iter().any(|r| r.end > r.start),
+            "{label} fixture: var_key indel channel must be populated"
+        );
+    }
 }
