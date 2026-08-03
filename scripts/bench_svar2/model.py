@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import typing
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -143,17 +144,79 @@ def fit_cost_law(
     )
 
 
-def fit_ram_law(rows: Sequence[tuple[int, int, int, float]]) -> RamLaw:
-    """rows: (workers, pending_highwater, chunk_bytes, peak_rss_mb).
+class RamRow(typing.NamedTuple):
+    """One observation the RAM law is fitted from.
 
-    peak_rss ~ base + kappa * (workers + pending_hw) * chunk_bytes. kappa is the
-    observed overhead multiple over the analytic chunk size: a DenseChunk holds
-    more than its packed grid.
+    Named rather than a bare tuple because the payload is four ints and a
+    float: swapping `chunk_bytes` and `samples` positionally still fits, just
+    wrongly, and no test would necessarily catch it. Fields are read by name at
+    every consumer (`fit_ram_law`, `decide`).
     """
-    x = [(w + p) * cb / 1e6 for (w, p, cb, _) in rows]
-    y = [r[3] for r in rows]
-    kappa, base, r2, _ = _linfit(x, y)
-    return RamLaw(base_mb=base, kappa=kappa, r2=r2, n_points=len(rows))
+
+    workers: int
+    pending: int
+    chunk_bytes: int
+    samples: int
+    peak_rss_mb: float
+
+
+def fit_ram_law(rows: Sequence[RamRow]) -> RamLaw:
+    """peak_rss ~ base + per_sample_mb * samples
+    + kappa * (workers + pending_hw) * chunk_bytes.
+
+    Two regressors, not one. `kappa` is the observed overhead multiple over the
+    analytic chunk size (a DenseChunk holds more than its packed grid), and
+    `per_sample_mb` is the cohort-sized term: per-sample accumulation buffers
+    that exist whether or not any chunk is in flight. Fitting only the chunk
+    term forces the cohort cost into the intercept, where it cannot vary with S
+    -- that is what held the fit at R^2=0.057 across a real 39-point sweep.
+
+    Solved as ordinary least squares over both regressors simultaneously rather
+    than by fitting one and regressing the other on the residual: the two are
+    correlated in any real sweep (bigger cohorts get smaller chunk_size), so
+    sequential fitting assigns shared variance to whichever goes first.
+    """
+    chunk = np.array(
+        [(r.workers + r.pending) * r.chunk_bytes / 1e6 for r in rows], dtype=float
+    )
+    samples = np.array([float(r.samples) for r in rows], dtype=float)
+    y = np.array([r.peak_rss_mb for r in rows], dtype=float)
+
+    # A sweep at a SINGLE cohort size makes the `samples` column a constant
+    # multiple of the intercept column. The two are then unidentifiable, and
+    # least squares happily returns a minimum-norm split of the intercept
+    # between them -- a `per_sample_mb` that is pure arithmetic artifact.
+    # `extrapolate` multiplies that coefficient by the target cohort (500,000),
+    # so an artifact here becomes hundreds of GB of projected RSS. Drop the
+    # regressor instead and let `base_mb` own the constant, which is what a
+    # one-cohort sweep can actually support.
+    cohort_identifiable = bool(samples.std() > 0)
+    cols = (
+        [np.ones(len(rows)), samples, chunk]
+        if cohort_identifiable
+        else [
+            np.ones(len(rows)),
+            chunk,
+        ]
+    )
+    a = np.column_stack(cols)
+    coef, *_ = np.linalg.lstsq(a, y, rcond=None)
+    if cohort_identifiable:
+        base, per_sample, kappa = (float(c) for c in coef)
+    else:
+        base, kappa = (float(c) for c in coef)
+        per_sample = 0.0
+    pred = a @ coef
+    ss_res = float(((y - pred) ** 2).sum())
+    ss_tot = float(((y - y.mean()) ** 2).sum())
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 1.0
+    return RamLaw(
+        base_mb=base,
+        per_sample_mb=per_sample,
+        kappa=kappa,
+        r2=r2,
+        n_points=len(rows),
+    )
 
 
 def _median_costs(
@@ -193,7 +256,7 @@ def decide(
     knees: dict[int, int],
     read_law: CostLaw,
     exec_law: CostLaw,
-    rows: Sequence[tuple[int, int, int, float]],
+    rows: Sequence[RamRow],
     ram_law: RamLaw | None,
     contig_counterfactual: tuple[float, float] | None = None,
 ) -> Verdict:
@@ -279,10 +342,10 @@ def decide(
     # non-head unit; the true baseline is `(w - 1) * chunks_per_unit`, which
     # these rows do not carry). Both are diagnostics for the byte share below.
     evidence["max_pending_fraction"] = max(
-        (p / w for (w, p, _, _) in rows if w > 0), default=0.0
+        (r.pending / r.workers for r in rows if r.workers > 0), default=0.0
     )
     evidence["max_pending_excess_over_structural"] = max(
-        (p - (w - 1) for (w, p, _, _) in rows if w > 0), default=0
+        (r.pending - (r.workers - 1) for r in rows if r.workers > 0), default=0
     )
 
     kappa = max(ram_law.kappa, 0.0) if ram_law is not None else None
@@ -290,16 +353,16 @@ def decide(
     max_backlog_share: float | None = None
     if kappa is not None:
         max_backlog_share = 0.0
-        worst_row: tuple[int, int, int, float] | None = None
+        worst_row: RamRow | None = None
         for row in rows:
-            _, p, cb, rss = row
+            p, cb, rss = row.pending, row.chunk_bytes, row.peak_rss_mb
             if rss <= 0 or p <= 0:
                 continue
             share = kappa * p * cb / 1e6 / rss
             if share > max_backlog_share:
                 max_backlog_share, worst_row = share, row
         # Name the row so a verdict can be traced back to one measurement
-        # rather than to an aggregate: (workers, pending, chunk_bytes, rss_mb).
+        # rather than to an aggregate; `RamRow` names its own fields.
         evidence["max_backlog_rss_share_row"] = worst_row
     evidence["max_backlog_rss_share"] = max_backlog_share
     if max_backlog_share is not None and max_backlog_share >= H3_BACKLOG_RSS_FRACTION:
@@ -450,8 +513,14 @@ def extrapolate(
     # fitted against (model.py:fit_ram_law: `(w + p) * chunk_bytes`). Dropping
     # `pending` here would project only the in-flight term and silently
     # discard the reorder-skew term entirely -- exactly the term H3 is about.
+    # The cohort term is NOT optional at biobank scale: it is the dominant
+    # one. Measured at a pinned 10.9 MB chunk, RSS runs 789 MB (S=4,000) ->
+    # 5,061 MB (S=500,000) with the chunk term held constant, so projecting to
+    # S=500,000 without `per_sample_mb * samples` under-counts by GBs.
     predicted_rss = (
-        ram_law.base_mb + ram_law.kappa * (workers + pending) * chunk_bytes / 1e6
+        ram_law.base_mb
+        + ram_law.per_sample_mb * samples
+        + ram_law.kappa * (workers + pending) * chunk_bytes / 1e6
     )
     return {
         "chunk_bytes": float(chunk_bytes),
@@ -719,11 +788,15 @@ def _resident_chunk_size(chunk_size: int, variants: int) -> int:
     return min(chunk_size, variants)
 
 
-def _ram_rows(*sweeps: _LoadedSweep) -> list[tuple[int, int, int, float]]:
-    """(workers, pending_highwater, chunk_bytes, peak_rss_mb) from every
-    resolved record across every sweep -- the RAM law is not scoped to one
-    sweep the way the V-law and cost laws are."""
-    rows: list[tuple[int, int, int, float]] = []
+def _ram_rows(*sweeps: _LoadedSweep) -> list[RamRow]:
+    """Every resolved record across every sweep -- the RAM law is not scoped to
+    one sweep the way the V-law and cost laws are.
+
+    `samples` rides along because peak RSS carries a cohort-sized term
+    independent of chunk bytes (see `RamLaw`); without it the fit has nowhere
+    to put that cost but the intercept.
+    """
+    rows: list[RamRow] = []
     for sweep in sweeps:
         for r in sweep.records:
             pt = sweep.point_of[r.point_id]
@@ -732,7 +805,13 @@ def _ram_rows(*sweeps: _LoadedSweep) -> list[tuple[int, int, int, float]]:
                 pt.chunk_size, m.variants
             )
             rows.append(
-                (pt.reader_workers, r.pending_highwater, chunk_bytes, r.maxrss_mb)
+                RamRow(
+                    workers=pt.reader_workers,
+                    pending=r.pending_highwater,
+                    chunk_bytes=chunk_bytes,
+                    samples=m.samples,
+                    peak_rss_mb=r.maxrss_mb,
+                )
             )
     return rows
 
@@ -782,6 +861,7 @@ def _print_law(label: str, law: CostLaw | VLaw | RamLaw | None) -> None:
     else:
         print(
             f"{label}: peak_rss_mb ~ {law.base_mb:.4g} + "
+            f"{law.per_sample_mb:.4g}*samples + "
             f"{law.kappa:.4g}*(w+pending)*chunk_bytes  (R^2={law.r2:.4f}, n={law.n_points})"
         )
 
@@ -906,7 +986,7 @@ def main() -> None:
     # sweep persists at the target scale -- there is no fitted law for
     # `pending` itself, only for peak RSS given `pending`, so this is the most
     # defensible number available rather than the previous silent 0.
-    frac = max((p / w for (w, p, _, _) in ram_rows if w > 0), default=0.0)
+    frac = max((r.pending / r.workers for r in ram_rows if r.workers > 0), default=0.0)
     target_pending = round(frac * a.target_workers)
     proj = extrapolate(
         v_law,
