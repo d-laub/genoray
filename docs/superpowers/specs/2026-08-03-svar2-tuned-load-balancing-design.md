@@ -112,11 +112,24 @@ charged for a decode pool it never allocates.
 ### 2. `contig_cost.rs` — per-contig work estimates
 
 Only *ratios* matter; the estimates order contigs and nothing else. Fallback
-chain, most to least precise:
+chain, most to least precise, as implemented:
 
 1. `hts_idx_get_stat` per-contig mapped-record counts from the `.tbi`/`.csi`.
-2. The linear index's compressed byte extent per contig.
-3. Contig length from the header.
+2. Contig length from the header.
+
+The middle tier from the original three-tier design — the linear index's
+compressed byte extent per contig — was dropped before implementation:
+reaching it means walking CSI internals through far more `unsafe` than either
+surviving tier, for an estimator whose entire output is a sort key.
+
+Tier 1's viability was an open question going in: `hts_idx_get_stat` is
+documented for BAM, and whether CSI/TBI indexes over VCF populate the
+mapped-record count was unconfirmed. A test built a 3-contig VCF with
+deliberately unequal record counts (5/40/15) and asserted `estimate_contig_costs`
+ranked them in true-count order. It passed on the first implementation —
+`hts_idx_get_stat` does return real per-contig mapped counts for CSI-over-VCF —
+so tier 1 shipped as designed rather than being cut down to the header-length
+tier alone.
 
 PGEN takes exact per-contig variant counts from the `.gvi` index it already
 builds. Every source is metadata already on disk; none reads variant data.
