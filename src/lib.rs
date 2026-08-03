@@ -112,6 +112,8 @@ pub mod svar2_view;
 // as `crate::trace::...` without needing `pub`.
 #[cfg(feature = "conversion")]
 mod trace;
+#[cfg(feature = "conversion")]
+pub mod tune;
 pub mod types;
 #[cfg(feature = "conversion")]
 pub mod vcf_list_reader;
