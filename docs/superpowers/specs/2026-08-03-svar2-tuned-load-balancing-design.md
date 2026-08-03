@@ -114,7 +114,11 @@ charged for a decode pool it never allocates.
 Only *ratios* matter; the estimates order contigs and nothing else. Fallback
 chain, most to least precise, as implemented:
 
-1. `hts_idx_get_stat` per-contig mapped-record counts from the `.tbi`/`.csi`.
+1. `hts_idx_get_stat` per-contig mapped-record counts, id resolved in the
+   INDEX's own space: `tbx_name2id` against a real tabix load for bgzipped
+   VCF (the project's primary input), falling back to a raw CSI load keyed
+   by header rid for BCF, with every id bounded against `hts_idx_nseq`
+   before use, unconditionally.
 2. Contig length from the header.
 
 The middle tier from the original three-tier design — the linear index's
@@ -124,12 +128,32 @@ surviving tier, for an estimator whose entire output is a sort key.
 
 Tier 1's viability was an open question going in: `hts_idx_get_stat` is
 documented for BAM, and whether CSI/TBI indexes over VCF populate the
-mapped-record count was unconfirmed. A test built a 3-contig VCF with
-deliberately unequal record counts (5/40/15) and asserted `estimate_contig_costs`
-ranked them in true-count order. It passed on the first implementation —
-`hts_idx_get_stat` does return real per-contig mapped counts for CSI-over-VCF —
-so tier 1 shipped as designed rather than being cut down to the header-length
-tier alone.
+mapped-record count was unconfirmed. An initial test built a 3-contig VCF
+with deliberately unequal record counts (5/40/15) — every contig covered,
+in header order — and found `hts_idx_get_stat` does return real per-contig
+mapped counts for CSI-over-VCF. But that test could not have failed even if
+the *resolution* were wrong: with every contig covered and in header order,
+an index slot number happens to equal the header rid, so it masked the bug
+below rather than ruling it out.
+
+Review caught the gap: a VCF-flavoured CSI/TBI stores only *covered*
+references, compacted by order of first appearance among data records, not
+header order, and `hts_idx_get_stat` performs no bounds check on its `tid`
+argument. A decider test confirmed it concretely — a VCF with an UNCOVERED
+middle contig (chrA=5 records, chrB=0, chrC=15, equal header lengths) made
+`estimate_contig_costs` return `{"chrA": 5, "chrB": 15}`: chrC's true count
+silently misattributed to chrB, chrC missing from the map entirely, no
+crash. The general case (a header declaring far more contigs than the file
+covers — this project's own single-contig-VCF-with-a-full-reference-header
+shape, already the root cause of issue #122) is an out-of-bounds read, not
+just a misattribution. Fixed by resolving every id in the index's own space
+rather than the header's, as tier 1 now reads above.
+
+Narrowed finding: `hts_idx_get_stat` does return real per-contig mapped
+counts for CSI/TBI-over-VCF — but only when the `tid` passed to it was
+resolved through the index's own id space (`tbx_name2id`, or a
+header rid bounds-checked against `hts_idx_nseq` on the no-tabix BCF path),
+never a raw, unbounded header rid.
 
 PGEN takes exact per-contig variant counts from the `.gvi` index it already
 builds. Every source is metadata already on disk; none reads variant data.
