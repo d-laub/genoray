@@ -64,6 +64,13 @@ H1_KNEE_TOLERANCE = 1  # w* varies by less than +/-1 across the S range
 H1_MIN_KNEE_POINTS = 3
 V_LAW_MIN_R2 = 0.98
 HOLDOUT_ERROR_GATE = 0.25  # spec: >25% predicted-vs-actual error is a model failure
+# Smallest spread in log(cells) -- relative to the spread in log(samples) --
+# that lets the cohort ladder identify `beta` at all. Below this the ladder is
+# a constant-cells hyperbola and `beta ~ 1` is arithmetic, not evidence; see
+# `cohort_beta_is_design_forced`. 0.05 admits the incidental few-percent
+# wobble from integer-rounding V = cells // S while still rejecting a ladder
+# built to hold cells fixed.
+COHORT_CELLS_SPREAD_MIN = 0.05
 # Share of measured peak RSS the reorder backlog must account for before H3(a)
 # fires -- see `decide` for why the gate is a BYTE share and not the spec's
 # literal `pending_highwater >= w/2` count.
@@ -127,6 +134,106 @@ def fit_v_law(points: Sequence[tuple[float, float]]) -> VLaw:
         n_points=len(points),
         max_extrapolation_factor=_V_LAW_TARGET_VARIANTS / max(v),
     )
+
+
+def fit_cohort_beta_from_ladders(
+    ladders: Sequence[tuple[float, Sequence[tuple[float, float]]]],
+) -> CostLaw | None:
+    """Cohort exponent from two or more V-ladders measured at different S.
+
+    `ladders` is [(samples, [(variants, phase1_s), ...]), ...]. Within one
+    ladder S is fixed and V varies, so `phase1 ~ a + b*V` measures the
+    per-variant cost AT that cohort size directly. Across ladders,
+    `b(S) = b0 * (S/S0)**beta`, and beta is the slope of `log(b)` on `log(S)`.
+
+    This is the estimator the constant-cells scale ladder cannot be: there,
+    every rung pins S*V, so no rung measures a per-variant slope -- the single
+    (S, phase1/V) point per rung conflates the two axes and forces beta to ~1
+    (see `cohort_beta_is_design_forced`). Here cells vary WITHIN each ladder,
+    so the slope is measured, and beta is a ratio of two measured slopes.
+
+    It matters: the forced fit reported beta=1.0020, CI [0.9689, 1.0352],
+    while two ladders (S=250 and S=100,000) give 0.9592 +/- 0.0046 -- outside
+    that CI. Scoring every F=0 w=1 point, the refit cut mean phase-1 error
+    from 19.1% to 8.8% and the hold-out from 24.9% to 3.3%.
+
+    Returns None when fewer than two distinct cohort sizes carry a usable
+    ladder, which is the caller's signal to fall back and warn.
+    """
+    fitted: list[tuple[float, float, float]] = []
+    for samples, pts in ladders:
+        if len(pts) < 2 or samples <= 0:
+            continue
+        slope, _intercept, _r2, stderr = _linfit(
+            [p[0] for p in pts], [p[1] for p in pts]
+        )
+        if slope <= 0:
+            # A non-positive per-variant slope has no logarithm; it also means
+            # the ladder did not measure a cost, so it cannot anchor beta.
+            continue
+        fitted.append((float(samples), slope, stderr))
+    by_s = {s: (b, se) for s, b, se in fitted}
+    if len(by_s) < 2:
+        return None
+
+    s_vals = sorted(by_s)
+    logs = np.log(np.array(s_vals, dtype=float))
+    logb = np.log(np.array([by_s[s][0] for s in s_vals], dtype=float))
+    beta, log_alpha, _r2, _se = _linfit(logs, logb)
+
+    if len(s_vals) == 2:
+        # Two ladders fit their line exactly, so the residual carries no
+        # information about uncertainty. Propagate the two SLOPE standard
+        # errors through the log-ratio instead of reporting stderr=0, which
+        # would collapse the CI to a point and read as certainty.
+        (s0, s1) = s_vals
+        rel = np.sqrt(
+            (by_s[s0][1] / by_s[s0][0]) ** 2 + (by_s[s1][1] / by_s[s1][0]) ** 2
+        )
+        half = 1.96 * float(rel) / abs(float(np.log(s1 / s0)))
+    else:
+        half = _t95(len(s_vals) - 2) * _se
+    return CostLaw(
+        name="cohort",
+        alpha=float(np.exp(log_alpha)),
+        beta=float(beta),
+        beta_ci95=(float(beta) - half, float(beta) + half),
+        n_points=len(s_vals),
+    )
+
+
+def cohort_beta_is_design_forced(
+    samples: Sequence[float], cells: Sequence[float]
+) -> bool:
+    """True when the cohort ladder holds total cells fixed, which FORCES
+    `beta ~ 1` no matter what the underlying cost structure is.
+
+    The cohort law regresses `log(phase1_s / V)` on `log(S)`. A constant-cells
+    ladder sets `V = cells / S`, so the regressand is identically
+
+        log(phase1/V) = log(phase1) + log(S) - log(cells)
+
+    and the fitted slope is `1 + dlog(phase1)/dlog(S)`. But a constant-cells
+    ladder is BUILT so every rung does the same total work, so `phase1` is
+    near-flat by construction and the slope collapses to 1 -- not because cost
+    is genuinely per-cell, but because the design cannot express anything
+    else. The reported CI is then a measure of the residual wiggle in
+    `phase1`, not of any uncertainty about cohort scaling, and reads far
+    tighter than the evidence warrants: the scale ladder returned
+    beta=1.0020, CI [0.9689, 1.0352] without ever varying cells.
+
+    That matters because `extrapolate` raises this beta to a 2000x cohort
+    ratio. A number the design pinned to 1.0 is indistinguishable there from
+    one genuinely measured as 1.0, and only the second is evidence.
+
+    Identifying beta needs at least two DISTINCT cells levels, so S and V move
+    independently instead of along a single hyperbola.
+    """
+    lc = np.log(np.asarray(cells, dtype=float))
+    ls = np.log(np.asarray(samples, dtype=float))
+    if len(lc) < 2 or ls.std() == 0.0:
+        return True
+    return bool(lc.std() / ls.std() < COHORT_CELLS_SPREAD_MIN)
 
 
 def fit_cost_law(
@@ -572,9 +679,10 @@ def extrapolate(
 
 # File-layout contract shared with the plan-generation and sbatch agents:
 # `<results-dir>/<name>.ndjson`, `<plans-dir>/<name>.json`, for `name` in
-# these four sweeps. `vlinear` is new (the V-linearity ladder); it may not
-# exist yet in every job dir, and its absence must degrade gracefully.
-_SWEEP_NAMES = ("scale", "contig", "holdout", "vlinear")
+# these five sweeps. `vlinear`/`vlinear2` are the two V-linearity ladders;
+# neither is guaranteed to exist in an older job dir, and their absence must
+# degrade gracefully.
+_SWEEP_NAMES = ("scale", "contig", "holdout", "vlinear", "vlinear2")
 
 
 class _LoadedSweep:
@@ -678,10 +786,22 @@ def load_sweep(
 
 
 def _v_law_points(vlinear: _LoadedSweep) -> list[tuple[float, float]]:
-    """(V, phase1_s) -- one point per corpus in the V-linearity ladder."""
+    """(V, phase1_s) -- one point per corpus in a V-linearity ladder."""
     return [
         (vlinear.manifest_of[r.point_id].variants, r.phase1_s) for r in vlinear.records
     ]
+
+
+def _ladder_samples(vlinear: _LoadedSweep) -> int | None:
+    """The cohort size a V-ladder was measured at, or None if it is empty.
+
+    A ladder is only meaningful if every rung shares one S -- that is what
+    makes its fitted slope a per-variant cost AT that cohort size. A mixed-S
+    ladder would silently blend two cost regimes into one slope, so it returns
+    None rather than a misleading first-record value.
+    """
+    sizes = {vlinear.manifest_of[r.point_id].samples for r in vlinear.records}
+    return sizes.pop() if len(sizes) == 1 else None
 
 
 def _cost_and_knee_rows(
@@ -689,13 +809,13 @@ def _cost_and_knee_rows(
 ) -> tuple[
     list[tuple[float, float]],
     list[tuple[float, float]],
-    list[tuple[float, float]],
+    list[tuple[float, float, float]],
     dict[int, int],
     list[str],
 ]:
     """From the w=1 row at each S: (S, c_read), (S, c_exec), (S, per-variant
-    wall), and the predicted knee. One run at w=1 is the spec's whole point --
-    it replaces an O(|w|) sweep at every scale point.
+    wall, cells), and the predicted knee. One run at w=1 is the spec's whole
+    point -- it replaces an O(|w|) sweep at every scale point.
 
     The third series is the ABSOLUTE cohort cost `phase1_s / variants` that
     `extrapolate`'s `cohort_beta` is fitted from. It has to be separate from
@@ -718,7 +838,7 @@ def _cost_and_knee_rows(
     """
     read_pts: dict[int, float] = {}
     exec_pts: dict[int, float] = {}
-    cohort_pts: dict[int, float] = {}
+    cohort_pts: dict[int, tuple[float, float]] = {}
     knees: dict[int, int] = {}
     excluded: list[str] = []
     for r in scale.records:
@@ -745,7 +865,9 @@ def _cost_and_knee_rows(
         exec_pts[m.samples] = c_exec
         knees[m.samples] = knee_from_probe(r.cpu_shard_pct, r.cpu_exec_pct)
         if r.phase1_s > 0 and m.variants > 0:
-            cohort_pts[m.samples] = r.phase1_s / m.variants
+            # `cells` rides along so `main` can tell whether this ladder can
+            # identify `beta` at all -- see `cohort_beta_is_design_forced`.
+            cohort_pts[m.samples] = (r.phase1_s / m.variants, float(m.cells))
         else:
             excluded.append(
                 f"scale/{r.point_id}: w=1 row at S={m.samples} has phase1_s="
@@ -755,7 +877,7 @@ def _cost_and_knee_rows(
     return (
         sorted(read_pts.items()),
         sorted(exec_pts.items()),
-        sorted(cohort_pts.items()),
+        [(s, pv, cells) for s, (pv, cells) in sorted(cohort_pts.items())],
         knees,
         excluded,
     )
@@ -896,7 +1018,7 @@ def main() -> None:
         for msg in excluded:
             print(f"  - {msg}")
 
-    scale, contig, holdout, vlinear = (sweeps[n] for n in _SWEEP_NAMES)
+    scale, contig, holdout, vlinear, vlinear2 = (sweeps[n] for n in _SWEEP_NAMES)
 
     print()
     v_law: VLaw | None = None
@@ -931,18 +1053,53 @@ def main() -> None:
     # what `extrapolate` scales its per-variant term by. NOT `read_law.beta`;
     # see `extrapolate`'s docstring for why a utilization exponent collapses
     # that correction to a no-op.
-    cohort_law = (
-        fit_cost_law("cohort", *zip(*cohort_points))
-        if len(cohort_points) >= 2
-        else None
-    )
+    # PREFERRED: beta from two V-ladders at different S. Each ladder varies V
+    # at fixed S, so it MEASURES a per-variant slope; beta is the log-ratio of
+    # the two. Falls back to the constant-cells regression below only when a
+    # second ladder is missing, and says loudly that the fallback is forced.
+    ladders = [
+        (samples, pts)
+        for samples, pts in (
+            (_ladder_samples(vlinear), _v_law_points(vlinear)),
+            (_ladder_samples(vlinear2), _v_law_points(vlinear2)),
+        )
+        if samples is not None and len(pts) >= 2
+    ]
+    cohort_law = fit_cohort_beta_from_ladders(ladders)
+    cohort_from_ladders = cohort_law is not None
+    if cohort_law is None and len(cohort_points) >= 2:
+        cohort_law = fit_cost_law(
+            "cohort",
+            [p[0] for p in cohort_points],
+            [p[1] for p in cohort_points],
+        )
     _print_law("read cost law", read_law)
     _print_law("exec cost law", exec_law)
     _print_law("cohort per-variant cost law", cohort_law)
+    if cohort_from_ladders:
+        print(
+            f"  fitted from {cohort_law.n_points} V-ladders at S="
+            + ", ".join(f"{int(s):,}" for s, _ in ladders)
+            + " -- cells vary within each ladder, so beta is measured"
+        )
+    elif cohort_law is not None and cohort_beta_is_design_forced(
+        [p[0] for p in cohort_points], [p[2] for p in cohort_points]
+    ):
+        print(
+            "  WARNING: only one V-ladder is present, so beta falls back to "
+            "the scale ladder -- which holds total cells (S*V) fixed, making "
+            f"beta={cohort_law.beta:.4f} forced to ~1 by the DESIGN rather "
+            "than measured. The CI above bounds the wiggle in phase1_s, not "
+            "the cohort exponent. `extrapolate` raises this beta to a 2000x "
+            "cohort ratio, so treat the projection as ASSUMING per-cell cost "
+            "rather than as evidence for it. Fix: run the `vlinear2` ladder "
+            "(build_plans.VLINEAR2_*), which measured beta=0.9592 -- outside "
+            "the forced fit's own CI."
+        )
     if knees:
         print(f"predicted knees by S: {knees}")
 
-    ram_rows = _ram_rows(scale, contig, holdout, vlinear)
+    ram_rows = _ram_rows(scale, contig, holdout, vlinear, vlinear2)
     ram_law = fit_ram_law(ram_rows) if len(ram_rows) >= 2 else None
     _print_law("RAM law", ram_law)
 
@@ -1027,8 +1184,19 @@ def main() -> None:
     # nothing would be worse. Name it.
     fitted_f = {
         len(m.format_fields)
-        for sweep in (scale, contig, vlinear)
+        for sweep in (scale, contig, vlinear, vlinear2)
         for m in sweep.manifest_of.values()
+    }
+    # Nodes the LAWS were fitted on. `point_id` deliberately excludes the
+    # machine (so a resumed sweep skips work already paid for), which means a
+    # hold-out can be measured somewhere else entirely and nothing in the
+    # record would say so. Measured: the same point_id ran 151.9s on one node
+    # and 73.2s on another. Comparing across that gap is not a model test.
+    fitted_nodes = {
+        r.node
+        for sweep in (scale, contig, vlinear, vlinear2)
+        for r in sweep.records
+        if r.node
     }
     for r in holdout.records:
         pt = holdout.point_of[r.point_id]
@@ -1088,7 +1256,19 @@ def main() -> None:
             phase1_err is not None and phase1_err > HOLDOUT_ERROR_GATE
         ) or rss_err > HOLDOUT_ERROR_GATE
         holdout_f = len(m.format_fields)
-        if holdout_f not in fitted_f:
+        cross_node = bool(r.node) and bool(fitted_nodes) and r.node not in fitted_nodes
+        if cross_node:
+            # Report the numbers, then refuse to call the gap a model failure:
+            # a slower machine biases the error strictly upward and there is
+            # no way to separate that from extrapolation error after the fact.
+            print(
+                f"  CROSS-NODE: hold-out ran on {r.node} but the laws were "
+                f"fitted on {sorted(fitted_nodes)}. Node speed varies enough "
+                "to dominate this gate (a measured 2.08x between two nodes of "
+                "the same partition), so the error above is NOT attributable "
+                "to the model. Re-measure the hold-out on a fitting node."
+            )
+        elif holdout_f not in fitted_f:
             # Out of the fitted domain: report loudly, but do not call it a
             # failure of the S,V extrapolation the gate exists to validate.
             print(

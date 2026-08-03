@@ -95,6 +95,19 @@ class ProbeRecord:
     shard_unit_secs: tuple[float, ...]
     oom_at_rss_mb: float | None = None
     error: str | None = None
+    # Machine this point was measured on. NOT part of `point_id`, deliberately
+    # -- resuming a preempted sweep on a different node must still skip points
+    # already paid for. But that is exactly why it has to be RECORDED: two
+    # records can share a point_id and disagree wildly. Measured, the same
+    # point (holdout_f0, w=1, chunk 875, point_id 2ac9bbbfbe0dc691) took
+    # 151.9s on one node and 73.2s on another -- a 2.08x spread that the
+    # hold-out gate charged to the model as a 40% "MODEL FAILURE" when the
+    # true error against same-node data was 3.3%. Without this field a
+    # cross-node comparison is invisible.
+    #
+    # Defaulted to "" so records written before this field existed still load
+    # (`from_json` drops unknown keys but cannot invent missing ones).
+    node: str = ""
 
 
 @dataclass(frozen=True)

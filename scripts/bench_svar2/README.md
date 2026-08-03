@@ -125,6 +125,45 @@ seed, only re-obtainable by rerunning the probe.
   trace) the time half of the gate is skipped and reported as skipped -- there
   is no correct fallback to `wall_s`.
 
+- **The cohort exponent needs TWO V-ladders; the scale ladder alone cannot
+  measure it.** The scale ladder holds `S*V = CELLS_BUDGET` at every rung, so
+  the cohort law's regressand `log(phase1/V)` is identically `log(phase1) +
+  log(S) - log(cells)` and its slope is `1 + dlog(phase1)/dlog(S)`. A
+  constant-cells ladder is BUILT so every rung does the same total work, so
+  `phase1` is flat (36-44s across a 2000x cohort range) and the slope collapses
+  to 1 no matter what the underlying cost structure is. It reported
+  `beta=1.0020, CI [0.9689, 1.0352]` -- tight enough to read as a solid
+  measurement, from a design that could not have returned anything else.
+  `model.py:cohort_beta_is_design_forced` detects this and says so.
+  `vlinear`/`vlinear2` fix it: within each ladder S is fixed and V varies, so
+  each fitted slope IS a per-variant cost at that cohort size, and beta is the
+  log-ratio of the two (`fit_cohort_beta_from_ladders`). Measured that way
+  `beta=0.9860, CI [0.9808, 0.9912]` -- outside the forced fit's own CI, so
+  that fit was not merely unidentified but wrong and falsely confident.
+  Refitting took the F=0 hold-out from a 40% "MODEL FAILURE" to 13%.
+  - `VLINEAR2_SAMPLES` is deliberately NOT the hold-out's cohort size. A ladder
+    at the hold-out's S would make the hold-out an interpolation inside the
+    fitted data, so the gate would go quiet for the wrong reason. The two
+    ladders (S=250 and S=250,000) BRACKET the hold-out's S=100,000.
+  - `beta` is not a true constant: per-cell cost is mildly U-shaped in S
+    (2.59e-8 s/cell at S=4,000-16,000 against 3.16e-8 at S=250 and 2.97e-8 at
+    S=500,000), so the estimate depends on which cohorts anchor it -- the
+    S=250/S=100,000 pair gives 0.9592, the S=250/S=250,000 pair 0.9860, and
+    those CIs do not overlap. A single power law is an approximation; it is
+    fitted across the range that brackets the hold-out, which is where it is
+    used.
+- **Never compare records measured on different nodes.** `point_id` hashes
+  every field of `SweepPoint` but deliberately NOT the machine, so a resumed
+  sweep skips work already paid for -- which also means two records can share a
+  `point_id` and disagree wildly. Measured: `2ac9bbbfbe0dc691` (holdout_f0,
+  w=1, chunk 875) took **151.9s on carter-cn-03 and 73.2s on carter-cn-04**, a
+  2.08x spread, while same-node controls reproduced within 1.9% and a repeated
+  control was identical to 0.0%. That one cross-node record was the entire
+  "40% MODEL FAILURE": the true same-node error is 13%. `ProbeRecord.node`
+  records the machine and `model.py` refuses to charge a cross-node gap to the
+  model. Node speed varies by more than the 25% gate, so sweeps that will be
+  compared must pin `--nodelist`.
+
 ## Prior findings
 
 `legacy_pr140/README.md` records the PR #140 review: the knee sits at w≈3-7 and

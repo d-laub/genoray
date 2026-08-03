@@ -8,7 +8,10 @@ from scripts.bench_svar2.plans.build_plans import (
     PROD_CHUNK_SIZE,
     SCALE_SAMPLES,
     VLINEAR_CHUNK_SIZE,
+    VLINEAR_SAMPLES,
     VLINEAR_VARIANTS,
+    VLINEAR2_SAMPLES,
+    VLINEAR2_VARIANTS,
     _chunk_size_for,
     build,
 )
@@ -188,5 +191,45 @@ def test_scale_plan_adds_a_dedicated_point_only_where_size_corpus_is_not_clamped
     assert len(dedicated) == len(unclamped_s) == 5
 
 
-def test_all_four_plans_are_produced():
-    assert set(_build().keys()) == {"scale", "contig", "holdout", "vlinear"}
+def test_all_five_plans_are_produced():
+    assert set(_build().keys()) == {
+        "scale",
+        "contig",
+        "holdout",
+        "vlinear",
+        "vlinear2",
+    }
+
+
+def test_the_two_v_ladders_sit_at_different_cohort_sizes():
+    """The whole point of the second ladder is a second cohort size. If both
+    ladders ever collapsed to one S, `fit_cohort_beta_from_ladders` would
+    return None and beta would silently fall back to the constant-cells fit
+    that forces beta ~ 1."""
+    assert VLINEAR_SAMPLES != VLINEAR2_SAMPLES
+
+
+def test_neither_v_ladder_sits_at_the_holdout_cohort_size():
+    """A ladder at the hold-out's S would make the hold-out an interpolation
+    inside the fitted data, so the 25% gate would go quiet for the wrong
+    reason -- it would be re-checking V-linearity, which the ladder's own R^2
+    already reports, instead of testing the composed S,V extrapolation."""
+    assert HOLDOUT["samples"] not in (VLINEAR_SAMPLES, VLINEAR2_SAMPLES)
+
+
+def test_the_holdout_cohort_is_bracketed_by_the_two_ladders():
+    """Strictly between the ladders, so the hold-out interpolates in S rather
+    than extrapolating past both -- the composed prediction is then tested
+    where the cohort law is best supported, not off the end of it."""
+    lo, hi = sorted((VLINEAR_SAMPLES, VLINEAR2_SAMPLES))
+    assert lo < HOLDOUT["samples"] < hi
+
+
+def test_the_second_v_ladder_pins_chunk_size_across_its_rungs():
+    """V must be the only axis moving. A per-rung chunk size would co-vary
+    with V and re-introduce the per-chunk-cost confound that once made the
+    V-law over-predict by 11.8x."""
+    pts = [p for p in _build()["vlinear2"] if "vlinear2_v" in p.corpus]
+    assert len(pts) == len(VLINEAR2_VARIANTS)
+    assert len({p.chunk_size for p in pts}) == 1
+    assert all(p.reader_workers == 1 for p in pts)
