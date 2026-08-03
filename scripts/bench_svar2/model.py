@@ -1019,6 +1019,17 @@ def main() -> None:
     if not holdout.records:
         print("HOLD-OUT CHECK: SKIPPED (no holdout records)")
         return
+    # Which FORMAT-field counts the laws were actually FITTED from. The cost
+    # laws have no F term at all -- `extrapolate` threads `format_fields` into
+    # chunk_bytes for the RSS side only -- so a hold-out at an F the fit never
+    # saw is testing an axis the model does not model. Scoring that as "MODEL
+    # FAILURE" blames the extrapolation for a dimension nobody fitted; saying
+    # nothing would be worse. Name it.
+    fitted_f = {
+        len(m.format_fields)
+        for sweep in (scale, contig, vlinear)
+        for m in sweep.manifest_of.values()
+    }
     for r in holdout.records:
         pt = holdout.point_of[r.point_id]
         m = holdout.manifest_of[r.point_id]
@@ -1073,9 +1084,22 @@ def main() -> None:
             f"rss pred={pred['predicted_peak_rss_mb']:.0f}MB actual={r.maxrss_mb:.0f}MB "
             f"err={rss_err:.0%}"
         )
-        if (phase1_err is not None and phase1_err > HOLDOUT_ERROR_GATE) or (
-            rss_err > HOLDOUT_ERROR_GATE
-        ):
+        over_gate = (
+            phase1_err is not None and phase1_err > HOLDOUT_ERROR_GATE
+        ) or rss_err > HOLDOUT_ERROR_GATE
+        holdout_f = len(m.format_fields)
+        if holdout_f not in fitted_f:
+            # Out of the fitted domain: report loudly, but do not call it a
+            # failure of the S,V extrapolation the gate exists to validate.
+            print(
+                f"  OUT-OF-DOMAIN: hold-out has F={holdout_f} but every law was "
+                f"fitted on F in {sorted(fitted_f)}. No cost law carries an F "
+                "term, so this point cannot validate the S,V extrapolation "
+                "either way -- the error above is dominated by an axis the "
+                "model does not model. Fit an F law, or hold out at an F the "
+                "laws were fitted on."
+            )
+        elif over_gate:
             print(
                 f"  MODEL FAILURE: error exceeds the {HOLDOUT_ERROR_GATE:.0%} gate "
                 "(spec: this invalidates the model, not just this point)"

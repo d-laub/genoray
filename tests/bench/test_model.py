@@ -723,13 +723,17 @@ def test_main_end_to_end(tmp_path, capsys, monkeypatch):
     (plans_dir / "vlinear.json").write_text(json.dumps([asdict(p) for p in v_points]))
 
     # holdout: actuals deliberately absurd so the >25% error gate must fire.
+    # F=() ON PURPOSE -- it must match the fitting corpora's F. No cost law has
+    # an F term, so a hold-out at an F the fit never saw is reported
+    # OUT-OF-DOMAIN rather than as a model failure, and this test would then be
+    # asserting the gate fires while exercising the path where it must not.
     (manifests_dir / "holdout.manifest.json").write_text(
         to_json(
             _manifest(
                 "holdout.manifest.json",
                 samples=100_000,
                 variants=28_000,
-                format_fields=("DP", "GQ", "AD"),
+                format_fields=(),
             )
         )
     )
@@ -764,6 +768,63 @@ def test_main_end_to_end(tmp_path, capsys, monkeypatch):
     assert "EXTRAPOLATION" in out
     assert "HOLD-OUT" in out
     assert "MODEL FAILURE" in out
+    # The hold-out is in the fitted domain (F=0 like every fitting corpus), so
+    # the failure must be attributed to the S,V extrapolation, not excused.
+    assert "OUT-OF-DOMAIN" not in out
+
+
+def test_holdout_outside_the_fitted_format_field_domain_is_not_a_model_failure(
+    tmp_path, capsys, monkeypatch
+):
+    """A hold-out at an F the laws were never fitted on cannot score them.
+
+    Every law-fitting corpus in this harness is F=0 and no cost law carries an
+    F term -- `extrapolate` threads `format_fields` into chunk_bytes for the
+    RSS side only. The real sweep's hold-out carried DP/GQ/AD, so its 63%
+    phase-1 error was an unmodelled FORMAT-decode cost reported as "MODEL
+    FAILURE: this invalidates the model". That reading blames the S,V
+    extrapolation for an axis nobody fitted. Report the mismatch instead.
+
+    The planted record is deliberately absurd, so the 25% gate WOULD fire if
+    this point were in-domain -- that is what makes the assertion meaningful
+    rather than vacuous (`test_main_end_to_end` pins the in-domain half).
+    """
+    manifests_dir, plans_dir, results_dir = _driver_dirs(
+        tmp_path,
+        lambda pid: _record(pid, wall_s=1e-6, maxrss_mb=1e-6, pending_highwater=0),
+    )
+    # Move ONLY the hold-out out of the fitted domain; everything else is the
+    # shared fixture, so F is the single difference from the in-domain case.
+    (manifests_dir / "holdout.manifest.json").write_text(
+        to_json(
+            _manifest(
+                "holdout.manifest.json",
+                samples=1_000,
+                variants=28_000,
+                format_fields=("DP", "GQ", "AD"),
+            )
+        )
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "model.py",
+            "--results",
+            str(results_dir),
+            "--manifests",
+            str(manifests_dir),
+            "--plans",
+            str(plans_dir),
+        ],
+    )
+    main()
+    out = capsys.readouterr().out
+    assert "OUT-OF-DOMAIN" in out
+    assert "F=3" in out
+    # Still reports the numbers -- silence would be worse than a wrong verdict.
+    assert "HOLD-OUT" in out
+    # ...but does not condemn the extrapolation on evidence that cannot bear it.
+    assert "MODEL FAILURE" not in out
 
 
 # --- Minor 11: H1 needs enough cohort sizes to be a claim about the range ---
