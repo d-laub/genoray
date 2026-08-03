@@ -121,3 +121,63 @@ def numba_threads(n: int):
         yield
     finally:
         numba.set_num_threads(prev)
+
+
+# Planning to 100% of a limit means the first prediction error is an OOM kill.
+# The RAM law it feeds predicts peak RSS with R^2=0.9040 and a 3% hold-out
+# error; this headroom covers that residual plus everything the law does not
+# model -- the interpreter, glibc arena fragmentation, the merge tail.
+MEM_BUDGET_FRACTION = 0.8
+
+# Module-level so tests can point them at fixtures.
+_CGROUP_V2 = Path("/sys/fs/cgroup/memory.max")
+_CGROUP_V1 = Path("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+_MEMINFO = Path("/proc/meminfo")
+
+# cgroup v1 writes a near-INT64_MAX sentinel rather than a real limit when the
+# group is uncapped. Anything at or above this is "no limit", not a budget.
+_CGROUP_V1_UNLIMITED = 1 << 62
+
+
+def _read_int(path: Path) -> int | None:
+    """Parse a single integer from `path`, or None if absent/unparseable."""
+    try:
+        text = path.read_text().strip()
+    except OSError:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return None  # cgroup v2 writes the literal "max" when uncapped.
+
+
+def _meminfo_total(path: Path) -> int | None:
+    try:
+        for line in path.read_text().splitlines():
+            if line.startswith("MemTotal:"):
+                return int(line.split()[1]) * 1024
+    except (OSError, IndexError, ValueError):
+        return None
+    return None
+
+
+def detect_memory_budget(fraction: float = MEM_BUDGET_FRACTION) -> int:
+    """Bytes of memory the conversion planner may plan against.
+
+    Prefers the cgroup limit over `/proc/meminfo`. Under Slurm the two differ:
+    `/proc/meminfo` reports the node, the cgroup reports the job. Planning
+    against the node hands the planner a budget it does not have, on exactly
+    the allocations where the planner matters most.
+    """
+    limit = _read_int(_CGROUP_V2)
+    if limit is None:
+        v1 = _read_int(_CGROUP_V1)
+        limit = v1 if v1 is not None and v1 < _CGROUP_V1_UNLIMITED else None
+    if limit is None:
+        limit = _meminfo_total(_MEMINFO)
+    if limit is None:
+        raise RuntimeError(
+            "could not detect a memory budget (no cgroup limit and no "
+            "/proc/meminfo); pass max_mem explicitly"
+        )
+    return int(limit * fraction)
