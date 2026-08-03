@@ -20,6 +20,8 @@ pub fn bits_get_bit(bytes: &[u8], i: usize) -> bool {
 pub mod budget;
 #[cfg(feature = "conversion")]
 pub mod chunk_assembler;
+#[cfg(feature = "conversion")]
+pub mod contig_cost;
 pub mod cost_model;
 pub mod dense;
 #[cfg(feature = "conversion")]
