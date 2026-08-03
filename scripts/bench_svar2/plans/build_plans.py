@@ -29,6 +29,15 @@ CONTIG_COUNTS = (1, 2, 8, 22)
 # reads this back (via `python -c 'from ... import HOLDOUT; ...'`) instead of
 # repeating the numbers, so editing one cannot silently drift from the other.
 HOLDOUT = {"samples": 100_000, "variants": 28_000, "format_fields": ("DP", "GQ", "AD")}
+# Same S and V, no FORMAT fields. The gate exists to validate the S,V
+# extrapolation, and it cannot do that from the F=3 corpus above: every
+# law-fitting corpus is F=0 and no cost law carries an F term, so scoring
+# against F=3 measures an axis nobody fitted (it read as a 63% phase-1 "model
+# failure" that was really an unmodelled FORMAT-decode cost). This corpus is
+# IN the fitted domain, so its error is attributable to S,V extrapolation and
+# nothing else. Keep BOTH: the F=3 point still runs and is still reported, as
+# the standing record of how far off the model is on data it does not cover.
+HOLDOUT_F0 = {"samples": 100_000, "variants": 28_000, "format_fields": ()}
 # `from_vcf` hardcodes exactly this -- the only `from_*` method that skips
 # `_auto_chunk_size`. It happens to equal `size_corpus`'s own upper clamp (see
 # MAX_CHUNK_SIZE's docstring in scale_corpus.py), so reuse that constant
@@ -216,6 +225,14 @@ def build(corpus_dir: Path, threads: int) -> dict[str, list[SweepPoint]]:
             corpus_dir / "holdout.manifest.json",
             1,
             _chunk_size_for(HOLDOUT["variants"]),
+            threads,
+        )
+    )
+    holdout.append(
+        _point(
+            corpus_dir / "holdout_f0.manifest.json",
+            1,
+            _chunk_size_for(HOLDOUT_F0["variants"]),
             threads,
         )
     )
