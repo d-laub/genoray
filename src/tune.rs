@@ -21,8 +21,10 @@ pub struct Rates {
 /// the probe, not the workload, is what to look at.
 pub const W_MAX: usize = 16;
 
-/// Chunks timed per probe. Two is enough to get past first-chunk warmup while
-/// staying negligible against a real conversion.
+/// Chunks timed per probe. Both chunks are averaged in at equal weight, so
+/// this dilutes first-chunk warmup (HTSlib index/seek setup, cold page cache)
+/// to half its weight rather than excluding it, while staying negligible
+/// against a real conversion.
 pub const PROBE_CHUNKS: usize = 2;
 
 /// Readers needed to keep one executor fed: `w/t_read >= 1/t_exec`.
@@ -47,7 +49,14 @@ pub fn workers_from_rates(rates: &Rates) -> usize {
 /// chunk-consumption rate, on a bounded prefix of `chrom`.
 ///
 /// Deliberately unsharded and unpooled: `t_read_s` must be ONE worker's rate,
-/// or the ratio it feeds means nothing.
+/// or the ratio it feeds means nothing. `t_read_s` includes reference-driven
+/// normalization (left-alignment, REF/FASTA validation) whenever `fasta_path`
+/// is `Some` -- that work happens inside the reader stage in production
+/// (`ChunkAssembler::with_reference` via the sharded path, or
+/// `ChunkAssembler::new` via the unsharded fallback this probe mirrors), so a
+/// probe run without it would understate `t_read_s` for any reference-
+/// normalized conversion and under-provision `w`. Pass `None` only when the
+/// real conversion also runs without a reference.
 pub fn probe_rates(
     vcf_path: &str,
     chrom: &str,
@@ -55,8 +64,15 @@ pub fn probe_rates(
     chunk_size: usize,
     ploidy: usize,
     fields: &[crate::field::FieldSpec],
+    fasta_path: Option<&str>,
 ) -> Result<Rates, crate::error::ConversionError> {
     use std::time::Instant;
+
+    if chunk_size == 0 {
+        return Err(crate::error::ConversionError::Input(
+            "probe chunk_size must be > 0 (read_next_chunk returns no chunks for 0)".to_string(),
+        ));
+    }
 
     let src = crate::vcf_reader::VcfRecordSource::new(
         vcf_path,
@@ -68,11 +84,18 @@ pub fn probe_rates(
         Vec::new(), // whole contig
         crate::svar2_view::OverlapMode::Pos,
     )?;
+    // `ChunkAssembler::new` is the same constructor the unsharded fallback
+    // reader uses (`orchestrator.rs`'s single-reader branch): it loads and
+    // wires up the reference when `fasta_path` is `Some`, and behaves exactly
+    // as before when it is `None`. `owned_range` is `None` either way -- that
+    // constructor always passes `None` through to `with_reference`, which is
+    // the "whole contig, no cross-shard dedup" value; a single-reader,
+    // whole-contig probe has no shard boundary to dedup against.
     let mut asm = crate::chunk_assembler::ChunkAssembler::new(
         Box::new(src),
         samples.len(),
         ploidy,
-        None, // no FASTA: left-alignment cost is not what is being compared
+        fasta_path,
         chrom,
         false, // skip_out_of_scope
         crate::normalize::CheckRef::Error,
@@ -81,13 +104,16 @@ pub fn probe_rates(
 
     // The bank is a required sink for dense2sparse_vk, not an output. No
     // writer thread is spawned to drain the channel -- there is nothing to
-    // write anywhere, so the probe leaves no user-visible bytes. `_rx` stays
-    // alive so `flush_buffer`'s `send` (if a pathological chunk of long
+    // write anywhere, so the probe leaves no user-visible bytes. `rx_long`
+    // stays alive so `flush_buffer`'s `send` (if a pathological chunk of long
     // alleles ever exceeds the buffer capacity) has somewhere to land rather
     // than panicking on a disconnected channel; the channel is unbounded so
     // that same `send` can never block waiting on a consumer that doesn't
-    // exist, and its queued buffers are simply dropped with `_rx` on return.
-    let (tx_long, _rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+    // exist. Buffers are drained with `try_iter` after each chunk (below) so
+    // the probe's memory use is bounded by chunk content rather than
+    // accumulating across `PROBE_CHUNKS`; anything left is dropped with
+    // `rx_long` on return.
+    let (tx_long, rx_long) = crossbeam_channel::unbounded::<Vec<u8>>();
     let mut bank = crate::nrvk::LongAlleleTableWriter::new(tx_long, 8 * 1024 * 1024);
 
     let mut read_s = 0.0f64;
@@ -102,8 +128,14 @@ pub fn probe_rates(
         read_s += t0.elapsed().as_secs_f64();
 
         let t1 = Instant::now();
-        let _ = crate::rvk::dense2sparse_vk(&chunk, &mut bank, false, fields);
+        let _sparse = crate::rvk::dense2sparse_vk(&chunk, &mut bank, false, fields);
         exec_s += t1.elapsed().as_secs_f64();
+
+        // Outside both timers: bounds probe memory to this chunk's long
+        // alleles, not the whole probe. `try_iter` never blocks -- no
+        // consumer thread exists to apply backpressure, so this cannot
+        // introduce the hang an unbounded channel was chosen to avoid.
+        for _ in rx_long.try_iter() {}
 
         chunks += 1;
     }
@@ -124,6 +156,7 @@ mod tests {
     use super::*;
     use rust_htslib::bcf::record::GenotypeAllele;
     use rust_htslib::bcf::{Format, Header, Writer};
+    use std::io::Write;
 
     /// To keep the executor fed, w readers must supply at least as fast as one
     /// executor drains: w/t_read >= 1/t_exec, so w = ceil(t_read/t_exec).
@@ -242,7 +275,7 @@ mod tests {
         let path = probe_fixture_vcf(dir.path(), 200, 64); // 200 variants, 64 samples
         let samples: Vec<String> = (0..64).map(|i| format!("s{i}")).collect();
         let refs: Vec<&str> = samples.iter().map(|s| s.as_str()).collect();
-        let rates = probe_rates(&path, "chr1", &refs, 64, 2, &[]).unwrap();
+        let rates = probe_rates(&path, "chr1", &refs, 64, 2, &[], None).unwrap();
         assert!(rates.t_read_s > 0.0, "rates = {rates:?}");
         assert!(rates.t_exec_s > 0.0, "rates = {rates:?}");
         let w = workers_from_rates(&rates);
@@ -257,6 +290,62 @@ mod tests {
         let path = probe_fixture_vcf(dir.path(), 50, 8);
         let samples: Vec<String> = (0..8).map(|i| format!("s{i}")).collect();
         let refs: Vec<&str> = samples.iter().map(|s| s.as_str()).collect();
-        assert!(probe_rates(&path, "chrNope", &refs, 32, 2, &[]).is_err());
+        assert!(probe_rates(&path, "chrNope", &refs, 32, 2, &[], None).is_err());
+    }
+
+    /// A `chunk_size` of 0 is a caller bug, not a contig with no records --
+    /// it must surface as a distinct error rather than the generic
+    /// "no records" message (`read_next_chunk` returns `Ok(None)` immediately
+    /// for `chunk_size == 0`, which would otherwise look identical to an
+    /// empty contig).
+    #[test]
+    fn probe_errors_on_zero_chunk_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = probe_fixture_vcf(dir.path(), 50, 8);
+        let samples: Vec<String> = (0..8).map(|i| format!("s{i}")).collect();
+        let refs: Vec<&str> = samples.iter().map(|s| s.as_str()).collect();
+        let err = probe_rates(&path, "chr1", &refs, 0, 2, &[], None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("chunk_size"), "unexpected message: {msg}");
+    }
+
+    /// Writes a one-contig FASTA (`>chrom` + `seq`) and its `.fai`, following
+    /// `tests/test_left_align_e2e.rs`'s `write_ref` fixture pattern.
+    fn write_fasta_ref(dir: &std::path::Path, chrom: &str, seq: &[u8]) -> String {
+        let path = dir.join("ref.fa");
+        {
+            let mut f = std::fs::File::create(&path).expect("create fasta");
+            writeln!(f, ">{chrom}").expect("write fasta header");
+            f.write_all(seq).expect("write fasta seq");
+            writeln!(f).expect("write fasta trailing newline");
+        }
+        rust_htslib::faidx::build(&path).expect("build fasta index");
+        path.to_str().expect("utf8 path").to_string()
+    }
+
+    /// With a reference supplied, the probe's reader stage also runs
+    /// REF/FASTA validation -- it must still return usable rates. Bounds,
+    /// not pinned numbers, same as the no-reference case: this only checks
+    /// that wiring `fasta_path: Some(..)` through to `ChunkAssembler::new`
+    /// works end to end, not a specific normalization cost.
+    #[test]
+    fn probe_includes_the_reference_stage_when_given_a_fasta() {
+        let dir = tempfile::tempdir().unwrap();
+        let n_variants = 200;
+        let path = probe_fixture_vcf(dir.path(), n_variants, 64);
+        // probe_fixture_vcf's REF is always "A" at every position (0, 10, ..),
+        // spanning the contig's declared length (n_variants * 10 + 100); an
+        // all-'A' reference of that length matches every REF call, so
+        // `CheckRef::Error` (already passed by `probe_rates`) never excludes
+        // a record here.
+        let ref_seq = vec![b'A'; n_variants * 10 + 100];
+        let fasta = write_fasta_ref(dir.path(), "chr1", &ref_seq);
+        let samples: Vec<String> = (0..64).map(|i| format!("s{i}")).collect();
+        let refs: Vec<&str> = samples.iter().map(|s| s.as_str()).collect();
+        let rates = probe_rates(&path, "chr1", &refs, 64, 2, &[], Some(&fasta)).unwrap();
+        assert!(rates.t_read_s > 0.0, "rates = {rates:?}");
+        assert!(rates.t_exec_s > 0.0, "rates = {rates:?}");
+        let w = workers_from_rates(&rates);
+        assert!((1..=W_MAX).contains(&w), "w = {w}");
     }
 }
