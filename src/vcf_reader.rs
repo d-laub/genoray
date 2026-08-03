@@ -6,6 +6,39 @@ use rust_htslib::bcf::header::HeaderView;
 use rust_htslib::bcf::record::Record;
 use rust_htslib::bcf::{IndexedReader, Read};
 use rust_htslib::errors::Error as HtslibError;
+use std::collections::HashMap;
+
+/// Resolve requested sample names to header column indices in O(S) total.
+///
+/// `HeaderView::sample_id` is `samples().iter().position(..)` — a linear scan
+/// that also rebuilds the full name vector on every call. Invoking it once per
+/// requested sample is therefore O(S^2): at S=500,000 that is ~2.5e11 byte
+/// comparisons, measured at ~1,150s per resolution and ~100% of phase-1 CPU
+/// (regressing cpu_s on shard count gave a statistically zero intercept).
+/// Build the name→index map once instead.
+///
+/// Duplicate names keep the FIRST index, matching `position`'s semantics, and
+/// the not-found message is byte-identical to the old one so the error-parity
+/// test between `new` and `resolve_sample_indices` still holds.
+fn resolve_against_header(
+    header: &HeaderView,
+    samples: &[&str],
+) -> Result<Vec<usize>, ConversionError> {
+    let all = header.samples();
+    let mut by_name: HashMap<&[u8], usize> = HashMap::with_capacity(all.len());
+    for (i, name) in all.iter().enumerate() {
+        by_name.entry(*name).or_insert(i);
+    }
+    samples
+        .iter()
+        .map(|name| {
+            by_name
+                .get(name.as_bytes())
+                .copied()
+                .ok_or_else(|| ConversionError::Input(format!("Sample '{name}' not found in VCF")))
+        })
+        .collect()
+}
 
 // Decode one INFO field for the CURRENT record, once. `Ok(None)` means the
 // field is absent from this record (a normal, expected occurrence — NOT an
@@ -410,8 +443,8 @@ impl VcfRecordSource {
     /// this lookup only — callers that plan to construct a `VcfRecordSource`
     /// for the same `vcf_path` right after should prefer resolving indices
     /// once (e.g. per-VCF, not per-window) and passing them to
-    /// `with_sample_indices`, which skips this O(k requested × n header
-    /// samples) walk entirely.
+    /// `with_sample_indices`, which skips this O(k requested + n header
+    /// samples) walk — plus the file open and header parse — entirely.
     pub fn resolve_sample_indices(
         vcf_path: &str,
         samples: &[&str],
@@ -429,14 +462,7 @@ impl VcfRecordSource {
         })?;
         let header = reader.header();
 
-        samples
-            .iter()
-            .map(|name| {
-                header.sample_id(name.as_bytes()).ok_or_else(|| {
-                    ConversionError::Input(format!("Sample '{name}' not found in VCF"))
-                })
-            })
-            .collect()
+        resolve_against_header(header, samples)
     }
 
     // opens the file, applies the sample filter at the C-level, and jumps to the chromosome.
@@ -453,14 +479,7 @@ impl VcfRecordSource {
     ) -> Result<Self, ConversionError> {
         let opened = open_vcf(vcf_path, chrom, htslib_threads, regions, overlap)?;
 
-        let sample_indices: Vec<usize> = samples
-            .iter()
-            .map(|name| {
-                opened.header.sample_id(name.as_bytes()).ok_or_else(|| {
-                    ConversionError::Input(format!("Sample '{name}' not found in VCF"))
-                })
-            })
-            .collect::<Result<_, _>>()?;
+        let sample_indices = resolve_against_header(&opened.header, samples)?;
         let num_samples = samples.len();
 
         Self::from_opened(opened, chrom, ploidy, sample_indices, num_samples, fields)

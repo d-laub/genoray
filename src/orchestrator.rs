@@ -486,26 +486,42 @@ pub fn process_chromosome(
                                 reader_workers,
                                 units.len()
                             );
+                            // Resolve the cohort's header-column indices ONCE for
+                            // the whole contig. The closure below runs per shard
+                            // and `units.len()` scales with `reader_workers`, so
+                            // resolving inside it cost O(reader_workers × S) file
+                            // opens + header parses. At S=500,000 that dominated
+                            // everything: cpu_s regressed on shard count gave
+                            // ~1,150s per shard with a statistically ZERO
+                            // intercept, i.e. essentially all of phase-1 CPU was
+                            // this resolution rather than record decoding, and
+                            // adding readers made the conversion monotonically
+                            // slower (1.67× at 11 workers) instead of faster.
+                            let sample_indices =
+                                crate::vcf_reader::VcfRecordSource::resolve_sample_indices(
+                                    &vcf_path, &s_refs,
+                                )?;
                             let totals = crate::shard_exec::run(
                                 &chr,
                                 units,
                                 reader_workers,
                                 |unit| {
-                                    let source = crate::vcf_reader::VcfRecordSource::new(
-                                        &vcf_path,
-                                        &chr,
-                                        &s_refs,
-                                        shard_htslib,
-                                        ploidy,
-                                        &fields_owned,
-                                        // The shard's padded fetch window IS the
-                                        // reader's region; `Pos` makes the fetch
-                                        // unwidened and the per-record filter the
-                                        // plain half-open POS test. `owned_range`
-                                        // (below) does the cross-shard POS dedup.
-                                        vec![(unit.fetch_start, unit.fetch_end)],
-                                        crate::svar2_view::OverlapMode::Pos,
-                                    )?;
+                                    let source =
+                                        crate::vcf_reader::VcfRecordSource::with_sample_indices(
+                                            &vcf_path,
+                                            &chr,
+                                            sample_indices.clone(),
+                                            shard_htslib,
+                                            ploidy,
+                                            &fields_owned,
+                                            // The shard's padded fetch window IS the
+                                            // reader's region; `Pos` makes the fetch
+                                            // unwidened and the per-record filter the
+                                            // plain half-open POS test. `owned_range`
+                                            // (below) does the cross-shard POS dedup.
+                                            vec![(unit.fetch_start, unit.fetch_end)],
+                                            crate::svar2_view::OverlapMode::Pos,
+                                        )?;
                                     Ok(crate::chunk_assembler::ChunkAssembler::with_reference(
                                         Box::new(source),
                                         s_refs.len(),
