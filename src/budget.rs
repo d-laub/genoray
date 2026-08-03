@@ -349,15 +349,21 @@ mod tests {
             reader_workers: 2,
         })
         .unwrap();
-        assert_eq!(plan.concurrent_chroms, 4);
+        assert_eq!(
+            plan,
+            ShardedPlan {
+                concurrent_chroms: 4,
+                reader_workers: 2
+            }
+        );
     }
 
     // The memory constraint must actually bind, or it is decoration.
     // S=500,000, ploidy 2, no FORMAT fields, chunk_size 25,000:
     //   chunk_bytes = 25_000 * (500_000*2/8) = 3.125e9 B = 3125 MB
     //   base        = 932 + 0.01115*500_000 = 6507 MB
-    //   per-contig  = 1.371 * (2 + 1) * 3125 = 12852.2 MB
-    //   budget      = 52428 MB  ->  (52428 - 6507)/12852.2 = 3.57 -> 3
+    //   per-contig  = 1.371 * (2 + 1) * 3125 = 12853.125 MB
+    //   budget      = 52428 MB  ->  (52428 - 6507)/12853.125 = 3.57 -> 3
     // The core bound alone would have allowed 15.
     #[test]
     fn memory_bound_beats_core_bound_at_biobank_scale() {
@@ -370,7 +376,13 @@ mod tests {
             reader_workers: 2,
         })
         .unwrap();
-        assert_eq!(plan.concurrent_chroms, 3);
+        assert_eq!(
+            plan,
+            ShardedPlan {
+                concurrent_chroms: 3,
+                reader_workers: 2
+            }
+        );
     }
 
     // A budget below the cohort baseline cannot fit even one contig. Failing
@@ -431,6 +443,12 @@ mod tests {
             reader_workers: 2,
         })
         .unwrap();
-        assert_eq!(plan.concurrent_chroms, 1);
+        assert_eq!(
+            plan,
+            ShardedPlan {
+                concurrent_chroms: 1,
+                reader_workers: 2
+            }
+        );
     }
 }
