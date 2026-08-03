@@ -24,7 +24,7 @@ from genoray._svar2_fields import (
 )
 from genoray._svar2_mutcat import _MutcatMixin
 from genoray._svar2_ops import Mode, _assert_concat_compatible, _load_meta, _write_store
-from genoray._utils import parse_memory
+from genoray._utils import detect_memory_budget, parse_memory
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -654,6 +654,8 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         check_ref: Literal["e", "x"] = "e",
         progress: bool = False,
         log_level: Literal["off", "warning", "info", "debug"] = "info",
+        max_mem: int | str | None = None,
+        tune: bool = False,
     ) -> int:
         """Convert a bgzipped VCF or BCF to an SVAR2 store.
 
@@ -717,6 +719,24 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         variable `GENORAY_LOG` overrides this argument when set to one of
         the same four values (e.g. `GENORAY_LOG=debug` for troubleshooting
         without touching call sites).
+
+        max_mem: byte budget the concurrency planner may use, as an int or a
+        string like `"64GiB"` (see `parse_memory`). Concurrent-contig count is
+        chosen so cohort baseline memory plus each concurrent contig's
+        in-flight chunk buffers fit inside this budget, in addition to the
+        existing core-count bound. **`None` (the default) means a DETECTED
+        budget** -- 80% of the cgroup memory limit (or `/proc/meminfo` total
+        outside a cgroup) -- **not unbounded**. This is a deliberate default
+        behavior change: unbounded planning preserves exactly the
+        biobank-scale OOM exposure the byte-budgeted planner exists to
+        remove. Pass an explicit value to raise or lower it, or a very large
+        value to approximate the old unbounded behavior.
+
+        tune: if True, probe the largest contig's actual read/exec rates on
+        this machine and input before dispatch, and derive the per-contig
+        reader-worker count from the measured ratio instead of a fixed
+        default. A failed probe never fails the conversion -- it falls back
+        to the default reader-worker count and logs a warning.
         """
         from cyvcf2 import VCF as _CyVCF
         from genoray._svar._regions import _normalize_samples
@@ -815,6 +835,14 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         format_ = [t for t in flds if t[1] == "format"]
         _validate_check_ref(check_ref)
 
+        # `None` means a DETECTED budget, not unbounded. Unbounded preserves
+        # exactly the biobank-scale OOM exposure the byte-budgeted planner
+        # exists to remove.
+        if max_mem is None:
+            max_mem_bytes = detect_memory_budget()
+        else:
+            max_mem_bytes = parse_memory(max_mem)
+
         from ._logging import write_reporting
 
         with write_reporting(progress, log_level) as (rx, level):
@@ -835,6 +863,8 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
                 check_ref,
                 region_ranges,
                 regions_overlap,
+                max_mem_bytes,
+                tune,
                 log_level=level,
                 receiver=rx,
             )
