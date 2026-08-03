@@ -3,17 +3,23 @@
 // without side effects.
 
 // 4 fixed OS threads per chrom: reader + executor + chunk_writer + long_allele_writer.
+// Governs the MONOLITHIC reader path only (plan_thread_budget); the sharded
+// path's per-contig demand is `1 + reader_workers` (see plan_sharded).
 pub const PIPELINE_THREADS_PER_CHROM: usize = 4;
 // Independent indexed VCF shard readers decompress in their worker thread.
 // Giving each one an HTSlib background pool would multiply the process-wide
 // thread budget by the shard count.
 pub const SHARDED_VCF_HTSLIB_THREADS_PER_READER: usize = 0;
 // Floor for HTSlib decode threads — below this the executor channel starves.
+// Governs the MONOLITHIC reader path only (plan_thread_budget); the sharded
+// path never allocates this pool (shard readers decompress inline).
 const MIN_HTSLIB_THREADS: usize = 2;
 // Ceiling for HTSlib decode threads. Bumped 4→8 for single-/few-contig
 // workloads with many idle cores: gdc's 16007-sample records mean very large
 // BGZF blocks where extra decode threads still pay. Multi-contig runs clamp
 // well below this via cores_per_chrom, so the bump only bites when cores are idle.
+// Governs the MONOLITHIC reader path only (plan_thread_budget); the sharded
+// path never allocates this pool (shard readers decompress inline).
 const MAX_HTSLIB_THREADS: usize = 8;
 // Min viable allocation for one chrom end-to-end.
 const MIN_THREADS_PER_CHROM: usize = PIPELINE_THREADS_PER_CHROM + MIN_HTSLIB_THREADS;
@@ -87,6 +93,105 @@ fn reader_workers(usable_cores: usize, concurrent: usize) -> usize {
         .checked_div(worker_cost)
         .unwrap_or(0)
         .max(1)
+}
+
+// Peak-RSS coefficients from the scale-bench RAM law, fitted 2026-08-03:
+//   peak_rss_mb ~ 932 + 0.01115*samples + 1.371*(w+pending)*chunk_bytes
+//   R^2 = 0.9040, n = 44
+// See docs/superpowers/specs/2026-08-03-svar2-tuned-load-balancing-design.md.
+// These are load-bearing in production, not just in the bench: a bad refit
+// becomes an OOM. Change them only alongside a refit that says so.
+pub const RAM_BASE_MB: f64 = 932.0;
+pub const RAM_PER_SAMPLE_MB: f64 = 0.01115;
+pub const RAM_KAPPA: f64 = 1.371;
+
+/// Inputs to the sharded-VCF concurrency plan. Every field is data the caller
+/// already has before opening a single record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlanInputs {
+    pub usable_cores: usize,
+    pub n_contigs: usize,
+    pub n_samples: usize,
+    /// Bytes of one FULL dense chunk:
+    /// `chunk_size * (n_samples*ploidy/8 + n_format_fields*n_samples*4)`.
+    pub chunk_bytes: u64,
+    /// `None` means the caller declined a budget; only the core bound applies.
+    pub max_mem_bytes: Option<u64>,
+    pub reader_workers: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShardedPlan {
+    pub concurrent_chroms: usize,
+    pub reader_workers: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PlanError {
+    /// The budget cannot fit the cohort baseline plus one contig's chunks.
+    InsufficientMemory { needed_mb: f64, budget_mb: f64 },
+}
+
+impl std::fmt::Display for PlanError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PlanError::InsufficientMemory {
+                needed_mb,
+                budget_mb,
+            } => write!(
+                f,
+                "max_mem is {budget_mb:.0} MB but converting this cohort needs \
+                 at least {needed_mb:.0} MB for one concurrent contig; raise \
+                 max_mem or lower chunk_size"
+            ),
+        }
+    }
+}
+
+/// Plan contig concurrency for the sharded VCF reader.
+///
+/// Per-contig CPU demand is `1 + reader_workers`: one executor
+/// (`run_compute_engine`, a serial recv loop, pegged at ~100% of one core) plus
+/// the shard readers. It is NOT `PIPELINE_THREADS_PER_CHROM + htslib_threads`
+/// -- the dispatcher and both writers are nearly always blocked (a measured
+/// 22-contig run put 16 threads on 2.02 cores), and the HTSlib decode pool is
+/// `SHARDED_VCF_HTSLIB_THREADS_PER_READER` = 0 on this path because shard
+/// readers decompress inline.
+///
+/// Memory bounds concurrency independently: each concurrent contig holds
+/// `reader_workers + pending` chunks in flight, where `pending` is the reorder
+/// buffer's structural floor `reader_workers - 1` (the units ahead of the head
+/// keep everything they produce buffered even with perfectly balanced readers).
+pub fn plan_sharded(inp: PlanInputs) -> Result<ShardedPlan, PlanError> {
+    let w = inp.reader_workers.max(1);
+    let n_contigs = inp.n_contigs.max(1);
+    let usable = inp.usable_cores.max(1);
+
+    let core_bound = (usable / (1 + w)).max(1);
+
+    let cc = match inp.max_mem_bytes {
+        None => std::cmp::min(core_bound, n_contigs),
+        Some(budget) => {
+            let budget_mb = budget as f64 / 1e6;
+            let baseline_mb = RAM_BASE_MB + RAM_PER_SAMPLE_MB * inp.n_samples as f64;
+            let pending = w.saturating_sub(1);
+            let per_contig_mb = RAM_KAPPA * (w + pending) as f64 * (inp.chunk_bytes as f64 / 1e6);
+            let headroom_mb = budget_mb - baseline_mb;
+            if headroom_mb < per_contig_mb {
+                return Err(PlanError::InsufficientMemory {
+                    needed_mb: baseline_mb + per_contig_mb,
+                    budget_mb,
+                });
+            }
+            let mem_bound = (headroom_mb / per_contig_mb).floor() as usize;
+            std::cmp::min(std::cmp::min(core_bound, n_contigs), mem_bound.max(1))
+        }
+    };
+
+    Ok(ShardedPlan {
+        concurrent_chroms: cc,
+        reader_workers: w,
+    })
 }
 
 #[cfg(test)]
@@ -206,5 +311,126 @@ mod tests {
         // (boundary: 6 < 6 is false), 1 chrom, htslib = clamp(6-4, 2, 8) = 2.
         // active = 1*(4+2)=6. processing = max(1, 6-6) = 1 (floored).
         assert_eq!(plan_thread_budget(7, 1).processing_threads, 1);
+    }
+
+    // 48 cores -> 47 usable. w=2 -> demand 3/contig -> 15 concurrent, under
+    // the 22 available. The OLD planner returned 7 here, because it charged
+    // 6 cores per contig for 4 mostly-blocked pipeline threads plus an
+    // HTSlib pool the sharded path never allocates.
+    #[test]
+    fn core_bound_concurrency() {
+        let plan = plan_sharded(PlanInputs {
+            usable_cores: 47,
+            n_contigs: 22,
+            n_samples: 4_000,
+            chunk_bytes: 10_937_000,
+            max_mem_bytes: None,
+            reader_workers: 2,
+        })
+        .unwrap();
+        assert_eq!(
+            plan,
+            ShardedPlan {
+                concurrent_chroms: 15,
+                reader_workers: 2
+            }
+        );
+    }
+
+    // Fewer contigs than cores allow: never spawn a pipeline with no contig.
+    #[test]
+    fn contig_count_bounds_concurrency() {
+        let plan = plan_sharded(PlanInputs {
+            usable_cores: 47,
+            n_contigs: 4,
+            n_samples: 4_000,
+            chunk_bytes: 10_937_000,
+            max_mem_bytes: None,
+            reader_workers: 2,
+        })
+        .unwrap();
+        assert_eq!(plan.concurrent_chroms, 4);
+    }
+
+    // The memory constraint must actually bind, or it is decoration.
+    // S=500,000, ploidy 2, no FORMAT fields, chunk_size 25,000:
+    //   chunk_bytes = 25_000 * (500_000*2/8) = 3.125e9 B = 3125 MB
+    //   base        = 932 + 0.01115*500_000 = 6507 MB
+    //   per-contig  = 1.371 * (2 + 1) * 3125 = 12852.2 MB
+    //   budget      = 52428 MB  ->  (52428 - 6507)/12852.2 = 3.57 -> 3
+    // The core bound alone would have allowed 15.
+    #[test]
+    fn memory_bound_beats_core_bound_at_biobank_scale() {
+        let plan = plan_sharded(PlanInputs {
+            usable_cores: 47,
+            n_contigs: 22,
+            n_samples: 500_000,
+            chunk_bytes: 3_125_000_000,
+            max_mem_bytes: Some(52_428 * 1_000_000),
+            reader_workers: 2,
+        })
+        .unwrap();
+        assert_eq!(plan.concurrent_chroms, 3);
+    }
+
+    // A budget below the cohort baseline cannot fit even one contig. Failing
+    // loudly beats planning cc=0 (which dispatches nothing and "succeeds"
+    // with an empty store) or cc=1 (which OOMs).
+    #[test]
+    fn budget_below_baseline_is_an_error() {
+        let err = plan_sharded(PlanInputs {
+            usable_cores: 47,
+            n_contigs: 22,
+            n_samples: 500_000,
+            chunk_bytes: 3_125_000_000,
+            max_mem_bytes: Some(5_000 * 1_000_000),
+            reader_workers: 2,
+        })
+        .unwrap_err();
+        match err {
+            PlanError::InsufficientMemory {
+                needed_mb,
+                budget_mb,
+            } => {
+                assert!(needed_mb > budget_mb);
+                assert!((budget_mb - 5_000.0).abs() < 1.0);
+            }
+        }
+    }
+
+    // Degenerate hardware must still produce a runnable plan.
+    #[test]
+    fn single_core_single_contig_still_runs() {
+        let plan = plan_sharded(PlanInputs {
+            usable_cores: 1,
+            n_contigs: 1,
+            n_samples: 250,
+            chunk_bytes: 64_000,
+            max_mem_bytes: None,
+            reader_workers: 4,
+        })
+        .unwrap();
+        assert_eq!(
+            plan,
+            ShardedPlan {
+                concurrent_chroms: 1,
+                reader_workers: 4
+            }
+        );
+    }
+
+    // Zero contigs is a caller bug, not a plan: clamp rather than divide by it.
+    #[test]
+    fn zero_contigs_clamps_to_one() {
+        let plan = plan_sharded(PlanInputs {
+            usable_cores: 47,
+            n_contigs: 0,
+            n_samples: 250,
+            chunk_bytes: 64_000,
+            max_mem_bytes: None,
+            reader_workers: 2,
+        })
+        .unwrap();
+        assert_eq!(plan.concurrent_chroms, 1);
     }
 }
