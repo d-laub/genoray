@@ -48,6 +48,13 @@ impl From<crate::normalize::NormalizeError> for ConversionError {
     }
 }
 
+#[cfg(feature = "conversion")]
+impl From<crate::budget::PlanError> for ConversionError {
+    fn from(e: crate::budget::PlanError) -> Self {
+        ConversionError::Input(e.to_string())
+    }
+}
+
 impl From<ConversionError> for pyo3::PyErr {
     fn from(e: ConversionError) -> Self {
         use pyo3::exceptions::{PyFileNotFoundError, PyOSError, PyRuntimeError, PyValueError};

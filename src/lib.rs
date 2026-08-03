@@ -145,12 +145,19 @@ fn index_vcf(path: String) -> PyResult<()> {
     index_bcf_csi(&path).map_err(pyo3::exceptions::PyRuntimeError::new_err)
 }
 
+// Low end of the scale bench's measured reader-worker knee (3-7). Chosen at
+// the low end because the executor is the bottleneck, not the reader, and
+// surplus readers steal cores from *other* concurrently-dispatched contigs'
+// executors rather than speeding up their own.
+#[cfg(feature = "conversion")]
+const DEFAULT_READER_WORKERS: usize = 3;
+
 //The Python Wrapper and resource allocator
 #[cfg(feature = "conversion")]
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 #[pyfunction]
-#[pyo3(signature = (vcf_path, reference_path, chroms, output_dir, samples, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false, signatures=false, info_fields=Vec::new(), format_fields=Vec::new(), check_ref="e".to_string(), region_ranges=Vec::new(), regions_overlap="pos".to_string(), log_level = "info".to_string(), receiver = None))]
+#[pyo3(signature = (vcf_path, reference_path, chroms, output_dir, samples, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false, signatures=false, info_fields=Vec::new(), format_fields=Vec::new(), check_ref="e".to_string(), region_ranges=Vec::new(), regions_overlap="pos".to_string(), max_mem_bytes=None, tune=false, log_level = "info".to_string(), receiver = None))]
 fn run_conversion_pipeline(
     py: Python,
     vcf_path: String,
@@ -169,6 +176,8 @@ fn run_conversion_pipeline(
     check_ref: String,
     region_ranges: Vec<(String, u32, u32)>,
     regions_overlap: String,
+    max_mem_bytes: Option<u64>,
+    tune: bool,
     log_level: String,
     receiver: Option<Py<PyEventReceiver>>,
 ) -> PyResult<usize> {
@@ -223,10 +232,73 @@ fn run_conversion_pipeline(
                 }
             };
 
+            // Per-variant dense-chunk cost, matching what the RAM law was
+            // fitted against: packed presence grid plus staged FORMAT values.
+            let n_format = fields
+                .iter()
+                .filter(|f| f.category == crate::field::FieldCategory::Format)
+                .count();
+            let per_variant_bytes =
+                (samples.len() * ploidy / 8 + n_format * samples.len() * 4) as u64;
+            let chunk_bytes = per_variant_bytes * chunk_size as u64;
+
+            let reader_workers = if tune {
+                // Probe the LARGEST contig: it dominates the makespan, so its
+                // rates are the ones worth matching.
+                let costs = crate::contig_cost::estimate_contig_costs(&vcf_path, &chroms);
+                let target = crate::contig_cost::order_longest_first(&chroms, &costs);
+                match target.first() {
+                    Some(c) => match crate::tune::probe_rates(
+                        &vcf_path,
+                        c,
+                        &sample_refs,
+                        chunk_size,
+                        ploidy,
+                        &fields,
+                        reference_path.as_deref(),
+                    ) {
+                        Ok(rates) => {
+                            let w = crate::tune::workers_from_rates(&rates);
+                            tracing::info!(
+                                t_read_s = rates.t_read_s,
+                                t_exec_s = rates.t_exec_s,
+                                reader_workers = w,
+                                "tuned reader workers from probe"
+                            );
+                            w
+                        }
+                        Err(e) => {
+                            // A failed probe must not fail the conversion; it
+                            // is an optimization, and the planner's default is
+                            // a measured knee, not a guess.
+                            tracing::warn!(error = %e, "probe failed; using default reader workers");
+                            DEFAULT_READER_WORKERS
+                        }
+                    },
+                    None => DEFAULT_READER_WORKERS,
+                }
+            } else {
+                DEFAULT_READER_WORKERS
+            };
+
+            let sharded = crate::budget::plan_sharded(crate::budget::PlanInputs {
+                usable_cores: available_cores.saturating_sub(1).max(1),
+                n_contigs: chroms.len(),
+                n_samples: samples.len(),
+                chunk_bytes,
+                max_mem_bytes,
+                reader_workers,
+            });
+            let sharded = match sharded {
+                Ok(p) => p,
+                Err(e) => return vec![Err(crate::error::ConversionError::from(e))],
+            };
+
             let plan = crate::budget::plan_thread_budget(available_cores, chroms.len());
-            let concurrent_chroms = orchestrator::bench_concurrent_chroms(plan.concurrent_chroms);
-            let htslib_threads = plan.htslib_threads;
-            let reader_workers = plan.reader_workers;
+            let concurrent_chroms =
+                orchestrator::bench_concurrent_chroms(sharded.concurrent_chroms);
+            let htslib_threads = plan.htslib_threads; // monolithic path only
+            let reader_workers = sharded.reader_workers;
             let processing_threads = plan.processing_threads;
 
             let monolithic_reader_active =
@@ -258,9 +330,15 @@ fn run_conversion_pipeline(
 
             // Step 3 -> Dispatch
             let fasta_ref: Option<&str> = reference_path.as_deref();
+            // Dispatch order only: `chroms` itself keeps its original order
+            // for `finalize_fields`/`write_meta` below, since the store's
+            // on-disk contig order is part of its layout.
+            let costs = crate::contig_cost::estimate_contig_costs(&vcf_path, &chroms);
+            let ordered = crate::contig_cost::order_longest_first(&chroms, &costs);
             let results = pool.install(|| {
-                chroms
+                ordered
                     .par_iter()
+                    .with_min_len(1)
                     .map(|chrom| {
                         tracing::info!(chrom = %chrom, "processing contig");
                         orchestrator::process_chromosome(
