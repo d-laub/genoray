@@ -11,6 +11,7 @@ from scripts.bench_svar2.model import (
     decide,
     extrapolate,
     fit_cost_law,
+    RamRow,
     fit_ram_law,
     fit_v_law,
     knee_from_probe,
@@ -66,8 +67,7 @@ def test_knee_floors_at_one():
 
 def test_ram_law_recovers_planted_slope():
     rows = [
-        # (workers, pending_highwater, chunk_bytes, peak_rss_mb)
-        (w, 0, 25_000_000, 100.0 + 3.0 * w * 25_000_000 / 1e6)
+        RamRow(w, 0, 25_000_000, _FIXED_S, 100.0 + 3.0 * w * 25_000_000 / 1e6)
         for w in (1, 3, 5, 7, 11)
     ]
     law = fit_ram_law(rows)
@@ -75,7 +75,81 @@ def test_ram_law_recovers_planted_slope():
     assert math.isclose(law.base_mb, 100.0, abs_tol=1e-6)
 
 
-# `rows` are (workers, pending_highwater, chunk_bytes, peak_rss_mb). Wherever a
+def test_ram_law_recovers_planted_cohort_term():
+    """Peak RSS carries a cohort-sized term independent of chunk bytes, and the
+    law must recover it rather than smear it into the intercept.
+
+    Measured motivation: with chunk_bytes pinned at 10.9 MB, real peak RSS runs
+    789 MB at S=4,000 to 5,061 MB at S=500,000 -- a 6.4x spread the chunk term
+    cannot express. A single-regressor fit sat at R^2=0.057 on the real
+    39-point sweep and pushed kappa to 2.94 against per-worker slopes implying
+    far less; adding this term took the same data to R^2=0.913 and kappa 1.11.
+
+    Both regressors are planted at once, and crucially they are CORRELATED the
+    way a real sweep correlates them (bigger cohorts run smaller chunks), so
+    this also pins that `fit_ram_law` solves them jointly -- a sequential fit
+    would hand the shared variance to whichever regressor went first.
+    """
+    base, per_sample, kappa = 200.0, 0.01, 2.0
+    plan = [
+        (4_000, 25_000_000),
+        (16_000, 10_000_000),
+        (64_000, 4_000_000),
+        (250_000, 1_000_000),
+        (500_000, 500_000),
+    ]
+    rows = [
+        RamRow(
+            w,
+            2 * (w - 1) + 1,
+            cb,
+            s_,
+            base + per_sample * s_ + kappa * (w + 2 * (w - 1) + 1) * cb / 1e6,
+        )
+        for s_, cb in plan
+        for w in (1, 3, 7)
+    ]
+    law = fit_ram_law(rows)
+    assert law.r2 > 0.9999
+    assert math.isclose(law.per_sample_mb, per_sample, rel_tol=1e-6)
+    assert math.isclose(law.kappa, kappa, rel_tol=1e-6)
+    assert math.isclose(law.base_mb, base, rel_tol=1e-6)
+
+
+def test_ram_law_without_cohort_term_cannot_fit_cohort_scaling():
+    """The guard that makes the term load-bearing rather than decorative.
+
+    Plant RSS that varies ONLY with cohort size, holding chunk bytes constant --
+    the exact shape of the real measurement that exposed the defect. A law with
+    a chunk term and a constant intercept has no way to express this, so a fit
+    that ignores `samples` is left with essentially no explanatory power. If a
+    future refactor drops the cohort regressor, this fails loudly instead of
+    quietly returning a confident-looking, wrong kappa.
+    """
+    rows = [
+        RamRow(1, 0, 10_900_000, s_, 780.0 + 0.0086 * s_)
+        for s_ in (4_000, 16_000, 64_000, 250_000, 500_000)
+    ]
+    law = fit_ram_law(rows)
+    assert law.r2 > 0.999
+    assert math.isclose(law.per_sample_mb, 0.0086, rel_tol=1e-6)
+
+    # Same data through a chunk-term-only fit: chunk_bytes is constant, so the
+    # regressor is constant, so it explains none of the variance.
+    import numpy as np
+
+    x = np.array([(r.workers + r.pending) * r.chunk_bytes / 1e6 for r in rows])
+    assert x.std() == 0.0, "sanity: the chunk regressor is constant by construction"
+
+
+# Every planted row below fixes ONE cohort size. The RAM law's cohort term is
+# `per_sample_mb * samples`, so holding `samples` constant makes that term a
+# constant the intercept absorbs -- which is exactly what these tests want:
+# they exercise the CHUNK term and `decide`'s backlog gate, not cohort scaling.
+# `test_ram_law_recovers_planted_cohort_term` is the one that varies S.
+_FIXED_S = 4_000
+
+# `rows` are RamRow(workers, pending, chunk_bytes, samples, peak_rss_mb). Wherever a
 # test needs a row that is NOT byte-material, it uses a tiny `chunk_bytes`
 # against a realistic peak RSS -- which is also what the small-S rows of the
 # real sweep look like (a few MB of chunk against a ~450 MB process). The
@@ -83,17 +157,19 @@ def test_ram_law_recovers_planted_slope():
 # `ReorderBuffer` keeps the w-1 non-head units' chunks buffered, so a w=3 run
 # really does sit at pending~5 and a w=7 run higher still. Planting pending=0 at
 # w>1, as these tests used to, is a state the harness cannot produce.
-_KAPPA3 = RamLaw(base_mb=100.0, kappa=3.0, r2=1.0, n_points=5)
+_KAPPA3 = RamLaw(base_mb=100.0, per_sample_mb=0.0, kappa=3.0, r2=1.0, n_points=5)
 
 
-def _immaterial_rows() -> list[tuple[int, int, int, float]]:
+def _immaterial_rows() -> list[RamRow]:
     """One row per swept worker count, each with a realistic structural
     backlog but a small chunk: 1 MB is the small-S end of the real sweep
     (S=250 at chunk_size=25_000 is 1.55 MB of packed grid) against a ~450 MB
     process. Backlog share peaks at 3 * 21 * 1 MB / 450 MB = 14% at w=11,
     under the 25% gate -- and 3 * 5 * 1 / 450 = 3.3% at w=3, where the
     old count-based gate read pending=5 as 1.67x workers and fired."""
-    return [(w, 2 * (w - 1) + 1, 1_000_000, 450.0) for w in (1, 3, 5, 7, 11)]
+    return [
+        RamRow(w, 2 * (w - 1) + 1, 1_000_000, _FIXED_S, 450.0) for w in (1, 3, 5, 7, 11)
+    ]
 
 
 def test_decide_picks_h1_when_knee_is_flat():
@@ -124,7 +200,7 @@ def test_decide_picks_h3_when_the_backlog_is_byte_material():
     knees = {250: 5, 1_000: 5, 4_000: 5}
     read = fit_cost_law("read", [250, 1_000, 4_000], [1.0, 1.0, 1.0])
     exec_ = fit_cost_law("exec", [250, 1_000, 4_000], [1.0, 1.0, 1.0])
-    rows = [(2, 1, 3_125_000_000, 9_800.0)]
+    rows = [RamRow(2, 1, 3_125_000_000, _FIXED_S, 9_800.0)]
     v = decide(knees, read, exec_, rows, _KAPPA3)
     assert v.hypothesis == "H3"
     assert v.evidence["max_backlog_rss_share"] > 0.25
@@ -146,7 +222,9 @@ def test_extrapolate_flags_the_current_default_as_over_budget():
     samples = [250, 1_000, 4_000]
     read = fit_cost_law("read", samples, [1.0, 1.0, 1.0])
     exec_ = fit_cost_law("exec", samples, [1.0, 1.0, 1.0])
-    ram = fit_ram_law([(w, 0, 25_000_000, 100.0 + 3.0 * w * 25.0) for w in (1, 3, 5)])
+    ram = fit_ram_law(
+        [RamRow(w, 0, 25_000_000, _FIXED_S, 100.0 + 3.0 * w * 25.0) for w in (1, 3, 5)]
+    )
     out = extrapolate(
         v_law,
         read,
@@ -172,7 +250,7 @@ def test_extrapolate_includes_the_pending_term():
     (model.py:fit_ram_law). Before this fix `extrapolate` dropped `pending`
     entirely, so a measured reorder backlog (H3's whole subject) had zero
     effect on the projected peak RSS."""
-    ram = RamLaw(base_mb=100.0, kappa=3.0, r2=1.0, n_points=5)
+    ram = RamLaw(base_mb=100.0, per_sample_mb=0.0, kappa=3.0, r2=1.0, n_points=5)
     v_law = VLaw(
         slope_s_per_variant=0.0,
         intercept_s=0.0,
@@ -215,7 +293,7 @@ def test_extrapolate_extrapolation_factor_is_variants_over_max_fitted_v():
     walls = [1.0 + 1e-4 * v for v in variants]
     v_law = fit_v_law(list(zip(variants, walls)))
     flat = CostLaw(name="x", alpha=1.0, beta=0.0, beta_ci95=(0.0, 0.0), n_points=3)
-    ram = RamLaw(base_mb=0.0, kappa=0.0, r2=1.0, n_points=2)
+    ram = RamLaw(base_mb=0.0, per_sample_mb=0.0, kappa=0.0, r2=1.0, n_points=2)
 
     out_1e9 = extrapolate(
         v_law,
@@ -274,7 +352,7 @@ def test_extrapolate_scales_wall_by_the_cohort_size_ratio():
         max_extrapolation_factor=1.0,
     )
     flat = CostLaw(name="x", alpha=1.0, beta=0.0, beta_ci95=(0.0, 0.0), n_points=5)
-    ram = RamLaw(base_mb=0.0, kappa=0.0, r2=1.0, n_points=2)
+    ram = RamLaw(base_mb=0.0, per_sample_mb=0.0, kappa=0.0, r2=1.0, n_points=2)
 
     out = extrapolate(
         v_law,
@@ -330,7 +408,7 @@ def test_cohort_scale_does_not_come_from_the_utilization_cost_law():
     saturated = CostLaw(
         name="read", alpha=100.0, beta=0.0, beta_ci95=(0.0, 0.0), n_points=7
     )
-    ram = RamLaw(base_mb=0.0, kappa=0.0, r2=1.0, n_points=2)
+    ram = RamLaw(base_mb=0.0, per_sample_mb=0.0, kappa=0.0, r2=1.0, n_points=2)
     out = extrapolate(
         v_law,
         saturated,
@@ -369,7 +447,7 @@ def test_cost_law_degenerate_two_points_has_unbounded_ci():
 # --- C1: the H3 gate must not fire on backlog the architecture forces -------
 
 
-def _structural_rows() -> list[tuple[int, int, int, float]]:
+def _structural_rows() -> list[RamRow]:
     """What a real sharded run at w in {3, 7} actually produces.
 
     `ReorderBuffer::push` (src/shard_exec.rs) releases a chunk on arrival only
@@ -381,7 +459,10 @@ def _structural_rows() -> list[tuple[int, int, int, float]]:
     5/3 = 1.67 and 13/7 = 1.86 both clear 0.5, so it fired on every row of
     every planned sweep. `chunk_bytes` is 1 MB, the small-S end of the sweep.
     """
-    return [(3, 5, 1_000_000, 450.0), (7, 13, 1_000_000, 450.0)]
+    return [
+        RamRow(3, 5, 1_000_000, _FIXED_S, 450.0),
+        RamRow(7, 13, 1_000_000, _FIXED_S, 450.0),
+    ]
 
 
 def test_decide_returns_h1_on_planted_h1_data():
@@ -424,7 +505,10 @@ def test_decide_h3_fires_when_the_same_backlog_is_byte_material():
     knees = {250: 5, 1_000: 5, 4_000: 5, 16_000: 6, 500_000: 5}
     read = fit_cost_law("read", [250, 1_000, 4_000], [1.0, 1.0, 1.0])
     exec_ = fit_cost_law("exec", [250, 1_000, 4_000], [1.0, 1.0, 1.0])
-    rows = [(3, 5, 350_000_000, 6_000.0), (7, 13, 350_000_000, 6_000.0)]
+    rows = [
+        RamRow(3, 5, 350_000_000, _FIXED_S, 6_000.0),
+        RamRow(7, 13, 350_000_000, _FIXED_S, 6_000.0),
+    ]
     v = decide(knees, read, exec_, rows, _KAPPA3)
     assert v.hypothesis == "H3"
 
@@ -447,7 +531,7 @@ def test_every_verdict_carries_the_full_evidence():
     knees = {250: 5, 1_000: 5, 4_000: 5}
     read = fit_cost_law("read", [250, 1_000, 4_000], [1.0, 1.0, 1.0])
     exec_ = fit_cost_law("exec", [250, 1_000, 4_000], [1.0, 1.0, 1.0])
-    byte_material = [(3, 5, 350_000_000, 6_000.0)]
+    byte_material = [RamRow(3, 5, 350_000_000, _FIXED_S, 6_000.0)]
     keys = {"knee_spread", "beta_diff_ci95", "max_backlog_rss_share"}
 
     h3a = decide(knees, read, exec_, byte_material, _KAPPA3)
@@ -570,15 +654,24 @@ def test_ram_rows_do_not_charge_untouched_chunk_tail_to_rss():
     assert math.isclose(fit_ram_law(ram_rows).kappa, 3.0, rel_tol=1e-9)
 
     nominal = [
-        (
-            pt.reader_workers,
-            r.pending_highwater,
-            m.chunk_bytes * pt.chunk_size,
-            r.maxrss_mb,
+        RamRow(
+            workers=pt.reader_workers,
+            pending=r.pending_highwater,
+            chunk_bytes=m.chunk_bytes * pt.chunk_size,
+            samples=m.samples,
+            peak_rss_mb=r.maxrss_mb,
         )
         for (m, pt, r) in rows
     ]
-    assert fit_ram_law(nominal).kappa < 0.5
+    # The planted law is exactly `100 + 3 * touched`, so the touched-chunk fit
+    # above recovers kappa=3 to 1e-9. Fitting the SAME rows against nominal
+    # chunk_bytes must not. Assert distance from the truth rather than a
+    # direction: since `cells` is held constant, nominal chunk_bytes is
+    # proportional to `samples` for every row where the chunk does not fill,
+    # making it near-collinear with the cohort regressor -- so the estimate now
+    # blows UP rather than collapsing to ~0.23 as it did under the
+    # single-regressor law. Either way it is not 3, which is the point.
+    assert not math.isclose(fit_ram_law(nominal).kappa, 3.0, rel_tol=0.5)
 
 
 def test_main_end_to_end(tmp_path, capsys, monkeypatch):
@@ -738,7 +831,7 @@ def test_decide_reports_knee_support_on_every_verdict():
         {250: 5, 1_000: 5, 4_000: 5},
         flat_read,
         flat_exec,
-        [(3, 5, 350_000_000, 6_000.0)],
+        [RamRow(3, 5, 350_000_000, _FIXED_S, 6_000.0)],
         _KAPPA3,
     )
     assert h3.hypothesis == "H3"

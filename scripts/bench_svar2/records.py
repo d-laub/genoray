@@ -121,9 +121,20 @@ class CostLaw:
 
 @dataclass(frozen=True)
 class RamLaw:
-    """peak_rss_mb ~ base_mb + kappa * (workers + pending_hw) * chunk_bytes."""
+    """peak_rss_mb ~ base_mb + per_sample_mb * samples
+    + kappa * (workers + pending_hw) * chunk_bytes.
+
+    `per_sample_mb` is NOT optional bookkeeping: peak RSS carries a large
+    cohort-sized term that has nothing to do with chunk bytes. Holding
+    chunk_bytes pinned at 10.9 MB and varying only the cohort, measured RSS
+    runs 789 MB (S=4,000) -> 5,061 MB (S=500,000) -- a 6.4x spread the
+    chunk term cannot express. Modelling that as a bare constant left the
+    fit at R^2=0.057 and dragged `kappa` to 2.94 against a per-worker slope
+    implying ~13, which in turn is what the H3 verdict is computed from.
+    """
 
     base_mb: float
+    per_sample_mb: float
     kappa: float
     r2: float
     n_points: int
