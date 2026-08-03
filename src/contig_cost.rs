@@ -9,7 +9,40 @@ use rust_htslib::bcf::Read;
 use std::collections::HashMap;
 use std::ffi::CString;
 
-/// Exact per-contig record counts via the tabix path (bgzipped VCF), or
+/// Whether `c_path`'s content is VCF-flavoured (tabix's territory) or
+/// something else (BCF, in this crate's usage), or `None` if the file can't
+/// even be opened to check. Determined by `hts_get_format`, i.e. htslib's
+/// own inspection of the file's actual magic bytes -- never guessed from the
+/// file extension -- mirroring how htslib's own `bcf_index_build3` dispatches
+/// (`switch (fp->format.format) { case bcf: ...; case vcf: ...; }`).
+///
+/// This exists because a BCF's `.csi` carries no tabix meta at all (only
+/// `vcf_idx_init` writes it, `bcf_idx_init` never does), so attempting the
+/// tabix load on a BCF makes `tbx.c`'s `index_load` hit its `l_meta < 28`
+/// check and unconditionally log `"Invalid index header for %s"` to stderr
+/// -- `HTS_IDX_SILENT_FAIL` does not gate that particular message. Checking
+/// the format first and skipping the tabix attempt for non-VCF input avoids
+/// ever triggering it.
+fn is_vcf_flavoured(c_path: &CString) -> Option<bool> {
+    // SAFETY: `c_path` is a valid NUL-terminated string alive for the call;
+    // the mode string is a static NUL-terminated literal; `hts_open` returns
+    // null on any failure, checked before use.
+    let fp = unsafe { rust_htslib::htslib::hts_open(c_path.as_ptr(), c"r".as_ptr()) };
+    if fp.is_null() {
+        return None;
+    }
+    // SAFETY: `fp` is non-null, just checked; `hts_get_format` returns a
+    // pointer into `fp`'s own storage, valid until `fp` is closed, and is
+    // read before that close.
+    let format = unsafe { (*rust_htslib::htslib::hts_get_format(fp)).format };
+    // SAFETY: `fp` was produced by `hts_open` and is closed exactly once,
+    // here, on every path that got past the null check.
+    unsafe { rust_htslib::htslib::hts_close(fp) };
+    Some(format == rust_htslib::htslib::htsExactFormat_vcf)
+}
+
+/// Exact per-contig record counts via the tabix path (bgzipped VCF only --
+/// callers must not invoke this for BCF input; see `is_vcf_flavoured`), or
 /// `None` if no tabix-flavoured index is present.
 ///
 /// `tbx_name2id` resolves each contig name in the INDEX's own id space,
@@ -39,6 +72,8 @@ fn counts_from_tabix(c_path: &CString, chroms: &[String]) -> Option<HashMap<Stri
     if tbx.is_null() {
         return None;
     }
+    // SAFETY: `tbx` is non-null, just checked above.
+    let nseq = unsafe { rust_htslib::htslib::hts_idx_nseq((*tbx).idx) };
 
     let mut out = HashMap::new();
     let mut any_nonzero = false;
@@ -49,17 +84,20 @@ fn counts_from_tabix(c_path: &CString, chroms: &[String]) -> Option<HashMap<Stri
         // SAFETY: `tbx` is non-null and owned for the duration of this loop;
         // `c_chrom` is a valid NUL-terminated string for the call.
         let tid = unsafe { rust_htslib::htslib::tbx_name2id(tbx, c_chrom.as_ptr()) };
-        if tid < 0 {
-            // Not in the index's name table: uncovered or unknown contig.
+        if tid < 0 || tid >= nseq {
+            // Not in the index's name table (uncovered/unknown contig), or
+            // -- belt and suspenders against a truncated/corrupt index,
+            // where the meta name count and on-disk `n_ref` could disagree
+            // -- out of `(*tbx).idx`'s slot range. Never pass this to
+            // `hts_idx_get_stat`, which does not bounds-check it.
             continue;
         }
         let mut mapped: u64 = 0;
         let mut unmapped: u64 = 0;
-        // SAFETY: `tbx` is non-null; `tid` was just resolved by
-        // `tbx_name2id` against this same `tbx`'s index, so it is in range
-        // for `(*tbx).idx`'s `bidx` array by construction -- the one thing
-        // `hts_idx_get_stat` does not check for itself. Both out-params are
-        // valid locals.
+        // SAFETY: `tbx` is non-null; `tid` was just bounded against
+        // `hts_idx_nseq((*tbx).idx)` above, so it is in range for
+        // `(*tbx).idx`'s `bidx` array -- the one thing `hts_idx_get_stat`
+        // does not check for itself. Both out-params are valid locals.
         let ret = unsafe {
             rust_htslib::htslib::hts_idx_get_stat((*tbx).idx, tid, &mut mapped, &mut unmapped)
         };
@@ -76,13 +114,17 @@ fn counts_from_tabix(c_path: &CString, chroms: &[String]) -> Option<HashMap<Stri
 }
 
 /// Exact per-contig record counts via a CSI loaded directly, or `None` if
-/// none is present. This is the BCF path: unlike tabix, a bare CSI has no
+/// none is present. This is the non-VCF (BCF) path, reached only through
+/// `counts_from_index`'s format dispatch: unlike tabix, a bare CSI has no
 /// name table, so contigs are resolved by the VCF header's own rid, which is
-/// correct here because BCF's CSI genuinely is keyed by header rid (BCF has
-/// no separate covered-only compaction the way tabix-over-VCF does). Every
-/// id is still bounded against `hts_idx_nseq` before use, unconditionally:
+/// correct here because BCF's CSI genuinely is keyed by header rid --
+/// `bcf_idx_init` sizes the index directly from the header's own contig
+/// count (`hts_idx_init(n_contigs, ...)`), and BCF has no separate
+/// covered-only compaction the way tabix-over-VCF does. Every id is still
+/// bounded against `hts_idx_nseq` before use, unconditionally:
 /// `hts_idx_get_stat` never bounds-checks its `tid` argument on any path,
-/// and a header can declare more contigs than the index has slots for.
+/// and a header can in principle declare more contigs than the index has
+/// slots for.
 fn counts_from_csi(
     vcf_path: &str,
     c_path: &CString,
@@ -142,16 +184,34 @@ fn counts_from_csi(
     any_nonzero.then_some(out)
 }
 
-/// Exact per-contig record counts from the index, or `None` if no index is
-/// present or it carries no per-reference statistics for any requested
-/// contig. Tries the tabix path first (correct for bgzipped VCF, the
-/// project's primary input), then a bare CSI keyed by header rid (correct
-/// for BCF). Every failure mode returns `None` and lets the caller fall back
-/// to tier 2 rather than reporting a confident zero or an out-of-bounds
-/// count.
+/// Exact per-contig record counts from the index, or `None` if the file
+/// can't be opened, no index is present, or the index carries no
+/// per-reference statistics for any requested contig. Dispatches on the
+/// file's actual content format (`is_vcf_flavoured`) rather than trying
+/// tabix and falling back to CSI on any failure: a tabix load against BCF
+/// input logs an htslib error unconditionally (see `is_vcf_flavoured`'s
+/// doc), and falling back to the header-rid CSI path after a tabix load
+/// that merely found zero matching counts would let it run against a
+/// tabix-flavoured index using header rids -- the same mixed-id-space
+/// mistake this module exists to avoid, just with a `hts_idx_nseq` bound
+/// keeping it from going out of range. Format dispatch makes both
+/// impossible: exactly one path ever runs, never both.
 fn counts_from_index(vcf_path: &str, chroms: &[String]) -> Option<HashMap<String, u64>> {
+    // `hts_open` (used by `is_vcf_flavoured` to check the file's actual
+    // format) logs an error unconditionally on a failed open -- unlike
+    // `hts_idx_load3`/`tbx_index_load3`, it has no silent-fail flag to pass.
+    // Checked here first rather than ever handing it a path that can't be
+    // opened, mirroring `rust_htslib::bcf::Reader::from_path`'s own
+    // existence pre-check (which is why the old `bcf::Reader`-first code
+    // never had this problem: a missing file never reached htslib at all).
+    if !std::path::Path::new(vcf_path).exists() {
+        return None;
+    }
     let c_path = CString::new(vcf_path).ok()?;
-    counts_from_tabix(&c_path, chroms).or_else(|| counts_from_csi(vcf_path, &c_path, chroms))
+    match is_vcf_flavoured(&c_path)? {
+        true => counts_from_tabix(&c_path, chroms),
+        false => counts_from_csi(vcf_path, &c_path, chroms),
+    }
 }
 
 /// Header contig lengths. Always available, and a reasonable proxy for a
@@ -263,6 +323,45 @@ mod tests {
         p
     }
 
+    /// BCF counterpart of `three_contig_vcf`: same contigs, header lengths,
+    /// and per-contig record counts, written as `Format::Bcf` and
+    /// CSI-indexed. A BCF's CSI carries no tabix meta at all, so this
+    /// exercises `counts_from_csi`'s header-rid path end to end -- and, via
+    /// `bcf_input_uses_csi_path_without_a_tabix_error` below, that the
+    /// tabix attempt is never even made against it.
+    fn three_contig_bcf(dir: &std::path::Path, counts: [u32; 3]) -> String {
+        let path = dir.join("cost.bcf");
+        let mut header = Header::new();
+        header.push_record(b"##contig=<ID=chrA,length=100000>");
+        header.push_record(b"##contig=<ID=chrB,length=100000>");
+        header.push_record(b"##contig=<ID=chrC,length=100000>");
+        header.push_record(b"##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">");
+        header.push_sample(b"s1");
+        {
+            let mut w = Writer::from_path(&path, &header, false, Format::Bcf).unwrap();
+            for (chrom, n) in [
+                ("chrA", counts[0]),
+                ("chrB", counts[1]),
+                ("chrC", counts[2]),
+            ] {
+                let rid = w.header().name2rid(chrom.as_bytes()).unwrap();
+                for i in 0..n {
+                    let mut rec = w.empty_record();
+                    rec.set_rid(Some(rid));
+                    rec.set_pos((i as i64 + 1) * 100);
+                    rec.set_alleles(&[b"A", b"C"]).unwrap();
+                    rec.push_genotypes(&[GenotypeAllele::Phased(0), GenotypeAllele::Phased(0)])
+                        .unwrap();
+                    w.write(&rec).unwrap();
+                }
+            }
+        }
+        let p = path.to_str().unwrap().to_string();
+        rust_htslib::bcf::index::build(&p, None, 1, rust_htslib::bcf::index::Type::Csi(14))
+            .unwrap();
+        p
+    }
+
     #[test]
     fn estimates_rank_contigs_by_true_record_count() {
         let dir = tempfile::tempdir().unwrap();
@@ -303,6 +402,30 @@ mod tests {
         );
         // The two covered contigs must still rank by their true counts.
         assert!(costs["chrC"] > costs["chrA"], "costs = {costs:?}");
+    }
+
+    /// A BCF's `.csi` has no tabix meta at all (only `vcf_idx_init` writes
+    /// it; `bcf_idx_init` never does). Before `is_vcf_flavoured` gated the
+    /// tabix attempt by actual file format, `counts_from_tabix` was tried
+    /// unconditionally, including here, and `tbx.c`'s `index_load` logged
+    /// `"Invalid index header for %s"` to stderr on every call -- run this
+    /// test with `--nocapture` to confirm that line is gone. Correctness of
+    /// the counts themselves is asserted here; the absence of that log line
+    /// is confirmed by inspecting the run's captured output, not by this
+    /// assertion (there is no portable in-process way to assert on
+    /// htslib's own C-level stderr writes).
+    #[test]
+    fn bcf_input_uses_csi_path_without_a_tabix_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = three_contig_bcf(dir.path(), [5, 40, 15]);
+        let chroms: Vec<String> = ["chrA", "chrB", "chrC"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let costs = estimate_contig_costs(&path, &chroms);
+        assert_eq!(costs.get("chrA").copied(), Some(5));
+        assert_eq!(costs.get("chrB").copied(), Some(40));
+        assert_eq!(costs.get("chrC").copied(), Some(15));
     }
 
     #[test]

@@ -115,10 +115,12 @@ Only *ratios* matter; the estimates order contigs and nothing else. Fallback
 chain, most to least precise, as implemented:
 
 1. `hts_idx_get_stat` per-contig mapped-record counts, id resolved in the
-   INDEX's own space: `tbx_name2id` against a real tabix load for bgzipped
-   VCF (the project's primary input), falling back to a raw CSI load keyed
-   by header rid for BCF, with every id bounded against `hts_idx_nseq`
-   before use, unconditionally.
+   INDEX's own space and dispatched by the file's actual content format
+   (`hts_get_format`, never the file extension): `tbx_name2id` against a
+   real tabix load for VCF-flavoured input (the project's primary input),
+   or a raw CSI load keyed by header rid for BCF-flavoured input, with
+   every id bounded against `hts_idx_nseq` before use, unconditionally, on
+   both paths.
 2. Contig length from the header.
 
 The middle tier from the original three-tier design — the linear index's
@@ -154,6 +156,24 @@ counts for CSI/TBI-over-VCF — but only when the `tid` passed to it was
 resolved through the index's own id space (`tbx_name2id`, or a
 header rid bounds-checked against `hts_idx_nseq` on the no-tabix BCF path),
 never a raw, unbounded header rid.
+
+A second review round found the id-space fix's own tabix attempt was tried
+unconditionally, including against BCF input: a BCF's `.csi` carries no
+tabix meta at all (only `vcf_idx_init` writes it; `bcf_idx_init` never
+does), so `tbx.c`'s `index_load` hit its meta-length check and logged
+`"Invalid index header for %s"` to stderr on every call — a real BCF file,
+not a malformed one, and `HTS_IDX_SILENT_FAIL` does not gate that
+particular message. Fixed by dispatching on `hts_get_format` before
+attempting either path, which also closes a smaller residual: without the
+dispatch, a tabix index that loaded but had zero matching counts fell
+through to the header-rid CSI path run against that *same* tabix-flavoured
+index — the mixed-id-space situation this section exists to rule out,
+bounded (no UB) but still capable of misattribution. Format dispatch makes
+that combination unreachable rather than merely bounded. The tabix loop's
+own `tid` is now also bounded against `hts_idx_nseq`, matching the CSI
+path, since `tbx_name2id`'s "in range by construction" argument holds only
+if the index's meta name count and its on-disk slot count agree — true by
+default, but not something to lean on unconditionally for an `unsafe` call.
 
 PGEN takes exact per-contig variant counts from the `.gvi` index it already
 builds. Every source is metadata already on disk; none reads variant data.
