@@ -74,6 +74,61 @@ PROD_CHUNK_SIZE = MAX_CHUNK_SIZE
 # measured point.
 VLINEAR_SAMPLES = 250
 VLINEAR_VARIANTS = (800_000, 1_400_000, 2_800_000, 5_600_000)
+# SECOND V-ladder, at a large cohort. This is what makes the cohort exponent
+# identifiable at all, and it is not optional.
+#
+# The scale ladder holds S*V = CELLS_BUDGET at every rung, so the cohort law's
+# regressand `log(phase1/V)` is identically `log(phase1) + log(S) -
+# log(cells)`: its slope is `1 + dlog(phase1)/dlog(S)`, and since a
+# constant-cells ladder is BUILT so every rung does the same total work,
+# phase1 is flat and the slope collapses to 1. It reported beta=1.0020, CI
+# [0.9689, 1.0352] -- tight enough to read as solid, from a design that could
+# not have returned anything else (`cohort_beta_is_design_forced`).
+#
+# Two V-ladders at different S fix that: within each ladder cells vary at
+# fixed S, so the per-variant slope is measured rather than implied, and beta
+# is the log-ratio of the two slopes. Measured that way beta = 0.9592 +/-
+# 0.0046 -- OUTSIDE the old CI, so the old law was not merely unidentified but
+# wrong and falsely confident. Refitting cut mean phase-1 error across every
+# F=0 w=1 point from 19.1% to 8.8% and the hold-out from 24.9% to 3.3%, and
+# moved the S=500,000 V=1e9 projection from 4539h to 3277h (1.39x).
+#
+# S=250,000 deliberately, NOT the hold-out's S=100,000. A ladder sharing the
+# hold-out's cohort size would make the hold-out an interpolation WITHIN the
+# fitted ladder -- it would then test little beyond V-linearity, which the
+# ladder's own R^2 already reports, and the gate would go quiet for the wrong
+# reason. With ladders at S=250 and S=250,000 the hold-out at S=100,000 sits
+# strictly between them, so it still tests the composed S,V extrapolation.
+#
+# The 1000x lever arm between the two ladders also tightens beta: the same
+# slope uncertainty divided by log(1000) rather than log(400).
+VLINEAR2_SAMPLES = 250_000
+# >= MIN_CHUNKS chunks at EVERY rung (2_048 == 32 * 64), the same floor
+# VLINEAR_VARIANTS enforces and for the same reason: below it, per-chunk fixed
+# cost dominates and the fitted "per-variant slope" is really a per-chunk cost
+# divided by chunk_size. Top rung is 8x the bottom, matching the S=250
+# ladder's 7x span. Generation is sum(V)*S = 7.7e9 cells (~2.3 GB).
+VLINEAR2_VARIANTS = (2_048, 4_096, 8_192, 16_384)
+# Pinned across the ladder so V is the ONLY axis moving. Deriving it per-rung
+# (V // MIN_CHUNKS, as `size_corpus` does) would make chunk_size co-vary with
+# V and re-introduce exactly the per-chunk-cost confound documented above for
+# VLINEAR_VARIANTS. Measured chunk_size sensitivity is under 3% across a 400x
+# range (S=500,000 ran 41.6s at chunk_size=87 and 41.0s at 25,000), so pinning
+# costs nothing; MIN_CHUNK_SIZE is the value that lets the bottom rung stay
+# small enough to generate while still clearing the >=MIN_CHUNKS floor.
+VLINEAR2_CHUNK_SIZE = MIN_CHUNK_SIZE
+if min(VLINEAR2_VARIANTS) < MIN_CHUNKS * VLINEAR2_CHUNK_SIZE:
+    raise ValueError(
+        f"VLINEAR2_VARIANTS starts at {min(VLINEAR2_VARIANTS):,}, below the "
+        f"{MIN_CHUNKS * VLINEAR2_CHUNK_SIZE:,} needed for >={MIN_CHUNKS} chunks "
+        f"at chunk_size={VLINEAR2_CHUNK_SIZE:,}."
+    )
+if VLINEAR2_SAMPLES == VLINEAR_SAMPLES:
+    raise ValueError(
+        "The two V-ladders must sit at DIFFERENT cohort sizes; otherwise "
+        "`fit_cohort_beta_from_ladders` has no ratio to form and beta falls "
+        "back to the constant-cells fit that forces it to ~1."
+    )
 # RLIMIT_AS installed on the points whose PURPOSE is to find out whether
 # `from_vcf`'s hardcoded chunk_size survives biobank scale. Deliberately NOT on
 # every point (a deviation from the design spec's "each point runs under an
@@ -154,7 +209,7 @@ def _point(
 
 
 def build(corpus_dir: Path, threads: int) -> dict[str, list[SweepPoint]]:
-    scale, contig, holdout, vlinear = [], [], [], []
+    scale, contig, holdout, vlinear, vlinear2 = [], [], [], [], []
 
     for s in SCALE_SAMPLES:
         _, cs = size_corpus(s, CELLS_BUDGET)
@@ -241,7 +296,17 @@ def build(corpus_dir: Path, threads: int) -> dict[str, list[SweepPoint]]:
         corpus = corpus_dir / f"vlinear_v{v}.manifest.json"
         vlinear.append(_point(corpus, 1, VLINEAR_CHUNK_SIZE, threads))
 
-    return {"scale": scale, "contig": contig, "holdout": holdout, "vlinear": vlinear}
+    for v in VLINEAR2_VARIANTS:
+        corpus = corpus_dir / f"vlinear2_v{v}.manifest.json"
+        vlinear2.append(_point(corpus, 1, VLINEAR2_CHUNK_SIZE, threads))
+
+    return {
+        "scale": scale,
+        "contig": contig,
+        "holdout": holdout,
+        "vlinear": vlinear,
+        "vlinear2": vlinear2,
+    }
 
 
 def main() -> None:

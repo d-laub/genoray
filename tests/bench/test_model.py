@@ -8,7 +8,9 @@ from scripts.bench_svar2.model import (
     _LoadedSweep,
     _ram_rows,
     _resident_chunk_size,
+    cohort_beta_is_design_forced,
     decide,
+    fit_cohort_beta_from_ladders,
     extrapolate,
     fit_cost_law,
     RamRow,
@@ -902,8 +904,13 @@ def test_decide_reports_knee_support_on_every_verdict():
 # --- Minor 12: the hold-out gate must score like-for-like ------------------
 
 
-def _driver_dirs(tmp_path, holdout_record):
-    """Minimal scale + vlinear + holdout fixture for `main()`."""
+def _driver_dirs(tmp_path, holdout_record, fit_node: str = ""):
+    """Minimal scale + vlinear + holdout fixture for `main()`.
+
+    `fit_node` stamps the LAW-FITTING records only; the hold-out's node comes
+    from `holdout_record`. Default "" matches records written before
+    `ProbeRecord.node` existed, which leaves the cross-node check inert.
+    """
     manifests_dir, plans_dir, results_dir = (
         tmp_path / "manifests",
         tmp_path / "plans",
@@ -927,6 +934,7 @@ def _driver_dirs(tmp_path, holdout_record):
                 cpu_exec_pct=(3.0 * s**0.5,),
                 pending_highwater=0,
                 maxrss_mb=500.0 + s,
+                node=fit_node,
             ),
         )
     (plans_dir / "scale.json").write_text(json.dumps([asdict(p) for p in scale_points]))
@@ -941,7 +949,9 @@ def _driver_dirs(tmp_path, holdout_record):
         v_points.append(pt)
         append_ndjson(
             results_dir / "vlinear.ndjson",
-            _record(pt.point_id, phase1_s=1.0 + 1e-4 * v, maxrss_mb=300.0),
+            _record(
+                pt.point_id, phase1_s=1.0 + 1e-4 * v, maxrss_mb=300.0, node=fit_node
+            ),
         )
     (plans_dir / "vlinear.json").write_text(json.dumps([asdict(p) for p in v_points]))
 
@@ -1045,3 +1055,206 @@ def test_extrapolate_does_not_expose_a_wall_named_key():
     )
     assert "predicted_phase1_s" in out
     assert "predicted_wall_s" not in out
+
+
+def test_constant_cells_ladder_cannot_identify_the_cohort_exponent():
+    """The real scale ladder pins S*V = 1.4e9 at every rung, which makes
+    beta ~ 1 arithmetic rather than evidence.
+
+    These are the harness's own S values and the per-variant costs it measured
+    (phase1_s / V from the w=1 rows). The fit returns beta=1.0020 with a 95% CI
+    of [0.969, 1.035] -- tight enough to read as a solid measurement, when in
+    fact no rung ever varied the total work. `extrapolate` then raises that
+    beta to (500000/250)**beta, so an unflagged design artifact propagates
+    straight into the biobank projection.
+    """
+    ladder = [
+        (250, 5_600_000, 44.3),
+        (1_000, 1_400_000, 37.0),
+        (4_000, 350_000, 36.2),
+        (16_000, 87_500, 36.2),
+        (64_000, 21_875, 37.8),
+        (250_000, 5_600, 41.9),
+        (500_000, 2_800, 41.6),
+    ]
+    samples = [s for s, _v, _t in ladder]
+    cells = [float(s * v) for s, v, _t in ladder]
+    per_variant = [t / v for _s, v, t in ladder]
+
+    law = fit_cost_law("cohort", samples, per_variant)
+    # The design forces this, which is exactly why it must not be trusted.
+    assert math.isclose(law.beta, 1.0, abs_tol=0.02)
+    assert cohort_beta_is_design_forced(samples, cells)
+
+
+def test_a_second_cells_level_makes_the_cohort_exponent_identifiable():
+    """Adding rungs at a different total-cells level lets S and V move
+    independently, which is what it takes for beta to carry information."""
+    ladder = [(250, 5_600_000), (4_000, 350_000), (64_000, 21_875), (500_000, 2_800)]
+    samples = [s for s, _v in ladder]
+    constant_cells = [float(s * v) for s, v in ladder]
+    assert cohort_beta_is_design_forced(samples, constant_cells)
+
+    # Same cohort sizes, but every rung also measured at 4x the variant count.
+    two_level_s = samples + samples
+    two_level_cells = constant_cells + [c * 4 for c in constant_cells]
+    assert not cohort_beta_is_design_forced(two_level_s, two_level_cells)
+
+
+def test_integer_rounding_of_variants_does_not_read_as_an_identifiable_design():
+    """V = cells // S leaves a few-percent wobble in realised cells. That is
+    incidental, not a second cells level, and must still count as forced --
+    otherwise the warning silently stops firing on the very ladder it exists
+    to flag."""
+    budget = 1_400_000_000
+    samples = [250, 1_000, 4_000, 16_000, 64_000, 250_000, 500_000]
+    cells = [float(s * (budget // s)) for s in samples]
+    assert cohort_beta_is_design_forced(samples, cells)
+
+
+def test_cohort_beta_from_two_ladders_recovers_a_planted_exponent():
+    """Two V-ladders at different S identify beta; one ladder cannot.
+
+    Each ladder varies V at fixed S, so its fitted slope IS the per-variant
+    cost at that cohort size. beta is then the log-ratio of the two slopes --
+    a measurement, not the arithmetic identity the constant-cells scale ladder
+    returns.
+    """
+    beta, b0, s0 = 0.9592, 8.046e-6, 250
+    ladders = []
+    for s_ in (250, 100_000):
+        slope = b0 * (s_ / s0) ** beta
+        ladders.append(
+            (s_, [(v, 0.2 + slope * v) for v in (7_000, 14_000, 28_000, 56_000)])
+        )
+    law = fit_cohort_beta_from_ladders(ladders)
+    assert law is not None
+    assert math.isclose(law.beta, beta, rel_tol=1e-3)
+
+
+def test_cohort_beta_needs_a_second_ladder():
+    """A single ladder has no second cohort size to form a ratio against, so
+    the estimator declines rather than returning a one-point 'fit'. That None
+    is what makes the driver fall back and print the design-forced warning."""
+    one = [(250, [(v, 0.2 + 8.046e-6 * v) for v in (800_000, 1_400_000, 2_800_000)])]
+    assert fit_cohort_beta_from_ladders(one) is None
+    # Two ladders that are really the same S collapse to one cohort size.
+    dup = one + [(250, [(v, 0.2 + 8.046e-6 * v) for v in (800_000, 5_600_000)])]
+    assert fit_cohort_beta_from_ladders(dup) is None
+
+
+def test_two_ladder_cohort_beta_reports_uncertainty_rather_than_a_point():
+    """Two ladders fit their line exactly, so the residual is zero. Reporting
+    stderr=0 would collapse the CI to a point and read as certainty; the
+    estimator must propagate the two slope standard errors instead.
+
+    This is the same failure `_linfit` guards for the n<=2 case, and it
+    matters more here: `extrapolate` raises beta to a 2000x cohort ratio.
+    """
+    # Noisy rungs so each ladder's slope carries real standard error.
+    lad = [
+        (250, [(7_000, 0.26), (14_000, 0.31), (28_000, 0.44), (56_000, 0.63)]),
+        (100_000, [(7_000, 19.6), (14_000, 37.4), (28_000, 73.2), (56_000, 143.1)]),
+    ]
+    law = fit_cohort_beta_from_ladders(lad)
+    assert law is not None
+    lo, hi = law.beta_ci95
+    assert hi > lo, "a two-ladder CI must not collapse to a point"
+    assert lo < law.beta < hi
+
+
+def test_real_two_ladder_measurement_disagrees_with_the_forced_fit():
+    """Regression pin on the finding itself.
+
+    Measured V-ladders at S=250 and S=100,000 (both on one node) give
+    beta=0.9592, which lies OUTSIDE the constant-cells ladder's reported CI of
+    [0.9689, 1.0352]. The forced fit was not merely unidentified -- it was
+    wrong and falsely confident. If a refactor ever routes beta back through
+    the degenerate path, this fails.
+    """
+    lad = [
+        (
+            250,
+            [(800_000, 6.6), (1_400_000, 11.8), (2_800_000, 22.3), (5_600_000, 45.4)],
+        ),
+        (100_000, [(7_000, 19.6), (14_000, 37.4), (28_000, 73.2), (56_000, 143.1)]),
+    ]
+    law = fit_cohort_beta_from_ladders(lad)
+    assert law is not None
+    assert math.isclose(law.beta, 0.9592, abs_tol=0.005)
+    forced_lo, forced_hi = 0.9689, 1.0352
+    assert not (forced_lo <= law.beta <= forced_hi)
+
+
+def test_a_holdout_measured_on_another_node_is_not_called_a_model_failure(
+    tmp_path, capsys, monkeypatch
+):
+    """`point_id` deliberately excludes the machine so a resumed sweep skips
+    work already paid for -- which means a hold-out can be measured somewhere
+    else entirely and nothing in the record would say so.
+
+    This is not hypothetical. The real point 2ac9bbbfbe0dc691 (holdout_f0,
+    w=1, chunk 875) measured 151.9s on carter-cn-03 and 73.2s on carter-cn-04
+    -- a 2.08x spread, against a 25% gate -- while same-node controls
+    reproduced within 1.9%. That single cross-node record was the entire "40%
+    MODEL FAILURE"; the true same-node error is 13%. A slower node biases the
+    error strictly upward and cannot be separated from extrapolation error
+    after the fact, so the driver must report the numbers and decline the
+    verdict.
+    """
+    manifests_dir, plans_dir, results_dir = _driver_dirs(
+        tmp_path,
+        # Wildly wrong on both axes: absent the cross-node check this is an
+        # unambiguous MODEL FAILURE.
+        lambda pid: _record(
+            pid, wall_s=999.0, phase1_s=999.0, maxrss_mb=99_000.0, node="carter-cn-03"
+        ),
+        fit_node="carter-cn-04",
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "model.py",
+            "--results",
+            str(results_dir),
+            "--manifests",
+            str(manifests_dir),
+            "--plans",
+            str(plans_dir),
+        ],
+    )
+    main()
+    out = capsys.readouterr().out
+    assert "CROSS-NODE" in out
+    assert "carter-cn-03" in out and "carter-cn-04" in out
+    # Still reports the numbers -- silence would be worse than a wrong verdict.
+    assert "HOLD-OUT" in out
+    assert "MODEL FAILURE" not in out
+
+
+def test_a_same_node_holdout_still_reaches_the_gate(tmp_path, capsys, monkeypatch):
+    """The guard must not become a blanket excuse: when the hold-out ran on a
+    fitting node, a genuinely bad prediction is still a MODEL FAILURE."""
+    manifests_dir, plans_dir, results_dir = _driver_dirs(
+        tmp_path,
+        lambda pid: _record(
+            pid, wall_s=999.0, phase1_s=999.0, maxrss_mb=99_000.0, node="carter-cn-04"
+        ),
+        fit_node="carter-cn-04",
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "model.py",
+            "--results",
+            str(results_dir),
+            "--manifests",
+            str(manifests_dir),
+            "--plans",
+            str(plans_dir),
+        ],
+    )
+    main()
+    out = capsys.readouterr().out
+    assert "CROSS-NODE" not in out
+    assert "MODEL FAILURE" in out

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import platform
 import re
 import resource
 import shutil
@@ -334,6 +335,7 @@ def run_point(
                 shard_unit_secs=(),
                 oom_at_rss_mb=oom,
                 error=err[-2000:],
+                node=platform.node(),
             )
 
         t = parse_trace(out + err)
@@ -352,6 +354,7 @@ def run_point(
             pending_highwater=t["pending_highwater"],
             pending_bytes_highwater=t["pending_bytes_highwater"],
             shard_unit_secs=t["shard_unit_secs"],
+            node=platform.node(),
         )
         # Min-of-N on wall time; the cluster is shared, so the minimum is the
         # least contended estimate.
