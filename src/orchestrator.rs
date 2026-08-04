@@ -8,7 +8,6 @@ use std::thread;
 
 use crate::enum_map::EnumKey;
 use crate::error::ConversionError;
-use crate::nrvk::LongAlleleTableWriter;
 use crate::streams::{REGISTRY, StreamMap, StreamTag};
 use crate::trace::trace_ll;
 use crate::{executor, merge, monitor, writer};
@@ -880,15 +879,21 @@ pub fn process_chromosome(
             let exec_sink = sink.clone();
             let exec_chrom = chrom.to_string();
             move || {
-                let bank = LongAlleleTableWriter::new(tx_long, long_allele_capacity);
-                executor::run_compute_engine(
+                // PROTOTYPE: `GENORAY_EXEC_WORKERS` (default 1) selects how many
+                // executor threads share `rx_dense`. At 1 this is byte-for-byte
+                // the previous single-bank serial loop.
+                executor::run_compute_engine_multi(
                     rx_dense,
                     tx_sparse,
-                    bank,
-                    signatures,
-                    &fields_exec,
-                    &exec_chrom,
-                    &exec_sink,
+                    tx_long,
+                    executor::ExecutorParams {
+                        workers: executor::exec_workers(),
+                        long_allele_capacity,
+                        sidecar_bits_enabled: signatures,
+                        fields: &fields_exec,
+                        chrom: &exec_chrom,
+                        sink: &exec_sink,
+                    },
                 )
             }
         })
