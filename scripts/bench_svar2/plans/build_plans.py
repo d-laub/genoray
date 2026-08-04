@@ -287,7 +287,11 @@ def build(corpus_dir: Path, threads: int) -> dict[str, list[SweepPoint]]:
             _point(
                 concurrency_corpus,
                 CONCURRENCY_READER_WORKERS,
-                10_937,
+                cs,  # same derived chunk size as the contig axis above (s=4000):
+                # both axes must share byte-identical point_ids with the
+                # contig-axis points they're compared against, and a
+                # hardcoded literal silently drifts from `cs` the moment
+                # CELLS_BUDGET or MIN_CHUNKS moves.
                 threads,
                 concurrent=cc,
             )
