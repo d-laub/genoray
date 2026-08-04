@@ -50,7 +50,10 @@ source** rather than reasoning from first principles.
 ## Cross-cutting conventions
 
 - Ranges are 0-based, half-open `[start, end)`.
-- `max_mem` accepts strings like `"4g"`, `"512m"`, `"2GB"`.
+- `max_mem` accepts strings like `"4g"`, `"512m"`, `"2GB"` — **except**
+  `SparseVar2.from_vcf`'s `max_mem`, a whole-process planning budget, not a
+  per-chunk cap; see its entry under "Conversion" below before assuming it
+  means the same thing as everywhere else this name appears.
 - Contig names auto-normalize: `"chr1"` and `"1"` both work regardless of file convention (`ContigNormalizer`).
 - Missing genotype = `-1` (int). Missing dosage = `np.nan` (float32).
 - Ploidy is 2 by default; `SparseVar.from_vcf`/`from_pgen` (and `genoray write-svar1`) accept `haploid=True` / `--haploid`, which OR-collapses haplotypes into a single haploid call per sample and records `ploidy=1` in metadata (intended for unphased somatic data).
@@ -247,7 +250,7 @@ dropped = SparseVar2.from_vcf(
 dropped = SparseVar2.from_vcf("out.svar2", "file.vcf.gz", no_reference=True)
 ```
 
-Signature: `from_vcf(out, source, reference=None, *, regions=None, samples=None, merge_overlapping=False, regions_overlap="pos", no_reference=False, skip_out_of_scope=False, ploidy=2, chunk_size=25_000, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False, info_fields=None, format_fields=None, check_ref="e", progress=False, log_level="info") -> int`
+Signature: `from_vcf(out, source, reference=None, *, regions=None, samples=None, merge_overlapping=False, regions_overlap="pos", no_reference=False, skip_out_of_scope=False, ploidy=2, chunk_size=25_000, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False, info_fields=None, format_fields=None, check_ref="e", progress=False, log_level="info", max_mem=None, tune=False) -> int`
 
 - `source` — a bgzipped VCF (`.vcf.gz`) or BCF (`.bcf`). Auto-indexes (`.csi`) if
   no `.csi`/`.tbi` is found. For a PLINK2 PGEN source, use `from_pgen` instead
@@ -356,6 +359,38 @@ Signature: `from_vcf(out, source, reference=None, *, regions=None, samples=None,
   - **Read path:** see "Reading INFO/FORMAT fields (SVAR2)" below —
     `SparseVar2(path, fields=…)` / `.with_fields(…)` / `.available_fields`
     opt into decoding these back out via `decode()`.
+- **`max_mem: int | str | None = None`** — byte budget for the **concurrency
+  planner**: how many contigs convert at once, chosen so cohort-baseline
+  memory plus each concurrent contig's in-flight chunk buffers fit inside it
+  (in addition to the existing core-count bound). Same string forms as the
+  module-level `max_mem` convention above (`"4g"`, `"512m"`, `"2GB"`, parsed
+  by `parse_memory`), but **do not confuse this with `from_vcf_list`'s
+  `max_mem`** (below) — the two are different quantities by orders of
+  magnitude:
+  - `from_vcf`'s `max_mem` (this one) is a **whole-process planning
+    budget** that governs contig concurrency.
+  - `from_vcf_list`'s `max_mem` (below) caps the bytes of **one in-flight
+    dense chunk**, and through that sizes `chunk_size`.
+
+  Passing one method's `max_mem` value to the other either errors or silently
+  sizes the wrong thing.
+  **`None` (the default) means a DETECTED budget — 80% of the cgroup memory
+  limit (or `/proc/meminfo` total outside a cgroup) — NOT unbounded.** This
+  is a deliberate default behavior change from the pre-`max_mem` planner. If
+  detection itself fails (no cgroup limit and no readable `/proc/meminfo` —
+  always true on macOS), genoray warns and falls back to the old
+  core-bound-only planning rather than raising. Pass an explicit value to
+  raise or lower the budget, or a very large value to approximate unbounded
+  planning. **Practical floor:** the planner's RAM law has a fixed
+  cohort-baseline term of roughly 932 MB, so any budget that can't cover
+  baseline plus one concurrent contig's chunk buffers — in practice, anything
+  much below ~1.2 GB — is rejected with `ValueError`, even for a tiny cohort.
+- **`tune: bool = False`** — Python-only kwarg (**no `--tune` CLI flag**). If
+  `True`, probes the largest contig's actual read/exec rates on this machine
+  and input before dispatch, and derives the per-contig reader-worker count
+  from the measured ratio instead of a fixed default. A failed probe never
+  fails the conversion — it falls back to the default reader-worker count and
+  logs a warning.
 - **`progress=False`/`log_level="info"`** — write-time progress/logging,
   shared by `from_vcf`/`from_pgen`/`from_vcf_list`/`from_svar1`/`write_view`.
   `progress=True` renders live progress: in a terminal or Jupyter, a `rich`
@@ -570,7 +605,12 @@ multi-sample VCF.
   since the dense fraction is a per-chunk, data-dependent routing outcome not
   knowable up front. Cohorts whose variants route sparse (e.g. private somatic
   calls) use considerably less than the ceiling. Ignored when `chunk_size` is
-  passed explicitly.
+  passed explicitly. **Not the same quantity as `from_vcf`'s `max_mem`**
+  (above): that one is a whole-process concurrency-planning budget, this one
+  sizes a single dense chunk — they differ by orders of magnitude and their
+  `None` defaults differ too (a detected system budget vs. this fixed
+  ~256 MiB target). Passing one method's value to the other either errors or
+  silently sizes the wrong thing.
 - `ploidy`, `skip_out_of_scope`, `threads`, `overwrite`,
   `long_allele_capacity`, `signatures`, `check_ref` all mean the same as
   `from_vcf`, and the return value is the same `int` (dropped out-of-scope

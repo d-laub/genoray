@@ -191,14 +191,27 @@ def test_scale_plan_adds_a_dedicated_point_only_where_size_corpus_is_not_clamped
     assert len(dedicated) == len(unclamped_s) == 5
 
 
-def test_all_five_plans_are_produced():
+def test_all_six_plans_are_produced():
     assert set(_build().keys()) == {
         "scale",
         "contig",
         "holdout",
         "vlinear",
         "vlinear2",
+        "concurrency",
     }
+
+
+def test_concurrency_plan_spans_the_measured_corners(tmp_path):
+    """The contig axis compared cc=1,w=12 against cc=4,w=3 and found 2.99x.
+    The new planner can reach cc=15; the sweep must cover that, or it cannot
+    tell whether the planner's choice is the good one."""
+    plans = build(tmp_path, threads=48)
+    cc_values = {
+        p.concurrent_chroms for p in plans["concurrency"] if p.concurrent_chroms
+    }
+    assert max(cc_values) >= 15
+    assert 1 in cc_values
 
 
 def test_the_two_v_ladders_sit_at_different_cohort_sizes():
