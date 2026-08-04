@@ -25,6 +25,16 @@ SCALE_SAMPLES = (250, 1_000, 4_000, 16_000, 64_000, 250_000, 500_000)
 KNEE_VALIDATION_SAMPLES = (250, 16_000, 500_000)
 KNEE_WORKERS = (1, 2, 3, 5, 7, 11)
 CONTIG_COUNTS = (1, 2, 8, 22)
+# The contig axis only ever compared cc=1 against cc=4, which cannot say
+# whether the planner's cc=15 is the good choice or merely better than cc=1.
+# w is pinned at the low end of the measured 3-7 knee: the executor is the
+# bottleneck, so surplus readers steal cores from OTHER contigs' executors.
+# No cc=4 corner here: at this same corpus, reader_workers, and chunk_size,
+# cc=4 is byte-identical to the contig axis's c=22/concurrent=4 point (same
+# point_id) -- adding it here would re-measure that point under a second
+# name, which `test_every_point_id_is_unique` exists to catch.
+CONCURRENCY_CHROMS = (1, 8, 15, 22)
+CONCURRENCY_READER_WORKERS = 3
 # Single source of truth for the hold-out corpus's shape: `sweep_scale.sbatch`
 # reads this back (via `python -c 'from ... import HOLDOUT; ...'`) instead of
 # repeating the numbers, so editing one cannot silently drift from the other.
@@ -209,7 +219,7 @@ def _point(
 
 
 def build(corpus_dir: Path, threads: int) -> dict[str, list[SweepPoint]]:
-    scale, contig, holdout, vlinear, vlinear2 = [], [], [], [], []
+    scale, contig, holdout, vlinear, vlinear2, concurrency = [], [], [], [], [], []
 
     for s in SCALE_SAMPLES:
         _, cs = size_corpus(s, CELLS_BUDGET)
@@ -271,6 +281,21 @@ def build(corpus_dir: Path, threads: int) -> dict[str, list[SweepPoint]]:
             workers = max(1, 12 // concurrent)
             contig.append(_point(corpus, workers, cs, threads, concurrent=concurrent))
 
+    for cc in CONCURRENCY_CHROMS:
+        concurrency.append(
+            SweepPoint(
+                corpus=str(corpus_dir / "s4000_c22.manifest.json"),
+                reader_workers=CONCURRENCY_READER_WORKERS,
+                concurrent_chroms=cc,
+                shard_htslib=0,
+                overshard=4,
+                chunk_size=10_937,
+                threads=threads,
+                reps=3,
+                rss_ceiling_mb=None,
+            )
+        )
+
     # Hold-out chunk size derived the same way the fitted points' is (from its
     # own variant count via the shared floor/clamp rule), not an unrelated
     # literal -- the hold-out exists to test the fitted laws OUT OF SAMPLE, so
@@ -306,6 +331,7 @@ def build(corpus_dir: Path, threads: int) -> dict[str, list[SweepPoint]]:
         "holdout": holdout,
         "vlinear": vlinear,
         "vlinear2": vlinear2,
+        "concurrency": concurrency,
     }
 
 
