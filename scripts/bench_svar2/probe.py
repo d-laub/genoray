@@ -22,9 +22,13 @@ from pathlib import Path
 from scripts.bench_svar2.records import CorpusManifest, ProbeRecord, SweepPoint
 
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
-# "done: 1000 kept, 0 excluded (8.15s)" -- the per-contig phase-1 span. This is
-# the ONLY span reader_workers can move; the rayon merge tail that follows is
-# reader-independent, so total wall understates the reader-side effect.
+# "done: 1000 kept, 0 excluded (8.15s)" -- the WHOLE per-contig span. Not just
+# the reader/executor pipeline: `contig_started` is stamped at the top of
+# `process_chromosome` and `contig_done` fires after the merge, so the merge is
+# INSIDE this number. Measured 2026-08-04, `merge_dense_class` alone is 33-51%
+# of it once the reader pool is wide. What total wall adds on top is process
+# startup, index/planning, and the run-level finalize -- none of which
+# `reader_workers` can move either.
 RE_PHASE1 = re.compile(r"done:.*?\(([0-9.]+)s\)")
 RE_SAMPLER = re.compile(r"pipeline sampler .*")
 RE_UNIT = re.compile(r"shard unit done .*?unit_secs=([0-9.]+)")

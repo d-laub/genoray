@@ -398,6 +398,9 @@ pub fn process_chromosome(
     let pending_gauge: Arc<crate::monitor::PendingGauge> =
         Arc::new(crate::monitor::PendingGauge::default());
 
+    // Executor-pool TID registry; see `monitor::TidRegistry`.
+    let exec_worker_tids: crate::monitor::TidRegistry = Arc::new(std::sync::Mutex::new(Vec::new()));
+
     // Periodic monitoring sampler. Owns Sender clones for read-only len()/capacity()
     // introspection. The clones drop when the sampler joins, allowing the executor's
     // rx_dense.recv() to see channel-close once the reader's Sender also drops.
@@ -408,8 +411,11 @@ pub fn process_chromosome(
         tx_sparse.clone(),
         tx_long.clone(),
         stop_sampler.clone(),
-        Arc::clone(&shard_worker_tids),
-        Arc::clone(&pending_gauge),
+        monitor::PipelineProbes {
+            shard_worker_tids: Arc::clone(&shard_worker_tids),
+            exec_worker_tids: Arc::clone(&exec_worker_tids),
+            pending_gauge: Arc::clone(&pending_gauge),
+        },
     );
 
     // Step 1 -> The Producer
@@ -878,6 +884,7 @@ pub fn process_chromosome(
         .spawn({
             let exec_sink = sink.clone();
             let exec_chrom = chrom.to_string();
+            let exec_worker_tids = Arc::clone(&exec_worker_tids);
             move || {
                 // PROTOTYPE: `GENORAY_EXEC_WORKERS` (default 1) selects how many
                 // executor threads share `rx_dense`. At 1 this is byte-for-byte
@@ -893,6 +900,7 @@ pub fn process_chromosome(
                         fields: &fields_exec,
                         chrom: &exec_chrom,
                         sink: &exec_sink,
+                        worker_tids: &exec_worker_tids,
                     },
                 )
             }
@@ -974,6 +982,25 @@ pub fn process_chromosome(
 
     tracing::debug!(chrom = %chrom, "Phase 1 complete; triggering in-memory merge");
 
+    // Per-stage timing for the post-Phase-1 tail. The pipeline sampler stops
+    // when Phase 1 does, so this span was previously invisible to every
+    // benchmark -- yet it is a near-constant 3-5s that grows to HALF of wall
+    // once the reader pool is widened. Emitted on the `genoray::monitor`
+    // target so it survives `GENORAY_LOG="genoray::monitor=trace"`, which is a
+    // filter and drops every other target.
+    macro_rules! stage {
+        ($label:expr, $body:expr) => {{
+            let t = std::time::Instant::now();
+            let out = $body;
+            tracing::debug!(
+                target: "genoray::monitor",
+                chrom = %chrom, stage = $label, secs = t.elapsed().as_secs_f64(),
+                "merge stage"
+            );
+            out
+        }};
+    }
+
     // Long-allele offsets belong to the indel stream.
     let offsets_array = ndarray::Array1::from_vec(long_allele_offsets);
     ndarray_npy::write_npy(paths.long_allele_offsets(), &offsets_array).map_err(|source| {
@@ -1008,29 +1035,35 @@ pub fn process_chromosome(
                 source: e,
             })?;
             let dest_values_bin = dest_dir.join("values.bin");
-            merge::merge_var_key_field_values(
-                dir.to_str().unwrap(),
-                num_chunks,
-                samples.len(),
-                ploidy,
-                ledgers.get(spec.tag),
-                field_ix,
-                4, // staged width (i32/f32); narrowed to final dtype at finalize (Task 9)
-                &dest_values_bin,
+            stage!(
+                format!("merge_vk_field/{}/{}", spec.subdir, field.name),
+                merge::merge_var_key_field_values(
+                    dir.to_str().unwrap(),
+                    num_chunks,
+                    samples.len(),
+                    ploidy,
+                    ledgers.get(spec.tag),
+                    field_ix,
+                    4, // staged width (i32/f32); narrowed to final dtype at finalize (Task 9)
+                    &dest_values_bin,
+                )
             )?;
         }
 
         let ledger = std::mem::take(ledgers.get_mut(spec.tag));
-        merge::merge_mini_sc(
-            spec.key_bytes,
-            num_chunks,
-            samples.len(),
-            ploidy,
-            dir.to_str().unwrap(),
-            ledger,
+        stage!(
+            format!("merge_mini_sc/{}", spec.subdir),
+            merge::merge_mini_sc(
+                spec.key_bytes,
+                num_chunks,
+                samples.len(),
+                ploidy,
+                dir.to_str().unwrap(),
+                ledger,
+            )
         )?;
         if let Some(hook) = spec.post_merge {
-            hook(&dir)?;
+            stage!(format!("post_merge/{}", spec.subdir), hook(&dir))?;
         }
     }
 
@@ -1075,31 +1108,40 @@ pub fn process_chromosome(
                 source: e,
             })?;
             let dest_values_bin = dest_dir.join("values.bin");
-            crate::dense_merge::merge_dense_field_values(
-                dir.to_str().unwrap(),
-                num_chunks,
-                &ledger,
-                field.category,
-                field_ix,
-                &dest_values_bin,
+            stage!(
+                format!("merge_dense_field/{}/{}", spec.subdir, field.name),
+                crate::dense_merge::merge_dense_field_values(
+                    dir.to_str().unwrap(),
+                    num_chunks,
+                    &ledger,
+                    field.category,
+                    field_ix,
+                    &dest_values_bin,
+                )
             )?;
         }
 
-        crate::dense_merge::merge_dense_class(
-            num_chunks,
-            samples.len(),
-            ploidy,
-            spec.key_bytes,
-            spec.pack_snp,
-            dir.to_str().unwrap(),
-            ledger,
+        stage!(
+            format!("merge_dense_class/{}", spec.subdir),
+            crate::dense_merge::merge_dense_class(
+                num_chunks,
+                samples.len(),
+                ploidy,
+                spec.key_bytes,
+                spec.pack_snp,
+                dir.to_str().unwrap(),
+                ledger,
+            )
         )?;
     }
 
     // M5 post-pass: emit max-deletion-length artifacts for the overlap query.
     // A pure scan of the finished indel key streams — decoupled from the merge.
     let contig_dir = std::path::Path::new(base_out_dir).join(chrom);
-    crate::max_del::write_max_del(&contig_dir, samples.len(), ploidy)?;
+    stage!(
+        "write_max_del",
+        crate::max_del::write_max_del(&contig_dir, samples.len(), ploidy)
+    )?;
 
     // Optional M-signatures write-time annotation: classify SBS96/ID83 codes
     // and store the mutcat sidecar now, while we're already in the
