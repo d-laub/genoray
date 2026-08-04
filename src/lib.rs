@@ -242,12 +242,18 @@ fn run_conversion_pipeline(
                 (samples.len() * ploidy / 8 + n_format * samples.len() * 4) as u64;
             let chunk_bytes = per_variant_bytes * chunk_size as u64;
 
+            // Longest-first cost estimate, computed once and reused for both
+            // the tune probe's target contig (below, if `tune`) and the
+            // dispatch order (Step 3): `estimate_contig_costs` opens the VCF
+            // and its index, so computing it twice would double that I/O for
+            // every conversion, tuned or not.
+            let costs = crate::contig_cost::estimate_contig_costs(&vcf_path, &chroms);
+            let ordered = crate::contig_cost::order_longest_first(&chroms, &costs);
+
             let reader_workers = if tune {
                 // Probe the LARGEST contig: it dominates the makespan, so its
                 // rates are the ones worth matching.
-                let costs = crate::contig_cost::estimate_contig_costs(&vcf_path, &chroms);
-                let target = crate::contig_cost::order_longest_first(&chroms, &costs);
-                match target.first() {
+                match ordered.first() {
                     Some(c) => match crate::tune::probe_rates(
                         &vcf_path,
                         c,
@@ -330,11 +336,17 @@ fn run_conversion_pipeline(
 
             // Step 3 -> Dispatch
             let fasta_ref: Option<&str> = reference_path.as_deref();
-            // Dispatch order only: `chroms` itself keeps its original order
-            // for `finalize_fields`/`write_meta` below, since the store's
-            // on-disk contig order is part of its layout.
-            let costs = crate::contig_cost::estimate_contig_costs(&vcf_path, &chroms);
-            let ordered = crate::contig_cost::order_longest_first(&chroms, &costs);
+            // `ordered` (computed above, longest-first) drives DISPATCH order
+            // only: `chroms` itself keeps its original order for
+            // `finalize_fields`/`write_meta` below, since the store's on-disk
+            // contig order is part of its layout.
+            //
+            // `results` below therefore comes back in DISPATCH order, not
+            // `chroms` order -- safe here only because the sole consumer
+            // (just below) sums every entry unconditionally; a future change
+            // that instead zips `results` positionally against `chroms` (or
+            // `samples`, or anything else keyed by the original order) would
+            // silently misattribute per-contig results.
             let results = pool.install(|| {
                 ordered
                     .par_iter()
