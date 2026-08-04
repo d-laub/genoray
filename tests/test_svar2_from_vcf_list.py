@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+import genoray._utils as _utils
 from genoray import SparseVar2
 
 _REF = "ACAGTACATGGGTACTAGCTAGGCTAACCGGTTAACCGGT"
@@ -90,18 +91,98 @@ def test_from_vcf_list_disjoint_sites_hom_ref_fill(tmp_path: Path):
     assert counts.tolist() == [1, 0, 0, 1]
 
 
-def test_from_vcf_list_huge_max_mem_warns_it_is_a_per_chunk_cap(tmp_path: Path):
-    """`from_vcf_list`'s `max_mem` caps ONE in-flight dense chunk;
-    `from_vcf`'s `max_mem` (same name, different quantity -- see both
-    docstrings) is a whole-process planning budget that legitimately reaches
-    tens of GB. Passing a `from_vcf`-sized value here doesn't raise -- it
-    silently derives an enormous `chunk_size` -- so this must at least warn.
+def test_from_vcf_list_max_mem_large_budget_hits_the_ceiling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """`max_mem` is now a WHOLE-PROCESS budget (same meaning as `from_vcf`'s),
+    not a per-chunk cap. A large budget must still derive a per-chunk target
+    no larger than the historical `_DENSE_CHUNK_TARGET_BYTES` ceiling -- large
+    budgets must not grow chunks past today's behavior (no regression for
+    cohorts that are currently fine).
+    """
+    import genoray._svar2 as sv2
+
+    seen = {}
+
+    def fake_auto_chunk_size(n_samples, ploidy=2, n_format_fields=0, max_mem=None):
+        seen["max_mem"] = max_mem
+        return 111
+
+    monkeypatch.setattr(sv2, "_auto_chunk_size", fake_auto_chunk_size)
+
+    a = _ss(tmp_path, "a", "S0", "chr1\t5\t.\tA\tC\t.\tPASS\t.\tGT\t1/1\n")
+    SparseVar2.from_vcf_list(
+        tmp_path / "out", [a], no_reference=True, threads=1, max_mem="1TiB"
+    )
+    assert seen["max_mem"] == sv2._DENSE_CHUNK_TARGET_BYTES
+
+
+def test_from_vcf_list_max_mem_tight_budget_shrinks_the_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A tight whole-process `max_mem` must genuinely shrink the derived
+    per-chunk target below the historical ceiling -- the actual improvement
+    this change ships (previously `max_mem` this size would have meant "cap
+    ONE chunk at this many bytes", which for a tiny value like this would
+    have raised or produced a degenerate chunk_size for a different reason;
+    now it means "the whole process may use this many bytes", and shrinks the
+    chunk target proportionally).
+    """
+    import genoray._svar2 as sv2
+
+    seen = {}
+
+    def fake_auto_chunk_size(n_samples, ploidy=2, n_format_fields=0, max_mem=None):
+        seen["max_mem"] = max_mem
+        return 111
+
+    monkeypatch.setattr(sv2, "_auto_chunk_size", fake_auto_chunk_size)
+
+    a = _ss(tmp_path, "a", "S0", "chr1\t5\t.\tA\tC\t.\tPASS\t.\tGT\t1/1\n")
+    tight_budget = 8 * 1024 * 1024  # 8 MiB whole-process budget
+    SparseVar2.from_vcf_list(
+        tmp_path / "out", [a], no_reference=True, threads=1, max_mem=tight_budget
+    )
+    expected = tight_budget // (
+        sv2._VCF_LIST_CONCURRENT_JOBS * sv2._VCF_LIST_IN_FLIGHT_CHUNKS_PER_JOB
+    )
+    assert seen["max_mem"] == expected
+    assert seen["max_mem"] < sv2._DENSE_CHUNK_TARGET_BYTES
+
+
+def test_from_vcf_list_falls_back_when_memory_budget_undetectable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """`max_mem=None` means a DETECTED budget, not unbounded -- but detection
+    is an optimization, not a requirement (mirrors
+    `test_from_vcf_falls_back_when_memory_budget_undetectable` in
+    `test_svar2_from_vcf.py`). `detect_memory_budget` raises `RuntimeError`
+    whenever there is no cgroup memory limit AND no readable `/proc/meminfo`
+    -- true of every macOS run and any host without `/proc`. `from_vcf_list`
+    must warn and degrade to the historical fixed dense-chunk target rather
+    than letting a planning optimization hard-fail the conversion.
     """
     ref = _write_ref(tmp_path)
     a = _ss(tmp_path, "a", "SA", "chr1\t3\t.\tA\tG\t.\t.\t.\tGT\t1|0\n")
     out = tmp_path / "store"
-    with pytest.warns(UserWarning, match="in-flight dense chunk"):
-        SparseVar2.from_vcf_list(out, [a], ref, threads=1, max_mem="64GiB")
+
+    # See test_svar2_from_vcf.py's twin test for why every tier must be
+    # blocked, including `_PROC_SELF_CGROUP` (self-discovery reads it FIRST).
+    missing_dir = tmp_path / "does-not-exist"
+    monkeypatch.setattr(_utils, "_PROC_SELF_CGROUP", missing_dir / "proc_self_cgroup")
+    monkeypatch.setattr(_utils, "_CGROUP_V2_ROOT", missing_dir / "cgroup_v2_root")
+    monkeypatch.setattr(_utils, "_CGROUP_V1_ROOT", missing_dir / "cgroup_v1_root")
+    monkeypatch.setattr(_utils, "_CGROUP_V2", missing_dir / "cgroup_v2")
+    monkeypatch.setattr(_utils, "_CGROUP_V1", missing_dir / "cgroup_v1")
+    monkeypatch.setattr(_utils, "_MEMINFO", missing_dir / "meminfo")
+
+    with pytest.warns(UserWarning, match="could not detect a memory budget"):
+        dropped = SparseVar2.from_vcf_list(out, [a], ref, threads=1)
+
+    assert dropped == 0
+    assert (out / "meta.json").exists()
+    sv = SparseVar2(out)
+    assert sv.available_samples == ["SA"]
 
 
 def test_from_vcf_list_contig_missing_from_some_files_is_hom_ref_filled(

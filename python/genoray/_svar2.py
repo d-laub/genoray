@@ -25,7 +25,7 @@ from genoray._svar2_fields import (
 )
 from genoray._svar2_mutcat import _MutcatMixin
 from genoray._svar2_ops import Mode, _assert_concat_compatible, _load_meta, _write_store
-from genoray._utils import detect_memory_budget, format_memory, parse_memory
+from genoray._utils import detect_memory_budget, parse_memory
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -725,12 +725,12 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         string like `"64GiB"` (see `parse_memory`). **This is a WHOLE-PROCESS
         planning budget** -- concurrent-contig count is chosen so cohort
         baseline memory plus each concurrent contig's in-flight chunk buffers
-        fit inside it, in addition to the existing core-count bound. It is
-        **not** the same quantity as :meth:`from_vcf_list`'s `max_mem`, which
-        caps the size of a single in-flight dense chunk (and, through that,
-        `chunk_size`) rather than process-wide concurrency; passing one
-        method's `max_mem` to the other silently means something else
-        entirely. **`None` (the default) means a DETECTED budget** -- 80% of
+        fit inside it, in addition to the existing core-count bound. **Same
+        meaning as** :meth:`from_vcf_list`'s `max_mem` -- both are
+        whole-process budgets; `from_vcf_list` has no fitted concurrency
+        planner to spend it on (its contigs run strictly sequentially), so it
+        derives its own per-chunk `chunk_size` from this budget instead (see
+        its docstring for the derivation). **`None` (the default) means a DETECTED budget** -- 80% of
         the cgroup memory limit (or `/proc/meminfo` total outside a cgroup)
         -- **not unbounded**. This is a deliberate default behavior change:
         unbounded planning preserves exactly the biobank-scale OOM exposure
@@ -1374,26 +1374,63 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
 
         chunk_size: variants per conversion chunk. When omitted (`None`,
         default), a memory-budget-derived value (`_auto_chunk_size`) is used so
-        one packed dense chunk stays ~`_DENSE_CHUNK_TARGET_BYTES` regardless of
-        cohort size — the same default `from_pgen` and `from_svar1` already use.
-        Scope: this bounds only the *dense-chunk* term, which is a small
-        fraction of peak RAM at typical cohort sizes (the budget does not bite
-        until roughly 43k inputs, below which it returns the historical
-        25_000). It is a large-cohort guardrail, not a fix for overall RAM
-        scaling in the number of input files. Pass an int to override with a
-        fixed count.
+        one packed dense chunk stays within a `max_mem`-derived per-chunk
+        target (see `max_mem` below) — the same default `from_pgen` and
+        `from_svar1` already use. Scope: this bounds only the *dense-chunk*
+        term, which is a small fraction of peak RAM at typical cohort sizes.
+        It is a large-cohort guardrail, not a fix for overall RAM scaling in
+        the number of input files. Pass an int to override with a fixed
+        count.
 
-        `max_mem` caps the bytes one in-flight dense chunk may occupy, sizing
-        `chunk_size` against the packed genotype grid plus staged FORMAT
-        values. It is a worst-case ceiling: the estimate assumes every variant
-        routes dense, so cohorts whose variants route sparse (e.g. private
-        somatic calls) use considerably less. **This is NOT the same quantity
-        as :meth:`from_vcf`'s `max_mem`**, which is a whole-process
-        concurrency-planning budget rather than a single-chunk cap; the two
-        differ by orders of magnitude (and `None` means something different
-        for each -- a target dense-chunk size here, a detected whole-process
-        budget there), so a value tuned for one method will not mean what you
-        expect on the other.
+        max_mem: byte budget the WHOLE PROCESS may use, as an int or a string
+        like `"64GiB"` (see `parse_memory`) -- **the same meaning as**
+        :meth:`from_vcf`'s `max_mem`, not a per-chunk cap.
+
+        **BREAKING CHANGE:** earlier versions of `from_vcf_list` treated
+        `max_mem` as a direct cap on the bytes of *one in-flight dense
+        chunk*. It is now a whole-process budget, matching `from_vcf`. A call
+        like ``max_mem="512MiB"`` that used to mean "let one dense chunk use
+        up to 512 MiB" now means "the whole process should use at most
+        512 MiB" -- which derives a MUCH smaller `chunk_size`. Re-tune any
+        `max_mem` value carried over from before this change.
+
+        `from_vcf_list` has no fitted concurrency planner the way the
+        sharded `from_vcf` reader does -- its contigs convert strictly
+        sequentially (`orchestrator::run_vcf_list` is a plain loop, forced
+        `concurrent_chroms=1`), and there is no RAM law fitted for this
+        pipeline the way :data:`RAM_BASE_MB`/:data:`RAM_PER_SAMPLE_MB`/
+        :data:`RAM_KAPPA` were fitted for the sharded one. So instead of
+        planning concurrency, it derives a per-chunk byte target from the
+        budget:
+
+            ``chunk_target = min(_DENSE_CHUNK_TARGET_BYTES, max_mem // (concurrent_jobs * in_flight_chunks_per_job))``
+
+        `concurrent_jobs=1` (contigs run one at a time). `in_flight_chunks_per_job=8` is a
+        fixed constant, not a fitted or plumbed value: it is read directly off
+        the Rust pipeline's architecture -- a single reader thread and a
+        single executor thread connected by a bounded channel of capacity 6
+        (`bounded::<DenseChunk>(6)` in `orchestrator.rs`), plus up to one
+        chunk each thread may hold outside the channel (built-but-unsent, or
+        received-but-still-processing): `6 + 1 + 1 = 8`. There is no
+        cohort-independent baseline term (`baseline=0`): unlike the sharded
+        path's fitted RAM law, nothing has been measured for this pipeline, so
+        subtracting an invented baseline would look fitted without being
+        fitted. `_DENSE_CHUNK_TARGET_BYTES` (~256 MiB) stays a **ceiling**: a
+        large budget cannot grow chunks past today's size (so this cannot
+        regress a cohort that is currently fine), while a tight budget shrinks
+        `chunk_target` -- and therefore `chunk_size` -- below it.
+
+        The resulting per-chunk target is still a worst-case ceiling on top of
+        that: `_auto_chunk_size` assumes every variant routes dense, so
+        cohorts whose variants route sparse (e.g. private somatic calls) use
+        considerably less than the budget allows.
+
+        **`None` (the default) means a DETECTED budget** -- same 80%-of-cgroup
+        (or `/proc/meminfo`) detection `from_vcf` uses, **not unbounded**. If
+        detection fails (no cgroup limit and no readable `/proc/meminfo` --
+        always true on macOS), a warning is emitted and `chunk_size` derivation
+        falls back to the historical fixed `_DENSE_CHUNK_TARGET_BYTES` target
+        rather than raising.
 
         For large multi-contig merges, also consider setting
         ``MALLOC_ARENA_MAX`` in the environment -- see the note below.
@@ -1509,45 +1546,51 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         format_ = [t for t in flds if t[1] == "format"]
 
         _validate_check_ref(check_ref)
-        max_mem_bytes = None if max_mem is None else parse_memory(max_mem)
-        if (
-            max_mem_bytes is not None
-            and max_mem_bytes > _DENSE_CHUNK_TARGET_BYTES * _MAX_MEM_SANITY_MULTIPLE
-        ):
-            # A value this far above one dense chunk's target size is far
-            # more likely to be a `from_vcf`-style whole-process planning
-            # budget (gigabytes-to-terabytes) landing on the wrong method
-            # than an intentional single-chunk cap. The consequence depends
-            # on `chunk_size`: `max_mem_bytes` only ever reaches
-            # `_auto_chunk_size` below when `chunk_size is None` -- an
-            # explicit `chunk_size` means `max_mem` is parsed above and then
-            # never used again, so the message must not claim it silently
-            # grows `chunk_size` when it is in fact silently discarded.
-            if chunk_size is None:
-                consequence = "This will silently derive a very large chunk_size."
-            else:
-                consequence = (
-                    "chunk_size was also passed explicitly, so max_mem is "
-                    "IGNORED entirely here -- it only takes effect when "
-                    "chunk_size is left as the default None."
+
+        # `max_mem` is a WHOLE-PROCESS budget here too -- same meaning and
+        # same detect/fall-back shape as `from_vcf` (see its comment above
+        # `if max_mem is None:`). Detection failure is a lost optimization,
+        # not a hard error: fall back to `_auto_chunk_size`'s historical
+        # fixed dense-chunk target (`chunk_target_bytes = None` below) rather
+        # than raising.
+        if max_mem is None:
+            try:
+                max_mem_bytes = detect_memory_budget()
+            except RuntimeError as e:
+                warnings.warn(
+                    f"could not detect a memory budget ({e}); deriving "
+                    "chunk_size from the historical fixed dense-chunk target "
+                    "instead. Pass max_mem explicitly to plan against a byte "
+                    "budget.",
+                    stacklevel=2,
                 )
-            warnings.warn(
-                f"max_mem={format_memory(max_mem_bytes)} is far above a single "
-                f"dense chunk's target size ({format_memory(_DENSE_CHUNK_TARGET_BYTES)}); "
-                "from_vcf_list's max_mem caps ONE in-flight dense chunk, not "
-                "whole-process planning like from_vcf's max_mem -- if you meant "
-                f"the latter, pass it to from_vcf instead. {consequence}",
-                stacklevel=2,
-            )
+                max_mem_bytes = None
+        else:
+            max_mem_bytes = parse_memory(max_mem)
+
         if chunk_size is None:
-            # Budget-derive so a packed dense chunk stays ~_DENSE_CHUNK_TARGET_BYTES
-            # (or the caller's max_mem) regardless of cohort size -- a fixed 25k chunk's
-            # dense RAM grows linearly in the number of input files (issue #120).
+            # Derive a per-chunk byte target from the whole-process budget --
+            # see the `max_mem` docstring above for the full derivation and
+            # why `concurrent_jobs`/`in_flight_chunks_per_job` have the
+            # values they do. `_DENSE_CHUNK_TARGET_BYTES` is a CEILING so a
+            # large budget can't grow chunks past today's size; only a tight
+            # budget shrinks them.
+            if max_mem_bytes is None:
+                chunk_target_bytes = None  # _auto_chunk_size treats None as the ceiling
+            else:
+                chunk_target_bytes = min(
+                    _DENSE_CHUNK_TARGET_BYTES,
+                    max_mem_bytes
+                    // (_VCF_LIST_CONCURRENT_JOBS * _VCF_LIST_IN_FLIGHT_CHUNKS_PER_JOB),
+                )
+            # Budget-derive so a packed dense chunk stays within that target
+            # regardless of cohort size -- a fixed 25k chunk's dense RAM
+            # grows linearly in the number of input files (issue #120).
             chunk_size = _auto_chunk_size(
                 len(samples),
                 ploidy,
                 n_format_fields=len(format_),
-                max_mem=max_mem_bytes,
+                max_mem=chunk_target_bytes,
             )
 
         # Per-contig, per-file membership: `contig_membership[c][i]` is True iff
@@ -2089,16 +2132,27 @@ def _svar1_fields_manifest(
 
 
 # Target byte size of one packed dense chunk (chunk_size * n_samples * ploidy / 8).
+# Also the CEILING `from_vcf_list` derives its per-chunk target against (see
+# its `max_mem` docstring) -- a large whole-process budget can grow the
+# per-chunk target up to, but never past, this.
 _DENSE_CHUNK_TARGET_BYTES = 256 * 1024 * 1024
 # Staged FORMAT is one 4-byte value per (variant, sample, field).
 _STAGED_FORMAT_BYTES = 4
-# `from_vcf_list`'s `max_mem` caps ONE in-flight dense chunk; `from_vcf`'s
-# `max_mem` (a different quantity, same name -- deliberately not renamed,
-# see both docstrings) caps whole-process planning and legitimately reaches
-# tens-to-hundreds of GB. A `from_vcf_list` `max_mem` this many multiples
-# above the dense-chunk target is far more likely to be that other budget
-# landing on the wrong method than an intentionally huge single-chunk cap.
-_MAX_MEM_SANITY_MULTIPLE = 64
+# `from_vcf_list` processes contigs strictly sequentially -- see
+# `orchestrator::run_vcf_list`'s doc comment ("concurrent_chroms is forced to
+# 1 regardless of what the plan suggests"). Only one contig's pipeline is
+# ever resident at a time.
+_VCF_LIST_CONCURRENT_JOBS = 1
+# Upper bound on `DenseChunk`s simultaneously resident in memory for ONE
+# contig's pipeline (`orchestrator.rs`, `process_chromosome`): the bounded
+# channel between the single reader thread and single executor thread holds
+# up to 6 (`bounded::<crate::types::DenseChunk>(6)`), plus up to 1 the reader
+# has just finished building and is blocked trying to send, plus up to 1 the
+# executor has already received and is actively processing: 6 + 1 + 1 = 8.
+# This is read directly off the Rust pipeline's fixed architecture (single
+# reader/executor threads, hardcoded channel capacity), not a runtime-plumbed
+# value or a fitted estimate -- update it if that architecture changes.
+_VCF_LIST_IN_FLIGHT_CHUNKS_PER_JOB = 8
 
 
 def _auto_chunk_size(
