@@ -388,9 +388,12 @@ Signature: `from_vcf(out, source, reference=None, *, regions=None, samples=None,
 - **`tune: bool = False`** — Python-only kwarg (**no `--tune` CLI flag**). If
   `True`, probes the largest contig's actual read/exec rates on this machine
   and input before dispatch, and derives the per-contig reader-worker count
-  from the measured ratio instead of a fixed default. A failed probe never
-  fails the conversion — it falls back to the default reader-worker count and
-  logs a warning.
+  from the measured ratio instead of a fixed default. `tune` is a pure
+  optimization and can never turn a working conversion into a failure: a
+  failed probe falls back to the default reader-worker count and logs a
+  warning, and a probe that SUCCEEDS but returns a worker count too large for
+  the memory budget also falls back to the default reader-worker count
+  (retried once) and logs a warning, rather than raising.
 - **`progress=False`/`log_level="info"`** — write-time progress/logging,
   shared by `from_vcf`/`from_pgen`/`from_vcf_list`/`from_svar1`/`write_view`.
   `progress=True` renders live progress: in a terminal or Jupyter, a `rich`
@@ -610,7 +613,15 @@ multi-sample VCF.
   sizes a single dense chunk — they differ by orders of magnitude and their
   `None` defaults differ too (a detected system budget vs. this fixed
   ~256 MiB target). Passing one method's value to the other either errors or
-  silently sizes the wrong thing.
+  silently sizes the wrong thing. As a guard against that specific mix-up,
+  passing a `max_mem` far above the dense-chunk target (currently 64x
+  `_DENSE_CHUNK_TARGET_BYTES`, i.e. ≥16 GiB) raises a `UserWarning` — such a
+  value is far more likely to be a `from_vcf`-style whole-process budget
+  landing on the wrong method than an intentional single-chunk cap. The
+  warning's wording differs depending on `chunk_size`: with `chunk_size=None`
+  it warns that a very large `chunk_size` will be silently derived; with an
+  explicit `chunk_size` it warns that `max_mem` is ignored entirely (per the
+  point above).
 - `ploidy`, `skip_out_of_scope`, `threads`, `overwrite`,
   `long_allele_capacity`, `signatures`, `check_ref` all mean the same as
   `from_vcf`, and the return value is the same `int` (dropped out-of-scope

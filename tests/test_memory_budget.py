@@ -46,15 +46,32 @@ def _block_legacy_and_meminfo(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr("genoray._utils._MEMINFO", missing / "meminfo")
 
 
-def test_v2_self_discovered_leaf_limit(tmp_path, monkeypatch):
-    """The common case: this process's own (leaf) cgroup carries the limit."""
+def _block_legacy_only(monkeypatch, tmp_path: Path) -> None:
+    """Like `_block_legacy_and_meminfo`, but leaves `_MEMINFO` alone -- for
+    tests that need a REAL, present `/proc/meminfo` to prove the cgroup tier
+    is preferred over it, not merely reached because meminfo was absent."""
+    missing = tmp_path / "does-not-exist"
+    monkeypatch.setattr("genoray._utils._CGROUP_V2", missing / "cgroup_v2")
+    monkeypatch.setattr("genoray._utils._CGROUP_V1", missing / "cgroup_v1")
+
+
+def test_v2_self_discovered_leaf_limit_wins_over_present_meminfo(tmp_path, monkeypatch):
+    """The common case: this process's own (leaf) cgroup carries the limit --
+    and wins even though `/proc/meminfo` is PRESENT and reports something far
+    larger (the node's whole RAM under Slurm, ~251 GiB here vs. an 8 GiB
+    cgroup). This precedence is exactly the property whose violation caused
+    the Critical this file exists to guard: a real cgroup limit falling
+    through to the larger node-wide meminfo total (measured on this cluster
+    as a 15.7x over-estimate, with no warning)."""
     v2_root = tmp_path / "sys-fs-cgroup"
     _write(v2_root / "slurm" / "job" / "memory.max", "8589934592\n")  # 8 GiB
     cgroup_file = _write(tmp_path / "proc_self_cgroup", "0::/slurm/job\n")
+    meminfo = _write(tmp_path / "meminfo", "MemTotal:       263192360 kB\n")  # ~251 GiB
 
     monkeypatch.setattr("genoray._utils._PROC_SELF_CGROUP", cgroup_file)
     monkeypatch.setattr("genoray._utils._CGROUP_V2_ROOT", v2_root)
-    _block_legacy_and_meminfo(monkeypatch, tmp_path)
+    monkeypatch.setattr("genoray._utils._MEMINFO", meminfo)
+    _block_legacy_only(monkeypatch, tmp_path)
 
     assert detect_memory_budget() == int(8589934592 * MEM_BUDGET_FRACTION)
 
@@ -75,9 +92,14 @@ def test_v2_ancestor_more_restrictive_than_leaf_wins(tmp_path, monkeypatch):
     assert detect_memory_budget() == int(4294967296 * MEM_BUDGET_FRACTION)
 
 
-def test_v1_self_discovered_real_path(tmp_path, monkeypatch):
+def test_v1_self_discovered_real_path_wins_over_present_meminfo(tmp_path, monkeypatch):
     """Mirrors this exact cluster: cgroup v1, job cgroup several levels below
-    the mount root (`/slurm/uid_<uid>/job_<id>`)."""
+    the mount root (`/slurm/uid_<uid>/job_<id>`) -- and wins over a PRESENT
+    `/proc/meminfo` reporting the whole node (~1 TiB here vs. a 64 GiB job
+    cgroup, this cluster's real numbers). cgroup v1 is the tier that actually
+    broke on this cluster (the Critical this file exists to guard was found
+    on a v1 host), so this precedence must be pinned directly, not just
+    inferred from the v2 case."""
     v1_root = tmp_path / "sys-fs-cgroup-memory"
     _write(
         v1_root / "slurm" / "uid_1111" / "job_13336789" / "memory.limit_in_bytes",
@@ -86,12 +108,60 @@ def test_v1_self_discovered_real_path(tmp_path, monkeypatch):
     cgroup_file = _write(
         tmp_path / "proc_self_cgroup", "11:memory:/slurm/uid_1111/job_13336789\n"
     )
+    meminfo = _write(tmp_path / "meminfo", "MemTotal:       1056717004 kB\n")  # ~1 TiB
+
+    monkeypatch.setattr("genoray._utils._PROC_SELF_CGROUP", cgroup_file)
+    monkeypatch.setattr("genoray._utils._CGROUP_V1_ROOT", v1_root)
+    monkeypatch.setattr("genoray._utils._MEMINFO", meminfo)
+    _block_legacy_only(monkeypatch, tmp_path)
+
+    assert detect_memory_budget() == int(68719476736 * MEM_BUDGET_FRACTION)
+
+
+def test_v2_max_falls_through_to_v1(tmp_path, monkeypatch):
+    """cgroup v2 writes the literal "max" when uncapped; self-discovery must
+    keep looking rather than treating that as a real (enormous) limit --
+    falling through to a self-discovered v1 tier, which wins over a PRESENT,
+    larger `/proc/meminfo` too. A real hybrid host's `/proc/self/cgroup`
+    carries both a `0::` (v2) line and a `N:memory:` (v1) line at once, so
+    both appear in the same fixture file here."""
+    v2_root = tmp_path / "sys-fs-cgroup"
+    _write(v2_root / "slurm" / "job" / "memory.max", "max\n")
+    v1_root = tmp_path / "sys-fs-cgroup-memory"
+    _write(
+        v1_root / "slurm" / "uid_1111" / "job_13336789" / "memory.limit_in_bytes",
+        "4294967296\n",  # 4 GiB
+    )
+    cgroup_file = _write(
+        tmp_path / "proc_self_cgroup",
+        "0::/slurm/job\n11:memory:/slurm/uid_1111/job_13336789\n",
+    )
+    meminfo = _write(tmp_path / "meminfo", "MemTotal:       263192360 kB\n")  # ~251 GiB
+
+    monkeypatch.setattr("genoray._utils._PROC_SELF_CGROUP", cgroup_file)
+    monkeypatch.setattr("genoray._utils._CGROUP_V2_ROOT", v2_root)
+    monkeypatch.setattr("genoray._utils._CGROUP_V1_ROOT", v1_root)
+    monkeypatch.setattr("genoray._utils._MEMINFO", meminfo)
+    _block_legacy_only(monkeypatch, tmp_path)
+
+    assert detect_memory_budget() == int(4294967296 * MEM_BUDGET_FRACTION)
+
+
+def test_v1_multi_controller_line_is_parsed(tmp_path, monkeypatch):
+    """A v1 hierarchy line can co-mount several controllers on one line (e.g.
+    `9:cpu,memory:/path`), not just the single-controller `N:memory:...` form
+    every other v1 fixture in this file uses. `_own_cgroup_path` must find
+    `memory` inside the comma-separated controller list, not require it to
+    be the entire field."""
+    v1_root = tmp_path / "sys-fs-cgroup-memory"
+    _write(v1_root / "job" / "memory.limit_in_bytes", "4294967296\n")  # 4 GiB
+    cgroup_file = _write(tmp_path / "proc_self_cgroup", "9:cpu,memory:/job\n")
 
     monkeypatch.setattr("genoray._utils._PROC_SELF_CGROUP", cgroup_file)
     monkeypatch.setattr("genoray._utils._CGROUP_V1_ROOT", v1_root)
     _block_legacy_and_meminfo(monkeypatch, tmp_path)
 
-    assert detect_memory_budget() == int(68719476736 * MEM_BUDGET_FRACTION)
+    assert detect_memory_budget() == int(4294967296 * MEM_BUDGET_FRACTION)
 
 
 def test_v1_root_sentinel_falls_through_to_meminfo(tmp_path, monkeypatch):
