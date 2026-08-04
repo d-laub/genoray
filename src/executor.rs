@@ -151,6 +151,11 @@ pub struct ExecutorParams<'a> {
     pub fields: &'a [crate::field::FieldSpec],
     pub chrom: &'a str,
     pub sink: &'a crate::logging::EventSink,
+    /// Registry each worker pushes its OS TID into so `monitor.rs` can report
+    /// pool-wide `cpu_exec`. Name-based lookup cannot do this: worker 0 and
+    /// the outer `exec-{chrom}` thread share a name, and the outer thread is
+    /// parked in `thread::scope`.
+    pub worker_tids: &'a crate::monitor::TidRegistry,
 }
 
 /// PROTOTYPE: `workers` executor threads sharing one `rx_dense` (crossbeam
@@ -185,8 +190,12 @@ pub fn run_compute_engine_multi(
         fields,
         chrom,
         sink,
+        worker_tids,
     } = params;
     let workers = workers.max(1);
+    // Captured by the workers only under `cfg(linux)`; keeps the binding used
+    // on platforms without `/proc`, where CPU sampling is unavailable anyway.
+    let _ = worker_tids;
     type Row = (usize, StreamMap<Vec<u32>>, DenseMap<u32>);
 
     let mut all_rows: Vec<Row> = Vec::with_capacity(10_000);
@@ -210,6 +219,13 @@ pub fn run_compute_engine_multi(
             let handle = std::thread::Builder::new()
                 .name(name)
                 .spawn_scoped(scope, move || {
+                    // Register before any work so the first sampler tick that
+                    // lands mid-chunk already counts this worker.
+                    #[cfg(target_os = "linux")]
+                    worker_tids
+                        .lock()
+                        .unwrap()
+                        .push(crate::monitor::current_tid());
                     let mut bank = LongAlleleTableWriter::new(tx_l, long_allele_capacity);
                     let mut rows: Vec<Row> = Vec::with_capacity(4096);
                     let mut kept: u64 = 0;

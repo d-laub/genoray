@@ -27,16 +27,8 @@ use crate::shard::WorkUnit;
 use crate::trace::trace_ll;
 use crate::types::DenseChunk;
 
-/// Current OS thread id (Linux `gettid`, distinct from the process pid and
-/// from Rust's internal `std::thread::ThreadId`). Used ONLY to populate
-/// `worker_tids` for `monitor.rs`'s per-chrom CPU sampling -- see that
-/// param's doc comment on [`run`] for why a shared TID registry is needed
-/// instead of matching threads by `comm` name.
 #[cfg(target_os = "linux")]
-fn current_tid() -> i32 {
-    // SAFETY: SYS_gettid takes no arguments and cannot fail.
-    unsafe { libc::syscall(libc::SYS_gettid) as i32 }
-}
+use crate::monitor::current_tid;
 
 /// Pure ordering oracle: decides WHEN a `(ordinal, local)` tag may be handed
 /// the next global id, given shards can finish (or even stream their own
