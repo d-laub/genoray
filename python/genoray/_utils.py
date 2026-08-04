@@ -130,6 +130,22 @@ def numba_threads(n: int):
 MEM_BUDGET_FRACTION = 0.8
 
 # Module-level so tests can point them at fixtures.
+#
+# `/proc/self/cgroup` tells us which cgroup THIS process actually lives in;
+# the roots below are where that relative path gets resolved. Under Slurm (or
+# any cgroup manager) the process sits several levels below the root, e.g.
+# `/slurm/uid_1111/job_13336789` -- reading `memory.max`/`memory.limit_in_bytes`
+# straight off the root only sees the right number when this process happens
+# to run un-namespaced at the top of the hierarchy.
+_PROC_SELF_CGROUP = Path("/proc/self/cgroup")
+_CGROUP_V2_ROOT = Path("/sys/fs/cgroup")
+_CGROUP_V1_ROOT = Path("/sys/fs/cgroup/memory")
+# Last-resort fixed paths: the ROOT cgroup's own limit. Used only when this
+# process's own cgroup can't be resolved from `_PROC_SELF_CGROUP` (missing
+# /proc, unreadable, or no matching hierarchy line) -- e.g. no cgroups at
+# all, or a namespaced container where "root" already IS this process's
+# cgroup. Kept as fixed module-level paths (not derived) so a host with no
+# `/proc/self/cgroup` still gets a best-effort answer instead of none.
 _CGROUP_V2 = Path("/sys/fs/cgroup/memory.max")
 _CGROUP_V1 = Path("/sys/fs/cgroup/memory/memory.limit_in_bytes")
 _MEMINFO = Path("/proc/meminfo")
@@ -161,6 +177,69 @@ def _meminfo_total(path: Path) -> int | None:
     return None
 
 
+def _own_cgroup_path(cgroup_file: Path, *, v2: bool) -> str | None:
+    """This process's path within one cgroup hierarchy.
+
+    Read from `cgroup_file` (normally `/proc/self/cgroup`); None if
+    unreadable or not found. Each line is
+    `<hierarchy-id>:<controller-list>:<path>`. v2's unified
+    hierarchy always has `hierarchy-id == 0` and an EMPTY controller list
+    (`0::<path>`); v1's memory controller has a comma-separated controller
+    list that may name `memory` alongside others (e.g. `11:memory:<path>` or
+    `9:cpu,memory:<path>`).
+    """
+    try:
+        text = cgroup_file.read_text()
+    except OSError:
+        return None
+    for line in text.splitlines():
+        parts = line.split(":", 2)
+        if len(parts) != 3:
+            continue
+        _hier_id, controllers, path = parts
+        if v2:
+            if controllers == "":
+                return path
+        elif "memory" in controllers.split(","):
+            return path
+    return None
+
+
+def _cgroup_v2_limit(cgroup_file: Path, root: Path) -> int | None:
+    """This process's effective cgroup v2 memory limit.
+
+    The MINIMUM of `memory.max` at its own cgroup and every ancestor up to
+    `root` (an ancestor can be more restrictive than the leaf; v2's unified
+    hierarchy has no separate "which controller won" question the way v1's
+    nesting does, so a plain min is correct here).
+    """
+    rel = _own_cgroup_path(cgroup_file, v2=True)
+    if rel is None:
+        return None
+    parts = [p for p in rel.split("/") if p]
+    limits = []
+    for depth in range(len(parts), -1, -1):
+        limit = _read_int(root.joinpath(*parts[:depth]) / "memory.max")
+        if limit is not None:
+            limits.append(limit)
+    return min(limits) if limits else None
+
+
+def _cgroup_v1_limit(cgroup_file: Path, root: Path) -> int | None:
+    """This process's cgroup v1 `memory.limit_in_bytes`.
+
+    Rejects the uncapped sentinel; returns None if unresolvable.
+    """
+    rel = _own_cgroup_path(cgroup_file, v2=False)
+    if rel is None:
+        return None
+    parts = [p for p in rel.split("/") if p]
+    limit = _read_int(root.joinpath(*parts) / "memory.limit_in_bytes")
+    if limit is not None and limit < _CGROUP_V1_UNLIMITED:
+        return limit
+    return None
+
+
 def detect_memory_budget(fraction: float = MEM_BUDGET_FRACTION) -> int:
     """Bytes of memory the conversion planner may plan against.
 
@@ -168,8 +247,19 @@ def detect_memory_budget(fraction: float = MEM_BUDGET_FRACTION) -> int:
     `/proc/meminfo` reports the node, the cgroup reports the job. Planning
     against the node hands the planner a budget it does not have, on exactly
     the allocations where the planner matters most.
+
+    Resolves THIS PROCESS's own cgroup from `/proc/self/cgroup` first (v2,
+    walking ancestors for the tightest limit; then v1), falling back to the
+    fixed root-cgroup paths only when self-discovery finds nothing --
+    reading the root directly is unlimited on any host without a cgroup
+    namespace (e.g. a bare Slurm compute node, where the real job limit
+    lives several levels down at `/slurm/uid_<uid>/job_<id>/...`).
     """
-    limit = _read_int(_CGROUP_V2)
+    limit = _cgroup_v2_limit(_PROC_SELF_CGROUP, _CGROUP_V2_ROOT)
+    if limit is None:
+        limit = _read_int(_CGROUP_V2)
+    if limit is None:
+        limit = _cgroup_v1_limit(_PROC_SELF_CGROUP, _CGROUP_V1_ROOT)
     if limit is None:
         v1 = _read_int(_CGROUP_V1)
         limit = v1 if v1 is not None and v1 < _CGROUP_V1_UNLIMITED else None

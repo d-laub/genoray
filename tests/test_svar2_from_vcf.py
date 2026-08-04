@@ -98,8 +98,15 @@ def test_from_vcf_falls_back_when_memory_budget_undetectable(
 
     # Point every tier `detect_memory_budget` checks at a path that can never
     # resolve, so all three fail and it raises -- mirrors a host with no
-    # cgroup and no /proc (e.g. macOS).
+    # cgroup and no /proc (e.g. macOS). `_PROC_SELF_CGROUP` must be blocked
+    # too, not just the legacy fixed roots: self-discovery reads it FIRST,
+    # and on a real cgroup host (e.g. this test's own CI/dev machine) it
+    # would otherwise find this process's actual cgroup and succeed despite
+    # every other path here being fake.
     missing_dir = tmp_path / "does-not-exist"
+    monkeypatch.setattr(_utils, "_PROC_SELF_CGROUP", missing_dir / "proc_self_cgroup")
+    monkeypatch.setattr(_utils, "_CGROUP_V2_ROOT", missing_dir / "cgroup_v2_root")
+    monkeypatch.setattr(_utils, "_CGROUP_V1_ROOT", missing_dir / "cgroup_v1_root")
     monkeypatch.setattr(_utils, "_CGROUP_V2", missing_dir / "cgroup_v2")
     monkeypatch.setattr(_utils, "_CGROUP_V1", missing_dir / "cgroup_v1")
     monkeypatch.setattr(_utils, "_MEMINFO", missing_dir / "meminfo")
