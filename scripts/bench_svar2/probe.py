@@ -85,7 +85,13 @@ def parse_trace(text: str) -> dict:
 def digest(store: Path) -> str:
     """Order-independent hash of every file in the .svar store -- the
     correctness oracle. Sharding is byte-identical, so this must not move
-    across any configuration."""
+    across any configuration.
+
+    Deliberately duplicated (not imported) at `tests/_oracle.py::store_digest`
+    -- coupling this standalone bench script to the test package is worse
+    than eight duplicated lines. Both must stay in agreement; if one changes,
+    change both.
+    """
     h = hashlib.sha256()
     for p in sorted(store.rglob("*")):
         if p.is_file():
