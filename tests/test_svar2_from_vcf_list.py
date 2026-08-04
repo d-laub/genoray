@@ -185,6 +185,44 @@ def test_from_vcf_list_falls_back_when_memory_budget_undetectable(
     assert sv.available_samples == ["SA"]
 
 
+def test_from_vcf_list_explicit_chunk_size_skips_max_mem_detection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """`max_mem`'s derived target is only ever consulted when `chunk_size`
+    is left at its default `None` (both docstrings and SKILL.md say
+    `max_mem` is "ignored when chunk_size is passed explicitly"). So with an
+    explicit `chunk_size`, `from_vcf_list` must not even ATTEMPT
+    memory-budget detection -- attempting it is observable (a warning on
+    failure) even though nothing about that detection feeds the result.
+
+    Regression test for a reintroduced bug: an earlier revision of this
+    method ran the detect/parse block unconditionally, ahead of the
+    `chunk_size is None` guard, so a caller passing an explicit `chunk_size`
+    on a host where detection fails (e.g. macOS, no cgroup and no
+    `/proc/meminfo`) got a spurious "could not detect a memory budget ...
+    deriving chunk_size from the historical fixed dense-chunk target
+    instead" warning while their `chunk_size` was in fact used verbatim and
+    nothing was being derived.
+    """
+    import genoray._svar2 as sv2
+
+    def boom():
+        raise AssertionError(
+            "detect_memory_budget must not be called when chunk_size is explicit"
+        )
+
+    monkeypatch.setattr(sv2, "detect_memory_budget", boom)
+
+    a = _ss(tmp_path, "a", "S0", "chr1\t5\t.\tA\tC\t.\tPASS\t.\tGT\t1/1\n")
+    # Would raise (from `boom`, propagating uncaught since it isn't a
+    # RuntimeError) if detection were attempted despite chunk_size being
+    # explicit.
+    dropped = SparseVar2.from_vcf_list(
+        tmp_path / "out", [a], no_reference=True, threads=1, chunk_size=321
+    )
+    assert dropped == 0
+
+
 def test_from_vcf_list_contig_missing_from_some_files_is_hom_ref_filled(
     tmp_path: Path,
 ):

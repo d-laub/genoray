@@ -1475,6 +1475,21 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run_svar1_conversion_pipeline, m)?)?;
     #[cfg(feature = "conversion")]
     m.add_function(wrap_pyfunction!(index_vcf, m)?)?;
+    // Exported so `_svar2.py`'s `from_vcf_list` `max_mem` -> `chunk_size`
+    // derivation reads the vcf_list pipeline's actual concurrency constants
+    // instead of duplicating them as hardcoded Python literals -- see both
+    // constants' doc comments in `orchestrator.rs` for why this must stay a
+    // single source of truth.
+    #[cfg(feature = "conversion")]
+    m.add(
+        "VCF_LIST_DENSE_CHANNEL_CAP",
+        crate::orchestrator::VCF_LIST_DENSE_CHANNEL_CAP,
+    )?;
+    #[cfg(feature = "conversion")]
+    m.add(
+        "VCF_LIST_CONCURRENT_CHROMS",
+        crate::orchestrator::VCF_LIST_CONCURRENT_CHROMS,
+    )?;
     #[cfg(feature = "conversion")]
     m.add_class::<PyEventReceiver>()?;
     m.add_class::<crate::py_query::PyContigReader>()?;
