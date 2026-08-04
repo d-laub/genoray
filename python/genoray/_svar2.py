@@ -748,8 +748,12 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         tune: if True, probe the largest contig's actual read/exec rates on
         this machine and input before dispatch, and derive the per-contig
         reader-worker count from the measured ratio instead of a fixed
-        default. A failed probe never fails the conversion -- it falls back
-        to the default reader-worker count and logs a warning.
+        default. `tune` is a pure optimization and can never turn a working
+        conversion into a failure: a failed probe falls back to the default
+        reader-worker count and logs a warning, and a probe that SUCCEEDS
+        but returns a worker count too large for the memory budget also
+        falls back to the default reader-worker count (retried once) and
+        logs a warning, rather than raising.
         """
         from cyvcf2 import VCF as _CyVCF
         from genoray._svar._regions import _normalize_samples
@@ -1513,16 +1517,26 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             # A value this far above one dense chunk's target size is far
             # more likely to be a `from_vcf`-style whole-process planning
             # budget (gigabytes-to-terabytes) landing on the wrong method
-            # than an intentional single-chunk cap -- silently, this
-            # produces an enormous `chunk_size` rather than raising, so the
-            # mistake only surfaces later as an OOM.
+            # than an intentional single-chunk cap. The consequence depends
+            # on `chunk_size`: `max_mem_bytes` only ever reaches
+            # `_auto_chunk_size` below when `chunk_size is None` -- an
+            # explicit `chunk_size` means `max_mem` is parsed above and then
+            # never used again, so the message must not claim it silently
+            # grows `chunk_size` when it is in fact silently discarded.
+            if chunk_size is None:
+                consequence = "This will silently derive a very large chunk_size."
+            else:
+                consequence = (
+                    "chunk_size was also passed explicitly, so max_mem is "
+                    "IGNORED entirely here -- it only takes effect when "
+                    "chunk_size is left as the default None."
+                )
             warnings.warn(
                 f"max_mem={format_memory(max_mem_bytes)} is far above a single "
                 f"dense chunk's target size ({format_memory(_DENSE_CHUNK_TARGET_BYTES)}); "
                 "from_vcf_list's max_mem caps ONE in-flight dense chunk, not "
                 "whole-process planning like from_vcf's max_mem -- if you meant "
-                "the latter, pass it to from_vcf instead. This will silently "
-                "derive a very large chunk_size.",
+                f"the latter, pass it to from_vcf instead. {consequence}",
                 stacklevel=2,
             )
         if chunk_size is None:
