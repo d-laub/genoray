@@ -679,10 +679,11 @@ def extrapolate(
 
 # File-layout contract shared with the plan-generation and sbatch agents:
 # `<results-dir>/<name>.ndjson`, `<plans-dir>/<name>.json`, for `name` in
-# these five sweeps. `vlinear`/`vlinear2` are the two V-linearity ladders;
-# neither is guaranteed to exist in an older job dir, and their absence must
-# degrade gracefully.
-_SWEEP_NAMES = ("scale", "contig", "holdout", "vlinear", "vlinear2")
+# these six sweeps. `vlinear`/`vlinear2` are the two V-linearity ladders;
+# `concurrency` is the cc={1,8,15,22} probe of the tuned load-balancing
+# planner's chosen contig concurrency. None of the three is guaranteed to
+# exist in an older job dir, and their absence must degrade gracefully.
+_SWEEP_NAMES = ("scale", "contig", "holdout", "vlinear", "vlinear2", "concurrency")
 
 
 class _LoadedSweep:
@@ -1018,7 +1019,15 @@ def main() -> None:
         for msg in excluded:
             print(f"  - {msg}")
 
-    scale, contig, holdout, vlinear, vlinear2 = (sweeps[n] for n in _SWEEP_NAMES)
+    # Named individually (not a generator-unpack over `_SWEEP_NAMES`) so
+    # adding a sweep name that has no dedicated law-fitting consumer yet
+    # (e.g. `concurrency`, which is only summarized in the usable-record
+    # counts above) cannot silently break this line's arity.
+    scale = sweeps["scale"]
+    contig = sweeps["contig"]
+    holdout = sweeps["holdout"]
+    vlinear = sweeps["vlinear"]
+    vlinear2 = sweeps["vlinear2"]
 
     print()
     v_law: VLaw | None = None
