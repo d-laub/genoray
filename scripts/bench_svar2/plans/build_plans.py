@@ -281,18 +281,15 @@ def build(corpus_dir: Path, threads: int) -> dict[str, list[SweepPoint]]:
             workers = max(1, 12 // concurrent)
             contig.append(_point(corpus, workers, cs, threads, concurrent=concurrent))
 
+    concurrency_corpus = corpus_dir / "s4000_c22.manifest.json"
     for cc in CONCURRENCY_CHROMS:
         concurrency.append(
-            SweepPoint(
-                corpus=str(corpus_dir / "s4000_c22.manifest.json"),
-                reader_workers=CONCURRENCY_READER_WORKERS,
-                concurrent_chroms=cc,
-                shard_htslib=0,
-                overshard=4,
-                chunk_size=10_937,
-                threads=threads,
-                reps=3,
-                rss_ceiling_mb=None,
+            _point(
+                concurrency_corpus,
+                CONCURRENCY_READER_WORKERS,
+                10_937,
+                threads,
+                concurrent=cc,
             )
         )
 

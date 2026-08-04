@@ -106,6 +106,27 @@ print(' '.join(str(v) for v in VLINEAR_VARIANTS))
     --out "$OUT" --samples "$VLIN_S" --variants "$V" --procs 16 --bgzip-threads 8
 done
 
+# Second V-linearity ladder (cohort-beta fix, commit 407a56c): same shape as
+# above but at a DIFFERENT fixed S (VLINEAR2_SAMPLES), so `fit_cohort_beta_
+# from_ladders` has two cohort sizes to form a ratio from instead of the
+# design pinning beta ~ 1. This block was missing entirely until now, which
+# left `vlinear2.json`/`.ndjson` permanently empty even though `model.py`
+# already knew how to consume them -- the plan existed, nothing ever filled
+# it.
+read -r VLIN2_S < <($PX python -c "
+from scripts.bench_svar2.plans.build_plans import VLINEAR2_SAMPLES
+print(VLINEAR2_SAMPLES)
+")
+for V in $($PX python -c "
+from scripts.bench_svar2.plans.build_plans import VLINEAR2_VARIANTS
+print(' '.join(str(v) for v in VLINEAR2_VARIANTS))
+"); do
+  OUT="$JD/corpora/vlinear2_v${V}.vcf.gz"
+  [ -f "${OUT%.vcf.gz}.manifest.json" ] && { echo "have $OUT"; continue; }
+  $PX python -m scripts.bench_svar2.scale_corpus \
+    --out "$OUT" --samples "$VLIN2_S" --variants "$V" --procs 16 --bgzip-threads 8
+done
+
 # --- plans and sweeps --------------------------------------------------------
 $PX python -m scripts.bench_svar2.plans.build_plans \
   --corpus-dir "$JD/corpora" --out-dir "$JD/plans" --threads "$THREADS"
@@ -120,15 +141,21 @@ $PX python -m scripts.bench_svar2.plans.build_plans \
 # Running that first is what nearly cost this study its answer. `vlinear` is
 # ~10 minutes and fits the V-law; the V-law is the ONLY reason 500,000 samples
 # is reachable at all, so a timeout inside `scale` would have left the model
-# unable to produce ANY verdict despite ~24h of measurement. `holdout` (the
-# out-of-sample check) and `contig` are likewise hours cheaper than `scale`.
+# unable to produce ANY verdict despite ~24h of measurement. `vlinear2` (the
+# second V-ladder, needed so `fit_cohort_beta_from_ladders` has two cohort
+# sizes to form a ratio from) is the same shape and cost class as `vlinear`,
+# so it sits right next to it. `holdout` (the out-of-sample check), `contig`,
+# and `concurrency` (the cc={1,8,15,22} probe of the tuned load-balancing
+# planner's chosen contig concurrency, reusing `contig`'s own s4000_c22
+# corpus -- no separate corpus-generation step needed) are likewise hours
+# cheaper than `scale`.
 #
 # Safe to reorder because `run_sweep` resumes: `pending_points` skips any
 # point already fsynced to the results ndjson, so a resubmit continues rather
 # than repeats. That also means point_id must stay stable -- it hashes every
 # SweepPoint field including `threads` and `reps`, so changing
 # --cpus-per-task invalidates resume as well as the regime.
-for NAME in vlinear contig holdout scale; do
+for NAME in vlinear vlinear2 contig concurrency holdout scale; do
   $PX python -m scripts.bench_svar2.sweep \
     --plan "$JD/plans/$NAME.json" \
     --results "$JD/out/$NAME.ndjson" \

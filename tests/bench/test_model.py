@@ -8,6 +8,7 @@ from scripts.bench_svar2.model import (
     _LoadedSweep,
     _ram_rows,
     _resident_chunk_size,
+    _SWEEP_NAMES,
     cohort_beta_is_design_forced,
     decide,
     fit_cohort_beta_from_ladders,
@@ -19,6 +20,7 @@ from scripts.bench_svar2.model import (
     knee_from_probe,
     main,
 )
+from scripts.bench_svar2.plans.build_plans import build as build_plans
 from scripts.bench_svar2.records import (
     CorpusManifest,
     CostLaw,
@@ -31,6 +33,18 @@ from scripts.bench_svar2.records import (
 )
 
 pytestmark = pytest.mark.bench
+
+
+def test_sweep_names_covers_every_axis_build_plans_produces(tmp_path):
+    """A sweep axis that `build_plans.build()` emits but `_SWEEP_NAMES` never
+    names is dispatched nowhere (`sweep_scale.sbatch`'s loop only iterates
+    `_SWEEP_NAMES`-shaped names) and loaded nowhere (`main()` only loads
+    `_SWEEP_NAMES`) -- it produces a plan file and then no data ever fills
+    it. This bit twice (`vlinear2`, then `concurrency`); this test exists so
+    the next axis added to `build_plans.py` fails loudly here instead of
+    shipping silently inert."""
+    plan_axes = set(build_plans(tmp_path, threads=8).keys())
+    assert plan_axes == set(_SWEEP_NAMES)
 
 
 def test_v_law_recovers_planted_line():
