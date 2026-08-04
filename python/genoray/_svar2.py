@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import warnings
 from collections.abc import Sequence as AbcSequence
 from collections import Counter
 from os import PathLike
@@ -721,16 +722,28 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         without touching call sites).
 
         max_mem: byte budget the concurrency planner may use, as an int or a
-        string like `"64GiB"` (see `parse_memory`). Concurrent-contig count is
-        chosen so cohort baseline memory plus each concurrent contig's
-        in-flight chunk buffers fit inside this budget, in addition to the
-        existing core-count bound. **`None` (the default) means a DETECTED
-        budget** -- 80% of the cgroup memory limit (or `/proc/meminfo` total
-        outside a cgroup) -- **not unbounded**. This is a deliberate default
-        behavior change: unbounded planning preserves exactly the
-        biobank-scale OOM exposure the byte-budgeted planner exists to
-        remove. Pass an explicit value to raise or lower it, or a very large
-        value to approximate the old unbounded behavior.
+        string like `"64GiB"` (see `parse_memory`). **This is a WHOLE-PROCESS
+        planning budget** -- concurrent-contig count is chosen so cohort
+        baseline memory plus each concurrent contig's in-flight chunk buffers
+        fit inside it, in addition to the existing core-count bound. It is
+        **not** the same quantity as :meth:`from_vcf_list`'s `max_mem`, which
+        caps the size of a single in-flight dense chunk (and, through that,
+        `chunk_size`) rather than process-wide concurrency; passing one
+        method's `max_mem` to the other silently means something else
+        entirely. **`None` (the default) means a DETECTED budget** -- 80% of
+        the cgroup memory limit (or `/proc/meminfo` total outside a cgroup)
+        -- **not unbounded**. This is a deliberate default behavior change:
+        unbounded planning preserves exactly the biobank-scale OOM exposure
+        the byte-budgeted planner exists to remove. If detection itself
+        fails (no cgroup limit and no readable `/proc/meminfo` -- always true
+        on macOS), a warning is emitted and planning falls back to the old
+        core-bound-only behavior rather than raising. Pass an explicit value
+        to raise or lower the budget, or a very large value to approximate
+        unbounded planning. Note the practical floor: the planner's RAM law
+        has a fixed cohort-baseline term of roughly 932 MB, so any budget
+        that can't cover baseline plus one concurrent contig's chunk buffers
+        -- in practice, anything much below ~1.2 GB -- is rejected with a
+        `ValueError` even for a tiny cohort.
 
         tune: if True, probe the largest contig's actual read/exec rates on
         this machine and input before dispatch, and derive the per-contig
@@ -837,9 +850,24 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
 
         # `None` means a DETECTED budget, not unbounded. Unbounded preserves
         # exactly the biobank-scale OOM exposure the byte-budgeted planner
-        # exists to remove.
+        # exists to remove. Detection itself is an optimization, though, not
+        # a requirement -- it raises RuntimeError whenever there is no cgroup
+        # limit AND no readable /proc/meminfo, which is every macOS run (this
+        # project ships an osx-arm64 wheel) and any host without /proc. A
+        # detection failure must not turn into a hard failure of the whole
+        # conversion: fall back to unconstrained (core-bound-only) planning,
+        # same as the pre-`max_mem` behavior, and say so.
         if max_mem is None:
-            max_mem_bytes = detect_memory_budget()
+            try:
+                max_mem_bytes = detect_memory_budget()
+            except RuntimeError as e:
+                warnings.warn(
+                    f"could not detect a memory budget ({e}); planning "
+                    "concurrency by core count only. Pass max_mem explicitly "
+                    "to plan against a byte budget.",
+                    stacklevel=2,
+                )
+                max_mem_bytes = None
         else:
             max_mem_bytes = parse_memory(max_mem)
 
@@ -1355,7 +1383,13 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         `chunk_size` against the packed genotype grid plus staged FORMAT
         values. It is a worst-case ceiling: the estimate assumes every variant
         routes dense, so cohorts whose variants route sparse (e.g. private
-        somatic calls) use considerably less.
+        somatic calls) use considerably less. **This is NOT the same quantity
+        as :meth:`from_vcf`'s `max_mem`**, which is a whole-process
+        concurrency-planning budget rather than a single-chunk cap; the two
+        differ by orders of magnitude (and `None` means something different
+        for each -- a target dense-chunk size here, a detected whole-process
+        budget there), so a value tuned for one method will not mean what you
+        expect on the other.
 
         For large multi-contig merges, also consider setting
         ``MALLOC_ARENA_MAX`` in the environment -- see the note below.
