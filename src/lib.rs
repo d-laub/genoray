@@ -240,7 +240,6 @@ fn run_conversion_pipeline(
                 .count();
             let per_variant_bytes =
                 (samples.len() * ploidy / 8 + n_format * samples.len() * 4) as u64;
-            let chunk_bytes = per_variant_bytes * chunk_size as u64;
 
             // Longest-first cost estimate, computed once and reused for both
             // the tune probe's target contig (below, if `tune`) and the
@@ -249,6 +248,33 @@ fn run_conversion_pipeline(
             // every conversion, tuned or not.
             let costs = crate::contig_cost::estimate_contig_costs(&vcf_path, &chroms);
             let ordered = crate::contig_cost::order_longest_first(&chroms, &costs);
+
+            // The RAM law (`RAM_KAPPA` etc., src/budget.rs) was fitted
+            // against RESIDENT chunk bytes -- `min(chunk_size, variants)` --
+            // not the nominal `chunk_size * per_variant_bytes`:
+            // `BitGrid3::zeros` is `alloc_zeroed` (a calloc), so an oversized
+            // `chunk_size` costs address space, not RSS, and feeding the
+            // nominal size in dragged the fitted kappa ~10x low. Narrowing
+            // by the largest contig's true record count is only valid when
+            // `costs` came from the index tier (`exact_counts`): the
+            // header-length fallback tier's values are base-pair CONTIG
+            // LENGTHS, a different unit entirely, and using those here would
+            // badly under-estimate. When it isn't known to be safe, fall
+            // back to the nominal (over-estimating, never under-estimating)
+            // size.
+            let resident_chunk_size = if costs.exact_counts {
+                costs
+                    .values
+                    .values()
+                    .copied()
+                    .max()
+                    .map_or(chunk_size, |max_records| {
+                        chunk_size.min(max_records as usize)
+                    })
+            } else {
+                chunk_size
+            };
+            let chunk_bytes = per_variant_bytes * resident_chunk_size as u64;
 
             let reader_workers = if tune {
                 // Probe the LARGEST contig: it dominates the makespan, so its
@@ -287,14 +313,24 @@ fn run_conversion_pipeline(
                 DEFAULT_READER_WORKERS
             };
 
-            let sharded = crate::budget::plan_sharded(crate::budget::PlanInputs {
-                usable_cores: available_cores.saturating_sub(1).max(1),
-                n_contigs: chroms.len(),
-                n_samples: samples.len(),
-                chunk_bytes,
-                max_mem_bytes,
-                reader_workers,
-            });
+            // `plan_sharded_tuned` (not `plan_sharded` directly): a probed
+            // `reader_workers` must stay a pure optimization, per `tune`'s
+            // docs -- if the tuned count blows the memory budget it falls
+            // back to `DEFAULT_READER_WORKERS` and warns rather than
+            // failing a conversion that would have succeeded untuned. A
+            // no-op when `tune=false`, since `reader_workers` already
+            // equals `DEFAULT_READER_WORKERS` in that case.
+            let sharded = crate::budget::plan_sharded_tuned(
+                crate::budget::PlanInputs {
+                    usable_cores: available_cores.saturating_sub(1).max(1),
+                    n_contigs: chroms.len(),
+                    n_samples: samples.len(),
+                    chunk_bytes,
+                    max_mem_bytes,
+                    reader_workers,
+                },
+                DEFAULT_READER_WORKERS,
+            );
             let sharded = match sharded {
                 Ok(p) => p,
                 Err(e) => return vec![Err(crate::error::ConversionError::from(e))],

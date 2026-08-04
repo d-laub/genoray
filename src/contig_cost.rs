@@ -243,12 +243,43 @@ fn lengths_from_header(vcf_path: &str, chroms: &[String]) -> HashMap<String, u64
     out
 }
 
+/// Per-contig work estimates, tagged with which tier produced them.
+///
+/// `Deref`s to the inner map so existing indexing/`.get`/`.contains_key`/
+/// `.is_empty` call sites keep working unchanged; `exact_counts` is the only
+/// thing callers need to check before treating a value as anything more
+/// specific than "a sort key" (see `order_longest_first`'s doc: only RATIOS
+/// are contractual across tiers, and the absolute unit differs between
+/// them).
+#[derive(Debug, Clone, Default)]
+pub struct ContigCosts {
+    pub values: HashMap<String, u64>,
+    /// True iff `values` are exact per-contig VARIANT RECORD counts from the
+    /// index tier (tabix/CSI, `counts_from_index`). False means the
+    /// header-length fallback tier (`lengths_from_header`), whose values are
+    /// base-pair CONTIG LENGTHS -- a different unit that must never be
+    /// treated as a record count (e.g. for a resident-chunk-size memory
+    /// estimate: `min(chunk_size, records)` is only valid math when
+    /// `records` really are record counts).
+    pub exact_counts: bool,
+}
+
+impl std::ops::Deref for ContigCosts {
+    type Target = HashMap<String, u64>;
+    fn deref(&self) -> &Self::Target {
+        &self.values
+    }
+}
+
 /// Per-contig work estimates, best source available.
-pub fn estimate_contig_costs(vcf_path: &str, chroms: &[String]) -> HashMap<String, u64> {
+pub fn estimate_contig_costs(vcf_path: &str, chroms: &[String]) -> ContigCosts {
     match counts_from_index(vcf_path, chroms) {
         Some(counts) => {
             tracing::debug!(source = "index", n = counts.len(), "contig cost estimates");
-            counts
+            ContigCosts {
+                values: counts,
+                exact_counts: true,
+            }
         }
         None => {
             let lens = lengths_from_header(vcf_path, chroms);
@@ -257,7 +288,10 @@ pub fn estimate_contig_costs(vcf_path: &str, chroms: &[String]) -> HashMap<Strin
                 n = lens.len(),
                 "contig cost estimates (index carried no per-contig counts)"
             );
-            lens
+            ContigCosts {
+                values: lens,
+                exact_counts: false,
+            }
         }
     }
 }
@@ -376,6 +410,11 @@ mod tests {
         // for CSI-over-VCF; delete tier 1 and ship the header-length tier.
         assert!(costs["chrB"] > costs["chrC"], "costs = {costs:?}");
         assert!(costs["chrC"] > costs["chrA"], "costs = {costs:?}");
+        // This VCF has a tabix index, so the counts came from tier 1 (exact
+        // per-contig record counts) -- callers that need to distinguish
+        // "these are real record counts" from "these are byte-length
+        // proxies" depend on this flag being set correctly per tier.
+        assert!(costs.exact_counts);
     }
 
     /// A VCF-flavoured CSI/TBI stores only COVERED references, compacted in
@@ -538,5 +577,10 @@ mod tests {
         assert_eq!(costs.get("chrA").copied(), Some(10000));
         assert_eq!(costs.get("chrB").copied(), Some(800000));
         assert_eq!(costs.get("chrC").copied(), Some(300000));
+        // No index at all -- these values are header CONTIG LENGTHS, not
+        // record counts. A caller that mistook this tier for `exact_counts`
+        // would badly under-estimate a `min(chunk_size, records)` memory
+        // guard against real record counts thousands of times smaller.
+        assert!(!costs.exact_counts);
     }
 }
