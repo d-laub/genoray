@@ -1019,6 +1019,15 @@ pub fn process_chromosome(
         }
     })?;
 
+    // BENCH-ONLY: `GENORAY_MERGE_THREADS` overrides the gather budget for the
+    // var_key merges. Setting it to 1 reproduces the pre-fix behaviour exactly
+    // (those gathers used to inherit `lib.rs`'s `concurrent_chroms`-sized pool
+    // and so always ran single-threaded), which is what makes serial-vs-parallel
+    // measurable from ONE build instead of needing two checkouts.
+    let merge_threads = bench_env("GENORAY_MERGE_THREADS")
+        .unwrap_or(processing_threads)
+        .max(1);
+
     // num_chunks is identical across streams — one ledger row per chunk.
     let num_chunks = ledgers.get(StreamTag::VarKeyIndel).len();
     let mut ledgers = ledgers; // make mutable to move rows out
@@ -1055,6 +1064,7 @@ pub fn process_chromosome(
                     field_ix,
                     4, // staged width (i32/f32); narrowed to final dtype at finalize (Task 9)
                     &dest_values_bin,
+                    merge_threads,
                 )
             )?;
         }
@@ -1068,6 +1078,7 @@ pub fn process_chromosome(
                 samples.len(),
                 ploidy,
                 dir.to_str().unwrap(),
+                merge_threads,
                 ledger,
             )
         )?;

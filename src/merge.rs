@@ -7,10 +7,23 @@ use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
-// Target peak RAM per tile (per worker). Two u32 buffers per tile, so a 256 MB
-// budget caps a tile at ~32M items. Workers run in parallel via rayon — peak
-// process RAM = TILE_RAM_BUDGET × rayon_threads.
+/// Target peak RAM for one `gather_columns` call AS A WHOLE — not per worker.
+/// Each worker holds one tile buffer at a time, so the per-worker share is this
+/// divided by the thread budget, and peak stays flat as threads grow.
+///
+/// It was previously documented as a per-worker budget ("peak = TILE_RAM_BUDGET
+/// × rayon_threads"), which only stayed survivable because the `par_iter` below
+/// was silently running on a one-thread pool. Actually parallelising it at that
+/// definition would have made peak scale with the thread budget — ~8.75 GB at
+/// 35 threads.
 const TILE_RAM_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Floor on a single worker's share of the budget. Dividing the whole-stage
+/// budget by a wide thread count would otherwise shrink tiles until each
+/// `pread` is too small to amortise, trading RAM for I/O efficiency. Worst-case
+/// peak is therefore `MIN_TILE_RAM_BYTES * threads` (~280 MB at 35 threads)
+/// rather than unbounded.
+const MIN_TILE_RAM_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Phase A (shared): derive global per-column offsets and per-chunk local
 /// offsets from the RAM Ledger. Both `merge_mini_sc` and
@@ -45,6 +58,35 @@ fn derive_offsets(
     (final_offsets, chunk_offsets)
 }
 
+/// How many columns one tile spans, given a thread budget.
+///
+/// `threads` workers each hold one tile buffer at a time, so a tile gets
+/// `TILE_RAM_BUDGET_BYTES / threads` and peak stays ~flat as threads grow --
+/// this is the whole point of taking `threads` here rather than sizing per
+/// worker. `MIN_TILE_RAM_BYTES` floors the share so a wide budget cannot shrink
+/// tiles into `pread`s too small to amortise; past that floor peak grows again,
+/// but only at ~8 MB per thread.
+///
+/// Pure and separately tested: the RAM coupling this encodes is the part that
+/// silently held only because the gather used to run single-threaded.
+fn tile_columns(
+    total_items: u64,
+    total_columns: usize,
+    bytes_per_item: u64,
+    threads: usize,
+) -> usize {
+    let per_worker_budget = (TILE_RAM_BUDGET_BYTES / threads.max(1) as u64).max(MIN_TILE_RAM_BYTES);
+    let avg_calls_per_col =
+        std::cmp::max(1u64, total_items / std::cmp::max(1, total_columns) as u64);
+    std::cmp::max(
+        1usize,
+        std::cmp::min(
+            total_columns.max(1),
+            (per_worker_budget / (avg_calls_per_col * bytes_per_item.max(1))) as usize,
+        ),
+    )
+}
+
 /// One byte-payload stream sharing the offset/tile schedule computed by
 /// `derive_offsets`: per-chunk source files (opened once, read via stateless
 /// `pread`) and the pre-sized destination file (written via `pwrite`).
@@ -75,112 +117,143 @@ fn gather_columns(
     final_offsets: &[u64],
     chunk_offsets: &[Vec<u32>],
     payloads: &[Payload],
+    threads: usize,
 ) -> Result<(), ConversionError> {
     let total_items: u64 = final_offsets[total_columns];
+    let threads = threads.max(1);
 
-    // Adaptive tile size: target TILE_RAM_BUDGET per tile. Payloads are
-    // gathered sequentially below (one tile_buffer live at a time), but we
-    // size against the sum of all payload item widths (e.g. pos + key for
-    // merge_mini_sc) as a conservative bound that keeps peak tile RAM under
-    // budget even if the gather were made concurrent.
+    // Payloads are gathered sequentially below (one tile_buffer live at a
+    // time), but we size against the sum of all payload item widths (e.g. pos
+    // + key for merge_mini_sc) as a conservative bound that keeps peak tile RAM
+    // under budget even if the gather were made concurrent.
     let bytes_per_item: u64 = payloads.iter().map(|p| p.item_width as u64).sum();
-    let avg_calls_per_col =
-        std::cmp::max(1u64, total_items / std::cmp::max(1, total_columns) as u64);
-    let columns_per_tile = std::cmp::max(
-        1usize,
-        std::cmp::min(
-            total_columns.max(1),
-            (TILE_RAM_BUDGET_BYTES / (avg_calls_per_col * bytes_per_item)) as usize,
-        ),
-    );
+    let columns_per_tile = tile_columns(total_items, total_columns, bytes_per_item, threads);
 
     // Tile start columns — independent work units, parallelized across rayon.
     let tile_starts: Vec<usize> = (0..total_columns).step_by(columns_per_tile).collect();
 
-    tile_starts
-        .par_iter()
-        .try_for_each(|&tile_start_col| -> Result<(), ConversionError> {
-            let tile_end_col = std::cmp::min(tile_start_col + columns_per_tile, total_columns);
-            let tile_n_cols = tile_end_col - tile_start_col;
-            let tile_start_item = final_offsets[tile_start_col] as usize;
-            let tile_end_item = final_offsets[tile_end_col] as usize;
-            let tile_total_items = tile_end_item - tile_start_item;
+    // Tile count is the ceiling on this gather's parallelism, and it is set by
+    // the DATA (total sparse bytes / per-worker budget), not by `threads`. A
+    // stream small enough to fit one tile cannot go faster no matter how wide
+    // the budget — worth logging, because otherwise "no speedup" is
+    // indistinguishable from "the pool never engaged".
+    tracing::debug!(
+        target: "genoray::monitor",
+        tiles = tile_starts.len(),
+        columns_per_tile,
+        threads,
+        payload_mb = (total_items * bytes_per_item) / (1024 * 1024),
+        "gather tiling"
+    );
 
-            if tile_total_items == 0 {
-                return Ok(());
-            }
+    let gather_tile = |tile_start_col: usize| -> Result<(), ConversionError> {
+        let tile_end_col = std::cmp::min(tile_start_col + columns_per_tile, total_columns);
+        let tile_n_cols = tile_end_col - tile_start_col;
+        let tile_start_item = final_offsets[tile_start_col] as usize;
+        let tile_end_item = final_offsets[tile_end_col] as usize;
+        let tile_total_items = tile_end_item - tile_start_item;
 
-            // per-column write head (offset within this tile buffer, in items).
-            // Identical for every payload — computed once, cloned per payload below.
-            let mut tile_write_heads_base = vec![0usize; tile_n_cols];
-            #[allow(clippy::needless_range_loop)]
-            for i in 0..tile_n_cols {
-                let col = tile_start_col + i;
-                tile_write_heads_base[i] = (final_offsets[col] as usize) - tile_start_item;
-            }
+        if tile_total_items == 0 {
+            return Ok(());
+        }
 
-            for payload in payloads {
-                let item_width = payload.item_width;
-                let mut tile_buffer = vec![0u8; tile_total_items * item_width];
-                let mut tile_write_heads = tile_write_heads_base.clone();
+        // per-column write head (offset within this tile buffer, in items).
+        // Identical for every payload — computed once, cloned per payload below.
+        let mut tile_write_heads_base = vec![0usize; tile_n_cols];
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..tile_n_cols {
+            let col = tile_start_col + i;
+            tile_write_heads_base[i] = (final_offsets[col] as usize) - tile_start_item;
+        }
 
-                // gather from chunks
-                for chunk_id in 0..num_chunks {
-                    let chunk_start_item = chunk_offsets[chunk_id][tile_start_col] as usize;
-                    let chunk_end_item = chunk_offsets[chunk_id][tile_end_col] as usize;
-                    let chunk_items_to_read = chunk_end_item - chunk_start_item;
+        for payload in payloads {
+            let item_width = payload.item_width;
+            let mut tile_buffer = vec![0u8; tile_total_items * item_width];
+            let mut tile_write_heads = tile_write_heads_base.clone();
 
-                    if chunk_items_to_read == 0 {
+            // gather from chunks
+            for chunk_id in 0..num_chunks {
+                let chunk_start_item = chunk_offsets[chunk_id][tile_start_col] as usize;
+                let chunk_end_item = chunk_offsets[chunk_id][tile_end_col] as usize;
+                let chunk_items_to_read = chunk_end_item - chunk_start_item;
+
+                if chunk_items_to_read == 0 {
+                    continue;
+                }
+
+                // Stateless positional read — multiple workers can read the
+                // same File concurrently without locking or seek contention.
+                let mut chunk_bytes = vec![0u8; chunk_items_to_read * item_width];
+                let byte_offset = (chunk_start_item * item_width) as u64;
+                payload.chunk_files[chunk_id]
+                    .read_exact_at(&mut chunk_bytes, byte_offset)
+                    .map_err(|e| ConversionError::Io {
+                        context: "pread chunk payload".into(),
+                        source: e,
+                    })?;
+
+                // stitch this chunk's block into the main Tile buffer
+                let mut local_chunk_cursor = 0usize;
+                #[allow(clippy::needless_range_loop)]
+                for i in 0..tile_n_cols {
+                    let col = tile_start_col + i;
+                    let calls = ram_ledger[chunk_id][col] as usize;
+                    if calls == 0 {
                         continue;
                     }
 
-                    // Stateless positional read — multiple workers can read the
-                    // same File concurrently without locking or seek contention.
-                    let mut chunk_bytes = vec![0u8; chunk_items_to_read * item_width];
-                    let byte_offset = (chunk_start_item * item_width) as u64;
-                    payload.chunk_files[chunk_id]
-                        .read_exact_at(&mut chunk_bytes, byte_offset)
-                        .map_err(|e| ConversionError::Io {
-                            context: "pread chunk payload".into(),
-                            source: e,
-                        })?;
+                    let dest_start = tile_write_heads[i] * item_width;
+                    let src_start = local_chunk_cursor * item_width;
+                    tile_buffer[dest_start..dest_start + calls * item_width]
+                        .copy_from_slice(&chunk_bytes[src_start..src_start + calls * item_width]);
 
-                    // stitch this chunk's block into the main Tile buffer
-                    let mut local_chunk_cursor = 0usize;
-                    #[allow(clippy::needless_range_loop)]
-                    for i in 0..tile_n_cols {
-                        let col = tile_start_col + i;
-                        let calls = ram_ledger[chunk_id][col] as usize;
-                        if calls == 0 {
-                            continue;
-                        }
-
-                        let dest_start = tile_write_heads[i] * item_width;
-                        let src_start = local_chunk_cursor * item_width;
-                        tile_buffer[dest_start..dest_start + calls * item_width].copy_from_slice(
-                            &chunk_bytes[src_start..src_start + calls * item_width],
-                        );
-
-                        tile_write_heads[i] += calls;
-                        local_chunk_cursor += calls;
-                    }
+                    tile_write_heads[i] += calls;
+                    local_chunk_cursor += calls;
                 }
-
-                // pwrite the assembled tile to its known byte range in the
-                // destination file. Tiles are disjoint by construction
-                // (final_offsets is monotonically increasing), so concurrent
-                // write_all_at calls touch non-overlapping regions.
-                let tile_byte_offset = (tile_start_item * item_width) as u64;
-                payload
-                    .dest
-                    .write_all_at(&tile_buffer, tile_byte_offset)
-                    .map_err(|e| ConversionError::Io {
-                        context: "pwrite payload".into(),
-                        source: e,
-                    })?;
             }
-            Ok(())
-        })
+
+            // pwrite the assembled tile to its known byte range in the
+            // destination file. Tiles are disjoint by construction
+            // (final_offsets is monotonically increasing), so concurrent
+            // write_all_at calls touch non-overlapping regions.
+            let tile_byte_offset = (tile_start_item * item_width) as u64;
+            payload
+                .dest
+                .write_all_at(&tile_buffer, tile_byte_offset)
+                .map_err(|e| ConversionError::Io {
+                    context: "pwrite payload".into(),
+                    source: e,
+                })?;
+        }
+        Ok(())
+    };
+
+    // Skip the pool when it cannot pay for itself. Building one costs `threads`
+    // OS thread spawns, and the gather is called several times per contig
+    // (once per var_key stream, plus once per field), so on cohorts whose
+    // variants are mostly DENSE — where the sparse streams hold few calls and
+    // fit in a single tile — that spawn cost is pure loss. Measured at ~4-5 ms
+    // per call against a 36 ms stage, i.e. a real regression if taken
+    // unconditionally.
+    if threads == 1 || tile_starts.len() <= 1 {
+        return tile_starts.iter().try_for_each(|&c| gather_tile(c));
+    }
+
+    // Otherwise run on an OWN pool rather than the ambient one.
+    // `process_chromosome` runs inside `lib.rs`'s dispatch pool, which is sized
+    // to `concurrent_chroms` (1 by default), so a bare `par_iter()` reached from
+    // here sees a ONE-thread pool and silently executes serially — the same trap
+    // documented on `DenseMergeParams::threads`. Tiles differ in item count
+    // (columns are not uniformly dense), so rayon's work-stealing is worth
+    // keeping here over the static `std::thread::scope` split the dense
+    // transpose uses.
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads.min(tile_starts.len()))
+        .thread_name(|i| format!("merge-{i}"))
+        .build()
+        .expect("build merge gather pool");
+
+    pool.install(|| tile_starts.par_iter().try_for_each(|&c| gather_tile(c)))
 }
 
 /// Performs the Tile-Based Interleaving Merge.
@@ -192,12 +265,20 @@ fn gather_columns(
 ///          then `pwrite`s the assembled tile to its pre-computed byte range in
 ///          `positions.bin` / `alleles.bin`.
 /// Phase C: cleanup of per-chunk temp files.
+///
+/// `threads` is the budget for the Phase B gather. Like
+/// [`crate::dense_merge::DenseMergeParams::threads`] it is passed in rather than
+/// taken from the ambient rayon pool: `process_chromosome` runs inside `lib.rs`'s
+/// dispatch pool, sized to `concurrent_chroms`, so an ambient `par_iter()` here
+/// would silently run on one thread.
+#[allow(clippy::too_many_arguments)]
 pub fn merge_mini_sc(
     key_bytes: usize,
     num_chunks: usize,
     num_samples: usize,
     ploidy: usize,
     output_dir: &str,
+    threads: usize,
     ram_ledger: Vec<Vec<u32>>,
 ) -> Result<(), ConversionError> {
     let output_dir_path = Path::new(output_dir);
@@ -273,8 +354,9 @@ pub fn merge_mini_sc(
         .collect::<Result<_, _>>()?;
 
     tracing::debug!(
-        tile_mb = TILE_RAM_BUDGET_BYTES / (1024 * 1024),
-        "Tile size target (adaptive; computed inside gather_columns)"
+        stage_budget_mb = TILE_RAM_BUDGET_BYTES / (1024 * 1024),
+        threads,
+        "Tile size target (adaptive; whole-stage budget split across workers)"
     );
 
     gather_columns(
@@ -295,6 +377,7 @@ pub fn merge_mini_sc(
                 dest: &final_key_file,
             },
         ],
+        threads,
     )?;
 
     // Drop file handles to flush metadata before cleanup
@@ -344,6 +427,7 @@ pub fn merge_var_key_field_values(
     field_ix: usize,
     item_width: usize,
     dest_values_bin: &Path,
+    threads: usize,
 ) -> Result<(), ConversionError> {
     let output_dir_path = Path::new(output_dir);
     let total_columns = num_samples * ploidy;
@@ -395,6 +479,7 @@ pub fn merge_var_key_field_values(
             chunk_files: &chunk_files,
             dest: &dest_file,
         }],
+        threads,
     )?;
 
     // Drop file handles to flush metadata before cleanup
@@ -418,6 +503,82 @@ mod tests {
     use std::io::Write;
     use std::path::Path;
     use tempfile::tempdir;
+
+    /// Deliberately > 1 so every merge test drives the pooled gather path
+    /// rather than the single-thread one that masked the ambient-pool bug.
+    const TEST_THREADS: usize = 4;
+
+    // ---- tile sizing / RAM coupling ----
+    //
+    // These fixtures are far too small to span more than one tile, so they
+    // cannot exercise the RAM math end-to-end. `tile_columns` is pure, so the
+    // coupling is asserted directly instead -- this is the invariant that used
+    // to hold only by accident, because the gather never actually ran on more
+    // than one thread.
+
+    #[test]
+    fn tile_budget_is_whole_stage_not_per_worker() {
+        // 64M items x 4 bytes = 256 MB of payload across 1024 columns.
+        let (items, cols, width) = (64u64 << 20, 1024usize, 4u64);
+
+        // Peak = threads concurrently-live tiles. Under the OLD per-worker
+        // reading this product grew linearly with `threads`; it must not.
+        let peak = |threads: usize| -> u64 {
+            let per_tile_cols = tile_columns(items, cols, width, threads) as u64;
+            let items_per_tile = per_tile_cols * (items / cols as u64);
+            items_per_tile * width * threads as u64
+        };
+
+        // Within the floor's reach, widening the pool must not raise peak RAM.
+        assert!(peak(8) <= TILE_RAM_BUDGET_BYTES + (1 << 20));
+        assert!(peak(16) <= TILE_RAM_BUDGET_BYTES + (1 << 20));
+        // 32 threads x 8 MB floor = 256 MB, i.e. still at budget, not 32x it.
+        assert!(
+            peak(32) <= 8 * TILE_RAM_BUDGET_BYTES,
+            "peak {} blew past the floor-bounded ceiling",
+            peak(32)
+        );
+    }
+
+    #[test]
+    fn tile_columns_shrinks_with_threads_then_hits_the_floor() {
+        let (items, cols, width) = (64u64 << 20, 1024usize, 4u64);
+        let t1 = tile_columns(items, cols, width, 1);
+        let t8 = tile_columns(items, cols, width, 8);
+        assert!(
+            t8 < t1,
+            "more threads must mean smaller tiles ({t1} -> {t8})"
+        );
+
+        // Past the floor, the share stops shrinking -- otherwise a wide budget
+        // would grind the gather down into tiny preads.
+        let huge = tile_columns(items, cols, width, 4096);
+        let huger = tile_columns(items, cols, width, 65536);
+        assert_eq!(
+            huge, huger,
+            "tile size must bottom out at MIN_TILE_RAM_BYTES"
+        );
+        assert!(huge >= 1);
+    }
+
+    #[test]
+    fn tile_columns_is_always_a_usable_span() {
+        // Degenerate shapes must still yield a legal, non-zero tile width:
+        // `step_by(0)` panics and a tile wider than the matrix is meaningless.
+        for &(items, cols, width, threads) in &[
+            (0u64, 0usize, 0u64, 0usize),
+            (0, 4, 4, 1),
+            (1, 1, 1, 1),
+            (u32::MAX as u64, 3, 8, 64),
+        ] {
+            let t = tile_columns(items, cols, width, threads);
+            assert!(
+                t >= 1,
+                "tile_columns returned 0 for {items}/{cols}/{width}/{threads}"
+            );
+            assert!(t <= cols.max(1));
+        }
+    }
 
     // Helper: stage one chunk's pos and key arrays to disk in the layout merge expects.
     fn write_chunk_files(dir: &Path, chunk_id: usize, pos: &[u32], key: &[u32]) {
@@ -467,7 +628,7 @@ mod tests {
         let key: Vec<u32> = vec![10, 20, 30, 40, 50, 60];
         write_chunk_files(dir, 0, &pos, &key);
 
-        merge_mini_sc(4, 1, 2, 2, dir.to_str().unwrap(), ram_ledger).unwrap();
+        merge_mini_sc(4, 1, 2, 2, dir.to_str().unwrap(), TEST_THREADS, ram_ledger).unwrap();
 
         let final_pos = read_u32_bin(&dir.join("positions.bin"));
         let final_key = read_u32_bin(&dir.join("alleles.bin"));
@@ -496,7 +657,7 @@ mod tests {
         write_chunk_files(dir, 0, &[100, 200, 300], &[1, 2, 3]);
         write_chunk_files(dir, 1, &[400, 500, 600], &[4, 5, 6]);
 
-        merge_mini_sc(4, 2, 2, 1, dir.to_str().unwrap(), ram_ledger).unwrap();
+        merge_mini_sc(4, 2, 2, 1, dir.to_str().unwrap(), TEST_THREADS, ram_ledger).unwrap();
 
         let final_pos = read_u32_bin(&dir.join("positions.bin"));
         let final_key = read_u32_bin(&dir.join("alleles.bin"));
@@ -516,7 +677,7 @@ mod tests {
         let ram_ledger = vec![vec![0u32; 4]];
         write_chunk_files(dir, 0, &[], &[]);
 
-        merge_mini_sc(4, 1, 2, 2, dir.to_str().unwrap(), ram_ledger).unwrap();
+        merge_mini_sc(4, 1, 2, 2, dir.to_str().unwrap(), TEST_THREADS, ram_ledger).unwrap();
 
         let final_pos = read_u32_bin(&dir.join("positions.bin"));
         let final_off = read_offsets_npy(&dir.join("offsets.npy"));
@@ -536,7 +697,7 @@ mod tests {
         write_chunk_files(dir, 0, &[], &[]);
         write_chunk_files(dir, 1, &[10, 20, 30, 40, 50], &[1, 2, 3, 4, 5]);
 
-        merge_mini_sc(4, 2, 2, 1, dir.to_str().unwrap(), ram_ledger).unwrap();
+        merge_mini_sc(4, 2, 2, 1, dir.to_str().unwrap(), TEST_THREADS, ram_ledger).unwrap();
 
         let final_pos = read_u32_bin(&dir.join("positions.bin"));
         let final_off = read_offsets_npy(&dir.join("offsets.npy"));
@@ -573,7 +734,7 @@ mod tests {
             kf.write_all(&[4u8, 5, 6]).unwrap();
         }
 
-        merge_mini_sc(1, 2, 2, 1, dir.to_str().unwrap(), ram_ledger).unwrap();
+        merge_mini_sc(1, 2, 2, 1, dir.to_str().unwrap(), TEST_THREADS, ram_ledger).unwrap();
 
         let final_pos = read_u32_bin(&dir.join("positions.bin"));
         let final_key = read_u8_bin(&dir.join("alleles.bin"));
@@ -631,6 +792,7 @@ mod tests {
             0,
             4,
             &dest_values_bin,
+            TEST_THREADS,
         )
         .unwrap();
 
@@ -650,11 +812,18 @@ mod tests {
         // sample-major concatenation of per-chunk slices in chunk_id order.
         // Catches off-by-one in tile boundaries, cursor mismanagement, and
         // pwrite offset bugs.
+        //
+        // `threads` is swept so the property covers the serial path AND the
+        // pooled one against the SAME independently-computed ground truth --
+        // the gather must be thread-count invariant. Before `gather_columns`
+        // took an explicit budget it always ran on one thread regardless, so
+        // this dimension could not have failed.
         #[test]
         fn test_merge_interleave_property(
             num_chunks in 1usize..5,
             num_samples in 1usize..5,
             ploidy in 1usize..3,
+            threads in 1usize..9,
             // Calls per (chunk, column) — bounded so the test is fast
             seed in any::<u64>(),
         ) {
@@ -698,7 +867,7 @@ mod tests {
                 write_chunk_files(dir, chunk_id, &pos_buf, &key_buf);
             }
 
-            merge_mini_sc(4, num_chunks, num_samples, ploidy, dir.to_str().unwrap(), ram_ledger.clone()).unwrap();
+            merge_mini_sc(4, num_chunks, num_samples, ploidy, dir.to_str().unwrap(), threads, ram_ledger.clone()).unwrap();
 
             let final_pos = read_u32_bin(&dir.join("positions.bin"));
             let final_key = read_u32_bin(&dir.join("alleles.bin"));
