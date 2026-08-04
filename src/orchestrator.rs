@@ -1124,12 +1124,15 @@ pub fn process_chromosome(
         stage!(
             format!("merge_dense_class/{}", spec.subdir),
             crate::dense_merge::merge_dense_class(
-                num_chunks,
-                samples.len(),
-                ploidy,
-                spec.key_bytes,
-                spec.pack_snp,
-                dir.to_str().unwrap(),
+                crate::dense_merge::DenseMergeParams {
+                    num_chunks,
+                    num_samples: samples.len(),
+                    ploidy,
+                    key_bytes: spec.key_bytes,
+                    pack_snp: spec.pack_snp,
+                    output_dir: dir.to_str().unwrap(),
+                    threads: processing_threads,
+                },
                 ledger,
             )
         )?;

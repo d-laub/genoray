@@ -8,21 +8,49 @@ use crate::bits::copy_bits;
 use crate::error::ConversionError;
 use crate::layout;
 use crate::rvk::pack_snp_keys;
+use memmap2::Mmap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+/// Greatest common divisor, for the hap-group alignment in
+/// [`merge_dense_class`].
+fn gcd(a: usize, b: usize) -> usize {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+
+/// Everything [`merge_dense_class`] needs besides the ledger itself.
+pub struct DenseMergeParams<'a> {
+    pub num_chunks: usize,
+    pub num_samples: usize,
+    pub ploidy: usize,
+    /// Indel key width is intrinsic to raw (unpacked) key bytes on disk today;
+    /// reserved for a future variable-width indel key encoding.
+    pub key_bytes: usize,
+    pub pack_snp: bool,
+    pub output_dir: &'a str,
+    /// Thread budget for the genotype transpose. Passed in rather than taken
+    /// from the ambient rayon pool ON PURPOSE: `process_chromosome` runs inside
+    /// `lib.rs`'s dispatch pool, which is sized to `concurrent_chroms` -- 1
+    /// today. Any `rayon::current_num_threads()` or `par_iter()` reached from
+    /// here therefore sees a ONE-thread pool and silently runs serially, which
+    /// is exactly the trap this field exists to avoid.
+    pub threads: usize,
+}
+
 pub fn merge_dense_class(
-    num_chunks: usize,
-    num_samples: usize,
-    ploidy: usize,
-    // Indel key width is intrinsic to raw (unpacked) key bytes on disk today;
-    // reserved for a future variable-width indel key encoding.
-    _key_bytes: usize,
-    pack_snp: bool,
-    output_dir: &str,
+    params: DenseMergeParams<'_>,
     dense_ledger: Vec<u32>,
 ) -> Result<(), ConversionError> {
+    let DenseMergeParams {
+        num_chunks,
+        num_samples,
+        ploidy,
+        key_bytes: _,
+        pack_snp,
+        output_dir,
+        threads,
+    } = params;
     debug_assert_eq!(
         dense_ledger.len(),
         num_chunks,
@@ -69,22 +97,78 @@ pub fn merge_dense_class(
         col_prefix[c + 1] = col_prefix[c] + dense_ledger[c] as usize;
     }
 
-    for c in 0..num_chunks {
-        let v_c = dense_ledger[c] as usize;
-        if v_c == 0 {
-            continue;
-        }
-        let geno_path = layout::chunk_geno(dir, c);
-        let block = fs::read(&geno_path).map_err(|e| ConversionError::Io {
-            context: format!("reading {}", geno_path.display()),
-            source: e,
-        })?;
-        // block bit (hap h, local col d) at h*v_c + d.
-        for h in 0..np {
-            let src_bit = h * v_c;
-            let dst_bit = h * v_total + col_prefix[c];
-            copy_bits(&mut out, dst_bit, &block, src_bit, v_c);
-        }
+    if v_total > 0 && np > 0 {
+        // Map every non-empty chunk block up front so the transpose can run
+        // HAP-major. Chunk-major (the shape this loop used to have) makes each
+        // chunk sweep the entire output: consecutive haps land `v_total` bits
+        // apart, so a single chunk touches every page of a matrix that is
+        // hundreds of MB at cohort scale, and does it once per chunk. Hap-major
+        // keeps each worker inside one contiguous output region instead.
+        //
+        // `Mmap` rather than `fs::read` so this costs page cache -- clean,
+        // file-backed, evictable under pressure -- instead of adding a second
+        // heap copy of the whole matrix alongside `out`. These files were
+        // written moments ago by this same process, so they are already cached.
+        let blocks: Vec<Option<Mmap>> = (0..num_chunks)
+            .map(|c| {
+                if dense_ledger[c] == 0 {
+                    return Ok(None);
+                }
+                let geno_path = layout::chunk_geno(dir, c);
+                let f = fs::File::open(&geno_path).map_err(|e| ConversionError::Io {
+                    context: format!("opening {}", geno_path.display()),
+                    source: e,
+                })?;
+                // SAFETY: these per-chunk files are private to this conversion
+                // and are not modified (or removed) until the cleanup below,
+                // which runs after every map is dropped.
+                let m = unsafe { Mmap::map(&f) }.map_err(|e| ConversionError::Io {
+                    context: format!("mmapping {}", geno_path.display()),
+                    source: e,
+                })?;
+                Ok(Some(m))
+            })
+            .collect::<Result<Vec<_>, ConversionError>>()?;
+
+        // A worker can only be handed WHOLE bytes of `out`, so hap-group
+        // boundaries have to be byte boundaries. Hap `h` starts at bit
+        // `h * v_total`, which is byte-aligned exactly when `h` is a multiple
+        // of `align_haps` -- at most 8, so this never meaningfully constrains
+        // group sizing. Aligning this way is what lets `chunks_mut` hand out
+        // provably disjoint slices: no unsafe aliasing, and no second pass to
+        // OR together overlapping boundary bytes.
+        let align_haps = 8 / gcd(v_total, 8);
+        let group_haps = np
+            .div_ceil(threads.max(1))
+            .next_multiple_of(align_haps)
+            .max(align_haps);
+        // Exact: `group_haps` is a multiple of `align_haps = 8/gcd(v_total,8)`,
+        // so `group_haps * v_total` is a multiple of 8.
+        let bytes_per_group = group_haps * v_total / 8;
+
+        let ledger = &dense_ledger;
+        let prefix = &col_prefix;
+        let maps = &blocks;
+        std::thread::scope(|scope| {
+            for (g, slab) in out.chunks_mut(bytes_per_group).enumerate() {
+                scope.spawn(move || {
+                    let h0 = g * group_haps;
+                    let h1 = (h0 + group_haps).min(np);
+                    for h in h0..h1 {
+                        let dst_base = (h - h0) * v_total;
+                        for (c, block) in maps.iter().enumerate() {
+                            let Some(block) = block else { continue };
+                            let v_c = ledger[c] as usize;
+                            // block bit (hap h, local col d) at h*v_c + d.
+                            copy_bits(slab, dst_base + prefix[c], block, h * v_c, v_c);
+                        }
+                    }
+                });
+            }
+        });
+
+        // Unmap before the cleanup below unlinks the files these map.
+        drop(blocks);
     }
     write_all(&layout::genotypes(dir), &out)?;
 
@@ -218,12 +302,15 @@ mod tests {
         stage_chunk(dir, 1, &[300], &[3u8], &[vec![true], vec![false]]);
 
         merge_dense_class(
-            2,
-            1,
-            2,
-            1,
-            /*pack_snp=*/ false,
-            dir.to_str().unwrap(),
+            DenseMergeParams {
+                num_chunks: 2,
+                num_samples: 1,
+                ploidy: 2,
+                key_bytes: 1,
+                pack_snp: false,
+                output_dir: dir.to_str().unwrap(),
+                threads: 1,
+            },
             vec![2, 1],
         )
         .unwrap();
@@ -250,11 +337,84 @@ mod tests {
         assert!(!layout::chunk_geno(dir, 0).exists());
     }
 
+    /// The transpose hands each rayon worker a disjoint byte range of the
+    /// output, which is only sound because hap-group boundaries are chosen to
+    /// land on byte boundaries. A `v_total` coprime to 8 is the case that
+    /// stresses it: every hap row then starts at a different bit offset within
+    /// its byte, so an off-by-one in the alignment math corrupts bits at the
+    /// seam between two workers -- invisible for `v_total % 8 == 0`, and
+    /// invisible whenever the whole matrix fits in one group.
+    #[test]
+    fn test_merge_dense_transpose_across_worker_boundaries() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        // v_total = 5+7+3 = 15, coprime to 8. np = 96 haps forces several
+        // groups on any plausible rayon pool size.
+        let widths = [5usize, 7, 3];
+        let np = 96usize;
+        let v_total: usize = widths.iter().sum();
+
+        // Deterministic pseudo-random fill; `want[h][g]` is the expected
+        // output bit for hap `h`, global column `g`.
+        let bit_of = |h: usize, g: usize| (h * 31 + g * 17 + h * g).is_multiple_of(3);
+
+        let mut base = 0usize;
+        for (c, &v_c) in widths.iter().enumerate() {
+            let mat: Vec<Vec<bool>> = (0..np)
+                .map(|h| (0..v_c).map(|d| bit_of(h, base + d)).collect())
+                .collect();
+            let positions: Vec<u32> = (0..v_c as u32).map(|d| base as u32 + d).collect();
+            let keys = vec![0u8; v_c];
+            stage_chunk(dir, c, &positions, &keys, &mat);
+            base += v_c;
+        }
+
+        let ledger: Vec<u32> = widths.iter().map(|&v| v as u32).collect();
+        merge_dense_class(
+            DenseMergeParams {
+                num_chunks: widths.len(),
+                num_samples: np / 2,
+                ploidy: 2, // -> np haps
+                key_bytes: 1,
+                pack_snp: false,
+                output_dir: dir.to_str().unwrap(),
+                // Several worker groups, so the byte-aligned seams are exercised.
+                threads: 8,
+            },
+            ledger,
+        )
+        .unwrap();
+
+        let geno = fs::read(layout::genotypes(dir)).unwrap();
+        assert_eq!(geno.len(), (np * v_total).div_ceil(8));
+        for h in 0..np {
+            for g in 0..v_total {
+                assert_eq!(
+                    get_bit(&geno, h * v_total + g),
+                    bit_of(h, g),
+                    "hap {h} col {g}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_merge_dense_empty() {
         let tmp = tempdir().unwrap();
         let dir = tmp.path();
-        merge_dense_class(1, 2, 2, 1, true, dir.to_str().unwrap(), vec![0]).unwrap();
+        merge_dense_class(
+            DenseMergeParams {
+                num_chunks: 1,
+                num_samples: 2,
+                ploidy: 2,
+                key_bytes: 1,
+                pack_snp: true,
+                output_dir: dir.to_str().unwrap(),
+                threads: 4,
+            },
+            vec![0],
+        )
+        .unwrap();
         assert_eq!(fs::read(layout::positions(dir)).unwrap().len(), 0);
         assert_eq!(fs::read(layout::genotypes(dir)).unwrap().len(), 0);
     }
@@ -272,7 +432,19 @@ mod tests {
             &[1u8, 2, 3, 0, 1],
             &[vec![true, true, true, true, true]],
         );
-        merge_dense_class(1, 1, 1, 1, true, dir.to_str().unwrap(), vec![5]).unwrap();
+        merge_dense_class(
+            DenseMergeParams {
+                num_chunks: 1,
+                num_samples: 1,
+                ploidy: 1,
+                key_bytes: 1,
+                pack_snp: true,
+                output_dir: dir.to_str().unwrap(),
+                threads: 4,
+            },
+            vec![5],
+        )
+        .unwrap();
         // pack_snp_keys([1,2,3,0,1]) == [0x39, 0x01] (see rvk.rs test)
         assert_eq!(fs::read(layout::alleles(dir)).unwrap(), vec![0x39u8, 0x01]);
     }
