@@ -10,7 +10,9 @@ logic (spanning deletions): callers pass the variant indices a query returns.
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Sequence
+from pathlib import Path
 
 import numpy as np
 from numpy.typing import NDArray
@@ -114,3 +116,18 @@ def expected_ilen(truth: GroundTruth, idx: Index) -> list[list[int | None]]:
                 row.append(None)
         out.append(row)
     return out
+
+
+def store_digest(store: Path) -> str:
+    """Order-independent hash of every file in a .svar store.
+
+    Deliberately a second copy of `scripts/bench_svar2/probe.py:digest` --
+    coupling a standalone bench script to the test package is worse than eight
+    duplicated lines. Both must stay in agreement; if one changes, change both.
+    """
+    h = hashlib.sha256()
+    for p in sorted(store.rglob("*")):
+        if p.is_file():
+            h.update(p.relative_to(store).as_posix().encode())
+            h.update(p.read_bytes())
+    return h.hexdigest()[:16]
