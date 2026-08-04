@@ -205,7 +205,7 @@ fn run_conversion_pipeline(
     // is a pure no-op. `EventSink`'s progress buffer is keyed per-chrom (a
     // `Mutex<HashMap<chrom, pending>>`), so it's safe even though this
     // pipeline dispatches chroms CONCURRENTLY (`concurrent_chroms` via
-    // `plan_thread_budget`, can exceed 1): ticks from different chroms
+    // `plan_sharded`, can exceed 1): ticks from different chroms
     // accumulate independently and are never flushed under the wrong chrom
     // label.
     let sink = match &receiver {
