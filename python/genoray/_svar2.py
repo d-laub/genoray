@@ -1384,13 +1384,17 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
 
         max_mem: byte budget the WHOLE PROCESS may use, as an int or a string
         like `"64GiB"` (see `parse_memory`) -- **the same meaning as**
-        :meth:`from_vcf`'s `max_mem`, not a per-chunk cap.
+        :meth:`from_vcf`'s `max_mem`, not a per-chunk cap. **This budget only
+        sizes the dense-chunk term** (below); it does NOT cap the reader's
+        per-input-file overhead (`from_vcf_list` opens all `N` files at once
+        per contig), which scales with the number of input files and is not
+        bounded by `max_mem` at all -- see `chunk_size`'s scope note above.
 
         **BREAKING CHANGE:** earlier versions of `from_vcf_list` treated
         `max_mem` as a direct cap on the bytes of *one in-flight dense
         chunk*. It is now a whole-process budget, matching `from_vcf`. A call
         like ``max_mem="512MiB"`` that used to mean "let one dense chunk use
-        up to 512 MiB" now means "the whole process should use at most
+        up to 512 MiB" now means "the dense-chunk term should use at most
         512 MiB" -- which derives a MUCH smaller `chunk_size`. Re-tune any
         `max_mem` value carried over from before this change.
 
@@ -1405,20 +1409,24 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
 
             ``chunk_target = min(_DENSE_CHUNK_TARGET_BYTES, max_mem // (concurrent_jobs * in_flight_chunks_per_job))``
 
-        `concurrent_jobs=1` (contigs run one at a time). `in_flight_chunks_per_job=8` is a
-        fixed constant, not a fitted or plumbed value: it is read directly off
-        the Rust pipeline's architecture -- a single reader thread and a
-        single executor thread connected by a bounded channel of capacity 6
-        (`bounded::<DenseChunk>(6)` in `orchestrator.rs`), plus up to one
-        chunk each thread may hold outside the channel (built-but-unsent, or
-        received-but-still-processing): `6 + 1 + 1 = 8`. There is no
-        cohort-independent baseline term (`baseline=0`): unlike the sharded
-        path's fitted RAM law, nothing has been measured for this pipeline, so
-        subtracting an invented baseline would look fitted without being
-        fitted. `_DENSE_CHUNK_TARGET_BYTES` (~256 MiB) stays a **ceiling**: a
-        large budget cannot grow chunks past today's size (so this cannot
-        regress a cohort that is currently fine), while a tight budget shrinks
-        `chunk_target` -- and therefore `chunk_size` -- below it.
+        `concurrent_jobs` and `in_flight_chunks_per_job` are **not** hardcoded
+        Python literals -- they are read live from the Rust extension module
+        (`_core.VCF_LIST_CONCURRENT_CHROMS`, currently `1` since contigs run
+        one at a time, and `_core.VCF_LIST_DENSE_CHANNEL_CAP + 2`, currently
+        `8`: the bounded reader/executor channel's capacity, plus up to one
+        chunk each of the single reader thread and single executor thread may
+        hold outside the channel), so this derivation cannot silently drift
+        out of sync with the orchestrator's actual architecture the way a
+        duplicated constant could. See `VCF_LIST_CONCURRENT_CHROMS` and
+        `VCF_LIST_DENSE_CHANNEL_CAP`'s doc comments in `orchestrator.rs` for
+        the full accounting. There is no cohort-independent baseline term
+        (`baseline=0`): unlike the sharded path's fitted RAM law, nothing has
+        been measured for this pipeline, so subtracting an invented baseline
+        would look fitted without being fitted. `_DENSE_CHUNK_TARGET_BYTES`
+        (~256 MiB) stays a **ceiling**: a large budget cannot grow chunks past
+        today's size (so this cannot regress a cohort that is currently
+        fine), while a tight budget shrinks `chunk_target` -- and therefore
+        `chunk_size` -- below it.
 
         The resulting per-chunk target is still a worst-case ceiling on top of
         that: `_auto_chunk_size` assumes every variant routes dense, so
@@ -1430,7 +1438,10 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         detection fails (no cgroup limit and no readable `/proc/meminfo` --
         always true on macOS), a warning is emitted and `chunk_size` derivation
         falls back to the historical fixed `_DENSE_CHUNK_TARGET_BYTES` target
-        rather than raising.
+        rather than raising. Detection (and this whole `max_mem` derivation)
+        is only attempted when `chunk_size` is left at its default `None` --
+        it is ignored entirely, without even a detection attempt, when
+        `chunk_size` is passed explicitly.
 
         For large multi-contig merges, also consider setting
         ``MALLOC_ARENA_MAX`` in the environment -- see the note below.
@@ -1547,28 +1558,41 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
 
         _validate_check_ref(check_ref)
 
-        # `max_mem` is a WHOLE-PROCESS budget here too -- same meaning and
-        # same detect/fall-back shape as `from_vcf` (see its comment above
-        # `if max_mem is None:`). Detection failure is a lost optimization,
-        # not a hard error: fall back to `_auto_chunk_size`'s historical
-        # fixed dense-chunk target (`chunk_target_bytes = None` below) rather
-        # than raising.
-        if max_mem is None:
-            try:
-                max_mem_bytes = detect_memory_budget()
-            except RuntimeError as e:
-                warnings.warn(
-                    f"could not detect a memory budget ({e}); deriving "
-                    "chunk_size from the historical fixed dense-chunk target "
-                    "instead. Pass max_mem explicitly to plan against a byte "
-                    "budget.",
-                    stacklevel=2,
-                )
-                max_mem_bytes = None
-        else:
-            max_mem_bytes = parse_memory(max_mem)
-
         if chunk_size is None:
+            # `max_mem` only feeds this derivation, so it -- and any
+            # memory-budget DETECTION, which has an observable side effect
+            # (a warning on failure) -- must be attempted only when
+            # chunk_size is actually being derived. An explicit chunk_size
+            # means max_mem's derived target is never consulted (matches the
+            # docstring: "ignored when chunk_size is passed explicitly"), so
+            # skip detection entirely rather than warn about a derivation
+            # that isn't happening. (This block previously ran
+            # unconditionally above this `if`, which produced exactly that
+            # misleading warning for a caller passing an explicit chunk_size
+            # on a host where memory-budget detection fails -- regression
+            # test: test_from_vcf_list_explicit_chunk_size_skips_max_mem_detection.)
+            #
+            # `max_mem` is a WHOLE-PROCESS budget here too -- same meaning
+            # and same detect/fall-back shape as `from_vcf` (see its comment
+            # above `if max_mem is None:`). Detection failure is a lost
+            # optimization, not a hard error: fall back to
+            # `_auto_chunk_size`'s historical fixed dense-chunk target
+            # (`chunk_target_bytes = None` below) rather than raising.
+            if max_mem is None:
+                try:
+                    max_mem_bytes = detect_memory_budget()
+                except RuntimeError as e:
+                    warnings.warn(
+                        f"could not detect a memory budget ({e}); deriving "
+                        "chunk_size from the historical fixed dense-chunk "
+                        "target instead. Pass max_mem explicitly to plan "
+                        "against a byte budget.",
+                        stacklevel=2,
+                    )
+                    max_mem_bytes = None
+            else:
+                max_mem_bytes = parse_memory(max_mem)
+
             # Derive a per-chunk byte target from the whole-process budget --
             # see the `max_mem` docstring above for the full derivation and
             # why `concurrent_jobs`/`in_flight_chunks_per_job` have the
@@ -2138,21 +2162,28 @@ def _svar1_fields_manifest(
 _DENSE_CHUNK_TARGET_BYTES = 256 * 1024 * 1024
 # Staged FORMAT is one 4-byte value per (variant, sample, field).
 _STAGED_FORMAT_BYTES = 4
-# `from_vcf_list` processes contigs strictly sequentially -- see
-# `orchestrator::run_vcf_list`'s doc comment ("concurrent_chroms is forced to
-# 1 regardless of what the plan suggests"). Only one contig's pipeline is
-# ever resident at a time.
-_VCF_LIST_CONCURRENT_JOBS = 1
+# How many contigs `from_vcf_list` converts concurrently. Read live from Rust
+# (`orchestrator::VCF_LIST_CONCURRENT_CHROMS`, exported via `_core`'s
+# `#[pymodule]`) instead of duplicated as a Python literal, so this can never
+# drift out of sync with the orchestrator's actual (currently sequential --
+# "MVP concurrency", cross-contig parallelism is explicit future work)
+# architecture. See that Rust constant's doc comment for what changes when
+# cross-contig parallelism ships.
+_VCF_LIST_CONCURRENT_JOBS = _core.VCF_LIST_CONCURRENT_CHROMS
 # Upper bound on `DenseChunk`s simultaneously resident in memory for ONE
 # contig's pipeline (`orchestrator.rs`, `process_chromosome`): the bounded
-# channel between the single reader thread and single executor thread holds
-# up to 6 (`bounded::<crate::types::DenseChunk>(6)`), plus up to 1 the reader
-# has just finished building and is blocked trying to send, plus up to 1 the
-# executor has already received and is actively processing: 6 + 1 + 1 = 8.
-# This is read directly off the Rust pipeline's fixed architecture (single
-# reader/executor threads, hardcoded channel capacity), not a runtime-plumbed
-# value or a fitted estimate -- update it if that architecture changes.
-_VCF_LIST_IN_FLIGHT_CHUNKS_PER_JOB = 8
+# reader/executor channel (`orchestrator::VCF_LIST_DENSE_CHANNEL_CAP`,
+# likewise read live via `_core` rather than duplicated), plus up to 1 the
+# single reader thread has just finished building and is blocked trying to
+# send, plus up to 1 the single executor thread has already received and is
+# actively processing: cap + 1 + 1. (This accounts for the DENSE-chunk
+# channel only -- there is a separate, smaller `SparseChunk` queue downstream
+# of the executor that this term does not need to budget for, since sparse
+# chunks are tiny relative to dense ones.) Because both constants are read
+# from Rust rather than hardcoded, retuning the channel capacity or ever
+# enabling cross-contig parallelism updates this derivation automatically --
+# no Python-side constant to remember to bump.
+_VCF_LIST_IN_FLIGHT_CHUNKS_PER_JOB = _core.VCF_LIST_DENSE_CHANNEL_CAP + 2
 
 
 def _auto_chunk_size(

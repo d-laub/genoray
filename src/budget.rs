@@ -459,8 +459,13 @@ mod tests {
         })
         .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("max_mem"), "message = {msg:?}");
-        assert!(msg.contains("chunk_size"), "message = {msg:?}");
+        // "max_mem" alone would pass regardless (it's also in the message's
+        // opening clause) -- pin the actual remedy phrase so this asserts
+        // something load-bearing.
+        assert!(
+            msg.contains("raise max_mem or lower chunk_size"),
+            "message = {msg:?}"
+        );
     }
 
     // Degenerate hardware must still produce a runnable plan.

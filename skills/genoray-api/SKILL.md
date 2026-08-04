@@ -597,33 +597,43 @@ multi-sample VCF.
 - `max_mem: int | str | None = None` — byte budget the **whole process** may
   use (same string forms as the module-level `max_mem` convention, e.g.
   `"4g"`, parsed by `parse_memory`) — **the same meaning as `from_vcf`'s
-  `max_mem`** (above), not a per-chunk cap.
+  `max_mem`** (above), not a per-chunk cap. **This budget only sizes the
+  dense-chunk term** — it does NOT cap the reader's per-input-file overhead
+  (`from_vcf_list` opens all `N` files at once per contig), which scales
+  with the number of input files and is not bounded by `max_mem` at all;
+  don't read "whole process" as a hard total-RSS guarantee.
 
   **BREAKING CHANGE:** earlier versions treated this `max_mem` as a direct
   cap on the bytes of one in-flight dense chunk. It is now a whole-process
   budget. A call like `max_mem="512MiB"` that used to mean "let one dense
-  chunk use up to 512 MiB" now means "the whole process should use at most
-  512 MiB", which derives a MUCH smaller `chunk_size`. Re-tune any carried-over
-  value.
+  chunk use up to 512 MiB" now means "the dense-chunk term should use at
+  most 512 MiB", which derives a MUCH smaller `chunk_size`. Re-tune any
+  carried-over value.
 
   `from_vcf_list` has no fitted concurrency planner the way the sharded
   `from_vcf` reader does — its contigs convert strictly sequentially — so
   instead of planning concurrency it derives a per-chunk byte target:
   `chunk_target = min(_DENSE_CHUNK_TARGET_BYTES, max_mem //
-  (concurrent_jobs * in_flight_chunks_per_job))`, with `concurrent_jobs=1`
-  and `in_flight_chunks_per_job=8` — a fixed constant read off the Rust
-  pipeline's reader/executor channel capacity (6) plus one chunk each thread
-  may hold outside the channel, **not** a fitted memory law (none exists for
+  (concurrent_jobs * in_flight_chunks_per_job))`. `concurrent_jobs` and
+  `in_flight_chunks_per_job` are **not** hardcoded Python literals — they
+  are read live from the Rust extension module
+  (`_core.VCF_LIST_CONCURRENT_CHROMS`, currently `1`, and
+  `_core.VCF_LIST_DENSE_CHANNEL_CAP + 2`, currently `8`: the reader/executor
+  channel's capacity plus one chunk each of the single reader and single
+  executor thread may hold outside it), so this can't silently drift out of
+  sync with the orchestrator's actual architecture the way a duplicated
+  constant could — **not** a fitted memory law either way (none exists for
   this pipeline, unlike the sharded path's RAM law). `_DENSE_CHUNK_TARGET_BYTES`
   stays a **ceiling**, so a large budget can't grow chunks past today's size —
   only a tight budget shrinks them below it. On top of that, the resulting
   target is still a **worst-case ceiling**: the estimate assumes every variant
   routes dense, so cohorts whose variants route sparse (e.g. private somatic
   calls) use considerably less. Ignored when `chunk_size` is passed
-  explicitly. **`None` (the default) means a DETECTED budget**, same
-  detection as `from_vcf`; if detection fails, this degrades to the
-  historical fixed ~256 MiB dense-chunk target (with a warning) rather than
-  raising.
+  explicitly — including skipping memory-budget DETECTION entirely (no
+  attempt, no warning) when `chunk_size` is explicit. **`None` (the default)
+  means a DETECTED budget**, same detection as `from_vcf`; if detection
+  fails, this degrades to the historical fixed ~256 MiB dense-chunk target
+  (with a warning) rather than raising.
 - `ploidy`, `skip_out_of_scope`, `threads`, `overwrite`,
   `long_allele_capacity`, `signatures`, `check_ref` all mean the same as
   `from_vcf`, and the return value is the same `int` (dropped out-of-scope

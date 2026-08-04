@@ -295,6 +295,23 @@ fn with_pgen_shard_context(
     }
 }
 
+/// Capacity of the `DenseChunk` channel between `process_chromosome`'s reader
+/// and executor threads (used at its `bounded::<DenseChunk>(..)` call
+/// below). Shared infrastructure across every `SourceSpec`, but exported to
+/// Python (`_core.VCF_LIST_DENSE_CHANNEL_CAP`, `src/lib.rs`'s `#[pymodule]`)
+/// specifically for `from_vcf_list`'s `max_mem` -> `chunk_size` derivation:
+/// only the `VcfList` branch has exactly one reader thread and one executor
+/// thread, so `VCF_LIST_DENSE_CHANNEL_CAP + 2` (this capacity, plus one
+/// chunk each of those two threads may hold outside the channel) is a tight
+/// upper bound on `DenseChunk`s resident in memory for that branch. (Other
+/// branches -- e.g. sharded `Vcf`, with multiple shard-reader threads
+/// feeding the same channel -- have a different, larger bound; the sharded
+/// path's memory planning uses the separately-fitted RAM law in
+/// `src/budget.rs` instead.) Retuning this capacity changes that Python
+/// derivation automatically -- it is read live from this constant, not
+/// duplicated.
+pub const VCF_LIST_DENSE_CHANNEL_CAP: usize = 6;
+
 //The rust pipeline (Per chromosome conversion from Dense to Sparse)
 #[allow(clippy::too_many_arguments)]
 pub fn process_chromosome(
@@ -358,11 +375,13 @@ pub fn process_chromosome(
     }
 
     // Channel capacities tuned for cohort-scale workloads.
-    // - tx_dense=6: smooths HTSlib BGZF block-boundary jitter so the executor
-    //   never starves on `rx_dense.recv()`. Each DenseChunk is ~chunk_size × S × P / 8 bytes.
+    // - tx_dense=VCF_LIST_DENSE_CHANNEL_CAP: smooths HTSlib BGZF block-boundary
+    //   jitter so the executor never starves on `rx_dense.recv()`. Each DenseChunk
+    //   is ~chunk_size × S × P / 8 bytes. Exported to Python -- see the constant's
+    //   doc comment above for why.
     // - tx_sparse=8: SparseChunks are tiny (~hundreds of KB); deeper queue is free.
     // - tx_long=2: each buffer is up to long_allele_capacity bytes — keep small.
-    let (tx_dense, rx_dense) = bounded::<crate::types::DenseChunk>(6);
+    let (tx_dense, rx_dense) = bounded::<crate::types::DenseChunk>(VCF_LIST_DENSE_CHANNEL_CAP);
     let (tx_sparse, rx_sparse) = bounded::<crate::types::SparseChunk>(8);
     let (tx_long, rx_long) = bounded::<Vec<u8>>(2);
 
@@ -1108,15 +1127,29 @@ pub fn process_chromosome(
     Ok(dropped)
 }
 
+/// How many contigs `run_vcf_list` converts concurrently. Currently always
+/// `1` (see the MVP-concurrency note below) -- exported to Python
+/// (`_core.VCF_LIST_CONCURRENT_CHROMS`, `src/lib.rs`'s `#[pymodule]`) so
+/// `_svar2.py`'s `from_vcf_list` `max_mem` -> `chunk_size` derivation reads
+/// this value instead of hardcoding it. **If cross-contig parallelism ever
+/// ships, update this constant (or however it's computed) FIRST** -- the
+/// Python-side derivation divides `max_mem` by
+/// `VCF_LIST_CONCURRENT_CHROMS * (VCF_LIST_DENSE_CHANNEL_CAP + 2)`, so it
+/// will silently under-estimate per-contig memory demand at biobank scale
+/// otherwise.
+pub const VCF_LIST_CONCURRENT_CHROMS: usize = 1;
+
 /// `SparseVar2.from_vcf_list`: build ONE SVAR2 store from N single-sample VCFs
 /// with possibly disjoint site lists. `vcf_paths[i]`'s sample is `samples[i]`.
 ///
 /// MVP concurrency: contigs are processed SEQUENTIALLY (a plain loop, no rayon
 /// pool) -- this bounds open file descriptors to roughly N (one per input
 /// file) rather than N * concurrent_chroms. Cross-contig parallelism is
-/// explicit future work. Mirrors `run_conversion_pipeline`
-/// (`src/lib.rs`)'s hardware-budget derivation, `parse_manifest`,
-/// `finalize_fields`, and `write_meta` tail, minus the rayon dispatch.
+/// explicit future work (see `VCF_LIST_CONCURRENT_CHROMS`'s doc comment
+/// above for what must be kept in sync when it lands). Mirrors
+/// `run_conversion_pipeline` (`src/lib.rs`)'s hardware-budget derivation,
+/// `parse_manifest`, `finalize_fields`, and `write_meta` tail, minus the
+/// rayon dispatch.
 ///
 /// Returns the total number of out-of-scope (symbolic/breakend) ALTs dropped
 /// across every input file and contig.
@@ -1177,9 +1210,10 @@ pub fn run_vcf_list(
         Some(t) if t > 0 => t,
         _ => std::thread::available_parallelism().unwrap().get(),
     };
-    // concurrent_chroms is forced to 1 (sequential loop below) regardless of
-    // what the plan suggests -- only `processing_threads` is consumed here.
-    let plan = crate::budget::plan_thread_budget(available_cores, 1);
+    // concurrent_chroms is forced to VCF_LIST_CONCURRENT_CHROMS (sequential
+    // loop below) regardless of what the plan suggests -- only
+    // `processing_threads` is consumed here.
+    let plan = crate::budget::plan_thread_budget(available_cores, VCF_LIST_CONCURRENT_CHROMS);
     let processing_threads = plan.processing_threads;
     tracing::info!(threads = processing_threads, "pipeline configured");
 
