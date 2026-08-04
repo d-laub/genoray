@@ -93,10 +93,26 @@ def _convert(vcf, out, cc, w, monkeypatch):
 
 def test_digest_is_invariant_across_schedules(multi_contig_vcf, tmp_path, monkeypatch):
     digests = {}
+    outs = {}
     for cc, w in SCHEDULES:
         out = tmp_path / f"cc{cc}_w{w}.svar"
         digests[(cc, w)] = _convert(multi_contig_vcf, out, cc, w, monkeypatch)
+        outs[(cc, w)] = out
     assert len(set(digests.values())) == 1, f"schedule changed output: {digests}"
+
+    # Digest-invariance alone cannot tell "correctly non-empty" from
+    # "incorrectly empty" -- a future edit shortening `_LONG_ALT` below
+    # MAX_INLINE_ALT_LEN would silently empty the long-allele bank and every
+    # digest above would still agree (on nothing). Assert the bank a planted
+    # long ALT actually lands in (chr8, per `multi_contig_vcf`) is non-empty,
+    # on one representative store -- the digests already proved every
+    # schedule produced byte-identical output.
+    any_out = next(iter(outs.values()))
+    long_alleles = any_out / "chr8" / "indel" / "long_alleles.bin"
+    assert long_alleles.exists() and long_alleles.stat().st_size > 0, (
+        "long-allele bank is empty -- the digest-invariance gate above would "
+        "pass green even if the bank write path silently broke"
+    )
 
 
 def test_max_mem_too_small_raises_rather_than_writing_an_empty_store(
