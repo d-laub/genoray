@@ -380,7 +380,16 @@ pub fn process_chromosome(
     //   doc comment above for why.
     // - tx_sparse=8: SparseChunks are tiny (~hundreds of KB); deeper queue is free.
     // - tx_long=2: each buffer is up to long_allele_capacity bytes — keep small.
-    let (tx_dense, rx_dense) = bounded::<crate::types::DenseChunk>(VCF_LIST_DENSE_CHANNEL_CAP);
+    // BENCH-ONLY: `GENORAY_DENSE_CAP` overrides the dense queue depth. A
+    // 6-deep queue is ample for the one-reader `VcfList` branch this constant
+    // was tuned for, but the sharded branch has `reader_workers` producers
+    // against it, so it is a candidate throttle there and must be separable
+    // from `GENORAY_EXEC_WORKERS` when sweeping. Does NOT touch the exported
+    // constant, so Python's `from_vcf_list` derivation is unaffected.
+    let dense_cap = bench_env("GENORAY_DENSE_CAP")
+        .unwrap_or(VCF_LIST_DENSE_CHANNEL_CAP)
+        .max(1);
+    let (tx_dense, rx_dense) = bounded::<crate::types::DenseChunk>(dense_cap);
     let (tx_sparse, rx_sparse) = bounded::<crate::types::SparseChunk>(8);
     let (tx_long, rx_long) = bounded::<Vec<u8>>(2);
 
