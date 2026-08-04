@@ -25,7 +25,7 @@ from genoray._svar2_fields import (
 )
 from genoray._svar2_mutcat import _MutcatMixin
 from genoray._svar2_ops import Mode, _assert_concat_compatible, _load_meta, _write_store
-from genoray._utils import detect_memory_budget, parse_memory
+from genoray._utils import detect_memory_budget, format_memory, parse_memory
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -1505,6 +1505,26 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         format_ = [t for t in flds if t[1] == "format"]
 
         _validate_check_ref(check_ref)
+        max_mem_bytes = None if max_mem is None else parse_memory(max_mem)
+        if (
+            max_mem_bytes is not None
+            and max_mem_bytes > _DENSE_CHUNK_TARGET_BYTES * _MAX_MEM_SANITY_MULTIPLE
+        ):
+            # A value this far above one dense chunk's target size is far
+            # more likely to be a `from_vcf`-style whole-process planning
+            # budget (gigabytes-to-terabytes) landing on the wrong method
+            # than an intentional single-chunk cap -- silently, this
+            # produces an enormous `chunk_size` rather than raising, so the
+            # mistake only surfaces later as an OOM.
+            warnings.warn(
+                f"max_mem={format_memory(max_mem_bytes)} is far above a single "
+                f"dense chunk's target size ({format_memory(_DENSE_CHUNK_TARGET_BYTES)}); "
+                "from_vcf_list's max_mem caps ONE in-flight dense chunk, not "
+                "whole-process planning like from_vcf's max_mem -- if you meant "
+                "the latter, pass it to from_vcf instead. This will silently "
+                "derive a very large chunk_size.",
+                stacklevel=2,
+            )
         if chunk_size is None:
             # Budget-derive so a packed dense chunk stays ~_DENSE_CHUNK_TARGET_BYTES
             # (or the caller's max_mem) regardless of cohort size -- a fixed 25k chunk's
@@ -1513,7 +1533,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
                 len(samples),
                 ploidy,
                 n_format_fields=len(format_),
-                max_mem=None if max_mem is None else parse_memory(max_mem),
+                max_mem=max_mem_bytes,
             )
 
         # Per-contig, per-file membership: `contig_membership[c][i]` is True iff
@@ -2058,6 +2078,13 @@ def _svar1_fields_manifest(
 _DENSE_CHUNK_TARGET_BYTES = 256 * 1024 * 1024
 # Staged FORMAT is one 4-byte value per (variant, sample, field).
 _STAGED_FORMAT_BYTES = 4
+# `from_vcf_list`'s `max_mem` caps ONE in-flight dense chunk; `from_vcf`'s
+# `max_mem` (a different quantity, same name -- deliberately not renamed,
+# see both docstrings) caps whole-process planning and legitimately reaches
+# tens-to-hundreds of GB. A `from_vcf_list` `max_mem` this many multiples
+# above the dense-chunk target is far more likely to be that other budget
+# landing on the wrong method than an intentionally huge single-chunk cap.
+_MAX_MEM_SANITY_MULTIPLE = 64
 
 
 def _auto_chunk_size(

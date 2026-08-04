@@ -90,6 +90,20 @@ def test_from_vcf_list_disjoint_sites_hom_ref_fill(tmp_path: Path):
     assert counts.tolist() == [1, 0, 0, 1]
 
 
+def test_from_vcf_list_huge_max_mem_warns_it_is_a_per_chunk_cap(tmp_path: Path):
+    """`from_vcf_list`'s `max_mem` caps ONE in-flight dense chunk;
+    `from_vcf`'s `max_mem` (same name, different quantity -- see both
+    docstrings) is a whole-process planning budget that legitimately reaches
+    tens of GB. Passing a `from_vcf`-sized value here doesn't raise -- it
+    silently derives an enormous `chunk_size` -- so this must at least warn.
+    """
+    ref = _write_ref(tmp_path)
+    a = _ss(tmp_path, "a", "SA", "chr1\t3\t.\tA\tG\t.\t.\t.\tGT\t1|0\n")
+    out = tmp_path / "store"
+    with pytest.warns(UserWarning, match="in-flight dense chunk"):
+        SparseVar2.from_vcf_list(out, [a], ref, threads=1, max_mem="64GiB")
+
+
 def test_from_vcf_list_contig_missing_from_some_files_is_hom_ref_filled(
     tmp_path: Path,
 ):

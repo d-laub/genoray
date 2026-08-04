@@ -142,7 +142,9 @@ impl std::fmt::Display for PlanError {
                 f,
                 "max_mem is {budget_mb:.0} MB but converting this cohort needs \
                  at least {needed_mb:.0} MB for one concurrent contig; raise \
-                 max_mem or lower chunk_size"
+                 max_mem or lower chunk_size (if you meant a per-chunk \
+                 dense-buffer cap, that is from_vcf_list's max_mem, not \
+                 from_vcf's -- the two are different quantities)"
             ),
         }
     }
@@ -442,6 +444,27 @@ mod tests {
                 assert!((budget_mb - 5_000.0).abs() < 1.0);
             }
         }
+    }
+
+    // `from_vcf`'s `max_mem` (a whole-process planning budget) and
+    // `from_vcf_list`'s `max_mem` (a per-chunk dense-buffer cap) share a
+    // name but not a meaning -- a `from_vcf_list`-sized value passed to
+    // `from_vcf` lands under this error's ~1.2 GB practical floor. The
+    // error message must point the reader at the mix-up, not just report
+    // the numbers.
+    #[test]
+    fn insufficient_memory_message_flags_the_from_vcf_list_mixup() {
+        let err = plan_sharded(PlanInputs {
+            usable_cores: 47,
+            n_contigs: 1,
+            n_samples: 1_000,
+            chunk_bytes: 1_000,
+            max_mem_bytes: Some(1_000_000), // 1 MB -- a from_vcf_list-scale value
+            reader_workers: 2,
+        })
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("from_vcf_list"), "message = {msg:?}");
     }
 
     // Degenerate hardware must still produce a runnable plan.
