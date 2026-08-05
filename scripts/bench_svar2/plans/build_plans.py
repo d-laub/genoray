@@ -139,6 +139,19 @@ if VLINEAR2_SAMPLES == VLINEAR_SAMPLES:
         "`fit_cohort_beta_from_ladders` has no ratio to form and beta falls "
         "back to the constant-cells fit that forces it to ~1."
     )
+# Two V-ladders at DIFFERENT cohort widths. A single ladder, or two ladders
+# holding S*V constant, pins the cohort exponent to ~1 by construction --
+# that failure has already produced one published-then-retracted interval
+# in this project, so the shape of this ladder is load-bearing.
+PGEN_LADDERS = (
+    (4_000, (250_000, 500_000, 1_000_000)),
+    (32_000, (250_000, 500_000, 1_000_000)),
+)
+# Concurrency axis: bracket the core bound (usable/2 = 23 on a 48-core box)
+# so the sweep can show where the GIL stops paying, if it does.
+PGEN_CONCURRENCY = (1, 4, 8, 11, 16, 22)
+PGEN_CONCURRENCY_AT = (4_000, 1_000_000)
+
 # RLIMIT_AS installed on the points whose PURPOSE is to find out whether
 # `from_vcf`'s hardcoded chunk_size survives biobank scale. Deliberately NOT on
 # every point (a deviation from the design spec's "each point runs under an
@@ -220,6 +233,7 @@ def _point(
 
 def build(corpus_dir: Path, threads: int) -> dict[str, list[SweepPoint]]:
     scale, contig, holdout, vlinear, vlinear2, concurrency = [], [], [], [], [], []
+    pgen = []
 
     for s in SCALE_SAMPLES:
         _, cs = size_corpus(s, CELLS_BUDGET)
@@ -326,6 +340,43 @@ def build(corpus_dir: Path, threads: int) -> dict[str, list[SweepPoint]]:
         corpus = corpus_dir / f"vlinear2_v{v}.manifest.json"
         vlinear2.append(_point(corpus, 1, VLINEAR2_CHUNK_SIZE, threads))
 
+    for s, vs in PGEN_LADDERS:
+        for v in vs:
+            corpus = corpus_dir / f"pgen_s{s}_v{v}.pgen"
+            cs = _chunk_size_for(v)
+            # w is always 1: from_pgen pins P=1, so there is no reader-worker
+            # axis to sweep. The RAM-law points leave concurrency unset so the
+            # planner's own choice is what gets measured.
+            pgen.append(
+                SweepPoint(
+                    corpus=str(corpus),
+                    reader_workers=1,
+                    concurrent_chroms=None,
+                    shard_htslib=0,
+                    overshard=4,
+                    chunk_size=cs,
+                    threads=threads,
+                    reps=3,
+                    backend="pgen",
+                )
+            )
+    s_cc, v_cc = PGEN_CONCURRENCY_AT
+    corpus_cc = corpus_dir / f"pgen_s{s_cc}_v{v_cc}.pgen"
+    for cc in PGEN_CONCURRENCY:
+        pgen.append(
+            SweepPoint(
+                corpus=str(corpus_cc),
+                reader_workers=1,
+                concurrent_chroms=cc,
+                shard_htslib=0,
+                overshard=4,
+                chunk_size=_chunk_size_for(v_cc),
+                threads=threads,
+                reps=3,
+                backend="pgen",
+            )
+        )
+
     return {
         "scale": scale,
         "contig": contig,
@@ -333,6 +384,7 @@ def build(corpus_dir: Path, threads: int) -> dict[str, list[SweepPoint]]:
         "vlinear": vlinear,
         "vlinear2": vlinear2,
         "concurrency": concurrency,
+        "pgen": pgen,
     }
 
 

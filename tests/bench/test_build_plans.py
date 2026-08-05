@@ -191,7 +191,7 @@ def test_scale_plan_adds_a_dedicated_point_only_where_size_corpus_is_not_clamped
     assert len(dedicated) == len(unclamped_s) == 5
 
 
-def test_all_six_plans_are_produced():
+def test_all_seven_plans_are_produced():
     assert set(_build().keys()) == {
         "scale",
         "contig",
@@ -199,6 +199,7 @@ def test_all_six_plans_are_produced():
         "vlinear",
         "vlinear2",
         "concurrency",
+        "pgen",
     }
 
 
@@ -246,3 +247,43 @@ def test_the_second_v_ladder_pins_chunk_size_across_its_rungs():
     assert len(pts) == len(VLINEAR2_VARIANTS)
     assert len({p.chunk_size for p in pts}) == 1
     assert all(p.reader_workers == 1 for p in pts)
+
+
+def _shape_of(point) -> tuple[int, int]:
+    """(samples, variants) encoded in the corpus path, e.g. `.../s4000_v250000/`."""
+    import re
+
+    m = re.search(r"s(\d+)_v(\d+)", point.corpus)
+    assert m, f"corpus path does not encode its shape: {point.corpus}"
+    return int(m.group(1)), int(m.group(2))
+
+
+def test_pgen_family_has_two_v_ladders_at_different_sample_counts():
+    """A ladder that holds S*V constant forces the cohort exponent to ~1
+    arithmetically -- it cannot identify beta no matter how many points it
+    has. Two V-ladders at DIFFERENT S is the minimum that can."""
+    from scripts.bench_svar2.plans.build_plans import build
+
+    plans = build(Path("/tmp/corpora"), threads=48)
+    pgen = plans["pgen"]
+    assert pgen, "pgen family must not be empty"
+    assert all(p.backend == "pgen" for p in pgen)
+
+    by_samples: dict[int, set[int]] = {}
+    for p in pgen:
+        s, v = _shape_of(p)
+        by_samples.setdefault(s, set()).add(v)
+    ladders = [s for s, vs in by_samples.items() if len(vs) >= 2]
+    assert len(ladders) >= 2, (
+        f"need >=2 V-ladders at different S to identify the cohort exponent; "
+        f"got {by_samples}"
+    )
+
+
+def test_pgen_concurrency_axis_holds_workers_at_one():
+    """PGEN pins P=1 (sub-contig sharding disabled), so a reader_workers
+    axis would measure nothing."""
+    from scripts.bench_svar2.plans.build_plans import build
+
+    for p in build(Path("/tmp/corpora"), threads=48)["pgen"]:
+        assert p.reader_workers == 1

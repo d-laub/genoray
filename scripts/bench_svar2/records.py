@@ -64,6 +64,16 @@ class SweepPoint:
     threads: int
     reps: int
     rss_ceiling_mb: int | None = None
+    # Which conversion path this point measures. Defaults to "vcf" so every
+    # call site that builds a `SweepPoint` without naming a backend keeps
+    # working unchanged (all pre-Task-8 construction sites use only the VCF
+    # path). NOTE: `point_id` hashes with `sort_keys=True`, so a SHA256 over
+    # the sorted JSON payload has no positional stability -- adding this
+    # field changes `point_id` for every point, existing or new, regardless
+    # of where in the dataclass it is declared or what its default is. There
+    # is no field placement that preserves ids across this change; "added
+    # last" only keeps existing constructor calls source-compatible.
+    backend: str = "vcf"
 
     @property
     def point_id(self) -> str:

@@ -1,6 +1,7 @@
 import os
 import signal
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -354,3 +355,67 @@ def test_build_env_leaves_arena_count_alone_without_a_ceiling():
         rss_ceiling_mb=None,
     )
     assert "MALLOC_ARENA_MAX" not in _build_env(point)
+
+
+def test_build_cmd_dispatches_on_backend():
+    from scripts.bench_svar2.probe import _build_cmd
+    from scripts.bench_svar2.records import CorpusManifest, SweepPoint
+
+    manifest = CorpusManifest(
+        path="/tmp/corpus.pgen",
+        samples=10,
+        variants=100,
+        contigs=("chr1",),
+        format_fields=(),
+        ploidy=2,
+        cells=1000,
+        compressed_bytes=1,
+        seed=0,
+        generator_version=1,
+    )
+    point = SweepPoint(
+        corpus=manifest.path,
+        reader_workers=1,
+        concurrent_chroms=4,
+        shard_htslib=0,
+        overshard=4,
+        chunk_size=1000,
+        threads=8,
+        reps=1,
+        backend="pgen",
+    )
+    cmd = _build_cmd(point, manifest, Path("/tmp/store.svar"))
+    assert "pgen" in cmd
+    assert "vcf" not in cmd
+    # Symbolic ALTs survive plink2 into the .pvar, so the PGEN arm must skip
+    # them or every conversion aborts on the first <DEL>.
+    assert "--skip-symbolics-and-breakends" in cmd
+
+
+def test_build_cmd_defaults_to_vcf():
+    from scripts.bench_svar2.probe import _build_cmd
+    from scripts.bench_svar2.records import CorpusManifest, SweepPoint
+
+    manifest = CorpusManifest(
+        path="/tmp/corpus.vcf.gz",
+        samples=10,
+        variants=100,
+        contigs=("chr1",),
+        format_fields=(),
+        ploidy=2,
+        cells=1000,
+        compressed_bytes=1,
+        seed=0,
+        generator_version=1,
+    )
+    point = SweepPoint(
+        corpus=manifest.path,
+        reader_workers=1,
+        concurrent_chroms=None,
+        shard_htslib=0,
+        overshard=4,
+        chunk_size=1000,
+        threads=8,
+        reps=1,
+    )
+    assert "vcf" in _build_cmd(point, manifest, Path("/tmp/s.svar"))

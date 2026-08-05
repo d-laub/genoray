@@ -170,12 +170,12 @@ def _build_env(point: SweepPoint) -> dict[str, str]:
 
 
 def _build_cmd(point: SweepPoint, manifest: CorpusManifest, store: Path) -> list[str]:
-    return [
+    cmd = [
         sys.executable,
         "-m",
         "genoray._cli",
         "write",
-        "vcf",
+        point.backend,
         manifest.path,
         str(store),
         "--no-reference",
@@ -187,6 +187,12 @@ def _build_cmd(point: SweepPoint, manifest: CorpusManifest, store: Path) -> list
         "--chunk-size",
         str(point.chunk_size),
     ]
+    if point.backend == "pgen":
+        # The germline-1kgp profile emits symbolic ALTs at a low rate and
+        # plink2 passes them into the .pvar, where check_ref="e" would abort
+        # the whole conversion on the first one.
+        cmd.append("--skip-symbolics-and-breakends")
+    return cmd
 
 
 def _tmp_dir(outdir: Path) -> Path:
