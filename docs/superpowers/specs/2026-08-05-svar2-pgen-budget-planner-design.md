@@ -265,6 +265,14 @@ Five findings that shape it, each verified:
    every per-contig share matching to two decimal places. One invocation, no
    `bcftools concat`, no multi-file bookkeeping.
 
+   Filed upstream as
+   [vcfixture-rs#15](https://github.com/d-laub/vcfixture-rs/issues/15) (no way
+   to express per-contig counts through `Size`). If that lands, the derived
+   profile can be replaced by a per-contig count spec — but note the derived
+   profile relies on `density_per_kb` having exactly one consumer, so it would
+   break silently if that ever stops holding. Prefer the upstream fix once
+   available.
+
    Commit the derived profile (~4 KB) as
    `scripts/bench_svar2/profiles/germline-1kgp-varskew.json`, carrying its
    provenance (source profile, its fit date, the `vcfixture` version used).
