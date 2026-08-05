@@ -252,7 +252,7 @@ dropped = SparseVar2.from_vcf(
 dropped = SparseVar2.from_vcf("out.svar2", "file.vcf.gz", no_reference=True)
 ```
 
-Signature: `from_vcf(out, source, reference=None, *, regions=None, samples=None, merge_overlapping=False, regions_overlap="pos", no_reference=False, skip_out_of_scope=False, ploidy=2, chunk_size=25_000, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False, info_fields=None, format_fields=None, check_ref="e", progress=False, log_level="info", max_mem=None, tune=False) -> int`
+Signature: `from_vcf(out, source, reference=None, *, regions=None, samples=None, merge_overlapping=False, regions_overlap="pos", no_reference=False, skip_out_of_scope=False, ploidy=2, chunk_size=25_000, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False, info_fields=None, format_fields=None, check_ref="e", progress=False, log_level="info", max_mem=None) -> int`
 
 - `source` — a bgzipped VCF (`.vcf.gz`) or BCF (`.bcf`). Auto-indexes (`.csi`) if
   no `.csi`/`.tbi` is found. For a PLINK2 PGEN source, use `from_pgen` instead
@@ -381,15 +381,6 @@ Signature: `from_vcf(out, source, reference=None, *, regions=None, samples=None,
   cohort-baseline term of roughly 932 MB, so any budget that can't cover
   baseline plus one concurrent contig's chunk buffers — in practice, anything
   much below ~1.2 GB — is rejected with `ValueError`, even for a tiny cohort.
-- **`tune: bool = False`** — Python-only kwarg (**no `--tune` CLI flag**). If
-  `True`, probes the largest contig's actual read/exec rates on this machine
-  and input before dispatch, and derives the per-contig reader-worker count
-  from the measured ratio instead of a fixed default. `tune` is a pure
-  optimization and can never turn a working conversion into a failure: a
-  failed probe falls back to the default reader-worker count and logs a
-  warning, and a probe that SUCCEEDS but returns a worker count too large for
-  the memory budget also falls back to the default reader-worker count
-  (retried once) and logs a warning, rather than raising.
 - **`progress=False`/`log_level="info"`** — write-time progress/logging,
   shared by `from_vcf`/`from_pgen`/`from_vcf_list`/`from_svar1`/`write_view`.
   `progress=True` renders live progress: in a terminal or Jupyter, a `rich`

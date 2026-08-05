@@ -1,9 +1,9 @@
 """Scheduling must not change output bytes.
 
 concurrent_chroms, reader_workers, and contig dispatch order all move under
-the tuned planner. Each is an opportunity to perturb chunk ordinals, per-chunk
+the planner. Each is an opportunity to perturb chunk ordinals, per-chunk
 ledgers, or long-allele bank offsets. If this test fails, nothing else in the
-tuned-load-balancing change matters.
+load-balancing change matters.
 """
 
 from __future__ import annotations
@@ -21,9 +21,7 @@ SCHEDULES = [(1, 1), (1, 12), (4, 3), (8, 2)]
 # Small enough that the largest contig (chr8, 32 records) spans multiple
 # chunks (4) while the smallest (chr1, 4 records) still fits in one. Chunk
 # ordinals must survive reordering/concurrency, not just a degenerate
-# one-chunk-per-contig case -- and it also gives the reader-rate probe
-# (PROBE_CHUNKS = 2, src/tune.rs) its full two chunks on the probed (largest)
-# contig instead of breaking after one.
+# one-chunk-per-contig case.
 CHUNK_SIZE = 8
 
 # > MAX_INLINE_ALT_LEN (13, svar2-codec/src/lib.rs) so these records spill
@@ -128,13 +126,3 @@ def test_max_mem_too_small_raises_rather_than_writing_an_empty_store(
             max_mem="1M",
         )
     assert not out.exists(), "a rejected max_mem budget must not create the store dir"
-
-
-def test_tune_does_not_change_output(multi_contig_vcf, tmp_path):
-    a = tmp_path / "untuned.svar"
-    b = tmp_path / "tuned.svar"
-    SparseVar2.from_vcf(a, multi_contig_vcf, no_reference=True, chunk_size=CHUNK_SIZE)
-    SparseVar2.from_vcf(
-        b, multi_contig_vcf, no_reference=True, chunk_size=CHUNK_SIZE, tune=True
-    )
-    assert _oracle.store_digest(a) == _oracle.store_digest(b)

@@ -194,40 +194,6 @@ pub fn plan_sharded(inp: PlanInputs) -> Result<ShardedPlan, PlanError> {
     })
 }
 
-/// `plan_sharded`, but treating a tuned `reader_workers` as a pure
-/// optimization the way `tune`'s docs already promise: `w=16` (the probe's
-/// ceiling) costs 6.2x the per-contig memory of the default `w=3`
-/// (`kappa*(w+(w-1))*chunk_bytes`), so a cohort that plans fine untuned can
-/// hit `InsufficientMemory` purely because the probe SUCCEEDED and picked a
-/// larger worker count. If the tuned plan doesn't fit, retry once at
-/// `default_workers` and warn rather than failing a conversion that would
-/// have succeeded without tuning. If the default doesn't fit either, that's
-/// a real budget problem independent of tuning -- the retry's error (not
-/// the original) is what the caller needs to act on. A no-op when
-/// `inp.reader_workers == default_workers` (untuned callers, or a probe
-/// that happened to land on the default).
-pub fn plan_sharded_tuned(
-    inp: PlanInputs,
-    default_workers: usize,
-) -> Result<ShardedPlan, PlanError> {
-    match plan_sharded(inp) {
-        Ok(p) => Ok(p),
-        Err(e) if inp.reader_workers != default_workers => {
-            tracing::warn!(
-                tuned_reader_workers = inp.reader_workers,
-                default_reader_workers = default_workers,
-                error = %e,
-                "tuned reader-worker count exceeded the memory budget; retrying at the default"
-            );
-            plan_sharded(PlanInputs {
-                reader_workers: default_workers,
-                ..inp
-            })
-        }
-        Err(e) => Err(e),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -510,10 +476,12 @@ mod tests {
         );
     }
 
-    // A tuned w=16 costs 6.2x w=3's per-contig memory (kappa*(w+w-1) is 31 vs
-    // 5), so a budget sized for the default can reject the tuned plan while
-    // still comfortably fitting the default. `plan_sharded_tuned` must not
-    // let a SUCCESSFUL probe turn that into a hard failure.
+    // Per-contig memory is `kappa*(w+(w-1))*chunk_bytes`, so it grows roughly
+    // linearly in `w`: raising the reader count from the fitted default of 3
+    // to 16 costs 6.2x (kappa*(w+w-1) is 31 vs 5) and can turn a plan that
+    // fits into `InsufficientMemory`. This is why `DEFAULT_READER_WORKERS` is
+    // a fitted constant rather than something a caller or a runtime probe
+    // dials up freely -- the memory law, not just throughput, bounds it.
     //
     // n_samples=1_000, chunk_bytes=10_000_000 (10 MB):
     //   baseline    = 932 + 0.01115*1_000        = 943.15 MB
@@ -522,66 +490,29 @@ mod tests {
     //     w=16 -> 1.371*31*10 = 425.01 MB -> needs  1368.16 MB
     //   budget = 1_200 MB: fits w=3, rejects w=16.
     #[test]
-    fn tuned_worker_count_that_blows_the_budget_retries_at_default() {
+    fn a_high_worker_count_can_exceed_a_budget_the_default_fits() {
         let inp = PlanInputs {
             usable_cores: 47,
             n_contigs: 1,
             n_samples: 1_000,
             chunk_bytes: 10_000_000,
             max_mem_bytes: Some(1_200_000_000),
-            reader_workers: 16, // as if `tune` probed and picked W_MAX
+            reader_workers: 16,
         };
-        // The untuned call must actually fail here, or this test proves
-        // nothing about the retry.
         assert!(matches!(
             plan_sharded(inp),
             Err(PlanError::InsufficientMemory { .. })
         ));
-
-        let plan = plan_sharded_tuned(inp, 3).unwrap();
         assert_eq!(
-            plan,
+            plan_sharded(PlanInputs {
+                reader_workers: 3,
+                ..inp
+            })
+            .unwrap(),
             ShardedPlan {
                 concurrent_chroms: 1,
-                reader_workers: 3, // retried at the default, not the tuned 16
+                reader_workers: 3,
             }
-        );
-    }
-
-    // If the default ALSO doesn't fit, that's a real budget problem
-    // independent of tuning -- the retry's error must still surface, not be
-    // swallowed.
-    #[test]
-    fn tuned_retry_still_fails_when_default_also_does_not_fit() {
-        let inp = PlanInputs {
-            usable_cores: 47,
-            n_contigs: 1,
-            n_samples: 500_000,
-            chunk_bytes: 3_125_000_000,
-            max_mem_bytes: Some(5_000 * 1_000_000), // below even the cohort baseline
-            reader_workers: 16,
-        };
-        let err = plan_sharded_tuned(inp, 3).unwrap_err();
-        assert!(matches!(err, PlanError::InsufficientMemory { .. }));
-    }
-
-    // Untuned callers (or a probe that happened to land on the default) hit
-    // the exact same `reader_workers`, so the guard must not double-attempt
-    // (functionally a no-op vs. `plan_sharded`, but exercised explicitly so
-    // the equality-guarded fast path is covered).
-    #[test]
-    fn tuned_planner_is_a_noop_when_workers_already_match_default() {
-        let inp = PlanInputs {
-            usable_cores: 47,
-            n_contigs: 22,
-            n_samples: 500_000,
-            chunk_bytes: 3_125_000_000,
-            max_mem_bytes: Some(52_428 * 1_000_000),
-            reader_workers: 3,
-        };
-        assert_eq!(
-            plan_sharded_tuned(inp, 3).unwrap(),
-            plan_sharded(inp).unwrap()
         );
     }
 }

@@ -656,7 +656,6 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         progress: bool = False,
         log_level: Literal["off", "warning", "info", "debug"] = "info",
         max_mem: int | str | None = None,
-        tune: bool = False,
     ) -> int:
         """Convert a bgzipped VCF or BCF to an SVAR2 store.
 
@@ -744,16 +743,6 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         that can't cover baseline plus one concurrent contig's chunk buffers
         -- in practice, anything much below ~1.2 GB -- is rejected with a
         `ValueError` even for a tiny cohort.
-
-        tune: if True, probe the largest contig's actual read/exec rates on
-        this machine and input before dispatch, and derive the per-contig
-        reader-worker count from the measured ratio instead of a fixed
-        default. `tune` is a pure optimization and can never turn a working
-        conversion into a failure: a failed probe falls back to the default
-        reader-worker count and logs a warning, and a probe that SUCCEEDS
-        but returns a worker count too large for the memory budget also
-        falls back to the default reader-worker count (retried once) and
-        logs a warning, rather than raising.
         """
         from cyvcf2 import VCF as _CyVCF
         from genoray._svar._regions import _normalize_samples
@@ -896,7 +885,6 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
                 region_ranges,
                 regions_overlap,
                 max_mem_bytes,
-                tune,
                 log_level=level,
                 receiver=rx,
             )
