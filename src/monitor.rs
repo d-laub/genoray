@@ -134,6 +134,41 @@ fn sample_interval_secs() -> u64 {
         .unwrap_or(5)
 }
 
+/// Granularity at which a sleeping sampler notices it has been asked to stop.
+///
+/// Small enough to be invisible against a contig, large enough that the wakeup
+/// is free: 100 ticks over a default 5s interval, each doing one atomic load.
+const STOP_POLL: Duration = Duration::from_millis(50);
+
+/// Wait one sample interval, but wake early if `stop` is set. Returns whether
+/// the wait was cut short (i.e. the caller should exit rather than sample).
+///
+/// A plain `sleep(interval)` is what made the sampler cost real wall time.
+/// `process_chromosome` shuts a contig down by setting `stop` and then joining
+/// this thread, and the loop only tested `stop` AFTER its sleep -- so every
+/// contig's shutdown waited out the remainder of the current tick. Measured on
+/// a 22-contig human-skewed corpus, per-contig time was pinned at 5.3-5.5s
+/// (the 5s default interval plus the 300ms settle) no matter the cohort width
+/// or the contig's record count, against 1.0-1.8s of actual work: 1.8-3.2x of
+/// wall time, on both this branch and main, spent joining a sleeping thread.
+///
+/// Sampling CADENCE is unchanged -- this still waits the full interval when
+/// nothing is shutting down, so every emitted `pipeline sampler` line covers
+/// the same span it did before and the CPU% columns stay comparable.
+fn sleep_until_tick_or_stop(interval: Duration, stop: &AtomicBool) -> bool {
+    let deadline = Instant::now() + interval;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        if stop.load(Ordering::Relaxed) {
+            return true;
+        }
+        std::thread::sleep(std::cmp::min(STOP_POLL, remaining));
+    }
+}
+
 /// High-water gauge for the shard collector's reorder backlog.
 ///
 /// `shard_exec`'s `pending` map is unbounded by construction: a fast shard's
@@ -238,7 +273,11 @@ pub fn spawn_sampler(
 
             // Brief settle so the four pipeline threads register their /proc/.../comm
             // entries before the first lookup. Missing TIDs are re-resolved each tick.
-            std::thread::sleep(Duration::from_millis(300));
+            // Interruptible for the same reason the tick is: a contig whose whole
+            // pipeline finishes inside the settle would otherwise still pay it in full.
+            if sleep_until_tick_or_stop(Duration::from_millis(300), &stop) {
+                return;
+            }
             let mut tids: Vec<Option<i32>> =
                 names.iter().map(|n| find_thread_tid_by_name(n)).collect();
             let mut prev_ticks: Vec<u64> = vec![0; names.len()];
@@ -260,7 +299,9 @@ pub fn spawn_sampler(
             // pipeline is most loaded and the reading matters most.
             let mut last_tick = Instant::now();
             while !stop.load(Ordering::Relaxed) {
-                std::thread::sleep(interval);
+                if sleep_until_tick_or_stop(interval, &stop) {
+                    break;
+                }
                 let now = Instant::now();
                 let gap = now.duration_since(last_tick);
                 last_tick = now;
@@ -334,8 +375,61 @@ pub fn spawn_sampler(
 
 #[cfg(test)]
 mod tests {
-    use super::PendingGauge;
-    use std::sync::atomic::Ordering;
+    use super::{PendingGauge, STOP_POLL, sleep_until_tick_or_stop};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    // The bug this guards: `process_chromosome` stops the sampler and then
+    // joins it, so a wait that ignores `stop` until it has elapsed puts a
+    // whole sample interval under every contig's shutdown. Measured at
+    // 5.3-5.5s per contig against 1.0-1.8s of real work before the fix.
+    #[test]
+    fn an_already_stopped_wait_returns_without_burning_the_interval() {
+        let stop = AtomicBool::new(true);
+        let t0 = Instant::now();
+        assert!(sleep_until_tick_or_stop(Duration::from_secs(30), &stop));
+        assert!(
+            t0.elapsed() < Duration::from_secs(1),
+            "waited {:?} on an already-stopped sampler",
+            t0.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_wait_stopped_midway_wakes_within_one_poll_slice() {
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let setter = std::sync::Arc::clone(&stop);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            setter.store(true, Ordering::Relaxed);
+        });
+        let t0 = Instant::now();
+        assert!(sleep_until_tick_or_stop(Duration::from_secs(30), &stop));
+        // 100ms to the store, plus at most one poll slice to notice it, plus
+        // slack for a loaded CI box. The point is "not 30 seconds".
+        assert!(
+            t0.elapsed() < Duration::from_millis(100) + STOP_POLL * 20,
+            "took {:?} to notice the stop flag",
+            t0.elapsed()
+        );
+    }
+
+    // Cadence must not change: the emitted CPU% columns divide by the measured
+    // gap, and a wait that returned early when nothing was stopping would
+    // silently shorten every sampled span.
+    #[test]
+    fn an_uninterrupted_wait_still_lasts_the_full_interval() {
+        let stop = AtomicBool::new(false);
+        let interval = STOP_POLL * 4;
+        let t0 = Instant::now();
+        assert!(!sleep_until_tick_or_stop(interval, &stop));
+        assert!(
+            t0.elapsed() >= interval,
+            "returned after {:?}, short of the {:?} interval",
+            t0.elapsed(),
+            interval
+        );
+    }
 
     #[test]
     fn gauge_records_len_highwater_not_current() {
