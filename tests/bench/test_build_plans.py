@@ -287,3 +287,21 @@ def test_pgen_concurrency_axis_holds_workers_at_one():
 
     for p in build(Path("/tmp/corpora"), threads=48)["pgen"]:
         assert p.reader_workers == 1
+
+
+def test_every_point_corpus_is_a_manifest_path():
+    """`sweep.py:run_sweep` reads `point.corpus` as UTF-8 text and decodes it
+    as a `CorpusManifest` -- it is a `sweep.py`-wide contract that every
+    family's `corpus` names a `*.manifest.json`, never the underlying data
+    file. The pgen family once pointed its points at the binary `.pgen`
+    directly, which raised `UnicodeDecodeError` 4.5 hours into a real Slurm
+    sweep. This constrains every family, not just pgen, so the next family
+    added hits the same trap here instead of at runtime."""
+    plans = build(Path("/tmp/corpora"), threads=48)
+    offenders = [
+        pt.corpus
+        for points in plans.values()
+        for pt in points
+        if not pt.corpus.endswith(".manifest.json")
+    ]
+    assert not offenders, f"corpus paths not pointing at a manifest: {offenders}"

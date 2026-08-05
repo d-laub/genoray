@@ -351,14 +351,14 @@ def build(corpus_dir: Path, threads: int) -> dict[str, list[SweepPoint]]:
 
     for s, vs in PGEN_LADDERS:
         for v in vs:
-            corpus = corpus_dir / f"pgen_s{s}_v{v}.pgen"
+            corpus = corpus_dir / f"pgen_s{s}_v{v}.manifest.json"
             cs = _chunk_size_for(v)
             # w is always 1: from_pgen pins P=1, so there is no reader-worker
             # axis to sweep. The RAM-law points leave concurrency unset so the
             # planner's own choice is what gets measured.
             pgen.append(_point(corpus, 1, cs, threads, backend="pgen"))
     s_cc, v_cc = PGEN_CONCURRENCY_AT
-    corpus_cc = corpus_dir / f"pgen_s{s_cc}_v{v_cc}.pgen"
+    corpus_cc = corpus_dir / f"pgen_s{s_cc}_v{v_cc}.manifest.json"
     for cc in PGEN_CONCURRENCY:
         pgen.append(
             _point(
