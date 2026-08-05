@@ -8,6 +8,7 @@ use std::thread;
 
 use crate::enum_map::EnumKey;
 use crate::error::ConversionError;
+use crate::nrvk::LongAlleleTableWriter;
 use crate::streams::{REGISTRY, StreamMap, StreamTag};
 use crate::trace::trace_ll;
 use crate::{executor, merge, monitor, writer};
@@ -383,9 +384,10 @@ pub fn process_chromosome(
     // BENCH-ONLY: `GENORAY_DENSE_CAP` overrides the dense queue depth. A
     // 6-deep queue is ample for the one-reader `VcfList` branch this constant
     // was tuned for, but the sharded branch has `reader_workers` producers
-    // against it, so it is a candidate throttle there and must be separable
-    // from `GENORAY_EXEC_WORKERS` when sweeping. Does NOT touch the exported
-    // constant, so Python's `from_vcf_list` derivation is unaffected.
+    // against it, so it is a candidate throttle there. Does NOT touch the
+    // exported constant, so Python's `from_vcf_list` derivation is unaffected.
+    // Measured 2026-08-05: no effect (within +-3% at 6/12/24 on both shapes),
+    // so this is a sweep hook for future work, not a knob with a known win.
     let dense_cap = bench_env("GENORAY_DENSE_CAP")
         .unwrap_or(VCF_LIST_DENSE_CHANNEL_CAP)
         .max(1);
@@ -895,21 +897,17 @@ pub fn process_chromosome(
             let exec_chrom = chrom.to_string();
             let exec_worker_tids = Arc::clone(&exec_worker_tids);
             move || {
-                // PROTOTYPE: `GENORAY_EXEC_WORKERS` (default 1) selects how many
-                // executor threads share `rx_dense`. At 1 this is byte-for-byte
-                // the previous single-bank serial loop.
-                executor::run_compute_engine_multi(
+                let bank = LongAlleleTableWriter::new(tx_long, long_allele_capacity);
+                executor::run_compute_engine(
                     rx_dense,
                     tx_sparse,
-                    tx_long,
+                    bank,
                     executor::ExecutorParams {
-                        workers: executor::exec_workers(),
-                        long_allele_capacity,
                         sidecar_bits_enabled: signatures,
                         fields: &fields_exec,
                         chrom: &exec_chrom,
                         sink: &exec_sink,
-                        worker_tids: &exec_worker_tids,
+                        exec_tids: &exec_worker_tids,
                     },
                 )
             }

@@ -230,10 +230,12 @@ pub struct PipelineProbes {
     /// `/proc/self/task` iteration finds first, misattributing CPU across
     /// chromosomes. See `shard_exec::run`'s `worker_tids` doc comment.
     pub shard_worker_tids: TidRegistry,
-    /// Registry of executor-worker OS TIDs, populated by
-    /// `executor::run_compute_engine_multi`. Same motivation as
-    /// `shard_worker_tids` -- see [`TidRegistry`] for why the executor pool
-    /// cannot be sampled by `comm` name either.
+    /// Registry of executor OS TIDs, populated by
+    /// `executor::run_compute_engine`. There is one executor thread per chrom,
+    /// so a `comm` lookup on `exec-{chrom}` would resolve correctly today --
+    /// but it is registered by TID for the same reason `shard_worker_tids` is:
+    /// the sampler reads CPU from this registry, and an empty one reports 0%
+    /// while the executor is busy.
     pub exec_worker_tids: TidRegistry,
     /// Reorder-backlog high-water for THIS chrom, updated by the shard
     /// collector. Stays zero on the single-reader fallback path.
