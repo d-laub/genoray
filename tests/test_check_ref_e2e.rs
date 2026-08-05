@@ -70,6 +70,7 @@ fn convert(
         SourceSpec::Vcf {
             vcf_path: bcf.to_str().unwrap().to_string(),
             htslib_threads: 1,
+            reader_workers: 1,
             regions: Vec::new(),
             overlap: genoray_core::svar2_view::OverlapMode::Pos,
         },
@@ -197,7 +198,7 @@ fn vcf_list_ref_mismatch_excluded_under_x() {
 // region list disables sharding — see the Python `from_vcf` comment on why
 // it always fills `[0, len)` for whole-contig conversion) and
 // `overlap == OverlapMode::Pos`. Passing the whole-contig range explicitly,
-// a small `chunk_size` (target shard span), and `processing_threads > 1`
+// a small `chunk_size` (target shard span), and `reader_workers > 1`
 // reproduces the Python test's sharded scenario (there: `threads=16,
 // chunk_size=1`) directly against the Rust entry point.
 #[test]
@@ -218,6 +219,7 @@ fn sharded_ref_excluded_counted_once_in_contig_done() {
         SourceSpec::Vcf {
             vcf_path: bcf.to_str().unwrap().to_string(),
             htslib_threads: 1,
+            reader_workers: 8,
             // Non-empty, whole-contig range: required to enable sub-contig
             // sharding (see comment above).
             regions: vec![(0, 1000)],
@@ -260,5 +262,136 @@ fn sharded_ref_excluded_counted_once_in_contig_done() {
             );
         }
         _ => unreachable!(),
+    }
+}
+
+/// Four distinct per-sample genotypes at each of three loci, so any mix-up of
+/// the sample→header-column mapping changes the output bytes. `gt` is flat
+/// (sample-major, ploidy 2).
+fn permuted_subset_records() -> Vec<SynthRecord<'static>> {
+    vec![
+        SynthRecord {
+            pos: 100,
+            ref_allele: b"A",
+            alts: vec![&b"C"[..]],
+            gt: vec![1, 1, 0, 1, 0, 0, 1, 0],
+        },
+        SynthRecord {
+            pos: 500,
+            ref_allele: b"T",
+            alts: vec![&b"G"[..]],
+            gt: vec![0, 0, 1, 0, 1, 1, 0, 1],
+        },
+        SynthRecord {
+            pos: 900,
+            ref_allele: b"C",
+            alts: vec![&b"A"[..]],
+            gt: vec![0, 1, 1, 1, 0, 0, 1, 1],
+        },
+    ]
+}
+
+/// Every regular file under `root`, as (relative path, bytes), sorted — enough
+/// to compare two output stores byte-for-byte without knowing the layout.
+fn store_bytes(root: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    fn walk(dir: &std::path::Path, base: &std::path::Path, out: &mut Vec<(String, Vec<u8>)>) {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .expect("read_dir")
+            .map(|e| e.expect("dir entry").path())
+            .collect();
+        entries.sort();
+        for path in entries {
+            if path.is_dir() {
+                walk(&path, base, out);
+            } else {
+                let rel = path
+                    .strip_prefix(base)
+                    .expect("strip_prefix")
+                    .to_string_lossy()
+                    .into_owned();
+                out.push((rel, std::fs::read(&path).expect("read file")));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out
+}
+
+/// Sub-contig sharding must not change WHICH header column each requested
+/// sample maps to.
+///
+/// The orchestrator resolves the cohort's header-column indices ONCE per
+/// contig and hands the resolved vector to every shard, rather than re-running
+/// the name lookup inside the per-shard closure (that cost O(reader_workers x
+/// S) header parses, which dominated phase-1 CPU at large cohorts). A hoist
+/// like that is only safe if the resolved mapping is genuinely shard-invariant,
+/// so pin it: request a REORDERED SUBSET -- `["S2", "S0", "S3"]` out of header
+/// order `["S0", "S1", "S2", "S3"]`, skipping S1 -- and require the sharded
+/// output to be byte-identical to the unsharded output.
+///
+/// The existing sharded test passes the full cohort in header order, where the
+/// mapping is the identity and any resolution bug is invisible.
+#[test]
+fn sharded_permuted_sample_subset_matches_unsharded_bytes() {
+    let tmp = TempDir::new().unwrap();
+    let bcf = tmp.path().join("in.bcf");
+    let samples = ["S0", "S1", "S2", "S3"];
+    build_bcf_with_index(&bcf, "chr1", 1000, &samples, &permuted_subset_records());
+
+    // Reordered and non-contiguous: header columns 2, 0, 3 in that order.
+    let requested: Vec<&str> = vec!["S2", "S0", "S3"];
+
+    let run = |out: &std::path::Path, reader_workers: usize, regions: Vec<(u32, u32)>| {
+        process_chromosome(
+            SourceSpec::Vcf {
+                vcf_path: bcf.to_str().unwrap().to_string(),
+                htslib_threads: 1,
+                reader_workers,
+                regions,
+                overlap: genoray_core::svar2_view::OverlapMode::Pos,
+            },
+            None, // no reference: this test is about sample mapping only
+            "chr1",
+            out.to_str().unwrap(),
+            &requested,
+            1, // chunk_size (target shard span, bp) -- tiny to force many shards
+            2, // ploidy
+            8 * 1024 * 1024,
+            false,
+            // Inert here: with no FASTA there is nothing to check REF against,
+            // so neither policy can drop a record. `Error` keeps the test
+            // honest -- if a check somehow did run and disagree, it fails loudly
+            // instead of silently excluding the record from both runs.
+            CheckRef::Error,
+            8,
+            false,
+            &[],
+            &EventSink::disabled(),
+        )
+        .expect("process_chromosome should succeed");
+    };
+
+    let sharded = tmp.path().join("sharded");
+    let unsharded = tmp.path().join("unsharded");
+    // Non-empty regions + OverlapMode::Pos + workers>1 enables sub-contig
+    // sharding; an empty region list disables it (see the sharded test above).
+    run(&sharded, 8, vec![(0, 1000)]);
+    run(&unsharded, 1, Vec::new());
+
+    let a = store_bytes(&sharded);
+    let b = store_bytes(&unsharded);
+    assert!(!a.is_empty(), "sanity: the sharded run wrote something");
+    assert_eq!(
+        a.iter().map(|(p, _)| p).collect::<Vec<_>>(),
+        b.iter().map(|(p, _)| p).collect::<Vec<_>>(),
+        "sharded and unsharded runs must write the same set of files"
+    );
+    for ((pa, ba), (_, bb)) in a.iter().zip(b.iter()) {
+        assert_eq!(
+            ba, bb,
+            "{pa} differs between the sharded and unsharded runs -- the \
+             per-contig sample-index resolution is not shard-invariant"
+        );
     }
 }

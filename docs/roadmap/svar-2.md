@@ -401,9 +401,11 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
   so Approach B was not built. Public API is unchanged — sharding is entirely
   internal to the existing `threads=` budget. Byte-identical output vs. serial
   conversion is gated by a store-hash oracle at every thread count for both
-  backends. **VCF** scales ~3.9× at 32 cores (chr21, 1176s → 300s); sub-contig
-  sharding only engages once the thread budget clears HTSlib decode-thread
-  allocation (~15 cores). **PGEN** sharding is byte-identical but not faster —
+  backends. **VCF** scales ~3.9× at 32 cores (chr21, 1176s → 300s). Its
+  backend-specific `reader_workers` budget treats indexed shard readers as a
+  replacement for the monolithic reader's HTSlib pool and disables per-shard
+  HTSlib background pools, so medium-sized single-contig runs no longer strand
+  cores in an inactive reservation. **PGEN** sharding is byte-identical but not faster —
   `pgenlib`'s genotype decode holds the CPython GIL, so shard readers serialize
   and sharding is net slightly slower than serial (memory
   `pgenlib-holds-gil-sharded-reads`); PGEN is intentionally not over-decomposed.

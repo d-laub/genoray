@@ -50,7 +50,12 @@ source** rather than reasoning from first principles.
 ## Cross-cutting conventions
 
 - Ranges are 0-based, half-open `[start, end)`.
-- `max_mem` accepts strings like `"4g"`, `"512m"`, `"2GB"`.
+- `max_mem` accepts strings like `"4g"`, `"512m"`, `"2GB"` — **except**
+  `SparseVar2.from_vcf` and `SparseVar2.from_vcf_list`'s `max_mem`, both a
+  **whole-process** planning budget, not a per-chunk cap; see their entries
+  under "Conversion" below before assuming they mean the same thing as
+  everywhere else this name appears (`VCF.chunk`/`chunk_ranges`,
+  `PGEN.chunk`/`chunk_ranges`, etc., where it caps one chunk directly).
 - Contig names auto-normalize: `"chr1"` and `"1"` both work regardless of file convention (`ContigNormalizer`).
 - Missing genotype = `-1` (int). Missing dosage = `np.nan` (float32).
 - Ploidy is 2 by default; `SparseVar.from_vcf`/`from_pgen` (and `genoray write-svar1`) accept `haploid=True` / `--haploid`, which OR-collapses haplotypes into a single haploid call per sample and records `ploidy=1` in metadata (intended for unphased somatic data).
@@ -247,7 +252,7 @@ dropped = SparseVar2.from_vcf(
 dropped = SparseVar2.from_vcf("out.svar2", "file.vcf.gz", no_reference=True)
 ```
 
-Signature: `from_vcf(out, source, reference=None, *, regions=None, samples=None, merge_overlapping=False, regions_overlap="pos", no_reference=False, skip_out_of_scope=False, ploidy=2, chunk_size=25_000, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False, info_fields=None, format_fields=None, check_ref="e", progress=False, log_level="info") -> int`
+Signature: `from_vcf(out, source, reference=None, *, regions=None, samples=None, merge_overlapping=False, regions_overlap="pos", no_reference=False, skip_out_of_scope=False, ploidy=2, chunk_size=25_000, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False, info_fields=None, format_fields=None, check_ref="e", progress=False, log_level="info", max_mem=None) -> int`
 
 - `source` — a bgzipped VCF (`.vcf.gz`) or BCF (`.bcf`). Auto-indexes (`.csi`) if
   no `.csi`/`.tbi` is found. For a PLINK2 PGEN source, use `from_pgen` instead
@@ -356,6 +361,26 @@ Signature: `from_vcf(out, source, reference=None, *, regions=None, samples=None,
   - **Read path:** see "Reading INFO/FORMAT fields (SVAR2)" below —
     `SparseVar2(path, fields=…)` / `.with_fields(…)` / `.available_fields`
     opt into decoding these back out via `decode()`.
+- **`max_mem: int | str | None = None`** — byte budget for the **concurrency
+  planner**: how many contigs convert at once, chosen so cohort-baseline
+  memory plus each concurrent contig's in-flight chunk buffers fit inside it
+  (in addition to the existing core-count bound). Same string forms as the
+  module-level `max_mem` convention above (`"4g"`, `"512m"`, `"2GB"`, parsed
+  by `parse_memory`), and **the same whole-process meaning as
+  `from_vcf_list`'s `max_mem`** (below) — `from_vcf_list` just has no fitted
+  concurrency planner to spend it on (its contigs run strictly sequentially),
+  so it derives its own per-chunk `chunk_size` from this budget instead.
+  **`None` (the default) means a DETECTED budget — 80% of the cgroup memory
+  limit (or `/proc/meminfo` total outside a cgroup) — NOT unbounded.** This
+  is a deliberate default behavior change from the pre-`max_mem` planner. If
+  detection itself fails (no cgroup limit and no readable `/proc/meminfo` —
+  always true on macOS), genoray warns and falls back to the old
+  core-bound-only planning rather than raising. Pass an explicit value to
+  raise or lower the budget, or a very large value to approximate unbounded
+  planning. **Practical floor:** the planner's RAM law has a fixed
+  cohort-baseline term of roughly 932 MB, so any budget that can't cover
+  baseline plus one concurrent contig's chunk buffers — in practice, anything
+  much below ~1.2 GB — is rejected with `ValueError`, even for a tiny cohort.
 - **`progress=False`/`log_level="info"`** — write-time progress/logging,
   shared by `from_vcf`/`from_pgen`/`from_vcf_list`/`from_svar1`/`write_view`.
   `progress=True` renders live progress: in a terminal or Jupyter, a `rich`
@@ -550,27 +575,56 @@ multi-sample VCF.
     `default=`).
 - `chunk_size=None` — unlike `from_vcf`'s fixed `25_000` default, `None` here
   derives a budget-based chunk size from the cohort size (`_auto_chunk_size`),
-  so one packed dense chunk stays ~256 MiB regardless of how many files are
-  merged; this is the same default `from_pgen`/`from_svar1` already use. The
-  budget accounts for both the packed genotype grid AND any staged
-  `format_fields` (`n_format_fields * n_samples * 4` bytes/variant — this term
-  can dominate the grid by `32 * F / ploidy`, e.g. 112x at F=7, ploidy=2), so
-  requesting FORMAT fields on a large cohort shrinks the auto chunk size
-  accordingly. Scope: it bounds only the dense-chunk term, which is a small
-  fraction of peak RAM at typical cohort sizes with no fields requested (the
-  budget does not bite until roughly 43k inputs, below which it returns the
-  historical `25_000`) — a large-cohort guardrail, not a fix for overall RAM
-  scaling in the number of inputs. Pass an int to override with a fixed count.
-- `max_mem: int | str | None = None` — caps the bytes one in-flight dense
-  chunk may occupy (same string forms as the module-level `max_mem`
-  convention, e.g. `"4g"`, parsed by the shared memory-string helper),
-  overriding the default `_DENSE_CHUNK_TARGET_BYTES` (~256 MiB) that
-  `_auto_chunk_size` budgets against when `chunk_size=None`. It is a
-  **worst-case ceiling**: the estimate assumes every variant routes dense,
-  since the dense fraction is a per-chunk, data-dependent routing outcome not
-  knowable up front. Cohorts whose variants route sparse (e.g. private somatic
-  calls) use considerably less than the ceiling. Ignored when `chunk_size` is
-  passed explicitly.
+  so one packed dense chunk stays within a `max_mem`-derived per-chunk target
+  (see `max_mem` below), up to a ~256 MiB ceiling; this is the same default
+  `from_pgen`/`from_svar1` already use. The budget accounts for both the
+  packed genotype grid AND any staged `format_fields` (`n_format_fields *
+  n_samples * 4` bytes/variant — this term can dominate the grid by `32 * F /
+  ploidy`, e.g. 112x at F=7, ploidy=2), so requesting FORMAT fields on a large
+  cohort shrinks the auto chunk size accordingly. Scope: it bounds only the
+  dense-chunk term, which is a small fraction of peak RAM at typical cohort
+  sizes — a large-cohort guardrail, not a fix for overall RAM scaling in the
+  number of inputs. Pass an int to override with a fixed count.
+- `max_mem: int | str | None = None` — byte budget the **whole process** may
+  use (same string forms as the module-level `max_mem` convention, e.g.
+  `"4g"`, parsed by `parse_memory`) — **the same meaning as `from_vcf`'s
+  `max_mem`** (above), not a per-chunk cap. **This budget only sizes the
+  dense-chunk term** — it does NOT cap the reader's per-input-file overhead
+  (`from_vcf_list` opens all `N` files at once per contig), which scales
+  with the number of input files and is not bounded by `max_mem` at all;
+  don't read "whole process" as a hard total-RSS guarantee.
+
+  **BREAKING CHANGE:** earlier versions treated this `max_mem` as a direct
+  cap on the bytes of one in-flight dense chunk. It is now a whole-process
+  budget. A call like `max_mem="512MiB"` that used to mean "let one dense
+  chunk use up to 512 MiB" now means "the dense-chunk term should use at
+  most 512 MiB", which derives a MUCH smaller `chunk_size`. Re-tune any
+  carried-over value.
+
+  `from_vcf_list` has no fitted concurrency planner the way the sharded
+  `from_vcf` reader does — its contigs convert strictly sequentially — so
+  instead of planning concurrency it derives a per-chunk byte target:
+  `chunk_target = min(_DENSE_CHUNK_TARGET_BYTES, max_mem //
+  (concurrent_jobs * in_flight_chunks_per_job))`. `concurrent_jobs` and
+  `in_flight_chunks_per_job` are **not** hardcoded Python literals — they
+  are read live from the Rust extension module
+  (`_core.VCF_LIST_CONCURRENT_CHROMS`, currently `1`, and
+  `_core.VCF_LIST_DENSE_CHANNEL_CAP + 2`, currently `8`: the reader/executor
+  channel's capacity plus one chunk each of the single reader and single
+  executor thread may hold outside it), so this can't silently drift out of
+  sync with the orchestrator's actual architecture the way a duplicated
+  constant could — **not** a fitted memory law either way (none exists for
+  this pipeline, unlike the sharded path's RAM law). `_DENSE_CHUNK_TARGET_BYTES`
+  stays a **ceiling**, so a large budget can't grow chunks past today's size —
+  only a tight budget shrinks them below it. On top of that, the resulting
+  target is still a **worst-case ceiling**: the estimate assumes every variant
+  routes dense, so cohorts whose variants route sparse (e.g. private somatic
+  calls) use considerably less. Ignored when `chunk_size` is passed
+  explicitly — including skipping memory-budget DETECTION entirely (no
+  attempt, no warning) when `chunk_size` is explicit. **`None` (the default)
+  means a DETECTED budget**, same detection as `from_vcf`; if detection
+  fails, this degrades to the historical fixed ~256 MiB dense-chunk target
+  (with a warning) rather than raising.
 - `ploidy`, `skip_out_of_scope`, `threads`, `overwrite`,
   `long_allele_capacity`, `signatures`, `check_ref` all mean the same as
   `from_vcf`, and the return value is the same `int` (dropped out-of-scope

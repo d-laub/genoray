@@ -442,6 +442,22 @@ mod tests {
         let _guard = TEST_LOCK.lock().unwrap();
         let (tx, rx) = unbounded();
         let sink = EventSink::new(tx, 1);
+        // `CURRENT_SINK` is process-global (see the module comment above), so
+        // while it is `Some` here, tracing events emitted by ANY concurrently
+        // running test in ANY module -- not just this file's -- route into
+        // `rx` too (e.g. `contig_cost::estimate_contig_costs`'s
+        // `tracing::debug!`, or `merge`'s gather-tiling logging, both
+        // exercised by their own modules' tests, which `cargo test`
+        // happily runs on other threads at the same moment). `TEST_LOCK`
+        // only serializes *this file's* tests against each other; it does
+        // nothing about that cross-module traffic. Filtering on `target ==
+        // module_path!()` (this test's own module) is what actually makes
+        // this deterministic: every `tracing::*!` call site textually inside
+        // `mod tests` here -- including the one on the spawned thread in
+        // `global_subscriber_routes_from_spawned_thread` below -- shares
+        // this exact target, while every foreign module's call site does
+        // not, regardless of which OS thread happens to run it.
+        let own_target = module_path!();
         with_channel_subscriber(sink, "info", || {
             tracing::info!(chrom = "chr1", "excluded 12 records");
             tracing::debug!(chrom = "chr1", "chr1:100 REF mismatch"); // filtered out at info
@@ -449,7 +465,12 @@ mod tests {
         let logs: Vec<(String, String)> = rx
             .try_iter()
             .filter_map(|e| match e {
-                Event::Log { chrom, message, .. } => Some((chrom.unwrap_or_default(), message)),
+                Event::Log {
+                    chrom,
+                    message,
+                    target,
+                    ..
+                } if target == own_target => Some((chrom.unwrap_or_default(), message)),
                 _ => None,
             })
             .collect();
@@ -471,6 +492,16 @@ mod tests {
         let _guard = TEST_LOCK.lock().unwrap();
         let (tx, rx) = unbounded();
         let sink = EventSink::new(tx, 1);
+        // See the identical comment in `channel_layer_routes_events_at_level`:
+        // `CURRENT_SINK` is process-global, so foreign modules' concurrently
+        // running tests (`contig_cost`, `merge`, ...) can leak `tracing::*!`
+        // events into `rx` while it is live. Filtering on `target ==
+        // module_path!()` isolates this test's own events -- the spawned
+        // thread's `tracing::info!` call below is textually inside this same
+        // `mod tests`, so it shares this target regardless of which OS
+        // thread actually emits it, while every foreign module's events do
+        // not.
+        let own_target = module_path!();
         with_channel_subscriber(sink, "debug", || {
             std::thread::spawn(|| {
                 tracing::info!(chrom = "chrX", "from worker");
@@ -481,7 +512,12 @@ mod tests {
         let logs: Vec<(String, String)> = rx
             .try_iter()
             .filter_map(|e| match e {
-                Event::Log { chrom, message, .. } => Some((chrom.unwrap_or_default(), message)),
+                Event::Log {
+                    chrom,
+                    message,
+                    target,
+                    ..
+                } if target == own_target => Some((chrom.unwrap_or_default(), message)),
                 _ => None,
             })
             .collect();

@@ -73,13 +73,14 @@ regions per contig raise — use `pos`/`record`, or convert separately.
 
 Single-file `SparseVar2.from_vcf` shards **within a contig**, driven by the same
 `threads=` budget shown above — no new argument. Sub-contig sharding only kicks
-in for the default whole-contig (`regions_overlap="pos"`) path: the thread budget
-first spends added cores on HTSlib decode threads for the single reader, so the
-sub-contig shard budget stays at 1 (an un-sharded reader) until the core count
-clears that stage (~15 cores on the benchmarked hardware). Output is
-**byte-identical** to serial conversion at every thread count — sharding is gated
-by a store-hash oracle and does not reintroduce missingness (a `./.` haplotype
-and a hom-ref haplotype remain indistinguishable in SVAR2 either way).
+in for the default whole-contig (`regions_overlap="pos"`) path. The planner uses
+a backend-specific reader budget: indexed shard readers decompress inline and
+replace, rather than run alongside, the monolithic reader's HTSlib pool. This
+lets medium-sized single-contig runs use their available cores without
+oversubscribing multi-contig runs. Output is **byte-identical** to serial
+conversion at every thread count — sharding is gated by a store-hash oracle and
+does not reintroduce missingness (a `./.` haplotype and a hom-ref haplotype
+remain indistinguishable in SVAR2 either way).
 
 Sub-contig sharding is restricted to `regions_overlap="pos"` (which the
 whole-contig default uses). `"record"` and `"variant"` conversions run on a

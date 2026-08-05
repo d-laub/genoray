@@ -20,6 +20,8 @@ pub fn bits_get_bit(bytes: &[u8], i: usize) -> bool {
 pub mod budget;
 #[cfg(feature = "conversion")]
 pub mod chunk_assembler;
+#[cfg(feature = "conversion")]
+pub mod contig_cost;
 pub mod cost_model;
 pub mod dense;
 #[cfg(feature = "conversion")]
@@ -141,12 +143,27 @@ fn index_vcf(path: String) -> PyResult<()> {
     index_bcf_csi(&path).map_err(pyo3::exceptions::PyRuntimeError::new_err)
 }
 
+// Low end of the scale bench's measured reader-worker knee (3-7). Chosen at
+// the low end because the executor is the bottleneck, not the reader, and
+// surplus readers steal cores from *other* concurrently-dispatched contigs'
+// executors rather than speeding up their own.
+//
+// This is the ONLY source of the per-contig reader count. An opt-in runtime
+// probe (`tune=`) that measured `t_read`/`t_exec` on the actual input and
+// derived `w` from the ratio was built and then removed: it re-read a prefix
+// of the largest contig before every dispatch, and the ratio it recovered
+// landed inside the fitted knee often enough that it never paid for that
+// read. Keep the fitted value; if it ever needs to move, move it here rather
+// than reintroducing a per-run measurement.
+#[cfg(feature = "conversion")]
+const DEFAULT_READER_WORKERS: usize = 3;
+
 //The Python Wrapper and resource allocator
 #[cfg(feature = "conversion")]
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 #[pyfunction]
-#[pyo3(signature = (vcf_path, reference_path, chroms, output_dir, samples, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false, signatures=false, info_fields=Vec::new(), format_fields=Vec::new(), check_ref="e".to_string(), region_ranges=Vec::new(), regions_overlap="pos".to_string(), log_level = "info".to_string(), receiver = None))]
+#[pyo3(signature = (vcf_path, reference_path, chroms, output_dir, samples, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false, signatures=false, info_fields=Vec::new(), format_fields=Vec::new(), check_ref="e".to_string(), region_ranges=Vec::new(), regions_overlap="pos".to_string(), max_mem_bytes=None, log_level = "info".to_string(), receiver = None))]
 fn run_conversion_pipeline(
     py: Python,
     vcf_path: String,
@@ -165,6 +182,7 @@ fn run_conversion_pipeline(
     check_ref: String,
     region_ranges: Vec<(String, u32, u32)>,
     regions_overlap: String,
+    max_mem_bytes: Option<u64>,
     log_level: String,
     receiver: Option<Py<PyEventReceiver>>,
 ) -> PyResult<usize> {
@@ -192,7 +210,7 @@ fn run_conversion_pipeline(
     // is a pure no-op. `EventSink`'s progress buffer is keyed per-chrom (a
     // `Mutex<HashMap<chrom, pending>>`), so it's safe even though this
     // pipeline dispatches chroms CONCURRENTLY (`concurrent_chroms` via
-    // `plan_thread_budget`, can exceed 1): ticks from different chroms
+    // `plan_sharded`, can exceed 1): ticks from different chroms
     // accumulate independently and are never flushed under the wrong chrom
     // label.
     let sink = match &receiver {
@@ -219,18 +237,81 @@ fn run_conversion_pipeline(
                 }
             };
 
+            // Per-variant dense-chunk cost, matching what the RAM law was
+            // fitted against: packed presence grid plus staged FORMAT values.
+            let n_format = fields
+                .iter()
+                .filter(|f| f.category == crate::field::FieldCategory::Format)
+                .count();
+            let per_variant_bytes =
+                (samples.len() * ploidy / 8 + n_format * samples.len() * 4) as u64;
+
+            // Longest-first cost estimate for the dispatch order (Step 3),
+            // computed once: `estimate_contig_costs` opens the VCF and its
+            // index, so computing it twice would double that I/O for every
+            // conversion.
+            let costs = crate::contig_cost::estimate_contig_costs(&vcf_path, &chroms);
+            let ordered = crate::contig_cost::order_longest_first(&chroms, &costs);
+
+            // The RAM law (`RAM_KAPPA` etc., src/budget.rs) was fitted
+            // against RESIDENT chunk bytes -- `min(chunk_size, variants)` --
+            // not the nominal `chunk_size * per_variant_bytes`:
+            // `BitGrid3::zeros` is `alloc_zeroed` (a calloc), so an oversized
+            // `chunk_size` costs address space, not RSS, and feeding the
+            // nominal size in dragged the fitted kappa ~10x low. Narrowing
+            // by the largest contig's true record count is only valid when
+            // `costs` came from the index tier (`exact_counts`): the
+            // header-length fallback tier's values are base-pair CONTIG
+            // LENGTHS, a different unit entirely, and using those here would
+            // badly under-estimate. When it isn't known to be safe, fall
+            // back to the nominal (over-estimating, never under-estimating)
+            // size.
+            let resident_chunk_size = if costs.exact_counts {
+                costs
+                    .values
+                    .values()
+                    .copied()
+                    .max()
+                    .map_or(chunk_size, |max_records| {
+                        chunk_size.min(max_records as usize)
+                    })
+            } else {
+                chunk_size
+            };
+            let chunk_bytes = per_variant_bytes * resident_chunk_size as u64;
+
+            let sharded = crate::budget::plan_sharded(crate::budget::PlanInputs {
+                usable_cores: available_cores.saturating_sub(1).max(1),
+                n_contigs: chroms.len(),
+                n_samples: samples.len(),
+                chunk_bytes,
+                max_mem_bytes,
+                reader_workers: DEFAULT_READER_WORKERS,
+            });
+            let sharded = match sharded {
+                Ok(p) => p,
+                Err(e) => return vec![Err(crate::error::ConversionError::from(e))],
+            };
+
             let plan = crate::budget::plan_thread_budget(available_cores, chroms.len());
-            let concurrent_chroms = plan.concurrent_chroms;
-            let htslib_threads = plan.htslib_threads;
+            let concurrent_chroms =
+                orchestrator::bench_concurrent_chroms(sharded.concurrent_chroms);
+            let htslib_threads = plan.htslib_threads; // monolithic path only
+            let reader_workers = sharded.reader_workers;
             let processing_threads = plan.processing_threads;
 
-            let total_active =
+            let monolithic_reader_active =
                 concurrent_chroms * (crate::budget::PIPELINE_THREADS_PER_CHROM + htslib_threads);
+            let sharded_vcf_active = concurrent_chroms
+                * (crate::budget::PIPELINE_THREADS_PER_CHROM
+                    + reader_workers * (1 + crate::budget::SHARDED_VCF_HTSLIB_THREADS_PER_READER));
             tracing::info!(cores = available_cores, "using cores");
             tracing::info!(
                 concurrent_chroms,
                 htslib_threads,
-                total_active,
+                monolithic_reader_active,
+                reader_workers,
+                sharded_vcf_active,
                 processing_threads,
                 "pipeline config"
             );
@@ -248,15 +329,28 @@ fn run_conversion_pipeline(
 
             // Step 3 -> Dispatch
             let fasta_ref: Option<&str> = reference_path.as_deref();
+            // `ordered` (computed above, longest-first) drives DISPATCH order
+            // only: `chroms` itself keeps its original order for
+            // `finalize_fields`/`write_meta` below, since the store's on-disk
+            // contig order is part of its layout.
+            //
+            // `results` below therefore comes back in DISPATCH order, not
+            // `chroms` order -- safe here only because the sole consumer
+            // (just below) sums every entry unconditionally; a future change
+            // that instead zips `results` positionally against `chroms` (or
+            // `samples`, or anything else keyed by the original order) would
+            // silently misattribute per-contig results.
             let results = pool.install(|| {
-                chroms
+                ordered
                     .par_iter()
+                    .with_min_len(1)
                     .map(|chrom| {
                         tracing::info!(chrom = %chrom, "processing contig");
                         orchestrator::process_chromosome(
                             orchestrator::SourceSpec::Vcf {
                                 vcf_path: vcf_path.clone(),
                                 htslib_threads,
+                                reader_workers,
                                 regions: ranges_by_chrom.get(chrom).cloned().unwrap_or_default(),
                                 overlap: overlap_mode,
                             },
@@ -424,7 +518,7 @@ fn run_pgen_conversion_pipeline(
                 _ => std::thread::available_parallelism().unwrap().get(),
             };
             let plan = crate::budget::plan_thread_budget(available_cores, jobs.len());
-            let concurrent_chroms = plan.concurrent_chroms;
+            let concurrent_chroms = orchestrator::bench_concurrent_chroms(plan.concurrent_chroms);
             let processing_threads = plan.processing_threads;
             tracing::info!(
                 concurrent_chroms,
@@ -1135,7 +1229,7 @@ fn run_svar1_conversion_pipeline(
                 _ => std::thread::available_parallelism().unwrap().get(),
             };
             let plan = crate::budget::plan_thread_budget(available_cores, jobs.len());
-            let concurrent_chroms = plan.concurrent_chroms;
+            let concurrent_chroms = orchestrator::bench_concurrent_chroms(plan.concurrent_chroms);
             let processing_threads = plan.processing_threads;
             tracing::info!(
                 concurrent_chroms,
@@ -1338,6 +1432,21 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run_svar1_conversion_pipeline, m)?)?;
     #[cfg(feature = "conversion")]
     m.add_function(wrap_pyfunction!(index_vcf, m)?)?;
+    // Exported so `_svar2.py`'s `from_vcf_list` `max_mem` -> `chunk_size`
+    // derivation reads the vcf_list pipeline's actual concurrency constants
+    // instead of duplicating them as hardcoded Python literals -- see both
+    // constants' doc comments in `orchestrator.rs` for why this must stay a
+    // single source of truth.
+    #[cfg(feature = "conversion")]
+    m.add(
+        "VCF_LIST_DENSE_CHANNEL_CAP",
+        crate::orchestrator::VCF_LIST_DENSE_CHANNEL_CAP,
+    )?;
+    #[cfg(feature = "conversion")]
+    m.add(
+        "VCF_LIST_CONCURRENT_CHROMS",
+        crate::orchestrator::VCF_LIST_CONCURRENT_CHROMS,
+    )?;
     #[cfg(feature = "conversion")]
     m.add_class::<PyEventReceiver>()?;
     m.add_class::<crate::py_query::PyContigReader>()?;

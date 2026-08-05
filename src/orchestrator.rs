@@ -57,12 +57,40 @@ parallel memory architecture.
 /// `SourceSpec::Pgen` branch below for the unchanged `max_shards` calc.
 pub(crate) const OVERSHARD_FACTOR: usize = 4;
 
+/// BENCH-ONLY: read a `usize` sweep override from the environment.
+///
+/// Lets one build sweep the sharded-VCF `(reader_workers, per-shard HTSlib
+/// threads, overshard factor)` space instead of rebuilding per configuration.
+/// Unset or unparseable leaves the planner's value in place.
+fn bench_env(key: &str) -> Option<usize> {
+    std::env::var(key).ok()?.parse::<usize>().ok()
+}
+
+/// BENCH-ONLY: override the planner's contig concurrency via
+/// `GENORAY_CONCURRENT_CHROMS`. Required to hold TOTAL reader workers constant
+/// while varying how they are partitioned across contigs --
+/// `GENORAY_READER_WORKERS` alone cannot separate "too few readers" from
+/// "readers on the wrong contig".
+///
+/// Lives here beside the other `GENORAY_*` sweep hooks, but is applied by the
+/// callers in `lib.rs` that size the per-run rayon chrom pool: `plan` is not in
+/// scope inside `process_chromosome`, which sees one contig at a time.
+/// Unset or unparseable leaves `planned` in place.
+pub(crate) fn bench_concurrent_chroms(planned: usize) -> usize {
+    bench_env("GENORAY_CONCURRENT_CHROMS")
+        .unwrap_or(planned)
+        .max(1)
+}
+
 /// Which backend a contig's records come from. Everything downstream of
 /// `ChunkAssembler` is identical for both.
 pub enum SourceSpec {
     Vcf {
         vcf_path: String,
         htslib_threads: usize,
+        /// Independent indexed shard readers for this contig. These replace
+        /// the monolithic reader's HTSlib pool on the sharded path.
+        reader_workers: usize,
         regions: Vec<(u32, u32)>,
         overlap: crate::svar2_view::OverlapMode,
     },
@@ -267,6 +295,23 @@ fn with_pgen_shard_context(
     }
 }
 
+/// Capacity of the `DenseChunk` channel between `process_chromosome`'s reader
+/// and executor threads (used at its `bounded::<DenseChunk>(..)` call
+/// below). Shared infrastructure across every `SourceSpec`, but exported to
+/// Python (`_core.VCF_LIST_DENSE_CHANNEL_CAP`, `src/lib.rs`'s `#[pymodule]`)
+/// specifically for `from_vcf_list`'s `max_mem` -> `chunk_size` derivation:
+/// only the `VcfList` branch has exactly one reader thread and one executor
+/// thread, so `VCF_LIST_DENSE_CHANNEL_CAP + 2` (this capacity, plus one
+/// chunk each of those two threads may hold outside the channel) is a tight
+/// upper bound on `DenseChunk`s resident in memory for that branch. (Other
+/// branches -- e.g. sharded `Vcf`, with multiple shard-reader threads
+/// feeding the same channel -- have a different, larger bound; the sharded
+/// path's memory planning uses the separately-fitted RAM law in
+/// `src/budget.rs` instead.) Retuning this capacity changes that Python
+/// derivation automatically -- it is read live from this constant, not
+/// duplicated.
+pub const VCF_LIST_DENSE_CHANNEL_CAP: usize = 6;
+
 //The rust pipeline (Per chromosome conversion from Dense to Sparse)
 #[allow(clippy::too_many_arguments)]
 pub fn process_chromosome(
@@ -330,11 +375,23 @@ pub fn process_chromosome(
     }
 
     // Channel capacities tuned for cohort-scale workloads.
-    // - tx_dense=6: smooths HTSlib BGZF block-boundary jitter so the executor
-    //   never starves on `rx_dense.recv()`. Each DenseChunk is ~chunk_size × S × P / 8 bytes.
+    // - tx_dense=VCF_LIST_DENSE_CHANNEL_CAP: smooths HTSlib BGZF block-boundary
+    //   jitter so the executor never starves on `rx_dense.recv()`. Each DenseChunk
+    //   is ~chunk_size × S × P / 8 bytes. Exported to Python -- see the constant's
+    //   doc comment above for why.
     // - tx_sparse=8: SparseChunks are tiny (~hundreds of KB); deeper queue is free.
     // - tx_long=2: each buffer is up to long_allele_capacity bytes — keep small.
-    let (tx_dense, rx_dense) = bounded::<crate::types::DenseChunk>(6);
+    // BENCH-ONLY: `GENORAY_DENSE_CAP` overrides the dense queue depth. A
+    // 6-deep queue is ample for the one-reader `VcfList` branch this constant
+    // was tuned for, but the sharded branch has `reader_workers` producers
+    // against it, so it is a candidate throttle there. Does NOT touch the
+    // exported constant, so Python's `from_vcf_list` derivation is unaffected.
+    // Measured 2026-08-05: no effect (within +-3% at 6/12/24 on both shapes),
+    // so this is a sweep hook for future work, not a knob with a known win.
+    let dense_cap = bench_env("GENORAY_DENSE_CAP")
+        .unwrap_or(VCF_LIST_DENSE_CHANNEL_CAP)
+        .max(1);
+    let (tx_dense, rx_dense) = bounded::<crate::types::DenseChunk>(dense_cap);
     let (tx_sparse, rx_sparse) = bounded::<crate::types::SparseChunk>(8);
     let (tx_long, rx_long) = bounded::<Vec<u8>>(2);
 
@@ -344,6 +401,16 @@ pub fn process_chromosome(
     // `shard_exec::run`'s `worker_tids` doc comment for why a shared registry
     // is required instead of matching threads by `comm` name.
     let shard_worker_tids: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
+
+    // Reorder-backlog high-water for THIS contig: written by
+    // `shard_exec::run`'s collector, read by the sampler below. Stays zero on
+    // the single-reader fallback path (nothing inserts into a `pending` map
+    // there).
+    let pending_gauge: Arc<crate::monitor::PendingGauge> =
+        Arc::new(crate::monitor::PendingGauge::default());
+
+    // Executor-pool TID registry; see `monitor::TidRegistry`.
+    let exec_worker_tids: crate::monitor::TidRegistry = Arc::new(std::sync::Mutex::new(Vec::new()));
 
     // Periodic monitoring sampler. Owns Sender clones for read-only len()/capacity()
     // introspection. The clones drop when the sampler joins, allowing the executor's
@@ -355,7 +422,11 @@ pub fn process_chromosome(
         tx_sparse.clone(),
         tx_long.clone(),
         stop_sampler.clone(),
-        Arc::clone(&shard_worker_tids),
+        monitor::PipelineProbes {
+            shard_worker_tids: Arc::clone(&shard_worker_tids),
+            exec_worker_tids: Arc::clone(&exec_worker_tids),
+            pending_gauge: Arc::clone(&pending_gauge),
+        },
     );
 
     // Step 1 -> The Producer
@@ -368,6 +439,7 @@ pub fn process_chromosome(
             let s_owned: Vec<String> = samples.iter().map(|&s| s.to_string()).collect();
             let fields_owned: Vec<crate::field::FieldSpec> = fields.to_vec();
             let shard_worker_tids = Arc::clone(&shard_worker_tids);
+            let pending_gauge = Arc::clone(&pending_gauge);
 
             // Returns `(dropped_out_of_scope, ref_excluded, normalized_total)` so
             // the caller can feed `EventSink::contig_done`'s `excluded` arg (and
@@ -384,6 +456,7 @@ pub fn process_chromosome(
                     SourceSpec::Vcf {
                         vcf_path,
                         htslib_threads,
+                        reader_workers,
                         regions,
                         overlap,
                     } => {
@@ -405,11 +478,21 @@ pub fn process_chromosome(
                         // reproduces the whole-contig split byte-for-byte
                         // (`query_window(Pos)` is identity; `keeps(Pos, ..)` is the
                         // half-open POS test the pre-region sharded reader used).
+                        // BENCH-ONLY sweep hooks (see scripts/bench_sharded_vcf).
+                        // Absent env vars leave the planner's values untouched.
+                        let reader_workers = bench_env("GENORAY_READER_WORKERS")
+                            .unwrap_or(reader_workers)
+                            .max(1);
+                        let shard_htslib = bench_env("GENORAY_SHARD_HTSLIB")
+                            .unwrap_or(crate::budget::SHARDED_VCF_HTSLIB_THREADS_PER_READER);
+                        let overshard = bench_env("GENORAY_OVERSHARD")
+                            .unwrap_or(OVERSHARD_FACTOR)
+                            .max(1);
                         let shards = if overlap == crate::svar2_view::OverlapMode::Pos {
                             crate::vcf_reader::plan_vcf_shards(
                                 &regions,
                                 &chr,
-                                processing_threads.saturating_mul(OVERSHARD_FACTOR),
+                                reader_workers.saturating_mul(overshard),
                                 chunk_size as u32,
                             )?
                         } else {
@@ -435,29 +518,45 @@ pub fn process_chromosome(
                                 .collect();
                             trace_ll!(
                                 "[plan {chr}] workers={} shards={}",
-                                processing_threads,
+                                reader_workers,
                                 units.len()
                             );
+                            // Resolve the cohort's header-column indices ONCE for
+                            // the whole contig. The closure below runs per shard
+                            // and `units.len()` scales with `reader_workers`, so
+                            // resolving inside it cost O(reader_workers × S) file
+                            // opens + header parses. At S=500,000 that dominated
+                            // everything: cpu_s regressed on shard count gave
+                            // ~1,150s per shard with a statistically ZERO
+                            // intercept, i.e. essentially all of phase-1 CPU was
+                            // this resolution rather than record decoding, and
+                            // adding readers made the conversion monotonically
+                            // slower (1.67× at 11 workers) instead of faster.
+                            let sample_indices =
+                                crate::vcf_reader::VcfRecordSource::resolve_sample_indices(
+                                    &vcf_path, &s_refs,
+                                )?;
                             let totals = crate::shard_exec::run(
                                 &chr,
                                 units,
-                                processing_threads,
+                                reader_workers,
                                 |unit| {
-                                    let source = crate::vcf_reader::VcfRecordSource::new(
-                                        &vcf_path,
-                                        &chr,
-                                        &s_refs,
-                                        1, // htslib_threads: many concurrent shard readers, keep each small
-                                        ploidy,
-                                        &fields_owned,
-                                        // The shard's padded fetch window IS the
-                                        // reader's region; `Pos` makes the fetch
-                                        // unwidened and the per-record filter the
-                                        // plain half-open POS test. `owned_range`
-                                        // (below) does the cross-shard POS dedup.
-                                        vec![(unit.fetch_start, unit.fetch_end)],
-                                        crate::svar2_view::OverlapMode::Pos,
-                                    )?;
+                                    let source =
+                                        crate::vcf_reader::VcfRecordSource::with_sample_indices(
+                                            &vcf_path,
+                                            &chr,
+                                            sample_indices.clone(),
+                                            shard_htslib,
+                                            ploidy,
+                                            &fields_owned,
+                                            // The shard's padded fetch window IS the
+                                            // reader's region; `Pos` makes the fetch
+                                            // unwidened and the per-record filter the
+                                            // plain half-open POS test. `owned_range`
+                                            // (below) does the cross-shard POS dedup.
+                                            vec![(unit.fetch_start, unit.fetch_end)],
+                                            crate::svar2_view::OverlapMode::Pos,
+                                        )?;
                                     Ok(crate::chunk_assembler::ChunkAssembler::with_reference(
                                         Box::new(source),
                                         s_refs.len(),
@@ -481,6 +580,7 @@ pub fn process_chromosome(
                                 chunk_size,
                                 &tx_dense,
                                 &shard_worker_tids,
+                                &pending_gauge,
                             )?;
                             report_ref_excluded(&chr, totals.ref_excluded);
                             report_normalized(&chr, totals.normalized_total);
@@ -671,6 +771,7 @@ pub fn process_chromosome(
                                 chunk_size,
                                 &tx_dense,
                                 &shard_worker_tids,
+                                &pending_gauge,
                             )?;
                             report_ref_excluded(&chr, totals.ref_excluded);
                             report_normalized(&chr, totals.normalized_total);
@@ -748,8 +849,9 @@ pub fn process_chromosome(
                 // Dedicated rayon pool for reader-side CPU work: bounded per-record
                 // normalization batches plus intra-chunk presence packing. The
                 // sharded VCF branch above returns before this point because its
-                // independent indexed readers consume the same `processing_threads`
-                // budget directly; building both would double-reserve cores.
+                // independent indexed readers consume the backend-specific
+                // `reader_workers` budget directly; building both would
+                // double-reserve cores.
                 let pool = rayon::ThreadPoolBuilder::new()
                     .num_threads(processing_threads.max(1))
                     .thread_name(|i| format!("pack-{}", i))
@@ -793,16 +895,20 @@ pub fn process_chromosome(
         .spawn({
             let exec_sink = sink.clone();
             let exec_chrom = chrom.to_string();
+            let exec_worker_tids = Arc::clone(&exec_worker_tids);
             move || {
                 let bank = LongAlleleTableWriter::new(tx_long, long_allele_capacity);
                 executor::run_compute_engine(
                     rx_dense,
                     tx_sparse,
                     bank,
-                    signatures,
-                    &fields_exec,
-                    &exec_chrom,
-                    &exec_sink,
+                    executor::ExecutorParams {
+                        sidecar_bits_enabled: signatures,
+                        fields: &fields_exec,
+                        chrom: &exec_chrom,
+                        sink: &exec_sink,
+                        exec_tids: &exec_worker_tids,
+                    },
                 )
             }
         })
@@ -883,6 +989,25 @@ pub fn process_chromosome(
 
     tracing::debug!(chrom = %chrom, "Phase 1 complete; triggering in-memory merge");
 
+    // Per-stage timing for the post-Phase-1 tail. The pipeline sampler stops
+    // when Phase 1 does, so this span was previously invisible to every
+    // benchmark -- yet it is a near-constant 3-5s that grows to HALF of wall
+    // once the reader pool is widened. Emitted on the `genoray::monitor`
+    // target so it survives `GENORAY_LOG="genoray::monitor=trace"`, which is a
+    // filter and drops every other target.
+    macro_rules! stage {
+        ($label:expr, $body:expr) => {{
+            let t = std::time::Instant::now();
+            let out = $body;
+            tracing::debug!(
+                target: "genoray::monitor",
+                chrom = %chrom, stage = $label, secs = t.elapsed().as_secs_f64(),
+                "merge stage"
+            );
+            out
+        }};
+    }
+
     // Long-allele offsets belong to the indel stream.
     let offsets_array = ndarray::Array1::from_vec(long_allele_offsets);
     ndarray_npy::write_npy(paths.long_allele_offsets(), &offsets_array).map_err(|source| {
@@ -891,6 +1016,15 @@ pub fn process_chromosome(
             source,
         }
     })?;
+
+    // BENCH-ONLY: `GENORAY_MERGE_THREADS` overrides the gather budget for the
+    // var_key merges. Setting it to 1 reproduces the pre-fix behaviour exactly
+    // (those gathers used to inherit `lib.rs`'s `concurrent_chroms`-sized pool
+    // and so always ran single-threaded), which is what makes serial-vs-parallel
+    // measurable from ONE build instead of needing two checkouts.
+    let merge_threads = bench_env("GENORAY_MERGE_THREADS")
+        .unwrap_or(processing_threads)
+        .max(1);
 
     // num_chunks is identical across streams — one ledger row per chunk.
     let num_chunks = ledgers.get(StreamTag::VarKeyIndel).len();
@@ -917,29 +1051,37 @@ pub fn process_chromosome(
                 source: e,
             })?;
             let dest_values_bin = dest_dir.join("values.bin");
-            merge::merge_var_key_field_values(
-                dir.to_str().unwrap(),
-                num_chunks,
-                samples.len(),
-                ploidy,
-                ledgers.get(spec.tag),
-                field_ix,
-                4, // staged width (i32/f32); narrowed to final dtype at finalize (Task 9)
-                &dest_values_bin,
+            stage!(
+                format!("merge_vk_field/{}/{}", spec.subdir, field.name),
+                merge::merge_var_key_field_values(
+                    dir.to_str().unwrap(),
+                    num_chunks,
+                    samples.len(),
+                    ploidy,
+                    ledgers.get(spec.tag),
+                    field_ix,
+                    4, // staged width (i32/f32); narrowed to final dtype at finalize (Task 9)
+                    &dest_values_bin,
+                    merge_threads,
+                )
             )?;
         }
 
         let ledger = std::mem::take(ledgers.get_mut(spec.tag));
-        merge::merge_mini_sc(
-            spec.key_bytes,
-            num_chunks,
-            samples.len(),
-            ploidy,
-            dir.to_str().unwrap(),
-            ledger,
+        stage!(
+            format!("merge_mini_sc/{}", spec.subdir),
+            merge::merge_mini_sc(
+                spec.key_bytes,
+                num_chunks,
+                samples.len(),
+                ploidy,
+                dir.to_str().unwrap(),
+                merge_threads,
+                ledger,
+            )
         )?;
         if let Some(hook) = spec.post_merge {
-            hook(&dir)?;
+            stage!(format!("post_merge/{}", spec.subdir), hook(&dir))?;
         }
     }
 
@@ -984,31 +1126,43 @@ pub fn process_chromosome(
                 source: e,
             })?;
             let dest_values_bin = dest_dir.join("values.bin");
-            crate::dense_merge::merge_dense_field_values(
-                dir.to_str().unwrap(),
-                num_chunks,
-                &ledger,
-                field.category,
-                field_ix,
-                &dest_values_bin,
+            stage!(
+                format!("merge_dense_field/{}/{}", spec.subdir, field.name),
+                crate::dense_merge::merge_dense_field_values(
+                    dir.to_str().unwrap(),
+                    num_chunks,
+                    &ledger,
+                    field.category,
+                    field_ix,
+                    &dest_values_bin,
+                )
             )?;
         }
 
-        crate::dense_merge::merge_dense_class(
-            num_chunks,
-            samples.len(),
-            ploidy,
-            spec.key_bytes,
-            spec.pack_snp,
-            dir.to_str().unwrap(),
-            ledger,
+        stage!(
+            format!("merge_dense_class/{}", spec.subdir),
+            crate::dense_merge::merge_dense_class(
+                crate::dense_merge::DenseMergeParams {
+                    num_chunks,
+                    num_samples: samples.len(),
+                    ploidy,
+                    key_bytes: spec.key_bytes,
+                    pack_snp: spec.pack_snp,
+                    output_dir: dir.to_str().unwrap(),
+                    threads: processing_threads,
+                },
+                ledger,
+            )
         )?;
     }
 
     // M5 post-pass: emit max-deletion-length artifacts for the overlap query.
     // A pure scan of the finished indel key streams — decoupled from the merge.
     let contig_dir = std::path::Path::new(base_out_dir).join(chrom);
-    crate::max_del::write_max_del(&contig_dir, samples.len(), ploidy)?;
+    stage!(
+        "write_max_del",
+        crate::max_del::write_max_del(&contig_dir, samples.len(), ploidy)
+    )?;
 
     // Optional M-signatures write-time annotation: classify SBS96/ID83 codes
     // and store the mutcat sidecar now, while we're already in the
@@ -1041,15 +1195,29 @@ pub fn process_chromosome(
     Ok(dropped)
 }
 
+/// How many contigs `run_vcf_list` converts concurrently. Currently always
+/// `1` (see the MVP-concurrency note below) -- exported to Python
+/// (`_core.VCF_LIST_CONCURRENT_CHROMS`, `src/lib.rs`'s `#[pymodule]`) so
+/// `_svar2.py`'s `from_vcf_list` `max_mem` -> `chunk_size` derivation reads
+/// this value instead of hardcoding it. **If cross-contig parallelism ever
+/// ships, update this constant (or however it's computed) FIRST** -- the
+/// Python-side derivation divides `max_mem` by
+/// `VCF_LIST_CONCURRENT_CHROMS * (VCF_LIST_DENSE_CHANNEL_CAP + 2)`, so it
+/// will silently under-estimate per-contig memory demand at biobank scale
+/// otherwise.
+pub const VCF_LIST_CONCURRENT_CHROMS: usize = 1;
+
 /// `SparseVar2.from_vcf_list`: build ONE SVAR2 store from N single-sample VCFs
 /// with possibly disjoint site lists. `vcf_paths[i]`'s sample is `samples[i]`.
 ///
 /// MVP concurrency: contigs are processed SEQUENTIALLY (a plain loop, no rayon
 /// pool) -- this bounds open file descriptors to roughly N (one per input
 /// file) rather than N * concurrent_chroms. Cross-contig parallelism is
-/// explicit future work. Mirrors `run_conversion_pipeline`
-/// (`src/lib.rs`)'s hardware-budget derivation, `parse_manifest`,
-/// `finalize_fields`, and `write_meta` tail, minus the rayon dispatch.
+/// explicit future work (see `VCF_LIST_CONCURRENT_CHROMS`'s doc comment
+/// above for what must be kept in sync when it lands). Mirrors
+/// `run_conversion_pipeline` (`src/lib.rs`)'s hardware-budget derivation,
+/// `parse_manifest`, `finalize_fields`, and `write_meta` tail, minus the
+/// rayon dispatch.
 ///
 /// Returns the total number of out-of-scope (symbolic/breakend) ALTs dropped
 /// across every input file and contig.
@@ -1110,9 +1278,10 @@ pub fn run_vcf_list(
         Some(t) if t > 0 => t,
         _ => std::thread::available_parallelism().unwrap().get(),
     };
-    // concurrent_chroms is forced to 1 (sequential loop below) regardless of
-    // what the plan suggests -- only `processing_threads` is consumed here.
-    let plan = crate::budget::plan_thread_budget(available_cores, 1);
+    // concurrent_chroms is forced to VCF_LIST_CONCURRENT_CHROMS (sequential
+    // loop below) regardless of what the plan suggests -- only
+    // `processing_threads` is consumed here.
+    let plan = crate::budget::plan_thread_budget(available_cores, VCF_LIST_CONCURRENT_CHROMS);
     let processing_threads = plan.processing_threads;
     tracing::info!(threads = processing_threads, "pipeline configured");
 

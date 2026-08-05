@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+import genoray._utils as _utils
 from genoray import SparseVar2
 
 _REF = "ACAGTACATGGGTACTAGCTAGGCTAACCGGTTAACCGGT"
@@ -78,6 +79,45 @@ def test_from_vcf_with_reference_roundtrips(tmp_path: Path):
     sv = SparseVar2(out)
     assert sv.available_samples == ["S0", "S1"]
     assert sv.contigs == ["chr1"]
+
+
+def test_from_vcf_falls_back_when_memory_budget_undetectable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """`max_mem=None` means a DETECTED budget, not unbounded -- but detection
+    is an optimization, not a requirement. `detect_memory_budget` raises
+    `RuntimeError` whenever there is no cgroup memory limit AND no readable
+    `/proc/meminfo` -- true of every macOS run (this project ships an
+    osx-arm64 wheel) and any host without `/proc`. `from_vcf` must warn and
+    fall back to core-bound-only planning (the pre-`max_mem` behavior)
+    rather than letting a planning optimization hard-fail the conversion.
+    """
+    ref = _write_ref(tmp_path)
+    vcf = _write_vcf(tmp_path, symbolic=False, indexed=True)
+    out = tmp_path / "store"
+
+    # Point every tier `detect_memory_budget` checks at a path that can never
+    # resolve, so all three fail and it raises -- mirrors a host with no
+    # cgroup and no /proc (e.g. macOS). `_PROC_SELF_CGROUP` must be blocked
+    # too, not just the legacy fixed roots: self-discovery reads it FIRST,
+    # and on a real cgroup host (e.g. this test's own CI/dev machine) it
+    # would otherwise find this process's actual cgroup and succeed despite
+    # every other path here being fake.
+    missing_dir = tmp_path / "does-not-exist"
+    monkeypatch.setattr(_utils, "_PROC_SELF_CGROUP", missing_dir / "proc_self_cgroup")
+    monkeypatch.setattr(_utils, "_CGROUP_V2_ROOT", missing_dir / "cgroup_v2_root")
+    monkeypatch.setattr(_utils, "_CGROUP_V1_ROOT", missing_dir / "cgroup_v1_root")
+    monkeypatch.setattr(_utils, "_CGROUP_V2", missing_dir / "cgroup_v2")
+    monkeypatch.setattr(_utils, "_CGROUP_V1", missing_dir / "cgroup_v1")
+    monkeypatch.setattr(_utils, "_MEMINFO", missing_dir / "meminfo")
+
+    with pytest.warns(UserWarning, match="could not detect a memory budget"):
+        dropped = SparseVar2.from_vcf(out, vcf, ref, threads=1)
+
+    assert dropped == 0
+    assert (out / "meta.json").exists()
+    sv = SparseVar2(out)
+    assert sv.available_samples == ["S0", "S1"]
 
 
 def test_from_vcf_regions_restricts_conversion(tmp_path: Path):

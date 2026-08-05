@@ -14,6 +14,7 @@ from hirola import HashTable
 from numpy.typing import ArrayLike, NDArray
 
 from .._contigs import ContigNormalizer
+from .._sample_select import _normalize_samples as _normalize_samples  # re-export
 from .._types import V_IDX_TYPE
 from .._var_ranges import var_ranges
 
@@ -140,34 +141,11 @@ def _normalize_regions(
     return df
 
 
-def _normalize_samples(
-    samples: "str | Sequence[str] | PathLike",
-    available: Sequence[str],
-) -> list[str]:
-    """Normalize `samples` to a list of valid sample names, preserving caller order and deduping by first occurrence.
-
-    Raises ValueError on unknown samples.
-    """
-    if isinstance(samples, str):
-        candidates: list[str] = [samples]
-    elif isinstance(samples, PathLike):
-        candidates = Path(samples).read_text().splitlines()
-        candidates = [s for s in candidates if s.strip()]
-    else:
-        candidates = list(samples)
-
-    avail_set = set(available)
-    missing = [s for s in candidates if s not in avail_set]
-    if missing:
-        raise ValueError(f"Samples not found in dataset: {missing}")
-
-    seen: set[str] = set()
-    deduped: list[str] = []
-    for s in candidates:
-        if s not in seen:
-            seen.add(s)
-            deduped.append(s)
-    return deduped
+# Moved to `genoray._sample_select` -- it is pure Python, and importing THIS
+# module costs ~2.2s (seqpro -> numba/llvmlite, hirola, plus `genoray._svar`'s
+# package __init__). `SparseVar2.from_vcf` needs only this helper, so keeping it
+# here put that import on the critical path of every conversion. Re-exported so
+# existing importers (`genoray._svar._core`, tests) are unaffected.
 
 
 def _resolve_sample_idxs(

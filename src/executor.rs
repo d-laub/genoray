@@ -22,6 +22,20 @@ pub struct Phase1Output {
     pub kept_total: u64,
 }
 
+/// Everything [`run_compute_engine`] needs beyond its channels and its bank.
+///
+/// Grouped rather than passed positionally purely to stay under clippy's
+/// `too_many_arguments` limit: the encoding arguments alone are already at 7.
+pub struct ExecutorParams<'a> {
+    pub sidecar_bits_enabled: bool,
+    pub fields: &'a [crate::field::FieldSpec],
+    pub chrom: &'a str,
+    pub sink: &'a crate::logging::EventSink,
+    /// Registry this thread pushes its OS TID into so `monitor.rs` can report
+    /// `cpu_exec`. See [`crate::monitor::TidRegistry`].
+    pub exec_tids: &'a crate::monitor::TidRegistry,
+}
+
 // Pulls raw chunks, encodes/splits, manages the bank, streams to the writer.
 // Returns Phase1Output — a ledger per active stream tag (each row a chunk's
 // per-column call counts), a scalar ledger per dense class, and the
@@ -30,11 +44,30 @@ pub fn run_compute_engine(
     rx_dense: Receiver<DenseChunk>,
     tx_sparse: Sender<SparseChunk>,
     mut bank: LongAlleleTableWriter,
-    sidecar_bits_enabled: bool,
-    fields: &[crate::field::FieldSpec],
-    chrom: &str,
-    sink: &crate::logging::EventSink,
+    params: ExecutorParams<'_>,
 ) -> Phase1Output {
+    let ExecutorParams {
+        sidecar_bits_enabled,
+        fields,
+        chrom,
+        sink,
+        exec_tids,
+    } = params;
+
+    // Register with the sampler by TID rather than letting it resolve
+    // `exec-{chrom}` by name. There is only one executor thread again, so a
+    // name lookup would now work -- but `monitor.rs` reads `cpu_exec` from this
+    // registry (see `TidRegistry`), and leaving it empty reports 0% while the
+    // executor is busy. Same idiom as `shard_exec`'s worker pool. The `let _`
+    // keeps the binding used on platforms without `/proc`, where the sampler's
+    // CPU columns print `n/a` anyway.
+    let _ = exec_tids;
+    #[cfg(target_os = "linux")]
+    exec_tids
+        .lock()
+        .unwrap()
+        .push(crate::monitor::current_tid());
+
     let mut var_key_ledgers: StreamMap<Vec<Vec<u32>>> =
         StreamMap::from_fn(|_| Vec::with_capacity(10_000));
     let mut dense_ledgers: DenseMap<Vec<u32>> = DenseMap::from_fn(|_| Vec::with_capacity(10_000));
@@ -120,7 +153,20 @@ mod tests {
 
         let bank = crate::nrvk::LongAlleleTableWriter::new(tx_l, 1 << 16);
         let sink = crate::logging::EventSink::disabled();
-        let out = run_compute_engine(rx_d, tx_s, bank, false, &[], "chrTest", &sink);
+        let tids: crate::monitor::TidRegistry =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let out = run_compute_engine(
+            rx_d,
+            tx_s,
+            bank,
+            ExecutorParams {
+                sidecar_bits_enabled: false,
+                fields: &[],
+                chrom: "chrTest",
+                sink: &sink,
+                exec_tids: &tids,
+            },
+        );
 
         // one chunk processed → one ledger row per stream and per dense class
         assert_eq!(out.var_key_ledgers.get(StreamTag::VarKeySnp).len(), 1);
