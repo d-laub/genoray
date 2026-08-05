@@ -11,16 +11,23 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 import polars as pl
 
 from genoray._contigs import ContigNormalizer
-from genoray._mutcat import MUTCAT_VERSION, N_CODES, code_ranges, labels
-from genoray._mutcat.strand import contig_strand_intervals, load_gene_intervals
-from genoray._reference import Reference
-from genoray._signatures import _load_signature_file, cosmic_signatures, fit_signatures
+
+# The mutcat/signature stack is expensive to import -- `genoray._mutcat` pulls
+# in numba (and llvmlite), `_mutcat.strand` pulls in seqpro (numba again, plus
+# pandera and pandas), and `_signatures` pulls in scipy.optimize, joblib and
+# pooch. `SparseVar2` inherits this mixin, so importing any of that at module
+# scope put all of it on the critical path of `import genoray` -- ~2.1s of a
+# 6.2s end-to-end `from_vcf` conversion that never touches a single one of
+# these names. Every use site is inside a method body, and annotations are
+# lazy under `from __future__ import annotations`, so they defer cleanly.
+if TYPE_CHECKING:
+    from genoray._reference import Reference
 
 
 class _MutcatMixin:
@@ -65,6 +72,10 @@ class _MutcatMixin:
             themselves are the ground truth checked by :meth:`mutation_matrix`'s
             guards.
         """
+        from genoray._mutcat import MUTCAT_VERSION
+        from genoray._mutcat.strand import contig_strand_intervals, load_gene_intervals
+        from genoray._reference import Reference
+
         if not isinstance(reference, Reference):
             reference = Reference.from_path(reference)
         if contigs is None:
@@ -156,6 +167,8 @@ class _MutcatMixin:
                 Also raised for ``"SBS192"``/``"SBS384"`` if the store has not been
                 strand-annotated (no on-disk ``strand.bin`` for every contig).
         """
+        from genoray._mutcat import N_CODES, code_ranges, labels
+
         if kind not in ("SBS96", "DBS78", "ID83", "SBS192", "SBS384"):
             raise ValueError(f"Unknown matrix kind {kind!r}.")
         if count not in ("allele", "sample"):
@@ -225,6 +238,12 @@ class _MutcatMixin:
             pl.DataFrame: One row per sample: ``Sample``, one column per signature, and
             ``cosine_similarity``.
         """
+        from genoray._signatures import (
+            _load_signature_file,
+            cosmic_signatures,
+            fit_signatures,
+        )
+
         if kind in ("SBS192", "SBS384"):
             raise NotImplementedError(
                 f"{kind} is a transcriptional-strand-bias catalog with no COSMIC "
