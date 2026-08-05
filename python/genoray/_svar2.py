@@ -127,11 +127,16 @@ def _normalize_svar2_regions(
     variants a region's POS/record/anchor-trimmed-extent must overlap) is
     applied downstream (Rust `query_window`/`parse_overlap_mode`), not here.
     """
-    from genoray._contigs import ContigNormalizer
-    from genoray._svar._regions import _normalize_regions
-
     if regions is None:
         return []
+
+    # Imported here rather than at function entry: `genoray._svar._regions`
+    # costs ~2.2s to import (seqpro -> numba/llvmlite, hirola, plus the SVAR1
+    # package __init__), and a conversion with no `regions=` -- the common case
+    # -- must not pay it. `_normalize_regions` genuinely needs that stack
+    # (`sp.bed.read` for BED input), so it stays there; only the ordering moves.
+    from genoray._contigs import ContigNormalizer
+    from genoray._svar._regions import _normalize_regions
 
     cnorm = ContigNormalizer(available_contigs)
 
@@ -548,11 +553,8 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         view in place is not supported).
         """
         from genoray._contigs import ContigNormalizer
-        from genoray._svar._regions import (
-            _normalize_regions,
-            _normalize_samples,
-            _validate_fields,
-        )
+        from genoray._sample_select import _normalize_samples
+        from genoray._svar._regions import _normalize_regions, _validate_fields
 
         output = Path(output)
         if reroute != "auto" and not isinstance(reroute, bool):
@@ -745,7 +747,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         `ValueError` even for a tiny cohort.
         """
         from cyvcf2 import VCF as _CyVCF
-        from genoray._svar._regions import _normalize_samples
+        from genoray._sample_select import _normalize_samples
 
         if regions_overlap not in {"pos", "record", "variant"}:
             raise ValueError(
@@ -994,7 +996,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         without touching call sites).
         """
         from genoray._pgen import _read_psam
-        from genoray._svar._regions import _normalize_samples
+        from genoray._sample_select import _normalize_samples
         from genoray._svar2_fields import _dosage_field_to_tuple
 
         if regions_overlap not in {"pos", "record", "variant"}:
@@ -1739,7 +1741,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         without touching call sites).
         """
         from genoray._svar import SparseVar
-        from genoray._svar._regions import _normalize_samples
+        from genoray._sample_select import _normalize_samples
 
         if regions_overlap not in {"pos", "record", "variant"}:
             raise ValueError(
