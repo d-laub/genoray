@@ -223,19 +223,99 @@ different:
   `n_contigs × n_dosage_fields` dosage readers — alive eagerly, constructed in
   Python before the pipeline starts, independent of `cc`.
 
+### Corpus: `vcfixture bulk` → BCF → `plink2` → PGEN
+
+The PGEN arm generates its corpus with the **`vcfixture-rs` `bulk` CLI**, not
+with `scale_corpus.py`. `scale_corpus.py` hand-writes VCF text in Python and
+pipes it through bgzip; `vcfixture bulk` streams from a `Profile` fitted against
+real data, which is what "human-genome-like" requires. The
+`germline-1kgp` profile is fitted on 3,202 samples / 73.6M variants and carries
+per-contig variant counts and `density_per_kb`, a gap distribution, the site
+frequency spectrum, variant-class mix, ti/tv, indel lengths, and missing/phased
+rates. Its site-frequency spectrum is rescaled to whatever `--samples` is asked
+for, so alt-allele density stays realistic at any cohort width.
+
+The whole recipe below was smoke-tested end-to-end at 100 samples / 20k records
+/ 3 contigs while writing this spec. Every claim in this section is an
+observation from that run, not an expectation.
+
+```
+vcfixture bulk --profile germline-1kgp --payload gt-only \
+  --contigs chrK --records N_K --seed <per-contig> --format bcf -o chrK.bcf   # per contig
+bcftools concat -O b -o corpus.bcf chr1.bcf ... chr22.bcf
+plink2 --bcf corpus.bcf --make-pgen --output-chr chrM --out corpus
+```
+
+Five findings that shape it, each verified:
+
+1. **Apportion contigs ourselves; do not use a single `--records` run.**
+   `--records` splits across contigs proportional to the profile's fitted
+   *`density_per_kb`*, which is nearly flat across the autosomes: a 22-contig
+   run measured **max/min = 1.38×**. The profile's own fitted `n_variants` are
+   skewed **6.07×** (chr2 6.09M vs chr21 1.00M). An even split is precisely what
+   `scale_corpus.py`'s existing comment warns hides the makespan tail — and
+   makespan skew is what longest-first dispatch exists to exploit, so a flat
+   corpus would make this spec's own feature unmeasurable. Apportion `N_K` from
+   the profile's `n_variants`, invoke `bulk` once per contig, and `bcftools
+   concat`. Generation is fast (220k records in 1.9 s), so per-contig invocation
+   costs nothing.
+
+2. **`plink2` strips the `chr` prefix by default — pass `--output-chr chrM`.**
+   Without it the emitted `.pvar` is internally inconsistent: `##contig=<ID=chr1>`
+   header lines are copied verbatim while data rows say `1`. `from_pgen` reads
+   contigs from the data rows, so the store's contigs would silently become
+   `1..22` while the source BCF's were `chr1..chr22`. Verified both ways.
+
+3. **The profile emits symbolic ALTs and they survive into the `.pvar`.** The
+   smoke corpus contained 24 `<DEL>` records; `plink2` passed all of them
+   through. Convert with `skip_out_of_scope=True` — verified to return exactly
+   24 — or filter them before `plink2`. The bench must use one, consistently,
+   and record which.
+
+4. **`--seed` makes output byte-identical regardless of thread count**, so a
+   corpus is deterministic and cacheable. Cache the BCF *and* the derived
+   `.pgen`/`.pvar`/`.psam`, keyed on
+   `(profile, samples, per-contig records, contigs, seed)`.
+
+5. **`--payload gt-only`** for the hardcall ladders. A dosage arm, if one is
+   wanted, uses `gt-vaf` plus a `plink2` dosage import; it is optional, because
+   `n_dosage` enters the law only through `chunk_bytes`, which the S/V ladders
+   already vary.
+
+**Binary resolution is a CI hazard, not a detail.** `plink2` and `bcftools` are
+already declared in `pixi.toml` (lines 56 and 21) and resolve inside the env.
+`vcfixture` does not. The `vcfixture` pinned in
+`pixi.toml:67` is the *PyPI* package (0.6.0), which ships **no console script** —
+verified: no `entry_points.txt`, no `bin/vcfixture` in the env. The `bulk` CLI
+is a separate Rust binary (`cargo install vcfixture --features cli`). A script
+that shells out to a bare `vcfixture` passes locally and fails in CI with
+`FileNotFoundError`. So: resolve via `$VCFIXTURE_BIN`, then `shutil.which`, and
+fail with an actionable install line; `skipif` any test that touches it on the
+binary being resolvable. Corpus generation is bench-only and never runs in CI.
+
+**Known coverage gap:** `germline-1kgp` has `multiallelic_rate = 0.0`, so this
+corpus does not exercise the multiallelic `allele_idx_offsets` path. That path
+is not what the RAM law models, so it does not invalidate the fit — but the
+fitted law should not be claimed to cover multiallelic-heavy cohorts. Record
+the limitation next to the coefficients.
+
 ### Harness work
 
-Add a PGEN arm to `scripts/bench_svar2`:
-
-- **Corpus.** Convert each generated VCF corpus to `.pgen` once with `plink2`
-  (already declared in `pixi.toml:56`), cached beside the VCF and regenerated
-  only when absent. Deterministic, so a corpus is reusable across runs.
-- **Plan family.** A `pgen` family in `plans/build_plans.py` over the same
-  S/V ladders the VCF RAM law was fitted on, so the two fits are comparable.
+- **Corpus module.** A `pgen_corpus.py` in `scripts/bench_svar2` implementing
+  the recipe above with caching.
+- **Plan family.** A `pgen` family in `plans/build_plans.py`. The ladders must
+  include **two V-ladders at different S**: a design that holds S×V constant
+  forces the cohort exponent to ≈1 arithmetically, which has already produced
+  one confidently-wrong published interval in this project's history.
 - **Fit.** Produce `RamLaw::PGEN` from the peak-RSS regression, reporting R² and
   n alongside the coefficients in the `budget.rs` doc comment, as `RamLaw::VCF`
   does.
 - **Sweep.** A `cc` axis at fixed `w = 1` to locate the wall-clock knee.
+
+Because the two corpora come from different generators, `RamLaw::PGEN` and
+`RamLaw::VCF` are **not** cross-comparable coefficient-by-coefficient. That is
+acceptable — each law is fitted on, and used for, its own backend. The spec
+does not claim otherwise, and neither should the doc comment.
 
 ### Protocol
 
@@ -329,5 +409,9 @@ the test exists to prove it does, not to assume it.
   decode is not the bottleneck.
 - `.pvar` INFO extraction. Still unimplemented, still out of scope.
 - The monolithic VCF fallback's planning (issue #152).
+- `scale_corpus.py` and the VCF corpus it generates. The PGEN arm adds a second,
+  independent corpus generator rather than retrofitting the first — the VCF RAM
+  law is already fitted against `scale_corpus.py` output, and changing that
+  generator would invalidate the fit currently shipping in production.
 - `from_vcf`'s concurrency. Only its `processing_threads`, via the shared
   `processing_threads_for` helper, and that change is tested.
