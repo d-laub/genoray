@@ -418,4 +418,6 @@ def test_build_cmd_defaults_to_vcf():
         threads=8,
         reps=1,
     )
-    assert "vcf" in _build_cmd(point, manifest, Path("/tmp/s.svar"))
+    cmd = _build_cmd(point, manifest, Path("/tmp/s.svar"))
+    assert "vcf" in cmd
+    assert "--skip-symbolics-and-breakends" not in cmd

@@ -214,6 +214,7 @@ def _point(
     threads: int,
     concurrent: int | None = None,
     rss_ceiling_mb: int | None = None,
+    backend: str = "vcf",
 ) -> SweepPoint:
     """One plan point. `rss_ceiling_mb` defaults to None -- see
     `OOM_PROBE_CEILING_MB` for why a ceiling is opt-in per point rather than a
@@ -228,12 +229,20 @@ def _point(
         threads=threads,
         reps=3,
         rss_ceiling_mb=rss_ceiling_mb,
+        backend=backend,
     )
 
 
 def build(corpus_dir: Path, threads: int) -> dict[str, list[SweepPoint]]:
-    scale, contig, holdout, vlinear, vlinear2, concurrency = [], [], [], [], [], []
-    pgen = []
+    scale, contig, holdout, vlinear, vlinear2, concurrency, pgen = (
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+    )
 
     for s in SCALE_SAMPLES:
         _, cs = size_corpus(s, CELLS_BUDGET)
@@ -347,32 +356,17 @@ def build(corpus_dir: Path, threads: int) -> dict[str, list[SweepPoint]]:
             # w is always 1: from_pgen pins P=1, so there is no reader-worker
             # axis to sweep. The RAM-law points leave concurrency unset so the
             # planner's own choice is what gets measured.
-            pgen.append(
-                SweepPoint(
-                    corpus=str(corpus),
-                    reader_workers=1,
-                    concurrent_chroms=None,
-                    shard_htslib=0,
-                    overshard=4,
-                    chunk_size=cs,
-                    threads=threads,
-                    reps=3,
-                    backend="pgen",
-                )
-            )
+            pgen.append(_point(corpus, 1, cs, threads, backend="pgen"))
     s_cc, v_cc = PGEN_CONCURRENCY_AT
     corpus_cc = corpus_dir / f"pgen_s{s_cc}_v{v_cc}.pgen"
     for cc in PGEN_CONCURRENCY:
         pgen.append(
-            SweepPoint(
-                corpus=str(corpus_cc),
-                reader_workers=1,
-                concurrent_chroms=cc,
-                shard_htslib=0,
-                overshard=4,
-                chunk_size=_chunk_size_for(v_cc),
-                threads=threads,
-                reps=3,
+            _point(
+                corpus_cc,
+                1,
+                _chunk_size_for(v_cc),
+                threads,
+                concurrent=cc,
                 backend="pgen",
             )
         )
