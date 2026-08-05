@@ -9,9 +9,9 @@ stripped from the child's environment, because a number measured with the
 planner overridden is not the number a user gets.
 
 A build is identified by its interpreter: each arm is a separate checkout with
-its own environment and its own `maturin develop --release`, and `--python`
-selects which one runs the conversion. Nothing else differs between arms --
-same corpus, same `--chunk-size`, same `-@`, same node, interleaved in time.
+its own environment and its own `maturin develop --release`, named and
+selected by `--arm NAME=PYTHON`. Nothing else differs between arms -- same
+corpus, same `--chunk-size`, same `-@`, same node, interleaved in time.
 
 Interleaving matters more than it looks: this cluster's nodes vary by 2.08x
 and are shared, so running all of arm A then all of arm B attributes any drift
