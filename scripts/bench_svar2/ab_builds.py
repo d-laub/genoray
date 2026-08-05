@@ -99,8 +99,13 @@ def run_once(
     store: Path,
     chunk_size: int,
     threads: int,
+    log: Path | None = None,
 ) -> tuple[int, float, float, float, str]:
-    """One conversion. Returns (status, wall_s, cpu_s, maxrss_mb, stderr)."""
+    """One conversion. Returns (status, wall_s, cpu_s, maxrss_mb, stderr).
+
+    `log` keeps the child's output even on success. The conversion logs the
+    plan it chose (`concurrent_chroms`, `reader_workers`) at info level, and
+    a result table without the plan that produced it cannot be acted on."""
     env = {k: v for k, v in os.environ.items() if k not in BENCH_ENV_VARS}
     cmd = [
         python,
@@ -133,10 +138,13 @@ def run_once(
     _, status, ru = os.wait4(proc.pid, 0)
     wall = time.perf_counter() - t0
     err = proc.stderr.read().decode(errors="replace") if proc.stderr else ""
+    out = proc.stdout.read().decode(errors="replace") if proc.stdout else ""
     if proc.stdout:
-        proc.stdout.read()
-    proc.stdout and proc.stdout.close()
-    proc.stderr and proc.stderr.close()
+        proc.stdout.close()
+    if proc.stderr:
+        proc.stderr.close()
+    if log is not None:
+        log.write_text(out + err)
     return status, wall, ru.ru_utime + ru.ru_stime, ru.ru_maxrss / 1024.0, err
 
 
@@ -180,7 +188,12 @@ def main() -> int:
             for name, python in arms:
                 store = a.outdir / f"{name}.svar"
                 status, wall, cpu, rss, err = run_once(
-                    python, Path(manifest["path"]), store, a.chunk_size, a.threads
+                    python,
+                    Path(manifest["path"]),
+                    store,
+                    a.chunk_size,
+                    a.threads,
+                    log=a.outdir / f"{name}_rep{rep}.log",
                 )
                 ok = status == 0
                 row = ArmResult(
