@@ -253,7 +253,7 @@ fn run_conversion_pipeline(
             let costs = crate::contig_cost::estimate_contig_costs(&vcf_path, &chroms);
             let ordered = crate::contig_cost::order_longest_first(&chroms, &costs);
 
-            // The RAM law (`RAM_KAPPA` etc., src/budget.rs) was fitted
+            // The RAM law (`RamLaw::VCF.kappa` etc., src/budget.rs) was fitted
             // against RESIDENT chunk bytes -- `min(chunk_size, variants)` --
             // not the nominal `chunk_size * per_variant_bytes`:
             // `BitGrid3::zeros` is `alloc_zeroed` (a calloc), so an oversized
@@ -299,7 +299,16 @@ fn run_conversion_pipeline(
                 orchestrator::bench_concurrent_chroms(sharded.concurrent_chroms);
             let htslib_threads = plan.htslib_threads; // monolithic path only
             let reader_workers = sharded.reader_workers;
-            let processing_threads = plan.processing_threads;
+            // Sized against the concurrency this path actually dispatches
+            // (`concurrent_chroms`, from `plan_sharded`) — NOT against
+            // `plan_thread_budget`'s own `concurrent_chroms`, which models the
+            // monolithic reader's 6-cores-per-contig shape and is only still
+            // consulted here for `htslib_threads`.
+            let processing_threads = crate::budget::processing_threads_for(
+                available_cores.saturating_sub(1).max(1),
+                concurrent_chroms,
+                reader_workers,
+            );
 
             let monolithic_reader_active =
                 concurrent_chroms * (crate::budget::PIPELINE_THREADS_PER_CHROM + htslib_threads);

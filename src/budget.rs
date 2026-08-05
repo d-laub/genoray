@@ -210,6 +210,21 @@ pub fn plan_sharded(inp: PlanInputs) -> Result<ShardedPlan, PlanError> {
     })
 }
 
+/// Cores left after the planned concurrency's executors and readers.
+///
+/// Sizes the merge tail — `merge.rs`'s var_key gather pool and
+/// `dense_merge`'s bit-transpose — which runs per contig once its pipeline
+/// drains. Both backends use this so the tail is sized against the
+/// concurrency actually dispatched, not against a different planner's
+/// hypothetical one.
+///
+/// Floors at 1: `rayon::ThreadPoolBuilder::num_threads(0)` means "use the
+/// global default", not "no threads", so returning 0 here would silently
+/// oversubscribe rather than serialize.
+pub fn processing_threads_for(usable_cores: usize, cc: usize, w: usize) -> usize {
+    usable_cores.saturating_sub(cc * (1 + w)).max(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -545,6 +560,22 @@ mod tests {
         assert_eq!(RamLaw::VCF.base_mb, 932.0);
         assert_eq!(RamLaw::VCF.per_sample_mb, 0.01115);
         assert_eq!(RamLaw::VCF.kappa, 1.371);
+    }
+
+    #[test]
+    fn processing_threads_for_returns_the_cores_left_after_executors_and_readers() {
+        // 47 usable, 11 contigs at (1 executor + 3 readers) = 44 spent, 3 left.
+        assert_eq!(processing_threads_for(47, 11, 3), 3);
+        // PGEN shape: w = 1, so each contig costs 2.
+        assert_eq!(processing_threads_for(47, 22, 1), 3);
+    }
+
+    #[test]
+    fn processing_threads_for_floors_at_one_when_oversubscribed() {
+        // Never 0: the merge tail must always get a usable thread count, and a
+        // rayon pool of 0 threads panics at build time.
+        assert_eq!(processing_threads_for(4, 8, 3), 1);
+        assert_eq!(processing_threads_for(1, 1, 1), 1);
     }
 
     #[test]
