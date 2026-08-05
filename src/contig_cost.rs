@@ -264,6 +264,25 @@ pub struct ContigCosts {
     pub exact_counts: bool,
 }
 
+impl ContigCosts {
+    /// Costs known exactly without probing any index.
+    ///
+    /// Used by the PGEN path, where the `.pvar` variant-index range
+    /// `[lo, hi)` for a contig IS its record count. Marked `exact_counts`
+    /// because these are genuine record counts, which is what licenses a
+    /// `min(chunk_size, records)` resident-chunk estimate downstream.
+    ///
+    /// Nothing here touches htslib, so none of this module's index-tier
+    /// hazards (tabix-vs-header id spaces, `hts_idx_get_stat` bounds) are
+    /// reachable through this constructor.
+    pub fn exact(values: HashMap<String, u64>) -> Self {
+        ContigCosts {
+            values,
+            exact_counts: true,
+        }
+    }
+}
+
 impl std::ops::Deref for ContigCosts {
     type Target = HashMap<String, u64>;
     fn deref(&self) -> &Self::Target {
@@ -526,6 +545,25 @@ mod tests {
                 vec!["chrA", "chrB", "chrC"]
             );
         }
+    }
+
+    #[test]
+    fn exact_marks_counts_as_exact_and_orders_longest_first() {
+        let mut m = HashMap::new();
+        m.insert("chr1".to_string(), 100u64);
+        m.insert("chr2".to_string(), 500u64);
+        m.insert("chr3".to_string(), 250u64);
+        let costs = ContigCosts::exact(m);
+
+        assert!(
+            costs.exact_counts,
+            "counts from .pvar ranges are exact record counts, not a fallback tier"
+        );
+        let chroms = vec!["chr1".to_string(), "chr2".to_string(), "chr3".to_string()];
+        assert_eq!(
+            order_longest_first(&chroms, &costs),
+            vec!["chr2".to_string(), "chr3".to_string(), "chr1".to_string()]
+        );
     }
 
     #[test]
