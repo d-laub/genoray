@@ -17,7 +17,7 @@ from __future__ import annotations
 import argparse
 import subprocess
 import zlib
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor
 from functools import partial
 from pathlib import Path
@@ -65,6 +65,42 @@ POOL_MEMORY_BUDGET = 32_000_000_000
 # seeding exists to guarantee.
 FMT_BLOCK_MEMORY_BUDGET = 2_000_000_000
 DEFAULT_CONTIG_LEN = 50_818_468  # GRCh38 chr22
+
+# GRCh38 primary-assembly autosome lengths (bp). These exist so a multi-contig
+# corpus can carry the LENGTH SKEW of a real human genome instead of splitting
+# variants evenly, which is what `generate` does by default.
+#
+# The skew is the point, not the realism: chr1 is 5.3x chr21, so a real
+# conversion's makespan is set by one contig that runs long after the rest have
+# drained. An even split hides that entirely -- every contig finishes at once,
+# so contig-level concurrency looks perfectly efficient and the tail that
+# actually bounds wall time never appears. Any measurement of `concurrent_chroms`
+# or of longest-first dispatch taken on an even split is measuring a workload
+# production never sees.
+GRCH38_AUTOSOME_LENGTHS: dict[str, int] = {
+    "chr1": 248_956_422,
+    "chr2": 242_193_529,
+    "chr3": 198_295_559,
+    "chr4": 190_214_555,
+    "chr5": 181_538_259,
+    "chr6": 170_805_979,
+    "chr7": 159_345_973,
+    "chr8": 145_138_636,
+    "chr9": 138_394_717,
+    "chr10": 133_797_422,
+    "chr11": 135_086_622,
+    "chr12": 133_275_309,
+    "chr13": 114_364_328,
+    "chr14": 107_043_718,
+    "chr15": 101_991_189,
+    "chr16": 90_338_345,
+    "chr17": 83_257_441,
+    "chr18": 80_373_285,
+    "chr19": 58_617_616,
+    "chr20": 64_444_167,
+    "chr21": 46_709_983,
+    "chr22": 50_818_468,
+}
 # Production reference: `_auto_chunk_size` clamps at 25_000 and `from_vcf`
 # hardcodes exactly that.
 MAX_CHUNK_SIZE = 25_000
@@ -147,6 +183,43 @@ def size_corpus(samples: int, cells_budget: int) -> tuple[int, int]:
     return variants, chunk_size
 
 
+def apportion_by_length(
+    contigs: Sequence[str], variants: int, lengths: Mapping[str, int]
+) -> dict[str, int]:
+    """Split `variants` across `contigs` in proportion to `lengths`.
+
+    Largest-remainder apportionment, so the counts sum to `variants` EXACTLY
+    rather than to `sum(floor(share))`. The uniform path deliberately keeps
+    its old floor-and-drop behaviour (`variants // n` each, remainder
+    discarded) because the committed regression baselines and the eleven
+    already-generated sweep corpora must stay byte-reproducible; this
+    function is only reached when a caller asks for skew.
+
+    Every contig gets at least one record. A contig declared in the header
+    with zero records is a genuinely different input -- it is the shape that
+    crashed `from_vcf_list` in #122 -- and silently generating one here would
+    conflate that case with a skew measurement, so an unsatisfiable request
+    raises instead.
+    """
+    total_len = sum(lengths[c] for c in contigs)
+    exact = {c: variants * lengths[c] / total_len for c in contigs}
+    counts = {c: int(exact[c]) for c in contigs}
+    # Hand out what flooring dropped, largest fractional part first. Ties break
+    # on contig name so the result does not depend on dict iteration order.
+    order = sorted(contigs, key=lambda c: (-(exact[c] - int(exact[c])), c))
+    for i in range(variants - sum(counts.values())):
+        counts[order[i]] += 1
+    empty = [c for c in contigs if counts[c] == 0]
+    if empty:
+        raise ValueError(
+            f"{variants} variants spread over {len(contigs)} contigs by length "
+            f"leaves {', '.join(empty)} with no records; raise --variants "
+            f"(the smallest contig's share is "
+            f"{min(lengths[c] for c in contigs) / total_len:.4%})"
+        )
+    return counts
+
+
 def _contig_key(contig: str) -> int:
     """Stable contig seed component. `hash()` is PYTHONHASHSEED-salted, so it
     would make corpora irreproducible across processes."""
@@ -154,17 +227,22 @@ def _contig_key(contig: str) -> int:
 
 
 def _format_block(
-    task: tuple[str, int, int],
+    task: tuple[str, int, int, int],
     *,
     n_samples: int,
     n_format: int,
     seed: int,
-    stride: int,
     block_variants: int,
 ) -> bytes:
     """Format one block of records. Module-level and keyword-bound via
-    `partial` so forkserver workers can import it by name."""
-    contig, block_index, n = task
+    `partial` so forkserver workers can import it by name.
+
+    `stride` rides on the TASK rather than the `partial` because a
+    length-skewed corpus gives every contig its own stride (records spread
+    across that contig's own declared length). On the uniform path every
+    task carries the same stride the `partial` used to hold, so the emitted
+    bytes are unchanged."""
+    contig, block_index, n, stride = task
     # Derive a per-block seed so output is independent of pool scheduling
     # order -- otherwise `procs` would change the bytes and break determinism.
     rng = np.random.default_rng([seed, _contig_key(contig), block_index])
@@ -243,28 +321,47 @@ def generate(
     seed: int,
     procs: int = 8,
     bgzip_threads: int = 4,
+    contig_lengths: Mapping[str, int] | None = None,
 ) -> CorpusManifest:
+    """Write a seed-deterministic bgzipped VCF and its tabix index.
+
+    `contig_lengths` opts into LENGTH SKEW: variants are apportioned across
+    `contigs` in proportion to the given lengths, and each contig declares its
+    own length. Pass `GRCH38_AUTOSOME_LENGTHS` for a human-genome-shaped
+    corpus. Default (`None`) keeps the historical uniform split -- every
+    contig gets `variants // n_contigs` records inside a `DEFAULT_CONTIG_LEN`
+    span -- which every committed regression baseline was recorded against.
+    """
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
     contigs = list(contigs)
     n_format = len(format_fields)
 
-    per_contig = variants // len(contigs)
-    total = per_contig * len(contigs)
-    # Run-level stride derived from the per-contig total (not BLOCK_VARIANTS)
-    # so positions stay within the declared contig length regardless of how
-    # many blocks a contig is split into.
-    stride = max(1, DEFAULT_CONTIG_LEN // max(per_contig, 1))
-    # When stride floors to 1 (per_contig > DEFAULT_CONTIG_LEN), positions run
-    # past DEFAULT_CONTIG_LEN. Declare a truthful length instead of rejecting
-    # the input -- a small-cohort/high-variant corpus is a legitimate ask.
+    if contig_lengths is None:
+        counts = {c: variants // len(contigs) for c in contigs}
+        base_len = {c: DEFAULT_CONTIG_LEN for c in contigs}
+    else:
+        missing = [c for c in contigs if c not in contig_lengths]
+        if missing:
+            raise ValueError(f"no length given for contig(s): {', '.join(missing)}")
+        counts = apportion_by_length(contigs, variants, contig_lengths)
+        base_len = {c: contig_lengths[c] for c in contigs}
+    total = sum(counts.values())
+
+    # Per-contig stride derived from that contig's own record total (not
+    # BLOCK_VARIANTS) so positions stay within its declared length regardless
+    # of how many blocks it is split into.
+    stride = {c: max(1, base_len[c] // max(counts[c], 1)) for c in contigs}
+    # When stride floors to 1 (count > base length), positions run past that
+    # length. Declare a truthful length instead of rejecting the input -- a
+    # small-cohort/high-variant corpus is a legitimate ask.
     # Block b starts at b * block_variants * stride + 1 and adds at most
     # n_b * stride, where n_b is that block's record count; block sizes sum
-    # to per_contig by construction (tasks below split per_contig into
+    # to the contig's count by construction (tasks below split it into
     # blocks of at most block_variants). So the true upper bound on POS
-    # across all blocks is per_contig * stride, independent of how per_contig
+    # across all blocks is count * stride, independent of how the count
     # happens to be chunked into blocks. This collapses to exactly
-    # DEFAULT_CONTIG_LEN in every regime that already worked.
+    # DEFAULT_CONTIG_LEN in every uniform regime that already worked.
     #
     # This bound requires the stripe width to BE `block_variants` -- the size
     # blocks are actually cut at -- not the `BLOCK_VARIANTS` constant. Striping
@@ -273,11 +370,11 @@ def generate(
     # `n_blocks * BLOCK_VARIANTS * stride`, far past `contig_len`; tabix then
     # rejects the corpus only after all of it has been written. See
     # `_block_positions`.
-    contig_len = max(DEFAULT_CONTIG_LEN, per_contig * stride + 1)
+    contig_len = {c: max(base_len[c], counts[c] * stride[c] + 1) for c in contigs}
 
     header = ["##fileformat=VCFv4.2"]
     for c in contigs:
-        header.append(f"##contig=<ID={c},length={contig_len}>")
+        header.append(f"##contig=<ID={c},length={contig_len[c]}>")
     header.append('##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">')
     if n_format:
         header.append('##FORMAT=<ID=DP,Number=1,Type=Integer,Description="Depth">')
@@ -293,19 +390,24 @@ def generate(
         + "\t".join(sample_names)
     )
 
+    # `plan_blocks`'s memory bound depends only on `block_variants` and the
+    # cohort width, so the LARGEST contig is the one that has to fit; its
+    # `n_tasks` is only an upper bound under skew, and `procs` is re-capped at
+    # the true task count below.
     block_variants, procs = plan_blocks(
-        per_contig, len(contigs), samples, n_format, procs
+        max(counts.values()), len(contigs), samples, n_format, procs
     )
 
-    tasks: list[tuple[str, int, int]] = []
+    tasks: list[tuple[str, int, int, int]] = []
     for c in contigs:
-        remaining = per_contig
+        remaining = counts[c]
         bi = 0
         while remaining > 0:
             n = min(block_variants, remaining)
-            tasks.append((c, bi, n))
+            tasks.append((c, bi, n, stride[c]))
             remaining -= n
             bi += 1
+    procs = max(1, min(procs, len(tasks)))
 
     with out.open("wb") as sink:
         bg = subprocess.Popen(
@@ -320,7 +422,6 @@ def generate(
             n_samples=samples,
             n_format=n_format,
             seed=seed,
-            stride=stride,
             block_variants=block_variants,
         )
         if procs > 1:
@@ -380,7 +481,21 @@ def main() -> None:
     p.add_argument("--samples", type=int, required=True)
     p.add_argument("--variants", type=int)
     p.add_argument("--cells-budget", type=int, default=1_400_000_000)
-    p.add_argument("--contigs", type=str, default="chr22")
+    p.add_argument(
+        "--contigs",
+        type=str,
+        default="chr22",
+        help="comma-separated contig names, or 'human' for GRCh38 chr1..chr22",
+    )
+    p.add_argument(
+        "--contig-lengths",
+        choices=("uniform", "grch38"),
+        default="uniform",
+        help="'uniform' splits variants evenly (the historical default, which "
+        "the committed baselines were recorded against); 'grch38' apportions "
+        "them by real chromosome length, giving the corpus a human contig-size "
+        "skew. Implied by --contigs human.",
+    )
     p.add_argument("--format-fields", type=str, default="")
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--procs", type=int, default=8)
@@ -391,15 +506,22 @@ def main() -> None:
     if variants is None:
         variants, _ = size_corpus(a.samples, a.cells_budget)
     fields = tuple(f for f in a.format_fields.split(",") if f)
+    if a.contigs == "human":
+        contigs = list(GRCH38_AUTOSOME_LENGTHS)
+        lengths = GRCH38_AUTOSOME_LENGTHS
+    else:
+        contigs = a.contigs.split(",")
+        lengths = GRCH38_AUTOSOME_LENGTHS if a.contig_lengths == "grch38" else None
     m = generate(
         a.out,
         a.samples,
         variants,
-        a.contigs.split(","),
+        contigs,
         fields,
         a.seed,
         a.procs,
         a.bgzip_threads,
+        contig_lengths=lengths,
     )
     print(
         f"wrote {m.path}: {m.variants} variants x {m.samples} samples "

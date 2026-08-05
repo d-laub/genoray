@@ -360,3 +360,96 @@ def test_sub_block_positions_stay_inside_the_declared_contig(tmp_path, monkeypat
         bgzip_threads=2,
     )
     assert out.read_bytes() == serial.read_bytes()
+
+
+def test_apportion_by_length_sums_exactly_and_tracks_length():
+    """Largest-remainder, so the counts sum to the request rather than to
+    `sum(floor(share))` -- a corpus that quietly generates fewer variants than
+    asked makes a shape comparison meaningless."""
+    lengths = scale_corpus.GRCH38_AUTOSOME_LENGTHS
+    contigs = list(lengths)
+    counts = scale_corpus.apportion_by_length(contigs, 100_000, lengths)
+    assert sum(counts.values()) == 100_000
+    # Ordering by count must reproduce ordering by length.
+    assert sorted(contigs, key=lambda c: -counts[c]) == sorted(
+        contigs, key=lambda c: -lengths[c]
+    )
+    # chr1 / chr21 = 248_956_422 / 46_709_983 = 5.33
+    assert 5.2 < counts["chr1"] / counts["chr21"] < 5.5
+
+
+def test_apportion_by_length_rejects_a_contig_it_cannot_fill():
+    """A header contig with zero records is the shape that crashed
+    `from_vcf_list` in #122, not a skew datum. Raise rather than emit it."""
+    lengths = scale_corpus.GRCH38_AUTOSOME_LENGTHS
+    with pytest.raises(ValueError, match="no records"):
+        scale_corpus.apportion_by_length(list(lengths), 25, lengths)
+
+
+def test_uniform_split_ignores_contig_lengths(tmp_path):
+    """The default path must keep splitting evenly inside DEFAULT_CONTIG_LEN.
+    Every committed regression baseline and the already-generated sweep
+    corpora were recorded against exactly this behaviour."""
+    generate(
+        tmp_path / "u.vcf.gz",
+        samples=2,
+        variants=400,
+        contigs=["chr1", "chr21"],
+        format_fields=(),
+        seed=11,
+        procs=1,
+        bgzip_threads=1,
+    )
+    hdr = subprocess.run(
+        ["bcftools", "view", "-h", str(tmp_path / "u.vcf.gz")],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    for c in ("chr1", "chr21"):
+        assert f"##contig=<ID={c},length={scale_corpus.DEFAULT_CONTIG_LEN}>" in hdr
+    per = _index_counts(tmp_path / "u.vcf.gz")
+    assert per == {"chr1": 200, "chr21": 200}
+
+
+def test_grch38_lengths_give_the_corpus_a_human_skew(tmp_path):
+    m = generate(
+        tmp_path / "s.vcf.gz",
+        samples=2,
+        variants=20_000,
+        contigs=["chr1", "chr11", "chr21"],
+        format_fields=(),
+        seed=13,
+        procs=1,
+        bgzip_threads=1,
+        contig_lengths=scale_corpus.GRCH38_AUTOSOME_LENGTHS,
+    )
+    per = _index_counts(tmp_path / "s.vcf.gz")
+    assert sum(per.values()) == m.variants == 20_000
+    assert per["chr1"] > per["chr11"] > per["chr21"]
+    hdr = subprocess.run(
+        ["bcftools", "view", "-h", str(tmp_path / "s.vcf.gz")],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    # Each contig declares its OWN length, not a single shared one -- tabix
+    # rejects records past the declared end, and the planner's fallback tier
+    # reads these lengths as a cost proxy.
+    for c in ("chr1", "chr11", "chr21"):
+        n = scale_corpus.GRCH38_AUTOSOME_LENGTHS[c]
+        assert f"##contig=<ID={c},length={n}>" in hdr
+
+
+def _index_counts(path) -> dict[str, int]:
+    out = subprocess.run(
+        ["bcftools", "index", "-s", str(path)],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    return {
+        line.split("\t")[0]: int(line.split("\t")[2])
+        for line in out.splitlines()
+        if line.strip()
+    }
