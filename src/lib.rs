@@ -287,6 +287,7 @@ fn run_conversion_pipeline(
                 chunk_bytes,
                 max_mem_bytes,
                 reader_workers: DEFAULT_READER_WORKERS,
+                ram: crate::budget::RamLaw::VCF,
             });
             let sharded = match sharded {
                 Ok(p) => p,

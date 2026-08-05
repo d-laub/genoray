@@ -95,19 +95,32 @@ fn reader_workers(usable_cores: usize, concurrent: usize) -> usize {
         .max(1)
 }
 
-// Peak-RSS coefficients from the scale-bench RAM law, fitted 2026-08-03:
-//   peak_rss_mb ~ 932 + 0.01115*samples + 1.371*(w+pending)*chunk_bytes
-//   R^2 = 0.9040, n = 44
-// See docs/superpowers/specs/2026-08-03-svar2-tuned-load-balancing-design.md.
-// These are load-bearing in production, not just in the bench: a bad refit
-// becomes an OOM. Change them only alongside a refit that says so.
-pub const RAM_BASE_MB: f64 = 932.0;
-pub const RAM_PER_SAMPLE_MB: f64 = 0.01115;
-pub const RAM_KAPPA: f64 = 1.371;
+/// Fitted peak-RSS coefficients for one conversion backend:
+///   peak_rss_mb ~ base_mb + per_sample_mb*samples + kappa*(w+pending)*chunk_bytes
+///
+/// These are load-bearing in production, not just in the bench: a bad refit
+/// becomes an OOM. Change a law only alongside a refit that says so, and
+/// record that refit's R^2 and n in the constant's doc comment.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RamLaw {
+    pub base_mb: f64,
+    pub per_sample_mb: f64,
+    pub kappa: f64,
+}
+
+impl RamLaw {
+    /// Sharded VCF path. Fitted 2026-08-03, R^2 = 0.9040, n = 44.
+    /// See docs/superpowers/specs/2026-08-03-svar2-tuned-load-balancing-design.md.
+    pub const VCF: RamLaw = RamLaw {
+        base_mb: 932.0,
+        per_sample_mb: 0.01115,
+        kappa: 1.371,
+    };
+}
 
 /// Inputs to the sharded-VCF concurrency plan. Every field is data the caller
 /// already has before opening a single record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PlanInputs {
     pub usable_cores: usize,
     pub n_contigs: usize,
@@ -118,6 +131,8 @@ pub struct PlanInputs {
     /// `None` means the caller declined a budget; only the core bound applies.
     pub max_mem_bytes: Option<u64>,
     pub reader_workers: usize,
+    /// Which backend's fitted peak-RSS law to plan against.
+    pub ram: RamLaw,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,9 +188,10 @@ pub fn plan_sharded(inp: PlanInputs) -> Result<ShardedPlan, PlanError> {
         None => std::cmp::min(core_bound, n_contigs),
         Some(budget) => {
             let budget_mb = budget as f64 / 1e6;
-            let baseline_mb = RAM_BASE_MB + RAM_PER_SAMPLE_MB * inp.n_samples as f64;
+            let baseline_mb = inp.ram.base_mb + inp.ram.per_sample_mb * inp.n_samples as f64;
             let pending = w.saturating_sub(1);
-            let per_contig_mb = RAM_KAPPA * (w + pending) as f64 * (inp.chunk_bytes as f64 / 1e6);
+            let per_contig_mb =
+                inp.ram.kappa * (w + pending) as f64 * (inp.chunk_bytes as f64 / 1e6);
             let headroom_mb = budget_mb - baseline_mb;
             if headroom_mb < per_contig_mb {
                 return Err(PlanError::InsufficientMemory {
@@ -326,6 +342,7 @@ mod tests {
             chunk_bytes: 10_937_000,
             max_mem_bytes: None,
             reader_workers: 2,
+            ram: RamLaw::VCF,
         })
         .unwrap();
         assert_eq!(
@@ -347,6 +364,7 @@ mod tests {
             chunk_bytes: 10_937_000,
             max_mem_bytes: None,
             reader_workers: 2,
+            ram: RamLaw::VCF,
         })
         .unwrap();
         assert_eq!(
@@ -374,6 +392,7 @@ mod tests {
             chunk_bytes: 3_125_000_000,
             max_mem_bytes: Some(52_428 * 1_000_000),
             reader_workers: 2,
+            ram: RamLaw::VCF,
         })
         .unwrap();
         assert_eq!(
@@ -397,6 +416,7 @@ mod tests {
             chunk_bytes: 3_125_000_000,
             max_mem_bytes: Some(5_000 * 1_000_000),
             reader_workers: 2,
+            ram: RamLaw::VCF,
         })
         .unwrap_err();
         match err {
@@ -422,6 +442,7 @@ mod tests {
             chunk_bytes: 1_000,
             max_mem_bytes: Some(1_000_000), // 1 MB -- far below the cohort baseline
             reader_workers: 2,
+            ram: RamLaw::VCF,
         })
         .unwrap_err();
         let msg = err.to_string();
@@ -444,6 +465,7 @@ mod tests {
             chunk_bytes: 64_000,
             max_mem_bytes: None,
             reader_workers: 4,
+            ram: RamLaw::VCF,
         })
         .unwrap();
         assert_eq!(
@@ -465,6 +487,7 @@ mod tests {
             chunk_bytes: 64_000,
             max_mem_bytes: None,
             reader_workers: 2,
+            ram: RamLaw::VCF,
         })
         .unwrap();
         assert_eq!(
@@ -498,6 +521,7 @@ mod tests {
             chunk_bytes: 10_000_000,
             max_mem_bytes: Some(1_200_000_000),
             reader_workers: 16,
+            ram: RamLaw::VCF,
         };
         assert!(matches!(
             plan_sharded(inp),
@@ -514,5 +538,44 @@ mod tests {
                 reader_workers: 3,
             }
         );
+    }
+
+    #[test]
+    fn ram_law_vcf_reproduces_the_fitted_coefficients() {
+        assert_eq!(RamLaw::VCF.base_mb, 932.0);
+        assert_eq!(RamLaw::VCF.per_sample_mb, 0.01115);
+        assert_eq!(RamLaw::VCF.kappa, 1.371);
+    }
+
+    #[test]
+    fn plan_sharded_uses_the_supplied_ram_law_not_a_global() {
+        // Two identical inputs differing ONLY in the law: a law with twice the
+        // kappa must halve the memory-bound concurrency. If plan_sharded still
+        // read module constants, both would return the same cc. Budget is
+        // sized (3 GB) so the memory bound -- not the core bound of 32 -- is
+        // the binding constraint in both arms.
+        let base = PlanInputs {
+            usable_cores: 64,
+            n_contigs: 32,
+            n_samples: 1_000,
+            chunk_bytes: 100_000_000,
+            max_mem_bytes: Some(3_000_000_000),
+            reader_workers: 1,
+            ram: RamLaw {
+                base_mb: 1000.0,
+                per_sample_mb: 0.0,
+                kappa: 1.0,
+            },
+        };
+        let doubled = PlanInputs {
+            ram: RamLaw {
+                kappa: 2.0,
+                ..base.ram
+            },
+            ..base
+        };
+        let a = plan_sharded(base).unwrap().concurrent_chroms;
+        let b = plan_sharded(doubled).unwrap().concurrent_chroms;
+        assert_eq!(a, 2 * b, "cc must scale inversely with kappa: {a} vs {b}");
     }
 }
