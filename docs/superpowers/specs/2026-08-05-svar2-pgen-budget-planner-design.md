@@ -240,25 +240,36 @@ The whole recipe below was smoke-tested end-to-end at 100 samples / 20k records
 observation from that run, not an expectation.
 
 ```
-vcfixture bulk --profile germline-1kgp --payload gt-only \
-  --contigs chrK --records N_K --seed <per-contig> --format bcf -o chrK.bcf   # per contig
-bcftools concat -O b -o corpus.bcf chr1.bcf ... chr22.bcf
+vcfixture bulk --profile germline-1kgp-varskew.json --payload gt-only \
+  --samples S --contigs chr1,...,chr22 --records V --seed N --format bcf -o corpus.bcf
 plink2 --bcf corpus.bcf --make-pgen --output-chr chrM --out corpus
 ```
 
 Five findings that shape it, each verified:
 
-1. **Apportion contigs ourselves; do not use a single `--records` run.**
+1. **The corpus needs a derived profile, committed to the bench directory.**
    `--records` splits across contigs proportional to the profile's fitted
    *`density_per_kb`*, which is nearly flat across the autosomes: a 22-contig
    run measured **max/min = 1.38×**. The profile's own fitted `n_variants` are
-   skewed **6.07×** (chr2 6.09M vs chr21 1.00M). An even split is precisely what
+   skewed **6.07×** (chr2 6.09M vs chr21 1.00M). A flat corpus is exactly what
    `scale_corpus.py`'s existing comment warns hides the makespan tail — and
-   makespan skew is what longest-first dispatch exists to exploit, so a flat
-   corpus would make this spec's own feature unmeasurable. Apportion `N_K` from
-   the profile's `n_variants`, invoke `bulk` once per contig, and `bcftools
-   concat`. Generation is fast (220k records in 1.9 s), so per-contig invocation
-   costs nothing.
+   makespan skew is what longest-first dispatch exists to exploit, so it would
+   make this spec's own feature unmeasurable.
+
+   The fix is a one-time transform, not per-contig invocation.
+   `density_per_kb` is read in **exactly one place** in `vcfixture` —
+   `distribute_by_density` — and nothing else (positions, gaps, SFS, and class
+   mix all ignore it). So a derived profile JSON whose `density_per_kb` is
+   rescaled to the fitted `n_variants` makes a single `--records` run reproduce
+   real 1kGP proportions. Measured: **max/min 6.071 against a true 6.072**, with
+   every per-contig share matching to two decimal places. One invocation, no
+   `bcftools concat`, no multi-file bookkeeping.
+
+   Commit the derived profile (~4 KB) as
+   `scripts/bench_svar2/profiles/germline-1kgp-varskew.json`, carrying its
+   provenance (source profile, its fit date, the `vcfixture` version used).
+   Freezing it is deliberate: a fitted RAM law wants a *frozen* corpus
+   distribution, not one that shifts silently when upstream refits the profile.
 
 2. **`plink2` strips the `chr` prefix by default — pass `--output-chr chrM`.**
    Without it the emitted `.pvar` is internally inconsistent: `##contig=<ID=chr1>`
@@ -282,16 +293,30 @@ Five findings that shape it, each verified:
    `n_dosage` enters the law only through `chunk_bytes`, which the S/V ladders
    already vary.
 
-**Binary resolution is a CI hazard, not a detail.** `plink2` and `bcftools` are
-already declared in `pixi.toml` (lines 56 and 21) and resolve inside the env.
-`vcfixture` does not. The `vcfixture` pinned in
-`pixi.toml:67` is the *PyPI* package (0.6.0), which ships **no console script** —
-verified: no `entry_points.txt`, no `bin/vcfixture` in the env. The `bulk` CLI
-is a separate Rust binary (`cargo install vcfixture --features cli`). A script
-that shells out to a bare `vcfixture` passes locally and fails in CI with
-`FileNotFoundError`. So: resolve via `$VCFIXTURE_BIN`, then `shutil.which`, and
-fail with an actionable install line; `skipif` any test that touches it on the
-binary being resolvable. Corpus generation is bench-only and never runs in CI.
+**Binary resolution is a CI hazard, not a detail.** `plink2` is already declared
+in `pixi.toml:56` and resolves inside the env. `vcfixture` does not. The
+`vcfixture` pinned in `pixi.toml:67` is the *PyPI* package (0.6.0), which ships
+**no console script** — verified: no `entry_points.txt`, no `bin/vcfixture` in
+the env. The `bulk` CLI is a separate Rust binary
+(`cargo install vcfixture --features cli`). A script that shells out to a bare
+`vcfixture` passes locally and fails in CI with `FileNotFoundError`. So: resolve
+via `$VCFIXTURE_BIN`, then `shutil.which`, and fail with an actionable install
+line; `skipif` any test that touches it on the binary being resolvable. Corpus
+generation is bench-only and never runs in CI.
+
+**Rejected: adding `vcfixture` as a Cargo dependency of `genoray`.** Considered
+and turned down for three reasons. (a) A `[dev-dependencies]` entry supplies the
+*library* to Rust code; it does not put a binary on `PATH`, so the Python bench
+script would still need a genoray-owned Rust bin to wrap it — and would then
+shell to `cargo run`, requiring a Rust toolchain in the bench env, where `rust`
+is currently only in `feature.lint`. (b) Cargo dev-dependencies cannot be
+optional, so every `cargo test --no-default-features --features conversion` run
+would compile `noodles-bcf`, `serde`, `rayon`, and `tempfile` for a bench-only
+capability; avoiding that needs an optional regular dependency behind a
+`bench-corpus` feature plus a feature-gated bin, which is more machinery than
+the committed-profile approach. (c) The reproducibility it would buy is better
+served by the committed derived profile plus a pinned seed, which travels with
+the corpus rather than living in `Cargo.lock`.
 
 **Known coverage gap:** `germline-1kgp` has `multiallelic_rate = 0.0`, so this
 corpus does not exercise the multiallelic `allele_idx_offsets` path. That path
@@ -302,7 +327,10 @@ the limitation next to the coefficients.
 ### Harness work
 
 - **Corpus module.** A `pgen_corpus.py` in `scripts/bench_svar2` implementing
-  the recipe above with caching.
+  the recipe above with caching, plus the committed derived profile at
+  `scripts/bench_svar2/profiles/germline-1kgp-varskew.json` and a small script
+  that regenerates it from an upstream profile so the rescaling is reproducible
+  rather than a hand-edited blob.
 - **Plan family.** A `pgen` family in `plans/build_plans.py`. The ladders must
   include **two V-ladders at different S**: a design that holds S×V constant
   forces the cohort exponent to ≈1 arithmetically, which has already produced
