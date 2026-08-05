@@ -446,8 +446,8 @@ mod tests {
         // while it is `Some` here, tracing events emitted by ANY concurrently
         // running test in ANY module -- not just this file's -- route into
         // `rx` too (e.g. `contig_cost::estimate_contig_costs`'s
-        // `tracing::debug!`, or `tune::probe_rates`'s reader-stage logging,
-        // both exercised by their own modules' tests, which `cargo test`
+        // `tracing::debug!`, or `merge`'s gather-tiling logging, both
+        // exercised by their own modules' tests, which `cargo test`
         // happily runs on other threads at the same moment). `TEST_LOCK`
         // only serializes *this file's* tests against each other; it does
         // nothing about that cross-module traffic. Filtering on `target ==
@@ -494,7 +494,7 @@ mod tests {
         let sink = EventSink::new(tx, 1);
         // See the identical comment in `channel_layer_routes_events_at_level`:
         // `CURRENT_SINK` is process-global, so foreign modules' concurrently
-        // running tests (`contig_cost`, `tune`, ...) can leak `tracing::*!`
+        // running tests (`contig_cost`, `merge`, ...) can leak `tracing::*!`
         // events into `rx` while it is live. Filtering on `target ==
         // module_path!()` isolates this test's own events -- the spawned
         // thread's `tracing::info!` call below is textually inside this same

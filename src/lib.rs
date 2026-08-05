@@ -112,8 +112,6 @@ pub mod svar2_view;
 // as `crate::trace::...` without needing `pub`.
 #[cfg(feature = "conversion")]
 mod trace;
-#[cfg(feature = "conversion")]
-pub mod tune;
 pub mod types;
 #[cfg(feature = "conversion")]
 pub mod vcf_list_reader;
@@ -149,6 +147,14 @@ fn index_vcf(path: String) -> PyResult<()> {
 // the low end because the executor is the bottleneck, not the reader, and
 // surplus readers steal cores from *other* concurrently-dispatched contigs'
 // executors rather than speeding up their own.
+//
+// This is the ONLY source of the per-contig reader count. An opt-in runtime
+// probe (`tune=`) that measured `t_read`/`t_exec` on the actual input and
+// derived `w` from the ratio was built and then removed: it re-read a prefix
+// of the largest contig before every dispatch, and the ratio it recovered
+// landed inside the fitted knee often enough that it never paid for that
+// read. Keep the fitted value; if it ever needs to move, move it here rather
+// than reintroducing a per-run measurement.
 #[cfg(feature = "conversion")]
 const DEFAULT_READER_WORKERS: usize = 3;
 
@@ -157,7 +163,7 @@ const DEFAULT_READER_WORKERS: usize = 3;
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 #[pyfunction]
-#[pyo3(signature = (vcf_path, reference_path, chroms, output_dir, samples, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false, signatures=false, info_fields=Vec::new(), format_fields=Vec::new(), check_ref="e".to_string(), region_ranges=Vec::new(), regions_overlap="pos".to_string(), max_mem_bytes=None, tune=false, log_level = "info".to_string(), receiver = None))]
+#[pyo3(signature = (vcf_path, reference_path, chroms, output_dir, samples, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false, signatures=false, info_fields=Vec::new(), format_fields=Vec::new(), check_ref="e".to_string(), region_ranges=Vec::new(), regions_overlap="pos".to_string(), max_mem_bytes=None, log_level = "info".to_string(), receiver = None))]
 fn run_conversion_pipeline(
     py: Python,
     vcf_path: String,
@@ -177,7 +183,6 @@ fn run_conversion_pipeline(
     region_ranges: Vec<(String, u32, u32)>,
     regions_overlap: String,
     max_mem_bytes: Option<u64>,
-    tune: bool,
     log_level: String,
     receiver: Option<Py<PyEventReceiver>>,
 ) -> PyResult<usize> {
@@ -241,11 +246,10 @@ fn run_conversion_pipeline(
             let per_variant_bytes =
                 (samples.len() * ploidy / 8 + n_format * samples.len() * 4) as u64;
 
-            // Longest-first cost estimate, computed once and reused for both
-            // the tune probe's target contig (below, if `tune`) and the
-            // dispatch order (Step 3): `estimate_contig_costs` opens the VCF
-            // and its index, so computing it twice would double that I/O for
-            // every conversion, tuned or not.
+            // Longest-first cost estimate for the dispatch order (Step 3),
+            // computed once: `estimate_contig_costs` opens the VCF and its
+            // index, so computing it twice would double that I/O for every
+            // conversion.
             let costs = crate::contig_cost::estimate_contig_costs(&vcf_path, &chroms);
             let ordered = crate::contig_cost::order_longest_first(&chroms, &costs);
 
@@ -276,61 +280,14 @@ fn run_conversion_pipeline(
             };
             let chunk_bytes = per_variant_bytes * resident_chunk_size as u64;
 
-            let reader_workers = if tune {
-                // Probe the LARGEST contig: it dominates the makespan, so its
-                // rates are the ones worth matching.
-                match ordered.first() {
-                    Some(c) => match crate::tune::probe_rates(
-                        &vcf_path,
-                        c,
-                        &sample_refs,
-                        chunk_size,
-                        ploidy,
-                        &fields,
-                        reference_path.as_deref(),
-                    ) {
-                        Ok(rates) => {
-                            let w = crate::tune::workers_from_rates(&rates);
-                            tracing::info!(
-                                t_read_s = rates.t_read_s,
-                                t_exec_s = rates.t_exec_s,
-                                reader_workers = w,
-                                "tuned reader workers from probe"
-                            );
-                            w
-                        }
-                        Err(e) => {
-                            // A failed probe must not fail the conversion; it
-                            // is an optimization, and the planner's default is
-                            // a measured knee, not a guess.
-                            tracing::warn!(error = %e, "probe failed; using default reader workers");
-                            DEFAULT_READER_WORKERS
-                        }
-                    },
-                    None => DEFAULT_READER_WORKERS,
-                }
-            } else {
-                DEFAULT_READER_WORKERS
-            };
-
-            // `plan_sharded_tuned` (not `plan_sharded` directly): a probed
-            // `reader_workers` must stay a pure optimization, per `tune`'s
-            // docs -- if the tuned count blows the memory budget it falls
-            // back to `DEFAULT_READER_WORKERS` and warns rather than
-            // failing a conversion that would have succeeded untuned. A
-            // no-op when `tune=false`, since `reader_workers` already
-            // equals `DEFAULT_READER_WORKERS` in that case.
-            let sharded = crate::budget::plan_sharded_tuned(
-                crate::budget::PlanInputs {
-                    usable_cores: available_cores.saturating_sub(1).max(1),
-                    n_contigs: chroms.len(),
-                    n_samples: samples.len(),
-                    chunk_bytes,
-                    max_mem_bytes,
-                    reader_workers,
-                },
-                DEFAULT_READER_WORKERS,
-            );
+            let sharded = crate::budget::plan_sharded(crate::budget::PlanInputs {
+                usable_cores: available_cores.saturating_sub(1).max(1),
+                n_contigs: chroms.len(),
+                n_samples: samples.len(),
+                chunk_bytes,
+                max_mem_bytes,
+                reader_workers: DEFAULT_READER_WORKERS,
+            });
             let sharded = match sharded {
                 Ok(p) => p,
                 Err(e) => return vec![Err(crate::error::ConversionError::from(e))],
