@@ -25,6 +25,9 @@ Gotchas, all measured rather than assumed:
 - germline-1kgp has multiallelic_rate 0.0, so this corpus does NOT exercise
   the multiallelic allele_idx_offsets path. The fitted law should not be
   claimed to cover multiallelic-heavy cohorts.
+- The `vcfixture` bulk CLI is a separate Rust binary, NOT the PyPI
+  `vcfixture` package pinned in pixi.toml (which ships no console script).
+  Its absence must SKIP a test, not fail it -- see `resolve_vcfixture`.
 """
 
 from __future__ import annotations
