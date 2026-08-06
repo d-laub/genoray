@@ -425,7 +425,7 @@ fn run_conversion_pipeline(
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 #[pyfunction]
-#[pyo3(signature = (pgen_path, pvar_path, reference_path, chroms, contig_ranges, output_dir, samples, chunk_size, max_threads, long_allele_capacity, skip_out_of_scope, signatures, dosage_fields, readers, dosage_readers, check_ref, region_ranges, regions_overlap, sample_perm, log_level = "info".to_string(), receiver = None))]
+#[pyo3(signature = (pgen_path, pvar_path, reference_path, chroms, contig_ranges, output_dir, samples, chunk_size, max_threads, long_allele_capacity, skip_out_of_scope, signatures, dosage_fields, readers, dosage_readers, check_ref, region_ranges, regions_overlap, sample_perm, max_mem_bytes=None, log_level = "info".to_string(), receiver = None))]
 fn run_pgen_conversion_pipeline(
     py: Python,
     pgen_path: String,
@@ -447,6 +447,7 @@ fn run_pgen_conversion_pipeline(
     region_ranges: Vec<(String, u32, u32)>,
     regions_overlap: String,
     sample_perm: Vec<usize>,
+    max_mem_bytes: Option<u64>,
     log_level: String,
     receiver: Option<Py<PyEventReceiver>>,
 ) -> PyResult<usize> {
@@ -527,14 +528,88 @@ fn run_pgen_conversion_pipeline(
                 Some(t) if t > 0 => t,
                 _ => std::thread::available_parallelism().unwrap().get(),
             };
-            let plan = crate::budget::plan_thread_budget(available_cores, jobs.len());
-            let concurrent_chroms = orchestrator::bench_concurrent_chroms(plan.concurrent_chroms);
-            let processing_threads = plan.processing_threads;
+            // Per-contig costs are EXACT here and cost no I/O: a contig's
+            // .pvar index range [lo, hi) IS its record count. The VCF path
+            // needs contig_cost's index tiers for this; PGEN does not, and so
+            // reaches none of their FFI hazards.
+            let costs = crate::contig_cost::ContigCosts::exact(
+                jobs.iter()
+                    .map(|(chrom, (lo, hi), _, _)| (chrom.clone(), (hi - lo) as u64))
+                    .collect(),
+            );
+
+            // Every dosage field is FORMAT-category by construction on this
+            // path, so unlike the VCF path there is no INFO to filter out.
+            let per_variant_bytes =
+                (samples.len() * ploidy / 8 + fields.len() * samples.len() * 4) as u64;
+
+            // The RAM law was fitted against RESIDENT chunk bytes, not the
+            // nominal chunk_size: BitGrid3::zeros is alloc_zeroed, so an
+            // oversized chunk_size costs address space rather than RSS.
+            // The VCF path guards this narrowing with `if costs.exact_counts`
+            // because its header-length fallback tier yields BASE PAIRS, a
+            // different unit. Here the counts are exact by construction, so
+            // the guard would always be true -- do not "restore" it.
+            let resident_chunk_size = costs
+                .values
+                .values()
+                .copied()
+                .max()
+                .map_or(chunk_size, |max_records| {
+                    chunk_size.min(max_records as usize)
+                });
+            let chunk_bytes = per_variant_bytes * resident_chunk_size as u64;
+
+            // reader_workers = 1: from_pgen pins P = 1, so a contig's demand
+            // is exactly one executor plus one pgenlib reader -- which is
+            // what plan_sharded's `1 + reader_workers` already models.
+            let sharded = crate::budget::plan_sharded(crate::budget::PlanInputs {
+                usable_cores: available_cores.saturating_sub(1).max(1),
+                n_contigs: jobs.len(),
+                n_samples: samples.len(),
+                chunk_bytes,
+                max_mem_bytes,
+                reader_workers: 1,
+                ram: crate::budget::RamLaw::PGEN,
+            });
+            let sharded = match sharded {
+                Ok(p) => p,
+                Err(e) => return vec![Err(crate::error::ConversionError::from(e))],
+            };
+            let concurrent_chroms =
+                orchestrator::bench_concurrent_chroms(sharded.concurrent_chroms);
+            let concurrent_chroms = concurrent_chroms.min(crate::budget::PGEN_MAX_CONCURRENT);
+            let processing_threads = crate::budget::processing_threads_for(
+                available_cores.saturating_sub(1).max(1),
+                concurrent_chroms,
+                sharded.reader_workers,
+            );
             tracing::info!(
                 concurrent_chroms,
+                reader_workers = sharded.reader_workers,
                 processing_threads,
                 "pipeline config (PGEN)"
             );
+
+            // Longest-first DISPATCH order. Sort the jobs themselves, not a
+            // separate name list: each tuple carries that contig's own
+            // pgenlib reader pool and dosage-reader pool, so reordering names
+            // alone would pair contigs with the wrong readers.
+            //
+            // `chroms` keeps its original order for finalize_fields/write_meta
+            // below -- the store's on-disk contig order is part of its layout.
+            // `results` therefore comes back in DISPATCH order; that is safe
+            // only because the sole consumer sums every entry unconditionally.
+            // A future change that zips `results` positionally against
+            // `chroms` would silently misattribute per-contig results.
+            let order = crate::contig_cost::order_longest_first(&chroms, &costs);
+            let rank: std::collections::HashMap<&str, usize> = order
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (c.as_str(), i))
+                .collect();
+            let mut jobs = jobs;
+            jobs.sort_by_key(|(chrom, _, _, _)| rank[chrom.as_str()]);
 
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(concurrent_chroms)
