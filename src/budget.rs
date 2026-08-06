@@ -116,7 +116,52 @@ impl RamLaw {
         per_sample_mb: 0.01115,
         kappa: 1.371,
     };
+
+    /// PGEN path. Fitted 2026-08-05, R^2 = 0.8872, n = 12.
+    /// See docs/superpowers/plans/results/2026-08-05-pgen-ram-law-fit.md.
+    ///
+    /// NOT comparable coefficient-by-coefficient with `RamLaw::VCF`: the two
+    /// corpora come from different generators (vcfixture bulk vs
+    /// scale_corpus.py), so each law is valid only for its own backend.
+    ///
+    /// Fitted on a corpus with multiallelic_rate 0.0, so this law is not
+    /// claimed to cover multiallelic-heavy cohorts.
+    ///
+    /// `kappa` is a CONSERVATIVE BOUND, not a precisely fitted rate: its 95%
+    /// CI is [-9.99, +23.68] (SE 7.44, t 0.92, p ~= 0.38) and contributes
+    /// only +0.0106 to R^2 -- the reported R^2 is almost entirely the
+    /// two-cohort intercept split. It ships anyway because the law
+    /// OVER-predicts memory at all 12 measured points the way `plan_sharded`
+    /// evaluates it (worst-case margin +621 MB / 1.16x at cc=8, S=4,000; the
+    /// S=32,000 ladder over-predicts by 1.33-2.04x). The failure mode this
+    /// margin trades away is under-utilization and a spurious
+    /// `PlanError::InsufficientMemory`, never an OOM -- the margin is
+    /// deliberate, not slack to be tuned away.
+    ///
+    /// Validity domain: S in {4,000, 32,000}, n_contigs = 22,
+    /// concurrent_chroms = 7 for the ladder rows, one node
+    /// (carter-cn-04), one profile (germline-1kgp-varskew). `per_sample_mb`
+    /// is extrapolated ~15.6x beyond the largest measured cohort (32,000) to
+    /// reach biobank scale.
+    pub const PGEN: RamLaw = RamLaw {
+        base_mb: 2688.5256180212755,
+        per_sample_mb: 0.12040939851127153,
+        kappa: 6.841965259264865,
+    };
 }
+
+/// Measured ceiling on useful PGEN contig concurrency: `pgenlib` holds the
+/// GIL through decode, so past this point extra concurrent contigs buy no
+/// wall time while still costing memory. Measured 2026-08-05 on carter-cn-04
+/// (48 CPUs / 64 GB) at
+/// one corpus shape (S=4,000, V=1,000,000, 22 contigs): wall time fell
+/// 31.20 -> 12.81 -> 10.18 s at cc = 1, 4, 8, then stayed within +/-2.4%
+/// through cc = 22 (cc=16->22 was actually +1.8%, slightly worse) while RSS
+/// kept rising for no wall-time benefit. See
+/// docs/superpowers/plans/results/2026-08-05-pgen-ram-law-fit.md. NOT a
+/// guess; if a future pgenlib release drops the GIL through decode,
+/// re-measure before raising it.
+pub const PGEN_MAX_CONCURRENT: usize = 8;
 
 /// Inputs to the sharded-VCF concurrency plan. Every field is data the caller
 /// already has before opening a single record.
@@ -576,6 +621,74 @@ mod tests {
         // rayon pool of 0 threads panics at build time.
         assert_eq!(processing_threads_for(4, 8, 3), 1);
         assert_eq!(processing_threads_for(1, 1, 1), 1);
+    }
+
+    #[test]
+    // The whole point is asserting on RamLaw::PGEN's const fields, so clippy
+    // sees a compile-time-constant condition; that's the guard, not a bug.
+    #[allow(clippy::assertions_on_constants)]
+    fn ram_law_pgen_is_a_usable_law() {
+        // Guards against a placeholder shipping: a zero kappa would make the
+        // memory bound vacuous and silently restore the unbounded planning
+        // this whole change exists to remove.
+        assert!(RamLaw::PGEN.kappa > 0.0, "kappa must be positive");
+        assert!(RamLaw::PGEN.base_mb > 0.0, "baseline must be positive");
+        assert!(RamLaw::PGEN.per_sample_mb >= 0.0);
+    }
+
+    #[test]
+    fn pgen_memory_bound_actually_binds() {
+        // A budget that fits the baseline plus two contigs (with headroom to
+        // 2.5, so floor(2.5) = 2 regardless of float representation of the
+        // fitted coefficients) must plan 2, not the core bound. Uses
+        // RamLaw::PGEN's real coefficients, so it fails if a future refit
+        // makes the law nonsensical.
+        let chunk_bytes = 100_000_000u64;
+        let baseline_mb = RamLaw::PGEN.base_mb + RamLaw::PGEN.per_sample_mb * 1000.0;
+        let per_contig_mb = RamLaw::PGEN.kappa * 1.0 * (chunk_bytes as f64 / 1e6);
+        let budget = ((baseline_mb + 2.5 * per_contig_mb) * 1e6) as u64;
+
+        let plan = plan_sharded(PlanInputs {
+            usable_cores: 64,
+            n_contigs: 22,
+            n_samples: 1_000,
+            chunk_bytes,
+            max_mem_bytes: Some(budget),
+            reader_workers: 1,
+            ram: RamLaw::PGEN,
+        })
+        .unwrap();
+        assert_eq!(plan.concurrent_chroms, 2);
+    }
+
+    #[test]
+    fn pgen_budget_too_small_for_one_contig_is_an_error_not_a_silent_cc_of_one() {
+        // Below the baseline + one contig, planning must FAIL. Clamping to
+        // cc=1 and proceeding would OOM at the exact scale the budget exists
+        // to protect, and would do it after writing a partial store.
+        let err = plan_sharded(PlanInputs {
+            usable_cores: 64,
+            n_contigs: 22,
+            n_samples: 1_000_000,
+            chunk_bytes: 10_000_000_000,
+            max_mem_bytes: Some(1_000_000),
+            reader_workers: 1,
+            ram: RamLaw::PGEN,
+        })
+        .unwrap_err();
+        match err {
+            PlanError::InsufficientMemory {
+                needed_mb,
+                budget_mb,
+            } => assert!(
+                needed_mb > budget_mb,
+                "needed {needed_mb} must exceed budget {budget_mb}"
+            ),
+        }
+        // The message must name the two knobs a caller can actually turn.
+        let msg = err.to_string();
+        assert!(msg.contains("max_mem"), "{msg}");
+        assert!(msg.contains("chunk_size"), "{msg}");
     }
 
     #[test]
