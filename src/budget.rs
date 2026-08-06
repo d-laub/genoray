@@ -157,10 +157,24 @@ impl RamLaw {
 /// one corpus shape (S=4,000, V=1,000,000, 22 contigs): wall time fell
 /// 31.20 -> 12.81 -> 10.18 s at cc = 1, 4, 8, then stayed within +/-2.4%
 /// through cc = 22 (cc=16->22 was actually +1.8%, slightly worse) while RSS
-/// kept rising for no wall-time benefit. See
+/// trends upward (+12.7% cc=8->22, non-monotonically -- it actually falls
+/// 3917->3586 MB from cc=8->11 before rising again to 4416 MB by cc=22) for
+/// no further wall-time benefit. See
 /// docs/superpowers/plans/results/2026-08-05-pgen-ram-law-fit.md. NOT a
 /// guess; if a future pgenlib release drops the GIL through decode,
 /// re-measure before raising it.
+///
+/// CAVEAT: the sweep that produced this value (commit 80b5fd8) ran BEFORE
+/// `processing_threads_for` was wired onto the PGEN path (commit a39ebcb),
+/// so all 12 fitted/measured rows ran under `plan_thread_budget`'s
+/// `processing_threads = 5`, not the shipped `47 - 2*cc` (= 31 at cc=8) merge
+/// tail. Memory is unaffected either way -- both merge-tail consumers
+/// (`merge.rs`'s `TILE_RAM_BUDGET_BYTES`, a whole-stage budget divided by
+/// thread count, and `dense_merge`'s single output buffer split across
+/// threads) are thread-count-flat -- but the wall-time knee above was not
+/// measured under the thread configuration this constant now gates in
+/// production. Re-measure with the shipped tail-pool sizing before trusting
+/// the wall-time numbers precisely, not just the memory ones.
 pub const PGEN_MAX_CONCURRENT: usize = 8;
 
 /// Inputs to the sharded-VCF concurrency plan. Every field is data the caller
@@ -189,7 +203,19 @@ pub struct ShardedPlan {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PlanError {
     /// The budget cannot fit the cohort baseline plus one contig's chunks.
-    InsufficientMemory { needed_mb: f64, budget_mb: f64 },
+    ///
+    /// `baseline_mb` is carried separately from `needed_mb` (rather than
+    /// leaving the caller to re-derive it) because the two failure shapes
+    /// need different advice: when `budget_mb` doesn't even cover
+    /// `baseline_mb`, `chunk_size` is powerless -- the cohort-baseline term
+    /// alone (fixed cost + per-sample cost, independent of `chunk_size`)
+    /// already exceeds the budget, so only a larger `max_mem` or a smaller
+    /// cohort can help.
+    InsufficientMemory {
+        needed_mb: f64,
+        budget_mb: f64,
+        baseline_mb: f64,
+    },
 }
 
 impl std::fmt::Display for PlanError {
@@ -198,12 +224,25 @@ impl std::fmt::Display for PlanError {
             PlanError::InsufficientMemory {
                 needed_mb,
                 budget_mb,
-            } => write!(
-                f,
-                "max_mem is {budget_mb:.0} MB but converting this cohort needs \
-                 at least {needed_mb:.0} MB for one concurrent contig; raise \
-                 max_mem or lower chunk_size"
-            ),
+                baseline_mb,
+            } => {
+                if budget_mb < baseline_mb {
+                    write!(
+                        f,
+                        "max_mem is {budget_mb:.0} MB but this cohort's baseline \
+                         memory alone is {baseline_mb:.0} MB, before any \
+                         concurrent contig's chunk buffers -- only a larger \
+                         max_mem or a smaller cohort can help"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "max_mem is {budget_mb:.0} MB but converting this cohort needs \
+                         at least {needed_mb:.0} MB for one concurrent contig; raise \
+                         max_mem or lower chunk_size"
+                    )
+                }
+            }
         }
     }
 }
@@ -242,6 +281,7 @@ pub fn plan_sharded(inp: PlanInputs) -> Result<ShardedPlan, PlanError> {
                 return Err(PlanError::InsufficientMemory {
                     needed_mb: baseline_mb + per_contig_mb,
                     budget_mb,
+                    baseline_mb,
                 });
             }
             let mem_bound = (headroom_mb / per_contig_mb).floor() as usize;
@@ -483,16 +523,20 @@ mod tests {
             PlanError::InsufficientMemory {
                 needed_mb,
                 budget_mb,
+                baseline_mb,
             } => {
                 assert!(needed_mb > budget_mb);
                 assert!((budget_mb - 5_000.0).abs() < 1.0);
+                assert!(budget_mb < baseline_mb);
             }
         }
     }
 
-    // `from_vcf` and `from_vcf_list` now share ONE `max_mem` meaning (a
-    // whole-process budget), so there is no more mix-up for the message to
-    // flag -- it just needs to name the two actionable remedies.
+    // This budget (1 MB) is far below the cohort baseline (~943 MB), so
+    // `chunk_size` is powerless here -- only `max_mem` or a smaller cohort
+    // can help. The message must say so, and must NOT claim `chunk_size`
+    // would help (that would be actionable-sounding but false in this
+    // regime).
     #[test]
     fn insufficient_memory_message_names_remedies() {
         let err = plan_sharded(PlanInputs {
@@ -506,9 +550,30 @@ mod tests {
         })
         .unwrap_err();
         let msg = err.to_string();
-        // "max_mem" alone would pass regardless (it's also in the message's
-        // opening clause) -- pin the actual remedy phrase so this asserts
-        // something load-bearing.
+        assert!(msg.contains("max_mem"), "message = {msg:?}");
+        assert!(
+            !msg.contains("chunk_size"),
+            "chunk_size cannot help when the budget is below baseline; \
+             message = {msg:?}"
+        );
+    }
+
+    // The budget-above-baseline-but-below-needed case is the one where
+    // `chunk_size` genuinely IS an actionable remedy alongside `max_mem`, so
+    // the message must still offer both there.
+    #[test]
+    fn insufficient_memory_message_names_both_remedies_when_baseline_fits() {
+        let err = plan_sharded(PlanInputs {
+            usable_cores: 47,
+            n_contigs: 1,
+            n_samples: 1_000,
+            chunk_bytes: 10_000_000,
+            max_mem_bytes: Some(1_200_000_000), // covers baseline (~943 MB), not per-contig
+            reader_workers: 16,
+            ram: RamLaw::VCF,
+        })
+        .unwrap_err();
+        let msg = err.to_string();
         assert!(
             msg.contains("raise max_mem or lower chunk_size"),
             "message = {msg:?}"
@@ -666,6 +731,11 @@ mod tests {
         // Below the baseline + one contig, planning must FAIL. Clamping to
         // cc=1 and proceeding would OOM at the exact scale the budget exists
         // to protect, and would do it after writing a partial store.
+        //
+        // This budget (1 MB) is far below even the cohort baseline
+        // (~123,098 MB at S=1,000,000 under RamLaw::PGEN), so this exercises
+        // the baseline-dominated branch: `chunk_size` cannot help here, only
+        // `max_mem` (or a smaller cohort) can.
         let err = plan_sharded(PlanInputs {
             usable_cores: 64,
             n_contigs: 22,
@@ -680,15 +750,20 @@ mod tests {
             PlanError::InsufficientMemory {
                 needed_mb,
                 budget_mb,
-            } => assert!(
-                needed_mb > budget_mb,
-                "needed {needed_mb} must exceed budget {budget_mb}"
-            ),
+                baseline_mb,
+            } => {
+                assert!(
+                    needed_mb > budget_mb,
+                    "needed {needed_mb} must exceed budget {budget_mb}"
+                );
+                assert!(budget_mb < baseline_mb, "budget must be baseline-dominated");
+            }
         }
-        // The message must name the two knobs a caller can actually turn.
+        // The message must name the one knob that can actually help here,
+        // and must NOT dangle `chunk_size` as a false remedy.
         let msg = err.to_string();
         assert!(msg.contains("max_mem"), "{msg}");
-        assert!(msg.contains("chunk_size"), "{msg}");
+        assert!(!msg.contains("chunk_size"), "{msg}");
     }
 
     #[test]

@@ -576,14 +576,24 @@ fn run_pgen_conversion_pipeline(
                 Ok(p) => p,
                 Err(e) => return vec![Err(crate::error::ConversionError::from(e))],
             };
-            let concurrent_chroms =
-                orchestrator::bench_concurrent_chroms(sharded.concurrent_chroms);
-            let concurrent_chroms = concurrent_chroms.min(crate::budget::PGEN_MAX_CONCURRENT);
+            // Cap the PLAN at the measured knee, then let the bench override
+            // (`GENORAY_CONCURRENT_CHROMS`) apply on top of that cap -- not
+            // before it. Clamping the override itself would make
+            // `PGEN_MAX_CONCURRENT` unfalsifiable: the env var exists
+            // specifically so a maintainer can re-measure past 8 (see its doc
+            // comment), and clamping it defeats that. `processing_threads_for`
+            // below still consumes this final `concurrent_chroms`, so the
+            // merge tail stays sized against what is actually dispatched.
+            let planned = sharded
+                .concurrent_chroms
+                .min(crate::budget::PGEN_MAX_CONCURRENT);
+            let concurrent_chroms = orchestrator::bench_concurrent_chroms(planned);
             let processing_threads = crate::budget::processing_threads_for(
                 available_cores.saturating_sub(1).max(1),
                 concurrent_chroms,
                 sharded.reader_workers,
             );
+            tracing::info!(cores = available_cores, "using cores");
             tracing::info!(
                 concurrent_chroms,
                 reader_workers = sharded.reader_workers,
