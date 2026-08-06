@@ -10,6 +10,21 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::sync::Arc;
 
+// What an atom retains in order to pack its presence row later.
+//
+// Dense sources keep a bitset (`columns/8` bytes, shared across the atoms of one
+// record) rather than the record's allele vector (`columns*4`). Sparse sources
+// keep their calls verbatim -- already O(carriers), and `flush_window` needs the
+// carriers themselves, not just their bits.
+enum AtomCalls {
+    Masks {
+        masks: Arc<PresenceMasks>,
+        /// This atom's slot within the record's slab.
+        slot: u16,
+    },
+    Sparse(Arc<Calls>),
+}
+
 // A decomposed atom awaiting emission. Carries a shared handle to its source record's
 // per-column allele indices so genotype presence is computed at chunk-build time.
 struct PendingAtom {
@@ -17,9 +32,12 @@ struct PendingAtom {
     ilen: i32,
     alt: Vec<u8>,
     source_alt_index: u16,
-    calls: Arc<Calls>, // shared across the atoms decomposed from one record
-    seq: u64,          // stable tiebreak for equal positions
-    global_idx: i32,   // threaded verbatim from the source record
+    // Shared across the atoms decomposed from one record. For dense sources this
+    // is a presence bitset, NOT the allele vector: retaining the vector is what
+    // made the reader cost ~8 KB per sample per contig (issue #155).
+    calls: AtomCalls,
+    seq: u64,        // stable tiebreak for equal positions
+    global_idx: i32, // threaded verbatim from the source record
 
     // INFO is resolved eagerly (already indexed by source_alt_index where the
     // underlying VCF field is Number=A) since it's already O(1) per atom -- one
@@ -77,32 +95,16 @@ impl Ord for PendingAtom {
 // per-bit `or_bit` loop, far fewer stores).
 #[inline]
 fn pack_row(words: &mut [u64], word_base: usize, vi: usize, a: &PendingAtom, columns: usize) {
-    let src = a.source_alt_index as i32;
     let base = vi * columns;
-    match a.calls.as_ref() {
-        Calls::Dense(gtc) => {
-            let mut col = 0usize;
-            while col < columns {
-                let flat = base + col;
-                let w = (flat >> 6) - word_base;
-                let b = flat & 63;
-                let n = (64 - b).min(columns - col);
-                let mut acc = 0u64;
-                for k in 0..n {
-                    // SAFETY: col + k < columns == gtc.len().
-                    acc |= ((unsafe { *gtc.get_unchecked(col + k) } == src) as u64) << (b + k);
-                }
-                // SAFETY: w indexes a word within this row's target slice.
-                unsafe {
-                    *words.get_unchecked_mut(w) |= acc;
-                }
-                col += n;
-            }
+    match &a.calls {
+        AtomCalls::Masks { masks, slot } => {
+            or_mask_into(words, word_base, base, masks.mask(*slot), columns);
         }
-        Calls::Sparse(_) => {
+        AtomCalls::Sparse(calls) => {
             // Only the carriers can match `src`; every other column is REF and packs 0.
             // This is the O(carriers) path that replaces the O(columns) scan.
-            for (col, allele) in a.calls.iter_non_ref() {
+            let src = a.source_alt_index as i32;
+            for (col, allele) in calls.iter_non_ref() {
                 if allele == src {
                     let flat = base + col as usize;
                     let w = (flat >> 6) - word_base;
@@ -124,7 +126,6 @@ fn pack_row(words: &mut [u64], word_base: usize, vi: usize, a: &PendingAtom, col
 // Replaces an O(columns) allele comparison with an O(columns/64) shifted word
 // OR. `base` is generally not word-aligned -- row `vi` starts at `vi*columns` --
 // so each mask word contributes to two target words.
-#[allow(dead_code)] // Task 3's `pack_row` dense arm consumes this.
 #[inline]
 fn or_mask_into(words: &mut [u64], word_base: usize, base: usize, mask: &[u64], columns: usize) {
     if columns == 0 {
@@ -176,14 +177,12 @@ fn pack_presence_seq(words: &mut [u64], atoms: &[PendingAtom], columns: usize) {
 /// that test's ANSWER: one bit per column instead of one `i32`, `columns/8`
 /// bytes per record instead of `columns*4`. That 32x is what keeps the reader's
 /// live set bounded at biobank cohort widths -- see issue #155.
-#[allow(dead_code)] // Task 2 packs from `mask()`; Task 3 constructs via `from_dense`.
 struct PresenceMasks {
     /// Slot-major: slot `s` owns `words[s*words_per_mask .. (s+1)*words_per_mask]`.
     words: Vec<u64>,
     words_per_mask: usize,
 }
 
-#[allow(dead_code)] // Task 2 packs from `mask()`; Task 3 constructs via `from_dense`.
 impl PresenceMasks {
     /// Build one slab from a record's dense calls, in a SINGLE pass over `gt`.
     ///
@@ -373,12 +372,12 @@ fn flush_window(
         // above) -- O(carriers), not a new scan. `Calls::Sparse`'s carrier list is
         // ascending by construction (Task 3-7), and filtering an ascending sequence
         // keeps it ascending, so `Carriers::push`'s ordering invariant holds.
-        let carriers = match a.calls.as_ref() {
-            Calls::Dense(_) => None,
-            Calls::Sparse(_) => {
+        let carriers = match &a.calls {
+            AtomCalls::Masks { .. } => None,
+            AtomCalls::Sparse(calls) => {
                 let src = a.source_alt_index as i32;
                 let mut c = Carriers::new();
-                for (col, allele) in a.calls.iter_non_ref() {
+                for (col, allele) in calls.iter_non_ref() {
                     if allele == src {
                         c.push(col, allele);
                     }
@@ -434,7 +433,6 @@ fn decompose_raw_record(
     chrom: &str,
 ) -> Result<DecomposedRecord, ConversionError> {
     let pos = rec.pos;
-    let calls = Arc::new(rec.calls);
     // Shared, not resolved: every atom decomposed from this record gets a cheap
     // `Arc::clone` of the SAME buffer, resolved lazily per (sample, field) at
     // chunk-metadata time (`resolve_format`) rather than widened to F x N here.
@@ -469,6 +467,39 @@ fn decompose_raw_record(
         &mut atoms,
         skip_out_of_scope,
     )?;
+    // Ends the borrow of `rec.alts` so `rec.calls` can be moved out below.
+    drop(alt_refs);
+
+    // Collapse the record's calls into what its atoms will actually retain.
+    // For a dense source that is one presence bitset per in-scope ALT; the
+    // `Vec<i32>` is dropped at the end of this match, which is the whole point
+    // -- 1.024 MB per record at S=128,000 that used to survive into the heap.
+    enum RecordCalls {
+        Masks {
+            masks: Arc<PresenceMasks>,
+            /// Indexed by `source_alt_index`; `u16::MAX` for alleles with no slot.
+            slot_of: Vec<u16>,
+        },
+        Sparse(Arc<Calls>),
+    }
+    let record_calls = match rec.calls {
+        Calls::Dense(gt) => {
+            let columns = gt.len();
+            let mut wanted: Vec<u16> = atoms.iter().map(|a| a.source_alt_index).collect();
+            wanted.sort_unstable();
+            wanted.dedup();
+            let mut slot_of =
+                vec![u16::MAX; wanted.iter().copied().max().unwrap_or(0) as usize + 1];
+            for (slot, &allele) in wanted.iter().enumerate() {
+                slot_of[allele as usize] = slot as u16;
+            }
+            RecordCalls::Masks {
+                masks: Arc::new(PresenceMasks::from_dense(&gt, columns, &wanted)),
+                slot_of,
+            }
+        }
+        sparse @ Calls::Sparse(_) => RecordCalls::Sparse(Arc::new(sparse)),
+    };
 
     let mut normalized = 0u64;
     let mut pending = Vec::with_capacity(atoms.len());
@@ -500,7 +531,13 @@ fn decompose_raw_record(
             ilen: atom.ilen,
             alt: atom.alt,
             source_alt_index: atom.source_alt_index,
-            calls: Arc::clone(&calls),
+            calls: match &record_calls {
+                RecordCalls::Masks { masks, slot_of } => AtomCalls::Masks {
+                    masks: Arc::clone(masks),
+                    slot: slot_of[atom.source_alt_index as usize],
+                },
+                RecordCalls::Sparse(c) => AtomCalls::Sparse(Arc::clone(c)),
+            },
             seq,
             info_vals,
             format_vals: Arc::clone(&format_vals),
@@ -921,14 +958,37 @@ mod tests {
         })
     }
 
+    // Test-only: builds a single-slot `PresenceMasks` matching `gt[col] == src`
+    // for ANY src, including 0. `PresenceMasks::from_dense` debug-asserts its
+    // `wanted` slots are all ALT (> 0) because production `source_alt_index` is
+    // always 1-based -- but `atom`/`atom_at` are exercised by proptests that
+    // deliberately probe src across REF/ALT/missing/out-of-range, so this
+    // bypasses that precondition by constructing the bitset directly rather
+    // than routing through `from_dense`.
+    fn mask_for(gt: &[i32], columns: usize, src: u16) -> PresenceMasks {
+        let words_per_mask = columns.div_ceil(64);
+        let mut words = vec![0u64; words_per_mask];
+        for (col, &g) in gt.iter().take(columns).enumerate() {
+            if g == src as i32 {
+                words[col >> 6] |= 1u64 << (col & 63);
+            }
+        }
+        PresenceMasks {
+            words,
+            words_per_mask,
+        }
+    }
+
     // Minimal PendingAtom carrying only the fields the packers read.
     fn atom(gt: Vec<i32>, src: u16) -> PendingAtom {
+        let columns = gt.len();
+        let masks = std::sync::Arc::new(mask_for(&gt, columns, src));
         PendingAtom {
             pos: 0,
             ilen: 0,
             alt: Vec::new(),
             source_alt_index: src,
-            calls: std::sync::Arc::new(Calls::Dense(gt)),
+            calls: AtomCalls::Masks { masks, slot: 0 },
             seq: 0,
             info_vals: Vec::new(),
             format_vals: Arc::new(FormatVals::Dense(Vec::new())),
@@ -937,12 +997,14 @@ mod tests {
     }
 
     fn atom_at(gt: Vec<i32>, src: u16, pos: u32) -> PendingAtom {
+        let columns = gt.len();
+        let masks = std::sync::Arc::new(mask_for(&gt, columns, src));
         PendingAtom {
             pos,
             ilen: 0,
             alt: Vec::new(),
             source_alt_index: src,
-            calls: std::sync::Arc::new(Calls::Dense(gt)),
+            calls: AtomCalls::Masks { masks, slot: 0 },
             seq: pos as u64,
             info_vals: Vec::new(),
             format_vals: Arc::new(FormatVals::Dense(Vec::new())),
@@ -965,7 +1027,7 @@ mod tests {
             ilen: 0,
             alt: Vec::new(),
             source_alt_index: src,
-            calls: std::sync::Arc::new(Calls::Sparse(carriers)),
+            calls: AtomCalls::Sparse(std::sync::Arc::new(Calls::Sparse(carriers))),
             seq: 0,
             info_vals: Vec::new(),
             format_vals: Arc::new(FormatVals::Dense(Vec::new())),
@@ -1099,6 +1161,44 @@ mod tests {
     }
 
     #[test]
+    fn decompose_retains_masks_not_the_allele_vector_for_dense_sources() {
+        // The memory claim, asserted structurally rather than by measurement: after
+        // decomposition a dense record's atoms must not hold anything sized like
+        // `columns * 4`. If this ever reverts to `AtomCalls::Sparse` or to a
+        // retained `Calls::Dense`, issue #155's ratchet is back.
+        let columns = 128usize;
+        let mut gt = vec![0i32; columns];
+        gt[7] = 1;
+        let rec = RawRecord {
+            pos: 100,
+            reference: b"A".to_vec(),
+            alts: vec![b"C".to_vec()],
+            calls: crate::record_source::Calls::Dense(gt),
+            format_vals: FormatVals::Dense(Vec::new()),
+            info_raw: Vec::new(),
+            global_idx: -1,
+        };
+        let d = decompose_raw_record(
+            rec,
+            0,
+            &[],
+            false,
+            true,
+            crate::normalize::CheckRef::Error,
+            &[],
+            "chrT",
+        )
+        .expect("decompose");
+        assert_eq!(d.atoms.len(), 1);
+        match &d.atoms[0].calls {
+            AtomCalls::Masks { masks, slot } => {
+                assert_eq!(masks.mask(*slot)[0], 1u64 << 7);
+            }
+            AtomCalls::Sparse(_) => panic!("dense source must retain masks, not calls"),
+        }
+    }
+
+    #[test]
     fn pack_row_dense_calls_matches_the_raw_gt_loop() {
         // Guards the Task 4 migration: packing from Calls::Dense must reproduce, bit for
         // bit, what the old `&a.gt` loop produced. Any drift here is a store diff.
@@ -1118,7 +1218,13 @@ mod tests {
             ilen: 0,
             alt: b"A".to_vec(),
             source_alt_index: src_alt as u16,
-            calls: std::sync::Arc::new(crate::record_source::Calls::Dense(gt)),
+            calls: {
+                let m = PresenceMasks::from_dense(&gt, columns, &[src_alt as u16]);
+                AtomCalls::Masks {
+                    masks: std::sync::Arc::new(m),
+                    slot: 0,
+                }
+            },
             seq: 0,
             info_vals: Vec::new(),
             format_vals: Arc::new(FormatVals::Dense(Vec::new())),
@@ -1280,12 +1386,12 @@ mod tests {
             }
         }
 
-        let mk = |calls: crate::record_source::Calls| PendingAtom {
+        let mk = |calls: AtomCalls| PendingAtom {
             pos: 100,
             ilen: 0,
             alt: b"A".to_vec(),
             source_alt_index: src_alt,
-            calls: std::sync::Arc::new(calls),
+            calls,
             seq: 0,
             info_vals: Vec::new(),
             format_vals: Arc::new(FormatVals::Dense(Vec::new())),
@@ -1293,11 +1399,12 @@ mod tests {
         };
 
         let mut dense_bits = vec![0u64; 1];
+        let masks = std::sync::Arc::new(PresenceMasks::from_dense(&gt, columns, &[src_alt]));
         pack_row(
             &mut dense_bits,
             0,
             0,
-            &mk(crate::record_source::Calls::Dense(gt)),
+            &mk(AtomCalls::Masks { masks, slot: 0 }),
             columns,
         );
 
@@ -1306,7 +1413,9 @@ mod tests {
             &mut sparse_bits,
             0,
             0,
-            &mk(crate::record_source::Calls::Sparse(carriers)),
+            &mk(AtomCalls::Sparse(std::sync::Arc::new(
+                crate::record_source::Calls::Sparse(carriers),
+            ))),
             columns,
         );
 
@@ -1331,12 +1440,12 @@ mod tests {
                 carriers.push(col as u32, g);
             }
         }
-        let mk = |calls: crate::record_source::Calls| PendingAtom {
+        let mk = |calls: AtomCalls| PendingAtom {
             pos: 1,
             ilen: 0,
             alt: b"A".to_vec(),
             source_alt_index: 1,
-            calls: std::sync::Arc::new(calls),
+            calls,
             seq: 0,
             info_vals: Vec::new(),
             format_vals: Arc::new(FormatVals::Dense(Vec::new())),
@@ -1345,11 +1454,12 @@ mod tests {
         let words = (columns * 2).div_ceil(64);
 
         let mut d = vec![0u64; words];
+        let masks = std::sync::Arc::new(PresenceMasks::from_dense(&gt, columns, &[1]));
         pack_row(
             &mut d,
             0,
             1,
-            &mk(crate::record_source::Calls::Dense(gt)),
+            &mk(AtomCalls::Masks { masks, slot: 0 }),
             columns,
         );
         let mut s = vec![0u64; words];
@@ -1357,7 +1467,9 @@ mod tests {
             &mut s,
             0,
             1,
-            &mk(crate::record_source::Calls::Sparse(carriers)),
+            &mk(AtomCalls::Sparse(std::sync::Arc::new(
+                crate::record_source::Calls::Sparse(carriers),
+            ))),
             columns,
         );
         assert_eq!(s, d);
