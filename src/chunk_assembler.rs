@@ -204,6 +204,22 @@ struct AtomMeta {
 // at call time, so every flush offset lands on a u64 boundary and
 // `pack_presence_par` keeps its word-disjoint invariant. 1024 keeps the window
 // above `PARALLEL_MIN_VARIANTS` (512) so parallel packing still engages.
+//
+// *** These two constants set the reader's peak RAM, and both are VARIANT
+// counts multiplying an O(n_samples) payload. *** Every buffered record holds a
+// `Calls::Dense(Vec<i32>)` of `n_samples * ploidy` entries (`Arc`-shared between
+// the heap and `buf`, so distinct RECORDS are what count), giving a live set of
+//
+//     min(V, NORMALIZE_BATCH_RECORDS + PACK_WINDOW) * n_samples * ploidy * 4 bytes
+//
+// = up to 16 KB per sample, independent of `chunk_size` and of `max_mem`.
+// Measured on `from_pgen` (single contig, 1,000 variants, S=128,000): 1,123 MB
+// of the 1,592 MB peak, and halving both constants took the peak to 1,102 MB.
+// This is the biobank-scale blocker -- see the issue linked from
+// `_svar2.py::from_pgen`. Fixing it means making both a CELL budget rather than
+// a variant count, which collides with `PARALLEL_MIN_VARIANTS` below (itself a
+// variant-count threshold for what is really a cell-count decision), so it is a
+// measured change, not a constant tweak.
 const PACK_WINDOW: usize = 1024;
 const NORMALIZE_BATCH_RECORDS: usize = 1024;
 

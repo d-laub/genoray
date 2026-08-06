@@ -210,6 +210,8 @@ fn report_ref_excluded(chrom: &str, ref_excluded: u64) {
     }
 }
 
+use crate::monitor::rss_mark;
+
 /// Return this contig's freed arena heaps to the OS.
 ///
 /// glibc keeps freed per-contig heaps mapped, so RSS ratchets across a
@@ -364,6 +366,7 @@ pub fn process_chromosome(
 ) -> Result<u64, ConversionError> {
     let contig_started = std::time::Instant::now();
     sink.contig_start(chrom, None); // streaming: total unknown
+    rss_mark(chrom, "contig_enter");
 
     // Directory Formatting: svar2/{contig}/var_key/{snp,indel}
     let paths = crate::layout::ContigPaths::new(base_out_dir, chrom);
@@ -901,12 +904,14 @@ pub fn process_chromosome(
                     &fields_owned,
                 )?;
                 let mut chunk_id = 0;
+                rss_mark(&chr, "reader_ready");
                 while let Some(dense_chunk) =
                     reader.read_next_chunk(chunk_size, chunk_id, Some(&pool))?
                 {
                     tx_dense.send(dense_chunk).unwrap();
                     chunk_id += 1;
                 }
+                rss_mark(&chr, "reader_drained");
                 let ref_excluded_total =
                     reader.ref_excluded() + vcf_list_ref_excluded.load(Ordering::Relaxed);
                 report_ref_excluded(&chr, ref_excluded_total);
@@ -1002,6 +1007,10 @@ pub fn process_chromosome(
         long_allele_offsets,
         kept_total,
     } = phase1;
+    // Reader + executor + writers have all joined here, so their working sets
+    // are gone: this mark separates "the streaming pipeline" from "the merge
+    // tail" for per-stage RSS attribution.
+    rss_mark(chrom, "pipeline_joined");
     match chunk_writer_res {
         Ok(r) => r?,
         Err(_) => {
@@ -1030,11 +1039,21 @@ pub fn process_chromosome(
     macro_rules! stage {
         ($label:expr, $body:expr) => {{
             let t = std::time::Instant::now();
+            let rss_before = crate::monitor::rss_bytes();
             let out = $body;
+            let rss_after = crate::monitor::rss_bytes();
             tracing::debug!(
                 target: "genoray::monitor",
                 chrom = %chrom, stage = $label, secs = t.elapsed().as_secs_f64(),
-                "merge stage"
+                // Values in the MESSAGE -- see `rss_mark` for why fields alone
+                // are invisible through the Python logging bridge. Delta is
+                // signed: a merge stage that frees more than it takes is
+                // exactly as interesting as one that grows.
+                "RSSSTAGE {} secs={:.3} rss_mb={} d_rss_mb={}",
+                $label,
+                t.elapsed().as_secs_f64(),
+                rss_after / 1_000_000,
+                (rss_after as i64 - rss_before as i64) / 1_000_000
             );
             out
         }};
@@ -1214,6 +1233,7 @@ pub fn process_chromosome(
         })?;
     }
 
+    rss_mark(chrom, "contig_exit");
     tracing::info!(chrom = %chrom, "pipeline execution finished successfully");
 
     sink.flush(chrom);
