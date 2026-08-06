@@ -26,6 +26,14 @@ SCHEDULES = [1, 2, 4, 8]
 
 CHUNK_SIZE = 8
 
+# > MAX_INLINE_ALT_LEN (13, svar2-codec/src/lib.rs) so these records spill
+# into the long-allele bank instead of packing inline. Without at least one
+# bank write, an offset-scrambling bug in the bank would produce a
+# byte-identical (empty) result under every schedule and this gate would
+# never catch it. Matches test_svar2_schedule_invariance.py's VCF-path
+# fixture.
+_LONG_ALT = "ACGTACGTACGTACGTACGT"  # 20 bases
+
 pytestmark = pytest.mark.skipif(
     shutil.which("plink2") is None, reason="plink2 not available"
 )
@@ -33,14 +41,22 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture(scope="module")
 def multi_contig_pgen(tmp_path_factory):
-    """Eight contigs with DIFFERENT record counts.
+    """Eight contigs with DIFFERENT record counts, some with an indel long
+    enough to spill into the long-allele bank.
 
     Unequal counts are the point: with equal contigs, longest-first ordering
-    is a no-op and this test proves nothing about reordering.
+    is a no-op and this test proves nothing about reordering. The long-ALT
+    record is planted at the MIDPOINT of more than one contig (never the
+    first or last record) so bank offsets have a real chance to interleave
+    differently across schedules, instead of only ever landing at a chunk
+    boundary.
     """
     d = tmp_path_factory.mktemp("pgen_sched")
     contigs = {f"chr{i}": 4 * i for i in range(1, 9)}  # 4, 8, ... 32 records
     length = 4 * max(contigs.values()) + 10
+    # Every other contig gets one long-ALT record; the rest stay all-short so
+    # both the inline and bank paths are exercised in the same store.
+    long_alt_contigs = {"chr2", "chr4", "chr6", "chr8"}
 
     header = [
         "##fileformat=VCFv4.2",
@@ -49,11 +65,12 @@ def multi_contig_pgen(tmp_path_factory):
         '##FORMAT=<ID=GT,Number=1,Type=String,Description="">',
         "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS0\tS1",
     ]
-    rows = [
-        f"{c}\t{4 * j + 1}\t.\tA\tG\t.\t.\t.\tGT\t0|1\t1|1"
-        for c, n in contigs.items()
-        for j in range(n)
-    ]
+    rows = []
+    for c, n in contigs.items():
+        long_idx = n // 2 if c in long_alt_contigs else None
+        for j in range(n):
+            alt = _LONG_ALT if j == long_idx else "G"
+            rows.append(f"{c}\t{4 * j + 1}\t.\tA\t{alt}\t.\t.\t.\tGT\t0|1\t1|1")
     vcf = d / "sched.vcf"
     vcf.write_text("\n".join(header + rows) + "\n")
 
@@ -87,11 +104,27 @@ def _convert(pgen, out, cc, monkeypatch):
 
 
 def test_digest_is_invariant_across_schedules(multi_contig_pgen, tmp_path, monkeypatch):
-    digests = {
-        cc: _convert(multi_contig_pgen, tmp_path / f"cc{cc}.svar", cc, monkeypatch)
-        for cc in SCHEDULES
-    }
+    digests = {}
+    outs = {}
+    for cc in SCHEDULES:
+        out = tmp_path / f"cc{cc}.svar"
+        digests[cc] = _convert(multi_contig_pgen, out, cc, monkeypatch)
+        outs[cc] = out
     assert len(set(digests.values())) == 1, f"schedule changed output: {digests}"
+
+    # Digest-invariance alone cannot tell "correctly non-empty" from
+    # "incorrectly empty" -- a future edit shortening `_LONG_ALT` below
+    # MAX_INLINE_ALT_LEN would silently empty the long-allele bank and every
+    # digest above would still agree (on nothing). Assert the bank a planted
+    # long ALT actually lands in (chr8, per `multi_contig_pgen`) is non-empty,
+    # on one representative store -- the digests already proved every
+    # schedule produced byte-identical output.
+    any_out = next(iter(outs.values()))
+    long_alleles = any_out / "chr8" / "indel" / "long_alleles.bin"
+    assert long_alleles.exists() and long_alleles.stat().st_size > 0, (
+        "long-allele bank is empty -- the digest-invariance gate above would "
+        "pass green even if the bank write path silently broke"
+    )
 
 
 def test_dispatch_order_is_longest_first_and_still_writes_meta_in_file_order(
