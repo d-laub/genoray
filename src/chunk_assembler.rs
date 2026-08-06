@@ -116,6 +116,47 @@ fn pack_row(words: &mut [u64], word_base: usize, vi: usize, a: &PendingAtom, col
     }
 }
 
+// OR one row's presence mask into `words` at flat bit offset `base`, where
+// `words[0]` is global word `word_base`. `mask` carries `columns` meaningful
+// bits; bits at or beyond `columns` are zero by construction
+// (`PresenceMasks::from_dense` only ever sets `col < columns`).
+//
+// Replaces an O(columns) allele comparison with an O(columns/64) shifted word
+// OR. `base` is generally not word-aligned -- row `vi` starts at `vi*columns` --
+// so each mask word contributes to two target words.
+#[allow(dead_code)] // Task 3's `pack_row` dense arm consumes this.
+#[inline]
+fn or_mask_into(words: &mut [u64], word_base: usize, base: usize, mask: &[u64], columns: usize) {
+    if columns == 0 {
+        return;
+    }
+    let w0 = (base >> 6) - word_base;
+    let s = base & 63;
+    let last = ((base + columns - 1) >> 6) - word_base;
+
+    for (j, &m) in mask.iter().enumerate() {
+        if m == 0 {
+            continue;
+        }
+        // A nonzero mask word's lowest set bit is at some `col < columns`, so
+        // its low half always lands inside the row's span.
+        let lo = w0 + j;
+        words[lo] |= m << s;
+        if s > 0 {
+            let hi = lo + 1;
+            if hi <= last {
+                words[hi] |= m >> (64 - s);
+            } else {
+                // Not merely an optimisation: `pack_presence_par` gives each
+                // task a word-DISJOINT slice, so writing past `last` would
+                // corrupt another task's words. A carry here is always zero,
+                // because bits at or beyond `columns` are zero.
+                debug_assert_eq!(m >> (64 - s), 0, "carry outside the row's span");
+            }
+        }
+    }
+}
+
 // Sequential full-grid presence packing: one row at a time into the whole `words`
 // slice (global word index == local word index, so `word_base == 0`).
 fn pack_presence_seq(words: &mut [u64], atoms: &[PendingAtom], columns: usize) {
@@ -1129,6 +1170,76 @@ mod tests {
         assert_eq!(w[0], (1u64 << 0) | (1u64 << 63));
         assert_eq!(w[1], (1u64 << 0) | (1u64 << 1));
         assert_eq!(w[3], 1u64 << (199 - 192));
+    }
+
+    #[test]
+    fn or_mask_into_handles_a_word_aligned_row() {
+        // vi = 0, columns = 64: s == 0, so the carry branch must not run at all
+        // (`>> 64` is UB).
+        let gt: Vec<i32> = (0..64).map(|c| if c % 3 == 0 { 1 } else { 0 }).collect();
+        let m = PresenceMasks::from_dense(&gt, 64, &[1]);
+        let mut got = vec![0u64; 1];
+        or_mask_into(&mut got, 0, 0, m.mask(0), 64);
+        let mut want = 0u64;
+        for c in 0..64 {
+            if c % 3 == 0 {
+                want |= 1u64 << c;
+            }
+        }
+        assert_eq!(got[0], want);
+    }
+
+    #[test]
+    fn or_mask_into_never_writes_past_the_rows_last_word() {
+        // columns = 100, vi = 1 -> the row spans bits 100..200 (last bit 199), i.e.
+        // words 1..=3: word 3 (bits 192..256) is the row's OWN last word (it holds
+        // bits 192..199), not a foreign next-row word -- so the boundary check below
+        // is the bit landing in exactly word 3, at exactly bit 7, and nowhere else
+        // (a wrong `w0`/`s`/`last` computation would misplace it or panic on an
+        // out-of-bounds `words[hi]`).
+        let mut gt = vec![0i32; 100];
+        gt[99] = 1;
+        let m = PresenceMasks::from_dense(&gt, 100, &[1]);
+        let mut got = vec![0u64; 4];
+        or_mask_into(&mut got, 0, 100, m.mask(0), 100);
+        assert_eq!(got[(199) >> 6], 1u64 << (199 & 63));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(400))]
+
+        // The migration's safety argument: packing from a mask must reproduce, bit
+        // for bit, what the per-allele scan produced. Generates `columns` that are
+        // and are not multiples of 64, rows at every shift, missing calls, and
+        // multiallelic records.
+        #[test]
+        fn or_mask_into_matches_the_allele_scan(
+            columns in 1usize..300,
+            vi in 0usize..40,
+            src in 1u16..4,
+            seed in any::<u64>(),
+        ) {
+            // xorshift64, matching `test_par_packing_matches_seq` in this module.
+            let mut state = seed | 1;
+            let mut next = || { state ^= state << 13; state ^= state >> 7; state ^= state << 17; state };
+            // Alleles in -1..=3: missing, REF, and ALTs 1..3, so `src` both matches and misses.
+            let gt: Vec<i32> = (0..columns).map(|_| (next() % 5) as i32 - 1).collect();
+
+            // Reference: the pre-mask element scan.
+            let total_words = ((vi + 1) * columns).div_ceil(64);
+            let mut want = vec![0u64; total_words];
+            for (col, &g) in gt.iter().enumerate() {
+                if g == src as i32 {
+                    let flat = vi * columns + col;
+                    want[flat >> 6] |= 1u64 << (flat & 63);
+                }
+            }
+
+            let masks = PresenceMasks::from_dense(&gt, columns, &[src]);
+            let mut got = vec![0u64; total_words];
+            or_mask_into(&mut got, 0, vi * columns, masks.mask(0), columns);
+            prop_assert_eq!(got, want);
+        }
     }
 
     #[test]
