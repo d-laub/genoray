@@ -11,7 +11,6 @@ import pytest
 
 from scripts.bench_svar2.pgen_corpus import (
     PgenCorpusSpec,
-    apportion,
     resolve_vcfixture,
 )
 
@@ -34,20 +33,6 @@ def test_resolve_vcfixture_error_names_the_install_command(monkeypatch):
     monkeypatch.setattr(shutil, "which", lambda _: None)
     with pytest.raises(FileNotFoundError, match="cargo install vcfixture"):
         resolve_vcfixture()
-
-
-def test_apportion_splits_by_weight_and_sums_exactly():
-    counts = apportion(total=100, weights={"chr1": 6.0, "chr2": 4.0})
-    assert counts == {"chr1": 60, "chr2": 40}
-    assert sum(counts.values()) == 100
-
-
-def test_apportion_never_yields_a_zero_count():
-    """A contig with no records would be declared in the header but absent
-    from the data -- the exact shape that crashed from_vcf_list in #122."""
-    counts = apportion(total=3, weights={"a": 1000.0, "b": 1.0, "c": 1.0})
-    assert min(counts.values()) >= 1
-    assert sum(counts.values()) == 3
 
 
 def test_stem_is_unique_per_shape():

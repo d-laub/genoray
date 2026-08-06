@@ -10,6 +10,7 @@ import argparse
 import dataclasses
 import json
 from pathlib import Path
+from typing import Literal
 
 from scripts.bench_svar2.records import SweepPoint
 from scripts.bench_svar2.scale_corpus import (
@@ -214,7 +215,7 @@ def _point(
     threads: int,
     concurrent: int | None = None,
     rss_ceiling_mb: int | None = None,
-    backend: str = "vcf",
+    backend: Literal["vcf", "pgen"] = "vcf",
 ) -> SweepPoint:
     """One plan point. `rss_ceiling_mb` defaults to None -- see
     `OOM_PROBE_CEILING_MB` for why a ceiling is opt-in per point rather than a

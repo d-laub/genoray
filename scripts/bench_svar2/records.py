@@ -14,7 +14,7 @@ import json
 import typing
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 
 T = TypeVar("T")
 
@@ -73,7 +73,7 @@ class SweepPoint:
     # of where in the dataclass it is declared or what its default is. There
     # is no field placement that preserves ids across this change; "added
     # last" only keeps existing constructor calls source-compatible.
-    backend: str = "vcf"
+    backend: Literal["vcf", "pgen"] = "vcf"
 
     @property
     def point_id(self) -> str:
