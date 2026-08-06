@@ -635,7 +635,7 @@ fn run_pgen_conversion_pipeline(
                         // per-shard dosage-reader pool down to its one live shard's
                         // per-field readers before handing off to `SourceSpec`.
                         let dosage_readers = dosage_readers.into_iter().next().unwrap_or_default();
-                        orchestrator::process_chromosome(
+                        let result = orchestrator::process_chromosome(
                             orchestrator::SourceSpec::Pgen {
                                 pgen_path: pgen_path.clone(),
                                 pvar_path: pvar_path.clone(),
@@ -660,7 +660,13 @@ fn run_pgen_conversion_pipeline(
                             signatures,
                             &fields,
                             &sink,
-                        )
+                        );
+                        // This worker is about to pick up the next contig, so hand
+                        // the finished one's freed heaps back to the OS first --
+                        // otherwise RSS ratchets across the cohort, the same defect
+                        // PR #130 fixed for `run_vcf_list`.
+                        orchestrator::trim_heap();
+                        result
                     })
                     .collect()
             })

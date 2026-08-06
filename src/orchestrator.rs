@@ -213,6 +213,30 @@ fn report_ref_excluded(chrom: &str, ref_excluded: u64) {
 /// Emit the per-contig left-alignment summary (nothing when no atoms moved).
 /// Shared by the single-reader and sub-contig-sharded paths, mirroring
 /// `report_ref_excluded` above.
+/// Return this contig's freed arena heaps to the OS.
+///
+/// glibc keeps freed per-contig heaps mapped, so RSS ratchets across a
+/// multi-contig cohort even though every contig drops its whole working set
+/// (issue #120). Call at each contig boundary, right after that working set is
+/// gone. Measured: without it the PGEN path retains ~500 MB per contig at
+/// S=128,000.
+///
+/// Cheap on the serial `run_vcf_list` loop; on the PGEN path several contigs
+/// finish concurrently and each caller takes the arena locks, so this trades a
+/// little lock traffic (once per contig, not per allocation) for the ratchet.
+///
+/// `malloc_trim` is a glibc extension -- absent under musl (Alpine source
+/// builds) and on non-Linux, where this compiles away to nothing.
+#[inline]
+pub(crate) fn trim_heap() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: malloc_trim takes no ownership and only releases free memory that
+    // the allocator is already holding; it cannot invalidate any live pointer.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
 fn report_normalized(chrom: &str, normalized_total: u64) {
     if normalized_total > 0 {
         tracing::info!(chrom = %chrom, normalized = normalized_total, "left-aligned indels");
@@ -1313,17 +1337,9 @@ pub fn run_vcf_list(
         )?;
         total_dropped += dropped;
 
-        // glibc keeps freed per-contig arena heaps mapped, so RSS ratchets across the
-        // 24-contig cohort (issue #120). With htslib threads at 0 and one processing
-        // thread, malloc_trim is cheap here (no arena-lock contention) and returns the
-        // freed heaps to the OS between contigs. `malloc_trim` is a glibc extension, so
-        // gate on `target_env = "gnu"` -- it is absent under musl (Alpine source builds)
-        // and on non-Linux; a no-op / compiled-out everywhere but glibc-Linux.
-        #[cfg(all(target_os = "linux", target_env = "gnu"))]
-        // SAFETY: malloc_trim takes no ownership and only releases free top-of-heap memory.
-        unsafe {
-            libc::malloc_trim(0);
-        }
+        // With htslib threads at 0 and one processing thread, this is cheap here
+        // (no arena-lock contention).
+        trim_heap();
     }
     tracing::info!("cohort processing complete");
 
