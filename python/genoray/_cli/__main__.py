@@ -283,6 +283,7 @@ def write_pgen(
     merge_overlapping: bool = False,
     regions_overlap: Literal["pos", "record", "variant"] = "pos",
     chunk_size: int | None = None,
+    max_mem: Annotated[str | None, Parameter(name="--max-mem")] = None,
     threads: Annotated[int | None, Parameter(name=["--threads", "-@"])] = None,
     long_allele_capacity: int = 8 * 1024 * 1024,
     overwrite: bool = False,
@@ -329,6 +330,13 @@ def write_pgen(
             variant extent overlaps the region; a multiallelic record is kept
             whole if any of its alleles truly overlaps).
         chunk_size: Variants per conversion chunk. Defaults to a memory-derived value.
+        max_mem: Whole-process byte budget for the concurrency planner (e.g. ``1g``,
+            ``512m``, ``2GB``). Chooses how many contigs convert at once; ``chunk_size``
+            keeps its own independent default regardless. Defaults (``None``) to a
+            DETECTED budget -- 80% of the cgroup memory limit, or total system memory
+            outside a cgroup -- not unbounded. If detection fails (no cgroup limit and
+            no readable ``/proc/meminfo``, e.g. on macOS), a warning is issued and
+            planning falls back to core-count only.
         threads: Number of threads. Defaults to all available cores.
         long_allele_capacity: Advanced: byte budget for the streaming long-allele buffer.
         overwrite: Overwrite the output directory if it exists.
@@ -376,6 +384,7 @@ def write_pgen(
         no_reference=no_reference,
         skip_out_of_scope=skip_out_of_scope,
         chunk_size=chunk_size,
+        max_mem=max_mem,
         threads=threads,
         overwrite=overwrite,
         long_allele_capacity=long_allele_capacity,

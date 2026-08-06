@@ -905,6 +905,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         no_reference: bool = False,
         skip_out_of_scope: bool = False,
         chunk_size: int | None = None,
+        max_mem: int | str | None = None,
         threads: int | None = None,
         overwrite: bool = False,
         long_allele_capacity: int = 8 * 1024 * 1024,
@@ -930,6 +931,38 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         chunk_size: variants per conversion chunk. Defaults to a value derived from
         a memory budget, since a packed dense chunk costs
         ``chunk_size * n_samples * 2 / 8`` bytes.
+
+        max_mem: byte budget the concurrency planner may use, as an int or a
+        string like `"64GiB"` (see `parse_memory`). **This is a
+        WHOLE-PROCESS planning budget** -- concurrent-contig count is chosen
+        so cohort baseline memory plus each concurrent contig's in-flight
+        chunk buffers fit inside it, in addition to the existing core-count
+        bound (also capped at 8 concurrent contigs regardless of budget).
+        **Same meaning as** :meth:`from_vcf`'s `max_mem` -- both pipelines
+        have a fitted concurrency planner and spend the budget on
+        concurrency the same way, just with separately-fitted RAM-law
+        coefficients (a PGEN chunk decodes both haplotypes at once, so its
+        per-variant cost is higher). `from_vcf_list`'s `max_mem` means the
+        same whole-process budget too, but that path has no concurrency
+        planner to spend it on (its contigs run strictly sequentially), so
+        it derives its own per-chunk `chunk_size` from the budget instead
+        (see its docstring). Here the budget buys concurrency and
+        `chunk_size` keeps its own independent default. **`None` (the
+        default) means a DETECTED budget** -- 80% of the cgroup memory limit
+        (or `/proc/meminfo` total outside a cgroup) -- **not unbounded**.
+        This is a deliberate default behavior change: unbounded planning
+        preserves exactly the biobank-scale OOM exposure the byte-budgeted
+        planner exists to remove. If detection itself fails (no cgroup limit
+        and no readable `/proc/meminfo` -- always true on macOS, and this
+        project ships an osx-arm64 wheel), a warning is emitted and planning
+        falls back to the old core-bound-only behavior rather than raising.
+        Pass an explicit value to raise or lower the budget, or a very large
+        value to approximate unbounded planning. Note the practical floor:
+        the planner's RAM law has a fixed cohort-baseline term of roughly
+        2.7 GB (PGEN's own fitted coefficients, higher than `from_vcf`'s
+        ~932 MB), so any budget that can't cover baseline plus one
+        concurrent contig's chunk buffers is rejected with a `ValueError`
+        even for a tiny cohort.
 
         `regions` restricts conversion to one or more `.pvar` variant-index
         ranges. Region strings use Genoray's existing convention:
@@ -1209,6 +1242,26 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
 
         _validate_check_ref(check_ref)
 
+        # `None` means a DETECTED budget, not unbounded -- unbounded preserves
+        # exactly the biobank-scale OOM exposure the byte-budgeted planner
+        # exists to remove. Detection is an optimization, not a requirement:
+        # it raises RuntimeError when there is no cgroup limit AND no readable
+        # /proc/meminfo, which is every macOS run (this project ships an
+        # osx-arm64 wheel). That must not fail the whole conversion.
+        if max_mem is None:
+            try:
+                max_mem_bytes = detect_memory_budget()
+            except RuntimeError as e:
+                warnings.warn(
+                    f"could not detect a memory budget ({e}); planning "
+                    "concurrency by core count only. Pass max_mem explicitly "
+                    "to plan against a byte budget.",
+                    stacklevel=2,
+                )
+                max_mem_bytes = None
+        else:
+            max_mem_bytes = parse_memory(max_mem)
+
         from ._logging import write_reporting
 
         with write_reporting(progress, log_level) as (rx, level):
@@ -1232,6 +1285,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
                 region_ranges,
                 regions_overlap,
                 sample_perm,
+                max_mem_bytes,
                 log_level=level,
                 receiver=rx,
             )
