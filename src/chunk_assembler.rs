@@ -124,6 +124,77 @@ fn pack_presence_seq(words: &mut [u64], atoms: &[PendingAtom], columns: usize) {
     }
 }
 
+/// Per-record presence bitsets: for each in-scope ALT of one source record, the
+/// set of haplotype columns whose call is that ALT.
+///
+/// This is what dense sources retain INSTEAD of `Calls::Dense(Vec<i32>)`. The
+/// only things a retained `Calls::Dense` was ever used for are `pack_row`'s
+/// `gt[col] == source_alt_index` test and carrier recovery -- and dense sources
+/// skip carrier recovery (`flush_window` returns `None`, since recovering
+/// carriers from the packed grid is cheaper). So the retained payload can be
+/// that test's ANSWER: one bit per column instead of one `i32`, `columns/8`
+/// bytes per record instead of `columns*4`. That 32x is what keeps the reader's
+/// live set bounded at biobank cohort widths -- see issue #155.
+#[allow(dead_code)] // Task 2 packs from `mask()`; Task 3 constructs via `from_dense`.
+struct PresenceMasks {
+    /// Slot-major: slot `s` owns `words[s*words_per_mask .. (s+1)*words_per_mask]`.
+    words: Vec<u64>,
+    words_per_mask: usize,
+}
+
+#[allow(dead_code)] // Task 2 packs from `mask()`; Task 3 constructs via `from_dense`.
+impl PresenceMasks {
+    /// Build one slab from a record's dense calls, in a SINGLE pass over `gt`.
+    ///
+    /// `wanted` is the ascending, deduplicated list of `source_alt_index` values
+    /// this record's atoms actually carry; slot `i` corresponds to `wanted[i]`.
+    /// Restricting to those means a record whose other ALTs were dropped as
+    /// out-of-scope pays for the ALTs it kept, not for `n_alts`. Alleles outside
+    /// `wanted` -- REF `0`, missing `-1`, dropped ALTs -- set no bit, which is
+    /// exactly what `gt[col] == src` does for any `src` in `wanted`.
+    fn from_dense(gt: &[i32], columns: usize, wanted: &[u16]) -> Self {
+        debug_assert!(
+            wanted.iter().all(|&a| a > 0),
+            "source_alt_index is 1-based; allele 0 is REF and can never be an atom's ALT"
+        );
+        let words_per_mask = columns.div_ceil(64);
+        let mut words = vec![0u64; words_per_mask * wanted.len()];
+
+        // allele -> slot. `u16::MAX` means "no slot"; sized by the largest
+        // wanted allele rather than by `n_alts`, which is not passed in.
+        let max_allele = wanted.iter().copied().max().unwrap_or(0) as usize;
+        let mut slot_of = vec![u16::MAX; max_allele + 1];
+        for (slot, &allele) in wanted.iter().enumerate() {
+            slot_of[allele as usize] = slot as u16;
+        }
+
+        for (col, &a) in gt.iter().take(columns).enumerate() {
+            if a < 0 {
+                continue; // missing
+            }
+            let a = a as usize;
+            if a >= slot_of.len() {
+                continue; // REF, or an ALT no atom kept
+            }
+            let slot = slot_of[a];
+            if slot == u16::MAX {
+                continue;
+            }
+            words[slot as usize * words_per_mask + (col >> 6)] |= 1u64 << (col & 63);
+        }
+        Self {
+            words,
+            words_per_mask,
+        }
+    }
+
+    #[inline]
+    fn mask(&self, slot: u16) -> &[u64] {
+        let start = slot as usize * self.words_per_mask;
+        &self.words[start..start + self.words_per_mask]
+    }
+}
+
 // Below this many variants in a chunk, parallel packing's per-task overhead
 // outweighs the win — pack sequentially instead. Tunable; measure on gdc/germline.
 const PARALLEL_MIN_VARIANTS: usize = 512;
@@ -1016,6 +1087,48 @@ mod tests {
         let mut got = vec![0u64; 1];
         pack_row(&mut got, 0, 0, &atom, columns);
         assert_eq!(got, expect);
+    }
+
+    #[test]
+    fn presence_masks_mark_exactly_the_columns_matching_each_alt() {
+        let gt = vec![0i32, 1, 2, -1, 1, 2, 0, 1];
+        let m = PresenceMasks::from_dense(&gt, 8, &[1, 2]);
+        // slot 0 == ALT 1 -> columns 1, 4, 7
+        assert_eq!(m.mask(0)[0], (1u64 << 1) | (1 << 4) | (1 << 7));
+        // slot 1 == ALT 2 -> columns 2, 5
+        assert_eq!(m.mask(1)[0], (1u64 << 2) | (1 << 5));
+    }
+
+    #[test]
+    fn presence_masks_ignore_ref_missing_and_out_of_scope_alts() {
+        // A record whose ALT 2 was dropped as out-of-scope (symbolic/breakend) gets
+        // ONE slot. REF (0), missing (-1) and the dropped ALT must not leak into it.
+        let gt = vec![0i32, 1, 2, -1, 3];
+        let m = PresenceMasks::from_dense(&gt, 5, &[1]);
+        assert_eq!(m.mask(0)[0], 1u64 << 1);
+    }
+
+    #[test]
+    fn presence_masks_cost_one_bit_per_column_per_slot() {
+        // The whole point of the type: 200 columns cost 4 words per slot, not 200
+        // i32s per record (issue #155).
+        let gt = vec![0i32; 200];
+        let m = PresenceMasks::from_dense(&gt, 200, &[1, 2]);
+        assert_eq!(m.mask(0).len(), 4);
+        assert_eq!(m.mask(1).len(), 4);
+    }
+
+    #[test]
+    fn presence_masks_set_high_columns_in_the_right_word() {
+        let mut gt = vec![0i32; 200];
+        for c in [0usize, 63, 64, 65, 199] {
+            gt[c] = 1;
+        }
+        let m = PresenceMasks::from_dense(&gt, 200, &[1]);
+        let w = m.mask(0);
+        assert_eq!(w[0], (1u64 << 0) | (1u64 << 63));
+        assert_eq!(w[1], (1u64 << 0) | (1u64 << 1));
+        assert_eq!(w[3], 1u64 << (199 - 192));
     }
 
     #[test]
