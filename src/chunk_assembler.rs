@@ -1190,19 +1190,42 @@ mod tests {
     }
 
     #[test]
-    fn or_mask_into_never_writes_past_the_rows_last_word() {
+    fn or_mask_into_places_a_high_column_in_the_rows_last_word() {
         // columns = 100, vi = 1 -> the row spans bits 100..200 (last bit 199), i.e.
         // words 1..=3: word 3 (bits 192..256) is the row's OWN last word (it holds
-        // bits 192..199), not a foreign next-row word -- so the boundary check below
-        // is the bit landing in exactly word 3, at exactly bit 7, and nowhere else
-        // (a wrong `w0`/`s`/`last` computation would misplace it or panic on an
-        // out-of-bounds `words[hi]`).
+        // bits 192..199), not a foreign next-row word -- so the check below is the
+        // bit landing in exactly word 3, at exactly bit 7, and nowhere else (a wrong
+        // `w0`/`s`/`last` computation would misplace it or panic on an out-of-bounds
+        // `words[hi]`).
         let mut gt = vec![0i32; 100];
         gt[99] = 1;
         let m = PresenceMasks::from_dense(&gt, 100, &[1]);
         let mut got = vec![0u64; 4];
         or_mask_into(&mut got, 0, 100, m.mask(0), 100);
         assert_eq!(got[(199) >> 6], 1u64 << (199 & 63));
+    }
+
+    #[test]
+    fn or_mask_into_never_writes_past_the_rows_last_word() {
+        // columns = 70, vi = 1 -> base = 70, w0 = 1, s = 6, last = (70+70-1)>>6 = 2.
+        // gt[69] = 1 puts the only set bit in mask word 1 (local bit 69&63 = 5), so
+        // `lo = w0+1 = 2` and the natural carry destination is `hi = 3`. `3 <= last`
+        // is FALSE, so the `hi <= last` guard must suppress that write.
+        //
+        // `got` is sized to EXACTLY `last + 1 = 3` words -- the row's own last word,
+        // nothing beyond it. `pack_presence_par` hands each rayon task a
+        // word-disjoint slice sized just like this, so if the guard were missing (or
+        // wrong), the carry write `words[3] |= ...` would index a length-3 slice out
+        // of bounds and PANIC here, rather than silently corrupting a neighbouring
+        // task's words as it would in production.
+        let mut gt = vec![0i32; 70];
+        gt[69] = 1;
+        let m = PresenceMasks::from_dense(&gt, 70, &[1]);
+        let mut got = vec![0u64; 3];
+        or_mask_into(&mut got, 0, 70, m.mask(0), 70);
+        assert_eq!(got[0], 0);
+        assert_eq!(got[1], 0);
+        assert_eq!(got[2], 1u64 << 11);
     }
 
     proptest! {
