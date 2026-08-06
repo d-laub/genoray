@@ -153,8 +153,12 @@ fn batch_records(columns: usize) -> usize {
 }
 ```
 
-`MAX_BATCH_RECORDS = 1024` preserves today's value as the cap, so no cohort
-currently under the budget changes behaviour.
+`MAX_BATCH_RECORDS = 1024` preserves today's value as the ceiling. It binds —
+nothing changes — up to `columns = 16_384`, i.e. **S = 8,192** at ploidy 2.
+Above that the batch shrinks with cohort width, so S=32,000 (inside
+`RamLaw::PGEN`'s fitted domain) stages 262 records rather than 1,024. That is
+the fix working, and it is exactly why the law must be re-fitted rather than
+carried over.
 
 `MIN_BATCH_RECORDS = 8`, deliberately small rather than scaled by thread count.
 A thread-scaled floor would defeat the budget: at 48 threads and 4 records per
