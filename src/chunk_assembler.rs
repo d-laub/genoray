@@ -215,11 +215,11 @@ struct AtomMeta {
 // = up to 16 KB per sample, independent of `chunk_size` and of `max_mem`.
 // Measured on `from_pgen` (single contig, 1,000 variants, S=128,000): 1,123 MB
 // of the 1,592 MB peak, and halving both constants took the peak to 1,102 MB.
-// This is the biobank-scale blocker -- see the issue linked from
-// `_svar2.py::from_pgen`. Fixing it means making both a CELL budget rather than
-// a variant count, which collides with `PARALLEL_MIN_VARIANTS` below (itself a
-// variant-count threshold for what is really a cell-count decision), so it is a
-// measured change, not a constant tweak.
+// This is the biobank-scale blocker behind `RamLaw::PGEN`'s conservative
+// margin -- see issue #155. Fixing it means making both a CELL budget rather
+// than a variant count, which collides with `PARALLEL_MIN_VARIANTS` below
+// (itself a variant-count threshold for what is really a cell-count decision),
+// so it is a measured change, not a constant tweak.
 const PACK_WINDOW: usize = 1024;
 const NORMALIZE_BATCH_RECORDS: usize = 1024;
 
