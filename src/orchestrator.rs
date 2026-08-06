@@ -210,16 +210,21 @@ fn report_ref_excluded(chrom: &str, ref_excluded: u64) {
     }
 }
 
-/// Emit the per-contig left-alignment summary (nothing when no atoms moved).
-/// Shared by the single-reader and sub-contig-sharded paths, mirroring
-/// `report_ref_excluded` above.
 /// Return this contig's freed arena heaps to the OS.
 ///
 /// glibc keeps freed per-contig heaps mapped, so RSS ratchets across a
 /// multi-contig cohort even though every contig drops its whole working set
 /// (issue #120). Call at each contig boundary, right after that working set is
-/// gone. Measured: without it the PGEN path retains ~500 MB per contig at
-/// S=128,000.
+/// gone. Measured on the VCF path (#130): peak-RSS exponent N^1.162 -> N^0.901
+/// and the ratchet 4.66x -> 1.00x, on contigs with millions of variants.
+///
+/// The PGEN call site is the same hygiene, but its win is *not* separately
+/// measured: on the only PGEN probe available (synthetic, 1,000 variants per
+/// contig) the effect is inside run-to-run noise, because per-contig arenas that
+/// small leave little to reclaim. Do not cite a PGEN number here without one.
+///
+/// This is also *not* a lever on `from_pgen`'s per-sample RAM scaling (~8 KB per
+/// sample per concurrently processed contig) -- that survives the trim.
 ///
 /// Cheap on the serial `run_vcf_list` loop; on the PGEN path several contigs
 /// finish concurrently and each caller takes the arena locks, so this trades a
@@ -237,6 +242,9 @@ pub(crate) fn trim_heap() {
     }
 }
 
+/// Emit the per-contig left-alignment summary (nothing when no atoms moved).
+/// Shared by the single-reader and sub-contig-sharded paths, mirroring
+/// `report_ref_excluded` above.
 fn report_normalized(chrom: &str, normalized_total: u64) {
     if normalized_total > 0 {
         tracing::info!(chrom = %chrom, normalized = normalized_total, "left-aligned indels");
