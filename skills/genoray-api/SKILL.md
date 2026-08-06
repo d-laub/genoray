@@ -461,7 +461,11 @@ Signature: `from_pgen(out, source, reference=None, *, regions=None, samples=None
   the planner's RAM law has a fixed cohort-baseline term of roughly 2.7 GB
   (PGEN's own fitted coefficients, higher than `from_vcf`'s ~932 MB), so any
   budget that can't cover baseline plus one concurrent contig's chunk
-  buffers is rejected with `ValueError`, even for a tiny cohort.
+  buffers is rejected with `ValueError`, even for a tiny cohort. That
+  baseline scales with cohort size (`~0.12 MB/sample`), so this isn't just a
+  small-cohort concern: at ~500k samples it alone predicts ~63 GB, so a
+  *detected* budget on a smaller host will reject the conversion — pass an
+  explicit `max_mem` sized to the host in that case.
 - **`regions=`/`merge_overlapping=`/`regions_overlap=`** — same convention,
   semantics, and three overlap modes (`"pos"`/`"record"`/`"variant"`) as
   `from_vcf`, restricting conversion to one or more `.pvar` variant-index

@@ -962,7 +962,12 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         2.7 GB (PGEN's own fitted coefficients, higher than `from_vcf`'s
         ~932 MB), so any budget that can't cover baseline plus one
         concurrent contig's chunk buffers is rejected with a `ValueError`
-        even for a tiny cohort.
+        even for a tiny cohort. That baseline term also scales with cohort
+        size (`~0.12 MB/sample`), so this floor is not just a small-cohort
+        curiosity: at ~500k samples the baseline alone predicts ~63 GB,
+        so a *detected* budget (80% of a smaller host's RAM) will reject
+        the conversion outright -- pass an explicit `max_mem` sized to the
+        host in that case.
 
         `regions` restricts conversion to one or more `.pvar` variant-index
         ranges. Region strings use Genoray's existing convention:
