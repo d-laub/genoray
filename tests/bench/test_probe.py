@@ -8,6 +8,7 @@ import pytest
 from scripts.bench_svar2.probe import (
     _build_env,
     _is_oom_failure,
+    _tmp_dir,
     parse_trace,
     run_point,
 )
@@ -421,3 +422,40 @@ def test_build_cmd_defaults_to_vcf():
     cmd = _build_cmd(point, manifest, Path("/tmp/s.svar"))
     assert "vcf" in cmd
     assert "--skip-symbolics-and-breakends" not in cmd
+
+
+def test_tmp_dir_prefers_the_job_dir_when_it_resolves(tmp_path, monkeypatch):
+    job = tmp_path / "job"
+    (job / "tmp").mkdir(parents=True)
+    monkeypatch.setenv("CLAUDE_JOB_DIR", str(job))
+    outdir = tmp_path / "out"
+    outdir.mkdir()
+    assert _tmp_dir(outdir) == job / "tmp" / "bench_probe"
+
+
+def test_tmp_dir_falls_back_when_the_job_dir_is_a_dangling_symlink(
+    tmp_path, monkeypatch
+):
+    # The harness symlinks $CLAUDE_JOB_DIR/tmp to node-local disk. Under
+    # `sbatch --export=ALL` on another node that target does not exist, so the
+    # symlink dangles -- mkdir of the child raises FileNotFoundError and the
+    # parents=True retry raises FileExistsError on the symlink itself. That
+    # killed a 7h PGEN sweep after its corpora were already built.
+    job = tmp_path / "job"
+    job.mkdir()
+    (job / "tmp").symlink_to(tmp_path / "local-scratch-on-another-node")
+    monkeypatch.setenv("CLAUDE_JOB_DIR", str(job))
+    outdir = tmp_path / "out"
+    outdir.mkdir()
+
+    got = _tmp_dir(outdir)
+
+    assert got == outdir / "tmp"
+    assert got.is_dir()
+
+
+def test_tmp_dir_falls_back_when_the_job_dir_is_unset(tmp_path, monkeypatch):
+    monkeypatch.delenv("CLAUDE_JOB_DIR", raising=False)
+    outdir = tmp_path / "out"
+    outdir.mkdir()
+    assert _tmp_dir(outdir) == outdir / "tmp"

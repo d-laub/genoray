@@ -199,11 +199,24 @@ def _tmp_dir(outdir: Path) -> Path:
     """Scratch directory for the per-rep stdout/stderr capture files.
 
     Never `/tmp`: it is reaped mid-session on this cluster (see
-    genoray-nfs-linker-bus-error memory). Prefer `$CLAUDE_JOB_DIR/tmp`; fall
-    back to the probe's own `outdir` if that env var is unset (e.g. outside
-    the Claude harness)."""
+    genoray-nfs-linker-bus-error memory). Prefer `$CLAUDE_JOB_DIR/tmp`, but
+    only when it is usable on THIS host: the harness symlinks it to node-local
+    disk, so under `sbatch --export=ALL` on any other node it is a DANGLING
+    symlink and every mkdir below it fails. That killed a 7h sweep after the
+    corpora were built -- `mkdir` of the child raised FileNotFoundError, and
+    the `parents=True` retry then raised FileExistsError on the symlink itself.
+    Fall back to the probe's own `outdir` whenever the env var is unset (e.g.
+    outside the Claude harness) or its target does not resolve here."""
     job_dir = os.environ.get("CLAUDE_JOB_DIR")
-    base = Path(job_dir) / "tmp" / "bench_probe" if job_dir else outdir / "tmp"
+    if job_dir:
+        base = Path(job_dir) / "tmp" / "bench_probe"
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass  # node-local scratch of a different host; use outdir instead
+        else:
+            return base
+    base = outdir / "tmp"
     base.mkdir(parents=True, exist_ok=True)
     return base
 

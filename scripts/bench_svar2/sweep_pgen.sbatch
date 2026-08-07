@@ -37,6 +37,12 @@ echo "=== commit $(git rev-parse HEAD) ==="
 # NOT $CLAUDE_JOB_DIR/tmp: /tmp inside a Slurm job is a PRIVATE slurmtmpfs bind
 # mount, so a job writing there dies with exit 53 and no log. /local/$USER is
 # node-local disk, visible from the compute node and not cleaned between jobs.
+#
+# Unset the var, do not merely avoid it here: `--export=ALL` carries it in, and
+# modules we invoke (probe.py) read it directly and would silently override this
+# choice with a path that is node-local to the SUBMITTING host. Stating the
+# policy in this script is not enough to enforce it.
+unset CLAUDE_JOB_DIR
 SCRATCH="/local/$USER/pgen-sweep"
 mkdir -p "$SCRATCH"/{corpora,plans,out}
 echo "=== disk headroom on /local/$USER ==="
