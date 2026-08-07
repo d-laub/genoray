@@ -144,10 +144,50 @@ if VLINEAR2_SAMPLES == VLINEAR_SAMPLES:
 # holding S*V constant, pins the cohort exponent to ~1 by construction --
 # that failure has already produced one published-then-retracted interval
 # in this project, so the shape of this ladder is load-bearing.
+#
+# A THIRD rung -- S=128,000, one V -- was added on top of that: the RAM law's
+# `per_sample_mb` term was being extrapolated 15.6x from S=32,000 to the
+# 500,000-sample target; a point at S=128,000 cuts that stretch to 3.9x. It
+# carries only V=250,000 (its own chunk-size axis lives in
+# `PGEN_CHUNK_SIZE_AXIS` below) rather than a full V-ladder: V-linearity is
+# already covered by the two ladders above, so this rung's job is purely to
+# add a third, further-out point on the cohort (S) axis.
+#
+# Separately, `kappa` (the per-chunk RAM coefficient) had SE 7.44 and a 95% CI
+# of [-9.99, +23.68] -- it spans zero, i.e. it is a bound, not a rate.
+# `_chunk_size_for(v)` depends only on V, and both ladders above swept the
+# SAME three V values, so `chunk_size` ended up correlated with `S` (both
+# ladders visited chunk_size in {7812, 15625, 25000} in lockstep with V) and
+# `[1, S, S*chunk_size]` stayed too collinear for a tight fit. Varying
+# chunk_size at a FIXED (S, V) -- see `PGEN_CHUNK_SIZE_AXIS` -- decorrelates
+# the two regressors instead of just adding more of the same confound.
 PGEN_LADDERS = (
     (4_000, (250_000, 500_000, 1_000_000)),
     (32_000, (250_000, 500_000, 1_000_000)),
+    (128_000, (250_000,)),
 )
+
+# Per-(samples, variants) chunk_size overrides for the PGEN_LADDERS loop below.
+# Absent an entry, a shape gets the single chunk_size `_chunk_size_for(v)`
+# would derive (unchanged behavior). Present entries add MULTIPLE rows on the
+# SAME, already-generated corpus -- pure chunk_size variation at fixed (S, V).
+#
+# V=1,000,000 at both existing widths: chunk_size in {3_125, 12_500, 25_000}
+# is 14.5 / 3.6 / 1.8 chunks/contig, an 8x chunk_bytes range at constant S.
+# 25_000 is what `_chunk_size_for(1_000_000)` already gives, so this adds two
+# rows per width on existing corpora -- no new generation.
+#
+# S=128,000, V=250,000: chunk_size in {3_125, 7_812} is 3.6 / 1.5
+# chunks/contig, matching the existing ladder's regime rather than reusing
+# the V=1e6 axis above -- 25_000 there would leave only 0.36 chunks/contig at
+# V=250_000, breaking the >=1-chunk-per-contig invariant `BitGrid3::zeros`
+# forces (it reserves the full chunk_size up front and truncates only after
+# EOF, so a partial chunk breaks the very linearity kappa measures).
+PGEN_CHUNK_SIZE_AXIS: dict[tuple[int, int], tuple[int, ...]] = {
+    (4_000, 1_000_000): (3_125, 12_500, 25_000),
+    (32_000, 1_000_000): (3_125, 12_500, 25_000),
+    (128_000, 250_000): (3_125, 7_812),
+}
 # Concurrency axis: bracket the core bound (usable/2 = 23 on a 48-core box)
 # so the sweep can show where the GIL stops paying, if it does.
 PGEN_CONCURRENCY = (1, 4, 8, 11, 16, 22)
@@ -353,11 +393,11 @@ def build(corpus_dir: Path, threads: int) -> dict[str, list[SweepPoint]]:
     for s, vs in PGEN_LADDERS:
         for v in vs:
             corpus = corpus_dir / f"pgen_s{s}_v{v}.manifest.json"
-            cs = _chunk_size_for(v)
             # w is always 1: from_pgen pins P=1, so there is no reader-worker
             # axis to sweep. The RAM-law points leave concurrency unset so the
             # planner's own choice is what gets measured.
-            pgen.append(_point(corpus, 1, cs, threads, backend="pgen"))
+            for cs in PGEN_CHUNK_SIZE_AXIS.get((s, v), (_chunk_size_for(v),)):
+                pgen.append(_point(corpus, 1, cs, threads, backend="pgen"))
     s_cc, v_cc = PGEN_CONCURRENCY_AT
     corpus_cc = corpus_dir / f"pgen_s{s_cc}_v{v_cc}.manifest.json"
     for cc in PGEN_CONCURRENCY:

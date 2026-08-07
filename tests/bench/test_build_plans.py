@@ -280,6 +280,40 @@ def test_pgen_family_has_two_v_ladders_at_different_sample_counts():
     )
 
 
+def test_pgen_matrix_can_identify_kappa():
+    """kappa's CI spanned zero (SE 7.44, 95% CI [-9.99, +23.68]) because
+    `_chunk_size_for` depends only on V and both ladders swept the same three
+    V values, so `chunk_size` and `S*chunk_size` stayed correlated with S.
+    Varying chunk_size at a FIXED (S, V) decorrelates them; a third cohort
+    width tightens `per_sample_mb`'s extrapolation to the 500,000-sample
+    target."""
+    plans = build(Path("/tmp/corpora"), threads=48)
+    pgen = plans["pgen"]
+
+    chunk_sizes_by_shape: dict[tuple[int, int], set[int]] = {}
+    widths: set[int] = set()
+    for p in pgen:
+        s, v = _shape_of(p)
+        chunk_sizes_by_shape.setdefault((s, v), set()).add(p.chunk_size)
+        widths.add(s)
+
+    assert max(len(cs) for cs in chunk_sizes_by_shape.values()) >= 3, (
+        "need >=3 distinct chunk_size values at some fixed (S, V) to "
+        f"decorrelate chunk_size from S; got {chunk_sizes_by_shape}"
+    )
+    assert len(widths) >= 3, f"need >=3 distinct cohort widths; got {widths}"
+
+    for p in pgen:
+        _, v = _shape_of(p)
+        chunks_per_contig = v / 22 / p.chunk_size
+        assert chunks_per_contig >= 1.0, (
+            f"{p.corpus} chunk_size={p.chunk_size} leaves "
+            f"{chunks_per_contig:.2f} chunks/contig < 1 -- BitGrid3::zeros "
+            "reserves the full chunk_size and truncates after EOF, so a "
+            "partial chunk breaks the linearity kappa measures"
+        )
+
+
 def test_pgen_concurrency_axis_holds_workers_at_one():
     """PGEN pins P=1 (sub-contig sharding disabled), so a reader_workers
     axis would measure nothing."""

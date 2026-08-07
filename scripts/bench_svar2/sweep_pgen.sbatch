@@ -9,12 +9,16 @@
 # gave a corpus-generation rate of ~6.15e-7 s/cell, essentially SINGLE-CORE
 # (`vcfixture bulk`'s own --threads defaults to "all available cores" but
 # user+sys time tracked real time within ~4% across all three probes, so the
-# 48-cpu allocation buys generation nothing). The six PGEN_LADDERS corpora
-# sum to 6.3e10 cells, i.e. ~10.8h for generation ALONE before any conversion
-# runs -- and that is the exact failure mode `sweep_scale.sbatch` already hit
-# once (24h -> 72h, see its own header comment) for a comparable VCF corpus
-# ladder. Matching that precedent rather than re-discovering it the expensive
-# way; see task-9-report.md Phase A for the full arithmetic.
+# 48-cpu allocation buys generation nothing). The seven PGEN_LADDERS corpora
+# (including the S=128,000 rung added for the RAM-law refit, 128,000 x
+# 250,000 = 3.2e10 cells ~= 5.5h on its own) sum to 9.5e10 cells, i.e. ~16.2h
+# for generation ALONE before any conversion runs -- and that is the exact
+# failure mode `sweep_scale.sbatch` already hit once (24h -> 72h, see its own
+# header comment) for a comparable VCF corpus ladder. Matching that precedent
+# rather than re-discovering it the expensive way; see task-9-report.md
+# Phase A for the full arithmetic. The chunk-size axis added alongside the
+# new rung (`PGEN_CHUNK_SIZE_AXIS`) reuses existing corpora and adds no
+# generation cost.
 #SBATCH --time=72:00:00
 #SBATCH --output=%x_%j.log
 
