@@ -243,9 +243,11 @@ impl PresenceMasks {
 // below any fixed variant count and silently disengages parallel packing.
 //
 // PROVISIONAL until Task 7 measures it. Seeded at the product that reproduces
-// today's gate (512 variants) at a 1,024-column cohort, so narrow cohorts behave
-// as they did; `or_mask_into` made packing ~64x cheaper, so the measured value
-// may well be higher.
+// today's gate (512 variants) at a 1,024-column cohort: the new gate matches the
+// old one exactly at columns == 1,024, is STRICTER below it (e.g. at columns =
+// 512 it now takes 1,024 atoms to go parallel where 512 used to suffice), and
+// LOOSER above it. `or_mask_into` made packing ~64x cheaper, so the measured
+// value may well be higher.
 const PARALLEL_MIN_CELLS: usize = 512 * 1_024;
 
 #[inline]
@@ -824,10 +826,10 @@ impl ChunkAssembler {
 
     // Pull up to `chunk_size` atoms (already globally position-sorted) and pack them
     // into a variant-major DenseChunk. Presence bits are packed in windows of
-    // `PACK_WINDOW` atoms so the reader never holds more than one window's worth of
-    // per-column genotype vectors. `pool`, when present and the window is large
-    // enough, hosts parallel packing; otherwise packing is sequential. Output is
-    // bit-identical either way. Returns None once no atoms remain.
+    // `pack_window(columns)` atoms so the reader never holds more than one window's
+    // worth of buffered `PresenceMasks` bitsets. `pool`, when present and the window
+    // is large enough, hosts parallel packing; otherwise packing is sequential.
+    // Output is bit-identical either way. Returns None once no atoms remain.
     pub fn read_next_chunk(
         &mut self,
         chunk_size: usize,
