@@ -344,7 +344,7 @@ instead of E2's literal recipe.)
 **Baseline-only term** (`base_mb + per_sample_mb·500,000`), the convention
 `src/budget.rs`'s own test comments use. (GiB below is computed correctly
 as `MB × 1e6 / 1024³`, not `MB / 1024` — that shortcut, inherited from PR
-#154 and this document's own precedent, understates GiB by ~5%: 62,893.2 MB
+#154 and this document's own precedent, overstates GiB by ~5%: 62,893.2 MB
 is 58.6 GiB, not 61.4.)
 
 | Law | baseline-only @ S=500,000 |
@@ -367,10 +367,10 @@ RAM a detected-budget caller needs to clear it (`cc=1`, i.e.
 
 | Law | min_budget (cc=1) @ S=500,000 | host RAM needed (÷0.8) |
 |---|---:|---:|
-| Previously shipped (2026-08-05) | 64,729.6 MB | **≈79.0 GiB** |
+| Previously shipped (2026-08-05) | 64,729.6 MB | **≈75.4 GiB** |
 | This document's shipped law | 16,628.5 MB | **≈19.4 GiB** |
 
-A **4.1×** reduction in the host RAM a caller needs to clear before
+A **3.9×** reduction in the host RAM a caller needs to clear before
 `plan_sharded` will accept even `cc=1` at biobank scale — this is the
 number that determines whether the planner *refuses* a host outright at
 S=500,000, and it drops from requiring a >64 GiB host to one well under 32

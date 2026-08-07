@@ -136,12 +136,15 @@ impl RamLaw {
     /// matrix `fit_ram_law` builds):
     ///   - `base_mb`: 2570.300231003748 (held at its fitted value -- see
     ///     below for why it is not also pushed to a bound)
-    ///   - `per_sample_mb`: 0.007600352463934604, SE 0.005304817406885589,
-    ///     95% CI [-0.003706598187246871, 0.018907303115116077] -- the CI
-    ///     spans zero, so this is shipped as a CONSERVATIVE BOUND, not a
-    ///     fitted rate, exactly like `kappa` below.
-    ///   - `kappa`: 10.793993745504235, SE 2.9846678648863567, 95% CI
-    ///     [4.432324781246695, 17.155662709761774].
+    ///   - `per_sample_mb`: 0.00760035, SE 0.00530482, 95% CI [-0.0037066,
+    ///     0.018907303115116077] -- the CI spans zero, so this is shipped as
+    ///     a CONSERVATIVE BOUND, not a fitted rate, exactly like `kappa`
+    ///     below. (SE/CI-lower rounded to 6 significant figures -- they only
+    ///     reproduce to ~12 anyway (`np.linalg.inv` round-off); the CI upper
+    ///     bound is kept at full precision because it is the shipped
+    ///     coefficient below.)
+    ///   - `kappa`: 10.7940, SE 2.98467, 95% CI [4.43232, 17.155662709761774]
+    ///     (same rounding: the CI upper bound is the shipped coefficient).
     ///
     /// **Construction: intercept pinned at its fitted value, each uncertain
     /// SLOPE raised independently to its own 95% CI upper bound.** This is
@@ -162,7 +165,10 @@ impl RamLaw {
     /// chunk_bytes=3.125 MB, cc=8. Largest over-prediction 6.90x at
     /// S=128,000, chunk_bytes=249.98 MB. (The previously shipped
     /// 2026-08-05 law, independently re-evaluated against this same clean
-    /// data, was 1.2763x / 5.58x -- this law is tighter everywhere.)
+    /// data, was 1.2763x / 5.5777x. The new law is tighter at the binding
+    /// worst case (1.1745x vs 1.2763x) but looser across most of the range:
+    /// tighter at only 4 of the 18 rows, and its own largest over-prediction
+    /// (6.8966x) exceeds the old law's (5.5777x).)
     ///
     /// **The margin's provenance is a fitting artifact, not a chosen safety
     /// factor**: `fit_ram_law` fits `kappa` cc-blind (its chunk regressor is
