@@ -184,6 +184,26 @@ struct PresenceMasks {
 }
 
 impl PresenceMasks {
+    /// allele -> slot map for `wanted`, the ascending, deduplicated list of
+    /// `source_alt_index` values one record's atoms actually carry: slot `i`
+    /// corresponds to `wanted[i]`, `u16::MAX` means "no slot". Sized by the
+    /// largest wanted allele rather than by `n_alts`, which is not passed in.
+    ///
+    /// Pulled out to a single definition so a caller that needs both a
+    /// `PresenceMasks` (via `from_dense`, below) and this same mapping --
+    /// `decompose_raw_record` routes each atom to `AtomCalls::Masks::slot`
+    /// with it -- gets it from ONE place. Building it twice independently
+    /// would let the two "slot = index into `wanted`" definitions silently
+    /// desync.
+    fn slot_map(wanted: &[u16]) -> Vec<u16> {
+        let max_allele = wanted.iter().copied().max().unwrap_or(0) as usize;
+        let mut slot_of = vec![u16::MAX; max_allele + 1];
+        for (slot, &allele) in wanted.iter().enumerate() {
+            slot_of[allele as usize] = slot as u16;
+        }
+        slot_of
+    }
+
     /// Build one slab from a record's dense calls, in a SINGLE pass over `gt`.
     ///
     /// `wanted` is the ascending, deduplicated list of `source_alt_index` values
@@ -192,21 +212,17 @@ impl PresenceMasks {
     /// out-of-scope pays for the ALTs it kept, not for `n_alts`. Alleles outside
     /// `wanted` -- REF `0`, missing `-1`, dropped ALTs -- set no bit, which is
     /// exactly what `gt[col] == src` does for any `src` in `wanted`.
-    fn from_dense(gt: &[i32], columns: usize, wanted: &[u16]) -> Self {
+    ///
+    /// `slot_of` MUST be `Self::slot_map(wanted)` -- taken as a parameter,
+    /// not rebuilt here, so a caller that also needs the map (to route
+    /// `AtomCalls::Masks::slot`) computes it exactly once.
+    fn from_dense(gt: &[i32], columns: usize, wanted: &[u16], slot_of: &[u16]) -> Self {
         debug_assert!(
             wanted.iter().all(|&a| a > 0),
             "source_alt_index is 1-based; allele 0 is REF and can never be an atom's ALT"
         );
         let words_per_mask = columns.div_ceil(64);
         let mut words = vec![0u64; words_per_mask * wanted.len()];
-
-        // allele -> slot. `u16::MAX` means "no slot"; sized by the largest
-        // wanted allele rather than by `n_alts`, which is not passed in.
-        let max_allele = wanted.iter().copied().max().unwrap_or(0) as usize;
-        let mut slot_of = vec![u16::MAX; max_allele + 1];
-        for (slot, &allele) in wanted.iter().enumerate() {
-            slot_of[allele as usize] = slot as u16;
-        }
 
         for (col, &a) in gt.iter().take(columns).enumerate() {
             if a < 0 {
@@ -250,9 +266,9 @@ impl PresenceMasks {
 // smaller than, the spread across values (2.1-3.2%); one pairwise comparison
 // out of 24 was nominally significant (p=0.0241), but across 24 comparisons
 // that alone is unremarkable: the family-wise chance of at least one such hit
-// is ~=0.44 (1-(1-0.0241)^24) -- coin-flip odds, not evidence. The corpora also can't
-// discriminate threshold PLACEMENT: at these widths every candidate but one
-// cell selects the same parallel/sequential branch, so the sweep mainly
+// is ~=0.44 (1-(1-0.0241)^24) -- coin-flip odds, not evidence. The corpora also
+// can't discriminate threshold PLACEMENT: at these widths every candidate but
+// one cell selects the same parallel/sequential branch, so the sweep mainly
 // measured parallel-vs-sequential packing, not where the gate should sit.
 // Kept at its seeded value rather than tuned off noise. Full analysis and
 // tables:
@@ -337,7 +353,14 @@ struct AtomMeta {
     carriers: Option<Carriers>,
 }
 
-// *** These two budgets set the reader's peak RAM. ***
+// *** These two budgets set the reader's peak RAM for the genotype path, with
+// *** no FORMAT/dosage fields requested. ***
+//
+// When FORMAT/dosage fields ARE requested, `PendingAtom.format_vals` /
+// `AtomMeta.format_vals` retain the record's raw `FormatVals::Dense` -- a
+// separately heap-allocated `Vec<f64>` per (field, sample) -- for as long as
+// `metas` is live, and that retention is covered by NEITHER budget below. It
+// is a pre-existing, separately tracked cost, not something these two bound.
 //
 // They used to be fixed VARIANT counts (`PACK_WINDOW`/`NORMALIZE_BATCH_RECORDS`,
 // both 1024) multiplying an O(n_samples) payload, giving a live set of
@@ -391,8 +414,11 @@ fn batch_records(columns: usize) -> usize {
 /// The CALLER rounds this up to a multiple of the word-aligned block size
 /// `g = 64/gcd(columns, 64)`, so every flush offset lands on a u64 boundary and
 /// `pack_presence_par` keeps its word-disjoint invariant. That rounding can
-/// exceed the budget by at most `g - 1 <= 63` records -- a few percent at the
-/// widths where the budget binds, and zero whenever `columns` is a multiple of 64.
+/// exceed the budget by at most `g - 1 <= 63` records -- up to ~1.2x once
+/// `pack_window` falls into the low hundreds (e.g. columns = 3,999,998, S =
+/// 1,999,999 at ploidy 2: g = 32, pack_window = 134, rounded window = 160,
+/// 76.3 MiB against a 64 MiB budget), and zero whenever `columns` is a
+/// multiple of 64.
 fn pack_window(columns: usize) -> usize {
     (MASK_STAGE_BYTES / (columns.div_ceil(64) * 8).max(1)).clamp(MIN_PACK_WINDOW, MAX_PACK_WINDOW)
 }
@@ -548,17 +574,30 @@ fn decompose_raw_record(
     let record_calls = match rec.calls {
         Calls::Dense(gt) => {
             let columns = gt.len();
-            let mut wanted: Vec<u16> = atoms.iter().map(|a| a.source_alt_index).collect();
-            wanted.sort_unstable();
-            wanted.dedup();
-            let mut slot_of =
-                vec![u16::MAX; wanted.iter().copied().max().unwrap_or(0) as usize + 1];
-            for (slot, &allele) in wanted.iter().enumerate() {
-                slot_of[allele as usize] = slot as u16;
-            }
-            RecordCalls::Masks {
-                masks: Arc::new(PresenceMasks::from_dense(&gt, columns, &wanted)),
-                slot_of,
+            if atoms.is_empty() {
+                // Every ALT this record had was dropped (symbolic/`*`/
+                // out-of-scope), so no atom will ever look up a slot -- skip
+                // the O(columns) scan `PresenceMasks::from_dense` would
+                // otherwise do for nothing. A fully-dropped record used to
+                // cost O(1); without this early return, an SV-heavy VCF pays
+                // O(columns) per dropped record for no benefit (at
+                // S=128,000 that's a 256,000-element scan).
+                RecordCalls::Masks {
+                    masks: Arc::new(PresenceMasks {
+                        words: Vec::new(),
+                        words_per_mask: columns.div_ceil(64),
+                    }),
+                    slot_of: Vec::new(),
+                }
+            } else {
+                let mut wanted: Vec<u16> = atoms.iter().map(|a| a.source_alt_index).collect();
+                wanted.sort_unstable();
+                wanted.dedup();
+                let slot_of = PresenceMasks::slot_map(&wanted);
+                RecordCalls::Masks {
+                    masks: Arc::new(PresenceMasks::from_dense(&gt, columns, &wanted, &slot_of)),
+                    slot_of,
+                }
             }
         }
         sparse @ Calls::Sparse(_) => RecordCalls::Sparse(Arc::new(sparse)),
@@ -1043,6 +1082,16 @@ mod tests {
         }
     }
 
+    // Test-only: `PresenceMasks::from_dense` takes its `slot_of` map as a
+    // parameter now (production builds it once and reuses it for
+    // `AtomCalls::Masks::slot` too -- see `PresenceMasks::slot_map`'s doc
+    // comment). Tests that only need the masks, not the map itself, go
+    // through this helper instead of repeating `slot_map` at every call site.
+    fn masks_from_dense(gt: &[i32], columns: usize, wanted: &[u16]) -> PresenceMasks {
+        let slot_of = PresenceMasks::slot_map(wanted);
+        PresenceMasks::from_dense(gt, columns, wanted, &slot_of)
+    }
+
     // Minimal PendingAtom carrying only the fields the packers read.
     fn atom(gt: Vec<i32>, src: u16) -> PendingAtom {
         let columns = gt.len();
@@ -1283,7 +1332,7 @@ mod tests {
             alt: b"A".to_vec(),
             source_alt_index: src_alt as u16,
             calls: {
-                let m = PresenceMasks::from_dense(&gt, columns, &[src_alt as u16]);
+                let m = masks_from_dense(&gt, columns, &[src_alt as u16]);
                 AtomCalls::Masks {
                     masks: std::sync::Arc::new(m),
                     slot: 0,
@@ -1303,7 +1352,7 @@ mod tests {
     #[test]
     fn presence_masks_mark_exactly_the_columns_matching_each_alt() {
         let gt = vec![0i32, 1, 2, -1, 1, 2, 0, 1];
-        let m = PresenceMasks::from_dense(&gt, 8, &[1, 2]);
+        let m = masks_from_dense(&gt, 8, &[1, 2]);
         // slot 0 == ALT 1 -> columns 1, 4, 7
         assert_eq!(m.mask(0)[0], (1u64 << 1) | (1 << 4) | (1 << 7));
         // slot 1 == ALT 2 -> columns 2, 5
@@ -1315,7 +1364,7 @@ mod tests {
         // A record whose ALT 2 was dropped as out-of-scope (symbolic/breakend) gets
         // ONE slot. REF (0), missing (-1) and the dropped ALT must not leak into it.
         let gt = vec![0i32, 1, 2, -1, 3];
-        let m = PresenceMasks::from_dense(&gt, 5, &[1]);
+        let m = masks_from_dense(&gt, 5, &[1]);
         assert_eq!(m.mask(0)[0], 1u64 << 1);
     }
 
@@ -1324,7 +1373,7 @@ mod tests {
         // The whole point of the type: 200 columns cost 4 words per slot, not 200
         // i32s per record (issue #155).
         let gt = vec![0i32; 200];
-        let m = PresenceMasks::from_dense(&gt, 200, &[1, 2]);
+        let m = masks_from_dense(&gt, 200, &[1, 2]);
         assert_eq!(m.mask(0).len(), 4);
         assert_eq!(m.mask(1).len(), 4);
     }
@@ -1335,7 +1384,7 @@ mod tests {
         for c in [0usize, 63, 64, 65, 199] {
             gt[c] = 1;
         }
-        let m = PresenceMasks::from_dense(&gt, 200, &[1]);
+        let m = masks_from_dense(&gt, 200, &[1]);
         let w = m.mask(0);
         assert_eq!(w[0], (1u64 << 0) | (1u64 << 63));
         assert_eq!(w[1], (1u64 << 0) | (1u64 << 1));
@@ -1347,7 +1396,7 @@ mod tests {
         // vi = 0, columns = 64: s == 0, so the carry branch must not run at all
         // (`>> 64` is UB).
         let gt: Vec<i32> = (0..64).map(|c| if c % 3 == 0 { 1 } else { 0 }).collect();
-        let m = PresenceMasks::from_dense(&gt, 64, &[1]);
+        let m = masks_from_dense(&gt, 64, &[1]);
         let mut got = vec![0u64; 1];
         or_mask_into(&mut got, 0, 0, m.mask(0), 64);
         let mut want = 0u64;
@@ -1369,7 +1418,7 @@ mod tests {
         // `words[hi]`).
         let mut gt = vec![0i32; 100];
         gt[99] = 1;
-        let m = PresenceMasks::from_dense(&gt, 100, &[1]);
+        let m = masks_from_dense(&gt, 100, &[1]);
         let mut got = vec![0u64; 4];
         or_mask_into(&mut got, 0, 100, m.mask(0), 100);
         assert_eq!(got[(199) >> 6], 1u64 << (199 & 63));
@@ -1390,7 +1439,7 @@ mod tests {
         // task's words as it would in production.
         let mut gt = vec![0i32; 70];
         gt[69] = 1;
-        let m = PresenceMasks::from_dense(&gt, 70, &[1]);
+        let m = masks_from_dense(&gt, 70, &[1]);
         let mut got = vec![0u64; 3];
         or_mask_into(&mut got, 0, 70, m.mask(0), 70);
         assert_eq!(got[0], 0);
@@ -1428,7 +1477,7 @@ mod tests {
                 }
             }
 
-            let masks = PresenceMasks::from_dense(&gt, columns, &[src]);
+            let masks = masks_from_dense(&gt, columns, &[src]);
             let mut got = vec![0u64; total_words];
             or_mask_into(&mut got, 0, vi * columns, masks.mask(0), columns);
             prop_assert_eq!(got, want);
@@ -1463,7 +1512,7 @@ mod tests {
         };
 
         let mut dense_bits = vec![0u64; 1];
-        let masks = std::sync::Arc::new(PresenceMasks::from_dense(&gt, columns, &[src_alt]));
+        let masks = std::sync::Arc::new(masks_from_dense(&gt, columns, &[src_alt]));
         pack_row(
             &mut dense_bits,
             0,
@@ -1518,7 +1567,7 @@ mod tests {
         let words = (columns * 2).div_ceil(64);
 
         let mut d = vec![0u64; words];
-        let masks = std::sync::Arc::new(PresenceMasks::from_dense(&gt, columns, &[1]));
+        let masks = std::sync::Arc::new(masks_from_dense(&gt, columns, &[1]));
         pack_row(
             &mut d,
             0,
@@ -1642,13 +1691,34 @@ mod tests {
     }
 
     #[test]
-    fn batch_records_bounds_staged_bytes_at_every_cohort_width() {
+    fn batch_records_bounds_staged_bytes_at_the_widths_where_it_binds() {
         for &s in &[100usize, 2_000, 32_000, 128_000, 500_000] {
             let columns = s * 2;
             let bytes = batch_records(columns) * columns * 4;
             assert!(
                 bytes <= RAW_STAGE_BYTES,
                 "S={s} stages {bytes} B against a {RAW_STAGE_BYTES} B budget"
+            );
+        }
+
+        // Past S ~= 1,048,576 (columns > RAW_STAGE_BYTES/32) MIN_BATCH_RECORDS
+        // floors the batch above what the byte budget allows -- a stated limit
+        // of the bound (see MIN_BATCH_RECORDS' doc comment above), pinned here
+        // with exact byte counts rather than left unchecked so a change to the
+        // floor or the budget shows up as a test failure instead of silently
+        // widening the regime this test's name would otherwise overclaim.
+        for &(s, want_bytes) in &[
+            (1_100_000usize, 70_400_000usize),
+            (2_000_000, 128_000_000),
+            (4_000_000, 256_000_000),
+        ] {
+            let columns = s * 2;
+            assert_eq!(batch_records(columns), MIN_BATCH_RECORDS, "S={s}");
+            let bytes = batch_records(columns) * columns * 4;
+            assert_eq!(bytes, want_bytes, "S={s}");
+            assert!(
+                bytes > RAW_STAGE_BYTES,
+                "S={s} expected to exceed the {RAW_STAGE_BYTES} B budget, got {bytes} B"
             );
         }
     }
@@ -1675,11 +1745,54 @@ mod tests {
 
     #[test]
     fn pack_window_bounds_retained_mask_bytes() {
+        // Production doesn't retain `pack_window(columns)` atoms -- it retains
+        // `pack_window(columns).div_ceil(g) * g` (`read_next_chunk`), rounded up
+        // to the word-aligned block size. Assert on THAT, since asserting on the
+        // unrounded value would test a quantity nothing ever actually retains.
         for &s in &[100usize, 2_000, 128_000, 500_000] {
             let columns = s * 2;
-            let bytes = pack_window(columns) * columns.div_ceil(64) * 8;
+            let g = 64 / gcd(columns, 64);
+            let window = pack_window(columns).div_ceil(g) * g;
+            let bytes = window * columns.div_ceil(64) * 8;
             assert!(bytes <= MASK_STAGE_BYTES, "S={s} retains {bytes} B");
         }
+    }
+
+    #[test]
+    fn pack_window_rounding_can_overshoot_the_budget_by_up_to_1_2x() {
+        // Not a claim that the bound never holds -- it holds at the widths
+        // above. This pins the two ways it stops holding once `pack_window`
+        // is small: word-alignment rounding (g-1 extra records), and the
+        // MIN_PACK_WINDOW floor (same mechanism as MIN_BATCH_RECORDS,
+        // `the_batch_floor_is_the_documented_limit_of_the_bound`).
+        //
+        // columns = 3,999,998 (S = 1,999,999, ploidy 2): g = 32,
+        // pack_window = 134 (computed, not floored), rounds up to 160.
+        let columns = 3_999_998usize;
+        let g = 64 / gcd(columns, 64);
+        assert_eq!(g, 32);
+        assert_eq!(pack_window(columns), 134);
+        let window = pack_window(columns).div_ceil(g) * g;
+        assert_eq!(window, 160);
+        let bytes = window * columns.div_ceil(64) * 8;
+        assert_eq!(bytes, 80_000_000);
+        assert!(bytes > MASK_STAGE_BYTES);
+        assert!((bytes as f64 / MASK_STAGE_BYTES as f64 - 1.19).abs() < 0.01);
+
+        // columns = 80,000,000: g = 1 (columns is a multiple of 64, so
+        // rounding is a no-op here), but pack_window itself is floored to
+        // MIN_PACK_WINDOW -- the same ~1.19x overshoot via a different
+        // mechanism.
+        let columns = 80_000_000usize;
+        let g = 64 / gcd(columns, 64);
+        assert_eq!(g, 1);
+        assert_eq!(pack_window(columns), MIN_PACK_WINDOW);
+        let window = pack_window(columns).div_ceil(g) * g;
+        assert_eq!(window, MIN_PACK_WINDOW);
+        let bytes = window * columns.div_ceil(64) * 8;
+        assert_eq!(bytes, 80_000_000);
+        assert!(bytes > MASK_STAGE_BYTES);
+        assert!((bytes as f64 / MASK_STAGE_BYTES as f64 - 1.19).abs() < 0.01);
     }
 
     #[test]

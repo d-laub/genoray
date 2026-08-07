@@ -2272,6 +2272,9 @@ def _auto_chunk_size(
             f"chunk at n_samples={n_samples}, ploidy={ploidy}, "
             f"n_format_fields={n_format_fields}; per-chunk overhead starts to "
             "matter below ~256. Raise max_mem or request fewer FORMAT fields.",
-            stacklevel=2,
+            # 3, not 2: `_auto_chunk_size` is a private helper called from
+            # `from_pgen`/`from_svar1`/`from_vcf_list`, so 2 would name this
+            # module rather than the user's call site.
+            stacklevel=3,
         )
     return chunk_size

@@ -214,6 +214,18 @@ the remaining ~59-65 MB per run is unexplained but flat in S, not the
 previously-flagged (and here, structurally ruled out) eager-reader
 candidate.
 
+**Scope.** This ladder never requested `dosages`/FORMAT fields —
+`rss_run.py` sets none. Both budgets bound `Calls::Dense`/`PresenceMasks`
+retention only; `PendingAtom.format_vals`/`AtomMeta.format_vals`
+(`src/chunk_assembler.rs`) retain the record's raw `FormatVals::Dense` — a
+separately heap-allocated `Vec<f64>` per (field, sample) — for as long as a
+chunk's `metas` are live, and that retention is covered by neither budget. It
+can dominate the two measured buffers by an order of magnitude or more once
+FORMAT/dosage fields are requested at wide S (flagged in the 2026-08-06
+final-review fix round). The 5.4x reduction and the "growth curve is now
+bounded" claim above are scoped to the no-FORMAT/dosage genotype path this
+ladder actually measured.
+
 ## Step 2 — `PARALLEL_MIN_CELLS` wall-time sweep
 
 **Methodology.** Same node, same four corpora, full (all 22 contig) default

@@ -436,6 +436,9 @@ Signature: `from_pgen(out, source, reference=None, *, regions=None, samples=None
   derives a variant-count budget from sample count (a packed dense chunk costs
   `chunk_size * n_samples * 2 / 8` bytes), so a fixed constant that's fine at
   200 samples doesn't blow memory at 500k. Pass an explicit `int` to override.
+  Warns if the derived value falls below 256 variants — see
+  `from_vcf_list`'s `chunk_size` entry below for the details, `dosages`
+  counts as `n_format_fields` here.
 - **`max_mem: int | str | None = None`** — byte budget for the **concurrency
   planner**: how many contigs convert at once, chosen so cohort-baseline
   memory plus each concurrent contig's in-flight chunk buffers fit inside it
@@ -615,7 +618,15 @@ multi-sample VCF.
   cohort shrinks the auto chunk size accordingly. Scope: it bounds only the
   dense-chunk term, which is a small fraction of peak RAM at typical cohort
   sizes — a large-cohort guardrail, not a fix for overall RAM scaling in the
-  number of inputs. Pass an int to override with a fixed count.
+  number of inputs. Pass an int to override with a fixed count. If the
+  derived `chunk_size` falls below 256 variants, `_auto_chunk_size` warns
+  (naming the budget, the derived `chunk_size`, and
+  `n_samples`/`ploidy`/`n_format_fields`) and keeps the small value rather
+  than raising — e.g. at `ploidy=2, n_format_fields=7` this fires above
+  `n_samples≈37,400` against the default ~256 MiB budget. Raise `max_mem` or
+  request fewer `format_fields` to clear it. Shared by all three converters
+  that derive `chunk_size` via this helper (`from_pgen`, `from_svar1`,
+  `from_vcf_list`).
 - `max_mem: int | str | None = None` — byte budget the **whole process** may
   use (same string forms as the module-level `max_mem` convention, e.g.
   `"4g"`, parsed by `parse_memory`) — **the same meaning as `from_vcf`'s
@@ -687,6 +698,11 @@ records from SVAR1's arrays and reuses the same conversion spine as `from_vcf`.
   `check_ref` all mean the same as `from_vcf` (above), and return the same
   `int` (dropped out-of-scope ALTs).
 - `ploidy` is read from SVAR1's metadata — no `ploidy=` kwarg.
+- `chunk_size=None` derives a variant-count budget from cohort size the same
+  way as `from_pgen`/`from_vcf_list` (`_auto_chunk_size`, `n_format_fields=0`
+  since this converter has no `format_fields=`/`dosages=` kwarg) and warns
+  under the same below-256-variant condition — see `from_vcf_list`'s
+  `chunk_size` entry above for the details.
 - **Biallelic SVAR1 only** — raises `ValueError` if the source store has
   multiallelic variants (SVAR1's `geno==1` model); re-create the SVAR1 store
   biallelically first.
