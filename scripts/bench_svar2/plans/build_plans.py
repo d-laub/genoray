@@ -193,6 +193,71 @@ PGEN_CHUNK_SIZE_AXIS: dict[tuple[int, int], tuple[int, ...]] = {
 PGEN_CONCURRENCY = (1, 4, 8, 11, 16, 22)
 PGEN_CONCURRENCY_AT = (4_000, 1_000_000)
 
+# --- Crossed axes for the RAM-law specification fix (issue #158) -------------
+#
+# The 2026-08-07 refit reached only R^2 0.7698. That is not noise: the cc
+# ladder above, six launches differing ONLY in concurrent_chroms, fits cc alone
+# at R^2 0.9903 / RMSE 63 MB, so peak RSS here is reproducible to a few
+# percent. Fitted on the 12 rows where cc is held at the planner's choice --
+# the block where `RamLaw`'s current form has every regressor it needs -- the
+# residual RMSE is still 463 MB, 7.3x that floor. The unexplained variance is
+# ~98% specification error.
+#
+# Two terms are missing, and the axes below are shaped to identify each.
+#
+# 1. `concurrent_chroms`. The six ladder rows share S, chunk_bytes and (w+p),
+#    so the law predicts ONE value (2870.6 MB) for measurements spanning
+#    1977.9 -> 3835.0 MB. But the deeper defect is that cc is not merely
+#    unidentified, it is UNOBSERVED: `probe.py` sets
+#    GENORAY_CONCURRENT_CHROMS only when a point pins it, `ProbeRecord` has no
+#    field for the value the planner picked, and 12 of the 18 rows left it
+#    unset. Coding those rows as cc=1 to fit them is what produced a pooled
+#    per-contig estimate of 41 MB against the ladder's own well-determined
+#    89.67. Hence: every point on these axes PINS cc, so the regressor exists.
+#
+# 2. A per-chunk-cycle term. Peak RSS is NON-MONOTONE in chunk bytes at fixed
+#    S -- at S=4,000 the 3.1 -> 7.8 MB step DROPS RSS by 586 MB, 9.3x the
+#    noise floor and measured in the same corner the floor came from. No law
+#    of the form `kappa * (w+p) * chunk_bytes` can produce that, whatever
+#    kappa is, so this is not fixable by re-fitting. The suspected mechanism
+#    is glibc arena ratchet across assembler cycles -- the same effect
+#    `libc::malloc_trim(0)` was added at the contig boundary to defeat (#120)
+#    -- which predicts a term in n_chunks = V / chunk_size.
+#
+# `PGEN_CHUNK_SIZE_AXIS` CANNOT test that second term. Varying chunk_size at a
+# fixed (S, V) moves chunk_bytes up and n_chunks down as exact reciprocals, so
+# a ratchet cost and a per-chunk residency cost are indistinguishable along it.
+# `PGEN_NCHUNKS_AXIS` below is the orthogonal lever: pin chunk_size and vary V
+# instead, which moves n_chunks alone with chunk_bytes held EXACTLY constant.
+#
+# Note VIFs over [1, S, chunk_MB, cc, n_chunks] are 2.0-2.4 for BOTH the old
+# and new designs -- collinearity was never the blocker, so these axes are
+# justified by the missing regressor and the reciprocal confound, not by
+# conditioning. All points reuse corpora `PGEN_LADDERS` already generates.
+PGEN_CROSSED_CC = (1, 4, 8, 16)
+# 16 exceeds `budget::PGEN_MAX_CONCURRENT` (8) and is reachable only through
+# the bench override -- included for lever arm on the per-contig slope, and
+# OUTSIDE the domain any production caller can reach (`lib.rs` clamps first).
+PGEN_CROSSED: dict[tuple[int, int], tuple[int, ...]] = {
+    (4_000, 1_000_000): (3_125, 12_500, 25_000),
+    (32_000, 1_000_000): (3_125, 12_500, 25_000),
+    (128_000, 250_000): (3_125, 7_812),
+}
+# Pinned across the V ladder so n_chunks is the ONLY thing moving. 7_812 is
+# the largest value legal at EVERY rung: the smallest corpus (V=250,000 over
+# 22 contigs) has 11,363 variants/contig, and `test_pgen_matrix_can_identify_
+# kappa` enforces >=1 chunk/contig because `BitGrid3::zeros` reserves the full
+# chunk_size and truncates only after EOF.
+PGEN_NCHUNKS_CHUNK_SIZE = 7_812
+PGEN_NCHUNKS_AXIS: dict[int, tuple[int, ...]] = {
+    4_000: (250_000, 500_000, 1_000_000),
+    32_000: (250_000, 500_000, 1_000_000),
+}
+# Two levels, not the full `PGEN_CROSSED_CC`: this axis exists to move
+# n_chunks, and a cc contrast at each end is enough to check that the ratchet
+# term does not itself depend on concurrency.
+PGEN_NCHUNKS_CC = (1, 8)
+
 # RLIMIT_AS installed on the points whose PURPOSE is to find out whether
 # `from_vcf`'s hardcoded chunk_size survives biobank scale. Deliberately NOT on
 # every point (a deviation from the design spec's "each point runs under an
@@ -411,6 +476,43 @@ def build(corpus_dir: Path, threads: int) -> dict[str, list[SweepPoint]]:
                 backend="pgen",
             )
         )
+
+    # Crossed cc x chunk_size at every cohort width (issue #158). Deduped
+    # below rather than skipped here: the (4_000, 1_000_000) cell at
+    # chunk_size=25_000 is byte-identical to four points the concurrency axis
+    # above already emits, and `test_every_point_id_is_unique` exists to catch
+    # exactly that collision.
+    for (s_x, v_x), chunk_sizes in PGEN_CROSSED.items():
+        corpus_x = corpus_dir / f"pgen_s{s_x}_v{v_x}.manifest.json"
+        for cs in chunk_sizes:
+            for cc in PGEN_CROSSED_CC:
+                pgen.append(
+                    _point(corpus_x, 1, cs, threads, concurrent=cc, backend="pgen")
+                )
+
+    # n_chunks at CONSTANT chunk_bytes -- the lever `PGEN_CHUNK_SIZE_AXIS`
+    # cannot supply. chunk_size is pinned, so chunk_bytes is identical across
+    # a row's rungs and only V (hence n_chunks) moves.
+    for s_n, variants in PGEN_NCHUNKS_AXIS.items():
+        for v_n in variants:
+            corpus_n = corpus_dir / f"pgen_s{s_n}_v{v_n}.manifest.json"
+            for cc in PGEN_NCHUNKS_CC:
+                pgen.append(
+                    _point(
+                        corpus_n,
+                        1,
+                        PGEN_NCHUNKS_CHUNK_SIZE,
+                        threads,
+                        concurrent=cc,
+                        backend="pgen",
+                    )
+                )
+
+    # Order-preserving dedupe on the full identity (point_id is a hash of it),
+    # so the crossed axes may overlap the older ones without re-measuring a
+    # config under two names.
+    seen: set[str] = set()
+    pgen = [p for p in pgen if not (p.point_id in seen or seen.add(p.point_id))]
 
     return {
         "scale": scale,

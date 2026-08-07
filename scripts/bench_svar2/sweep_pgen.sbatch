@@ -20,7 +20,11 @@
 # new rung (`PGEN_CHUNK_SIZE_AXIS`) reuses existing corpora and adds no
 # generation cost.
 #SBATCH --time=72:00:00
-#SBATCH --output=%x_%j.log
+# NOT the submission directory (Slurm's default): that is the git worktree, and
+# a multi-GB sweep log landing in it shows up as an untracked file mid-run.
+# NOT $CLAUDE_JOB_DIR/tmp either -- that is a symlink to node-local scratch on
+# the SUBMITTING node, so it dangles here and Slurm silently drops the log.
+#SBATCH --output=/carter/users/dlaub/scratch/pgen-crossed/logs/%x_%j.log
 
 set -euo pipefail
 
@@ -45,6 +49,16 @@ echo "=== commit $(git rev-parse HEAD) ==="
 unset CLAUDE_JOB_DIR
 SCRATCH="/local/$USER/pgen-sweep"
 mkdir -p "$SCRATCH"/{corpora,plans,out}
+
+# Names the RESULTS file, not the plan -- the plan is always `pgen.json`.
+# `sweep.py:pending_points` resumes by `point_id`, and `point_id` hashes only
+# the CONFIG: not the commit, not the .so. So a rerun whose code changed but
+# whose points did not will silently serve the PREVIOUS run's rows back as its
+# own. That is not hypothetical -- it produced a shipped-then-reverted RAM-law
+# refit on 2026-08-07 (12 of 18 rows were stale; issue #159). Until #159 is
+# fixed, any run whose BINARY differs from the last one must pass a fresh tag.
+RESULTS_TAG="${RESULTS_TAG:-pgen}"
+echo "=== results tag: $RESULTS_TAG ==="
 echo "=== disk headroom on /local/$USER ==="
 df -h "/local/$USER"
 
@@ -95,7 +109,30 @@ $PX python -m scripts.bench_svar2.plans.build_plans \
 
 $PX python -m scripts.bench_svar2.sweep \
   --plan "$SCRATCH/plans/pgen.json" \
-  --results "$SCRATCH/out/pgen.ndjson" \
-  --outdir "$SCRATCH/out/pgen"
+  --results "$SCRATCH/out/$RESULTS_TAG.ndjson" \
+  --outdir "$SCRATCH/out/$RESULTS_TAG"
+
+# Row count vs plan count. The 2026-08-07 contamination was invisible in every
+# summary the run printed -- exit 0, all points `ok`, and a row count that
+# matched, because the stale rows were counted as recorded. What did NOT match
+# was how many points the run actually MEASURED. Fail loudly here rather than
+# discovering it in a fit weeks later.
+$PX python - "$SCRATCH/plans/pgen.json" "$SCRATCH/out/$RESULTS_TAG.ndjson" <<'PYEOF'
+import json, sys
+plan, results = sys.argv[1], sys.argv[2]
+n_plan = len(json.load(open(plan)))
+rows = [json.loads(line) for line in open(results) if line.strip()]
+ids = {r["point_id"] for r in rows}
+print(f"plan points: {n_plan}   result rows: {len(rows)}   unique ids: {len(ids)}")
+bad = [r["point_id"] for r in rows if not r.get("ok") and r.get("oom_at_rss_mb") is None]
+if bad:
+    print(f"FAILED points (not OOM deliverables): {bad}")
+if len(ids) != n_plan:
+    sys.exit(f"ABORT: {len(ids)} distinct points in results, plan has {n_plan}")
+nodes = {r.get("node") for r in rows}
+if len(nodes) > 1:
+    sys.exit(f"ABORT: rows span multiple nodes {nodes} -- not comparable")
+print(f"OK: every planned point measured, single node {nodes}")
+PYEOF
 
 echo "=== ALL DONE (node $(hostname)) ==="

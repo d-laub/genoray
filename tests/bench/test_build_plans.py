@@ -339,3 +339,65 @@ def test_every_point_corpus_is_a_manifest_path():
         if not pt.corpus.endswith(".manifest.json")
     ]
     assert not offenders, f"corpus paths not pointing at a manifest: {offenders}"
+
+
+def test_pgen_crosses_concurrency_with_chunk_size_at_more_than_one_width():
+    """The 2026-08-07 sweep varied `concurrent_chroms` at exactly ONE
+    (S, V, chunk_size) corner, so nothing could say whether the per-contig RAM
+    cost is additive or interacts with cohort width or chunk size. Fitting it
+    as additive anyway is part of why that refit reached only R^2 0.7698
+    against a measured reproducibility floor of 63 MB (issue #158)."""
+    pgen = build(Path("/corpora"), threads=48)["pgen"]
+
+    crossed: dict[int, set[int]] = {}
+    for p in pgen:
+        if p.concurrent_chroms is None:
+            continue
+        s, _ = _shape_of(p)
+        crossed.setdefault(s, set())
+    for s in list(crossed):
+        by_cs: dict[int, set[int]] = {}
+        for p in pgen:
+            if p.concurrent_chroms is None or _shape_of(p)[0] != s:
+                continue
+            by_cs.setdefault(p.chunk_size, set()).add(p.concurrent_chroms)
+        crossed[s] = {cs for cs, ccs in by_cs.items() if len(ccs) >= 2}
+
+    widths = [s for s, cs in crossed.items() if len(cs) >= 2]
+    assert len(widths) >= 2, (
+        "need >=2 cohort widths that each vary concurrent_chroms at >=2 "
+        f"chunk_sizes, or the per-contig term cannot be tested for "
+        f"additivity; got {crossed}"
+    )
+
+
+def test_pgen_varies_n_chunks_at_constant_chunk_bytes():
+    """`PGEN_CHUNK_SIZE_AXIS` moves chunk_bytes UP and n_chunks DOWN as exact
+    reciprocals, so it cannot distinguish a per-chunk residency cost from a
+    per-cycle allocator ratchet. Measured peak RSS is non-monotone in chunk
+    bytes -- at S=4,000 the 3.1 -> 7.8 MB step DROPS RSS by 586 MB, 9.3x the
+    63 MB noise floor -- which no `kappa * (w+p) * chunk_bytes` term can
+    produce at any kappa. Separating them needs V varied at PINNED
+    chunk_size."""
+    pgen = build(Path("/corpora"), threads=48)["pgen"]
+
+    # (samples, chunk_size) -> distinct variant counts. chunk_bytes is a
+    # function of exactly those two, so a group with >=3 variant counts varies
+    # n_chunks with chunk_bytes held exactly constant.
+    by_fixed: dict[tuple[int, int], set[int]] = {}
+    for p in pgen:
+        s, v = _shape_of(p)
+        by_fixed.setdefault((s, p.chunk_size), set()).add(v)
+
+    usable = {k: vs for k, vs in by_fixed.items() if len(vs) >= 3}
+    assert usable, (
+        "no (samples, chunk_size) group carries >=3 variant counts, so "
+        "n_chunks never moves independently of chunk_bytes; got "
+        f"{ {k: sorted(v) for k, v in by_fixed.items()} }"
+    )
+    for (s, cs), vs in usable.items():
+        spread = max(vs) / min(vs)
+        assert spread >= 3.0, (
+            f"S={s} chunk_size={cs} spans only {spread:.1f}x in V; too short a "
+            "lever to separate a ratchet term from kappa"
+        )
