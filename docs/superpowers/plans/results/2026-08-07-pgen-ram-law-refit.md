@@ -483,46 +483,6 @@ what risk is acceptable to take on data this sweep did not measure (small
 `chunk_size` crossed with high `cc`, S beyond 128,000). That is a judgement
 call on production OOM risk appetite that this document declines to make.
 
-## MAINTAINER DECISION (2026-08-07): SHIP E2
-
-The open question in Finding (g) has been resolved. The maintainer chose
-**Candidate E2** (`base_mb=3197.5857`, `per_sample_mb=0.013210` — the 95%
-upper confidence bound — `kappa=11.9870`); these coefficients now ship as
-`RamLaw::PGEN` in `src/budget.rs`.
-
-**Why E2 over the status quo.** E2 is more conservative than the
-previously shipped law at *every* measured point (worst-case margin
-1.359× vs. 1.159×), *and* it is 6.4× less wasteful at biobank scale
-(baseline @ S=500,000: 62,893 MB → 9,803 MB). It does not trade safety for
-efficiency against the status quo — it dominates it on both axes at once,
-which is why "ship nothing" was not treated as a neutral default.
-
-**Why E2 over "ship no refit" (Position 2, not deleted — recorded above).**
-Position 2's core objection is correct and is not disputed: E2 passes the
-gate cc-blind, via the same cc-omission artifact as Candidate A, and its
-apparent conservatism is partly a fitting-vs-consuming model mismatch
-rather than deliberately priced margin. That mechanism is now written into
-`RamLaw::PGEN`'s doc comment and tracked as issue #158, rather than left
-implicit. But leaving the status quo in place keeps a `per_sample_mb`
-(0.120409) that this sweep shows is roughly 9× too high relative to even
-E2's conservative upper bound (0.013210) for a per-sample reader cost
-Tasks 1–4 had already deleted from the code — carrying forward a
-~79 GiB projected host requirement at S=500,000 for a cost that no longer
-exists. Position 2's caution about the cc-omission artifact is valid and
-now documented, but accepting it does not, by itself, justify continuing
-to charge for a per-sample term the branch under test removed.
-
-**Why E2 over E1 (`per_sample_mb := 0`).** Pinning to exactly zero asserts
-the per-sample cost *is* zero; the data only shows it is indistinguishable
-from zero (95% CI [-0.03540914, +0.01321036], point estimate -0.011099).
-Taking the 95% upper bound is the honest conservative choice — the same
-"conservative bound, not a fitted rate" philosophy this file already
-applies to `kappa` — without asserting a claim (exact zero) the sweep
-cannot support.
-
-The dissent in Finding (g) stands as written above; it is not superseded,
-only outvoted on this specific risk-appetite call.
-
 ## Before/after projected host requirement at S=500,000
 
 Two figures matter here, both traceable to a named source.
