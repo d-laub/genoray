@@ -235,9 +235,18 @@ impl PresenceMasks {
     }
 }
 
-// Below this many variants in a chunk, parallel packing's per-task overhead
-// outweighs the win — pack sequentially instead. Tunable; measure on gdc/germline.
-const PARALLEL_MIN_VARIANTS: usize = 512;
+// Below this much packing work in a window, parallel packing's per-task overhead
+// outweighs the win -- pack sequentially instead.
+//
+// CELLS, not variants. A variant count is a threshold on the wrong quantity: the
+// work is `variants * columns`, so a cell-budgeted window at large `S` drops
+// below any fixed variant count and silently disengages parallel packing.
+//
+// PROVISIONAL until Task 7 measures it. Seeded at the product that reproduces
+// today's gate (512 variants) at a 1,024-column cohort, so narrow cohorts behave
+// as they did; `or_mask_into` made packing ~64x cheaper, so the measured value
+// may well be higher.
+const PARALLEL_MIN_CELLS: usize = 512 * 1_024;
 
 #[inline]
 fn gcd(mut a: usize, mut b: usize) -> usize {
@@ -310,29 +319,65 @@ struct AtomMeta {
     carriers: Option<Carriers>,
 }
 
-// Atoms buffered before their presence bits are flushed into the chunk's BitGrid.
-// Rounded UP to a multiple of the word-aligned block size `g = 64/gcd(columns,64)`
-// at call time, so every flush offset lands on a u64 boundary and
-// `pack_presence_par` keeps its word-disjoint invariant. 1024 keeps the window
-// above `PARALLEL_MIN_VARIANTS` (512) so parallel packing still engages.
+// *** These two budgets set the reader's peak RAM. ***
 //
-// *** These two constants set the reader's peak RAM, and both are VARIANT
-// counts multiplying an O(n_samples) payload. *** Every buffered record holds a
-// `Calls::Dense(Vec<i32>)` of `n_samples * ploidy` entries (`Arc`-shared between
-// the heap and `buf`, so distinct RECORDS are what count), giving a live set of
+// They used to be fixed VARIANT counts (`PACK_WINDOW`/`NORMALIZE_BATCH_RECORDS`,
+// both 1024) multiplying an O(n_samples) payload, giving a live set of
+// `min(V, 2048) * n_samples * ploidy * 4` bytes -- up to 16 KB per sample,
+// bounded by neither `chunk_size` nor `max_mem`, and the blocker behind
+// `RamLaw::PGEN`'s conservative margin (issue #155).
 //
-//     min(V, NORMALIZE_BATCH_RECORDS + PACK_WINDOW) * n_samples * ploidy * 4 bytes
+// They are BYTE budgets now, in the units each buffer actually holds:
 //
-// = up to 16 KB per sample, independent of `chunk_size` and of `max_mem`.
-// Measured on `from_pgen` (single contig, 1,000 variants, S=128,000): 1,123 MB
-// of the 1,592 MB peak, and halving both constants took the peak to 1,102 MB.
-// This is the biobank-scale blocker behind `RamLaw::PGEN`'s conservative
-// margin -- see issue #155. Fixing it means making both a CELL budget rather
-// than a variant count, which collides with `PARALLEL_MIN_VARIANTS` below
-// (itself a variant-count threshold for what is really a cell-count decision),
-// so it is a measured change, not a constant tweak.
-const PACK_WINDOW: usize = 1024;
-const NORMALIZE_BATCH_RECORDS: usize = 1024;
+//   * `RAW_STAGE_BYTES` bounds `fill_normalize_batch`'s staged `RawRecord`s,
+//     which still carry `Calls::Dense` -- `columns * 4` bytes each.
+//   * `MASK_STAGE_BYTES` bounds the atoms a pack window RETAINS, which carry
+//     `PresenceMasks` -- `columns/8` bytes each, 32x smaller. That 32x is why
+//     the window stays large in the normal regime instead of collapsing to ~65
+//     records at S=128,000.
+//
+// Deliberately constants rather than derived from `max_mem`: threading a budget
+// into `ChunkAssembler` would add a regressor to `RamLaw::PGEN`, whereas a
+// constant lands in `base_mb` where a constant belongs, and the bound stays
+// checkable by arithmetic instead of only by measurement.
+const RAW_STAGE_BYTES: usize = 64 << 20;
+const MASK_STAGE_BYTES: usize = 64 << 20;
+
+// Caps preserve today's value as the ceiling. They bind -- i.e. nothing changes
+// -- only while a buffer's per-record cost keeps 1024 records inside the budget:
+// up to S = 8,192 for the batch, and up to S = 262,144 for the window, the
+// latter because masks are 32x cheaper per record. Between those, the batch
+// shrinks with cohort width. That is the fix, and it is why `RamLaw::PGEN` has
+// to be re-fitted rather than carried over.
+const MAX_BATCH_RECORDS: usize = 1024;
+const MAX_PACK_WINDOW: usize = 1024;
+
+// Floors are small ON PURPOSE. A thread-scaled floor would defeat the budget:
+// 48 threads x 4 records is 192 records, which at S=128,000 is 197 MB against a
+// 64 MiB budget. At 8, the floor binds only when one record exceeds an eighth of
+// the budget -- roughly S = 1,000,000 -- and even then the batch costs exactly
+// the budget rather than a multiple of it. Past that width staging resumes
+// growing with S and decode has only 8 tasks to spread; each is 8+ MB of work,
+// so the pool is coarsely fed rather than starved. That is a stated limit of the
+// bound, not a claim that it holds everywhere.
+const MIN_BATCH_RECORDS: usize = 8;
+const MIN_PACK_WINDOW: usize = 8;
+
+/// Records `fill_normalize_batch` stages before decomposing them.
+fn batch_records(columns: usize) -> usize {
+    (RAW_STAGE_BYTES / (columns * 4).max(1)).clamp(MIN_BATCH_RECORDS, MAX_BATCH_RECORDS)
+}
+
+/// Atoms buffered before their presence bits are flushed into the chunk's grid.
+///
+/// The CALLER rounds this up to a multiple of the word-aligned block size
+/// `g = 64/gcd(columns, 64)`, so every flush offset lands on a u64 boundary and
+/// `pack_presence_par` keeps its word-disjoint invariant. That rounding can
+/// exceed the budget by at most `g - 1 <= 63` records -- a few percent at the
+/// widths where the budget binds, and zero whenever `columns` is a multiple of 64.
+fn pack_window(columns: usize) -> usize {
+    (MASK_STAGE_BYTES / (columns.div_ceil(64) * 8).max(1)).clamp(MIN_PACK_WINDOW, MAX_PACK_WINDOW)
+}
 
 // Pack `buf`'s presence bits into `genos` starting at variant offset `v0`, then
 // move each atom's metadata into `metas`, dropping `gt`.
@@ -359,7 +404,7 @@ fn flush_window(
     let words = &mut genos.words[word_base..word_base + n_words];
 
     let parallel = matches!(pool, Some(p) if p.current_num_threads() >= 2)
-        && buf.len() >= PARALLEL_MIN_VARIANTS;
+        && buf.len().saturating_mul(columns) >= PARALLEL_MIN_CELLS;
     if parallel {
         pack_presence_par(words, buf, columns, pool.unwrap());
     } else {
@@ -655,8 +700,9 @@ impl ChunkAssembler {
         &mut self,
         pool: Option<&rayon::ThreadPool>,
     ) -> Result<(), ConversionError> {
-        let mut records = Vec::with_capacity(NORMALIZE_BATCH_RECORDS);
-        while records.len() < NORMALIZE_BATCH_RECORDS {
+        let cap = batch_records(self.num_samples * self.ploidy);
+        let mut records = Vec::with_capacity(cap);
+        while records.len() < cap {
             match self.source.next_record()? {
                 Some(rec) => {
                     self.frontier = rec.pos;
@@ -791,7 +837,7 @@ impl ChunkAssembler {
         let columns = self.num_samples * self.ploidy;
         // Word-aligned block size: `g` variants span exactly `columns/gcd` u64 words.
         let g = 64 / gcd(columns, 64);
-        let window = PACK_WINDOW.div_ceil(g) * g;
+        let window = pack_window(columns).div_ceil(g) * g;
 
         // Allocate for the full chunk up front (packed size: chunk_size*columns bits),
         // then shrink to the true variant count after EOF.
@@ -1575,5 +1621,54 @@ mod tests {
             prop_assert_eq!(got.words, expect.words);
             prop_assert_eq!(metas.len(), v);
         }
+    }
+
+    #[test]
+    fn batch_records_bounds_staged_bytes_at_every_cohort_width() {
+        for &s in &[100usize, 2_000, 32_000, 128_000, 500_000] {
+            let columns = s * 2;
+            let bytes = batch_records(columns) * columns * 4;
+            assert!(
+                bytes <= RAW_STAGE_BYTES,
+                "S={s} stages {bytes} B against a {RAW_STAGE_BYTES} B budget"
+            );
+        }
+    }
+
+    #[test]
+    fn batch_records_holds_todays_value_only_for_narrow_cohorts() {
+        // The cap binds up to columns = RAW_STAGE_BYTES/(4*MAX_BATCH_RECORDS) =
+        // 16,384, i.e. S = 8,192 at ploidy 2.
+        assert_eq!(batch_records(16_384), MAX_BATCH_RECORDS);
+        // Wider cohorts DO change: S=32,000 -- inside RamLaw::PGEN's fitted domain --
+        // stages 262 records rather than 1,024. That is the fix working, not a
+        // regression, and it is precisely why the law must be re-fitted (Task 9)
+        // rather than carried over.
+        assert_eq!(batch_records(64_000), 262);
+    }
+
+    #[test]
+    fn the_batch_floor_is_the_documented_limit_of_the_bound() {
+        // Past columns == RAW_STAGE_BYTES/(4*MIN_BATCH_RECORDS) -- about S=1,000,000
+        // at ploidy 2 -- the floor binds and staging resumes growing with S. Asserted
+        // rather than hidden: this is the boundary of what the budget promises.
+        assert_eq!(batch_records(4_000_000), MIN_BATCH_RECORDS);
+    }
+
+    #[test]
+    fn pack_window_bounds_retained_mask_bytes() {
+        for &s in &[100usize, 2_000, 128_000, 500_000] {
+            let columns = s * 2;
+            let bytes = pack_window(columns) * columns.div_ceil(64) * 8;
+            assert!(bytes <= MASK_STAGE_BYTES, "S={s} retains {bytes} B");
+        }
+    }
+
+    #[test]
+    fn pack_window_stays_at_todays_value_until_far_past_the_fitted_domain() {
+        // Masks are what keep this non-binding in the normal regime: budgeting the
+        // same bytes over raw calls would give ~65 records at S=128,000.
+        assert_eq!(pack_window(256_000), MAX_PACK_WINDOW); // S=128,000
+        assert!(pack_window(1_000_000) < MAX_PACK_WINDOW); // S=500,000
     }
 }
