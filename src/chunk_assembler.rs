@@ -245,10 +245,16 @@ impl PresenceMasks {
 // MEASURED (Task 7): a wall-time sweep on carter-cn-03 over
 // {0, 512*1_024, 8*512*1_024, usize::MAX} at S=2,000/8,000/32,000/128,000
 // (3 reps each, full 22-contig conversions) found no value distinguishably
-// faster or slower than any other at any width -- the run-to-run spread
-// (up to ~8% at S=128,000) exceeds the spread across values (at most ~3%) at
-// every measured point. Kept at its seeded value rather than tuned off
-// noise. Full tables:
+// faster or slower than any other at any width -- run-to-run noise (1.0-6.4%
+// of the mean at S<=32,000, up to 8.4% at S=128,000) is comparable to, not
+// smaller than, the spread across values (2.1-3.2%); one pairwise comparison
+// out of 24 was nominally significant (p<0.05) but at an effect size below
+// this design's ~5-9% minimum detectable effect. The corpora also can't
+// discriminate threshold PLACEMENT: at these widths every candidate but one
+// cell selects the same parallel/sequential branch, so the sweep mainly
+// measured parallel-vs-sequential packing, not where the gate should sit.
+// Kept at its seeded value rather than tuned off noise. Full analysis and
+// tables:
 // docs/superpowers/plans/results/2026-08-06-reader-cell-budget-measurement.md
 //
 // Seeded at the product that reproduces the OLD gate (512 variants) at a

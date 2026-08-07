@@ -34,11 +34,23 @@ baseline used: the `a93d1fc` commit message that introduced `rss_mark`
 reports, verbatim, `reader_drained 1574 MB <- +1094 MB, all of it here` against
 `reader_ready 480 MB` at S=128,000 (1574-480=1094), and issue.md's "Evidence"
 table is the same subtraction. Both marks bracket exactly
-`ChunkAssembler::read_next_chunk`'s loop (`orchestrator.rs:907-914`); nothing
-upstream of `reader_ready` (reader construction, pool construction) or
-downstream of `reader_drained` (executor, writers, merge) is included by either
-definition. I did not have to guess or reconstruct this — the commit message
-that shipped the instrumentation states the arithmetic directly.
+`ChunkAssembler::read_next_chunk`'s loop (`orchestrator.rs:907-914`), so
+nothing upstream of `reader_ready` (reader construction, pool construction) is
+included by either definition. But the marks bracket wall-clock time, not a
+call stack, and RSS is process-wide: the executor thread
+(`orchestrator.rs:930-952`), the chunk writer (`:960-963`), and the
+long-allele writer (`:966-973`) are all spawned before the reader loop
+finishes and run
+**concurrently** with it, consuming the `DenseChunk`s the reader is sending
+over `tx_dense`. Their allocations inside the `reader_ready`-`reader_drained`
+window are therefore counted in the delta too — it is not reader-only. This
+does not affect the before/after comparison above (the baseline used the same
+window, so the same concurrent contribution is present on both sides), but it
+matters for the residual accounting below: the executor's concurrent working
+set, not just the reader-side rayon pool, is a candidate for the unexplained
+residual. I did not have to guess or reconstruct the marks' placement — the
+commit message that shipped the instrumentation states the arithmetic
+directly.
 
 For completeness (the reader also confirmed this doesn't change the
 conclusion), here is `reader_drained - contig_enter` alongside it. The two
@@ -52,9 +64,6 @@ mildly with S) and tell the identical story:
 | 8,000 | 919 | 1,053 | **134** | 137 |
 | 32,000 | 938 | 1,083 | **145** | 152 |
 | 128,000 | 959 | 1,149 | **190** | 204 |
-
-(Repeated directly on this node outside the sbatch job, S=128,000 only, as a
-determinism check: 673-480 = 193 MB — within 2% of the sbatch job's 190 MB.)
 
 **Comparison to baseline.**
 
@@ -79,8 +88,8 @@ binds instead of the `MAX_BATCH_RECORDS`/`MAX_PACK_WINDOW` caps, the two
 buffers stop growing with S at all.
 
 **A real, stated trade at the narrow end.** At S=2,000 the new number (49 MB)
-is *higher* than the 13 MB baseline. This is not noise and not a regression —
-it is the direct, intended consequence of replacing a per-sample-scaled cap
+is *higher* than the 13 MB baseline. This is not noise — it is an intended
+regression at narrow widths, the direct consequence of replacing a per-sample-scaled cap
 with a fixed byte budget: at S=2,000, `batch_records`/`pack_window` both still
 clamp to their `MAX_*` caps (1,024), so the reader stages/retains close to the
 same absolute bytes it would at any width up to where the budget starts
@@ -147,7 +156,16 @@ the S=128,000 gap from 90.67 MB to about 58.7 MB, but does almost nothing at
 S=2,000 (32.1 MB gap, essentially unchanged) — so it is a real, legitimate,
 *bounded* (capped at `dense_cap+2` chunks in flight) contributor at wide
 cohorts, but it cannot be the whole story, and isn't a story at all at the
-narrow end.
+narrow end. This `min(V, chunk_size) * columns / 8` credit assumes the
+`BitGrid3::zeros(chunk_size, ...)` allocation (`chunk_assembler.rs:855`,
+4,096 rows regardless of S — ~131 MB of address space at S=128,000) is
+resident only for the `V=1,000` rows actually written by this corpus, not for
+its full `chunk_size` extent; that is consistent with the
+`bitgrid-zeros-calloc-not-resident` finding (calloc pages cost address space,
+not RSS, until touched) and with `a93d1fc`'s own accounting, but it is
+load-bearing here — without this credit the residual gap runs 32.1 / 66.4 /
+69.7 / 90.7 MB and *grows* 1.37x from S=8,000 to S=128,000 instead of staying
+flat. The flatness claim below is conditional on this assumption.
 
 **What remains unexplained.** After both the two Task-4 budgets and the
 dense-chunk-channel term, the residual is:
@@ -162,15 +180,23 @@ dense-chunk-channel term, the residual is:
 This residual is **not proportional to S** — it jumps from S=2,000 to
 S=8,000 and then stays flat (58-65 MB) through S=128,000, which is the
 signature of a roughly per-run/per-thread fixed cost rather than a per-sample
-one. The most plausible remaining candidate is the reader-side rayon pool
-(`orchestrator.rs:890-894`, sized 5-31 threads across the configurations
-measured here — confirmed via `GENORAY_LOG=genoray=info`, which bypasses the
-message-only Python log bridge and prints the `processing_threads` field
-directly) doing its first real allocating work inside the measured window
-(thread stacks, work-stealing deques, and/or glibc per-thread malloc arenas
-touched for the first time when several threads pack concurrently) — but I
-did not instrument far enough to attribute it to the byte. I am reporting it
-as unexplained rather than asserting a mechanism I have not verified.
+one. One candidate is the reader-side rayon pool (`orchestrator.rs:890-894`,
+sized 5-31 threads across the configurations measured here — confirmed via
+`GENORAY_LOG=genoray=info`, which bypasses the message-only Python log bridge
+and prints the `processing_threads` field directly) doing its first real
+allocating work inside the measured window (thread stacks, work-stealing
+deques, and/or glibc per-thread malloc arenas touched for the first time when
+several threads pack concurrently). But as noted above, the `reader_ready`/
+`reader_drained` window is process-wide and the executor thread
+(`orchestrator.rs:930-952`) — plus the chunk and long-allele writer threads
+(`:960-963`, `:966-973`) — run concurrently with the reader inside that same
+window, consuming the `DenseChunk`s this section already credits. The
+executor's own working set (its compute-engine state, sink buffers, and
+whatever it allocates decoding/re-encoding each `DenseChunk`) is at least as
+plausible a candidate as the reader-side pool, and is not something I ruled
+out. I did not instrument either candidate far enough to attribute the residual
+to a specific byte. I am reporting it as unexplained rather than asserting a
+mechanism I have not verified.
 **This is not the eagerly-constructed-`PgenReader` candidate** (ruled out
 above on structural grounds, independent of its measured cost), and it does
 not grow with S beyond S≈8,000, so it does not reopen the biobank-scale
@@ -207,7 +233,7 @@ value) and a final restoring rebuild, all inside one sbatch job
 
 | S | always (0) | seeded (512×1,024) | 8x (4,194,304) | never (`usize::MAX`) |
 | ---: | ---: | ---: | ---: | ---: |
-| 2,000 | 4.20 | 4.12 | 4.09 | 4.09 |
+| 2,000 | 4.19 | 4.12 | 4.09 | 4.09 |
 | 8,000 | 4.83 | 4.88 | 4.79 | 4.89 |
 | 32,000 | 6.70 | 6.70 | 6.84 | 6.69 |
 | 128,000 | 16.21 | 16.65 | 16.14 | 16.36 |
@@ -221,21 +247,71 @@ value) and a final restoring rebuild, all inside one sbatch job
 | 32,000 | 6.80, 6.60, 6.68 | 6.66, 6.71, 6.74 | 6.70, 6.87, 6.93 | 6.80, 6.63, 6.65 |
 | 128,000 | 16.12, 16.74, 15.76 | 16.08, 16.38, 17.48 | 15.86, 16.06, 16.49 | 16.63, 16.70, 15.73 |
 
-**Noise estimate.** Within a single (value, S) cell, the 3-rep range is
-0.06-0.27s at S≤32,000 (2-4% of the mean) and up to 1.40s at S=128,000
-(seeded: 16.08-17.48, ~8.4% of the mean) — driven by `carter-cn-03` being a
-shared node, not by anything in the code under test. At every S, the spread
-*across* the four values (max mean − min mean: 0.11s at S=2,000, 0.10s at
-S=8,000, 0.15s at S=32,000, 0.51s at S=128,000) is smaller than the
-within-cell rep-to-rep spread at that same S. No value is distinguishably
-faster or slower than any other at any measured width — the differences are
-noise, not signal.
+**Noise estimate.** Within a single (value, S) cell, the 3-rep range spans
+1.0-6.4% of the mean at S≤32,000 (min 0.0497s, `never`@S=8,000; max 0.2686s,
+`always`@S=2,000) and up to 8.4% at S=128,000 (seeded: 16.08-17.48s). This is
+driven by `carter-cn-03` being a shared node, not by anything in the code
+under test. The spread *across* the four values (max mean − min mean) is
+0.11s at S=2,000, 0.10s at S=8,000, 0.14s at S=32,000, and 0.51s at
+S=128,000 — 2.1-3.2% of the mean at every S. That is **comparable to**, not
+smaller than, the within-cell run-to-run spread: at S=8,000 the across-value
+spread (0.1018s) actually *exceeds* the largest within-cell range at that S
+(0.0924s, `always`). A Welch t-test across all 24 pairwise (value, value')
+comparisons, one per S, finds exactly one nominally significant separation
+(p<0.05, unequal-variance): `eight_x` vs `never` at S=8,000 (4.791s vs
+4.893s, t=-3.86); `seeded` vs `eight_x` at that same S is close but short of
+significance (t=2.54). With n=3 reps per cell, this design's minimum
+detectable effect is roughly 5% at S≤32,000 and ~9% at S=128,000 — an effect
+has to be at least that large before the sweep could reliably see it. One
+nominal hit in 24 comparisons, with an effect size (1.8%) at or below the
+detection floor and no consistent direction across the other three widths, is
+what noise looks like, not signal.
+
+A further limitation on the noise estimate itself: all three reps of a given
+value ran consecutively (`always`'s three reps, then a rebuild, then
+`seeded`'s three reps, and so on) in a fixed value order, on a node shared
+with other users' jobs. Reps were not interleaved or randomized across
+values, and no independent load record was captured. So *value* is
+confounded with *time-order* (and whatever load drift happened over the
+sweep's ~10-minute span) — this design cannot separate a genuine
+per-value effect from a drift effect, which is one more reason to read the
+one nominal hit as noise rather than a real difference.
+
+**What this design can discriminate — and what it cannot.** All four
+corpora are 22 contigs x 1,000 variants, and `pack_window() >= 1,024` at
+every S tested, so each contig packs inside exactly one `flush_window` call
+of ~1,000 atoms. Cells per window are `1,000 * columns`: 4M / 16M / 64M /
+256M at S=2,000/8,000/32,000/128,000. Against the swept candidates
+`{0, 512*1,024 (=524,288), 8*512*1,024 (=4,194,304)}`, every candidate
+selects the **same branch** (parallel vs. sequential) in 11 of the 12
+non-`never` (value, S) cells: `always` (threshold 0) and `seeded` (threshold
+524,288) select parallel at all four S, and so does `eight_x` (threshold
+4,194,304) at S=8,000/32,000/128,000 — the sole divergence is `eight_x` at
+S=2,000, where 4,000,000 < 4,194,304 flips it to sequential while `always`
+and `seeded` stay parallel. So `always` and `seeded` are, across this entire
+sweep, a **null replicate of the same branch**, not a comparison of two
+threshold placements — and `eight_x` differs from them in only one of four
+cells. What this sweep actually measured is parallel-vs-sequential packing
+at these four widths, not where within the parallel range the gate should
+sit.
+
+Given that, the honest finding is narrower than "the constant doesn't
+matter": **on this corpus, the gate's placement is not wall-time-visible,
+and parallel packing itself does not measurably beat sequential packing at
+these widths.** Demonstrating that placement matters (or doesn't) would
+need corpora whose per-window cell count straddles the candidate thresholds
+more finely — e.g. varying `chunk_size`/`pack_window` independently of S,
+not just S itself — which is out of scope for this task.
 
 **Chosen constant: `PARALLEL_MIN_CELLS = 512 * 1_024` (unchanged from the
 seeded value).** Per the plan: when the sweep shows no measurable difference,
 the correct action is to keep the seeded value and record that finding, not
 to pick a value out of noise. That is what happened here — recorded as the
-finding, not skipped.
+finding, not skipped. The caveats above (comparable-not-smaller noise, one
+nominal hit, the design's inability to discriminate placement, and the
+time-order confound) narrow what can be *claimed* from this sweep, but they
+do not change the decision: it remains plan-compliant to keep the seeded
+value, and nothing above is a retraction of that call.
 
 ## Verification (commit `25e3d4a` + this task's changes)
 
