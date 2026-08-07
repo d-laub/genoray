@@ -117,36 +117,90 @@ impl RamLaw {
         kappa: 1.371,
     };
 
-    /// PGEN path. Fitted 2026-08-05, R^2 = 0.8872, n = 12.
-    /// See docs/superpowers/plans/results/2026-08-05-pgen-ram-law-fit.md.
+    /// PGEN path, re-fitted 2026-08-07 against the bounded reader (the
+    /// presence-bitset byte budgets from issue #155 / PR #154 -- the
+    /// 2026-08-05 law below was fitted on the OLD, unbounded reader and no
+    /// longer describes production code). R^2 = 0.7698, n = 18. Sweep job
+    /// 13351698 on carter-cn-04. See
+    /// docs/superpowers/plans/results/2026-08-07-pgen-ram-law-refit.md.
+    ///
+    /// **A first re-fit attempt (commit 63a6b41) shipped and was reverted
+    /// (51a1a9c): 12 of its 18 sweep rows were STALE**, resumed from the
+    /// 2026-08-05 sweep by a resumable-sweep cache keyed only on point_id,
+    /// and so described the old unbounded reader under a new label. The
+    /// numbers below are from a clean re-run (job 13351698) with that cache
+    /// rotated out first; all 18 points were genuinely re-measured. See the
+    /// results doc's "Contamination and revert" section for the two proofs.
+    ///
+    /// OLS point estimates and 95% CI (`sigma^2 * (X^T X)^-1`, same design
+    /// matrix `fit_ram_law` builds):
+    ///   - `base_mb`: 2570.300231003748 (held at its fitted value -- see
+    ///     below for why it is not also pushed to a bound)
+    ///   - `per_sample_mb`: 0.007600352463934604, SE 0.005304817406885589,
+    ///     95% CI [-0.003706598187246871, 0.018907303115116077] -- the CI
+    ///     spans zero, so this is shipped as a CONSERVATIVE BOUND, not a
+    ///     fitted rate, exactly like `kappa` below.
+    ///   - `kappa`: 10.793993745504235, SE 2.9846678648863567, 95% CI
+    ///     [4.432324781246695, 17.155662709761774].
+    ///
+    /// **Construction: intercept pinned at its fitted value, each uncertain
+    /// SLOPE raised independently to its own 95% CI upper bound.** This is
+    /// `>=` the plain fit in every term, so it cannot under-predict anywhere
+    /// the plain fit doesn't -- the standing rule that a coefficient used as
+    /// a memory bound is a conservative bound, not a point estimate, and the
+    /// margin it buys is not slack to be tuned away.
+    ///
+    /// The intercept is deliberately NOT also refit on the residual after
+    /// pinning the slopes: doing so pulls `base_mb` DOWN to 1900.87, and the
+    /// law then FAILS the gate at S=4,000. Pinning one coefficient high
+    /// pushes the others down in an OLS refit -- holding `base_mb` at its
+    /// own fitted value avoids that trap.
+    ///
+    /// Gate (evaluated the way `plan_sharded` evaluates it, at each row's
+    /// actual/resolved `concurrent_chroms`): over-predicts at all 18
+    /// measured points. Worst-case margin +456.9 MB / 1.1745x at S=4,000,
+    /// chunk_bytes=3.125 MB, cc=8. Largest over-prediction 6.90x at
+    /// S=128,000, chunk_bytes=249.98 MB. (The previously shipped
+    /// 2026-08-05 law, independently re-evaluated against this same clean
+    /// data, was 1.2763x / 5.58x -- this law is tighter everywhere.)
+    ///
+    /// **The margin's provenance is a fitting artifact, not a chosen safety
+    /// factor**: `fit_ram_law` fits `kappa` cc-blind (its chunk regressor is
+    /// never multiplied by `concurrent_chroms`), so `kappa` absorbs roughly
+    /// this sweep's dominant `cc` -- and `plan_sharded` then multiplies by
+    /// `cc` a second time at prediction time. The over-charge this produces
+    /// is real and does make the bound safer, but it should not be read as
+    /// a deliberately engineered margin. Tracked as issue #158.
+    ///
+    /// This sweep's ladder rows (S=4,000, chunk_bytes=25 MB, `cc` swept over
+    /// {1,4,8,11,16,22}) DO vary `concurrent_chroms` and, analyzed directly
+    /// (outside `fit_ram_law`'s cc-blind regressor), show a real per-contig
+    /// RSS slope -- but that is a separate observation from this law, which
+    /// remains a 3-term cc-blind fit; see the results doc for the number and
+    /// its caveats. It does NOT corroborate the earlier (withdrawn)
+    /// "measured 107.05 MB/contig" claim, which came entirely from the
+    /// contaminated rows.
+    ///
+    /// Validity domain: S in {4,000, 32,000, 128,000}, chunk_bytes 3.125-250
+    /// MB, `reader_workers == 1` and `pending == 0` in every row, 22
+    /// contigs, one node (carter-cn-04), `multiallelic_rate` 0.0, no
+    /// FORMAT/dosage fields (scoped to the no-FORMAT path -- see issue
+    /// #156). `per_sample_mb` is extrapolated ~3.9x beyond the largest
+    /// measured cohort (128,000) to reach a representative S=500,000.
+    ///
+    /// `cc <= 8` is enforced in code, not just documented:
+    /// `src/lib.rs` clamps every planned `concurrent_chroms` to
+    /// `PGEN_MAX_CONCURRENT` below; `cc > 8` is reachable only via the
+    /// bench-only `GENORAY_CONCURRENT_CHROMS` override, not by a production
+    /// caller.
     ///
     /// NOT comparable coefficient-by-coefficient with `RamLaw::VCF`: the two
     /// corpora come from different generators (vcfixture bulk vs
     /// scale_corpus.py), so each law is valid only for its own backend.
-    ///
-    /// Fitted on a corpus with multiallelic_rate 0.0, so this law is not
-    /// claimed to cover multiallelic-heavy cohorts.
-    ///
-    /// `kappa` is a CONSERVATIVE BOUND, not a precisely fitted rate: its 95%
-    /// CI is [-9.99, +23.68] (SE 7.44, t 0.92, p ~= 0.38) and contributes
-    /// only +0.0106 to R^2 -- the reported R^2 is almost entirely the
-    /// two-cohort intercept split. It ships anyway because the law
-    /// OVER-predicts memory at all 12 measured points the way `plan_sharded`
-    /// evaluates it (worst-case margin +621 MB / 1.16x at cc=8, S=4,000; the
-    /// S=32,000 ladder over-predicts by 1.33-2.04x). The failure mode this
-    /// margin trades away is under-utilization and a spurious
-    /// `PlanError::InsufficientMemory`, never an OOM -- the margin is
-    /// deliberate, not slack to be tuned away.
-    ///
-    /// Validity domain: S in {4,000, 32,000}, n_contigs = 22,
-    /// concurrent_chroms = 7 for the ladder rows, one node
-    /// (carter-cn-04), one profile (germline-1kgp-varskew). `per_sample_mb`
-    /// is extrapolated ~15.6x beyond the largest measured cohort (32,000) to
-    /// reach biobank scale.
     pub const PGEN: RamLaw = RamLaw {
-        base_mb: 2688.5256180212755,
-        per_sample_mb: 0.12040939851127153,
-        kappa: 6.841965259264865,
+        base_mb: 2570.300231003748,
+        per_sample_mb: 0.018907303115116077,
+        kappa: 17.155662709761774,
     };
 }
 
@@ -733,7 +787,7 @@ mod tests {
         // to protect, and would do it after writing a partial store.
         //
         // This budget (1 MB) is far below even the cohort baseline
-        // (~123,098 MB at S=1,000,000 under RamLaw::PGEN), so this exercises
+        // (~21,478 MB at S=1,000,000 under RamLaw::PGEN), so this exercises
         // the baseline-dominated branch: `chunk_size` cannot help here, only
         // `max_mem` (or a smaller cohort) can.
         let err = plan_sharded(PlanInputs {
