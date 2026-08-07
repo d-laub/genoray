@@ -258,13 +258,19 @@ smaller than, the within-cell run-to-run spread: at S=8,000 the across-value
 spread (0.1018s) actually *exceeds* the largest within-cell range at that S
 (0.0924s, `always`). A Welch t-test across all 24 pairwise (value, value')
 comparisons, one per S, finds exactly one nominally significant separation
-(p<0.05, unequal-variance): `eight_x` vs `never` at S=8,000 (4.791s vs
-4.893s, t=-3.86); `seeded` vs `eight_x` at that same S is close but short of
-significance (t=2.54). With n=3 reps per cell, this design's minimum
-detectable effect is roughly 5% at S≤32,000 and ~9% at S=128,000 — an effect
-has to be at least that large before the sweep could reliably see it. One
-nominal hit in 24 comparisons, with an effect size (1.8%) at or below the
-detection floor and no consistent direction across the other three widths, is
+(p=0.0241, unequal-variance): `eight_x` vs `never` at S=8,000 (4.791s vs
+4.893s, t=-3.86, a 2.1% effect); `seeded` vs `eight_x` at that same S is
+close but short of significance (t=2.54). One nominal hit at p=0.0241 is not
+remarkable on its own once multiplicity is accounted for: across 24
+independent-ish comparisons, the family-wise probability of at least one hit
+this extreme by chance is ≈0.44 (1−(1−0.0241)^24) — coin-flip odds, not
+evidence of a real difference. (For scale, this design's per-S minimum
+detectable effect — n=3 reps/arm, pooled sd, α=0.05 two-sided, power 0.8 —
+is roughly 6.0% / 2.5% / 4.2% / 10.1% at S=2,000/8,000/32,000/128,000; the
+2.1% hit sits right at the S=8,000 floor, consistent with a noise floor that
+occasionally pokes through by chance rather than a real effect too small to
+usually detect.) One nominal hit in 24 comparisons, at a multiplicity-corrected
+p≈0.44 and with no consistent direction across the other three widths, is
 what noise looks like, not signal.
 
 A further limitation on the noise estimate itself: all three reps of a given
@@ -298,7 +304,15 @@ sit.
 Given that, the honest finding is narrower than "the constant doesn't
 matter": **on this corpus, the gate's placement is not wall-time-visible,
 and parallel packing itself does not measurably beat sequential packing at
-these widths.** Demonstrating that placement matters (or doesn't) would
+these widths.** (The one nominal hit above sits precisely on this contrast —
+`eight_x`, parallel at S=8,000, beating `never`, sequential at every S. That
+doesn't overturn the call: it's one hit at a multiplicity-corrected p≈0.44,
+it's confounded with time-order (above), and the direction isn't even
+consistent across widths — at S=2,000, where `eight_x` is itself in the
+sequential branch alongside `never`, that sequential pair (means 4.09-4.09s)
+is nominally *faster* than the parallel pair `always`/`seeded` (means
+4.12-4.19s), the opposite direction from S=8,000.) Demonstrating that
+placement matters (or doesn't) would
 need corpora whose per-window cell count straddles the candidate thresholds
 more finely — e.g. varying `chunk_size`/`pack_window` independently of S,
 not just S itself — which is out of scope for this task.
