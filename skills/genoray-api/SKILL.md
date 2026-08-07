@@ -437,7 +437,7 @@ Signature: `from_pgen(out, source, reference=None, *, regions=None, samples=None
   `chunk_size * n_samples * 2 / 8` bytes), so a fixed constant that's fine at
   200 samples doesn't blow memory at 500k. Pass an explicit `int` to override.
   Warns if the derived value falls below 256 variants — see
-  `from_vcf_list`'s `chunk_size` entry below for the details, `dosages`
+  `from_vcf_list`'s `chunk_size` entry below for the details. `dosages`
   counts as `n_format_fields` here.
 - **`max_mem: int | str | None = None`** — byte budget for the **concurrency
   planner**: how many contigs convert at once, chosen so cohort-baseline
@@ -623,7 +623,7 @@ multi-sample VCF.
   (naming the budget, the derived `chunk_size`, and
   `n_samples`/`ploidy`/`n_format_fields`) and keeps the small value rather
   than raising — e.g. at `ploidy=2, n_format_fields=7` this fires above
-  `n_samples≈37,400` against the default ~256 MiB budget. Raise `max_mem` or
+  `n_samples≈37,118` against the default ~256 MiB budget. Raise `max_mem` or
   request fewer `format_fields` to clear it. Shared by all three converters
   that derive `chunk_size` via this helper (`from_pgen`, `from_svar1`,
   `from_vcf_list`).
@@ -699,10 +699,14 @@ records from SVAR1's arrays and reuses the same conversion spine as `from_vcf`.
   `int` (dropped out-of-scope ALTs).
 - `ploidy` is read from SVAR1's metadata — no `ploidy=` kwarg.
 - `chunk_size=None` derives a variant-count budget from cohort size the same
-  way as `from_pgen`/`from_vcf_list` (`_auto_chunk_size`, `n_format_fields=0`
-  since this converter has no `format_fields=`/`dosages=` kwarg) and warns
-  under the same below-256-variant condition — see `from_vcf_list`'s
-  `chunk_size` entry above for the details.
+  way as `from_pgen`/`from_vcf_list` (`_auto_chunk_size`) and warns under the
+  same below-256-variant condition — see `from_vcf_list`'s `chunk_size` entry
+  above for the details. **Known gap:** this call site always passes
+  `n_format_fields=0`, even though `fields=` (below) selects SVAR1 FORMAT
+  fields and defaults to carrying all of them — so unlike `from_pgen`, the
+  budget here does not account for staged FORMAT bytes and can under-size
+  the chunk when `fields=` carries a wide FORMAT set. Tracked in
+  [#157](https://github.com/d-laub/genoray/issues/157).
 - **Biallelic SVAR1 only** — raises `ValueError` if the source store has
   multiallelic variants (SVAR1's `geno==1` model); re-create the SVAR1 store
   biallelically first.

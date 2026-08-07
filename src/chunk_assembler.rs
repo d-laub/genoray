@@ -221,6 +221,11 @@ impl PresenceMasks {
             wanted.iter().all(|&a| a > 0),
             "source_alt_index is 1-based; allele 0 is REF and can never be an atom's ALT"
         );
+        debug_assert_eq!(
+            slot_of,
+            &Self::slot_map(wanted)[..],
+            "slot_of must be exactly Self::slot_map(wanted)"
+        );
         let words_per_mask = columns.div_ceil(64);
         let mut words = vec![0u64; words_per_mask * wanted.len()];
 
@@ -353,8 +358,10 @@ struct AtomMeta {
     carriers: Option<Carriers>,
 }
 
-// *** These two budgets set the reader's peak RAM for the genotype path, with
-// *** no FORMAT/dosage fields requested. ***
+// ***********************************************************************
+// These two budgets set the reader's peak RAM for the genotype path, with
+// no FORMAT/dosage fields requested.
+// ***********************************************************************
 //
 // When FORMAT/dosage fields ARE requested, `PendingAtom.format_vals` /
 // `AtomMeta.format_vals` retain the record's raw `FormatVals::Dense` -- a
