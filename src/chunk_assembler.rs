@@ -242,12 +242,21 @@ impl PresenceMasks {
 // work is `variants * columns`, so a cell-budgeted window at large `S` drops
 // below any fixed variant count and silently disengages parallel packing.
 //
-// PROVISIONAL until Task 7 measures it. Seeded at the product that reproduces
-// today's gate (512 variants) at a 1,024-column cohort: the new gate matches the
-// old one exactly at columns == 1,024, is STRICTER below it (e.g. at columns =
-// 512 it now takes 1,024 atoms to go parallel where 512 used to suffice), and
-// LOOSER above it. `or_mask_into` made packing ~64x cheaper, so the measured
-// value may well be higher.
+// MEASURED (Task 7): a wall-time sweep on carter-cn-03 over
+// {0, 512*1_024, 8*512*1_024, usize::MAX} at S=2,000/8,000/32,000/128,000
+// (3 reps each, full 22-contig conversions) found no value distinguishably
+// faster or slower than any other at any width -- the run-to-run spread
+// (up to ~8% at S=128,000) exceeds the spread across values (at most ~3%) at
+// every measured point. Kept at its seeded value rather than tuned off
+// noise. Full tables:
+// docs/superpowers/plans/results/2026-08-06-reader-cell-budget-measurement.md
+//
+// Seeded at the product that reproduces the OLD gate (512 variants) at a
+// 1,024-column cohort: the new gate matches the old one exactly at columns ==
+// 1,024, is STRICTER below it (e.g. at columns = 512 it now takes 1,024 atoms
+// to go parallel where 512 used to suffice), and LOOSER above it -- it does
+// NOT reproduce the old gate's behavior generally, only at that one column
+// count.
 const PARALLEL_MIN_CELLS: usize = 512 * 1_024;
 
 #[inline]
