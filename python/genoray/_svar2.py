@@ -2253,9 +2253,25 @@ def _auto_chunk_size(
     The dense fraction is a per-chunk, data-dependent routing outcome and is not known
     here, so `max_mem` is a ceiling rather than a prediction. Cohorts whose variants
     route sparse simply come in under it -- under-budgeting would reintroduce the OOM.
+
+    There is no floor beyond 1. A floor of 1024 shipped previously and broke
+    this function's whole contract at biobank width -- at S=2,000,000 the budget
+    affords 536 variants and the floor returned 1024, i.e. a ~512 MB chunk
+    against a 256 MiB target. Lowering it is cheap: `plans/build_plans.py`
+    records chunk-size wall-time sensitivity under 3% across a 400x range
+    (S=500,000 ran 41.6 s at chunk_size=87 and 41.0 s at 25,000).
     """
     budget = _DENSE_CHUNK_TARGET_BYTES if max_mem is None else max_mem
     grid_bytes = (n_samples * ploidy) // 8
     format_bytes = n_format_fields * n_samples * _STAGED_FORMAT_BYTES
     per_variant = max(grid_bytes + format_bytes, 1)
-    return max(1024, min(25_000, budget // per_variant))
+    chunk_size = max(1, min(25_000, budget // per_variant))
+    if chunk_size < 256:
+        warnings.warn(
+            f"budget of {budget} B affords only {chunk_size} variants per dense "
+            f"chunk at n_samples={n_samples}, ploidy={ploidy}, "
+            f"n_format_fields={n_format_fields}; per-chunk overhead starts to "
+            "matter below ~256. Raise max_mem or request fewer FORMAT fields.",
+            stacklevel=2,
+        )
+    return chunk_size
