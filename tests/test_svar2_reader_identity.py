@@ -36,7 +36,14 @@ must be FIXED, not re-baselined. The only legitimate reason to update
 that has to come back): extract `git archive fab677f` into a scratch dir,
 `pixi run maturin build --release` there, drop the resulting `_core*.so`
 into `<dir>/python/genoray/`, then run the same fixture builders against
-that tree and against HEAD and compare.
+that tree and against HEAD and compare. Do NOT export the shared
+`CARGO_TARGET_DIR` (e.g. `/local/$USER/cargo-target-diag`, per this repo's
+usual convention) for that build -- a different tree at a different path
+sharing one target dir can make cargo hand back a stale artifact
+byte-for-byte, so the "confirmation" never actually recompiled; use a
+per-tree target dir instead, and before trusting a captured digest confirm
+the build log shows `Compiling genoray v0.1.0 (<scratch path>)` and the
+resulting `.so` sha changed from the previous build.
 """
 
 from __future__ import annotations
@@ -142,14 +149,20 @@ def _build_vcf_list_store(tmp_path: Path) -> Path:
 
 # 50 samples => 100 columns (ploidy 2). columns=100 => words_per_mask =
 # ceil(100/64) = 2, so a presence-mask row no longer fits in one u64 the way
-# the 2-sample (4-column) fixtures above always do. Concretely: variant
-# index vi=1 (the second record below, the insertion at POS 7) has bit span
-# [100*1, 100*1+100) = [100, 200). 100 is not a multiple of 64 (100 % 64 ==
-# 36), so this row starts mid-word; its words run from word 100//64==1
-# through word 199//64==3, crossing the 64-bit boundaries at 128 and 192.
-# That forces `or_mask_into` (src/chunk_assembler.rs) to take its carry
-# branch (`words[hi] |= m >> (64 - s)`), which every other source in this
-# file -- all one word per row -- never reaches.
+# the 2-sample (4-column) fixtures above always do. 100 is not a multiple of
+# 64 (100 % 64 == 36), so a row starts mid-word whenever its bit offset
+# isn't a multiple of 64, forcing `or_mask_into` (src/chunk_assembler.rs)
+# to take its carry branch (`words[hi] |= m >> (64 - s)`) for that row. 128
+# and 192 are BIT indices where a mask row's word range would cross a
+# 64-bit boundary -- not column indices; columns only run 0..99. This
+# fixture's six records atomize into 7 atoms (the multiallelic record
+# splits into two), giving observed mid-word shifts s in
+# {8, 16, 24, 36, 44, 52} and 9 carry-branch executions across both mask
+# words. Which atom lands at which shift depends on internal atomization
+# order, so this comment only asserts the robust property this fixture
+# guarantees: at least one atom starts mid-word, exercising the carry path
+# that every other source in this file -- all one word per row -- never
+# reaches.
 _WIDE_N_SAMPLES = 50
 
 
@@ -233,6 +246,8 @@ _BUILDERS = {
 
 
 @pytest.mark.parametrize("source", sorted(EXPECTED))
-def test_store_is_byte_identical_to_the_pre_mask_reader(source: str, tmp_path: Path):
+def test_store_is_byte_identical_to_the_pre_mask_reader(
+    source: str, tmp_path: Path
+) -> None:
     out = _BUILDERS[source](tmp_path)
     assert _oracle.store_digest(out) == EXPECTED[source]
