@@ -21,6 +21,11 @@ def _write_ref(d: Path) -> Path:
 
 
 def _write_vcf(d: Path, *, symbolic: bool, indexed: bool) -> Path:
+    # The symbolic=False body's bytes are pinned by
+    # tests/test_svar2_reader_identity.py (its "svar1" digest, via
+    # test_svar2_from_svar1._build_svar1, which calls this with
+    # symbolic=False). Changing them requires re-capturing that test's
+    # EXPECTED digests at fab677f -- see that module's docstring.
     body = (
         "##fileformat=VCFv4.2\n"
         "##contig=<ID=chr1,length=40>\n"
