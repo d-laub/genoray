@@ -51,6 +51,53 @@ pub fn current_tid() -> i32 {
     unsafe { libc::syscall(libc::SYS_gettid) as i32 }
 }
 
+/// Process resident set size, in bytes.
+///
+/// Field 1 of `/proc/self/statm` is resident pages. This is deliberately RSS and
+/// not an allocator counter: at biobank scale the interesting question is what
+/// is actually *resident*, and allocation-counting profilers mislead badly here
+/// -- `BitGrid3::zeros` is a `calloc` whose pages never become resident until
+/// written, and memray's high-water lands on a 1 GiB *virtual* mimalloc arena
+/// that pyarrow reserves at import.
+///
+/// Returns 0 where unavailable, so callers can log unconditionally.
+pub fn rss_bytes() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/self/statm")
+            .ok()
+            .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
+            .map(|pages| pages.saturating_mul(page_size()))
+            .unwrap_or(0)
+    }
+    #[cfg(not(target_os = "linux"))]
+    0
+}
+
+#[cfg(target_os = "linux")]
+fn page_size() -> u64 {
+    // SAFETY: sysconf takes an int and cannot fail for _SC_PAGESIZE.
+    unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 }
+}
+
+/// Log process RSS at a named point in a contig's lifecycle.
+///
+/// Emitted on the `genoray::monitor` target, so one `log_level="debug"` run
+/// yields a labelled RSS trace and peak RSS can be attributed to a stage
+/// without a heap profiler.
+///
+/// Values go in the MESSAGE, not in structured fields: the Python logging
+/// bridge renders only the message, so fields alone are invisible from a
+/// `log_level="debug"` run.
+pub(crate) fn rss_mark(chrom: &str, label: &str) {
+    tracing::debug!(
+        target: "genoray::monitor",
+        chrom = %chrom, mark = label,
+        "RSSMARK {label} rss_mb={}",
+        rss_bytes() / 1_000_000
+    );
+}
+
 /// Aggregate CPU% across a whole pool since the previous tick.
 ///
 /// `elapsed` MUST be the measured wall time since the previous tick, not the
@@ -352,6 +399,7 @@ pub fn spawn_sampler(
                     // above the nominal interval means the sampler itself was
                     // starved, which is worth seeing next to the numbers.
                     gap_ms = gap.as_millis(),
+                    rss_mb = rss_bytes() / 1_000_000,
                     dense = tx_dense.len(), dense_cap = dense_cap,
                     sparse = tx_sparse.len(), sparse_cap = sparse_cap,
                     long = tx_long.len(), long_cap = long_cap,

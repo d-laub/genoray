@@ -905,6 +905,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         no_reference: bool = False,
         skip_out_of_scope: bool = False,
         chunk_size: int | None = None,
+        max_mem: int | str | None = None,
         threads: int | None = None,
         overwrite: bool = False,
         long_allele_capacity: int = 8 * 1024 * 1024,
@@ -930,6 +931,43 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         chunk_size: variants per conversion chunk. Defaults to a value derived from
         a memory budget, since a packed dense chunk costs
         ``chunk_size * n_samples * 2 / 8`` bytes.
+
+        max_mem: byte budget the concurrency planner may use, as an int or a
+        string like `"64GiB"` (see `parse_memory`). **This is a
+        WHOLE-PROCESS planning budget** -- concurrent-contig count is chosen
+        so cohort baseline memory plus each concurrent contig's in-flight
+        chunk buffers fit inside it, in addition to the existing core-count
+        bound (also capped at 8 concurrent contigs regardless of budget).
+        **Same meaning as** :meth:`from_vcf`'s `max_mem` -- both pipelines
+        have a fitted concurrency planner and spend the budget on
+        concurrency the same way, just with separately-fitted RAM-law
+        coefficients (a PGEN chunk decodes both haplotypes at once, so its
+        per-variant cost is higher). `from_vcf_list`'s `max_mem` means the
+        same whole-process budget too, but that path has no concurrency
+        planner to spend it on (its contigs run strictly sequentially), so
+        it derives its own per-chunk `chunk_size` from the budget instead
+        (see its docstring). Here the budget buys concurrency and
+        `chunk_size` keeps its own independent default. **`None` (the
+        default) means a DETECTED budget** -- 80% of the cgroup memory limit
+        (or `/proc/meminfo` total outside a cgroup) -- **not unbounded**.
+        This is a deliberate default behavior change: unbounded planning
+        preserves exactly the biobank-scale OOM exposure the byte-budgeted
+        planner exists to remove. If detection itself fails (no cgroup limit
+        and no readable `/proc/meminfo` -- always true on macOS, and this
+        project ships an osx-arm64 wheel), a warning is emitted and planning
+        falls back to the old core-bound-only behavior rather than raising.
+        Pass an explicit value to raise or lower the budget, or a very large
+        value to approximate unbounded planning. Note the practical floor:
+        the planner's RAM law has a fixed cohort-baseline term of roughly
+        2.7 GB (PGEN's own fitted coefficients, higher than `from_vcf`'s
+        ~932 MB), so any budget that can't cover baseline plus one
+        concurrent contig's chunk buffers is rejected with a `ValueError`
+        even for a tiny cohort. That baseline term also scales with cohort
+        size (`~0.12 MB/sample`), so this floor is not just a small-cohort
+        curiosity: at ~500k samples the baseline alone predicts ~63 GB,
+        so a *detected* budget (80% of a smaller host's RAM) will reject
+        the conversion outright -- pass an explicit `max_mem` sized to the
+        host in that case.
 
         `regions` restricts conversion to one or more `.pvar` variant-index
         ranges. Region strings use Genoray's existing convention:
@@ -1209,6 +1247,26 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
 
         _validate_check_ref(check_ref)
 
+        # `None` means a DETECTED budget, not unbounded -- unbounded preserves
+        # exactly the biobank-scale OOM exposure the byte-budgeted planner
+        # exists to remove. Detection is an optimization, not a requirement:
+        # it raises RuntimeError when there is no cgroup limit AND no readable
+        # /proc/meminfo, which is every macOS run (this project ships an
+        # osx-arm64 wheel). That must not fail the whole conversion.
+        if max_mem is None:
+            try:
+                max_mem_bytes = detect_memory_budget()
+            except RuntimeError as e:
+                warnings.warn(
+                    f"could not detect a memory budget ({e}); planning "
+                    "concurrency by core count only. Pass max_mem explicitly "
+                    "to plan against a byte budget.",
+                    stacklevel=2,
+                )
+                max_mem_bytes = None
+        else:
+            max_mem_bytes = parse_memory(max_mem)
+
         from ._logging import write_reporting
 
         with write_reporting(progress, log_level) as (rx, level):
@@ -1232,6 +1290,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
                 region_ranges,
                 regions_overlap,
                 sample_perm,
+                max_mem_bytes,
                 log_level=level,
                 receiver=rx,
             )
@@ -2194,9 +2253,28 @@ def _auto_chunk_size(
     The dense fraction is a per-chunk, data-dependent routing outcome and is not known
     here, so `max_mem` is a ceiling rather than a prediction. Cohorts whose variants
     route sparse simply come in under it -- under-budgeting would reintroduce the OOM.
+
+    There is no floor beyond 1. A floor of 1024 shipped previously and broke
+    this function's whole contract at biobank width -- at S=2,000,000 the budget
+    affords 536 variants and the floor returned 1024, i.e. a ~512 MB chunk
+    against a 256 MiB target. Lowering it is cheap: `plans/build_plans.py`
+    records chunk-size wall-time sensitivity under 3% across a 400x range
+    (S=500,000 ran 41.6 s at chunk_size=87 and 41.0 s at 25,000).
     """
     budget = _DENSE_CHUNK_TARGET_BYTES if max_mem is None else max_mem
     grid_bytes = (n_samples * ploidy) // 8
     format_bytes = n_format_fields * n_samples * _STAGED_FORMAT_BYTES
     per_variant = max(grid_bytes + format_bytes, 1)
-    return max(1024, min(25_000, budget // per_variant))
+    chunk_size = max(1, min(25_000, budget // per_variant))
+    if chunk_size < 256:
+        warnings.warn(
+            f"budget of {budget} B affords only {chunk_size} variants per dense "
+            f"chunk at n_samples={n_samples}, ploidy={ploidy}, "
+            f"n_format_fields={n_format_fields}; per-chunk overhead starts to "
+            "matter below ~256. Raise max_mem or request fewer FORMAT fields.",
+            # 3, not 2: `_auto_chunk_size` is a private helper called from
+            # `from_pgen`/`from_svar1`/`from_vcf_list`, so 2 would name this
+            # module rather than the user's call site.
+            stacklevel=3,
+        )
+    return chunk_size

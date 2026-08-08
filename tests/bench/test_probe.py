@@ -1,12 +1,14 @@
 import os
 import signal
 import sys
+from pathlib import Path
 
 import pytest
 
 from scripts.bench_svar2.probe import (
     _build_env,
     _is_oom_failure,
+    _tmp_dir,
     parse_trace,
     run_point,
 )
@@ -354,3 +356,106 @@ def test_build_env_leaves_arena_count_alone_without_a_ceiling():
         rss_ceiling_mb=None,
     )
     assert "MALLOC_ARENA_MAX" not in _build_env(point)
+
+
+def test_build_cmd_dispatches_on_backend():
+    from scripts.bench_svar2.probe import _build_cmd
+    from scripts.bench_svar2.records import CorpusManifest, SweepPoint
+
+    manifest = CorpusManifest(
+        path="/tmp/corpus.pgen",
+        samples=10,
+        variants=100,
+        contigs=("chr1",),
+        format_fields=(),
+        ploidy=2,
+        cells=1000,
+        compressed_bytes=1,
+        seed=0,
+        generator_version=1,
+    )
+    point = SweepPoint(
+        corpus=manifest.path,
+        reader_workers=1,
+        concurrent_chroms=4,
+        shard_htslib=0,
+        overshard=4,
+        chunk_size=1000,
+        threads=8,
+        reps=1,
+        backend="pgen",
+    )
+    cmd = _build_cmd(point, manifest, Path("/tmp/store.svar"))
+    assert "pgen" in cmd
+    assert "vcf" not in cmd
+    # Symbolic ALTs survive plink2 into the .pvar, so the PGEN arm must skip
+    # them or every conversion aborts on the first <DEL>.
+    assert "--skip-symbolics-and-breakends" in cmd
+
+
+def test_build_cmd_defaults_to_vcf():
+    from scripts.bench_svar2.probe import _build_cmd
+    from scripts.bench_svar2.records import CorpusManifest, SweepPoint
+
+    manifest = CorpusManifest(
+        path="/tmp/corpus.vcf.gz",
+        samples=10,
+        variants=100,
+        contigs=("chr1",),
+        format_fields=(),
+        ploidy=2,
+        cells=1000,
+        compressed_bytes=1,
+        seed=0,
+        generator_version=1,
+    )
+    point = SweepPoint(
+        corpus=manifest.path,
+        reader_workers=1,
+        concurrent_chroms=None,
+        shard_htslib=0,
+        overshard=4,
+        chunk_size=1000,
+        threads=8,
+        reps=1,
+    )
+    cmd = _build_cmd(point, manifest, Path("/tmp/s.svar"))
+    assert "vcf" in cmd
+    assert "--skip-symbolics-and-breakends" not in cmd
+
+
+def test_tmp_dir_prefers_the_job_dir_when_it_resolves(tmp_path, monkeypatch):
+    job = tmp_path / "job"
+    (job / "tmp").mkdir(parents=True)
+    monkeypatch.setenv("CLAUDE_JOB_DIR", str(job))
+    outdir = tmp_path / "out"
+    outdir.mkdir()
+    assert _tmp_dir(outdir) == job / "tmp" / "bench_probe"
+
+
+def test_tmp_dir_falls_back_when_the_job_dir_is_a_dangling_symlink(
+    tmp_path, monkeypatch
+):
+    # The harness symlinks $CLAUDE_JOB_DIR/tmp to node-local disk. Under
+    # `sbatch --export=ALL` on another node that target does not exist, so the
+    # symlink dangles -- mkdir of the child raises FileNotFoundError and the
+    # parents=True retry raises FileExistsError on the symlink itself. That
+    # killed a 7h PGEN sweep after its corpora were already built.
+    job = tmp_path / "job"
+    job.mkdir()
+    (job / "tmp").symlink_to(tmp_path / "local-scratch-on-another-node")
+    monkeypatch.setenv("CLAUDE_JOB_DIR", str(job))
+    outdir = tmp_path / "out"
+    outdir.mkdir()
+
+    got = _tmp_dir(outdir)
+
+    assert got == outdir / "tmp"
+    assert got.is_dir()
+
+
+def test_tmp_dir_falls_back_when_the_job_dir_is_unset(tmp_path, monkeypatch):
+    monkeypatch.delenv("CLAUDE_JOB_DIR", raising=False)
+    outdir = tmp_path / "out"
+    outdir.mkdir()
+    assert _tmp_dir(outdir) == outdir / "tmp"

@@ -31,10 +31,11 @@ pub struct DenseMergeParams<'a> {
     pub output_dir: &'a str,
     /// Thread budget for the genotype transpose. Passed in rather than taken
     /// from the ambient rayon pool ON PURPOSE: `process_chromosome` runs inside
-    /// `lib.rs`'s dispatch pool, which is sized to `concurrent_chroms` -- 1
-    /// today. Any `rayon::current_num_threads()` or `par_iter()` reached from
-    /// here therefore sees a ONE-thread pool and silently runs serially, which
-    /// is exactly the trap this field exists to avoid.
+    /// `lib.rs`'s dispatch pool, which is sized to `concurrent_chroms` (up to
+    /// `PGEN_MAX_CONCURRENT` = 8 on the PGEN path, more elsewhere) -- not 1.
+    /// Any `rayon::current_num_threads()` or `par_iter()` reached from here
+    /// therefore sees a pool sized to the dispatch concurrency, not a global
+    /// one, which is exactly the trap this field exists to avoid.
     pub threads: usize,
 }
 

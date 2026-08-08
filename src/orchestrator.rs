@@ -210,6 +210,40 @@ fn report_ref_excluded(chrom: &str, ref_excluded: u64) {
     }
 }
 
+use crate::monitor::rss_mark;
+
+/// Return this contig's freed arena heaps to the OS.
+///
+/// glibc keeps freed per-contig heaps mapped, so RSS ratchets across a
+/// multi-contig cohort even though every contig drops its whole working set
+/// (issue #120). Call at each contig boundary, right after that working set is
+/// gone. Measured on the VCF path (#130): peak-RSS exponent N^1.162 -> N^0.901
+/// and the ratchet 4.66x -> 1.00x, on contigs with millions of variants.
+///
+/// The PGEN call site is the same hygiene, but its win is *not* separately
+/// measured: on the only PGEN probe available (synthetic, 1,000 variants per
+/// contig) the effect is inside run-to-run noise, because per-contig arenas that
+/// small leave little to reclaim. Do not cite a PGEN number here without one.
+///
+/// This is also *not* a lever on `from_pgen`'s per-sample RAM scaling (~8 KB per
+/// sample per concurrently processed contig) -- that survives the trim.
+///
+/// Cheap on the serial `run_vcf_list` loop; on the PGEN path several contigs
+/// finish concurrently and each caller takes the arena locks, so this trades a
+/// little lock traffic (once per contig, not per allocation) for the ratchet.
+///
+/// `malloc_trim` is a glibc extension -- absent under musl (Alpine source
+/// builds) and on non-Linux, where this compiles away to nothing.
+#[inline]
+pub(crate) fn trim_heap() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: malloc_trim takes no ownership and only releases free memory that
+    // the allocator is already holding; it cannot invalidate any live pointer.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
 /// Emit the per-contig left-alignment summary (nothing when no atoms moved).
 /// Shared by the single-reader and sub-contig-sharded paths, mirroring
 /// `report_ref_excluded` above.
@@ -332,6 +366,7 @@ pub fn process_chromosome(
 ) -> Result<u64, ConversionError> {
     let contig_started = std::time::Instant::now();
     sink.contig_start(chrom, None); // streaming: total unknown
+    rss_mark(chrom, "contig_enter");
 
     // Directory Formatting: svar2/{contig}/var_key/{snp,indel}
     let paths = crate::layout::ContigPaths::new(base_out_dir, chrom);
@@ -869,12 +904,14 @@ pub fn process_chromosome(
                     &fields_owned,
                 )?;
                 let mut chunk_id = 0;
+                rss_mark(&chr, "reader_ready");
                 while let Some(dense_chunk) =
                     reader.read_next_chunk(chunk_size, chunk_id, Some(&pool))?
                 {
                     tx_dense.send(dense_chunk).unwrap();
                     chunk_id += 1;
                 }
+                rss_mark(&chr, "reader_drained");
                 let ref_excluded_total =
                     reader.ref_excluded() + vcf_list_ref_excluded.load(Ordering::Relaxed);
                 report_ref_excluded(&chr, ref_excluded_total);
@@ -970,6 +1007,10 @@ pub fn process_chromosome(
         long_allele_offsets,
         kept_total,
     } = phase1;
+    // Reader + executor + writers have all joined here, so their working sets
+    // are gone: this mark separates "the streaming pipeline" from "the merge
+    // tail" for per-stage RSS attribution.
+    rss_mark(chrom, "pipeline_joined");
     match chunk_writer_res {
         Ok(r) => r?,
         Err(_) => {
@@ -998,11 +1039,21 @@ pub fn process_chromosome(
     macro_rules! stage {
         ($label:expr, $body:expr) => {{
             let t = std::time::Instant::now();
+            let rss_before = crate::monitor::rss_bytes();
             let out = $body;
+            let rss_after = crate::monitor::rss_bytes();
             tracing::debug!(
                 target: "genoray::monitor",
                 chrom = %chrom, stage = $label, secs = t.elapsed().as_secs_f64(),
-                "merge stage"
+                // Values in the MESSAGE -- see `rss_mark` for why fields alone
+                // are invisible through the Python logging bridge. Delta is
+                // signed: a merge stage that frees more than it takes is
+                // exactly as interesting as one that grows.
+                "RSSSTAGE {} secs={:.3} rss_mb={} d_rss_mb={}",
+                $label,
+                t.elapsed().as_secs_f64(),
+                rss_after / 1_000_000,
+                (rss_after as i64 - rss_before as i64) / 1_000_000
             );
             out
         }};
@@ -1182,6 +1233,7 @@ pub fn process_chromosome(
         })?;
     }
 
+    rss_mark(chrom, "contig_exit");
     tracing::info!(chrom = %chrom, "pipeline execution finished successfully");
 
     sink.flush(chrom);
@@ -1313,17 +1365,9 @@ pub fn run_vcf_list(
         )?;
         total_dropped += dropped;
 
-        // glibc keeps freed per-contig arena heaps mapped, so RSS ratchets across the
-        // 24-contig cohort (issue #120). With htslib threads at 0 and one processing
-        // thread, malloc_trim is cheap here (no arena-lock contention) and returns the
-        // freed heaps to the OS between contigs. `malloc_trim` is a glibc extension, so
-        // gate on `target_env = "gnu"` -- it is absent under musl (Alpine source builds)
-        // and on non-Linux; a no-op / compiled-out everywhere but glibc-Linux.
-        #[cfg(all(target_os = "linux", target_env = "gnu"))]
-        // SAFETY: malloc_trim takes no ownership and only releases free top-of-heap memory.
-        unsafe {
-            libc::malloc_trim(0);
-        }
+        // With htslib threads at 0 and one processing thread, this is cheap here
+        // (no arena-lock contention).
+        trim_heap();
     }
     tracing::info!("cohort processing complete");
 

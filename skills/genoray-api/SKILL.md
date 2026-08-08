@@ -51,11 +51,12 @@ source** rather than reasoning from first principles.
 
 - Ranges are 0-based, half-open `[start, end)`.
 - `max_mem` accepts strings like `"4g"`, `"512m"`, `"2GB"` — **except**
-  `SparseVar2.from_vcf` and `SparseVar2.from_vcf_list`'s `max_mem`, both a
-  **whole-process** planning budget, not a per-chunk cap; see their entries
-  under "Conversion" below before assuming they mean the same thing as
-  everywhere else this name appears (`VCF.chunk`/`chunk_ranges`,
-  `PGEN.chunk`/`chunk_ranges`, etc., where it caps one chunk directly).
+  `SparseVar2.from_vcf`, `SparseVar2.from_pgen`, and
+  `SparseVar2.from_vcf_list`'s `max_mem`, all a **whole-process** planning
+  budget, not a per-chunk cap; see their entries under "Conversion" below
+  before assuming they mean the same thing as everywhere else this name
+  appears (`VCF.chunk`/`chunk_ranges`, `PGEN.chunk`/`chunk_ranges`, etc.,
+  where it caps one chunk directly).
 - Contig names auto-normalize: `"chr1"` and `"1"` both work regardless of file convention (`ContigNormalizer`).
 - Missing genotype = `-1` (int). Missing dosage = `np.nan` (float32).
 - Ploidy is 2 by default; `SparseVar.from_vcf`/`from_pgen` (and `genoray write-svar1`) accept `haploid=True` / `--haploid`, which OR-collapses haplotypes into a single haploid call per sample and records `ploidy=1` in metadata (intended for unphased somatic data).
@@ -411,7 +412,7 @@ dropped = SparseVar2.from_pgen(
 )
 ```
 
-Signature: `from_pgen(out, source, reference=None, *, regions=None, samples=None, merge_overlapping=False, regions_overlap="pos", no_reference=False, skip_out_of_scope=False, chunk_size=None, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False, dosages=None, check_ref="e", progress=False, log_level="info") -> int`
+Signature: `from_pgen(out, source, reference=None, *, regions=None, samples=None, merge_overlapping=False, regions_overlap="pos", no_reference=False, skip_out_of_scope=False, chunk_size=None, max_mem=None, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False, dosages=None, check_ref="e", progress=False, log_level="info") -> int`
 
 - `source` — a `.pgen` file. Variant metadata is read from the sibling
   `.pvar`/`.pvar.zst`, sample names from the sibling `.psam`.
@@ -435,6 +436,39 @@ Signature: `from_pgen(out, source, reference=None, *, regions=None, samples=None
   derives a variant-count budget from sample count (a packed dense chunk costs
   `chunk_size * n_samples * 2 / 8` bytes), so a fixed constant that's fine at
   200 samples doesn't blow memory at 500k. Pass an explicit `int` to override.
+  Warns if the derived value falls below 256 variants — see
+  `from_vcf_list`'s `chunk_size` entry below for the details. `dosages`
+  counts as `n_format_fields` here.
+- **`max_mem: int | str | None = None`** — byte budget for the **concurrency
+  planner**: how many contigs convert at once, chosen so cohort-baseline
+  memory plus each concurrent contig's in-flight chunk buffers fit inside it
+  (in addition to the existing core-count bound, also capped at 8 concurrent
+  contigs regardless of budget). Same string forms as the module-level
+  `max_mem` convention above (`"4g"`, `"512m"`, `"2GB"`, parsed by
+  `parse_memory`), and **the same whole-process meaning as `from_vcf`'s
+  `max_mem`** (above) — both pipelines have a fitted concurrency planner and
+  spend the budget on concurrency the same way, just with
+  separately-fitted RAM-law coefficients (a PGEN chunk decodes both
+  haplotypes at once, so its per-variant cost is higher). `from_vcf_list`'s
+  `max_mem` means the same whole-process budget too, but that path has no
+  concurrency planner to spend it on (its contigs run strictly
+  sequentially), so it derives its own per-chunk `chunk_size` from the
+  budget instead — see its entry below. **`None` (the default) means a
+  DETECTED budget — 80% of the cgroup memory limit (or `/proc/meminfo` total
+  outside a cgroup) — NOT unbounded.** This is a deliberate default behavior
+  change from the pre-`max_mem` planner. If detection itself fails (no
+  cgroup limit and no readable `/proc/meminfo` — always true on macOS),
+  genoray warns and falls back to the old core-bound-only planning rather
+  than raising. Pass an explicit value to raise or lower the budget, or a
+  very large value to approximate unbounded planning. **Practical floor:**
+  the planner's RAM law has a fixed cohort-baseline term of roughly 2.7 GB
+  (PGEN's own fitted coefficients, higher than `from_vcf`'s ~932 MB), so any
+  budget that can't cover baseline plus one concurrent contig's chunk
+  buffers is rejected with `ValueError`, even for a tiny cohort. That
+  baseline scales with cohort size (`~0.12 MB/sample`), so this isn't just a
+  small-cohort concern: at ~500k samples it alone predicts ~63 GB, so a
+  *detected* budget on a smaller host will reject the conversion — pass an
+  explicit `max_mem` sized to the host in that case.
 - **`regions=`/`merge_overlapping=`/`regions_overlap=`** — same convention,
   semantics, and three overlap modes (`"pos"`/`"record"`/`"variant"`) as
   `from_vcf`, restricting conversion to one or more `.pvar` variant-index
@@ -584,7 +618,15 @@ multi-sample VCF.
   cohort shrinks the auto chunk size accordingly. Scope: it bounds only the
   dense-chunk term, which is a small fraction of peak RAM at typical cohort
   sizes — a large-cohort guardrail, not a fix for overall RAM scaling in the
-  number of inputs. Pass an int to override with a fixed count.
+  number of inputs. Pass an int to override with a fixed count. If the
+  derived `chunk_size` falls below 256 variants, `_auto_chunk_size` warns
+  (naming the budget, the derived `chunk_size`, and
+  `n_samples`/`ploidy`/`n_format_fields`) and keeps the small value rather
+  than raising — e.g. at `ploidy=2, n_format_fields=7` this fires above
+  `n_samples≈37,118` against the default ~256 MiB budget. Raise `max_mem` or
+  request fewer `format_fields` to clear it. Shared by all three converters
+  that derive `chunk_size` via this helper (`from_pgen`, `from_svar1`,
+  `from_vcf_list`).
 - `max_mem: int | str | None = None` — byte budget the **whole process** may
   use (same string forms as the module-level `max_mem` convention, e.g.
   `"4g"`, parsed by `parse_memory`) — **the same meaning as `from_vcf`'s
@@ -656,6 +698,15 @@ records from SVAR1's arrays and reuses the same conversion spine as `from_vcf`.
   `check_ref` all mean the same as `from_vcf` (above), and return the same
   `int` (dropped out-of-scope ALTs).
 - `ploidy` is read from SVAR1's metadata — no `ploidy=` kwarg.
+- `chunk_size=None` derives a variant-count budget from cohort size the same
+  way as `from_pgen`/`from_vcf_list` (`_auto_chunk_size`) and warns under the
+  same below-256-variant condition — see `from_vcf_list`'s `chunk_size` entry
+  above for the details. **Known gap:** this call site always passes
+  `n_format_fields=0`, even though `fields=` (below) selects SVAR1 FORMAT
+  fields and defaults to carrying all of them — so unlike `from_pgen`, the
+  budget here does not account for staged FORMAT bytes and can under-size
+  the chunk when `fields=` carries a wide FORMAT set. Tracked in
+  [#157](https://github.com/d-laub/genoray/issues/157).
 - **Biallelic SVAR1 only** — raises `ValueError` if the source store has
   multiallelic variants (SVAR1's `geno==1` model); re-create the SVAR1 store
   biallelically first.
@@ -993,7 +1044,9 @@ to `from_vcf_list`; its single-file form forwards both to `from_vcf`.
   `NAME=self` (read dosage from `source` itself) or `NAME=/path/to/vaf.pgen`
   (read from a separate PGEN), each becoming a `DosageField(name=NAME,
   source=...)` passed as `dosages=`. `--chunk-size` defaults to a
-  memory-derived value (`None`).
+  memory-derived value (`None`). `--max-mem` (default `None` = a DETECTED
+  budget, not unbounded) is the same whole-process concurrency-planner
+  budget as `from_pgen(max_mem=)` (above).
 - `genoray write svar1` (`SparseVar2.from_svar1`): `source` is a `*.svar`
   (SVAR1) directory. `--fields` (repeatable) selects which SVAR1 FORMAT
   fields carry through (default: all); `--empty-fields` overrides `--fields`

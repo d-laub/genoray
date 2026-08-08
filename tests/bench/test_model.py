@@ -42,9 +42,14 @@ def test_sweep_names_covers_every_axis_build_plans_produces(tmp_path):
     `_SWEEP_NAMES`) -- it produces a plan file and then no data ever fills
     it. This bit twice (`vlinear2`, then `concurrency`); this test exists so
     the next axis added to `build_plans.py` fails loudly here instead of
-    shipping silently inert."""
+    shipping silently inert.
+
+    `pgen` is deliberately excluded from this check: it is fitted by its own
+    pipeline (`sweep_pgen.sbatch` + a dedicated `load_sweep("pgen", ...)`
+    call), not by `main()`/`_SWEEP_NAMES`, which fits only the VCF-path laws.
+    """
     plan_axes = set(build_plans(tmp_path, threads=8).keys())
-    assert plan_axes == set(_SWEEP_NAMES)
+    assert plan_axes - {"pgen"} == set(_SWEEP_NAMES)
 
 
 def test_v_law_recovers_planted_line():
