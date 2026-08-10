@@ -313,6 +313,43 @@ def test_gather_haps_readbound_rejects_malformed_dicts(store, mutate, exc, match
         sv._gather_haps_readbound("chr1", bad)
 
 
+def test_lut_is_opt_in_and_absent_by_default(store: Path):
+    """The LUT is whole-contig, so it must not ride along uninvited.
+
+    Absent (not empty) when unrequested: a decoder that forgot ``with_lut``
+    then raises KeyError rather than resolving long insertions against an empty
+    table, which would silently yield wrong alleles.
+    """
+    sv = SparseVar2(store)
+    _, hr = _readbound(sv, PAIRS)
+
+    off = sv._gather_haps_readbound("chr1", hr)
+    assert "lut_bytes" not in off and "lut_off" not in off
+
+    on = sv._gather_haps_readbound("chr1", hr, with_lut=True)
+    assert "lut_bytes" in on and "lut_off" in on
+
+    # Everything else must be identical either way -- `with_lut` controls only
+    # whether the LUT is copied, never what the gather computes.
+    assert set(off) | {"lut_bytes", "lut_off"} == set(on)
+    for k in off:
+        np.testing.assert_array_equal(
+            np.asarray(off[k]), np.asarray(on[k]), err_msg=f"{k!r} changed"
+        )
+
+
+def test_optin_lut_matches_the_fused_read_ranges_lut(store: Path):
+    """When asked for, it must be the SAME table ``read_ranges`` hands back --
+    otherwise long-INS alleles would decode differently on the two paths."""
+    sv = SparseVar2(store)
+    _, hr = _readbound(sv, PAIRS)
+    on = sv._gather_haps_readbound("chr1", hr, with_lut=True)
+    fused = sv.read_ranges("chr1", [0], [60])
+    for k in ("lut_bytes", "lut_off"):
+        np.testing.assert_array_equal(np.asarray(on[k]), np.asarray(fused[k]))
+        assert np.asarray(on[k]).dtype == np.asarray(fused[k]).dtype
+
+
 def test_readbound_covers_only_the_pairs_asked_for(store: Path):
     """Cost scales with pairs, not with the cross-product.
 

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, TypedDict
 
 import numpy as np
+from typing_extensions import NotRequired
 
 if TYPE_CHECKING:
     from numpy.typing import ArrayLike
@@ -106,6 +107,12 @@ class BatchResultSplit(TypedDict):
     the read-bound path never builds the contig-wide dense union. Consumers
     merge ``var_key``, ``dense_snp`` and ``dense_indel`` by position downstream.
     ``n_samples`` is always 1 and the hap index is ``q * ploidy + p``.
+
+    ``lut_bytes`` / ``lut_off`` are present only when the gather was called with
+    ``with_lut=True``. They are the long-INS allele table and are whole-contig,
+    so unlike :class:`BatchResult` they are opt-in here; when not requested the
+    keys are ABSENT rather than empty, so a decoder that forgot to ask raises
+    ``KeyError`` instead of silently resolving long insertions against nothing.
     """
 
     vk_pos: np.ndarray
@@ -121,8 +128,8 @@ class BatchResultSplit(TypedDict):
     dense_indel_range: np.ndarray
     dense_indel_present: np.ndarray
     dense_indel_present_off: np.ndarray
-    lut_bytes: np.ndarray
-    lut_off: np.ndarray
+    lut_bytes: NotRequired[np.ndarray]
+    lut_off: NotRequired[np.ndarray]
     n_regions: int
     n_samples: int
     ploidy: int
@@ -392,7 +399,11 @@ class _BatchQueryMixin:
         )
 
     def _gather_haps_readbound(
-        self, contig: str, hap_ranges: Mapping[str, Any]
+        self,
+        contig: str,
+        hap_ranges: Mapping[str, Any],
+        *,
+        with_lut: bool = False,
     ) -> BatchResultSplit:
         """Tree-free read-bound gather.
 
@@ -404,8 +415,18 @@ class _BatchQueryMixin:
         arbitrary pair set has to be covered either by over-gathering the
         cross-product or by one bundle per sample. This path does neither, and
         (unlike ``_gather_ranges``) never rebuilds the contig-wide dense union.
+
+        Args:
+            contig: Contig name.
+            hap_ranges: A flat :class:`HapRanges`.
+            with_lut: Include ``lut_bytes`` / ``lut_off`` in the result. Needed
+                to decode long insertions, and off by default because the LUT is
+                whole-contig: copying it costs O(contig) per call (~0.3 ms/MB on
+                1kGP), which would otherwise be most of this call's fixed cost
+                for a small query. When off, those keys are absent rather than
+                empty, so a decoder that forgot to ask raises ``KeyError``.
         """
-        return self._reader(contig).gather_haps_readbound(dict(hap_ranges))
+        return self._reader(contig).gather_haps_readbound(dict(hap_ranges), with_lut)
 
     def _find_ranges_chunked(
         self,

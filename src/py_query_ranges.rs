@@ -17,6 +17,10 @@
 //! `find_dense_class_ranges` (per-class dense windows, built WITHOUT
 //! `dense_union()`) + `gather_haps_readbound`, which replays a FLAT
 //! per-(region, sample) `HapRanges` into the `BatchResultSplit` dict contract.
+//! That contract's `lut_bytes`/`lut_off` are OPT-IN (`with_lut=True`), unlike
+//! `read_ranges`/`gather_ranges` where they are always present — the LUT is
+//! whole-contig, so on a path whose whole point is cell-proportional cost it is
+//! the caller's choice to pay for it.
 //! Its var_key search half is already exposed by `find_ranges_chunk` (a thin
 //! binding over `query::find_ranges_haps`), so there is exactly one way to run
 //! each of the two searches.
@@ -336,13 +340,18 @@ fn hap_ranges_from_dict(
 }
 
 /// `BatchResultSplit` -> numpy dict. The split-dense analog of
-/// `batch_result_to_dict`: same `vk_*` and `lut_*` keys, but the single
-/// `dense_*` channel is replaced by the per-class `dense_snp_*` /
-/// `dense_indel_*` pair, and the dense payload covers ONLY the queried windows
-/// (no whole-contig `DenseUnion` is ever built).
+/// `batch_result_to_dict`: same `vk_*` keys, but the single `dense_*` channel is
+/// replaced by the per-class `dense_snp_*` / `dense_indel_*` pair, and the dense
+/// payload covers ONLY the queried windows (no whole-contig `DenseUnion` is ever
+/// built).
+///
+/// `reader_lut` is an `Option` because the LUT is the one remaining O(contig)
+/// term on this path: `None` omits `lut_bytes` / `lut_off` entirely (absent, not
+/// empty — see `gather_haps_readbound`). `batch_result_to_dict` keeps taking its
+/// LUT unconditionally, so no existing caller changes.
 fn batch_result_split_to_dict<'py>(
     py: Python<'py>,
-    reader_lut: (Vec<u8>, Vec<u64>),
+    reader_lut: Option<(Vec<u8>, Vec<u64>)>,
     br: &BatchResultSplit,
 ) -> PyResult<Bound<'py, PyDict>> {
     let pairs_to_2d = |v: &[Range<usize>]| {
@@ -362,9 +371,6 @@ fn batch_result_split_to_dict<'py>(
     let snp_key: Vec<u32> = br.dense_snp.iter().map(|k| k.key).collect();
     let indel_pos: Vec<u32> = br.dense_indel.iter().map(|k| k.position).collect();
     let indel_key: Vec<u32> = br.dense_indel.iter().map(|k| k.key).collect();
-
-    let (lut_bytes, lut_off_u64) = reader_lut;
-    let lut_off: Vec<i64> = lut_off_u64.iter().map(|&x| x as i64).collect();
 
     let d = PyDict::new(py);
     d.set_item("vk_pos", u32_to_i32_pyarray(py, &vk_pos))?;
@@ -392,8 +398,11 @@ fn batch_result_split_to_dict<'py>(
         "dense_indel_present_off",
         usize_to_i64_pyarray(py, &br.dense_indel_present_off),
     )?;
-    d.set_item("lut_bytes", u8_to_pyarray(py, &lut_bytes))?;
-    d.set_item("lut_off", PyArray1::from_slice(py, &lut_off))?;
+    if let Some((lut_bytes, lut_off_u64)) = reader_lut {
+        let lut_off: Vec<i64> = lut_off_u64.iter().map(|&x| x as i64).collect();
+        d.set_item("lut_bytes", u8_to_pyarray(py, &lut_bytes))?;
+        d.set_item("lut_off", PyArray1::from_slice(py, &lut_off))?;
+    }
     d.set_item("n_regions", br.n_regions)?;
     d.set_item("n_samples", br.n_samples)?;
     d.set_item("ploidy", br.ploidy)?;
@@ -491,16 +500,33 @@ impl PyContigReader {
     /// scalar. Returns the `BatchResultSplit` dict (per-class dense channels);
     /// `n_regions = n_q`, `n_samples = 1`, hap index `q*ploidy + p`.
     ///
-    /// Builds zero SearchTrees and never calls `dense_union()`, so its cost is
-    /// proportional to the cells actually requested.
+    /// Builds zero SearchTrees and never calls `dense_union()`, so the GATHER
+    /// itself scales with the cells requested rather than with the contig.
+    ///
+    /// `with_lut` is off by default because it does not: the LUT (long-INS
+    /// allele bytes) is a whole-contig structure, and copying it into the
+    /// result costs O(contig) per call — measured at ~0.3 ms/MB on 1kGP, which
+    /// is most of this call's fixed cost for a small query. Pass
+    /// `with_lut=True` to get `lut_bytes` / `lut_off`, which a consumer needs to
+    /// decode long insertions; when it is off those two keys are ABSENT rather
+    /// than empty, so a decoder that forgot to ask fails with a KeyError
+    /// instead of silently resolving long-INS alleles against an empty table.
+    #[pyo3(signature = (hap_ranges, with_lut=false))]
     pub fn gather_haps_readbound<'py>(
         &self,
         py: Python<'py>,
         hap_ranges: Bound<'py, PyDict>,
+        with_lut: bool,
     ) -> PyResult<Bound<'py, PyDict>> {
         let owned = hap_ranges_from_dict(&hap_ranges, self.inner.n_samples, self.inner.ploidy)?;
         let br = gather_haps_readbound(&self.inner, &owned.view());
-        batch_result_split_to_dict(py, self.inner.lut_arrays(), &br)
+        // `lut_arrays()` is the O(contig) copy — only call it when asked.
+        let lut = if with_lut {
+            Some(self.inner.lut_arrays())
+        } else {
+            None
+        };
+        batch_result_split_to_dict(py, lut, &br)
     }
 
     /// Region-level half of a chunked `find_ranges`: everything whose size is
