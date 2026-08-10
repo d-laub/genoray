@@ -12,6 +12,14 @@
 //! `out=` streaming (writing directly into a caller-provided memmap) is
 //! deferred to the Python layer (Task 5) — `find_ranges` here always returns
 //! freshly-allocated numpy arrays.
+//!
+//! The read-bound (split-dense) half of the same split is exposed by
+//! `find_dense_class_ranges` (per-class dense windows, built WITHOUT
+//! `dense_union()`) + `gather_haps_readbound`, which replays a FLAT
+//! per-(region, sample) `HapRanges` into the `BatchResultSplit` dict contract.
+//! Its var_key search half is already exposed by `find_ranges_chunk` (a thin
+//! binding over `query::find_ranges_haps`), so there is exactly one way to run
+//! each of the two searches.
 
 use std::ops::Range;
 
@@ -24,8 +32,8 @@ use pyo3::types::{PyDict, PyDictMethods};
 use crate::py_convert::{u8_to_pyarray, u32_to_i32_pyarray, usize_to_i64_pyarray};
 use crate::py_query::PyContigReader;
 use crate::query::{
-    BatchResult, MAX_END_SHIFT, RangesBundle, dense_max_end_keys, find_ranges, find_ranges_haps,
-    gather_ranges, read_ranges,
+    BatchResult, BatchResultSplit, HapRanges, MAX_END_SHIFT, RangesBundle, dense_max_end_keys,
+    find_ranges, find_ranges_haps, gather_haps_readbound, gather_ranges, read_ranges,
 };
 
 /// Identical to `py_query_batch.rs::overlap_batch`'s dict assembly — the whole
@@ -138,30 +146,37 @@ fn bundle_to_dict<'py>(py: Python<'py>, rb: &RangesBundle) -> PyResult<Bound<'py
     Ok(d)
 }
 
-/// Inverse of `bundle_to_dict`: read a `find_ranges` dict back into a
-/// `RangesBundle` for `gather_ranges`. Fallible: a missing key or wrong
-/// dtype/shape becomes a Python KeyError/TypeError rather than a Rust panic.
-fn bundle_from_dict(d: &Bound<'_, PyDict>) -> PyResult<RangesBundle> {
-    let require = |k: &str| -> PyResult<Bound<'_, PyAny>> {
+/// Strict numpy-dict readers shared by `bundle_from_dict` (the `RangesBundle`
+/// contract) and `hap_ranges_from_dict` (the `HapRanges` contract). Casts are
+/// exact (`PyArray1<i32>` / `PyArray1<i64>` / `PyArray2<i32>` / `PyArray2<i64>`),
+/// so a dtype slip fails loudly with a TypeError instead of being silently
+/// reinterpreted.
+mod dict_get {
+    use super::*;
+
+    pub(super) fn require<'py>(d: &Bound<'py, PyDict>, k: &str) -> PyResult<Bound<'py, PyAny>> {
         d.get_item(k)?
             .ok_or_else(|| PyKeyError::new_err(format!("bundle missing key '{k}'")))
-    };
-    let get_i32 = |k: &str| -> PyResult<Vec<i32>> {
-        let obj = require(k)?;
+    }
+
+    pub(super) fn i32s(d: &Bound<'_, PyDict>, k: &str) -> PyResult<Vec<i32>> {
+        let obj = require(d, k)?;
         let arr = obj.cast::<PyArray1<i32>>().map_err(|_| {
             PyTypeError::new_err(format!("bundle key '{k}' must be an int32 1D array"))
         })?;
         Ok(arr.readonly().as_slice()?.to_vec())
-    };
-    let get_i64 = |k: &str| -> PyResult<Vec<i64>> {
-        let obj = require(k)?;
+    }
+
+    pub(super) fn i64s(d: &Bound<'_, PyDict>, k: &str) -> PyResult<Vec<i64>> {
+        let obj = require(d, k)?;
         let arr = obj.cast::<PyArray1<i64>>().map_err(|_| {
             PyTypeError::new_err(format!("bundle key '{k}' must be an int64 1D array"))
         })?;
         Ok(arr.readonly().as_slice()?.to_vec())
-    };
-    let get_i32_pairs = |k: &str| -> PyResult<Vec<Range<usize>>> {
-        let obj = require(k)?;
+    }
+
+    pub(super) fn i32_pairs(d: &Bound<'_, PyDict>, k: &str) -> PyResult<Vec<Range<usize>>> {
+        let obj = require(d, k)?;
         let arr = obj
             .cast::<PyArray2<i32>>()
             .map_err(|_| {
@@ -174,9 +189,10 @@ fn bundle_from_dict(d: &Bound<'_, PyDict>) -> PyResult<RangesBundle> {
             .into_iter()
             .map(|row| (row[0] as usize)..(row[1] as usize))
             .collect())
-    };
-    let get_i64_pairs = |k: &str| -> PyResult<Vec<Range<usize>>> {
-        let obj = require(k)?;
+    }
+
+    pub(super) fn i64_pairs(d: &Bound<'_, PyDict>, k: &str) -> PyResult<Vec<Range<usize>>> {
+        let obj = require(d, k)?;
         let arr = obj
             .cast::<PyArray2<i64>>()
             .map_err(|_| {
@@ -189,8 +205,22 @@ fn bundle_from_dict(d: &Bound<'_, PyDict>) -> PyResult<RangesBundle> {
             .into_iter()
             .map(|row| (row[0] as usize)..(row[1] as usize))
             .collect())
-    };
-    let get_usize = |k: &str| -> PyResult<usize> { require(k)?.extract() };
+    }
+
+    pub(super) fn usize_(d: &Bound<'_, PyDict>, k: &str) -> PyResult<usize> {
+        require(d, k)?.extract()
+    }
+}
+
+/// Inverse of `bundle_to_dict`: read a `find_ranges` dict back into a
+/// `RangesBundle` for `gather_ranges`. Fallible: a missing key or wrong
+/// dtype/shape becomes a Python KeyError/TypeError rather than a Rust panic.
+fn bundle_from_dict(d: &Bound<'_, PyDict>) -> PyResult<RangesBundle> {
+    let get_i32 = |k: &str| dict_get::i32s(d, k);
+    let get_i64 = |k: &str| dict_get::i64s(d, k);
+    let get_i32_pairs = |k: &str| dict_get::i32_pairs(d, k);
+    let get_i64_pairs = |k: &str| dict_get::i64_pairs(d, k);
+    let get_usize = |k: &str| dict_get::usize_(d, k);
 
     Ok(RangesBundle {
         n_regions: get_usize("n_regions")?,
@@ -210,6 +240,164 @@ fn bundle_from_dict(d: &Bound<'_, PyDict>) -> PyResult<RangesBundle> {
         dense_snp_range: get_i32_pairs("dense_snp_range")?,
         dense_indel_range: get_i32_pairs("dense_indel_range")?,
     })
+}
+
+/// Owned backing store for a `HapRanges`, which borrows all six of its slices.
+/// The dict -> Rust conversion has to materialize the `Vec<Range<usize>>`s
+/// somewhere; keeping them in one struct with a `view()` makes the borrow
+/// obviously outlive the `gather_haps_readbound` call.
+struct OwnedHapRanges {
+    region_starts: Vec<u32>,
+    orig_samples: Vec<usize>,
+    vk_snp_range: Vec<Range<usize>>,
+    vk_indel_range: Vec<Range<usize>>,
+    dense_snp_range: Vec<Range<usize>>,
+    dense_indel_range: Vec<Range<usize>>,
+    ploidy: usize,
+}
+
+impl OwnedHapRanges {
+    fn view(&self) -> HapRanges<'_> {
+        HapRanges::new(
+            &self.region_starts,
+            &self.orig_samples,
+            &self.vk_snp_range,
+            &self.vk_indel_range,
+            &self.dense_snp_range,
+            &self.dense_indel_range,
+            self.ploidy,
+        )
+    }
+}
+
+/// Read a FLAT per-(region, sample) `HapRanges` dict. Dtypes deliberately match
+/// `bundle_to_dict`'s (`region_starts` int32, sample indices int64, `vk_*_range`
+/// int64 (N,2), `dense_*_range` int32 (N,2)) so a caller can slice a
+/// `find_ranges`/`find_ranges_chunk` result straight in with no casting.
+///
+/// Every length/bound the Rust core would otherwise `assert!` or index-panic on
+/// is checked here first, so a malformed dict is a Python ValueError.
+fn hap_ranges_from_dict(
+    d: &Bound<'_, PyDict>,
+    n_samples_total: usize,
+    reader_ploidy: usize,
+) -> PyResult<OwnedHapRanges> {
+    let ploidy = dict_get::usize_(d, "ploidy")?;
+    if ploidy != reader_ploidy {
+        return Err(PyValueError::new_err(format!(
+            "hap_ranges ploidy {ploidy} != this contig's ploidy {reader_ploidy}"
+        )));
+    }
+    let region_starts: Vec<u32> = dict_get::i32s(d, "region_starts")?
+        .into_iter()
+        .map(|x| x as u32)
+        .collect();
+    let n_q = region_starts.len();
+
+    let orig_samples: Vec<usize> = dict_get::i64s(d, "orig_samples")?
+        .into_iter()
+        .map(|x| x as usize)
+        .collect();
+    if let Some(&bad) = orig_samples.iter().find(|&&s| s >= n_samples_total) {
+        return Err(PyValueError::new_err(format!(
+            "orig_samples contains {bad}, out of bounds for {n_samples_total} samples"
+        )));
+    }
+
+    let vk_snp_range = dict_get::i64_pairs(d, "vk_snp_range")?;
+    let vk_indel_range = dict_get::i64_pairs(d, "vk_indel_range")?;
+    let dense_snp_range = dict_get::i32_pairs(d, "dense_snp_range")?;
+    let dense_indel_range = dict_get::i32_pairs(d, "dense_indel_range")?;
+
+    let check = |name: &str, got: usize, want: usize| -> PyResult<()> {
+        if got == want {
+            Ok(())
+        } else {
+            Err(PyValueError::new_err(format!(
+                "hap_ranges key '{name}' has {got} rows, expected {want}"
+            )))
+        }
+    };
+    check("orig_samples", orig_samples.len(), n_q)?;
+    check("dense_snp_range", dense_snp_range.len(), n_q)?;
+    check("dense_indel_range", dense_indel_range.len(), n_q)?;
+    check("vk_snp_range", vk_snp_range.len(), n_q * ploidy)?;
+    check("vk_indel_range", vk_indel_range.len(), n_q * ploidy)?;
+
+    Ok(OwnedHapRanges {
+        region_starts,
+        orig_samples,
+        vk_snp_range,
+        vk_indel_range,
+        dense_snp_range,
+        dense_indel_range,
+        ploidy,
+    })
+}
+
+/// `BatchResultSplit` -> numpy dict. The split-dense analog of
+/// `batch_result_to_dict`: same `vk_*` and `lut_*` keys, but the single
+/// `dense_*` channel is replaced by the per-class `dense_snp_*` /
+/// `dense_indel_*` pair, and the dense payload covers ONLY the queried windows
+/// (no whole-contig `DenseUnion` is ever built).
+fn batch_result_split_to_dict<'py>(
+    py: Python<'py>,
+    reader_lut: (Vec<u8>, Vec<u64>),
+    br: &BatchResultSplit,
+) -> PyResult<Bound<'py, PyDict>> {
+    let pairs_to_2d = |v: &[Range<usize>]| {
+        let mut o = Vec::with_capacity(v.len() * 2);
+        for r in v {
+            o.push(r.start as i32);
+            o.push(r.end as i32);
+        }
+        Array2::from_shape_vec((v.len(), 2), o)
+            .expect("dense range shape")
+            .to_pyarray(py)
+    };
+
+    let vk_pos: Vec<u32> = br.vk.iter().map(|k| k.position).collect();
+    let vk_key: Vec<u32> = br.vk.iter().map(|k| k.key).collect();
+    let snp_pos: Vec<u32> = br.dense_snp.iter().map(|k| k.position).collect();
+    let snp_key: Vec<u32> = br.dense_snp.iter().map(|k| k.key).collect();
+    let indel_pos: Vec<u32> = br.dense_indel.iter().map(|k| k.position).collect();
+    let indel_key: Vec<u32> = br.dense_indel.iter().map(|k| k.key).collect();
+
+    let (lut_bytes, lut_off_u64) = reader_lut;
+    let lut_off: Vec<i64> = lut_off_u64.iter().map(|&x| x as i64).collect();
+
+    let d = PyDict::new(py);
+    d.set_item("vk_pos", u32_to_i32_pyarray(py, &vk_pos))?;
+    d.set_item("vk_key", u32_to_i32_pyarray(py, &vk_key))?;
+    d.set_item("vk_off", usize_to_i64_pyarray(py, &br.vk_off))?;
+    d.set_item("dense_snp_pos", u32_to_i32_pyarray(py, &snp_pos))?;
+    d.set_item("dense_snp_key", u32_to_i32_pyarray(py, &snp_key))?;
+    d.set_item("dense_snp_range", pairs_to_2d(&br.dense_snp_range))?;
+    d.set_item(
+        "dense_snp_present",
+        u8_to_pyarray(py, &br.dense_snp_present),
+    )?;
+    d.set_item(
+        "dense_snp_present_off",
+        usize_to_i64_pyarray(py, &br.dense_snp_present_off),
+    )?;
+    d.set_item("dense_indel_pos", u32_to_i32_pyarray(py, &indel_pos))?;
+    d.set_item("dense_indel_key", u32_to_i32_pyarray(py, &indel_key))?;
+    d.set_item("dense_indel_range", pairs_to_2d(&br.dense_indel_range))?;
+    d.set_item(
+        "dense_indel_present",
+        u8_to_pyarray(py, &br.dense_indel_present),
+    )?;
+    d.set_item(
+        "dense_indel_present_off",
+        usize_to_i64_pyarray(py, &br.dense_indel_present_off),
+    )?;
+    d.set_item("lut_bytes", u8_to_pyarray(py, &lut_bytes))?;
+    d.set_item("lut_off", PyArray1::from_slice(py, &lut_off))?;
+    d.set_item("n_regions", br.n_regions)?;
+    d.set_item("n_samples", br.n_samples)?;
+    d.set_item("ploidy", br.ploidy)?;
+    Ok(d)
 }
 
 #[pymethods]
@@ -252,6 +440,67 @@ impl PyContigReader {
         let rb = bundle_from_dict(&bundle)?;
         let br = gather_ranges(&self.inner, &rb);
         batch_result_to_dict(py, self.inner.lut_arrays(), &br)
+    }
+
+    /// Per-class dense windows for the read-bound path: `[s, e)` into
+    /// `dense/snp` and `dense/indel` for each region. The read-bound counterpart
+    /// of the `dense_range` half of `find_ranges` — dense is cohort-shared, so
+    /// these are per-region, not per-(region, sample).
+    ///
+    /// Unlike `find_ranges`/`find_ranges_header` this never calls
+    /// `dense_union()`, which is the whole point: the union merge is O(contig)
+    /// per call and is the fixed floor a read-bound gather must not pay.
+    pub fn find_dense_class_ranges<'py>(
+        &self,
+        py: Python<'py>,
+        regions: Vec<(u32, u32)>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let snp_ix = self.inner.dense_snp_index();
+        let indel_ix = self.inner.dense_indel_index();
+        let pairs_to_2d = |v: Vec<Range<usize>>| {
+            let mut o = Vec::with_capacity(v.len() * 2);
+            for r in &v {
+                o.push(r.start as i32);
+                o.push(r.end as i32);
+            }
+            Array2::from_shape_vec((v.len(), 2), o)
+                .expect("dense range shape")
+                .to_pyarray(py)
+        };
+        let snp: Vec<Range<usize>> = regions.iter().map(|&(s, e)| snp_ix.overlap(s, e)).collect();
+        let indel: Vec<Range<usize>> = regions
+            .iter()
+            .map(|&(s, e)| indel_ix.overlap(s, e))
+            .collect();
+
+        let d = PyDict::new(py);
+        d.set_item("dense_snp_range", pairs_to_2d(snp))?;
+        d.set_item("dense_indel_range", pairs_to_2d(indel))?;
+        d.set_item("n_regions", regions.len())?;
+        Ok(d)
+    }
+
+    /// Tree-free read-bound gather over a FLAT list of `(region, sample)`
+    /// queries — the exact-cell counterpart of `gather_ranges`, whose bundle is
+    /// inherently a region x sample rectangle.
+    ///
+    /// `hap_ranges` is the dict contract read by `hap_ranges_from_dict`:
+    /// `region_starts (n_q) int32`, `orig_samples (n_q) int64`, `vk_snp_range` /
+    /// `vk_indel_range (n_q*ploidy, 2) int64` (row `q*ploidy + p`),
+    /// `dense_snp_range` / `dense_indel_range (n_q, 2) int32`, plus a `ploidy`
+    /// scalar. Returns the `BatchResultSplit` dict (per-class dense channels);
+    /// `n_regions = n_q`, `n_samples = 1`, hap index `q*ploidy + p`.
+    ///
+    /// Builds zero SearchTrees and never calls `dense_union()`, so its cost is
+    /// proportional to the cells actually requested.
+    pub fn gather_haps_readbound<'py>(
+        &self,
+        py: Python<'py>,
+        hap_ranges: Bound<'py, PyDict>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let owned = hap_ranges_from_dict(&hap_ranges, self.inner.n_samples, self.inner.ploidy)?;
+        let br = gather_haps_readbound(&self.inner, &owned.view());
+        batch_result_split_to_dict(py, self.inner.lut_arrays(), &br)
     }
 
     /// Region-level half of a chunked `find_ranges`: everything whose size is

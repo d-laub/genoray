@@ -98,6 +98,131 @@ class RangesBundle(TypedDict):
     ploidy: int
 
 
+class BatchResultSplit(TypedDict):
+    """Split-dense batch-query result contract (see py_query_ranges.rs).
+
+    As :class:`BatchResult`, except the single unified ``dense_*`` channel is
+    replaced by the per-class ``dense_snp_*`` / ``dense_indel_*`` pair, because
+    the read-bound path never builds the contig-wide dense union. Consumers
+    merge ``var_key``, ``dense_snp`` and ``dense_indel`` by position downstream.
+    ``n_samples`` is always 1 and the hap index is ``q * ploidy + p``.
+    """
+
+    vk_pos: np.ndarray
+    vk_key: np.ndarray
+    vk_off: np.ndarray
+    dense_snp_pos: np.ndarray
+    dense_snp_key: np.ndarray
+    dense_snp_range: np.ndarray
+    dense_snp_present: np.ndarray
+    dense_snp_present_off: np.ndarray
+    dense_indel_pos: np.ndarray
+    dense_indel_key: np.ndarray
+    dense_indel_range: np.ndarray
+    dense_indel_present: np.ndarray
+    dense_indel_present_off: np.ndarray
+    lut_bytes: np.ndarray
+    lut_off: np.ndarray
+    n_regions: int
+    n_samples: int
+    ploidy: int
+
+
+class HapRanges(TypedDict):
+    """Flat per-``(region, sample)`` search result replayed by ``_gather_haps_readbound``.
+
+    One row ``q`` per query *pair*, so an arbitrary (non-rectangular) set of
+    ``(region, sample)`` cells costs exactly those cells -- unlike
+    :class:`RangesBundle`, whose ``sample_cols`` axis makes it inherently a
+    region-by-sample rectangle. Dtypes match :class:`RangesBundle`'s so a
+    bundle's arrays can be sliced straight in.
+
+    Attributes:
+        region_starts: Shape ``(n_q,)`` int32. Each query's ``q_start``.
+        orig_samples: Shape ``(n_q,)`` int64. Each query's sample index in the
+            store's FULL cohort (not a subset slot).
+        vk_snp_range: Shape ``(n_q * ploidy, 2)`` int64, row ``q * ploidy + p``.
+        vk_indel_range: Shape ``(n_q * ploidy, 2)`` int64, row ``q * ploidy + p``.
+        dense_snp_range: Shape ``(n_q, 2)`` int32. Dense is cohort-shared, so
+            this is per-query, not per-hap.
+        dense_indel_range: Shape ``(n_q, 2)`` int32.
+        ploidy: Must equal the contig's ploidy.
+    """
+
+    region_starts: np.ndarray
+    orig_samples: np.ndarray
+    vk_snp_range: np.ndarray
+    vk_indel_range: np.ndarray
+    dense_snp_range: np.ndarray
+    dense_indel_range: np.ndarray
+    ploidy: int
+
+
+@dataclass(frozen=True)
+class HapRangesRect:
+    """Search output for the read-bound gather.
+
+    The region-by-sample rectangle of var_key ranges plus the per-region,
+    cohort-shared dense class windows.
+
+    Produced by ``_find_haps_ranges``; :meth:`select` folds it down to the flat
+    :class:`HapRanges` the gather replays. Splitting search (rectangle) from
+    gather (flat) is deliberate: the var_key search is column-outer, so
+    searching a sample's whole region list at once is what amortizes its index
+    build, while the gather should touch only the cells asked for.
+
+    Attributes:
+        region_starts: Shape ``(n_regions,)`` int32.
+        sample_cols: Shape ``(n_samples,)`` int64 -- selected samples' indices in
+            the store's full cohort.
+        vk_snp_range: Shape ``(n_samples, ploidy, n_regions, 2)`` int64.
+        vk_indel_range: Shape ``(n_samples, ploidy, n_regions, 2)`` int64.
+        dense_snp_range: Shape ``(n_regions, 2)`` int32.
+        dense_indel_range: Shape ``(n_regions, 2)`` int32.
+    """
+
+    n_regions: int
+    n_samples: int
+    ploidy: int
+    region_starts: "np.ndarray"
+    sample_cols: "np.ndarray"
+    vk_snp_range: "np.ndarray"
+    vk_indel_range: "np.ndarray"
+    dense_snp_range: "np.ndarray"
+    dense_indel_range: "np.ndarray"
+
+    def select(self, regions: "ArrayLike", samples: "ArrayLike") -> HapRanges:
+        """Fold this rectangle down to the flat cells the parallel index arrays name.
+
+        Args:
+            regions: Row indices into ``region_starts``.
+            samples: Slots on THIS rectangle's ``sample_cols`` axis (not
+                full-cohort sample indices).
+
+        Raises:
+            ValueError: If the two index arrays have different lengths.
+        """
+        r = np.asarray(regions, dtype=np.intp).ravel()
+        s = np.asarray(samples, dtype=np.intp).ravel()
+        if r.shape != s.shape:
+            raise ValueError(
+                f"regions and samples must be parallel, got {r.shape} and {s.shape}"
+            )
+        # Advanced indexing on axes 0 and 2 with a slice between them puts the
+        # broadcast (n_q) axis FIRST, giving (n_q, ploidy, 2) -- i.e. exactly
+        # HapRanges' row order q*ploidy + p once flattened.
+        shape = (r.size * self.ploidy, 2)
+        return HapRanges(
+            region_starts=np.ascontiguousarray(self.region_starts[r]),
+            orig_samples=np.ascontiguousarray(self.sample_cols[s]),
+            vk_snp_range=self.vk_snp_range[s, :, r, :].reshape(shape),
+            vk_indel_range=self.vk_indel_range[s, :, r, :].reshape(shape),
+            dense_snp_range=np.ascontiguousarray(self.dense_snp_range[r]),
+            dense_indel_range=np.ascontiguousarray(self.dense_indel_range[r]),
+            ploidy=self.ploidy,
+        )
+
+
 class _BatchQueryMixin:
     """Raw ``BatchResult`` → numpy query methods."""
 
@@ -105,6 +230,7 @@ class _BatchQueryMixin:
     # declared here so the mixin's use of them type-checks in isolation.
     _readers: dict[str, Any]
     available_samples: list[str]
+    ploidy: int
 
     def _reader(self, contig: str) -> "_core.PyContigReader":  # host-provided
         ...
@@ -218,6 +344,68 @@ class _BatchQueryMixin:
                     f"(got {want!r}, bundle has {have!r})"
                 )
         return self._reader(contig).gather_ranges(ranges)
+
+    def _find_haps_ranges(
+        self,
+        contig: str,
+        starts: "ArrayLike",
+        ends: "ArrayLike",
+        samples: "ArrayLike | None" = None,
+    ) -> HapRangesRect:
+        """Search-only step for the READ-BOUND gather.
+
+        Returns var_key ranges for the region-by-sample rectangle plus the
+        per-region dense class windows.
+
+        ``starts``/``ends`` and ``samples`` behave as in :meth:`read_ranges`.
+        Unlike :meth:`_find_ranges` this builds no contig-wide dense union, so
+        the result can only be replayed by :meth:`_gather_haps_readbound` (via
+        :meth:`HapRangesRect.select`), never by :meth:`_gather_ranges`.
+        """
+        reg = self._regions(starts, ends)
+        sample_idxs = self._sample_idxs(samples)
+        reader = self._reader(contig)
+        ploidy = self.ploidy
+        n_regions = len(reg)
+        n_samples = (
+            len(sample_idxs) if sample_idxs is not None else len(self.available_samples)
+        )
+
+        vk = reader.find_ranges_chunk(reg, sample_idxs, 0, n_samples * ploidy)
+        dense = reader.find_dense_class_ranges(reg)
+        shape = (n_samples, ploidy, n_regions, 2)
+        cols = (
+            np.asarray(sample_idxs, np.int64)
+            if sample_idxs is not None
+            else np.arange(n_samples, dtype=np.int64)
+        )
+        return HapRangesRect(
+            n_regions=n_regions,
+            n_samples=n_samples,
+            ploidy=ploidy,
+            region_starts=np.asarray([s for s, _ in reg], np.int32),
+            sample_cols=cols,
+            vk_snp_range=np.asarray(vk["vk_snp_range"]).reshape(shape),
+            vk_indel_range=np.asarray(vk["vk_indel_range"]).reshape(shape),
+            dense_snp_range=np.asarray(dense["dense_snp_range"]),
+            dense_indel_range=np.asarray(dense["dense_indel_range"]),
+        )
+
+    def _gather_haps_readbound(
+        self, contig: str, hap_ranges: Mapping[str, Any]
+    ) -> BatchResultSplit:
+        """Tree-free read-bound gather.
+
+        Replays a flat :class:`HapRanges` into a :class:`BatchResultSplit`,
+        touching only the ``(region, sample)`` cells it names.
+
+        The exact-cell counterpart of :meth:`_gather_ranges`, whose
+        :class:`RangesBundle` is inherently a region-by-sample rectangle: an
+        arbitrary pair set has to be covered either by over-gathering the
+        cross-product or by one bundle per sample. This path does neither, and
+        (unlike ``_gather_ranges``) never rebuilds the contig-wide dense union.
+        """
+        return self._reader(contig).gather_haps_readbound(dict(hap_ranges))
 
     def _find_ranges_chunked(
         self,

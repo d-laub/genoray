@@ -201,6 +201,74 @@ fn test_readbound_gather_builds_no_search_tree() {
     );
 }
 
+/// The load-bearing property for the FLAT (per-(region, sample)) gather that
+/// `PyContigReader::gather_haps_readbound` exposes: it must build zero
+/// SearchTrees, i.e. carry no per-call whole-contig `dense_union()` floor. The
+/// test above covers only the cartesian oracle twin; a regression that made the
+/// flat impl re-search (or rebuild the union) would leave that one green.
+#[test]
+fn test_flat_gather_haps_readbound_builds_no_search_tree() {
+    let tmp = tempdir().unwrap();
+    let out = tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let reader = synth_reader(&out); // 2 samples, ploidy 2
+    let regions = vec![(0u32, 1_000_000u32), (250u32, 400u32)];
+    let ploidy = 2usize;
+
+    let rb = find_ranges(&reader, &regions, None);
+    // A deliberately NON-rectangular pair set: region 0 x sample 1 and
+    // region 1 x sample 0 -- the shape a RangesBundle cannot express.
+    let region_starts = vec![rb.region_starts[0], rb.region_starts[1]];
+    let orig_samples = vec![rb.sample_cols[1], rb.sample_cols[0]];
+    let dsr = vec![rb.dense_snp_range[0].clone(), rb.dense_snp_range[1].clone()];
+    let dir_ = vec![
+        rb.dense_indel_range[0].clone(),
+        rb.dense_indel_range[1].clone(),
+    ];
+    let hpr = rb.n_samples * ploidy;
+    let mut vk_snp_range = Vec::new();
+    let mut vk_indel_range = Vec::new();
+    for (r, s) in [(0usize, 1usize), (1, 0)] {
+        for p in 0..ploidy {
+            let row = r * hpr + s * ploidy + p;
+            vk_snp_range.push(rb.vk_snp_range[row].clone());
+            vk_indel_range.push(rb.vk_indel_range[row].clone());
+        }
+    }
+    let hr = HapRanges::new(
+        &region_starts,
+        &orig_samples,
+        &vk_snp_range,
+        &vk_indel_range,
+        &dsr,
+        &dir_,
+        ploidy,
+    );
+
+    let before = search::search_tree_build_count();
+    let got = gather_haps_readbound(&reader, &hr);
+    assert_eq!(
+        search::search_tree_build_count(),
+        before,
+        "gather_haps_readbound must build zero SearchTrees (no dense_union)"
+    );
+
+    // ...and it really gathered the requested cells, not an empty result.
+    assert_eq!(got.n_regions, 2);
+    assert_eq!(got.n_samples, 1);
+    assert_eq!(got.vk_off.len(), 2 * ploidy + 1);
+    let full = gather_ranges_readbound(&reader, &rb);
+    for (q, (r, s)) in [(0usize, 1usize), (1, 0)].into_iter().enumerate() {
+        for p in 0..ploidy {
+            assert_eq!(
+                readbound_decode_hap(&got, &reader, q, 0, p),
+                readbound_decode_hap(&full, &reader, r, s, p),
+                "flat query {q} (region {r}, sample {s}) ploid {p}"
+            );
+        }
+    }
+}
+
 #[test]
 fn test_readbound_subset_matches_full_selected_haps() {
     let tmp = tempdir().unwrap();
