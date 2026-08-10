@@ -42,9 +42,14 @@ def test_sweep_names_covers_every_axis_build_plans_produces(tmp_path):
     `_SWEEP_NAMES`) -- it produces a plan file and then no data ever fills
     it. This bit twice (`vlinear2`, then `concurrency`); this test exists so
     the next axis added to `build_plans.py` fails loudly here instead of
-    shipping silently inert."""
+    shipping silently inert.
+
+    `pgen` is deliberately excluded from this check: it is fitted by its own
+    pipeline (`sweep_pgen.sbatch` + a dedicated `load_sweep("pgen", ...)`
+    call), not by `main()`/`_SWEEP_NAMES`, which fits only the VCF-path laws.
+    """
     plan_axes = set(build_plans(tmp_path, threads=8).keys())
-    assert plan_axes == set(_SWEEP_NAMES)
+    assert plan_axes - {"pgen"} == set(_SWEEP_NAMES)
 
 
 def test_v_law_recovers_planted_line():
@@ -86,9 +91,29 @@ def test_ram_law_recovers_planted_slope():
         RamRow(w, 0, 25_000_000, _FIXED_S, 100.0 + 3.0 * w * 25_000_000 / 1e6)
         for w in (1, 3, 5, 7, 11)
     ]
-    law = fit_ram_law(rows)
+    # margin=1.0: with noiseless rows lying exactly on the plane, the tightest
+    # non-under-predicting law IS that plane, so the envelope recovers planted
+    # coefficients exactly. At the shipped 1.25 margin it would return them
+    # scaled by 1.25 -- correct for a bound, useless for a recovery assertion.
+    law = fit_ram_law(rows, margin=1.0)
     assert math.isclose(law.kappa, 3.0, rel_tol=1e-6)
     assert math.isclose(law.base_mb, 100.0, abs_tol=1e-6)
+    assert math.isclose(law.worst_ratio, 1.0, rel_tol=1e-9)
+
+    # And the property that actually matters: the law is an upper BOUND, so
+    # the requested margin is honoured at every row.
+    scaled = fit_ram_law(rows, margin=1.25)
+    for r in rows:
+        pred = (
+            scaled.base_mb
+            + scaled.per_sample_mb * r.samples
+            + r.concurrent_chroms
+            * (
+                scaled.per_contig_mb
+                + scaled.kappa * (r.workers + r.pending) * r.chunk_bytes / 1e6
+            )
+        )
+        assert pred >= r.peak_rss_mb * 1.25 - 1e-6
 
 
 def test_ram_law_recovers_planted_cohort_term():
@@ -125,7 +150,7 @@ def test_ram_law_recovers_planted_cohort_term():
         for s_, cb in plan
         for w in (1, 3, 7)
     ]
-    law = fit_ram_law(rows)
+    law = fit_ram_law(rows, margin=1.0)
     assert law.r2 > 0.9999
     assert math.isclose(law.per_sample_mb, per_sample, rel_tol=1e-6)
     assert math.isclose(law.kappa, kappa, rel_tol=1e-6)
@@ -146,7 +171,7 @@ def test_ram_law_without_cohort_term_cannot_fit_cohort_scaling():
         RamRow(1, 0, 10_900_000, s_, 780.0 + 0.0086 * s_)
         for s_ in (4_000, 16_000, 64_000, 250_000, 500_000)
     ]
-    law = fit_ram_law(rows)
+    law = fit_ram_law(rows, margin=1.0)
     assert law.r2 > 0.999
     assert math.isclose(law.per_sample_mb, 0.0086, rel_tol=1e-6)
 
@@ -593,7 +618,13 @@ def _point(
     base = dict(
         corpus=corpus,
         reader_workers=workers,
-        concurrent_chroms=None,
+        # PINNED, not None. `_ram_rows` drops rows whose `concurrent_chroms`
+        # was never recorded, because for those the planner chose and nothing
+        # captured the choice -- fitting them means inventing the regressor
+        # (issue #158). These fixtures are synthetic single-contig data, so
+        # cc=1 is the true value rather than a convenient stand-in. Override
+        # per-point where a test needs a different concurrency.
+        concurrent_chroms=1,
         shard_htslib=0,
         overshard=4,
         chunk_size=chunk_size,
@@ -667,7 +698,9 @@ def test_ram_rows_do_not_charge_untouched_chunk_tail_to_rss():
         )
 
     ram_rows = _ram_rows(_sweep_of(rows))
-    assert math.isclose(fit_ram_law(ram_rows).kappa, 3.0, rel_tol=1e-9)
+    # margin=1.0 so the envelope collapses onto the planted plane; at the
+    # shipped margin every coefficient comes back scaled by it.
+    assert math.isclose(fit_ram_law(ram_rows, margin=1.0).kappa, 3.0, rel_tol=1e-9)
 
     nominal = [
         RamRow(
@@ -684,10 +717,16 @@ def test_ram_rows_do_not_charge_untouched_chunk_tail_to_rss():
     # chunk_bytes must not. Assert distance from the truth rather than a
     # direction: since `cells` is held constant, nominal chunk_bytes is
     # proportional to `samples` for every row where the chunk does not fill,
-    # making it near-collinear with the cohort regressor -- so the estimate now
-    # blows UP rather than collapsing to ~0.23 as it did under the
-    # single-regressor law. Either way it is not 3, which is the point.
-    assert not math.isclose(fit_ram_law(nominal).kappa, 3.0, rel_tol=0.5)
+    # so which way the estimate moves depends on the fitting method (it blew
+    # UP under the old OLS law and collapses under the envelope). Either way
+    # it is not 3, which is the point.
+    bad = fit_ram_law(nominal, margin=1.0)
+    assert not math.isclose(bad.kappa, 3.0, rel_tol=0.2)
+    # The envelope makes the defect legible in a way R^2 never did: charging
+    # the untouched tail leaves no coefficient set that fits tightly, so the
+    # bound has to stand off by nearly 5x where the touched-chunk fit sits
+    # exactly on the data.
+    assert bad.worst_ratio > 2.0
 
 
 def test_main_end_to_end(tmp_path, capsys, monkeypatch):

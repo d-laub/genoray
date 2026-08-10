@@ -14,7 +14,7 @@ import json
 import typing
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 
 T = TypeVar("T")
 
@@ -64,6 +64,16 @@ class SweepPoint:
     threads: int
     reps: int
     rss_ceiling_mb: int | None = None
+    # Which conversion path this point measures. Defaults to "vcf" so every
+    # call site that builds a `SweepPoint` without naming a backend keeps
+    # working unchanged (all pre-Task-8 construction sites use only the VCF
+    # path). NOTE: `point_id` hashes with `sort_keys=True`, so a SHA256 over
+    # the sorted JSON payload has no positional stability -- adding this
+    # field changes `point_id` for every point, existing or new, regardless
+    # of where in the dataclass it is declared or what its default is. There
+    # is no field placement that preserves ids across this change; "added
+    # last" only keeps existing constructor calls source-compatible.
+    backend: Literal["vcf", "pgen"] = "vcf"
 
     @property
     def point_id(self) -> str:
@@ -135,7 +145,13 @@ class CostLaw:
 @dataclass(frozen=True)
 class RamLaw:
     """peak_rss_mb ~ base_mb + per_sample_mb * samples
-    + kappa * (workers + pending_hw) * chunk_bytes.
+    + cc * (per_contig_mb + kappa * (workers + pending_hw) * chunk_MB)
+
+    Mirrors `src/budget.rs`'s `RamLaw` exactly, including `plan_sharded`'s
+    multiplication by `cc`. It did NOT always: the fit was cc-blind while the
+    consumer multiplied by `concurrent_chroms`, so the fitted `kappa` was not
+    the quantity production used and the resulting "safety margin" was a
+    double-count artifact rather than a chosen factor (issue #158).
 
     `per_sample_mb` is NOT optional bookkeeping: peak RSS carries a large
     cohort-sized term that has nothing to do with chunk bytes. Holding
@@ -144,6 +160,15 @@ class RamLaw:
     chunk term cannot express. Modelling that as a bare constant left the
     fit at R^2=0.057 and dragged `kappa` to 2.94 against a per-worker slope
     implying ~13, which in turn is what the H3 verdict is computed from.
+
+    `per_contig_mb` prices what one live contig pipeline holds independently
+    of `chunk_bytes`. It is 0.0 for a backend whose sweep never varied
+    `concurrent_chroms` at fixed (S, chunk_size), because such a sweep carries
+    no information about it.
+
+    `worst_ratio` is the gate: the largest predicted/measured ratio over the
+    fitted points. A law is an upper BOUND, so `worst_ratio` is the quantity
+    to minimise and `r2` is only descriptive -- see `fit_ram_law`.
     """
 
     base_mb: float
@@ -151,6 +176,13 @@ class RamLaw:
     kappa: float
     r2: float
     n_points: int
+    # Declared last, after the pre-existing fields, purely so the many
+    # positional `RamLaw(...)` constructions in the tests keep working. The
+    # 0.0 default carries the documented meaning "not fitted for this
+    # backend", which is the same thing `RamLaw::VCF` ships.
+    per_contig_mb: float = 0.0
+    worst_ratio: float = float("nan")
+    margin: float = 1.0
 
 
 @dataclass(frozen=True)

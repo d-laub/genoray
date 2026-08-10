@@ -191,7 +191,7 @@ def test_scale_plan_adds_a_dedicated_point_only_where_size_corpus_is_not_clamped
     assert len(dedicated) == len(unclamped_s) == 5
 
 
-def test_all_six_plans_are_produced():
+def test_all_seven_plans_are_produced():
     assert set(_build().keys()) == {
         "scale",
         "contig",
@@ -199,6 +199,7 @@ def test_all_six_plans_are_produced():
         "vlinear",
         "vlinear2",
         "concurrency",
+        "pgen",
     }
 
 
@@ -246,3 +247,157 @@ def test_the_second_v_ladder_pins_chunk_size_across_its_rungs():
     assert len(pts) == len(VLINEAR2_VARIANTS)
     assert len({p.chunk_size for p in pts}) == 1
     assert all(p.reader_workers == 1 for p in pts)
+
+
+def _shape_of(point) -> tuple[int, int]:
+    """(samples, variants) encoded in the corpus path, e.g. `.../s4000_v250000/`."""
+    import re
+
+    m = re.search(r"s(\d+)_v(\d+)", point.corpus)
+    assert m, f"corpus path does not encode its shape: {point.corpus}"
+    return int(m.group(1)), int(m.group(2))
+
+
+def test_pgen_family_has_two_v_ladders_at_different_sample_counts():
+    """A ladder that holds S*V constant forces the cohort exponent to ~1
+    arithmetically -- it cannot identify beta no matter how many points it
+    has. Two V-ladders at DIFFERENT S is the minimum that can."""
+    from scripts.bench_svar2.plans.build_plans import build
+
+    plans = build(Path("/tmp/corpora"), threads=48)
+    pgen = plans["pgen"]
+    assert pgen, "pgen family must not be empty"
+    assert all(p.backend == "pgen" for p in pgen)
+
+    by_samples: dict[int, set[int]] = {}
+    for p in pgen:
+        s, v = _shape_of(p)
+        by_samples.setdefault(s, set()).add(v)
+    ladders = [s for s, vs in by_samples.items() if len(vs) >= 2]
+    assert len(ladders) >= 2, (
+        f"need >=2 V-ladders at different S to identify the cohort exponent; "
+        f"got {by_samples}"
+    )
+
+
+def test_pgen_matrix_can_identify_kappa():
+    """kappa's CI spanned zero (SE 7.44, 95% CI [-9.99, +23.68]) because
+    `_chunk_size_for` depends only on V and both ladders swept the same three
+    V values, so `chunk_size` and `S*chunk_size` stayed correlated with S.
+    Varying chunk_size at a FIXED (S, V) decorrelates them; a third cohort
+    width tightens `per_sample_mb`'s extrapolation to the 500,000-sample
+    target."""
+    plans = build(Path("/tmp/corpora"), threads=48)
+    pgen = plans["pgen"]
+
+    chunk_sizes_by_shape: dict[tuple[int, int], set[int]] = {}
+    widths: set[int] = set()
+    for p in pgen:
+        s, v = _shape_of(p)
+        chunk_sizes_by_shape.setdefault((s, v), set()).add(p.chunk_size)
+        widths.add(s)
+
+    assert max(len(cs) for cs in chunk_sizes_by_shape.values()) >= 3, (
+        "need >=3 distinct chunk_size values at some fixed (S, V) to "
+        f"decorrelate chunk_size from S; got {chunk_sizes_by_shape}"
+    )
+    assert len(widths) >= 3, f"need >=3 distinct cohort widths; got {widths}"
+
+    for p in pgen:
+        _, v = _shape_of(p)
+        chunks_per_contig = v / 22 / p.chunk_size
+        assert chunks_per_contig >= 1.0, (
+            f"{p.corpus} chunk_size={p.chunk_size} leaves "
+            f"{chunks_per_contig:.2f} chunks/contig < 1 -- BitGrid3::zeros "
+            "reserves the full chunk_size and truncates after EOF, so a "
+            "partial chunk breaks the linearity kappa measures"
+        )
+
+
+def test_pgen_concurrency_axis_holds_workers_at_one():
+    """PGEN pins P=1 (sub-contig sharding disabled), so a reader_workers
+    axis would measure nothing."""
+    from scripts.bench_svar2.plans.build_plans import build
+
+    for p in build(Path("/tmp/corpora"), threads=48)["pgen"]:
+        assert p.reader_workers == 1
+
+
+def test_every_point_corpus_is_a_manifest_path():
+    """`sweep.py:run_sweep` reads `point.corpus` as UTF-8 text and decodes it
+    as a `CorpusManifest` -- it is a `sweep.py`-wide contract that every
+    family's `corpus` names a `*.manifest.json`, never the underlying data
+    file. The pgen family once pointed its points at the binary `.pgen`
+    directly, which raised `UnicodeDecodeError` 4.5 hours into a real Slurm
+    sweep. This constrains every family, not just pgen, so the next family
+    added hits the same trap here instead of at runtime."""
+    plans = build(Path("/tmp/corpora"), threads=48)
+    offenders = [
+        pt.corpus
+        for points in plans.values()
+        for pt in points
+        if not pt.corpus.endswith(".manifest.json")
+    ]
+    assert not offenders, f"corpus paths not pointing at a manifest: {offenders}"
+
+
+def test_pgen_crosses_concurrency_with_chunk_size_at_more_than_one_width():
+    """The 2026-08-07 sweep varied `concurrent_chroms` at exactly ONE
+    (S, V, chunk_size) corner, so nothing could say whether the per-contig RAM
+    cost is additive or interacts with cohort width or chunk size. Fitting it
+    as additive anyway is part of why that refit reached only R^2 0.7698
+    against a measured reproducibility floor of 63 MB (issue #158)."""
+    pgen = build(Path("/corpora"), threads=48)["pgen"]
+
+    crossed: dict[int, set[int]] = {}
+    for p in pgen:
+        if p.concurrent_chroms is None:
+            continue
+        s, _ = _shape_of(p)
+        crossed.setdefault(s, set())
+    for s in list(crossed):
+        by_cs: dict[int, set[int]] = {}
+        for p in pgen:
+            if p.concurrent_chroms is None or _shape_of(p)[0] != s:
+                continue
+            by_cs.setdefault(p.chunk_size, set()).add(p.concurrent_chroms)
+        crossed[s] = {cs for cs, ccs in by_cs.items() if len(ccs) >= 2}
+
+    widths = [s for s, cs in crossed.items() if len(cs) >= 2]
+    assert len(widths) >= 2, (
+        "need >=2 cohort widths that each vary concurrent_chroms at >=2 "
+        f"chunk_sizes, or the per-contig term cannot be tested for "
+        f"additivity; got {crossed}"
+    )
+
+
+def test_pgen_varies_n_chunks_at_constant_chunk_bytes():
+    """`PGEN_CHUNK_SIZE_AXIS` moves chunk_bytes UP and n_chunks DOWN as exact
+    reciprocals, so it cannot distinguish a per-chunk residency cost from a
+    per-cycle allocator ratchet. Measured peak RSS is non-monotone in chunk
+    bytes -- at S=4,000 the 3.1 -> 7.8 MB step DROPS RSS by 586 MB, 9.3x the
+    63 MB noise floor -- which no `kappa * (w+p) * chunk_bytes` term can
+    produce at any kappa. Separating them needs V varied at PINNED
+    chunk_size."""
+    pgen = build(Path("/corpora"), threads=48)["pgen"]
+
+    # (samples, chunk_size) -> distinct variant counts. chunk_bytes is a
+    # function of exactly those two, so a group with >=3 variant counts varies
+    # n_chunks with chunk_bytes held exactly constant.
+    by_fixed: dict[tuple[int, int], set[int]] = {}
+    for p in pgen:
+        s, v = _shape_of(p)
+        by_fixed.setdefault((s, p.chunk_size), set()).add(v)
+
+    usable = {k: vs for k, vs in by_fixed.items() if len(vs) >= 3}
+    assert usable, (
+        "no (samples, chunk_size) group carries >=3 variant counts, so "
+        "n_chunks never moves independently of chunk_bytes; got "
+        f"{ {k: sorted(v) for k, v in by_fixed.items()} }"
+    )
+    for (s, cs), vs in usable.items():
+        spread = max(vs) / min(vs)
+        assert spread >= 3.0, (
+            f"S={s} chunk_size={cs} spans only {spread:.1f}x in V; too short a "
+            "lever to separate a ratchet term from kappa"
+        )

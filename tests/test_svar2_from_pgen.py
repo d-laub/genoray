@@ -10,6 +10,11 @@ import pytest
 from genoray import SparseVar2
 
 # 40 bp reference. 1-based POS 3 = 'A', 7 = 'C', 12..14 = 'GTA'.
+#
+# _REF and _VCF_BODY's exact bytes are pinned by
+# tests/test_svar2_reader_identity.py (its "pgen"/"vcf" digests). Changing
+# either requires re-capturing that test's EXPECTED digests at fab677f -- see
+# that module's docstring for the recipe.
 _REF = "ACAGTACATGGGTACTAGCTAGGCTAACCGGTTAACCGGT"
 
 # Phased, no half-calls, no symbolics: plink2's VCF import is lossless here, so
