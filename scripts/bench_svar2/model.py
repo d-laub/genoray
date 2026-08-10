@@ -18,6 +18,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
+from scipy.optimize import linprog
 
 from scripts.bench_svar2.records import (
     CorpusManifest,
@@ -254,10 +255,24 @@ def fit_cost_law(
 class RamRow(typing.NamedTuple):
     """One observation the RAM law is fitted from.
 
-    Named rather than a bare tuple because the payload is four ints and a
+    Named rather than a bare tuple because the payload is several ints and a
     float: swapping `chunk_bytes` and `samples` positionally still fits, just
     wrongly, and no test would necessarily catch it. Fields are read by name at
     every consumer (`fit_ram_law`, `decide`).
+
+    `concurrent_chroms` must be the value ACTUALLY used, never the planner's
+    unrecorded choice. `budget.rs:plan_sharded` multiplies the per-contig
+    bracket by it, so a fit that omits it is not fitting the quantity
+    production consumes -- that mismatch is what made the shipped margin a
+    double-count artifact rather than a chosen factor (issue #158).
+
+    It is declared last with a default only so the synthetic fixtures in
+    `tests/bench/test_model.py`, which construct rows positionally and are
+    all single-contig by intent, keep working. The default is NOT a licence
+    to code an unknown `cc` as 1 -- that is precisely the mistake that put a
+    41 MB per-contig estimate against a directly measured 89.67. `_ram_rows`,
+    the only path that builds these from real sweep data, always passes it
+    explicitly and DROPS rows where it was never recorded.
     """
 
     workers: int
@@ -265,64 +280,114 @@ class RamRow(typing.NamedTuple):
     chunk_bytes: int
     samples: int
     peak_rss_mb: float
+    concurrent_chroms: int = 1
 
 
-def fit_ram_law(rows: Sequence[RamRow]) -> RamLaw:
-    """peak_rss ~ base + per_sample_mb * samples
-    + kappa * (workers + pending_hw) * chunk_bytes.
+def fit_ram_law(rows: Sequence[RamRow], margin: float = 1.25) -> RamLaw:
+    """Tightest law that over-predicts EVERY row by at least `margin`.
 
-    Two regressors, not one. `kappa` is the observed overhead multiple over the
-    analytic chunk size (a DenseChunk holds more than its packed grid), and
-    `per_sample_mb` is the cohort-sized term: per-sample accumulation buffers
-    that exist whether or not any chunk is in flight. Fitting only the chunk
-    term forces the cohort cost into the intercept, where it cannot vary with S
-    -- that is what held the fit at R^2=0.057 across a real 39-point sweep.
+    peak_rss ~ base + per_sample_mb*samples
+             + cc * (per_contig_mb + kappa*(workers + pending_hw)*chunk_MB)
 
-    Solved as ordinary least squares over both regressors simultaneously rather
-    than by fitting one and regressing the other on the residual: the two are
-    correlated in any real sweep (bigger cohorts get smaller chunk_size), so
-    sequential fitting assigns shared variance to whichever goes first.
+    **Fitted as an envelope, not by least squares.** `plan_sharded` uses this
+    as an upper bound and divides available headroom by the per-contig bracket,
+    so a coefficient that is too small is an OOM while one that is too large
+    only costs concurrency. Least squares answers "what is RSS typically?"; the
+    planner asks "what is the most it can be?" Those have different optimal
+    coefficients, and padding an OLS fit out to CI upper bounds does not fix it
+    -- the slack that results is an accident of the residual spread. On the
+    2026-08-08 PGEN sweep that left the shipped law over-predicting by up to
+    10.111x while no OLS variant passed the over-predict-everywhere gate at
+    all; the envelope reaches 2.419x from the same functional form.
+
+    Stated as the linear program actually solved here:
+
+        minimise  t
+        s.t.      margin*y_i <= X_i . b <= t*y_i   for every row
+                  b >= 0
+
+    so the returned `worst_ratio` (= t) is optimal for this functional form:
+    no other coefficients do better. `margin` is the SAFETY FACTOR and is a
+    deliberate choice -- the envelope touches the data at its binding points,
+    while the law is applied well beyond the measured cohort range. Raising it
+    trades under-utilisation and spurious `PlanError::InsufficientMemory`
+    against an OOM.
+
+    `r2` is still reported, but it is descriptive only. It is not the
+    criterion and must not be used as one.
     """
-    chunk = np.array(
-        [(r.workers + r.pending) * r.chunk_bytes / 1e6 for r in rows], dtype=float
-    )
+    if not rows:
+        raise ValueError("fit_ram_law needs at least one row")
+    if margin < 1.0:
+        raise ValueError(f"margin must be >= 1.0 (a bound, not a fit); got {margin}")
+
     samples = np.array([float(r.samples) for r in rows], dtype=float)
+    cc = np.array([float(r.concurrent_chroms) for r in rows], dtype=float)
+    chunk_cc = np.array(
+        [
+            (r.workers + r.pending) * r.chunk_bytes / 1e6 * r.concurrent_chroms
+            for r in rows
+        ],
+        dtype=float,
+    )
     y = np.array([r.peak_rss_mb for r in rows], dtype=float)
 
     # A sweep at a SINGLE cohort size makes the `samples` column a constant
-    # multiple of the intercept column. The two are then unidentifiable, and
-    # least squares happily returns a minimum-norm split of the intercept
-    # between them -- a `per_sample_mb` that is pure arithmetic artifact.
+    # multiple of the intercept column, so the two are unidentifiable and the
+    # solver is free to split the intercept between them arbitrarily.
     # `extrapolate` multiplies that coefficient by the target cohort (500,000),
-    # so an artifact here becomes hundreds of GB of projected RSS. Drop the
-    # regressor instead and let `base_mb` own the constant, which is what a
-    # one-cohort sweep can actually support.
+    # turning an artifact into hundreds of GB of projected RSS. Drop the
+    # regressor and let `base_mb` own the constant, which is what a one-cohort
+    # sweep can actually support. Same argument for `cc`.
     cohort_identifiable = bool(samples.std() > 0)
-    cols = (
-        [np.ones(len(rows)), samples, chunk]
-        if cohort_identifiable
-        else [
-            np.ones(len(rows)),
-            chunk,
+    contig_identifiable = bool(cc.std() > 0)
+
+    names = ["base"]
+    cols = [np.ones(len(rows))]
+    if cohort_identifiable:
+        names.append("per_sample")
+        cols.append(samples)
+    if contig_identifiable:
+        names.append("per_contig")
+        cols.append(cc)
+    names.append("kappa")
+    cols.append(chunk_cc)
+
+    a = np.column_stack(cols)
+    n, p = a.shape
+    # Variables are [coefficients..., t]; minimise t.
+    c = np.zeros(p + 1)
+    c[-1] = 1.0
+    ub = np.vstack(
+        [
+            np.column_stack([-a, np.zeros(n)]),  # -X.b <= -margin*y
+            np.column_stack([a, -y]),  # X.b - t*y <= 0
         ]
     )
-    a = np.column_stack(cols)
-    coef, *_ = np.linalg.lstsq(a, y, rcond=None)
-    if cohort_identifiable:
-        base, per_sample, kappa = (float(c) for c in coef)
-    else:
-        base, kappa = (float(c) for c in coef)
-        per_sample = 0.0
-    pred = a @ coef
+    rhs = np.concatenate([-y * margin, np.zeros(n)])
+    # Coefficients are non-negative: more samples, contigs or chunk bytes
+    # cannot reduce peak RSS, and a negative coefficient would let the law be
+    # talked below a measured point by growing an input.
+    res = linprog(
+        c, A_ub=ub, b_ub=rhs, bounds=[(0, None)] * p + [(1, None)], method="highs"
+    )
+    if not res.success:
+        raise ValueError(f"envelope fit infeasible: {res.message}")
+
+    coef = dict(zip(names, (float(v) for v in res.x[:p])))
+    pred = a @ res.x[:p]
+    ratio = pred / y
     ss_res = float(((y - pred) ** 2).sum())
     ss_tot = float(((y - y.mean()) ** 2).sum())
-    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 1.0
     return RamLaw(
-        base_mb=base,
-        per_sample_mb=per_sample,
-        kappa=kappa,
-        r2=r2,
+        base_mb=coef["base"],
+        per_sample_mb=coef.get("per_sample", 0.0),
+        per_contig_mb=coef.get("per_contig", 0.0),
+        kappa=coef["kappa"],
+        r2=1.0 - ss_res / ss_tot if ss_tot > 0 else 1.0,
         n_points=len(rows),
+        worst_ratio=float(ratio.max()),
+        margin=margin,
     )
 
 
@@ -624,10 +689,21 @@ def extrapolate(
     # one. Measured at a pinned 10.9 MB chunk, RSS runs 789 MB (S=4,000) ->
     # 5,061 MB (S=500,000) with the chunk term held constant, so projecting to
     # S=500,000 without `per_sample_mb * samples` under-counts by GBs.
+    #
+    # `concurrent_chroms=1`: this projects the RSS of a SINGLE contig
+    # pipeline, which is the quantity the hold-out and the H3 verdict compare
+    # against (every probed row runs one corpus through the planner and
+    # records one peak). `plan_sharded` is what multiplies the per-contig
+    # bracket up to the planned concurrency; doing it here as well would
+    # double-count, which is the mirror image of the bug in issue #158.
     predicted_rss = (
         ram_law.base_mb
         + ram_law.per_sample_mb * samples
-        + ram_law.kappa * (workers + pending) * chunk_bytes / 1e6
+        + 1
+        * (
+            ram_law.per_contig_mb
+            + ram_law.kappa * (workers + pending) * chunk_bytes / 1e6
+        )
     )
     return {
         "chunk_bytes": float(chunk_bytes),
@@ -927,12 +1003,21 @@ def _ram_rows(*sweeps: _LoadedSweep) -> list[RamRow]:
             chunk_bytes = m.chunk_bytes * _resident_chunk_size(
                 pt.chunk_size, m.variants
             )
+            # A point that did NOT pin `concurrent_chroms` ran at whatever the
+            # planner chose, and `ProbeRecord` has no field for that value --
+            # so `cc` is UNOBSERVED, not merely unidentified, and the row
+            # cannot be fitted. Coding it as 1 is what produced a pooled
+            # per-contig estimate of 41 MB against a directly measured 89.67
+            # (issue #158). Drop it rather than invent the regressor.
+            if pt.concurrent_chroms is None:
+                continue
             rows.append(
                 RamRow(
                     workers=pt.reader_workers,
                     pending=r.pending_highwater,
                     chunk_bytes=chunk_bytes,
                     samples=m.samples,
+                    concurrent_chroms=pt.concurrent_chroms,
                     peak_rss_mb=r.maxrss_mb,
                 )
             )
@@ -985,7 +1070,11 @@ def _print_law(label: str, law: CostLaw | VLaw | RamLaw | None) -> None:
         print(
             f"{label}: peak_rss_mb ~ {law.base_mb:.4g} + "
             f"{law.per_sample_mb:.4g}*samples + "
-            f"{law.kappa:.4g}*(w+pending)*chunk_bytes  (R^2={law.r2:.4f}, n={law.n_points})"
+            f"cc*({law.per_contig_mb:.4g} + "
+            f"{law.kappa:.4g}*(w+pending)*chunk_MB)  "
+            # worst_ratio is the gate; R^2 is descriptive only for a bound.
+            f"(worst {law.worst_ratio:.4f}x at margin {law.margin:.2f}, "
+            f"R^2={law.r2:.4f}, n={law.n_points})"
         )
 
 

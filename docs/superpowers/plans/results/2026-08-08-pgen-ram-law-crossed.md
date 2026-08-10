@@ -103,14 +103,19 @@ by at least `m` and report the cost:
 | 1.50 | 3.603× | 2.903× |
 | 2.00 | 4.804× | 3.870× |
 
-**Recommendation: option B at margin 1.25** —
+**SHIPPED: option B at margin 1.25** —
 
+```rust
+pub const PGEN: RamLaw = RamLaw {
+    base_mb: 2696.785976670047,
+    per_sample_mb: 0.01575147162905773,
+    per_contig_mb: 209.8696589690541,   // new field
+    kappa: 2.3847735782388906,
+};
 ```
-base_mb        2696.8
-per_sample_mb  0.015751
-per_contig_mb  209.87     (new field)
-kappa          2.3848
-```
+
+Gate: over-predicts all 46 cc-observed points, **worst 2.4189×**, mean 1.8816×,
+min exactly 1.2500× (the margin, honoured as an equality at the binding point).
 
 Worst case 2.419× against the shipped law's 10.111×: **4.2× less
 over-allocation**, with a 25% safety factor that is chosen and stated rather
@@ -118,12 +123,36 @@ than inherited from a double-count. This supersedes the "margin is not slack to
 be tuned away" framing of Task 9 only in *mechanism* — the margin is still not
 slack, it is now simply explicit.
 
+## What also changed in the harness
+
+The bench model was fitting a different equation than the consumer, which is the
+root of #158. Both sides now agree:
+
+- `RamLaw` (Rust and Python) gains `per_contig_mb`, and `plan_sharded`'s
+  per-contig bracket becomes `per_contig_mb + kappa*(w+pending)*chunk_MB`.
+  `RamLaw::VCF` carries `0.0` — its sweep never varied `concurrent_chroms` at
+  fixed `(S, chunk_size)`, so it holds no information about the term and
+  inventing one would be worse than omitting it. The VCF law is unchanged.
+- `RamRow` carries `concurrent_chroms`, and `fit_ram_law` multiplies the
+  per-contig bracket by it, matching `plan_sharded`. The fit was previously
+  cc-blind while the consumer multiplied by cc — that double count *was* the
+  old "safety margin".
+- `fit_ram_law` now solves the envelope LP with an explicit `margin` instead of
+  running OLS.
+- `_ram_rows` **drops** rows whose `concurrent_chroms` was never recorded,
+  rather than coding them as 1. That is the mistake which produced a pooled
+  per-contig estimate of 41 MB against a directly measured 89.67.
+
 ## What remains open
 
 - The per-contig and per-chunk coefficients both vary with `S` and `cc`. The
   envelope fit is safe regardless, but the law still does not describe the
   mechanism, so σ stays ~9× the noise floor. #158 stays open.
-- `ProbeRecord` still has no field for the realised `concurrent_chroms`; the 12
-  planner's-choice rows remain unfittable and were excluded from every fit here.
+- `ProbeRecord` still has no field for the realised `concurrent_chroms`, so a
+  point that does not pin it is unfittable — 12 of this sweep's 58 rows. Every
+  law-fitting point should pin `cc` until that field exists.
+- **`RamLaw::VCF` has the same defect this fixed for PGEN**: it is an OLS mean
+  fit, cc-blind, with no per-contig term. It needs the same crossed design run
+  against the VCF corpora before it can be trusted the way PGEN now is.
 - #159 (resume key omits code identity) is avoided by a fresh results tag and
   the new post-run guard, not fixed.

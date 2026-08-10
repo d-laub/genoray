@@ -96,117 +96,148 @@ fn reader_workers(usable_cores: usize, concurrent: usize) -> usize {
 }
 
 /// Fitted peak-RSS coefficients for one conversion backend:
-///   peak_rss_mb ~ base_mb + per_sample_mb*samples + kappa*(w+pending)*chunk_bytes
+///
+/// ```text
+///   peak_rss_mb ~ base_mb
+///               + per_sample_mb * samples
+///               + cc * (per_contig_mb + kappa * (w + pending) * chunk_MB)
+/// ```
+///
+/// where `cc` is the concurrently-processed contig count. Everything inside
+/// the bracket is owned by ONE live contig pipeline; everything outside it is
+/// process-wide.
+///
+/// A law is an UPPER BOUND, not a prediction. `plan_sharded` divides available
+/// headroom by the bracket, so a coefficient that is too small becomes an OOM
+/// while one that is too large only costs concurrency. Fit these as envelopes
+/// -- the tightest coefficients that over-predict every measured point, plus a
+/// stated safety margin -- not by least squares. Fitting the mean and then
+/// padding to CI upper bounds optimises the wrong objective and leaves slack
+/// that is an accident of the residual spread; on the PGEN data that produced
+/// a 10.1x worst-case over-allocation where 2.4x was achievable from the same
+/// functional form.
 ///
 /// These are load-bearing in production, not just in the bench: a bad refit
 /// becomes an OOM. Change a law only alongside a refit that says so, and
-/// record that refit's R^2 and n in the constant's doc comment.
+/// record that refit's gate result and n in the constant's doc comment.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RamLaw {
     pub base_mb: f64,
     pub per_sample_mb: f64,
+    /// RAM held by ONE live contig pipeline that does not scale with
+    /// `chunk_bytes` -- staging buffers and per-contig bookkeeping. Charged
+    /// per concurrent contig alongside the `kappa` term, so the per-contig
+    /// bracket `plan_sharded` divides headroom by is
+    /// `per_contig_mb + kappa * (w + pending) * chunk_MB`.
+    ///
+    /// `0.0` means "not fitted for this backend", which leaves the law
+    /// exactly as it behaved before this field existed.
+    pub per_contig_mb: f64,
     pub kappa: f64,
 }
 
 impl RamLaw {
     /// Sharded VCF path. Fitted 2026-08-03, R^2 = 0.9040, n = 44.
     /// See docs/superpowers/specs/2026-08-03-svar2-tuned-load-balancing-design.md.
+    ///
+    /// `per_contig_mb` is 0.0 because that sweep never varied
+    /// `concurrent_chroms` at fixed `(S, chunk_size)`, so it carries no
+    /// information about a per-contig constant -- the term would be an
+    /// invention, not a measurement. The VCF law is therefore unchanged by
+    /// the 2026-08-08 PGEN re-fit. Fitting it needs the crossed design in
+    /// `PGEN_CROSSED` / `PGEN_NCHUNKS_AXIS` run against the VCF corpora.
     pub const VCF: RamLaw = RamLaw {
         base_mb: 932.0,
         per_sample_mb: 0.01115,
+        per_contig_mb: 0.0,
         kappa: 1.371,
     };
 
-    /// PGEN path, re-fitted 2026-08-07 against the bounded reader (the
-    /// presence-bitset byte budgets from issue #155 / PR #154 -- the
-    /// 2026-08-05 law below was fitted on the OLD, unbounded reader and no
-    /// longer describes production code). R^2 = 0.7698, n = 18. Sweep job
-    /// 13351698 on carter-cn-04. See
-    /// docs/superpowers/plans/results/2026-08-07-pgen-ram-law-refit.md.
+    /// PGEN path, re-fitted 2026-08-08 against the crossed sweep (job
+    /// 13351716, carter-cn-04, 58/58 points measured on one node). See
+    /// docs/superpowers/plans/results/2026-08-08-pgen-ram-law-crossed.md.
     ///
-    /// **A first re-fit attempt (commit 63a6b41) shipped and was reverted
-    /// (51a1a9c): 12 of its 18 sweep rows were STALE**, resumed from the
-    /// 2026-08-05 sweep by a resumable-sweep cache keyed only on point_id,
-    /// and so described the old unbounded reader under a new label. The
-    /// numbers below are from a clean re-run (job 13351698) with that cache
-    /// rotated out first; all 18 points were genuinely re-measured. See the
-    /// results doc's "Contamination and revert" section for the two proofs.
+    /// **Fitted as an ENVELOPE, not by least squares.** This law is not a
+    /// prediction of RSS -- `plan_sharded` uses it as an upper bound and the
+    /// shipping gate is over-prediction at every measured point. Fitting by
+    /// OLS and then raising slopes to their 95% CI upper bounds (the
+    /// 2026-08-07 construction) optimises squared error and *then* pads, so
+    /// the resulting slack is an accident of the residual spread: it left the
+    /// old law over-predicting by up to 10.111x while no OLS form passed the
+    /// gate at all. The coefficients below solve, over the 46 rows where
+    /// `concurrent_chroms` was pinned and therefore observed:
     ///
-    /// OLS point estimates and 95% CI (`sigma^2 * (X^T X)^-1`, same design
-    /// matrix `fit_ram_law` builds):
-    ///   - `base_mb`: 2570.300231003748 (held at its fitted value -- see
-    ///     below for why it is not also pushed to a bound)
-    ///   - `per_sample_mb`: 0.00760035, SE 0.00530482, 95% CI [-0.0037066,
-    ///     0.018907303115116077] -- the CI spans zero, so this is shipped as
-    ///     a CONSERVATIVE BOUND, not a fitted rate, exactly like `kappa`
-    ///     below. (SE/CI-lower rounded to 6 significant figures -- they only
-    ///     reproduce to ~12 anyway (`np.linalg.inv` round-off); the CI upper
-    ///     bound is kept at full precision because it is the shipped
-    ///     coefficient below.)
-    ///   - `kappa`: 10.7940, SE 2.98467, 95% CI [4.43232, 17.155662709761774]
-    ///     (same rounding: the CI upper bound is the shipped coefficient).
+    /// ```text
+    ///   minimise  t
+    ///   s.t.      1.25 * y_i  <=  X_i . b  <=  t * y_i    for every point
+    ///             b >= 0
+    /// ```
     ///
-    /// **Construction: intercept pinned at its fitted value, each uncertain
-    /// SLOPE raised independently to its own 95% CI upper bound.** This is
-    /// `>=` the plain fit in every term, so it cannot under-predict anywhere
-    /// the plain fit doesn't -- the standing rule that a coefficient used as
-    /// a memory bound is a conservative bound, not a point estimate, and the
-    /// margin it buys is not slack to be tuned away.
+    /// so `t` is the worst-case over-allocation and is OPTIMAL for this
+    /// functional form -- no other coefficients do better. Gate: over-predicts
+    /// all 46 points, worst **2.4189x**, mean 1.8816x, min exactly 1.2500x.
+    /// The 2026-08-07 law on this same data is 10.1113x / 3.0497x, so this is
+    /// **4.18x less over-allocation at the worst case** and 1.62x on average.
     ///
-    /// The intercept is deliberately NOT also refit on the residual after
-    /// pinning the slopes: doing so pulls `base_mb` DOWN to 1900.87, and the
-    /// law then FAILS the gate at S=4,000. Pinning one coefficient high
-    /// pushes the others down in an OLS refit -- holding `base_mb` at its
-    /// own fitted value avoids that trap.
+    /// **The 1.25 margin is a CHOSEN safety factor, stated here, not an
+    /// artifact.** The previous law's margin came from `fit_ram_law` fitting
+    /// `kappa` cc-blind while `plan_sharded` multiplies by `cc` a second time
+    /// -- a double count (issue #158). An envelope fit removes that accident
+    /// but would also remove *the* margin, since it touches the data at its
+    /// binding points while the law is applied ~3.9x beyond the largest
+    /// measured cohort. Raising or lowering it is a deliberate trade of
+    /// under-utilisation and spurious `PlanError::InsufficientMemory` against
+    /// an OOM; margin 1.00 gives 1.935x worst case, 1.50 gives 2.903x.
     ///
-    /// Gate (evaluated the way `plan_sharded` evaluates it, at each row's
-    /// actual/resolved `concurrent_chroms`): over-predicts at all 18
-    /// measured points. Worst-case margin +456.9 MB / 1.1745x at S=4,000,
-    /// chunk_bytes=3.125 MB, cc=8. Largest over-prediction 6.90x at
-    /// S=128,000, chunk_bytes=249.98 MB. (The previously shipped
-    /// 2026-08-05 law, independently re-evaluated against this same clean
-    /// data, was 1.2763x / 5.5777x. The new law is tighter at the binding
-    /// worst case (1.1745x vs 1.2763x) but looser across most of the range:
-    /// tighter at only 4 of the 18 rows, and its own largest over-prediction
-    /// (6.8966x) exceeds the old law's (5.5777x).)
+    /// `per_contig_mb` is new and measured: at S=4,000 the per-contig slope is
+    /// 83.7-88.8 MB across three chunk sizes, independently reproducing the
+    /// 89.67 MB the 2026-08-07 concurrency ladder gave. It is NOT the analytic
+    /// `RAW_STAGE_BYTES + MASK_STAGE_BYTES` = 128 MiB = 134.2177 MB: a large
+    /// `calloc` costs address space, not resident pages. The shipped value is
+    /// above the measured slope because the envelope must also cover S=32,000
+    /// and S=128,000, where the slope rises (263 MB, 301 MB) but the CIs are
+    /// too wide to identify it -- so the term is a BOUND over the measured
+    /// domain, not a per-contig rate.
     ///
-    /// **The margin's provenance is a fitting artifact, not a chosen safety
-    /// factor**: `fit_ram_law` fits `kappa` cc-blind (its chunk regressor is
-    /// never multiplied by `concurrent_chroms`), so `kappa` absorbs roughly
-    /// this sweep's dominant `cc` -- and `plan_sharded` then multiplies by
-    /// `cc` a second time at prediction time. The over-charge this produces
-    /// is real and does make the bound safer, but it should not be read as
-    /// a deliberately engineered margin. Tracked as issue #158.
+    /// **A per-chunk (`n_chunks`) term was measured and deliberately NOT
+    /// shipped.** With `chunk_size` pinned and V varied -- holding
+    /// `chunk_bytes` exactly constant -- RSS is linear in chunk count at R^2
+    /// up to 1.0000, so the term is real, and including it is tightest
+    /// in-sample (1.774x). But it would be applied at 40,000 chunks for
+    /// V=1e9, ~300x beyond the 32-128 measured, where it dominates and takes
+    /// the S=500,000 projection to 160.7 GiB against 65.3 GiB without it. The
+    /// ratchet must also saturate physically, since `libc::malloc_trim(0)`
+    /// runs at every contig boundary. A well-measured local coefficient is not
+    /// licensed for a 300x extrapolation.
     ///
-    /// This sweep's ladder rows (S=4,000, chunk_bytes=25 MB, `cc` swept over
-    /// {1,4,8,11,16,22}) DO vary `concurrent_chroms` and, analyzed directly
-    /// (outside `fit_ram_law`'s cc-blind regressor), show a real per-contig
-    /// RSS slope -- but that is a separate observation from this law, which
-    /// remains a 3-term cc-blind fit; see the results doc for the number and
-    /// its caveats. It does NOT corroborate the earlier (withdrawn)
-    /// "measured 107.05 MB/contig" claim, which came entirely from the
-    /// contaminated rows.
+    /// Residual sigma remains ~9x the 63 MB reproducibility floor (measured
+    /// from six launches differing only in `cc`, R^2 0.9903): both new
+    /// coefficients vary with `S` and `cc`, so the law still does not describe
+    /// the mechanism. The envelope is safe regardless -- that is the point of
+    /// fitting a bound rather than a mean -- but #158 stays open.
     ///
     /// Validity domain: S in {4,000, 32,000, 128,000}, chunk_bytes 3.125-250
-    /// MB, `reader_workers == 1` and `pending == 0` in every row, 22
-    /// contigs, one node (carter-cn-04), `multiallelic_rate` 0.0, no
-    /// FORMAT/dosage fields (scoped to the no-FORMAT path -- see issue
-    /// #156). `per_sample_mb` is extrapolated ~3.9x beyond the largest
-    /// measured cohort (128,000) to reach a representative S=500,000.
+    /// MB, `cc` in {1,4,8,16}, `reader_workers == 1` and `pending == 0` in
+    /// every row, 22 contigs, one node (carter-cn-04), `multiallelic_rate`
+    /// 0.0, no FORMAT/dosage fields (see issue #156). `per_sample_mb` is
+    /// extrapolated ~3.9x beyond the largest measured cohort to reach
+    /// S=500,000.
     ///
-    /// `cc <= 8` is enforced in code, not just documented:
-    /// `src/lib.rs` clamps every planned `concurrent_chroms` to
-    /// `PGEN_MAX_CONCURRENT` below; `cc > 8` is reachable only via the
-    /// bench-only `GENORAY_CONCURRENT_CHROMS` override, not by a production
-    /// caller.
+    /// `cc <= 8` is enforced in code, not just documented: `src/lib.rs` clamps
+    /// every planned `concurrent_chroms` to `PGEN_MAX_CONCURRENT` below, so
+    /// `cc > 8` is reachable only via the bench-only
+    /// `GENORAY_CONCURRENT_CHROMS` override. The `cc=16` rows exist to give
+    /// the per-contig slope a lever arm and sit OUTSIDE the production domain.
     ///
     /// NOT comparable coefficient-by-coefficient with `RamLaw::VCF`: the two
     /// corpora come from different generators (vcfixture bulk vs
-    /// scale_corpus.py), so each law is valid only for its own backend.
+    /// scale_corpus.py), so each law is valid only for its own backend. VCF is
+    /// also still an OLS fit with no `per_contig_mb`.
     pub const PGEN: RamLaw = RamLaw {
-        base_mb: 2570.300231003748,
-        per_sample_mb: 0.018907303115116077,
-        kappa: 17.155662709761774,
+        base_mb: 2696.785976670047,
+        per_sample_mb: 0.01575147162905773,
+        per_contig_mb: 209.8696589690541,
+        kappa: 2.3847735782388906,
     };
 }
 
@@ -334,8 +365,11 @@ pub fn plan_sharded(inp: PlanInputs) -> Result<ShardedPlan, PlanError> {
             let budget_mb = budget as f64 / 1e6;
             let baseline_mb = inp.ram.base_mb + inp.ram.per_sample_mb * inp.n_samples as f64;
             let pending = w.saturating_sub(1);
-            let per_contig_mb =
-                inp.ram.kappa * (w + pending) as f64 * (inp.chunk_bytes as f64 / 1e6);
+            // Everything ONE live contig pipeline holds: the chunk-scaled term
+            // plus the chunk-independent staging that `per_contig_mb` prices.
+            // Laws that never fitted the latter carry 0.0 and are unaffected.
+            let per_contig_mb = inp.ram.per_contig_mb
+                + inp.ram.kappa * (w + pending) as f64 * (inp.chunk_bytes as f64 / 1e6);
             let headroom_mb = budget_mb - baseline_mb;
             if headroom_mb < per_contig_mb {
                 return Err(PlanError::InsufficientMemory {
@@ -759,6 +793,13 @@ mod tests {
         assert!(RamLaw::PGEN.kappa > 0.0, "kappa must be positive");
         assert!(RamLaw::PGEN.base_mb > 0.0, "baseline must be positive");
         assert!(RamLaw::PGEN.per_sample_mb >= 0.0);
+        // The PGEN law FITTED this term (VCF legitimately carries 0.0). A
+        // refit that drops it back to zero has silently discarded the
+        // per-contig staging cost the 2026-08-08 crossed sweep measured.
+        assert!(
+            RamLaw::PGEN.per_contig_mb > 0.0,
+            "PGEN's per-contig term is measured, not optional"
+        );
     }
 
     #[test]
@@ -770,7 +811,12 @@ mod tests {
         // makes the law nonsensical.
         let chunk_bytes = 100_000_000u64;
         let baseline_mb = RamLaw::PGEN.base_mb + RamLaw::PGEN.per_sample_mb * 1000.0;
-        let per_contig_mb = RamLaw::PGEN.kappa * 1.0 * (chunk_bytes as f64 / 1e6);
+        // Must mirror `plan_sharded`'s bracket EXACTLY, including the
+        // chunk-independent `per_contig_mb`. Computing only the kappa term
+        // here would under-size the budget and silently turn this into a
+        // "cc=1" test that still looks like it is asserting 2.
+        let per_contig_mb =
+            RamLaw::PGEN.per_contig_mb + RamLaw::PGEN.kappa * 1.0 * (chunk_bytes as f64 / 1e6);
         let budget = ((baseline_mb + 2.5 * per_contig_mb) * 1e6) as u64;
 
         let plan = plan_sharded(PlanInputs {
@@ -843,6 +889,10 @@ mod tests {
             ram: RamLaw {
                 base_mb: 1000.0,
                 per_sample_mb: 0.0,
+                // 0.0 so the arms differ ONLY in kappa: a nonzero per-contig
+                // constant sits inside the same bracket, so it would break the
+                // exact 2x inversion this test asserts.
+                per_contig_mb: 0.0,
                 kappa: 1.0,
             },
         };
