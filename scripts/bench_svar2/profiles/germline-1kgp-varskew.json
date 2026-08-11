@@ -6,6 +6,9 @@
   "n_variants_source": 73652396,
   "fitted_on": "2026-07-16",
   "fit_tool_version": "0.1.0",
+  "supplied": [
+   "ploidy"
+  ],
   "derived_from": "germline-1kgp",
   "derivation": "density_per_kb overwritten with n_variants so vcfixture's distribute_by_density apportions records by true per-contig variant counts instead of near-uniform densities (vcfixture-rs#15)"
  },
@@ -263,10 +266,10 @@
   "titv": 2.0563938643992925,
   "multiallelic_rate": 0.0,
   "missing_rate": 0.0001374522952447152,
-  "phased_rate": 1.0,
-  "ploidy": 2
+  "phased_rate": 1.0
  },
  "dialed": {
-  "payload": "gt-only"
+  "payload": "gt-only",
+  "ploidy": 2
  }
 }
