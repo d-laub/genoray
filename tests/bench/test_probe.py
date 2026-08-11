@@ -447,7 +447,48 @@ def test_build_cmd_defaults_to_vcf():
     )
     cmd = _build_cmd(point, manifest, Path("/tmp/s.svar"))
     assert "vcf" in cmd
-    assert "--skip-symbolics-and-breakends" not in cmd
+
+
+def test_build_cmd_skips_symbolics_for_vcf_backend_too():
+    """Regression for the finding that a 100%-failed vcf_ram sweep (job
+    13355460) surfaced: Task 3 switched the VCF RAM-law corpora to come from
+    the same `vcfixture bulk` `germline-1kgp-varskew` profile the PGEN corpora
+    already used, so the VCF path now emits symbolic ALTs (`fitted.
+    variant_classes.symbolic` ~= 0.135%) too. `--skip-symbolics-and-breakends`
+    was gated on `point.backend == "pgen"` only, so every VCF conversion in
+    that sweep aborted on the first `<DEL>`. The flag must be unconditional --
+    it is a documented no-op on corpora that carry no symbolic ALTs (e.g.
+    `scale_corpus.py`'s numpy generator), so one code path can serve both
+    backends."""
+    from scripts.bench_svar2.probe import _build_cmd
+    from scripts.bench_svar2.records import CorpusManifest, SweepPoint
+
+    manifest = CorpusManifest(
+        path="/tmp/corpus.vcf.gz",
+        samples=10,
+        variants=100,
+        contigs=("chr1",),
+        format_fields=(),
+        ploidy=2,
+        cells=1000,
+        compressed_bytes=1,
+        seed=0,
+        generator_version=1,
+    )
+    point = SweepPoint(
+        corpus=manifest.path,
+        reader_workers=1,
+        concurrent_chroms=None,
+        shard_htslib=0,
+        overshard=4,
+        chunk_size=1000,
+        threads=8,
+        reps=1,
+        backend="vcf",
+    )
+    cmd = _build_cmd(point, manifest, Path("/tmp/s.svar"))
+    assert "vcf" in cmd
+    assert "--skip-symbolics-and-breakends" in cmd
 
 
 def test_tmp_dir_prefers_the_job_dir_when_it_resolves(tmp_path, monkeypatch):

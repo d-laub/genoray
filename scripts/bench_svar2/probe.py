@@ -199,12 +199,24 @@ def _build_cmd(point: SweepPoint, manifest: CorpusManifest, store: Path) -> list
         str(point.threads),
         "--chunk-size",
         str(point.chunk_size),
+        # Unconditional for BOTH backends. Corpora for both `vcf` and `pgen`
+        # points now come from the same `vcfixture bulk`
+        # `germline-1kgp-varskew` profile (Task 3 switched the VCF RAM-law
+        # corpora over to it too), and that profile emits symbolic ALTs at a
+        # low rate (`fitted.variant_classes.symbolic` ~= 0.135%, ~236 in a
+        # 175,000-variant corpus). Without this flag a single `<DEL>` aborts
+        # the whole conversion -- for PGEN because plink2 passes symbolics
+        # into the .pvar where `check_ref="e"` rejects them, and for VCF
+        # because `SparseVar2.from_vcf` raises on the first one it meets. This
+        # flag being gated on `backend == "pgen"` only is exactly what wasted
+        # a full 48-point `vcf_ram` sweep (job 13355460): every row failed
+        # with the same "symbolic/breakend ALT ... out of scope" error. It is
+        # a documented no-op on corpora with no symbolic ALTs (e.g.
+        # `scale_corpus.py`'s numpy generator), so one unconditional code path
+        # serves both backends and there is no second condition to get wrong
+        # later.
+        "--skip-symbolics-and-breakends",
     ]
-    if point.backend == "pgen":
-        # The germline-1kgp profile emits symbolic ALTs at a low rate and
-        # plink2 passes them into the .pvar, where check_ref="e" would abort
-        # the whole conversion on the first one.
-        cmd.append("--skip-symbolics-and-breakends")
     return cmd
 
 
