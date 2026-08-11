@@ -49,14 +49,12 @@ def test_sweep_names_covers_every_axis_build_plans_produces(tmp_path):
     `load_sweep("pgen", ...)` call), not by `main()`/`_SWEEP_NAMES`, which
     fits only the VCF-path laws.
 
-    Only the `plan_axes -> _SWEEP_NAMES` direction is checked (`<=`, not
-    `==`): `_SWEEP_NAMES` is allowed to name a family `build_plans` does not
-    produce yet, because `load_sweep` degrades that to a recorded exclusion
-    rather than a crash. `vcf_ram` is exactly that -- named ahead of the plan
-    family Task 5 of #158 adds, per `fit_ram.py`'s docstring.
+    Exact equality (`==`, not `<=`): `build_plans.build()` now produces
+    `vcf_ram` (Task 5 of #158), so `_SWEEP_NAMES` no longer needs to name it
+    ahead of the plan family that supplies it.
     """
     plan_axes = set(build_plans(tmp_path, threads=8).keys())
-    assert plan_axes - {"pgen"} <= set(_SWEEP_NAMES)
+    assert plan_axes - {"pgen"} == set(_SWEEP_NAMES)
 
 
 def test_v_law_recovers_planted_line():

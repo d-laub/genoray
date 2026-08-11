@@ -7,6 +7,9 @@ from scripts.bench_svar2.plans.build_plans import (
     OOM_PROBE_CEILING_MB,
     PROD_CHUNK_SIZE,
     SCALE_SAMPLES,
+    VCF_BIGCHUNK,
+    VCF_CONTIGS,
+    VCF_CROSSED,
     VLINEAR_CHUNK_SIZE,
     VLINEAR_SAMPLES,
     VLINEAR_VARIANTS,
@@ -191,7 +194,7 @@ def test_scale_plan_adds_a_dedicated_point_only_where_size_corpus_is_not_clamped
     assert len(dedicated) == len(unclamped_s) == 5
 
 
-def test_all_seven_plans_are_produced():
+def test_all_eight_plans_are_produced():
     assert set(_build().keys()) == {
         "scale",
         "contig",
@@ -200,6 +203,7 @@ def test_all_seven_plans_are_produced():
         "vlinear2",
         "concurrency",
         "pgen",
+        "vcf_ram",
     }
 
 
@@ -401,3 +405,58 @@ def test_pgen_varies_n_chunks_at_constant_chunk_bytes():
             f"S={s} chunk_size={cs} spans only {spread:.1f}x in V; too short a "
             "lever to separate a ratchet term from kappa"
         )
+
+
+def test_vcf_ram_family_has_the_planned_point_count():
+    # 36 crossed (3 widths x 3 chunk sizes x 4 cc) + 12 n_chunks
+    # (2 widths x 3 V rungs x 2 cc) + 4 big-chunk (2 chunk sizes x 2 cc) = 52
+    # raw points, deduped to 48. The dedupe (not a skip) is what catches these:
+    # at S=4,000 the n_chunks ladder's middle rung is V=350,000 -- the SAME
+    # corpus the crossed grid uses at S=4,000 -- with pinned chunk_size
+    # 175,000 // 22 = 7,954, which equals the crossed grid's own middle chunk
+    # 350,000 // 44 = 7,954. At S=32,000 the same thing happens: the n_chunks
+    # middle rung is V=43,750 (again the crossed grid's own corpus) with
+    # pinned chunk_size 21,875 // 22 = 994, equal to the crossed grid's
+    # 43,750 // 44 = 994. `VCF_NCHUNKS_CC` (1, 8) is a subset of
+    # `VCF_CROSSED_CC`, so both cc values collide at both widths: 2 collisions
+    # x 2 cohort widths = 4 duplicate point_ids, and 52 - 4 = 48.
+    plans = build(Path("/corpora"), threads=48)
+    assert len(plans["vcf_ram"]) == 48
+
+
+def test_vcf_ram_points_never_exceed_one_chunk_per_contig():
+    # `model._resident_chunk_size` clamps chunk_size by TOTAL V, not per-contig
+    # V. On a 22-contig corpus a point above V/22 would be fitted against a
+    # chunk up to 22x larger than anything ever resident, because BitGrid3's
+    # calloc pages are not resident until written.
+    plans = build(Path("/corpora"), threads=48)
+    for pt in plans["vcf_ram"]:
+        variants = int(Path(pt.corpus).name.split("_v")[1].split(".")[0])
+        assert pt.chunk_size <= variants // len(VCF_CONTIGS), (
+            f"{pt.corpus} chunk_size={pt.chunk_size} exceeds "
+            f"{variants // len(VCF_CONTIGS)} variants per contig"
+        )
+
+
+def test_vcf_crossed_chunk_sizes_land_on_the_same_megabytes_at_every_width():
+    # chunk_MB = (S*ploidy/8) * chunk_size and V = CELLS_BUDGET / S, so
+    # {V/88, V/44, V/22} is ~4/8/16 MB at EVERY width. That uniformity
+    # is the point of expressing them as fractions of V rather than literals.
+    for s, chunk_sizes in VCF_CROSSED.items():
+        mbs = [(s * 2 // 8) * cs / 1e6 for cs in chunk_sizes]
+        assert mbs == pytest.approx([3.98, 7.95, 15.9], rel=0.02), (s, mbs)
+
+
+def test_vcf_bigchunk_reaches_a_hundred_megabyte_chunk():
+    # The whole reason this corpus exists: without it kappa is measured only to
+    # 15.9 MB and extrapolated ~16x to production's 256 MiB chunks.
+    s, v = VCF_BIGCHUNK["samples"], VCF_BIGCHUNK["variants"]
+    biggest = max(VCF_BIGCHUNK["chunk_sizes"])
+    assert (s * 2 // 8) * biggest / 1e6 == pytest.approx(100.0, rel=0.01)
+    assert biggest <= v // len(VCF_CONTIGS)
+
+
+def test_every_vcf_ram_point_id_is_unique():
+    plans = build(Path("/corpora"), threads=48)
+    ids = [pt.point_id for pt in plans["vcf_ram"]]
+    assert len(ids) == len(set(ids))
