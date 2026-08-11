@@ -35,14 +35,19 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
-import os
-import shutil
 import subprocess
 from pathlib import Path
 
 from scripts.bench_svar2.records import CorpusManifest
 
-PROFILE = Path(__file__).parent / "profiles" / "germline-1kgp-varskew.json"
+# Re-exported so existing callers (sweep_pgen.sbatch, tests) keep importing
+# `resolve_vcfixture` and `PROFILE` from here.
+from scripts.bench_svar2.vcfixture_cli import (  # noqa: F401
+    PROFILE,
+    bulk,
+    cli_version,
+    resolve_vcfixture,
+)
 
 # Bumped whenever a change to THIS MODULE's generation logic (not the
 # profile's content -- that's covered by the profile-content hash folded
@@ -57,33 +62,6 @@ class PgenCorpusSpec:
     variants: int
     contigs: tuple[str, ...]
     seed: int
-
-
-def resolve_vcfixture() -> Path:
-    """Locate the `vcfixture` bulk CLI.
-
-    This is NOT the PyPI `vcfixture` package pinned in pixi.toml -- that
-    ships no console script (no entry_points.txt, no bin/vcfixture). The
-    bulk generator is a separate Rust binary. Shelling out to a bare
-    `vcfixture` therefore passes on a dev box that happens to have it built
-    and fails in CI with FileNotFoundError, so resolution is explicit and
-    the error says how to fix it.
-    """
-    env = os.environ.get("VCFIXTURE_BIN")
-    if env:
-        p = Path(env)
-        if p.is_file():
-            return p
-        raise FileNotFoundError(f"VCFIXTURE_BIN={env} is not a file")
-    found = shutil.which("vcfixture")
-    if found:
-        return Path(found)
-    raise FileNotFoundError(
-        "vcfixture bulk CLI not found. It is a Rust binary, separate from the "
-        "PyPI `vcfixture` package (which has no CLI). Install it with "
-        "`cargo install vcfixture --features cli`, or point VCFIXTURE_BIN at "
-        "an existing build."
-    )
 
 
 def corpus_stem(spec: PgenCorpusSpec) -> str:
@@ -135,30 +113,14 @@ def generate(spec: PgenCorpusSpec, outdir: Path) -> CorpusManifest:
             payload["format_fields"] = tuple(payload["format_fields"])
             return CorpusManifest(**payload)
 
-    vcfixture = resolve_vcfixture()
     bcf = outdir / f"{stem}.bcf"
-    subprocess.run(
-        [
-            str(vcfixture),
-            "bulk",
-            "--profile",
-            str(PROFILE),
-            "--samples",
-            str(spec.samples),
-            "--contigs",
-            ",".join(spec.contigs),
-            "--records",
-            str(spec.variants),
-            "--payload",
-            "gt-only",
-            "--format",
-            "bcf",
-            "--seed",
-            str(spec.seed),
-            "-o",
-            str(bcf),
-        ],
-        check=True,
+    bulk(
+        samples=spec.samples,
+        variants=spec.variants,
+        contigs=spec.contigs,
+        seed=spec.seed,
+        fmt="bcf",
+        out=bcf,
     )
 
     # --output-chr chrM: keep the `chr` prefix on .pvar DATA rows. Without it
