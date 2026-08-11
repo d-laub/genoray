@@ -237,7 +237,16 @@ ids = {r["point_id"] for r in rows}
 print(f"plan points: {n_plan}   result rows: {len(rows)}   unique ids: {len(ids)}")
 bad = [r["point_id"] for r in rows if not r.get("ok") and r.get("oom_at_rss_mb") is None]
 if bad:
-    print(f"FAILED points (not OOM deliverables): {bad}")
+    # A point that failed for a reason other than a deliberate OOM probe is
+    # not a measurement. This used to be a print-and-continue, which is why a
+    # run where ALL 48 rows failed on the same "symbolic ALT out of scope"
+    # error (job 13355460) still printed "OK: every planned point measured"
+    # and exited 0 -- the guard checked row COUNT, never row VALIDITY. An OOM
+    # row (`oom_at_rss_mb` set) is excluded above and must keep passing.
+    sys.exit(
+        f"ABORT: {len(bad)} of {len(rows)} point(s) failed (not OOM "
+        f"deliverables): {bad[:5]}"
+    )
 if len(ids) != n_plan:
     sys.exit(f"ABORT: {len(ids)} distinct points in results, plan has {n_plan}")
 nodes = {r.get("node") for r in rows}
