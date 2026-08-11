@@ -8,17 +8,34 @@
 # A wall-clock kill mid-point is recoverable (see the resume note below) but
 # costs a queue round-trip for nothing.
 #SBATCH --time=72:00:00
+# PIN THE NODE for any run whose rows will be compared or pooled. Measured
+# spread on byte-identical work is 2.08x (151.9s on one node vs 73.2s on
+# another), and unpinned rows have already produced published-then-retracted
+# findings. Submit with:  sbatch --nodelist=carter-cn-04 sweep_scale.sbatch
 #SBATCH --output=%x_%j.log
 
 set -euo pipefail
 
-WT=/carter/users/dlaub/projects/genoray/.claude/worktrees/bench-pr140-reader-workers
-# Slurm's default cwd is the *submission* directory, not this script's location,
-# but every `python -m scripts.bench_svar2.<module>` below needs cwd = repo root
-# to resolve as a package. Without this, resubmitting from anywhere but $WT dies
-# on the first command with ModuleNotFoundError.
+# Repo root DERIVED, not hardcoded. This previously pinned a specific worktree
+# (`bench-pr140-reader-workers`) that no longer exists, so resubmitting from a
+# different tree silently measured the wrong checkout -- or died on the first
+# command. Slurm's default cwd is the SUBMISSION directory, and every
+# `python -m scripts.bench_svar2.<module>` below needs cwd = repo root to
+# resolve as a package.
+WT=$(git -C "$SLURM_SUBMIT_DIR" rev-parse --show-toplevel)
 cd "$WT"
-JD="${CLAUDE_JOB_DIR:?set CLAUDE_JOB_DIR}"/tmp
+
+# NOT $CLAUDE_JOB_DIR/tmp. The harness symlinks that path to node-local disk on
+# the SUBMITTING node, and `sbatch --export=ALL` carries the variable to
+# whatever node runs the job, where it is a DANGLING symlink: mkdir of a child
+# raises FileNotFoundError and the parents=True retry then raises FileExistsError
+# on the symlink itself, naming neither the symlink nor the node. That killed
+# job 13351680 after 6:57:53 with all corpora already built. `probe.py` reads
+# the variable directly, so it must be unset here, not merely avoided.
+unset CLAUDE_JOB_DIR
+SCRATCH="/local/$USER/scale-sweep"
+mkdir -p "$SCRATCH"
+JD="$SCRATCH"
 PX="pixi run --manifest-path $WT/pixi.toml"
 CELLS=1400000000
 
