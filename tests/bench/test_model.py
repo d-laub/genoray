@@ -45,11 +45,18 @@ def test_sweep_names_covers_every_axis_build_plans_produces(tmp_path):
     shipping silently inert.
 
     `pgen` is deliberately excluded from this check: it is fitted by its own
-    pipeline (`sweep_pgen.sbatch` + a dedicated `load_sweep("pgen", ...)`
-    call), not by `main()`/`_SWEEP_NAMES`, which fits only the VCF-path laws.
+    pipeline (`fit_ram.py`'s `BACKEND_SWEEPS["pgen"]`, a dedicated
+    `load_sweep("pgen", ...)` call), not by `main()`/`_SWEEP_NAMES`, which
+    fits only the VCF-path laws.
+
+    Only the `plan_axes -> _SWEEP_NAMES` direction is checked (`<=`, not
+    `==`): `_SWEEP_NAMES` is allowed to name a family `build_plans` does not
+    produce yet, because `load_sweep` degrades that to a recorded exclusion
+    rather than a crash. `vcf_ram` is exactly that -- named ahead of the plan
+    family Task 5 of #158 adds, per `fit_ram.py`'s docstring.
     """
     plan_axes = set(build_plans(tmp_path, threads=8).keys())
-    assert plan_axes - {"pgen"} == set(_SWEEP_NAMES)
+    assert plan_axes - {"pgen"} <= set(_SWEEP_NAMES)
 
 
 def test_v_law_recovers_planted_line():
@@ -666,6 +673,50 @@ def _sweep_of(rows: list[tuple[CorpusManifest, SweepPoint, ProbeRecord]]):
         sweep.point_of[r.point_id] = pt
         sweep.manifest_of[r.point_id] = m
     return sweep
+
+
+def _row(
+    concurrent_chroms: int | None = 1, concurrent_chroms_used: int | None = None
+) -> tuple[CorpusManifest, SweepPoint, ProbeRecord]:
+    """One `_sweep_of`-shaped row, for tests that only care about the
+    pinned-vs-realised `concurrent_chroms` fallback in `_ram_rows`. Everything
+    else is `_manifest`/`_point`/`_record` filler at their defaults.
+    """
+    name = "cc.manifest.json"
+    m = _manifest(name)
+    pt = _point(name, workers=1, concurrent_chroms=concurrent_chroms)
+    r = _record(pt.point_id, concurrent_chroms_used=concurrent_chroms_used)
+    return (m, pt, r)
+
+
+def test_ram_rows_fall_back_to_the_realised_concurrent_chroms():
+    # A point that let the planner choose (`concurrent_chroms=None`) used to be
+    # dropped outright. If the RECORD observed the realised value, the row is
+    # fittable and must be kept -- at the observed value, never at 1.
+    rows = _ram_rows(
+        _sweep_of(
+            [
+                _row(concurrent_chroms=None, concurrent_chroms_used=8),
+            ]
+        )
+    )
+    assert [r.concurrent_chroms for r in rows] == [8]
+
+
+def test_ram_rows_still_drop_rows_where_cc_was_never_observed():
+    # Neither pinned nor parsed: UNOBSERVED. Coding it as 1 produced a pooled
+    # per-contig estimate of 41 MB against a directly measured 89.67 (#158).
+    rows = _ram_rows(
+        _sweep_of([_row(concurrent_chroms=None, concurrent_chroms_used=None)])
+    )
+    assert rows == []
+
+
+def test_ram_rows_prefer_the_pinned_value_over_the_realised_one():
+    # The pinned value is what the plan asked for and what `point_id` hashes.
+    # If the two disagree the plan is what the sweep is indexed by.
+    rows = _ram_rows(_sweep_of([_row(concurrent_chroms=4, concurrent_chroms_used=8)]))
+    assert [r.concurrent_chroms for r in rows] == [4]
 
 
 def test_resident_chunk_size_is_bounded_by_the_corpus():

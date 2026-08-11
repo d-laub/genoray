@@ -755,11 +755,26 @@ def extrapolate(
 
 # File-layout contract shared with the plan-generation and sbatch agents:
 # `<results-dir>/<name>.ndjson`, `<plans-dir>/<name>.json`, for `name` in
-# these six sweeps. `vlinear`/`vlinear2` are the two V-linearity ladders;
+# these seven sweeps. `vlinear`/`vlinear2` are the two V-linearity ladders;
 # `concurrency` is the cc={1,8,15,22} probe of the tuned load-balancing
-# planner's chosen contig concurrency. None of the three is guaranteed to
-# exist in an older job dir, and their absence must degrade gracefully.
-_SWEEP_NAMES = ("scale", "contig", "holdout", "vlinear", "vlinear2", "concurrency")
+# planner's chosen contig concurrency; `vcf_ram` is the crossed RAM-law sweep
+# for the VCF backend (Task 5 of #158 adds it to `build_plans`; naming it here
+# now is safe -- `load_sweep` records a missing file in `.excluded` rather
+# than raising). `pgen` is deliberately NOT named here: it has its own
+# dedicated fit entry point (`fit_ram.py`'s `BACKEND_SWEEPS["pgen"]`), not
+# `main()`'s VCF-law driver -- see
+# `test_sweep_names_covers_every_axis_build_plans_produces`. None of these is
+# guaranteed to exist in an older job dir, and their absence must degrade
+# gracefully.
+_SWEEP_NAMES = (
+    "scale",
+    "contig",
+    "holdout",
+    "vlinear",
+    "vlinear2",
+    "concurrency",
+    "vcf_ram",
+)
 
 
 class _LoadedSweep:
@@ -1003,13 +1018,19 @@ def _ram_rows(*sweeps: _LoadedSweep) -> list[RamRow]:
             chunk_bytes = m.chunk_bytes * _resident_chunk_size(
                 pt.chunk_size, m.variants
             )
-            # A point that did NOT pin `concurrent_chroms` ran at whatever the
-            # planner chose, and `ProbeRecord` has no field for that value --
-            # so `cc` is UNOBSERVED, not merely unidentified, and the row
-            # cannot be fitted. Coding it as 1 is what produced a pooled
-            # per-contig estimate of 41 MB against a directly measured 89.67
-            # (issue #158). Drop it rather than invent the regressor.
-            if pt.concurrent_chroms is None:
+            # `cc` must be the value production ACTUALLY ran at, because
+            # `plan_sharded` multiplies the per-contig bracket by it. Prefer the
+            # PINNED request (it is what `point_id` hashes and what the plan is
+            # indexed by), fall back to the value the child reported on its
+            # `pipeline config` line, and drop only when NEITHER exists.
+            #
+            # Dropping, not defaulting: an unknown `cc` coded as 1 is what
+            # produced a pooled per-contig estimate of 41 MB against a directly
+            # measured 89.67 (issue #158).
+            cc = pt.concurrent_chroms
+            if cc is None:
+                cc = r.concurrent_chroms_used
+            if cc is None:
                 continue
             rows.append(
                 RamRow(
@@ -1017,7 +1038,7 @@ def _ram_rows(*sweeps: _LoadedSweep) -> list[RamRow]:
                     pending=r.pending_highwater,
                     chunk_bytes=chunk_bytes,
                     samples=m.samples,
-                    concurrent_chroms=pt.concurrent_chroms,
+                    concurrent_chroms=cc,
                     peak_rss_mb=r.maxrss_mb,
                 )
             )
@@ -1197,7 +1218,19 @@ def main() -> None:
     if knees:
         print(f"predicted knees by S: {knees}")
 
-    ram_rows = _ram_rows(scale, contig, holdout, vlinear, vlinear2)
+    # `concurrency` and `vcf_ram` are the families that vary `concurrent_chroms`
+    # at fixed (S, chunk_size), which is the ONLY way `per_contig_mb` becomes
+    # identifiable. Omitting `concurrency` here is why `RamLaw::VCF` shipped
+    # with that term at 0.0 even after the axis existed.
+    ram_rows = _ram_rows(
+        scale,
+        contig,
+        holdout,
+        vlinear,
+        vlinear2,
+        sweeps["concurrency"],
+        sweeps["vcf_ram"],
+    )
     ram_law = fit_ram_law(ram_rows) if len(ram_rows) >= 2 else None
     _print_law("RAM law", ram_law)
 
