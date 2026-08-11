@@ -94,6 +94,32 @@ def test_na_in_one_cpu_column_does_not_misalign_the_other_series():
     assert len(t["cpu_shard_pct"]) == len(t["cpu_exec_pct"])
 
 
+def test_parse_trace_extracts_realised_concurrent_chroms():
+    # Both backends emit a "pipeline config" line; the VCF one is bare, the
+    # PGEN one is suffixed. tracing's fmt layer prints the message first, then
+    # the fields, so `concurrent_chroms=` follows the message text.
+    vcf = (
+        "2026-08-11T00:00:00Z  INFO genoray: pipeline config "
+        "concurrent_chroms=4 htslib_threads=2 monolithic_reader_active=8 "
+        "reader_workers=3 sharded_vcf_active=16 processing_threads=31\n"
+    )
+    assert parse_trace(vcf)["concurrent_chroms_used"] == 4
+
+    pgen = (
+        "2026-08-11T00:00:00Z  INFO genoray: pipeline config (PGEN) "
+        "concurrent_chroms=8 reader_workers=1 processing_threads=31\n"
+    )
+    assert parse_trace(pgen)["concurrent_chroms_used"] == 8
+
+
+def test_parse_trace_reports_unknown_concurrent_chroms_as_none():
+    # A run whose log level suppressed the line, or a crash before planning.
+    # None means UNOBSERVED. It must never be coded as 1 -- that is exactly
+    # what produced a 41 MB per-contig estimate against a measured 89.67
+    # (issue #158).
+    assert parse_trace("no config line here\n")["concurrent_chroms_used"] is None
+
+
 def test_empty_input_yields_zeroed_trace():
     t = parse_trace("")
     assert t["phase1_s"] == 0.0

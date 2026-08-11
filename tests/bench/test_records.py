@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from scripts.bench_svar2.records import (
@@ -164,3 +166,47 @@ def test_verdict_evidence_does_not_survive_a_json_round_trip():
     assert back.evidence["knees"] == {"250": 5, "1000": 5}
     # ...while plain scalars are unaffected.
     assert back.evidence["knee_points"] == 3
+
+
+def test_probe_record_round_trips_concurrent_chroms_used():
+    rec = ProbeRecord(
+        point_id="abc",
+        ok=True,
+        wall_s=1.0,
+        phase1_s=1.0,
+        cpu_s=1.0,
+        maxrss_mb=100.0,
+        digest="d",
+        dense_cap=1,
+        dense_occupancy=(),
+        cpu_shard_pct=(),
+        cpu_exec_pct=(),
+        pending_highwater=0,
+        pending_bytes_highwater=0,
+        shard_unit_secs=(),
+        concurrent_chroms_used=8,
+    )
+    assert from_json(ProbeRecord, to_json(rec)) == rec
+
+
+def test_probe_record_without_concurrent_chroms_used_still_loads():
+    # Records written before the field existed must keep loading, the same
+    # reason `node` carries a default. `from_json` drops unknown keys but
+    # cannot invent missing ones, so the default is what makes this work.
+    payload = {
+        "point_id": "abc",
+        "ok": True,
+        "wall_s": 1.0,
+        "phase1_s": 1.0,
+        "cpu_s": 1.0,
+        "maxrss_mb": 100.0,
+        "digest": "d",
+        "dense_cap": 1,
+        "dense_occupancy": [],
+        "cpu_shard_pct": [],
+        "cpu_exec_pct": [],
+        "pending_highwater": 0,
+        "pending_bytes_highwater": 0,
+        "shard_unit_secs": [],
+    }
+    assert from_json(ProbeRecord, json.dumps(payload)).concurrent_chroms_used is None

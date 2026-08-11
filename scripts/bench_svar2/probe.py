@@ -32,6 +32,12 @@ ANSI = re.compile(r"\x1b\[[0-9;]*m")
 RE_PHASE1 = re.compile(r"done:.*?\(([0-9.]+)s\)")
 RE_SAMPLER = re.compile(r"pipeline sampler .*")
 RE_UNIT = re.compile(r"shard unit done .*?unit_secs=([0-9.]+)")
+# `tracing::info!(concurrent_chroms, ..., "pipeline config")` in src/lib.rs --
+# emitted by BOTH backends (the PGEN one is "pipeline config (PGEN)"), so this
+# pattern must stay loose enough to match either. This is the ONLY record of
+# the concurrency the planner actually chose: `SweepPoint.concurrent_chroms` is
+# the REQUEST, and is None whenever the point let the planner decide.
+RE_PIPELINE_CONFIG = re.compile(r"pipeline config.*")
 
 
 def _field(line: str, key: str) -> str | None:
@@ -74,6 +80,12 @@ def parse_trace(text: str) -> dict:
             shard.append(float(sv.rstrip("%")))
             execp.append(float(ev.rstrip("%")))
 
+    cc_used: int | None = None
+    for line in RE_PIPELINE_CONFIG.findall(plain):
+        v = _field(line, "concurrent_chroms")
+        if v is not None:
+            cc_used = int(v)
+
     return {
         "phase1_s": phase1,
         "dense_occupancy": tuple(dense),
@@ -83,6 +95,7 @@ def parse_trace(text: str) -> dict:
         "pending_highwater": pending_hw,
         "pending_bytes_highwater": pending_bytes_hw,
         "shard_unit_secs": tuple(float(x) for x in RE_UNIT.findall(plain)),
+        "concurrent_chroms_used": cc_used,
     }
 
 
@@ -365,6 +378,7 @@ def run_point(
                 oom_at_rss_mb=oom,
                 error=err[-2000:],
                 node=platform.node(),
+                concurrent_chroms_used=None,
             )
 
         t = parse_trace(out + err)
@@ -384,6 +398,7 @@ def run_point(
             pending_bytes_highwater=t["pending_bytes_highwater"],
             shard_unit_secs=t["shard_unit_secs"],
             node=platform.node(),
+            concurrent_chroms_used=t["concurrent_chroms_used"],
         )
         # Min-of-N on wall time; the cluster is shared, so the minimum is the
         # least contended estimate.

@@ -118,6 +118,15 @@ class ProbeRecord:
     # Defaulted to "" so records written before this field existed still load
     # (`from_json` drops unknown keys but cannot invent missing ones).
     node: str = ""
+    # The concurrency the planner ACTUALLY dispatched, parsed from the child's
+    # `pipeline config` line. `SweepPoint.concurrent_chroms` is only the
+    # REQUEST and is None whenever the point let the planner choose, which
+    # made every such point unfittable -- 12 of the 58 rows in the 2026-08-08
+    # PGEN crossed sweep (issue #158). None still means UNOBSERVED, never 1.
+    #
+    # Defaulted for the same reason `node` is: records written before this
+    # field existed must still load.
+    concurrent_chroms_used: int | None = None
 
 
 @dataclass(frozen=True)
