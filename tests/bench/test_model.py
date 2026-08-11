@@ -188,6 +188,64 @@ def test_ram_law_without_cohort_term_cannot_fit_cohort_scaling():
     assert x.std() == 0.0, "sanity: the chunk regressor is constant by construction"
 
 
+def test_fit_ram_law_without_interaction_leaves_the_term_at_zero():
+    rows = [
+        RamRow(
+            workers=1,
+            pending=0,
+            chunk_bytes=10_000_000,
+            samples=4_000,
+            peak_rss_mb=1_000.0,
+            concurrent_chroms=1,
+        ),
+        RamRow(
+            workers=1,
+            pending=0,
+            chunk_bytes=10_000_000,
+            samples=32_000,
+            peak_rss_mb=3_000.0,
+            concurrent_chroms=4,
+        ),
+    ]
+    law = fit_ram_law(rows, margin=1.0)
+    assert law.per_contig_per_sample_mb == 0.0
+
+
+def test_fit_ram_law_with_interaction_is_never_looser_than_without():
+    # The interaction form NESTS the current one (set the extra coefficient to
+    # zero), so its optimal worst-case ratio can only be <= the simpler form's.
+    # If it ever comes out larger the LP is misconstructed, not the data.
+    rows = [
+        RamRow(
+            workers=1,
+            pending=0,
+            chunk_bytes=10_000_000,
+            samples=4_000,
+            peak_rss_mb=1_000.0,
+            concurrent_chroms=1,
+        ),
+        RamRow(
+            workers=1,
+            pending=0,
+            chunk_bytes=10_000_000,
+            samples=32_000,
+            peak_rss_mb=3_000.0,
+            concurrent_chroms=4,
+        ),
+        RamRow(
+            workers=1,
+            pending=0,
+            chunk_bytes=20_000_000,
+            samples=128_000,
+            peak_rss_mb=9_000.0,
+            concurrent_chroms=8,
+        ),
+    ]
+    plain = fit_ram_law(rows, margin=1.0)
+    inter = fit_ram_law(rows, margin=1.0, interaction=True)
+    assert inter.worst_ratio <= plain.worst_ratio + 1e-9
+
+
 # Every planted row below fixes ONE cohort size. The RAM law's cohort term is
 # `per_sample_mb * samples`, so holding `samples` constant makes that term a
 # constant the intercept absorbs -- which is exactly what these tests want:

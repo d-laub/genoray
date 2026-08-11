@@ -283,7 +283,9 @@ class RamRow(typing.NamedTuple):
     concurrent_chroms: int = 1
 
 
-def fit_ram_law(rows: Sequence[RamRow], margin: float = 1.25) -> RamLaw:
+def fit_ram_law(
+    rows: Sequence[RamRow], margin: float = 1.25, interaction: bool = False
+) -> RamLaw:
     """Tightest law that over-predicts EVERY row by at least `margin`.
 
     peak_rss ~ base + per_sample_mb*samples
@@ -350,6 +352,21 @@ def fit_ram_law(rows: Sequence[RamRow], margin: float = 1.25) -> RamLaw:
     if contig_identifiable:
         names.append("per_contig")
         cols.append(cc)
+        # Optional per-contig term that scales with cohort width. The
+        # 2026-08-08 PGEN crossed sweep measured the per-contig slope at
+        # 83.7 MB (S=4,000), 263 MB (S=32,000) and 301 MB (S=128,000): the
+        # bracket GROWS with S, which a single additive `per_contig` cannot
+        # express. This form NESTS the simpler one (the coefficient can go to
+        # zero), so its optimal worst-case ratio is never larger.
+        #
+        # Off by default. Whether it ships is a recorded decision, not a
+        # modelling preference -- see
+        # docs/superpowers/plans/results/2026-08-11-ram-law-form-check.md.
+        # A term multiplying S is extrapolated ~3.9x to reach S=500,000, which
+        # is exactly the kind of reach that made the `n_chunks` term unsafe.
+        if interaction and cohort_identifiable:
+            names.append("per_contig_per_sample")
+            cols.append(cc * samples)
     names.append("kappa")
     cols.append(chunk_cc)
 
@@ -383,6 +400,7 @@ def fit_ram_law(rows: Sequence[RamRow], margin: float = 1.25) -> RamLaw:
         base_mb=coef["base"],
         per_sample_mb=coef.get("per_sample", 0.0),
         per_contig_mb=coef.get("per_contig", 0.0),
+        per_contig_per_sample_mb=coef.get("per_contig_per_sample", 0.0),
         kappa=coef["kappa"],
         r2=1.0 - ss_res / ss_tot if ss_tot > 0 else 1.0,
         n_points=len(rows),

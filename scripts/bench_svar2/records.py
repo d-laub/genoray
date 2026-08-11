@@ -196,6 +196,12 @@ class RamLaw:
     # 0.0 default carries the documented meaning "not fitted for this
     # backend", which is the same thing `RamLaw::VCF` ships.
     per_contig_mb: float = 0.0
+    # Per-contig cost that scales with cohort width. The 2026-08-08 PGEN
+    # crossed sweep measured the per-contig slope at 83.7 MB (S=4,000), 263 MB
+    # (S=32,000) and 301 MB (S=128,000) -- a bracket that grows with S, which a
+    # single additive `per_contig_mb` cannot express. 0.0 means "not fitted",
+    # which is the form the law had before this field existed.
+    per_contig_per_sample_mb: float = 0.0
     worst_ratio: float = float("nan")
     margin: float = 1.0
 

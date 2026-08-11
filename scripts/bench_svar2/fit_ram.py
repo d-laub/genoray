@@ -84,6 +84,11 @@ def main() -> None:
         default=1.25,
         help="safety factor: every point must be over-predicted by at least this",
     )
+    p.add_argument(
+        "--interaction",
+        action="store_true",
+        help="fit the optional per_contig_per_sample term (off by default)",
+    )
     a = p.parse_args()
 
     manifests = _load_manifests(a.manifests)
@@ -101,7 +106,7 @@ def main() -> None:
     if len(rows) < 2:
         raise SystemExit("ABORT: need >= 2 rows with an observed concurrent_chroms")
 
-    law = fit_ram_law(rows, margin=a.margin)
+    law = fit_ram_law(rows, margin=a.margin, interaction=a.interaction)
     report = gate_report(law, rows)
 
     print(f"\nRamLaw::{a.backend.upper()} (margin {a.margin}):")
