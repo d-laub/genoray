@@ -158,22 +158,53 @@ fn to_log_level(l: &tracing::Level) -> LogLevel {
 struct FieldGrab {
     message: String,
     chrom: Option<String>,
+    // Every field that is neither `message` nor `chrom`, in visit order.
+    fields: Vec<(String, String)>,
+}
+
+impl FieldGrab {
+    /// `"<message> k1=v1 k2=v2"` -- the same compact `key=value` shape
+    /// `tracing_subscriber`'s own fmt layer renders, and the shape
+    /// `scripts/bench_svar2/probe.py::_field` parses with `\bkey=([^\s]+)`.
+    ///
+    /// Returns the message unchanged (no trailing space) when the event
+    /// carried nothing beyond `message`/`chrom`.
+    fn render(&self) -> String {
+        if self.fields.is_empty() {
+            return self.message.clone();
+        }
+        let mut s = self.message.clone();
+        for (k, v) in &self.fields {
+            s.push(' ');
+            s.push_str(k);
+            s.push('=');
+            s.push_str(v);
+        }
+        s
+    }
 }
 
 impl Visit for FieldGrab {
     fn record_str(&mut self, field: &Field, value: &str) {
-        if field.name() == "chrom" {
-            self.chrom = Some(value.to_string());
-        } else if field.name() == "message" {
-            self.message = value.to_string();
+        match field.name() {
+            "chrom" => self.chrom = Some(value.to_string()),
+            "message" => self.message = value.to_string(),
+            // Recorded UNQUOTED. This override exists precisely because
+            // `Debug` on a `&str` renders `"chr1"` with quotes, which would
+            // both diverge from the fmt layer's rendering and break
+            // `probe.py::_field`'s `([^\s]+)` capture.
+            name => self.fields.push((name.to_string(), value.to_string())),
         }
     }
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
         let v = format!("{value:?}");
-        if field.name() == "chrom" {
-            self.chrom = Some(v.trim_matches('"').to_string());
-        } else if field.name() == "message" {
-            self.message = v;
+        match field.name() {
+            "chrom" => self.chrom = Some(v.trim_matches('"').to_string()),
+            "message" => self.message = v,
+            // Integers, bools and every other typed field arrive here:
+            // `Visit::record_i64`/`record_u64`/`record_bool` all default to
+            // forwarding to `record_debug`, so no typed impls are needed.
+            name => self.fields.push((name.to_string(), v)),
         }
     }
 }
@@ -250,7 +281,7 @@ impl<S: tracing::Subscriber> Layer<S> for ChannelLayer {
                 to_log_level(lvl),
                 g.chrom.as_deref(),
                 event.metadata().target(),
-                g.message,
+                g.render(),
             );
         }
     }
@@ -477,6 +508,52 @@ mod tests {
         assert_eq!(logs.len(), 1);
         assert_eq!(logs[0].0, "chr1");
         assert!(logs[0].1.contains("excluded 12"));
+    }
+
+    /// #162 regression: `FieldGrab` used to forward only `message` and
+    /// `chrom`, so `tracing::info!(concurrent_chroms = 8, ..., "pipeline
+    /// config")` reached Python as the bare string "pipeline config" --
+    /// every structured field silently dropped. That made
+    /// `ProbeRecord.concurrent_chroms_used` `None` on all 48 rows of the
+    /// committed 2026-08-11 VCF crossed sweep.
+    #[test]
+    fn channel_layer_carries_structured_fields_onto_the_message() {
+        use crossbeam_channel::unbounded;
+        let _guard = TEST_LOCK.lock().unwrap();
+        let (tx, rx) = unbounded();
+        let sink = EventSink::new(tx, 1);
+        // Same reason as `channel_layer_routes_events_at_level`: CURRENT_SINK
+        // is process-global, so filter to this module's own target or a
+        // concurrently running foreign test leaks events into `rx`.
+        let own_target = module_path!();
+        with_channel_subscriber(sink, "info", || {
+            tracing::info!(
+                concurrent_chroms = 8usize,
+                reader_workers = 4usize,
+                "pipeline config"
+            );
+            tracing::info!(chrom = "chr1", "excluded 12 records");
+        });
+        let msgs: Vec<String> = rx
+            .try_iter()
+            .filter_map(|e| match e {
+                Event::Log {
+                    message, target, ..
+                } if target == own_target => Some(message),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(msgs.len(), 2);
+        // Fields render in tracing's declaration order, which is stable per
+        // call site, so this can be asserted exactly.
+        assert_eq!(
+            msgs[0],
+            "pipeline config concurrent_chroms=8 reader_workers=4"
+        );
+        // An event carrying nothing beyond message/chrom is unchanged: no
+        // trailing space, and `chrom` is NOT duplicated into the message
+        // (it already has its own `Event::Log` field).
+        assert_eq!(msgs[1], "excluded 12 records");
     }
 
     /// Regression guard for the global-subscriber fix: events emitted from an

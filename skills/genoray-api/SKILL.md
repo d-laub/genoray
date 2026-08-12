@@ -423,6 +423,9 @@ Signature: `from_vcf(out, source, reference=None, *, regions=None, samples=None,
   `GENORAY_LOG` environment variable overrides the `log_level` argument when
   set to one of the same four values (e.g. `GENORAY_LOG=debug`), without
   touching call sites.
+  Structured log lines render their fields inline as ` key=value` pairs
+  after the message (e.g. `pipeline config concurrent_chroms=8
+  reader_workers=4`), matching what `GENORAY_LOG`'s stderr layer emits.
 
 ### Conversion from PGEN
 
