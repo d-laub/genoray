@@ -137,20 +137,83 @@ pub struct RamLaw {
 }
 
 impl RamLaw {
-    /// Sharded VCF path. Fitted 2026-08-03, R^2 = 0.9040, n = 44.
-    /// See docs/superpowers/specs/2026-08-03-svar2-tuned-load-balancing-design.md.
+    /// Sharded VCF path, refitted 2026-08-11 against the crossed sweep (Slurm
+    /// job 13355527, `carter-cn-03`, `n = 48/48` points measured on one
+    /// node). See
+    /// docs/superpowers/plans/results/2026-08-11-vcf-ram-law-crossed.md.
     ///
-    /// `per_contig_mb` is 0.0 because that sweep never varied
-    /// `concurrent_chroms` at fixed `(S, chunk_size)`, so it carries no
-    /// information about a per-contig constant -- the term would be an
-    /// invention, not a measurement. The VCF law is therefore unchanged by
-    /// the 2026-08-08 PGEN re-fit. Fitting it needs the crossed design in
-    /// `PGEN_CROSSED` / `PGEN_NCHUNKS_AXIS` run against the VCF corpora.
+    /// **Fitted as an ENVELOPE (LP), not by least squares.** `plan_sharded`
+    /// uses this law as an upper bound, and the shipping gate is
+    /// over-prediction at every measured point, not squared error. `r2` is
+    /// printed by the fitter for description only and is **not** the
+    /// shipping criterion -- see `RamLaw`'s top-level doc comment and the
+    /// `RamLaw::PGEN` comment below for why an OLS-plus-CI-padding fit is the
+    /// wrong objective for a bound.
+    ///
+    /// ```text
+    ///   minimise  t
+    ///   s.t.      1.25 * y_i  <=  X_i . b  <=  t * y_i    for every point
+    ///             b >= 0
+    /// ```
+    ///
+    /// Gate: over-predicts all 48 measured points as `plan_sharded` evaluates
+    /// them, worst **3.7267x**, mean 2.4417x, min exactly 1.2500x (the
+    /// margin, honoured as an equality at the binding point).
+    ///
+    /// **The 1.25 margin is a CHOSEN safety factor, stated here, not
+    /// inherited.** An envelope fit touches the data only at its binding
+    /// points and therefore carries no margin of its own, and the law is
+    /// applied ~3.9x beyond the largest measured cohort (S=128,000 ->
+    /// 500,000). Sensitivity, same 48 rows:
+    ///
+    /// | margin | worst   | mean    |
+    /// |-------:|--------:|--------:|
+    /// | 1.00   | 2.9814x | 1.9534x |
+    /// | 1.25   | 3.7267x | 2.4417x |
+    /// | 1.50   | 4.4721x | 2.9301x |
+    /// | 2.00   | 5.9628x | 3.9068x |
+    ///
+    /// `per_contig_mb` is now MEASURED, not zero. This sweep is the first on
+    /// this backend to vary `concurrent_chroms` at fixed `(S, chunk_size)`,
+    /// and the fitted value prices the ~128 MiB per-live-contig
+    /// `ChunkAssembler` staging allocation that the old cc-blind OLS fit left
+    /// unpriced -- an UNDER-prediction, the OOM direction, unlike that fit's
+    /// double-counted `kappa` (issue #158).
+    ///
+    /// An interaction term (`per_contig_per_sample_mb`, entering as
+    /// `cc * samples`) was fitted and gated against the committed 2026-08-08
+    /// PGEN crossed data before this sweep ran, under a decision rule
+    /// pre-registered in issue #158: adopt only on a >=20% worst-case
+    /// improvement. It reached only 1.76% (2.4189x -> 2.3763x). NO-GO.
+    /// `RamLaw::VCF` therefore ships the same four coefficients as before;
+    /// `per_contig_per_sample_mb` stays the tested-but-dormant `0.0` default.
+    ///
+    /// Validity domain: S in {4,000, 32,000, 128,000}, chunk_MB roughly
+    /// 4-100 MB, `cc` in {1,4,8,16}, `reader_workers == 1` and `pending == 0`
+    /// in every row, 22 contigs, one node (`carter-cn-03`), `multiallelic_rate`
+    /// 0.0, no FORMAT/dosage fields (gt-only payload, matching issue #156).
+    /// `per_sample_mb` is extrapolated ~3.9x beyond the largest measured
+    /// cohort (128,000) to reach the production target S=500,000.
+    ///
+    /// `cc = 16` sits OUTSIDE the production domain. Unlike the PGEN path,
+    /// nothing in `lib.rs` clamps VCF `concurrent_chroms`, so `cc=16` is
+    /// reachable only through the bench-only `GENORAY_CONCURRENT_CHROMS`
+    /// override, applied here purely to give the per-contig term a lever arm.
+    ///
+    /// Residual sigma (an unconstrained OLS fit of the same four-term form,
+    /// computed for description only, never shipped) is ~336 MB, ~5.3x the
+    /// 63 MB reproducibility floor measured on the PGEN cc ladder -- the law
+    /// still does not describe the mechanism; the per-contig bracket grows
+    /// with cohort width (~48 -> ~90 -> ~175 MB at the smallest measured
+    /// chunk size across S=4,000/32,000/128,000), the same non-additive
+    /// pattern the PGEN sweep showed. The envelope is safe regardless --
+    /// that is the point of fitting a bound rather than a mean -- but #158
+    /// stays open.
     pub const VCF: RamLaw = RamLaw {
-        base_mb: 932.0,
-        per_sample_mb: 0.01115,
-        per_contig_mb: 0.0,
-        kappa: 1.371,
+        base_mb: 457.25887672659735,
+        per_sample_mb: 0.011017408281198566,
+        per_contig_mb: 111.42612019477279,
+        kappa: 6.105786273211022,
     };
 
     /// PGEN path, re-fitted 2026-08-08 against the crossed sweep (job
@@ -229,10 +292,16 @@ impl RamLaw {
     /// `GENORAY_CONCURRENT_CHROMS` override. The `cc=16` rows exist to give
     /// the per-contig slope a lever arm and sit OUTSIDE the production domain.
     ///
-    /// NOT comparable coefficient-by-coefficient with `RamLaw::VCF`: the two
-    /// corpora come from different generators (vcfixture bulk vs
-    /// scale_corpus.py), so each law is valid only for its own backend. VCF is
-    /// also still an OLS fit with no `per_contig_mb`.
+    /// Still NOT comparable coefficient-by-coefficient with `RamLaw::VCF`,
+    /// even though both now come from `vcfixture bulk` against the same
+    /// fitted `germline-1kgp-varskew` profile: this corpus predates
+    /// vcfixture-rs v0.5.0 (its manifests carry an un-migrated
+    /// `profile_hash` that v0.5.x cannot even load), while the 2026-08-11 VCF
+    /// sweep used v0.5.0+. v0.5.0 gave variant positions their own PRNG
+    /// stream, so a given seed realizes different variants under the two CLI
+    /// versions -- the fitted distributions (SFS, class mix, gaps) are
+    /// identical, but the realized draws are not, so the two corpora are not
+    /// byte-comparable and neither are the two laws' coefficients.
     pub const PGEN: RamLaw = RamLaw {
         base_mb: 2696.785976670047,
         per_sample_mb: 0.01575147162905773,
@@ -571,11 +640,12 @@ mod tests {
     }
 
     // The memory constraint must actually bind, or it is decoration.
-    // S=500,000, ploidy 2, no FORMAT fields, chunk_size 25,000:
+    // S=500,000, ploidy 2, no FORMAT fields, chunk_size 25,000, re-derived for
+    // the 2026-08-11 RamLaw::VCF envelope refit:
     //   chunk_bytes = 25_000 * (500_000*2/8) = 3.125e9 B = 3125 MB
-    //   base        = 932 + 0.01115*500_000 = 6507 MB
-    //   per-contig  = 1.371 * (2 + 1) * 3125 = 12853.125 MB
-    //   budget      = 52428 MB  ->  (52428 - 6507)/12853.125 = 3.57 -> 3
+    //   base        = 457.259 + 0.011017*500_000    = 5965.963 MB
+    //   per-contig  = 111.426 + 6.105786*(2+1)*3125 = 57353.172 MB
+    //   budget      = 200,000 MB -> (200_000 - 5965.963)/57353.172 = 3.383 -> 3
     // The core bound alone would have allowed 15.
     #[test]
     fn memory_bound_beats_core_bound_at_biobank_scale() {
@@ -584,7 +654,7 @@ mod tests {
             n_contigs: 22,
             n_samples: 500_000,
             chunk_bytes: 3_125_000_000,
-            max_mem_bytes: Some(52_428 * 1_000_000),
+            max_mem_bytes: Some(200_000 * 1_000_000),
             reader_workers: 2,
             ram: RamLaw::VCF,
         })
@@ -725,11 +795,12 @@ mod tests {
     // a fitted constant rather than something a caller or a runtime probe
     // dials up freely -- the memory law, not just throughput, bounds it.
     //
-    // n_samples=1_000, chunk_bytes=10_000_000 (10 MB):
-    //   baseline    = 932 + 0.01115*1_000        = 943.15 MB
-    //   per-contig  = 1.371 * (w + (w-1)) * 10 MB
-    //     w=3  -> 1.371*5*10  =  68.55 MB -> needs  1011.70 MB
-    //     w=16 -> 1.371*31*10 = 425.01 MB -> needs  1368.16 MB
+    // n_samples=1_000, chunk_bytes=10_000_000 (10 MB), re-derived for the
+    // 2026-08-11 RamLaw::VCF envelope refit:
+    //   baseline    = 457.259 + 0.011017*1_000               =  468.276 MB
+    //   per-contig  = 111.426 + 6.105786*(w + (w-1))*10
+    //     w=3  -> 111.426 + 6.105786*5*10  =  416.715 MB -> needs   884.992 MB
+    //     w=16 -> 111.426 + 6.105786*31*10 = 2004.220 MB -> needs  2472.496 MB
     //   budget = 1_200 MB: fits w=3, rejects w=16.
     #[test]
     fn a_high_worker_count_can_exceed_a_budget_the_default_fits() {
@@ -761,9 +832,35 @@ mod tests {
 
     #[test]
     fn ram_law_vcf_reproduces_the_fitted_coefficients() {
-        assert_eq!(RamLaw::VCF.base_mb, 932.0);
-        assert_eq!(RamLaw::VCF.per_sample_mb, 0.01115);
-        assert_eq!(RamLaw::VCF.kappa, 1.371);
+        // Re-derived for the 2026-08-11 envelope refit (issue #158). See
+        // docs/superpowers/plans/results/2026-08-11-vcf-ram-law-crossed.md --
+        // reproduce with `python -m scripts.bench_svar2.fit_ram --backend vcf
+        // --margin 1.25` against the committed crossed-sweep data.
+        assert_eq!(RamLaw::VCF.base_mb, 457.25887672659735);
+        assert_eq!(RamLaw::VCF.per_sample_mb, 0.011017408281198566);
+        assert_eq!(RamLaw::VCF.per_contig_mb, 111.42612019477279);
+        assert_eq!(RamLaw::VCF.kappa, 6.105786273211022);
+    }
+
+    #[test]
+    // The whole point is asserting on RamLaw::VCF's const fields, so clippy
+    // sees a compile-time-constant condition; that's the guard, not a bug.
+    #[allow(clippy::assertions_on_constants)]
+    fn ram_law_vcf_is_a_usable_law() {
+        // Guards against a placeholder shipping: a zero kappa would make the
+        // memory bound vacuous and silently restore unbounded planning.
+        assert!(RamLaw::VCF.kappa > 0.0, "kappa must be positive");
+        assert!(RamLaw::VCF.base_mb > 0.0, "baseline must be positive");
+        assert!(RamLaw::VCF.per_sample_mb >= 0.0);
+        // Measured by the 2026-08-11 crossed sweep, which varied
+        // concurrent_chroms at fixed (S, chunk_size) for the first time on
+        // this backend. A refit that drops it back to zero has silently
+        // discarded the per-contig staging cost and restored the
+        // under-prediction #158 was opened about.
+        assert!(
+            RamLaw::VCF.per_contig_mb > 0.0,
+            "VCF's per-contig term is measured, not optional"
+        );
     }
 
     #[test]

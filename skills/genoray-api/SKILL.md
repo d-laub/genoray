@@ -379,12 +379,13 @@ Signature: `from_vcf(out, source, reference=None, *, regions=None, samples=None,
   core-bound-only planning rather than raising. Pass an explicit value to
   raise or lower the budget, or a very large value to approximate unbounded
   planning. **Practical floor:** the planner's RAM law has a fixed
-  cohort-baseline term, so any budget that can't cover baseline plus one
-  concurrent contig is rejected with `ValueError`, even for a tiny cohort. The
-  floor is **backend-specific**: the VCF law's baseline is roughly 932 MB (so
-  in practice anything much below ~1.2 GB is rejected), while `from_pgen`'s is
-  roughly 2.7 GB plus ~210 MB per concurrent contig, putting its floor nearer
-  ~3 GB.
+  cohort-baseline term plus a per-concurrent-contig term, so any budget that
+  can't cover baseline plus one concurrent contig is rejected with
+  `ValueError`, even for a tiny cohort. The floor is **backend-specific**: the
+  VCF law's baseline is roughly 457 MB plus ~111 MB per concurrent contig
+  (so in practice anything much below ~600 MB is rejected), while
+  `from_pgen`'s is roughly 2.7 GB plus ~210 MB per concurrent contig, putting
+  its floor nearer ~3 GB.
 - **`progress=False`/`log_level="info"`** — write-time progress/logging,
   shared by `from_vcf`/`from_pgen`/`from_vcf_list`/`from_svar1`/`write_view`.
   `progress=True` renders live progress: in a terminal or Jupyter, a `rich`
@@ -465,7 +466,7 @@ Signature: `from_pgen(out, source, reference=None, *, regions=None, samples=None
   than raising. Pass an explicit value to raise or lower the budget, or a
   very large value to approximate unbounded planning. **Practical floor:**
   the planner's RAM law has a fixed cohort-baseline term of roughly 2.7 GB
-  (PGEN's own fitted coefficients, higher than `from_vcf`'s ~932 MB), so any
+  (PGEN's own fitted coefficients, higher than `from_vcf`'s ~457 MB), so any
   budget that can't cover baseline plus one concurrent contig's chunk
   buffers is rejected with `ValueError`, even for a tiny cohort. That
   baseline scales with cohort size (`~0.12 MB/sample`), so this isn't just a

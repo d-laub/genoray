@@ -194,7 +194,9 @@ class RamLaw:
     # Declared last, after the pre-existing fields, purely so the many
     # positional `RamLaw(...)` constructions in the tests keep working. The
     # 0.0 default carries the documented meaning "not fitted for this
-    # backend", which is the same thing `RamLaw::VCF` ships.
+    # backend" -- true of both `RamLaw::VCF` and `RamLaw::PGEN` before their
+    # respective 2026-08-11 / 2026-08-08 crossed-sweep refits; both now ship
+    # a measured, nonzero value.
     per_contig_mb: float = 0.0
     # Per-contig cost that scales with cohort width. The 2026-08-08 PGEN
     # crossed sweep measured the per-contig slope at 83.7 MB (S=4,000), 263 MB
