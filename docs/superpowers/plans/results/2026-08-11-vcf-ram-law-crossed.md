@@ -64,7 +64,17 @@ pub const VCF: RamLaw = RamLaw {
 };
 ```
 
-## The interaction-term check (Phase 0) applies here unchanged
+**This refit roughly quadruples `from_vcf`'s real-world memory floor at its
+own defaults** (`chunk_size=25_000`, `reader_workers=3`, cc=1) relative to
+the pre-refit law — the direction is safe (more over-allocation, not an
+OOM), but it is a large, user-visible change: the minimum `max_mem` needed
+to admit even one concurrent contig goes ~1.15 GB → ~1.38 GB at S=4,000,
+~7.8 GB → ~26.4 GB at S=128,000, and ~27.9 GB → ~101.5 GB at S=500,000, so
+(since `max_mem` defaults to 80% of detected RAM, `_utils.py:130`) a
+500k-sample `from_vcf` on a 128 GB host now plans `concurrent_chroms=1`
+where the old law planned 4.
+
+## The interaction-term check (Phase 0) does not speak to the extrapolation this law is actually used for
 
 The pre-registered decision rule was tested in an earlier, zero-cluster-cost
 task against the already-committed 2026-08-08 PGEN crossed data (see
@@ -78,6 +88,33 @@ exactly once. `RamLaw` therefore ships **four** coefficients here too;
 the Rust struct and `scripts/bench_svar2/records.py::RamLaw`. `RamLaw::PGEN`
 is unchanged by this task — a NO-GO does not trigger the refit a GO verdict
 would have required.
+
+**NO-GO is the right answer to the question Phase 0 asked, but that question
+does not cover the extrapolation this law is actually used for, and it would
+be understating the limitation to say otherwise.** Phase 0 scored the
+interaction term on **in-sample worst-case envelope tightness** (1.76%
+against a 20% bar) — a metric that is structurally blind to extrapolation,
+since it only ever compares fits against points the sweep measured. This
+VCF sweep's own check 4 (above) independently shows the per-contig bracket
+is close to linear in cohort width — 48.13 / 89.16 / 175.17 MB at S=4,000 /
+32,000 / 128,000, R² 0.9739 / 0.9898 / 0.9978. Extrapolating that near-linear
+trend to the production cohort size (S=500,000) implies a true per-contig
+bracket near 500 MB, against the 111.43 MB `per_contig_mb` this law ships —
+an **under-charge of roughly 390 MB per concurrent contig** at production
+scale, and under-charging is the OOM direction, not the safe one. What
+actually saves the shipped law at that scale is that the `kappa` term
+dwarfs it: at `from_vcf`'s production chunk size (S=500,000, chunk_size
+25,000, reader_workers=3), the full per-contig bracket
+`plan_sharded` computes (`per_contig_mb + kappa*(w+pending)*chunk_MB`,
+overwhelmingly the `kappa` term) is ~95,514 MB per contig, roughly **250x**
+the ~390 MB the per-contig term under-charges. That
+is a **cancellation between two separately unjustified extrapolations, not
+a designed margin** — the 1.25 margin (above) is the only deliberately
+chosen safety factor in this law, and it was not sized with this
+cancellation in mind. So: NO-GO remains correct for the question Phase 0
+asked (the interaction term is not worth shipping to tighten the in-sample
+envelope), but it is not evidence that the interaction term is unneeded for
+the extrapolation `RamLaw::VCF` is actually asked to make in production.
 
 ## Margin sensitivity
 
@@ -205,20 +242,41 @@ stays open as a research question about the missing interaction term.
   `concurrent_chroms`), so the realised `cc` equals the pinned `cc` for all
   48 rows, including the `cc=16` lever-arm points. `_ram_rows` uses the
   pinned value and never had to fall back or drop a row for this reason.
-- **Production-domain `kappa` beyond 100 MB chunks.** The largest measured
-  chunk (`VCF_BIGCHUNK`, 100 MB) is ~2.68x below `_auto_chunk_size`'s 256 MiB
-  (268.44 MB) production target — much better than the ~16x this sweep's
-  design doc calculated for a same-cells-budget-only design, but still an
-  extrapolation, not a measurement.
+- **Production-domain `kappa` well beyond the measured chunk range.**
+  `_auto_chunk_size` is the wrong target to compare against here: it is
+  called only from `from_pgen`/`from_vcf_list`/`from_svar1`
+  (`_svar2.py:1130,1662,1902`). `from_vcf` — the only consumer of
+  `RamLaw::VCF` — takes a fixed `chunk_size: int = 25_000` (`_svar2.py:650`),
+  which is 800 MB at S=128,000 and 3,125 MB at S=500,000 — **8x and 31x**
+  the largest chunk this sweep measured (`VCF_BIGCHUNK`, 100 MB), not the
+  ~2.68x a comparison against `_auto_chunk_size`'s 256 MiB target would
+  suggest (this task's own biobank-scale test uses
+  `chunk_bytes: 3_125_000_000`, i.e. 3,125 MB, contradicting that comparison
+  within this same commit). Compounding it: all 48 rows have
+  `reader_workers=1`, but production hard-codes `DEFAULT_READER_WORKERS = 3`
+  (`src/lib.rs:159,289`), so the `(w + pending)` multiplier `plan_sharded`
+  applies is 5 in production against 1 as measured — a further 5x. Combined,
+  `kappa` is applied at roughly **156x** the largest measured
+  `(w+pending)·chunk_MB` product when `from_vcf` runs at production scale
+  (S=500,000). For contrast: `RamLaw::PGEN` carries no equivalent `w`
+  extrapolation, since `from_pgen` pins `reader_workers = 1` in production,
+  matching its own measured domain exactly — this asymmetry is
+  VCF-specific. Still an extrapolation, not a measurement, but a
+  considerably larger one than previously stated here.
 
 ## Validity domain
 
-S in {4,000, 32,000, 128,000}; chunk_MB roughly 4–100 MB; `cc` in
-{1, 4, 8, 16}; `reader_workers == 1` and `pending == 0` in every row; 22
-contigs; one node (`carter-cn-03`); `multiallelic_rate` 0.0; no FORMAT/dosage
-fields (gt-only payload, matching issue #156). `per_sample_mb` is
-extrapolated ~3.9x beyond the largest measured cohort (128,000) to reach the
-production target S=500,000.
+S in {4,000, 32,000, 128,000}; chunk_MB roughly 4–100 MB, though chunk_MB
+above 16 exists **only at S=32,000** (2 chunk sizes, 25 and 100 MB, each
+measured at cc=1 and cc=8) — the largest chunk actually measured at
+S=128,000 is 15.9 MB; `cc` in {1, 4, 8, 16}; `reader_workers == 1` and
+`pending == 0` in every row; 22 contigs; one node (`carter-cn-03`);
+`multiallelic_rate` 0.0; no FORMAT/dosage fields (gt-only payload, matching
+issue #156). `per_sample_mb` is extrapolated ~3.9x beyond the largest
+measured cohort (128,000) to reach the production target S=500,000 — the
+smallest of the three extrapolations `from_vcf`'s production defaults incur;
+see the `kappa`/chunk-size point above for the other two (8–31x on chunk
+size, 5x on `reader_workers`).
 
 `cc = 16` sits **outside the production domain**. Unlike the PGEN path
 (`PGEN_MAX_CONCURRENT = 8`, enforced in `src/lib.rs`), nothing in this

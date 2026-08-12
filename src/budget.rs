@@ -189,11 +189,32 @@ impl RamLaw {
     /// `per_contig_per_sample_mb` stays the tested-but-dormant `0.0` default.
     ///
     /// Validity domain: S in {4,000, 32,000, 128,000}, chunk_MB roughly
-    /// 4-100 MB, `cc` in {1,4,8,16}, `reader_workers == 1` and `pending == 0`
-    /// in every row, 22 contigs, one node (`carter-cn-03`), `multiallelic_rate`
-    /// 0.0, no FORMAT/dosage fields (gt-only payload, matching issue #156).
-    /// `per_sample_mb` is extrapolated ~3.9x beyond the largest measured
-    /// cohort (128,000) to reach the production target S=500,000.
+    /// 4-100 MB -- but chunk_MB above 16 exists ONLY at S=32,000 (2 chunk
+    /// sizes, 25 and 100 MB, each measured at cc=1 and cc=8); the largest
+    /// chunk actually measured at S=128,000 is 15.9 MB. `cc` in {1,4,8,16},
+    /// `reader_workers == 1` and `pending == 0` in every row, 22 contigs, one
+    /// node (`carter-cn-03`), `multiallelic_rate` 0.0, no FORMAT/dosage
+    /// fields (gt-only payload, matching issue #156).
+    ///
+    /// Three extrapolations carry this law from the measured domain to
+    /// `from_vcf`'s production defaults (`chunk_size: int = 25_000`,
+    /// `DEFAULT_READER_WORKERS = 3`), and `per_sample_mb`'s is the smallest
+    /// of the three: ~3.9x beyond the largest measured cohort (128,000) to
+    /// reach S=500,000. `from_vcf` does not size chunks via
+    /// `_auto_chunk_size` -- that helper is called only from `from_pgen`,
+    /// `from_vcf_list`, and `from_svar1` -- it takes a fixed
+    /// `chunk_size: int = 25_000`, which is 800 MB at S=128,000 and 3,125 MB
+    /// at S=500,000: **8x and 31x** the largest chunk this sweep measured
+    /// (`VCF_BIGCHUNK`, 100 MB). And every one of the 48 measured rows pinned
+    /// `reader_workers = 1`, but production hard-codes
+    /// `DEFAULT_READER_WORKERS = 3` (`src/lib.rs`), so the `(w + pending)`
+    /// multiplier `plan_sharded` applies is 5 in production against 1 as
+    /// measured -- a further 5x. Combined, `kappa` is applied at roughly
+    /// **156x** the largest measured `(w+pending)*chunk_MB` product when
+    /// `from_vcf` runs at S=500,000. `RamLaw::PGEN` carries no equivalent `w`
+    /// extrapolation: `from_pgen` pins `reader_workers = 1` in production
+    /// (`src/lib.rs`), matching its own measured domain exactly, so this
+    /// asymmetry is VCF-specific.
     ///
     /// `cc = 16` sits OUTSIDE the production domain. Unlike the PGEN path,
     /// nothing in `lib.rs` clamps VCF `concurrent_chroms`, so `cc=16` is
@@ -207,8 +228,14 @@ impl RamLaw {
     /// with cohort width (~48 -> ~90 -> ~175 MB at the smallest measured
     /// chunk size across S=4,000/32,000/128,000), the same non-additive
     /// pattern the PGEN sweep showed. The envelope is safe regardless --
-    /// that is the point of fitting a bound rather than a mean -- but #158
-    /// stays open.
+    /// that is the point of fitting a bound rather than a mean -- but the
+    /// per-contig term's true functional form is a separate open research
+    /// question, tracked as its own follow-up rather than under #158 or
+    /// #160. This refit closes both: #158's umbrella ask -- a cc-aware,
+    /// per-contig-priced envelope for every backend -- is now met by both
+    /// `RamLaw::PGEN` and `RamLaw::VCF`, and #160, which #158 split out
+    /// specifically for VCF's still-cc-blind OLS fit after c100d51 fixed
+    /// only PGEN, is fixed by this same envelope LP.
     pub const VCF: RamLaw = RamLaw {
         base_mb: 457.25887672659735,
         per_sample_mb: 0.011017408281198566,
@@ -696,7 +723,7 @@ mod tests {
         }
     }
 
-    // This budget (1 MB) is far below the cohort baseline (~943 MB), so
+    // This budget (1 MB) is far below the cohort baseline (468.28 MB), so
     // `chunk_size` is powerless here -- only `max_mem` or a smaller cohort
     // can help. The message must say so, and must NOT claim `chunk_size`
     // would help (that would be actionable-sounding but false in this
@@ -732,7 +759,7 @@ mod tests {
             n_contigs: 1,
             n_samples: 1_000,
             chunk_bytes: 10_000_000,
-            max_mem_bytes: Some(1_200_000_000), // covers baseline (~943 MB), not per-contig
+            max_mem_bytes: Some(1_200_000_000), // covers baseline (468.28 MB), not per-contig
             reader_workers: 16,
             ram: RamLaw::VCF,
         })
@@ -788,12 +815,15 @@ mod tests {
         );
     }
 
-    // Per-contig memory is `kappa*(w+(w-1))*chunk_bytes`, so it grows roughly
-    // linearly in `w`: raising the reader count from the fitted default of 3
-    // to 16 costs 6.2x (kappa*(w+w-1) is 31 vs 5) and can turn a plan that
-    // fits into `InsufficientMemory`. This is why `DEFAULT_READER_WORKERS` is
-    // a fitted constant rather than something a caller or a runtime probe
-    // dials up freely -- the memory law, not just throughput, bounds it.
+    // Per-contig memory is `per_contig_mb + kappa*(w+(w-1))*chunk_bytes`. The
+    // kappa term alone grows linearly in `w` and 6.2x raising the reader
+    // count from the fitted default of 3 to 16 (kappa*(w+w-1) is 31 vs 5),
+    // but `per_contig_mb` is a nonzero constant now, so the full bracket
+    // below only grows 4.81x over the same jump (2004.220 / 416.715) -- still
+    // enough to turn a plan that fits into `InsufficientMemory`. This is why
+    // `DEFAULT_READER_WORKERS` is a fitted constant rather than something a
+    // caller or a runtime probe dials up freely -- the memory law, not just
+    // throughput, bounds it.
     //
     // n_samples=1_000, chunk_bytes=10_000_000 (10 MB), re-derived for the
     // 2026-08-11 RamLaw::VCF envelope refit:

@@ -385,7 +385,15 @@ Signature: `from_vcf(out, source, reference=None, *, regions=None, samples=None,
   VCF law's baseline is roughly 457 MB plus ~111 MB per concurrent contig
   (so in practice anything much below ~600 MB is rejected), while
   `from_pgen`'s is roughly 2.7 GB plus ~210 MB per concurrent contig, putting
-  its floor nearer ~3 GB.
+  its floor nearer ~3 GB. **The 2026-08-11 envelope refit roughly
+  quadruples `from_vcf`'s real-world floor at its own defaults**
+  (`chunk_size=25_000`, `reader_workers=3`, cc=1) versus the pre-refit
+  law — safe (it over-allocates, not OOMs), but large: the minimum
+  `max_mem` for one concurrent contig goes ~1.15 GB → ~1.38 GB at
+  S=4,000, ~7.8 GB → ~26.4 GB at S=128,000, and ~27.9 GB → ~101.5 GB at
+  S=500,000, so on a 128 GB host (`max_mem` defaults to 80% of detected
+  RAM) a 500k-sample `from_vcf` now plans `concurrent_chroms=1` where it
+  used to plan 4.
 - **`progress=False`/`log_level="info"`** — write-time progress/logging,
   shared by `from_vcf`/`from_pgen`/`from_vcf_list`/`from_svar1`/`write_view`.
   `progress=True` renders live progress: in a terminal or Jupyter, a `rich`
