@@ -8,18 +8,48 @@
 # A wall-clock kill mid-point is recoverable (see the resume note below) but
 # costs a queue round-trip for nothing.
 #SBATCH --time=72:00:00
+# PIN THE NODE for any run whose rows will be compared or pooled. Measured
+# spread on byte-identical work is 2.08x (151.9s on one node vs 73.2s on
+# another), and unpinned rows have already produced published-then-retracted
+# findings. Submit with:  sbatch --nodelist=carter-cn-04 sweep_scale.sbatch
 #SBATCH --output=%x_%j.log
 
 set -euo pipefail
 
-WT=/carter/users/dlaub/projects/genoray/.claude/worktrees/bench-pr140-reader-workers
-# Slurm's default cwd is the *submission* directory, not this script's location,
-# but every `python -m scripts.bench_svar2.<module>` below needs cwd = repo root
-# to resolve as a package. Without this, resubmitting from anywhere but $WT dies
-# on the first command with ModuleNotFoundError.
+# Repo root DERIVED, not hardcoded. This previously pinned a specific worktree
+# (`bench-pr140-reader-workers`) that no longer exists, so resubmitting from a
+# different tree silently measured the wrong checkout -- or died on the first
+# command. Slurm's default cwd is the SUBMISSION directory, and every
+# `python -m scripts.bench_svar2.<module>` below needs cwd = repo root to
+# resolve as a package.
+WT=$(git -C "$SLURM_SUBMIT_DIR" rev-parse --show-toplevel)
 cd "$WT"
-JD="${CLAUDE_JOB_DIR:?set CLAUDE_JOB_DIR}"/tmp
+
+# NOT $CLAUDE_JOB_DIR/tmp. The harness symlinks that path to node-local disk on
+# the SUBMITTING node, and `sbatch --export=ALL` carries the variable to
+# whatever node runs the job, where it is a DANGLING symlink: mkdir of a child
+# raises FileNotFoundError and the parents=True retry then raises FileExistsError
+# on the symlink itself, naming neither the symlink nor the node. That killed
+# job 13351680 after 6:57:53 with all corpora already built. `probe.py` reads
+# the variable directly, so it must be unset here, not merely avoided.
+unset CLAUDE_JOB_DIR
+SCRATCH="/local/$USER/scale-sweep"
+mkdir -p "$SCRATCH"
+JD="$SCRATCH"
 PX="pixi run --manifest-path $WT/pixi.toml"
+
+# Which sweep families this submission measures. Defaults to the historical list
+# so existing studies are unaffected. Override to measure a subset, e.g. the
+# RAM-law refit (issue #158), which needs only its own family:
+#   sbatch --export=ALL,SWEEP_FAMILIES=vcf_ram --nodelist=<node> sweep_scale.sbatch
+# Corpus generation below is gated on the same variable: generating the scale
+# ladder's corpora costs hours and is pure waste for a run that will not sweep
+# them.
+SWEEP_FAMILIES="${SWEEP_FAMILIES:-vlinear vlinear2 contig concurrency holdout scale}"
+
+# True when $1 appears in $SWEEP_FAMILIES.
+wants() { case " $SWEEP_FAMILIES " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+
 CELLS=1400000000
 
 # `-@ THREADS` is the conversion's TOTAL thread budget and reader workers are
@@ -56,6 +86,11 @@ $PX maturin develop --release
 echo "--- built $(find "$WT/python/genoray" -name '*.so' -printf '%p %TY-%Tm-%Td %TH:%TM\n') ---"
 
 mkdir -p "$JD/corpora" "$JD/plans" "$JD/out"
+
+# The legacy scale/contig/holdout/vlinear/vlinear2/concurrency corpora are
+# expensive to generate (hours) and only feed those six families -- skip the
+# whole section when none of them is selected (e.g. a vcf_ram-only run).
+if wants scale || wants contig || wants holdout || wants vlinear || wants vlinear2 || wants concurrency; then
 
 # --- corpora -----------------------------------------------------------------
 for S in 250 1000 4000 16000 64000 250000 500000; do
@@ -127,6 +162,33 @@ print(' '.join(str(v) for v in VLINEAR2_VARIANTS))
     --out "$OUT" --samples "$VLIN2_S" --variants "$V" --procs 16 --bgzip-threads 8
 done
 
+fi
+
+if wants vcf_ram; then
+
+# --- VCF RAM-law corpora (issue #158) ----------------------------------------
+echo "=== disk headroom before RAM-law corpora ==="
+df -h "/local/$USER"
+time $PX python -c "
+from pathlib import Path
+from scripts.bench_svar2.vcf_corpus import VcfCorpusSpec, generate
+from scripts.bench_svar2.plans.build_plans import (
+    CELLS_BUDGET, VCF_BIGCHUNK, VCF_CONTIGS, VCF_CROSSED, VCF_NCHUNKS,
+)
+out = Path('$SCRATCH/corpora')
+shapes = {(s, CELLS_BUDGET // s) for s in VCF_CROSSED}
+shapes |= {(s, v) for s, vs in VCF_NCHUNKS.items() for v in vs}
+shapes.add((VCF_BIGCHUNK['samples'], VCF_BIGCHUNK['variants']))
+for s, v in sorted(shapes):
+    m = generate(VcfCorpusSpec(s, v, VCF_CONTIGS, seed=42), out)
+    print(m.path, m.compressed_bytes, m.generator_cli_version, flush=True)
+"
+echo "=== disk headroom after RAM-law corpora ==="
+df -h "/local/$USER"
+du -sh "$SCRATCH/corpora"
+
+fi
+
 # --- plans and sweeps --------------------------------------------------------
 $PX python -m scripts.bench_svar2.plans.build_plans \
   --corpus-dir "$JD/corpora" --out-dir "$JD/plans" --threads "$THREADS"
@@ -155,11 +217,47 @@ $PX python -m scripts.bench_svar2.plans.build_plans \
 # than repeats. That also means point_id must stay stable -- it hashes every
 # SweepPoint field including `threads` and `reps`, so changing
 # --cpus-per-task invalidates resume as well as the regime.
-for NAME in vlinear vlinear2 contig concurrency holdout scale; do
+for NAME in $SWEEP_FAMILIES; do
   $PX python -m scripts.bench_svar2.sweep \
     --plan "$JD/plans/$NAME.json" \
     --results "$JD/out/$NAME.ndjson" \
     --outdir "$JD/out/$NAME"
+
+  if [ "$NAME" = "vcf_ram" ]; then
+    # Row count vs plan count. The 2026-08-07 contamination was invisible in every
+    # summary its run printed -- exit 0, all points ok, matching row count -- because
+    # stale rows counted as recorded. What did NOT match was how many points the run
+    # actually MEASURED. Fail loudly here, not in a fit weeks later.
+    $PX python - "$JD/plans/vcf_ram.json" "$JD/out/vcf_ram.ndjson" <<'PYEOF'
+import json, sys
+plan, results = sys.argv[1], sys.argv[2]
+n_plan = len(json.load(open(plan)))
+rows = [json.loads(line) for line in open(results) if line.strip()]
+ids = {r["point_id"] for r in rows}
+print(f"plan points: {n_plan}   result rows: {len(rows)}   unique ids: {len(ids)}")
+bad = [r["point_id"] for r in rows if not r.get("ok") and r.get("oom_at_rss_mb") is None]
+if bad:
+    # A point that failed for a reason other than a deliberate OOM probe is
+    # not a measurement. This used to be a print-and-continue, which is why a
+    # run where ALL 48 rows failed on the same "symbolic ALT out of scope"
+    # error (job 13355460) still printed "OK: every planned point measured"
+    # and exited 0 -- the guard checked row COUNT, never row VALIDITY. An OOM
+    # row (`oom_at_rss_mb` set) is excluded above and must keep passing.
+    sys.exit(
+        f"ABORT: {len(bad)} of {len(rows)} point(s) failed (not OOM "
+        f"deliverables): {bad[:5]}"
+    )
+if len(ids) != n_plan:
+    sys.exit(f"ABORT: {len(ids)} distinct points in results, plan has {n_plan}")
+nodes = {r.get("node") for r in rows}
+if len(nodes) > 1:
+    sys.exit(f"ABORT: rows span multiple nodes {nodes} -- not comparable")
+missing = [r["point_id"] for r in rows if r.get("concurrent_chroms_used") is None]
+if missing:
+    print(f"WARNING: {len(missing)} row(s) never reported a realised cc")
+print(f"OK: every planned point measured, single node {nodes}")
+PYEOF
+  fi
 done
 
 echo "=== ALL DONE ==="

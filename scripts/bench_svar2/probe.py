@@ -32,6 +32,32 @@ ANSI = re.compile(r"\x1b\[[0-9;]*m")
 RE_PHASE1 = re.compile(r"done:.*?\(([0-9.]+)s\)")
 RE_SAMPLER = re.compile(r"pipeline sampler .*")
 RE_UNIT = re.compile(r"shard unit done .*?unit_secs=([0-9.]+)")
+# `tracing::info!(concurrent_chroms, ..., "pipeline config")` in src/lib.rs --
+# emitted by BOTH backends (the PGEN one is "pipeline config (PGEN)"), so this
+# pattern must stay loose enough to match either. IN PRINCIPLE this would be
+# the only record of the concurrency the planner actually chose
+# (`SweepPoint.concurrent_chroms` is only the REQUEST, None whenever a point
+# lets the planner decide) -- but through this Python CLI path it is
+# currently ALWAYS a no-op. `src/logging.rs`'s `FieldGrab` visitor, which
+# turns this event into what crosses the channel to Python, forwards only
+# `message` and `chrom`; every other field, including `concurrent_chroms`,
+# is dropped before it reaches here. The stderr fmt-layer fallback that
+# *would* render the fields as text is also closed off: `_build_env` below
+# sets `GENORAY_LOG=genoray::monitor=trace`, which enables only the
+# `genoray::monitor` target, and this event's target is plain `genoray`. So
+# `RE_PIPELINE_CONFIG` never has anything to match against, and
+# `concurrent_chroms_used` in the returned dict is always `None` -- see
+# issue #162. A sweep author who writes an unpinned point
+# (`SweepPoint.concurrent_chroms=None`), trusting this fallback to recover
+# what the planner actually chose, gets every such row SILENTLY DROPPED by
+# `_ram_rows` instead of an error -- and the gate would then certify an
+# envelope fitted on a subset that excludes exactly the planner-chosen
+# production configurations, which is the under-prediction / OOM direction.
+# Every point in every sweep committed so far pins `concurrent_chroms`
+# instead (see issue #161's "interim workaround"), so no shipped law has
+# actually been affected -- but nothing catches a future point that forgets
+# to.
+RE_PIPELINE_CONFIG = re.compile(r"pipeline config.*")
 
 
 def _field(line: str, key: str) -> str | None:
@@ -74,6 +100,12 @@ def parse_trace(text: str) -> dict:
             shard.append(float(sv.rstrip("%")))
             execp.append(float(ev.rstrip("%")))
 
+    cc_used: int | None = None
+    for line in RE_PIPELINE_CONFIG.findall(plain):
+        v = _field(line, "concurrent_chroms")
+        if v is not None:
+            cc_used = int(v)
+
     return {
         "phase1_s": phase1,
         "dense_occupancy": tuple(dense),
@@ -83,6 +115,7 @@ def parse_trace(text: str) -> dict:
         "pending_highwater": pending_hw,
         "pending_bytes_highwater": pending_bytes_hw,
         "shard_unit_secs": tuple(float(x) for x in RE_UNIT.findall(plain)),
+        "concurrent_chroms_used": cc_used,
     }
 
 
@@ -186,12 +219,24 @@ def _build_cmd(point: SweepPoint, manifest: CorpusManifest, store: Path) -> list
         str(point.threads),
         "--chunk-size",
         str(point.chunk_size),
+        # Unconditional for BOTH backends. Corpora for both `vcf` and `pgen`
+        # points now come from the same `vcfixture bulk`
+        # `germline-1kgp-varskew` profile (Task 3 switched the VCF RAM-law
+        # corpora over to it too), and that profile emits symbolic ALTs at a
+        # low rate (`fitted.variant_classes.symbolic` ~= 0.135%, ~236 in a
+        # 175,000-variant corpus). Without this flag a single `<DEL>` aborts
+        # the whole conversion -- for PGEN because plink2 passes symbolics
+        # into the .pvar where `check_ref="e"` rejects them, and for VCF
+        # because `SparseVar2.from_vcf` raises on the first one it meets. This
+        # flag being gated on `backend == "pgen"` only is exactly what wasted
+        # a full 48-point `vcf_ram` sweep (job 13355460): every row failed
+        # with the same "symbolic/breakend ALT ... out of scope" error. It is
+        # a documented no-op on corpora with no symbolic ALTs (e.g.
+        # `scale_corpus.py`'s numpy generator), so one unconditional code path
+        # serves both backends and there is no second condition to get wrong
+        # later.
+        "--skip-symbolics-and-breakends",
     ]
-    if point.backend == "pgen":
-        # The germline-1kgp profile emits symbolic ALTs at a low rate and
-        # plink2 passes them into the .pvar, where check_ref="e" would abort
-        # the whole conversion on the first one.
-        cmd.append("--skip-symbolics-and-breakends")
     return cmd
 
 
@@ -365,6 +410,7 @@ def run_point(
                 oom_at_rss_mb=oom,
                 error=err[-2000:],
                 node=platform.node(),
+                concurrent_chroms_used=None,
             )
 
         t = parse_trace(out + err)
@@ -384,6 +430,7 @@ def run_point(
             pending_bytes_highwater=t["pending_bytes_highwater"],
             shard_unit_secs=t["shard_unit_secs"],
             node=platform.node(),
+            concurrent_chroms_used=t["concurrent_chroms_used"],
         )
         # Min-of-N on wall time; the cluster is shared, so the minimum is the
         # least contended estimate.

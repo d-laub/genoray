@@ -19,6 +19,19 @@ from scripts.bench_svar2.scale_corpus import (
     MIN_CHUNKS,
     size_corpus,
 )
+from scripts.bench_svar2.vcf_corpus import (
+    VcfCorpusSpec,
+    corpus_stem as _vcf_corpus_stem,
+)
+
+
+def vcf_stem(samples: int, variants: int) -> str:
+    """Corpus stem for a VCF RAM-law point, via the generator's own namer so
+    the plan and the corpus cannot drift apart."""
+    return _vcf_corpus_stem(
+        VcfCorpusSpec(samples=samples, variants=variants, contigs=VCF_CONTIGS, seed=42)
+    )
+
 
 CELLS_BUDGET = 1_400_000_000
 SCALE_SAMPLES = (250, 1_000, 4_000, 16_000, 64_000, 250_000, 500_000)
@@ -36,6 +49,72 @@ CONTIG_COUNTS = (1, 2, 8, 22)
 # name, which `test_every_point_id_is_unique` exists to catch.
 CONCURRENCY_CHROMS = (1, 8, 15, 22)
 CONCURRENCY_READER_WORKERS = 3
+
+# --- VCF RAM-law crossed design (issue #158) ---------------------------------
+# The PGEN crossed grid does not port directly: VCF corpora are TEXT, so the
+# cell budget binds. Per-variant chunk bytes are `samples*ploidy/8` and the
+# >=1-chunk-per-contig invariant caps chunk_size at V/n_contigs, so
+#
+#     max chunk_MB = cells / (4 * n_contigs * 1e6)
+#
+# which at CELLS_BUDGET over 22 contigs is 15.9 MB -- INDEPENDENT of cohort
+# width. The `cc` lever arm wants many contigs and the `chunk_MB` lever arm
+# wants few, and at a fixed cell budget they are in direct conflict. Hence the
+# constant-cells grid below for cc, plus ONE oversized corpus (VCF_BIGCHUNK)
+# whose only job is to carry kappa out to ~100 MB. That is NOT the ~16x-to-2.7x
+# cut this comment used to claim -- that number compared against
+# `_auto_chunk_size`'s 256 MiB target, but `from_vcf` (`RamLaw::VCF`'s only
+# consumer) takes a fixed `chunk_size: int = 25_000` and never calls
+# `_auto_chunk_size` (that helper serves only `from_pgen`/`from_vcf_list`/
+# `from_svar1`). Against `from_vcf`'s actual fixed chunk size, VCF_BIGCHUNK's
+# ~100 MB cuts the extrapolation from ~50x (15.9 MB) to ~8x at S=128,000
+# (chunk_MB=800), and from ~197x to ~31x at S=500,000 (chunk_MB=3,125) --
+# still large, and compounded a further ~5x by `reader_workers` going 1->3 in
+# production, for `kappa` applied at roughly 156x its measured range overall.
+# See `RamLaw::VCF`'s doc comment in `src/budget.rs` and
+# `docs/superpowers/plans/results/2026-08-11-vcf-ram-law-crossed.md` for the
+# full derivation.
+VCF_CONTIGS = tuple(f"chr{i}" for i in range(1, 23))
+
+# Cohort widths for the crossed grid. V is derived (CELLS_BUDGET // S) so every
+# corpus costs the same to generate.
+VCF_CROSSED_SAMPLES = (4_000, 32_000, 128_000)
+
+# cc=16 exceeds any production clamp and is reachable only through the
+# bench-only GENORAY_CONCURRENT_CHROMS override. It is here for LEVER ARM on
+# the per-contig term and sits OUTSIDE the production domain -- the same role
+# and the same caveat as the PGEN law's cc=16 rows.
+VCF_CROSSED_CC = (1, 4, 8, 16)
+
+# {V/88, V/44, V/22} -> ~4/8/16 MB at every width, the largest sitting exactly
+# on the per-contig cap. Fractions of V, not literals, so the grid stays
+# uniform if CELLS_BUDGET ever moves.
+VCF_CROSSED: dict[int, tuple[int, ...]] = {
+    s: tuple((CELLS_BUDGET // s) // d for d in (88, 44, 22))
+    for s in VCF_CROSSED_SAMPLES
+}
+
+# n_chunks at CONSTANT chunk_bytes -- the orthogonal lever that decides whether
+# a per-chunk term is real or merely a reparameterisation of kappa. chunk_size
+# is pinned at what the SMALLEST V rung permits, so chunk_bytes is identical
+# across a row's rungs and only V (hence the chunk count) moves.
+VCF_NCHUNKS_SAMPLES = (4_000, 32_000)
+VCF_NCHUNKS_CC = (1, 8)
+VCF_NCHUNKS: dict[int, tuple[int, ...]] = {
+    s: tuple((CELLS_BUDGET // s) * m // 2 for m in (1, 2, 4))
+    for s in VCF_NCHUNKS_SAMPLES
+}
+
+# One oversized corpus, ~7.9x CELLS_BUDGET, purely for kappa's lever arm.
+# 1.1e10 cells at S=32,000 gives V=343,750 and 15,625 variants per contig, so
+# chunk_size 12,500 is 100 MB and still clears the per-contig cap.
+VCF_BIGCHUNK = {
+    "samples": 32_000,
+    "variants": 343_750,
+    "chunk_sizes": (3_125, 12_500),
+    "cc": (1, 8),
+}
+
 # Single source of truth for the hold-out corpus's shape: `sweep_scale.sbatch`
 # reads this back (via `python -c 'from ... import HOLDOUT; ...'`) instead of
 # repeating the numbers, so editing one cannot silently drift from the other.
@@ -340,7 +419,8 @@ def _point(
 
 
 def build(corpus_dir: Path, threads: int) -> dict[str, list[SweepPoint]]:
-    scale, contig, holdout, vlinear, vlinear2, concurrency, pgen = (
+    scale, contig, holdout, vlinear, vlinear2, concurrency, pgen, vcf_ram = (
+        [],
         [],
         [],
         [],
@@ -514,6 +594,60 @@ def build(corpus_dir: Path, threads: int) -> dict[str, list[SweepPoint]]:
     seen: set[str] = set()
     pgen = [p for p in pgen if not (p.point_id in seen or seen.add(p.point_id))]
 
+    # --- VCF RAM-law axes (issue #158) --------------------------------------
+    # `w=1` throughout: reader_workers is a separate, already-fitted axis and
+    # varying it here would confound the per-contig term these points exist to
+    # identify.
+    for s_c, chunk_sizes in VCF_CROSSED.items():
+        v_c = CELLS_BUDGET // s_c
+        corpus = corpus_dir / f"{vcf_stem(s_c, v_c)}.manifest.json"
+        for cs in chunk_sizes:
+            for cc in VCF_CROSSED_CC:
+                vcf_ram.append(_point(corpus, 1, cs, threads, concurrent=cc))
+
+    for s_n, variants in VCF_NCHUNKS.items():
+        pinned = min(variants) // len(VCF_CONTIGS)
+        for v_n in variants:
+            corpus = corpus_dir / f"{vcf_stem(s_n, v_n)}.manifest.json"
+            for cc in VCF_NCHUNKS_CC:
+                vcf_ram.append(_point(corpus, 1, pinned, threads, concurrent=cc))
+
+    s_b, v_b = VCF_BIGCHUNK["samples"], VCF_BIGCHUNK["variants"]
+    corpus_b = corpus_dir / f"{vcf_stem(s_b, v_b)}.manifest.json"
+    for cs in VCF_BIGCHUNK["chunk_sizes"]:
+        for cc in VCF_BIGCHUNK["cc"]:
+            vcf_ram.append(_point(corpus_b, 1, cs, threads, concurrent=cc))
+
+    # Order-preserving dedupe on the full identity, the same way the PGEN axes
+    # are deduped: the n_chunks ladder's middle rung IS the crossed grid's
+    # corpus, so the two axes can legitimately request the same configuration.
+    # 4 of the 52 raw points collide this way (both cc={1,8} land in
+    # VCF_CROSSED_CC too): S=4,000's n_chunks middle rung is V=350,000 (the
+    # same corpus as the crossed grid's S=4,000 point) with pinned chunk_size
+    # 175,000 // 22 = 7,954, which equals the crossed grid's own middle chunk
+    # 350,000 // 44 = 7,954; S=32,000's n_chunks middle rung is V=43,750 (again
+    # the crossed grid's own corpus) with pinned chunk_size 21,875 // 22 = 994,
+    # equal to the crossed grid's 43,750 // 44 = 994. 2 collisions x 2 cohort
+    # widths = 4 duplicates, so 52 raw points dedupe to 48 distinct ones.
+    seen_vcf: set[str] = set()
+    vcf_ram = [
+        p for p in vcf_ram if not (p.point_id in seen_vcf or seen_vcf.add(p.point_id))
+    ]
+
+    # A point above V/n_contigs would be fitted against a chunk that is never
+    # resident (see `model._resident_chunk_size`, which clamps by TOTAL V).
+    # Assert at BUILD time: a plan that cannot be fitted correctly must not
+    # reach a node and consume hours first.
+    for pt in vcf_ram:
+        v_pt = int(Path(pt.corpus).name.split("_v")[1].split(".")[0])
+        per_contig = v_pt // len(VCF_CONTIGS)
+        if pt.chunk_size > per_contig:
+            raise ValueError(
+                f"{Path(pt.corpus).name}: chunk_size={pt.chunk_size:,} exceeds "
+                f"{per_contig:,} variants per contig, so the fitted chunk_bytes "
+                "would price memory that is never resident"
+            )
+
     return {
         "scale": scale,
         "contig": contig,
@@ -522,6 +656,7 @@ def build(corpus_dir: Path, threads: int) -> dict[str, list[SweepPoint]]:
         "vlinear2": vlinear2,
         "concurrency": concurrency,
         "pgen": pgen,
+        "vcf_ram": vcf_ram,
     }
 
 

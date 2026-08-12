@@ -741,10 +741,14 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         core-bound-only behavior rather than raising. Pass an explicit value
         to raise or lower the budget, or a very large value to approximate
         unbounded planning. Note the practical floor: the planner's RAM law
-        has a fixed cohort-baseline term of roughly 932 MB, so any budget
-        that can't cover baseline plus one concurrent contig's chunk buffers
-        -- in practice, anything much below ~1.2 GB -- is rejected with a
-        `ValueError` even for a tiny cohort.
+        has a fixed cohort-baseline term of roughly 457 MB (plus ~0.011
+        MB/sample), but that alone understates the floor here -- at this
+        method's own defaults (`chunk_size=25_000`, three reader shards per
+        contig) the per-contig term dominates, putting the real floor at
+        roughly 1.38 GB even for a tiny cohort (S=4,000). Any budget that
+        can't cover baseline plus one concurrent contig's chunk buffers --
+        in practice, anything much below that -- is rejected with a
+        `ValueError`.
         """
         from cyvcf2 import VCF as _CyVCF
         from genoray._sample_select import _normalize_samples
@@ -960,11 +964,11 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         value to approximate unbounded planning. Note the practical floor:
         the planner's RAM law has a fixed cohort-baseline term of roughly
         2.7 GB (PGEN's own fitted coefficients, higher than `from_vcf`'s
-        ~932 MB), so any budget that can't cover baseline plus one
+        ~457 MB), so any budget that can't cover baseline plus one
         concurrent contig's chunk buffers is rejected with a `ValueError`
         even for a tiny cohort. That baseline term also scales with cohort
-        size (`~0.12 MB/sample`), so this floor is not just a small-cohort
-        curiosity: at ~500k samples the baseline alone predicts ~63 GB,
+        size (`~0.0158 MB/sample`), so this floor is not just a small-cohort
+        curiosity: at ~500k samples the baseline alone predicts ~10.6 GB,
         so a *detected* budget (80% of a smaller host's RAM) will reject
         the conversion outright -- pass an explicit `max_mem` sized to the
         host in that case.
