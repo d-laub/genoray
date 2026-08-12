@@ -122,6 +122,20 @@ print(HOLDOUT['samples'], HOLDOUT['variants'], ','.join(HOLDOUT['format_fields']
   --out "$JD/corpora/holdout.vcf.gz" --samples "$HOLDOUT_S" --variants "$HOLDOUT_V" \
   --format-fields "$HOLDOUT_F" --procs 16 --bgzip-threads 8
 
+# Hold-out at F=0: same single-source-of-truth pattern as the block above.
+# `build_plans.py` dispatches a plan point against this corpus but nothing
+# generated it, so `holdout` aborted the whole job on any machine where it
+# did not already exist (issue #151 -- the same gap #141 fixed for
+# vlinear2). HOLDOUT_F0["format_fields"] is empty, so `--format-fields` is
+# deliberately omitted: its argparse default is already "".
+read -r HOLDOUT_F0_S HOLDOUT_F0_V < <($PX python -c "
+from scripts.bench_svar2.plans.build_plans import HOLDOUT_F0
+print(HOLDOUT_F0['samples'], HOLDOUT_F0['variants'])
+")
+[ -f "$JD/corpora/holdout_f0.manifest.json" ] || $PX python -m scripts.bench_svar2.scale_corpus \
+  --out "$JD/corpora/holdout_f0.vcf.gz" --samples "$HOLDOUT_F0_S" \
+  --variants "$HOLDOUT_F0_V" --procs 16 --bgzip-threads 8
+
 # V-linearity ladder (C2): fixed small S, V varies alone. Shape comes from
 # plans/build_plans.py's VLINEAR_SAMPLES/VLINEAR_VARIANTS -- same
 # single-source-of-truth reasoning as the hold-out above. This is the ladder

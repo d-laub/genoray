@@ -273,6 +273,38 @@ def test_check_oracle_allows_cross_corpus_divergence_but_flags_within_corpus():
     assert "c1" in err
 
 
+def test_run_sweep_fails_before_measuring_when_a_corpus_is_missing(tmp_path):
+    """#151: manifests load lazily inside the point loop, so a plan point
+    whose corpus nobody generates surfaces hours into an overnight job. Fail
+    at second zero instead, naming EVERY missing manifest rather than the
+    first."""
+    pts = [
+        {
+            "corpus": str(tmp_path / f"absent_{i}.manifest.json"),
+            "reader_workers": 1,
+            "concurrent_chroms": None,
+            "shard_htslib": 0,
+            "overshard": 4,
+            "chunk_size": 25_000,
+            "threads": 16,
+            "reps": 1,
+        }
+        for i in range(2)
+    ]
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(json.dumps(pts))
+
+    def runner(point, manifest, outdir, warm=True):
+        raise AssertionError("no point may run when a corpus is missing")
+
+    with pytest.raises(FileNotFoundError) as exc:
+        run_sweep(plan_path, tmp_path / "r.ndjson", tmp_path / "out", runner=runner)
+
+    msg = str(exc.value)
+    assert "absent_0.manifest.json" in msg
+    assert "absent_1.manifest.json" in msg
+
+
 def test_check_oracle_ignores_records_whose_point_id_left_the_plan():
     """A plan edited between runs shouldn't crash the oracle check -- a
     stale record with no home in the current plan is simply unattributable,

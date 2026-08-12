@@ -70,6 +70,24 @@ def pending_points(
     return [p for p in plan if (p.point_id, code_id) not in done]
 
 
+def check_corpora(points: Sequence[SweepPoint]) -> None:
+    """Raise naming EVERY plan point whose corpus manifest is absent.
+
+    `run_sweep` loads manifests lazily inside the point loop, so a plan that
+    names a corpus nobody generates fails hours into an overnight job -- and
+    under `set -euo pipefail` that aborts the whole sbatch (issue #151, and
+    #141 before it for `vlinear2`). Reporting all of them at once means one
+    generation pass fixes the run, rather than one per resubmit.
+    """
+    missing = sorted({p.corpus for p in points if not Path(p.corpus).exists()})
+    if missing:
+        listed = "\n".join(f"  {m}" for m in missing)
+        raise FileNotFoundError(
+            f"{len(missing)} corpus manifest(s) named by the plan do not "
+            f"exist:\n{listed}"
+        )
+
+
 def check_oracle(
     records: Sequence[ProbeRecord], plan: Sequence[SweepPoint]
 ) -> str | None:
@@ -119,6 +137,9 @@ def run_sweep(
     run_id = os.environ.get("SLURM_JOB_ID") or uuid.uuid4().hex[:16]
 
     pending = pending_points(plan, results_path, code_id)
+    # Pending only, not the whole plan: a fully-resumed sweep whose corpora
+    # were since cleaned up has nothing left to read and must not fail.
+    check_corpora(pending)
     reused = len(plan) - len(pending)
     measured = 0
 
