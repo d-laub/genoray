@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from scripts.bench_svar2 import scale_corpus
 from scripts.bench_svar2.probe import (
     _build_env,
     _is_oom_failure,
@@ -131,6 +132,50 @@ def test_empty_input_yields_zeroed_trace():
     assert t["phase1_s"] == 0.0
     assert t["pending_highwater"] == 0
     assert t["dense_occupancy"] == ()
+
+
+def test_run_point_records_the_realised_concurrent_chroms(tmp_path: Path):
+    """#162 regression, exercising the REAL Python channel path.
+
+    The `parse_trace` tests above feed synthetic fmt-layer TEXT straight to
+    the parser. They passed throughout the period in which the channel path
+    carried no structured fields at all, so they could not have caught this.
+    This test drives the actual `genoray._cli` subprocess `run_point` runs,
+    with `concurrent_chroms` deliberately UNPINNED so the planner chooses and
+    this field is the only record of its choice.
+
+    Requires a freshly built extension: `pixi run maturin develop --release`.
+    `pixi run test` does not rebuild it.
+    """
+    manifest = scale_corpus.generate(
+        tmp_path / "tiny.vcf.gz",
+        samples=8,
+        variants=200,
+        contigs=["chr22"],
+        format_fields=(),
+        seed=42,
+        procs=1,
+        bgzip_threads=1,
+    )
+    point = SweepPoint(
+        corpus=str(tmp_path / "tiny.manifest.json"),
+        reader_workers=1,
+        concurrent_chroms=None,  # unpinned: the planner decides
+        shard_htslib=0,
+        overshard=4,
+        chunk_size=64,
+        threads=2,
+        reps=1,
+    )
+
+    rec = run_point(point, manifest, tmp_path / "out", warm=False)
+
+    assert rec.ok, rec.error
+    assert rec.concurrent_chroms_used is not None, (
+        "the planner's realised concurrent_chroms did not survive the "
+        "channel path -- see issue #162"
+    )
+    assert rec.concurrent_chroms_used >= 1
 
 
 def _fake_build_cmd(point, manifest, store):

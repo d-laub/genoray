@@ -124,28 +124,12 @@ class ProbeRecord:
     # Defaulted to "" so records written before this field existed still load
     # (`from_json` drops unknown keys but cannot invent missing ones).
     node: str = ""
-    # The concurrency the planner ACTUALLY dispatched. `SweepPoint.
-    # concurrent_chroms` is only the REQUEST and is None whenever the point
-    # let the planner choose, which made every such point unfittable -- 12 of
-    # the 58 rows in the 2026-08-08 PGEN crossed sweep (issue #158). None
-    # still means UNOBSERVED, never 1.
-    #
-    # INTENDED to be parsed from the child's `pipeline config` tracing line,
-    # but as of this field's introduction (a5d1c6f) that path is inert:
-    # `src/logging.rs`'s `FieldGrab` visitor forwards only `message` and
-    # `chrom` to Python, stripping `concurrent_chroms` and every other
-    # structured field before `probe.py`'s `RE_PIPELINE_CONFIG` ever sees the
-    # line, and the stderr fmt-layer fallback that would otherwise carry the
-    # fields is closed off by `probe.py` setting
-    # `GENORAY_LOG=genoray::monitor=trace` (this event's target is `genoray`,
-    # not `genoray::monitor`). So this field is **always `None` through the
-    # Python CLI path** -- see issue #162. A sweep point that leaves
-    # `concurrent_chroms` unpinned, relying on this field as a fallback, will
-    # have its row SILENTLY DROPPED by `_ram_rows` rather than erroring, and
-    # a law fitted on the survivors would silently exclude exactly the
-    # planner-chosen production configurations -- the under-prediction / OOM
-    # direction. Every sweep committed so far works around this by pinning
-    # `concurrent_chroms` on every point (issue #161's "interim workaround").
+    # The concurrency the planner ACTUALLY dispatched, parsed from the
+    # child's `pipeline config` tracing line. `SweepPoint.concurrent_chroms`
+    # is only the REQUEST and is None whenever the point let the planner
+    # choose. None here still means UNOBSERVED, never 1 -- `_ram_rows` drops
+    # such rows rather than inventing a value, and `sweep_scale.sbatch`
+    # aborts on them.
     #
     # Defaulted for the same reason `node` is: records written before this
     # field existed must still load.
