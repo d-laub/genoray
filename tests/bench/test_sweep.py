@@ -9,7 +9,13 @@ from scripts.bench_svar2.records import (
     append_ndjson,
     read_ndjson,
 )
-from scripts.bench_svar2.sweep import check_oracle, load_plan, pending_points, run_sweep
+from scripts.bench_svar2.sweep import (
+    build_code_id,
+    check_oracle,
+    load_plan,
+    pending_points,
+    run_sweep,
+)
 
 pytestmark = pytest.mark.bench
 
@@ -43,7 +49,9 @@ def _plan_pts(mapping: dict[str, str]):
     ]
 
 
-def _rec(pid: str, digest: str = "aaa", ok: bool = True) -> ProbeRecord:
+def _rec(
+    pid: str, digest: str = "aaa", ok: bool = True, code_id: str = ""
+) -> ProbeRecord:
     return ProbeRecord(
         point_id=pid,
         ok=ok,
@@ -59,6 +67,7 @@ def _rec(pid: str, digest: str = "aaa", ok: bool = True) -> ProbeRecord:
         pending_highwater=0,
         pending_bytes_highwater=0,
         shard_unit_secs=(1.0,),
+        code_id=code_id,
     )
 
 
@@ -71,14 +80,50 @@ def test_load_plan_returns_sweep_points(tmp_path):
 def test_pending_skips_already_recorded_points(tmp_path):
     plan = load_plan(_plan_file(tmp_path))
     results = tmp_path / "r.ndjson"
-    append_ndjson(results, _rec(plan[0].point_id))
-    remaining = pending_points(plan, results)
+    append_ndjson(results, _rec(plan[0].point_id, code_id="samebuild0000000"))
+    remaining = pending_points(plan, results, "samebuild0000000")
     assert [p.point_id for p in remaining] == [plan[1].point_id, plan[2].point_id]
 
 
 def test_pending_returns_all_when_no_results_yet(tmp_path):
     plan = load_plan(_plan_file(tmp_path))
-    assert len(pending_points(plan, tmp_path / "absent.ndjson")) == 3
+    assert len(pending_points(plan, tmp_path / "absent.ndjson", "")) == 3
+
+
+def test_pending_requeues_a_point_measured_by_different_code(tmp_path):
+    """#159: `point_id` hashes the CONFIGURATION only, so two runs of one
+    configuration against different code are indistinguishable to it --
+    exactly the case a benchmark exists to distinguish. On PR #154 that
+    served 12 rows describing the old reader as measurements of the new
+    one."""
+    plan = load_plan(_plan_file(tmp_path))
+    results = tmp_path / "r.ndjson"
+    append_ndjson(results, _rec(plan[0].point_id, code_id="oldbuild00000000"))
+    remaining = pending_points(plan, results, "newbuild11111111")
+    assert [p.point_id for p in remaining] == [p.point_id for p in plan]
+
+
+def test_pending_skips_a_point_measured_by_the_same_code(tmp_path):
+    plan = load_plan(_plan_file(tmp_path))
+    results = tmp_path / "r.ndjson"
+    append_ndjson(results, _rec(plan[0].point_id, code_id="samebuild0000000"))
+    remaining = pending_points(plan, results, "samebuild0000000")
+    assert [p.point_id for p in remaining] == [plan[1].point_id, plan[2].point_id]
+
+
+def test_pending_requeues_rows_written_before_code_id_existed(tmp_path):
+    """Pre-existing rows carry code_id="" and are re-measured. Failing
+    toward MEASURING is the correct default for a provenance gap."""
+    plan = load_plan(_plan_file(tmp_path))
+    results = tmp_path / "r.ndjson"
+    append_ndjson(results, _rec(plan[0].point_id, code_id=""))
+    assert len(pending_points(plan, results, "anybuild00000000")) == 3
+
+
+def test_build_code_id_is_stable_and_nonempty():
+    """Hashes the ARTIFACT, so it must be reproducible within one process."""
+    assert build_code_id() == build_code_id()
+    assert len(build_code_id()) == 16
 
 
 def test_run_sweep_is_resumable(tmp_path):
@@ -113,6 +158,41 @@ def test_run_sweep_is_resumable(tmp_path):
     calls.clear()
     run_sweep(plan_path, results, tmp_path / "out", runner=runner)
     assert calls == []
+
+
+def test_run_sweep_reports_measured_and_reused_separately(tmp_path):
+    """The contaminated run printed `18 points recorded` for 6
+    measurements. The row count is the size of the output FILE, not work
+    performed (#159)."""
+    plan_path = _plan_file(tmp_path)
+    results = tmp_path / "r.ndjson"
+
+    def runner(point, manifest, outdir, warm=True):
+        return _rec(point.point_id)
+
+    (tmp_path / "c.manifest.json").write_text(
+        json.dumps(
+            {
+                "path": str(tmp_path / "c.vcf.gz"),
+                "samples": 10,
+                "variants": 100,
+                "contigs": ["chr22"],
+                "format_fields": [],
+                "ploidy": 2,
+                "cells": 1000,
+                "compressed_bytes": 10,
+                "seed": 1,
+                "generator_version": 1,
+            }
+        )
+    )
+
+    first = run_sweep(plan_path, results, tmp_path / "out", runner=runner)
+    assert (first.measured, first.reused) == (3, 0)
+
+    second = run_sweep(plan_path, results, tmp_path / "out", runner=runner)
+    assert (second.measured, second.reused) == (0, 3)
+    assert len(second.records) == 3
 
 
 def test_run_sweep_fails_fast_on_a_within_corpus_digest_mismatch(tmp_path):
