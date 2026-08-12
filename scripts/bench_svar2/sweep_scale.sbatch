@@ -223,12 +223,11 @@ for NAME in $SWEEP_FAMILIES; do
     --results "$JD/out/$NAME.ndjson" \
     --outdir "$JD/out/$NAME"
 
-  if [ "$NAME" = "vcf_ram" ]; then
-    # Row count vs plan count. The 2026-08-07 contamination was invisible in every
-    # summary its run printed -- exit 0, all points ok, matching row count -- because
-    # stale rows counted as recorded. What did NOT match was how many points the run
-    # actually MEASURED. Fail loudly here, not in a fit weeks later.
-    $PX python - "$JD/plans/vcf_ram.json" "$JD/out/vcf_ram.ndjson" <<'PYEOF'
+  # Row count vs plan count. The 2026-08-07 contamination was invisible in every
+  # summary its run printed -- exit 0, all points ok, matching row count -- because
+  # stale rows counted as recorded. What did NOT match was how many points the run
+  # actually MEASURED. Fail loudly here, not in a fit weeks later.
+  $PX python - "$JD/plans/$NAME.json" "$JD/out/$NAME.ndjson" <<'PYEOF'
 import json, sys
 plan, results = sys.argv[1], sys.argv[2]
 n_plan = len(json.load(open(plan)))
@@ -254,10 +253,17 @@ if len(nodes) > 1:
     sys.exit(f"ABORT: rows span multiple nodes {nodes} -- not comparable")
 missing = [r["point_id"] for r in rows if r.get("concurrent_chroms_used") is None]
 if missing:
-    print(f"WARNING: {len(missing)} row(s) never reported a realised cc")
+    # Was a WARNING while src/logging.rs stripped the field from every
+    # event (issue #162). Now that the planner's choice actually reaches
+    # the row, an unobserved cc is a defect: `_ram_rows` drops such rows,
+    # so a law would be fitted on a subset excluding the planner-chosen
+    # configurations.
+    sys.exit(
+        f"ABORT: {len(missing)} of {len(rows)} row(s) never reported a "
+        f"realised concurrent_chroms: {missing[:5]}"
+    )
 print(f"OK: every planned point measured, single node {nodes}")
 PYEOF
-  fi
 done
 
 echo "=== ALL DONE ==="

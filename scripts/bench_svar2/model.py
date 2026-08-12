@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import sys
 import typing
+import warnings
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -1029,6 +1030,7 @@ def _ram_rows(*sweeps: _LoadedSweep) -> list[RamRow]:
     to put that cost but the intercept.
     """
     rows: list[RamRow] = []
+    dropped: list[str] = []
     for sweep in sweeps:
         for r in sweep.records:
             pt = sweep.point_of[r.point_id]
@@ -1049,6 +1051,7 @@ def _ram_rows(*sweeps: _LoadedSweep) -> list[RamRow]:
             if cc is None:
                 cc = r.concurrent_chroms_used
             if cc is None:
+                dropped.append(r.point_id)
                 continue
             rows.append(
                 RamRow(
@@ -1060,6 +1063,19 @@ def _ram_rows(*sweeps: _LoadedSweep) -> list[RamRow]:
                     peak_rss_mb=r.maxrss_mb,
                 )
             )
+    if dropped:
+        # Dropping is correct (see above); dropping in SILENCE is not. A law
+        # fitted on the survivors excludes exactly the planner-chosen
+        # production configurations, which is the under-prediction / OOM
+        # direction -- issue #162.
+        shown = ", ".join(dropped[:5]) + (" ..." if len(dropped) > 5 else "")
+        warnings.warn(
+            f"_ram_rows dropped {len(dropped)} row(s) with unobserved "
+            f"concurrent_chroms (neither pinned on the point nor reported by "
+            f"the probe): {shown}. The law is being fitted WITHOUT them.",
+            UserWarning,
+            stacklevel=2,
+        )
     return rows
 
 

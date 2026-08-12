@@ -775,6 +775,23 @@ def test_ram_rows_prefer_the_pinned_value_over_the_realised_one():
     assert [r.concurrent_chroms for r in rows] == [4]
 
 
+def test_ram_rows_reports_the_rows_it_drops():
+    """A silently dropped row lets a law be certified on a subset that
+    excludes exactly the planner-chosen production configurations -- the
+    under-prediction / OOM direction (issue #162). Dropping is correct;
+    dropping in silence is not."""
+    sweep = _sweep_of(
+        [
+            _row(concurrent_chroms=None, concurrent_chroms_used=None),
+            _row(concurrent_chroms=4, concurrent_chroms_used=4),
+        ]
+    )
+    with pytest.warns(UserWarning, match="unobserved concurrent_chroms"):
+        rows = _ram_rows(sweep)
+    # the observable behaviour is unchanged: the bad row is still dropped.
+    assert len(rows) == 1
+
+
 def test_resident_chunk_size_is_bounded_by_the_corpus():
     assert _resident_chunk_size(25_000, 2_800) == 2_800  # S=500_000 sweep point
     assert _resident_chunk_size(25_000, 1_000_000_000) == 25_000  # biobank target
