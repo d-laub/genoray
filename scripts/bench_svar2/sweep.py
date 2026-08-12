@@ -8,8 +8,13 @@ finished point is durably appended before the next one starts.
 from __future__ import annotations
 
 import argparse
+import dataclasses
+import hashlib
 import json
+import os
+import uuid
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 from scripts.bench_svar2.records import (
@@ -27,9 +32,60 @@ def load_plan(path: Path) -> list[SweepPoint]:
     return [SweepPoint(**entry) for entry in raw]
 
 
-def pending_points(plan: Sequence[SweepPoint], results_path: Path) -> list[SweepPoint]:
-    done = {r.point_id for r in read_ndjson(results_path, ProbeRecord)}
-    return [p for p in plan if p.point_id not in done]
+def build_code_id() -> str:
+    """SHA256 (16 hex) of the built `_core` extension this process loaded.
+
+    The ARTIFACT, not the git commit: `pixi run test` does not rebuild the
+    extension, so a commit can advance while the measured binary does not.
+    `probe.run_point` launches the child with `sys.executable`, so the child
+    loads this same extension.
+    """
+    import genoray._core as _core
+
+    return hashlib.sha256(Path(_core.__file__).read_bytes()).hexdigest()[:16]
+
+
+@dataclass(frozen=True)
+class SweepResult:
+    """`measured` and `reused` are reported separately because the row count
+    is the size of the output FILE, not work performed: the contaminated run
+    on PR #154 printed `18 points recorded` for 6 measurements (#159)."""
+
+    records: list[ProbeRecord]
+    measured: int
+    reused: int
+
+
+def pending_points(
+    plan: Sequence[SweepPoint], results_path: Path, code_id: str
+) -> list[SweepPoint]:
+    """Points still to measure AGAINST THIS BUILD.
+
+    Keyed on `(point_id, code_id)`, not `point_id` alone: `point_id` hashes
+    the configuration only, so it cannot distinguish two runs of one
+    configuration against different code -- which is the one distinction a
+    benchmark exists to make (issue #159).
+    """
+    done = {(r.point_id, r.code_id) for r in read_ndjson(results_path, ProbeRecord)}
+    return [p for p in plan if (p.point_id, code_id) not in done]
+
+
+def check_corpora(points: Sequence[SweepPoint]) -> None:
+    """Raise naming EVERY plan point whose corpus manifest is absent.
+
+    `run_sweep` loads manifests lazily inside the point loop, so a plan that
+    names a corpus nobody generates fails hours into an overnight job -- and
+    under `set -euo pipefail` that aborts the whole sbatch (issue #151, and
+    #141 before it for `vlinear2`). Reporting all of them at once means one
+    generation pass fixes the run, rather than one per resubmit.
+    """
+    missing = sorted({p.corpus for p in points if not Path(p.corpus).exists()})
+    if missing:
+        listed = "\n".join(f"  {m}" for m in missing)
+        raise FileNotFoundError(
+            f"{len(missing)} corpus manifest(s) named by the plan do not "
+            f"exist:\n{listed}"
+        )
 
 
 def check_oracle(
@@ -69,7 +125,7 @@ def run_sweep(
     results_path: Path,
     outdir: Path,
     runner: Callable[..., ProbeRecord] | None = None,
-) -> list[ProbeRecord]:
+) -> SweepResult:
     if runner is None:
         from scripts.bench_svar2.probe import run_point as runner  # noqa: PLW0127
 
@@ -77,14 +133,28 @@ def run_sweep(
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
+    code_id = build_code_id()
+    run_id = os.environ.get("SLURM_JOB_ID") or uuid.uuid4().hex[:16]
+
+    pending = pending_points(plan, results_path, code_id)
+    # Pending only, not the whole plan: a fully-resumed sweep whose corpora
+    # were since cleaned up has nothing left to read and must not fail.
+    check_corpora(pending)
+    reused = len(plan) - len(pending)
+    measured = 0
+
     manifests: dict[str, CorpusManifest] = {}
-    for point in pending_points(plan, results_path):
+    for point in pending:
         if point.corpus not in manifests:
             manifests[point.corpus] = from_json(
                 CorpusManifest, Path(point.corpus).read_text()
             )
         rec = runner(point, manifests[point.corpus], outdir)
+        # Stamped here, not in `run_point`: one site, and an injected test
+        # runner does not have to know about provenance.
+        rec = dataclasses.replace(rec, code_id=code_id, run_id=run_id)
         append_ndjson(results_path, rec)
+        measured += 1
         status = "OOM" if rec.oom_at_rss_mb else ("ok" if rec.ok else "FAIL")
         print(
             f"w={point.reader_workers:>3} cs={point.chunk_size:>6} "
@@ -108,7 +178,7 @@ def run_sweep(
     problem = check_oracle(records, plan)
     if problem:
         raise RuntimeError(problem)
-    return records
+    return SweepResult(records=records, measured=measured, reused=reused)
 
 
 def main() -> None:
@@ -117,8 +187,11 @@ def main() -> None:
     p.add_argument("--results", type=Path, required=True)
     p.add_argument("--outdir", type=Path, required=True)
     a = p.parse_args()
-    recs = run_sweep(a.plan, a.results, a.outdir)
-    print(f"{len(recs)} points recorded to {a.results}")
+    res = run_sweep(a.plan, a.results, a.outdir)
+    print(
+        f"{res.measured} measured, {res.reused} reused "
+        f"({len(res.records)} rows in {a.results})"
+    )
 
 
 if __name__ == "__main__":

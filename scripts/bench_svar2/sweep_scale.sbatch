@@ -122,6 +122,20 @@ print(HOLDOUT['samples'], HOLDOUT['variants'], ','.join(HOLDOUT['format_fields']
   --out "$JD/corpora/holdout.vcf.gz" --samples "$HOLDOUT_S" --variants "$HOLDOUT_V" \
   --format-fields "$HOLDOUT_F" --procs 16 --bgzip-threads 8
 
+# Hold-out at F=0: same single-source-of-truth pattern as the block above.
+# `build_plans.py` dispatches a plan point against this corpus but nothing
+# generated it, so `holdout` aborted the whole job on any machine where it
+# did not already exist (issue #151 -- the same gap #141 fixed for
+# vlinear2). HOLDOUT_F0["format_fields"] is empty, so `--format-fields` is
+# deliberately omitted: its argparse default is already "".
+read -r HOLDOUT_F0_S HOLDOUT_F0_V < <($PX python -c "
+from scripts.bench_svar2.plans.build_plans import HOLDOUT_F0
+print(HOLDOUT_F0['samples'], HOLDOUT_F0['variants'])
+")
+[ -f "$JD/corpora/holdout_f0.manifest.json" ] || $PX python -m scripts.bench_svar2.scale_corpus \
+  --out "$JD/corpora/holdout_f0.vcf.gz" --samples "$HOLDOUT_F0_S" \
+  --variants "$HOLDOUT_F0_V" --procs 16 --bgzip-threads 8
+
 # V-linearity ladder (C2): fixed small S, V varies alone. Shape comes from
 # plans/build_plans.py's VLINEAR_SAMPLES/VLINEAR_VARIANTS -- same
 # single-source-of-truth reasoning as the hold-out above. This is the ladder
@@ -212,29 +226,50 @@ $PX python -m scripts.bench_svar2.plans.build_plans \
 # corpus -- no separate corpus-generation step needed) are likewise hours
 # cheaper than `scale`.
 #
-# Safe to reorder because `run_sweep` resumes: `pending_points` skips any
-# point already fsynced to the results ndjson, so a resubmit continues rather
-# than repeats. That also means point_id must stay stable -- it hashes every
-# SweepPoint field including `threads` and `reps`, so changing
-# --cpus-per-task invalidates resume as well as the regime.
+# Safe to reorder because `run_sweep` resumes: `pending_points` skips a point
+# only when it is already fsynced to the results ndjson AGAINST THIS BUILD --
+# it is keyed on (point_id, code_id), not point_id alone (#159), so a
+# resubmit continues rather than repeats. That also means point_id must stay
+# stable -- it hashes every SweepPoint field including `threads` and `reps`,
+# so changing --cpus-per-task invalidates resume as well as the regime. Note
+# the unconditional `maturin develop --release` above (line 85) means a
+# rebuild changes code_id and therefore discards an otherwise-valid resume
+# for every point: that is intended (measuring again is the safe direction)
+# but an operator resubmitting after a code change should expect a full
+# re-measure, not a fast resume.
 for NAME in $SWEEP_FAMILIES; do
   $PX python -m scripts.bench_svar2.sweep \
     --plan "$JD/plans/$NAME.json" \
     --results "$JD/out/$NAME.ndjson" \
     --outdir "$JD/out/$NAME"
 
-  if [ "$NAME" = "vcf_ram" ]; then
-    # Row count vs plan count. The 2026-08-07 contamination was invisible in every
-    # summary its run printed -- exit 0, all points ok, matching row count -- because
-    # stale rows counted as recorded. What did NOT match was how many points the run
-    # actually MEASURED. Fail loudly here, not in a fit weeks later.
-    $PX python - "$JD/plans/vcf_ram.json" "$JD/out/vcf_ram.ndjson" <<'PYEOF'
+  # Row count vs plan count. The 2026-08-07 contamination was invisible in every
+  # summary its run printed -- exit 0, all points ok, matching row count -- because
+  # stale rows counted as recorded. What did NOT match was how many points the run
+  # actually MEASURED. Fail loudly here, not in a fit weeks later.
+  #
+  # code_id is computed and passed in as a third argv so the guard below can
+  # filter to THIS build. Resume is keyed on (point_id, code_id) (#159), so a
+  # rerun against new code APPENDS fresh rows rather than replacing the old
+  # ones -- the file accumulates rows across builds. Every pre-branch row has
+  # code_id="" and concurrent_chroms_used=None, so scanning the whole file
+  # unfiltered aborts on old data even when this run measured everything
+  # correctly. Filtering to code_id first is what makes the checks below mean
+  # "this build's rows", not "everything ever appended to this path".
+  CODE_ID="$($PX python -c 'from scripts.bench_svar2.sweep import build_code_id; print(build_code_id())')"
+  $PX python - "$JD/plans/$NAME.json" "$JD/out/$NAME.ndjson" "$CODE_ID" <<'PYEOF'
 import json, sys
-plan, results = sys.argv[1], sys.argv[2]
+plan, results, code_id = sys.argv[1], sys.argv[2], sys.argv[3]
 n_plan = len(json.load(open(plan)))
-rows = [json.loads(line) for line in open(results) if line.strip()]
+all_rows = [json.loads(line) for line in open(results) if line.strip()]
+# Do NOT fall back to "if this yields nothing, use all_rows" -- that silently
+# restores the cross-build mixing bug this filter exists to remove.
+rows = [r for r in all_rows if r.get("code_id") == code_id]
 ids = {r["point_id"] for r in rows}
-print(f"plan points: {n_plan}   result rows: {len(rows)}   unique ids: {len(ids)}")
+print(
+    f"total rows: {len(all_rows)}   this build: {len(rows)}   "
+    f"plan points: {n_plan}   unique ids: {len(ids)}"
+)
 bad = [r["point_id"] for r in rows if not r.get("ok") and r.get("oom_at_rss_mb") is None]
 if bad:
     # A point that failed for a reason other than a deliberate OOM probe is
@@ -254,10 +289,17 @@ if len(nodes) > 1:
     sys.exit(f"ABORT: rows span multiple nodes {nodes} -- not comparable")
 missing = [r["point_id"] for r in rows if r.get("concurrent_chroms_used") is None]
 if missing:
-    print(f"WARNING: {len(missing)} row(s) never reported a realised cc")
+    # Was a WARNING while src/logging.rs stripped the field from every
+    # event (issue #162). Now that the planner's choice actually reaches
+    # the row, an unobserved cc is a defect: `_ram_rows` drops such rows,
+    # so a law would be fitted on a subset excluding the planner-chosen
+    # configurations.
+    sys.exit(
+        f"ABORT: {len(missing)} of {len(rows)} row(s) never reported a "
+        f"realised concurrent_chroms: {missing[:5]}"
+    )
 print(f"OK: every planned point measured, single node {nodes}")
 PYEOF
-  fi
 done
 
 echo "=== ALL DONE ==="

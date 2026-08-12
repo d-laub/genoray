@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import sys
 import typing
+import warnings
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -858,6 +859,29 @@ def load_sweep(
         out.excluded.append(f"{name}: {results_path} exists but has no records")
         return out
 
+    # Resume is keyed on (point_id, code_id) (#159), so a legitimately-resumed
+    # results file can hold one row per (point, build): read_ndjson does not
+    # dedup and nothing upstream partitions by build. A fit pooling rows from
+    # two different `_core` builds mixes measurements the same way #159 exists
+    # to prevent -- just at fit time instead of sweep time, where the
+    # sbatch guard's `len(ids) != n_plan` check (a set, so blind to code_id)
+    # cannot see it. This must NOT fire on a single-build file, including one
+    # where every row carries code_id="" (every results file committed before
+    # #159 landed) -- only two or more DISTINCT code_id values are refused.
+    code_ids: dict[str, int] = {}
+    for r in records:
+        code_ids[r.code_id] = code_ids.get(r.code_id, 0) + 1
+    if len(code_ids) > 1:
+        counts = ", ".join(
+            f"{cid!r}: {n} row(s)" for cid, n in sorted(code_ids.items())
+        )
+        raise ValueError(
+            f"{name}: {results_path} spans {len(code_ids)} distinct code_id "
+            f"values ({counts}) -- a fit would pool measurements from "
+            "different builds (#159). Pick one build (e.g. filter the "
+            "ndjson to a single code_id) before fitting."
+        )
+
     points = _load_plan_points(plans_dir, name)
     if points is None:
         out.excluded.append(
@@ -1029,6 +1053,7 @@ def _ram_rows(*sweeps: _LoadedSweep) -> list[RamRow]:
     to put that cost but the intercept.
     """
     rows: list[RamRow] = []
+    dropped: list[str] = []
     for sweep in sweeps:
         for r in sweep.records:
             pt = sweep.point_of[r.point_id]
@@ -1049,6 +1074,7 @@ def _ram_rows(*sweeps: _LoadedSweep) -> list[RamRow]:
             if cc is None:
                 cc = r.concurrent_chroms_used
             if cc is None:
+                dropped.append(r.point_id)
                 continue
             rows.append(
                 RamRow(
@@ -1060,6 +1086,19 @@ def _ram_rows(*sweeps: _LoadedSweep) -> list[RamRow]:
                     peak_rss_mb=r.maxrss_mb,
                 )
             )
+    if dropped:
+        # Dropping is correct (see above); dropping in SILENCE is not. A law
+        # fitted on the survivors excludes exactly the planner-chosen
+        # production configurations, which is the under-prediction / OOM
+        # direction -- issue #162.
+        shown = ", ".join(dropped[:5]) + (" ..." if len(dropped) > 5 else "")
+        warnings.warn(
+            f"_ram_rows dropped {len(dropped)} row(s) with unobserved "
+            f"concurrent_chroms (neither pinned on the point nor reported by "
+            f"the probe): {shown}. The law is being fitted WITHOUT them.",
+            UserWarning,
+            stacklevel=2,
+        )
     return rows
 
 

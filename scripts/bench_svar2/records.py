@@ -124,32 +124,39 @@ class ProbeRecord:
     # Defaulted to "" so records written before this field existed still load
     # (`from_json` drops unknown keys but cannot invent missing ones).
     node: str = ""
-    # The concurrency the planner ACTUALLY dispatched. `SweepPoint.
-    # concurrent_chroms` is only the REQUEST and is None whenever the point
-    # let the planner choose, which made every such point unfittable -- 12 of
-    # the 58 rows in the 2026-08-08 PGEN crossed sweep (issue #158). None
-    # still means UNOBSERVED, never 1.
-    #
-    # INTENDED to be parsed from the child's `pipeline config` tracing line,
-    # but as of this field's introduction (a5d1c6f) that path is inert:
-    # `src/logging.rs`'s `FieldGrab` visitor forwards only `message` and
-    # `chrom` to Python, stripping `concurrent_chroms` and every other
-    # structured field before `probe.py`'s `RE_PIPELINE_CONFIG` ever sees the
-    # line, and the stderr fmt-layer fallback that would otherwise carry the
-    # fields is closed off by `probe.py` setting
-    # `GENORAY_LOG=genoray::monitor=trace` (this event's target is `genoray`,
-    # not `genoray::monitor`). So this field is **always `None` through the
-    # Python CLI path** -- see issue #162. A sweep point that leaves
-    # `concurrent_chroms` unpinned, relying on this field as a fallback, will
-    # have its row SILENTLY DROPPED by `_ram_rows` rather than erroring, and
-    # a law fitted on the survivors would silently exclude exactly the
-    # planner-chosen production configurations -- the under-prediction / OOM
-    # direction. Every sweep committed so far works around this by pinning
-    # `concurrent_chroms` on every point (issue #161's "interim workaround").
+    # The concurrency the planner ACTUALLY dispatched, parsed from the
+    # child's `pipeline config` tracing line. `SweepPoint.concurrent_chroms`
+    # is only the REQUEST and is None whenever the point let the planner
+    # choose. None here still means UNOBSERVED, never 1 -- `_ram_rows` drops
+    # such rows rather than inventing a value, and `sweep_scale.sbatch`
+    # aborts on them.
     #
     # Defaulted for the same reason `node` is: records written before this
     # field existed must still load.
     concurrent_chroms_used: int | None = None
+    # SHA256 (16 hex) of the built `_core` extension the measurement ran
+    # against -- the ARTIFACT, not the git commit. `pixi run test` does not
+    # rebuild the extension, so a commit can advance while the measured
+    # binary does not; hashing the .so catches that direction as well as the
+    # ordinary one, and distinguishes two A/B builds at one commit.
+    #
+    # NOT part of `point_id` (that hashes the SweepPoint, which has no code
+    # identity and must stay stable across this change), but it IS half of
+    # the resume key -- see `sweep.pending_points`. On PR #154, resuming on
+    # `point_id` alone served 12 rows measured against the old unbounded
+    # reader as measurements of its replacement; the re-fit computed from
+    # the mixture was committed, pushed and announced before review caught
+    # it (issue #159).
+    #
+    # Defaulted to "" so pre-existing rows still load. "" never equals a
+    # real hash, so those rows are RE-MEASURED rather than trusted --
+    # failing toward measuring is the correct default for a provenance gap.
+    code_id: str = ""
+    # One id per `run_sweep` invocation (`$SLURM_JOB_ID` when set, else a
+    # random hex). Makes a mixed results file self-partitioning after the
+    # fact, which is what would have let the 2026-08-07 audit attribute rows
+    # to jobs without `cmp`-ing against an older file.
+    run_id: str = ""
 
 
 @dataclass(frozen=True)

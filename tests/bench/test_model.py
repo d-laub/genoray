@@ -1,6 +1,7 @@
 import json
 import math
 from dataclasses import asdict
+from pathlib import Path
 
 import pytest
 
@@ -14,6 +15,7 @@ from scripts.bench_svar2.model import (
     fit_cohort_beta_from_ladders,
     extrapolate,
     fit_cost_law,
+    load_sweep,
     RamRow,
     fit_ram_law,
     fit_v_law,
@@ -719,6 +721,61 @@ def _record(point_id: str, **overrides) -> ProbeRecord:
     return ProbeRecord(**base)
 
 
+# --- code_id partitioning at fit time (final-review finding 2 / #159) -------
+
+
+def _write_plan(plans_dir: Path, name: str, points: list[SweepPoint]) -> None:
+    plans_dir.mkdir(parents=True, exist_ok=True)
+    (plans_dir / f"{name}.json").write_text(json.dumps([asdict(pt) for pt in points]))
+
+
+def test_load_sweep_accepts_a_results_file_with_one_code_id(tmp_path):
+    """A legitimately-resumed or never-resumed results file has exactly one
+    code_id across every row -- including the all-`""` shape of every results
+    file committed before #159 (e.g. the 48-row vcf_ram.ndjson under
+    docs/superpowers/plans/results/). That must load exactly as before."""
+    name = "cc"
+    manifest_name = "cc.manifest.json"
+    m = _manifest(manifest_name)
+    pt = _point(manifest_name, workers=1)
+    results_dir = tmp_path / "out"
+    plans_dir = tmp_path / "plans"
+    _write_plan(plans_dir, name, [pt])
+    append_ndjson(results_dir / f"{name}.ndjson", _record(pt.point_id, code_id=""))
+
+    loaded = load_sweep(name, results_dir, plans_dir, {manifest_name: m})
+    assert [r.point_id for r in loaded.records] == [pt.point_id]
+    assert loaded.excluded == []
+
+
+def test_load_sweep_refuses_a_results_file_spanning_two_code_ids(tmp_path):
+    """Resume is keyed on (point_id, code_id) (#159), so a resumed file can
+    hold one row per (point, build). `read_ndjson` does not dedup and
+    nothing upstream partitions by build, so pooling two builds into one fit
+    is the same mixture #159 exists to prevent -- just surviving to fit time
+    instead of sweep time. This must raise, naming both code_ids and their
+    row counts, rather than silently averaging across builds."""
+    name = "cc"
+    manifest_name = "cc.manifest.json"
+    m = _manifest(manifest_name)
+    pt = _point(manifest_name, workers=1)
+    other = _point(manifest_name, workers=3)
+    results_dir = tmp_path / "out"
+    plans_dir = tmp_path / "plans"
+    _write_plan(plans_dir, name, [pt, other])
+    append_ndjson(
+        results_dir / f"{name}.ndjson", _record(pt.point_id, code_id="build1")
+    )
+    append_ndjson(
+        results_dir / f"{name}.ndjson", _record(other.point_id, code_id="build2")
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        load_sweep(name, results_dir, plans_dir, {manifest_name: m})
+    assert "build1" in str(exc_info.value)
+    assert "build2" in str(exc_info.value)
+
+
 # --- C2: the RAM law's regressor is the TOUCHED chunk, not the nominal one --
 
 
@@ -773,6 +830,23 @@ def test_ram_rows_prefer_the_pinned_value_over_the_realised_one():
     # If the two disagree the plan is what the sweep is indexed by.
     rows = _ram_rows(_sweep_of([_row(concurrent_chroms=4, concurrent_chroms_used=8)]))
     assert [r.concurrent_chroms for r in rows] == [4]
+
+
+def test_ram_rows_reports_the_rows_it_drops():
+    """A silently dropped row lets a law be certified on a subset that
+    excludes exactly the planner-chosen production configurations -- the
+    under-prediction / OOM direction (issue #162). Dropping is correct;
+    dropping in silence is not."""
+    sweep = _sweep_of(
+        [
+            _row(concurrent_chroms=None, concurrent_chroms_used=None),
+            _row(concurrent_chroms=4, concurrent_chroms_used=4),
+        ]
+    )
+    with pytest.warns(UserWarning, match="unobserved concurrent_chroms"):
+        rows = _ram_rows(sweep)
+    # the observable behaviour is unchanged: the bad row is still dropped.
+    assert len(rows) == 1
 
 
 def test_resident_chunk_size_is_bounded_by_the_corpus():

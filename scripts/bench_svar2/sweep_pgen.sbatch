@@ -51,12 +51,15 @@ SCRATCH="/local/$USER/pgen-sweep"
 mkdir -p "$SCRATCH"/{corpora,plans,out}
 
 # Names the RESULTS file, not the plan -- the plan is always `pgen.json`.
-# `sweep.py:pending_points` resumes by `point_id`, and `point_id` hashes only
-# the CONFIG: not the commit, not the .so. So a rerun whose code changed but
-# whose points did not will silently serve the PREVIOUS run's rows back as its
-# own. That is not hypothetical -- it produced a shipped-then-reverted RAM-law
-# refit on 2026-08-07 (12 of 18 rows were stale; issue #159). Until #159 is
-# fixed, any run whose BINARY differs from the last one must pass a fresh tag.
+# #159 is now FIXED: `sweep.py:pending_points` resumes on (point_id, code_id),
+# where code_id is a hash of the built `_core` .so, not just point_id's config
+# hash. A rerun whose code changed but whose points did not now re-measures
+# automatically and APPENDS fresh rows under the new code_id rather than
+# silently reusing the previous run's rows -- the manual fresh-`RESULTS_TAG`
+# ritual this comment used to prescribe is no longer a correctness
+# requirement. (That is what produced the shipped-then-reverted RAM-law refit
+# on 2026-08-07, 12 of 18 rows stale.) `RESULTS_TAG` itself is kept: it still
+# names the output file, which is convenient for keeping unrelated runs apart.
 RESULTS_TAG="${RESULTS_TAG:-pgen}"
 echo "=== results tag: $RESULTS_TAG ==="
 echo "=== disk headroom on /local/$USER ==="
@@ -117,21 +120,52 @@ $PX python -m scripts.bench_svar2.sweep \
 # matched, because the stale rows were counted as recorded. What did NOT match
 # was how many points the run actually MEASURED. Fail loudly here rather than
 # discovering it in a fit weeks later.
-$PX python - "$SCRATCH/plans/pgen.json" "$SCRATCH/out/$RESULTS_TAG.ndjson" <<'PYEOF'
+#
+# code_id is computed and passed in as a third argv so the guard can filter
+# to THIS build before checking anything. Resume is keyed on
+# (point_id, code_id) (#159), so a rerun against new code APPENDS fresh rows
+# rather than replacing the old ones -- the results file accumulates rows
+# across builds and an unfiltered scan would see them all.
+CODE_ID="$($PX python -c 'from scripts.bench_svar2.sweep import build_code_id; print(build_code_id())')"
+$PX python - "$SCRATCH/plans/pgen.json" "$SCRATCH/out/$RESULTS_TAG.ndjson" "$CODE_ID" <<'PYEOF'
 import json, sys
-plan, results = sys.argv[1], sys.argv[2]
+plan, results, code_id = sys.argv[1], sys.argv[2], sys.argv[3]
 n_plan = len(json.load(open(plan)))
-rows = [json.loads(line) for line in open(results) if line.strip()]
+all_rows = [json.loads(line) for line in open(results) if line.strip()]
+# Do NOT fall back to "if this yields nothing, use all_rows" -- that silently
+# restores the cross-build mixing bug this filter exists to remove.
+rows = [r for r in all_rows if r.get("code_id") == code_id]
 ids = {r["point_id"] for r in rows}
-print(f"plan points: {n_plan}   result rows: {len(rows)}   unique ids: {len(ids)}")
+print(
+    f"total rows: {len(all_rows)}   this build: {len(rows)}   "
+    f"plan points: {n_plan}   unique ids: {len(ids)}"
+)
+# A point that failed for a reason other than a deliberate OOM probe is not a
+# measurement. This used to be print-and-continue, which is exactly what let
+# an all-rows-failed run print "OK: every planned point measured" and exit 0
+# (see sweep_scale.sbatch's own guard, which hit this for real on job
+# 13355460). An OOM row (`oom_at_rss_mb` set) is excluded above and must keep
+# passing.
 bad = [r["point_id"] for r in rows if not r.get("ok") and r.get("oom_at_rss_mb") is None]
 if bad:
-    print(f"FAILED points (not OOM deliverables): {bad}")
+    sys.exit(
+        f"ABORT: {len(bad)} of {len(rows)} point(s) failed (not OOM "
+        f"deliverables): {bad[:5]}"
+    )
 if len(ids) != n_plan:
     sys.exit(f"ABORT: {len(ids)} distinct points in results, plan has {n_plan}")
 nodes = {r.get("node") for r in rows}
 if len(nodes) > 1:
     sys.exit(f"ABORT: rows span multiple nodes {nodes} -- not comparable")
+# `_point()` (plans/build_plans.py) leaves concurrent_chroms=None by default,
+# so unpinned points -- ones that rely on the planner's realised choice
+# reaching the row -- are the norm in this family, not the exception.
+missing = [r["point_id"] for r in rows if r.get("concurrent_chroms_used") is None]
+if missing:
+    sys.exit(
+        f"ABORT: {len(missing)} of {len(rows)} row(s) never reported a "
+        f"realised concurrent_chroms: {missing[:5]}"
+    )
 print(f"OK: every planned point measured, single node {nodes}")
 PYEOF
 
