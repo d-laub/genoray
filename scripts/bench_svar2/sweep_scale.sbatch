@@ -226,11 +226,17 @@ $PX python -m scripts.bench_svar2.plans.build_plans \
 # corpus -- no separate corpus-generation step needed) are likewise hours
 # cheaper than `scale`.
 #
-# Safe to reorder because `run_sweep` resumes: `pending_points` skips any
-# point already fsynced to the results ndjson, so a resubmit continues rather
-# than repeats. That also means point_id must stay stable -- it hashes every
-# SweepPoint field including `threads` and `reps`, so changing
-# --cpus-per-task invalidates resume as well as the regime.
+# Safe to reorder because `run_sweep` resumes: `pending_points` skips a point
+# only when it is already fsynced to the results ndjson AGAINST THIS BUILD --
+# it is keyed on (point_id, code_id), not point_id alone (#159), so a
+# resubmit continues rather than repeats. That also means point_id must stay
+# stable -- it hashes every SweepPoint field including `threads` and `reps`,
+# so changing --cpus-per-task invalidates resume as well as the regime. Note
+# the unconditional `maturin develop --release` above (line 85) means a
+# rebuild changes code_id and therefore discards an otherwise-valid resume
+# for every point: that is intended (measuring again is the safe direction)
+# but an operator resubmitting after a code change should expect a full
+# re-measure, not a fast resume.
 for NAME in $SWEEP_FAMILIES; do
   $PX python -m scripts.bench_svar2.sweep \
     --plan "$JD/plans/$NAME.json" \
@@ -241,13 +247,29 @@ for NAME in $SWEEP_FAMILIES; do
   # summary its run printed -- exit 0, all points ok, matching row count -- because
   # stale rows counted as recorded. What did NOT match was how many points the run
   # actually MEASURED. Fail loudly here, not in a fit weeks later.
-  $PX python - "$JD/plans/$NAME.json" "$JD/out/$NAME.ndjson" <<'PYEOF'
+  #
+  # code_id is computed and passed in as a third argv so the guard below can
+  # filter to THIS build. Resume is keyed on (point_id, code_id) (#159), so a
+  # rerun against new code APPENDS fresh rows rather than replacing the old
+  # ones -- the file accumulates rows across builds. Every pre-branch row has
+  # code_id="" and concurrent_chroms_used=None, so scanning the whole file
+  # unfiltered aborts on old data even when this run measured everything
+  # correctly. Filtering to code_id first is what makes the checks below mean
+  # "this build's rows", not "everything ever appended to this path".
+  CODE_ID="$($PX python -c 'from scripts.bench_svar2.sweep import build_code_id; print(build_code_id())')"
+  $PX python - "$JD/plans/$NAME.json" "$JD/out/$NAME.ndjson" "$CODE_ID" <<'PYEOF'
 import json, sys
-plan, results = sys.argv[1], sys.argv[2]
+plan, results, code_id = sys.argv[1], sys.argv[2], sys.argv[3]
 n_plan = len(json.load(open(plan)))
-rows = [json.loads(line) for line in open(results) if line.strip()]
+all_rows = [json.loads(line) for line in open(results) if line.strip()]
+# Do NOT fall back to "if this yields nothing, use all_rows" -- that silently
+# restores the cross-build mixing bug this filter exists to remove.
+rows = [r for r in all_rows if r.get("code_id") == code_id]
 ids = {r["point_id"] for r in rows}
-print(f"plan points: {n_plan}   result rows: {len(rows)}   unique ids: {len(ids)}")
+print(
+    f"total rows: {len(all_rows)}   this build: {len(rows)}   "
+    f"plan points: {n_plan}   unique ids: {len(ids)}"
+)
 bad = [r["point_id"] for r in rows if not r.get("ok") and r.get("oom_at_rss_mb") is None]
 if bad:
     # A point that failed for a reason other than a deliberate OOM probe is

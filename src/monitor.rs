@@ -86,9 +86,12 @@ fn page_size() -> u64 {
 /// yields a labelled RSS trace and peak RSS can be attributed to a stage
 /// without a heap profiler.
 ///
-/// Values go in the MESSAGE, not in structured fields: the Python logging
-/// bridge renders only the message, so fields alone are invisible from a
-/// `log_level="debug"` run.
+/// Values go in the MESSAGE as well as in structured fields: `FieldGrab`
+/// (see `src/logging.rs`) now renders structured fields inline onto the
+/// Python logging bridge's message as trailing ` key=value` pairs, so a
+/// field alone would no longer be invisible from a `log_level="debug"` run.
+/// Kept in the message text too for a human skimming the log without
+/// grepping for individual keys.
 pub(crate) fn rss_mark(chrom: &str, label: &str) {
     tracing::debug!(
         target: "genoray::monitor",

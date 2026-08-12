@@ -859,6 +859,29 @@ def load_sweep(
         out.excluded.append(f"{name}: {results_path} exists but has no records")
         return out
 
+    # Resume is keyed on (point_id, code_id) (#159), so a legitimately-resumed
+    # results file can hold one row per (point, build): read_ndjson does not
+    # dedup and nothing upstream partitions by build. A fit pooling rows from
+    # two different `_core` builds mixes measurements the same way #159 exists
+    # to prevent -- just at fit time instead of sweep time, where the
+    # sbatch guard's `len(ids) != n_plan` check (a set, so blind to code_id)
+    # cannot see it. This must NOT fire on a single-build file, including one
+    # where every row carries code_id="" (every results file committed before
+    # #159 landed) -- only two or more DISTINCT code_id values are refused.
+    code_ids: dict[str, int] = {}
+    for r in records:
+        code_ids[r.code_id] = code_ids.get(r.code_id, 0) + 1
+    if len(code_ids) > 1:
+        counts = ", ".join(
+            f"{cid!r}: {n} row(s)" for cid, n in sorted(code_ids.items())
+        )
+        raise ValueError(
+            f"{name}: {results_path} spans {len(code_ids)} distinct code_id "
+            f"values ({counts}) -- a fit would pool measurements from "
+            "different builds (#159). Pick one build (e.g. filter the "
+            "ndjson to a single code_id) before fitting."
+        )
+
     points = _load_plan_points(plans_dir, name)
     if points is None:
         out.excluded.append(

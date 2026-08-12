@@ -172,6 +172,16 @@ def _build_env(point: SweepPoint) -> dict[str, str]:
         "GENORAY_OVERSHARD": str(point.overshard),
         "GENORAY_LOG": "genoray::monitor=trace",
         "GENORAY_SAMPLE_INTERVAL": "1",
+        # The realised concurrent_chroms is parsed out of the `pipeline
+        # config ...` line rendered by a `rich.Console()` writing to a
+        # non-tty, which defaults to 80 columns. At 80 columns that line can
+        # wrap mid-fields, and `_field`'s `\bkey=([^\s]+)` regex cannot span
+        # a line break -- it survives today only because `concurrent_chroms`
+        # happens to be declared first in the `tracing::info!` macro
+        # (src/lib.rs). Force enough width that the line never wraps; rich
+        # honours COLUMNS. An unparsed cc is now a hard sweep abort (see the
+        # concurrent_chroms_used check in sweep_scale.sbatch/sweep_pgen.sbatch).
+        "COLUMNS": "400",
     }
     if point.concurrent_chroms is not None:
         env["GENORAY_CONCURRENT_CHROMS"] = str(point.concurrent_chroms)
