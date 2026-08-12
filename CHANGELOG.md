@@ -1,3 +1,114 @@
+## 4.0.0 (2026-08-12)
+
+### BREAKING CHANGE
+
+- `SparseVar2.from_vcf(tune=)` is removed. It was a pure
+optimization with no effect on output bytes, so callers can drop the kwarg.
+- `SparseVar2.from_vcf_list(max_mem=...)` no longer caps a
+single dense chunk; it is now a whole-process byte budget, matching
+`SparseVar2.from_vcf`. A call like `max_mem="512MiB"` that used to mean
+"let one dense chunk use up to 512 MiB" now means "the whole process
+should use at most 512 MiB", which derives a much smaller chunk_size.
+Callers relying on the old per-chunk-cap meaning must re-tune their
+`max_mem` value.
+
+### Feat
+
+- **bench**: add vcf_ram corpus generation and sweep, gated by SWEEP_FAMILIES
+- **bench**: add the crossed VCF RAM-law axes
+- **bench**: generate VCF RAM-law corpora with vcfixture bulk
+- **bench**: fit RAM laws from a CLI and stop dropping observed-cc rows
+- **bench**: record the concurrency the planner actually dispatched
+- **bench**: cross cc x chunk_size and add an n_chunks axis for the RAM law
+- **svar2**: pack presence rows by shifted word OR from a mask
+- **svar2**: add PresenceMasks, a per-record presence bitset
+- **svar2**: add RSS instrumentation, pin the per-sample conversion blocker
+- **svar2**: add max_mem to from_pgen
+- **svar2**: plan PGEN conversion under core and memory budgets
+- **svar2**: add the fitted RamLaw::PGEN coefficients
+- **bench**: add a PGEN backend axis to the probe and plan builder
+- **svar2**: add ContigCosts::exact for index-free per-contig costs
+- **bench**: generate a human-genome-shaped PGEN corpus
+- **bench**: add a variant-skewed vcfixture profile for the PGEN corpus
+- **bench**: keep each A/B run's child log
+- **bench**: give the corpus generator a human contig-length skew
+- **svar2**: remove the `tune` argument and keep the fitted reader count
+- **svar2**: unify from_vcf_list's max_mem into a whole-process budget
+- **svar2**: plan and order contigs before dispatch
+- **svar2**: probe read and exec rates on two chunks
+- **svar2**: derive reader count from a read/exec rate ratio
+- **svar2**: estimate per-contig conversion cost from index metadata
+- **svar2**: plan contig concurrency under core and memory constraints
+- **svar2**: detect the conversion memory budget from the cgroup
+- **svar2**: trace-level gauges for reorder backlog and shard skew
+
+### Fix
+
+- **bench**: hard-abort the vcf_ram row-count guard on real failures
+- **bench**: skip symbolic ALTs for the vcf backend too
+- **bench**: move ploidy to dialed so v0.5.x can load the bulk profile
+- **bench**: stop sweep_scale.sbatch inheriting another node's scratch
+- **svar2**: fit RamLaw::PGEN as an envelope, cutting over-allocation 4.18x
+- **bench**: fall back when $CLAUDE_JOB_DIR is another node's scratch
+- **svar2**: scope the reader budget claim and tighten its bound tests
+- **svar2**: stop _auto_chunk_size overriding its own byte budget
+- **pgen**: stop clamping the bench concurrency override, make the budget error actionable
+- **bench**: point pgen plan points at their manifest, not the .pgen
+- **svar2**: attribute pipeline CPU correctly in the monitor sampler
+- **svar2**: address review of the from_vcf_list max_mem unification
+- **svar2**: restore cgroup-vs-meminfo precedence coverage and fix a wrong warning message
+- **bench**: reuse the derived chunk size instead of a hardcoded literal in the concurrency axis
+- **svar2**: resolve memory budget from the process's own cgroup, not the root cgroup
+- **svar2**: make the from_vcf/from_vcf_list max_mem quantity mismatch self-explaining at runtime
+- **svar2**: keep tuned reader-worker probes and nominal chunk-byte estimates from over-tightening the memory budget
+- **svar2**: dispatch and load the concurrency sweep axis
+- **svar2**: degrade gracefully when memory-budget detection fails
+- **svar2**: skip the tabix probe for BCF input
+- **svar2**: time the reference stage in the reader probe
+- **svar2**: resolve contig ids in the index's own space
+- **svar2**: measure the cohort exponent instead of letting the design pin it
+- **svar2**: stop scoring the model on an axis it never fitted
+- **svar2**: give the RAM law the cohort term peak RSS actually has
+- **svar2**: fit the V-law in the regime it is used to predict
+- **svar2**: bound corpus-generation memory without costing determinism
+- **svar2**: close the remaining scale-bench review findings
+- **svar2**: gate H3 on byte materiality and stop the RAM law being poisoned
+- **svar2**: make the scale-bench harness able to answer its own question
+- **svar2**: refuse to record failed runs or compare baselines across widths
+- **svar2**: key regression baselines by worker count, record on a dedicated allocation
+- **svar2**: repo-root cd in sweep sbatch, dedupe c=1 contig point, README wording
+- **svar2**: scope sweep digest oracle to within-corpus, check per point
+- **svar2**: tighten declared contig length to the true position bound
+- **svar2**: declare truthful contig length when stride floors to 1
+
+### Refactor
+
+- **bench**: delete dead apportion helpers, type SweepPoint.backend, hash the profile
+- **bench**: build the pgen family through the shared _point helper
+- **svar2**: extract the fitted RAM coefficients into a RamLaw struct
+- **svar2**: drop the parallel-executor prototype
+
+### Perf
+
+- **svar2**: fit RamLaw::VCF as an envelope with a measured per-contig term
+- **svar2**: re-fit RamLaw::PGEN on the bounded reader
+- **svar2**: re-fit RamLaw::PGEN on the bounded reader
+- **svar2**: measure the reader cell budget, set PARALLEL_MIN_CELLS
+- **svar2**: budget the reader's two buffers in bytes, not variants
+- **svar2**: retain presence masks, not allele vectors, per atom
+- **svar2**: trim glibc heaps at the PGEN contig boundary too
+- **svar2**: size the merge tail against the dispatched concurrency
+- **svar2**: take the SVAR1/seqpro import stack off the from_vcf path
+- defer the mutcat/signature import stack off `import genoray`
+- **svar2**: stop the monitor sampler holding a 5s floor under every contig
+- **svar2**: give the var_key merge a real thread budget
+- **svar2**: add a bench-only override for the dense channel depth
+- **svar2**: parallelize the dense genotype bit-transpose
+- **svar2**: prototype a parallel executor behind GENORAY_EXEC_WORKERS
+- **svar2**: resolve VCF sample columns once per contig, not per shard
+- **svar2**: rebalance sharded VCF workers
+- **query**: hoist the last region-scaled SearchTree builds (#148)
+
 ## 3.4.0 (2026-07-31)
 
 ### Feat
