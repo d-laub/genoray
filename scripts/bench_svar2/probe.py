@@ -34,9 +34,29 @@ RE_SAMPLER = re.compile(r"pipeline sampler .*")
 RE_UNIT = re.compile(r"shard unit done .*?unit_secs=([0-9.]+)")
 # `tracing::info!(concurrent_chroms, ..., "pipeline config")` in src/lib.rs --
 # emitted by BOTH backends (the PGEN one is "pipeline config (PGEN)"), so this
-# pattern must stay loose enough to match either. This is the ONLY record of
-# the concurrency the planner actually chose: `SweepPoint.concurrent_chroms` is
-# the REQUEST, and is None whenever the point let the planner decide.
+# pattern must stay loose enough to match either. IN PRINCIPLE this would be
+# the only record of the concurrency the planner actually chose
+# (`SweepPoint.concurrent_chroms` is only the REQUEST, None whenever a point
+# lets the planner decide) -- but through this Python CLI path it is
+# currently ALWAYS a no-op. `src/logging.rs`'s `FieldGrab` visitor, which
+# turns this event into what crosses the channel to Python, forwards only
+# `message` and `chrom`; every other field, including `concurrent_chroms`,
+# is dropped before it reaches here. The stderr fmt-layer fallback that
+# *would* render the fields as text is also closed off: `_build_env` below
+# sets `GENORAY_LOG=genoray::monitor=trace`, which enables only the
+# `genoray::monitor` target, and this event's target is plain `genoray`. So
+# `RE_PIPELINE_CONFIG` never has anything to match against, and
+# `concurrent_chroms_used` in the returned dict is always `None` -- see
+# issue #162. A sweep author who writes an unpinned point
+# (`SweepPoint.concurrent_chroms=None`), trusting this fallback to recover
+# what the planner actually chose, gets every such row SILENTLY DROPPED by
+# `_ram_rows` instead of an error -- and the gate would then certify an
+# envelope fitted on a subset that excludes exactly the planner-chosen
+# production configurations, which is the under-prediction / OOM direction.
+# Every point in every sweep committed so far pins `concurrent_chroms`
+# instead (see issue #161's "interim workaround"), so no shipped law has
+# actually been affected -- but nothing catches a future point that forgets
+# to.
 RE_PIPELINE_CONFIG = re.compile(r"pipeline config.*")
 
 

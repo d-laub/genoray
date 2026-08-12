@@ -185,8 +185,11 @@ impl RamLaw {
     /// PGEN crossed data before this sweep ran, under a decision rule
     /// pre-registered in issue #158: adopt only on a >=20% worst-case
     /// improvement. It reached only 1.76% (2.4189x -> 2.3763x). NO-GO.
-    /// `RamLaw::VCF` therefore ships the same four coefficients as before;
-    /// `per_contig_per_sample_mb` stays the tested-but-dormant `0.0` default.
+    /// `RamLaw::VCF` therefore ships the same four-coefficient FORM as
+    /// before (`base_mb`, `per_sample_mb`, `per_contig_mb`, `kappa`) -- not
+    /// the same VALUES: all four moved in this refit, and `per_contig_mb`
+    /// came off its old `0.0`. `per_contig_per_sample_mb` stays the
+    /// tested-but-dormant `0.0` default.
     ///
     /// Validity domain: S in {4,000, 32,000, 128,000}, chunk_MB roughly
     /// 4-100 MB -- but chunk_MB above 16 exists ONLY at S=32,000 (2 chunk
@@ -304,7 +307,12 @@ impl RamLaw {
     /// from six launches differing only in `cc`, R^2 0.9903): both new
     /// coefficients vary with `S` and `cc`, so the law still does not describe
     /// the mechanism. The envelope is safe regardless -- that is the point of
-    /// fitting a bound rather than a mean -- but #158 stays open.
+    /// fitting a bound rather than a mean. #158's own substance (a measured,
+    /// non-zero `per_contig_mb` fitted as an envelope) is now closed -- by
+    /// this PGEN refit for this backend, and by the 2026-08-11 `RamLaw::VCF`
+    /// refit below for the other -- but the per-contig term's true
+    /// functional form remains a separate, still-open research question
+    /// (see `RamLaw::VCF`'s doc comment).
     ///
     /// Validity domain: S in {4,000, 32,000, 128,000}, chunk_bytes 3.125-250
     /// MB, `cc` in {1,4,8,16}, `reader_workers == 1` and `pending == 0` in
@@ -864,8 +872,14 @@ mod tests {
     fn ram_law_vcf_reproduces_the_fitted_coefficients() {
         // Re-derived for the 2026-08-11 envelope refit (issue #158). See
         // docs/superpowers/plans/results/2026-08-11-vcf-ram-law-crossed.md --
-        // reproduce with `python -m scripts.bench_svar2.fit_ram --backend vcf
-        // --margin 1.25` against the committed crossed-sweep data.
+        // reproduce with (paths matter: `BACKEND_SWEEPS["vcf"]` pools all
+        // seven VCF sweep families, so pointing this at a directory holding
+        // OTHER sweeps too would silently fit a different law):
+        //
+        //   D=docs/superpowers/plans/results/2026-08-11-vcf-ram-law-crossed-data
+        //   pixi run python -m scripts.bench_svar2.fit_ram \
+        //     --results $D --plans $D --manifests $D/manifests \
+        //     --backend vcf --margin 1.25
         assert_eq!(RamLaw::VCF.base_mb, 457.25887672659735);
         assert_eq!(RamLaw::VCF.per_sample_mb, 0.011017408281198566);
         assert_eq!(RamLaw::VCF.per_contig_mb, 111.42612019477279);
@@ -920,9 +934,11 @@ mod tests {
         assert!(RamLaw::PGEN.kappa > 0.0, "kappa must be positive");
         assert!(RamLaw::PGEN.base_mb > 0.0, "baseline must be positive");
         assert!(RamLaw::PGEN.per_sample_mb >= 0.0);
-        // The PGEN law FITTED this term (VCF legitimately carries 0.0). A
-        // refit that drops it back to zero has silently discarded the
-        // per-contig staging cost the 2026-08-08 crossed sweep measured.
+        // The PGEN law FITTED this term (0.0 would mean "not fitted for
+        // this backend" -- true of neither law since the 2026-08-11 VCF
+        // refit, see `ram_law_vcf_is_a_usable_law` below). A refit that
+        // drops it back to zero here has silently discarded the per-contig
+        // staging cost the 2026-08-08 crossed sweep measured.
         assert!(
             RamLaw::PGEN.per_contig_mb > 0.0,
             "PGEN's per-contig term is measured, not optional"

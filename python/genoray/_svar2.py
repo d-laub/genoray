@@ -967,8 +967,8 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         ~457 MB), so any budget that can't cover baseline plus one
         concurrent contig's chunk buffers is rejected with a `ValueError`
         even for a tiny cohort. That baseline term also scales with cohort
-        size (`~0.12 MB/sample`), so this floor is not just a small-cohort
-        curiosity: at ~500k samples the baseline alone predicts ~63 GB,
+        size (`~0.0158 MB/sample`), so this floor is not just a small-cohort
+        curiosity: at ~500k samples the baseline alone predicts ~10.6 GB,
         so a *detected* budget (80% of a smaller host's RAM) will reject
         the conversion outright -- pass an explicit `max_mem` sized to the
         host in that case.

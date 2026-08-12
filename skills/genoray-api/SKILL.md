@@ -382,18 +382,29 @@ Signature: `from_vcf(out, source, reference=None, *, regions=None, samples=None,
   cohort-baseline term plus a per-concurrent-contig term, so any budget that
   can't cover baseline plus one concurrent contig is rejected with
   `ValueError`, even for a tiny cohort. The floor is **backend-specific**: the
-  VCF law's baseline is roughly 457 MB plus ~111 MB per concurrent contig
-  (so in practice anything much below ~600 MB is rejected), while
-  `from_pgen`'s is roughly 2.7 GB plus ~210 MB per concurrent contig, putting
-  its floor nearer ~3 GB. **The 2026-08-11 envelope refit roughly
-  quadruples `from_vcf`'s real-world floor at its own defaults**
-  (`chunk_size=25_000`, `reader_workers=3`, cc=1) versus the pre-refit
-  law — safe (it over-allocates, not OOMs), but large: the minimum
-  `max_mem` for one concurrent contig goes ~1.15 GB → ~1.38 GB at
-  S=4,000, ~7.8 GB → ~26.4 GB at S=128,000, and ~27.9 GB → ~101.5 GB at
-  S=500,000, so on a 128 GB host (`max_mem` defaults to 80% of detected
-  RAM) a 500k-sample `from_vcf` now plans `concurrent_chroms=1` where it
-  used to plan 4.
+  VCF law's raw LP coefficients are ~457 MB baseline plus ~111 MB per
+  concurrent contig, but at `from_vcf`'s own defaults (`chunk_size=25_000`,
+  `reader_workers=3`) the per-contig bracket's `kappa` term dominates those
+  two numbers completely, so the real floor for even a tiny cohort is
+  **roughly 1.38 GB**, not ~600 MB (see the S=4,000 figure below) — anything
+  much below that is rejected in practice. `from_pgen`'s floor is roughly
+  2.7 GB plus ~210 MB per concurrent contig, putting its floor nearer ~3 GB.
+  **The 2026-08-11 envelope refit roughly quadruples `from_vcf`'s real-world
+  floor at its own defaults** (`chunk_size=25_000`, `reader_workers=3`,
+  cc=1) versus the pre-refit law: the minimum `max_mem` for one concurrent
+  contig goes ~1.15 GB → ~1.38 GB at S=4,000, ~7.8 GB → ~26.4 GB at
+  S=128,000, and ~27.9 GB → ~101.5 GB at S=500,000. The direction is safe (a
+  larger requirement means more over-allocation or an outright refusal to
+  plan, never an OOM), but the size of the jump is large enough to flip
+  outcomes at production scale. At S=500,000 with `from_vcf`'s own defaults
+  (`chunk_size=25_000`, `reader_workers=3`), the floor for
+  `concurrent_chroms=1` is ~101,480 MB: a **64 GB host** (`max_mem` defaults
+  to 80% of detected RAM, i.e. `51,200 MB`) now raises
+  `PlanError::InsufficientMemory` — naming both remedies in its message,
+  "raise `max_mem` or lower `chunk_size`" — where the pre-refit law planned
+  `concurrent_chroms=2` and ran; a **128 GB host** (`102,400 MB`) still
+  clears and plans `concurrent_chroms=1`, but by under 1% of headroom, where
+  the pre-refit law planned 4.
 - **`progress=False`/`log_level="info"`** — write-time progress/logging,
   shared by `from_vcf`/`from_pgen`/`from_vcf_list`/`from_svar1`/`write_view`.
   `progress=True` renders live progress: in a terminal or Jupyter, a `rich`
@@ -477,8 +488,8 @@ Signature: `from_pgen(out, source, reference=None, *, regions=None, samples=None
   (PGEN's own fitted coefficients, higher than `from_vcf`'s ~457 MB), so any
   budget that can't cover baseline plus one concurrent contig's chunk
   buffers is rejected with `ValueError`, even for a tiny cohort. That
-  baseline scales with cohort size (`~0.12 MB/sample`), so this isn't just a
-  small-cohort concern: at ~500k samples it alone predicts ~63 GB, so a
+  baseline scales with cohort size (`~0.0158 MB/sample`), so this isn't just
+  a small-cohort concern: at ~500k samples it alone predicts ~10.6 GB, so a
   *detected* budget on a smaller host will reject the conversion — pass an
   explicit `max_mem` sized to the host in that case.
 - **`regions=`/`merge_overlapping=`/`regions_overlap=`** — same convention,

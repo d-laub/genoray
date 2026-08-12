@@ -66,13 +66,40 @@ pub const VCF: RamLaw = RamLaw {
 
 **This refit roughly quadruples `from_vcf`'s real-world memory floor at its
 own defaults** (`chunk_size=25_000`, `reader_workers=3`, cc=1) relative to
-the pre-refit law — the direction is safe (more over-allocation, not an
-OOM), but it is a large, user-visible change: the minimum `max_mem` needed
-to admit even one concurrent contig goes ~1.15 GB → ~1.38 GB at S=4,000,
-~7.8 GB → ~26.4 GB at S=128,000, and ~27.9 GB → ~101.5 GB at S=500,000, so
-(since `max_mem` defaults to 80% of detected RAM, `_utils.py:130`) a
-500k-sample `from_vcf` on a 128 GB host now plans `concurrent_chroms=1`
-where the old law planned 4.
+the pre-refit law — the direction is safe (more over-allocation, or an
+outright refusal to plan, never an OOM), but it is a large, user-visible
+change: the minimum `max_mem` needed to admit even one concurrent contig
+goes ~1.15 GB → ~1.38 GB at S=4,000, ~7.8 GB → ~26.4 GB at S=128,000, and
+~27.9 GB → ~101.5 GB at S=500,000 (since `max_mem` defaults to 80% of
+detected RAM, `_utils.py:130`).
+
+That last jump crosses a real cliff at production scale. `plan_sharded`'s
+floor for `concurrent_chroms=1` is `base_mb + per_sample_mb*S +
+per_contig_mb + kappa*(w+pending)*chunk_MB` where `pending = w - 1`. At
+S=500,000, `chunk_size=25_000` (`chunk_MB = 25_000 * 500_000 * 2 / 8 / 1e6 =
+3,125`), and `from_vcf`'s production `reader_workers=3` (so `w+pending =
+3+2 = 5`):
+
+```
+457.259 + 0.011017*500,000 + 111.426 + 6.105786*5*3,125
+= 457.259 + 5,508.704 + 111.426 + 95,402.911
+≈ 101,480.3 MB
+```
+
+- A **64 GB host** (`max_mem` defaults to 80% of detected RAM = `51,200
+  MB` decimal) has `headroom_mb = 51,200 − 5,965.96 ≈ 45,234 MB`, which is
+  less than the ~95,514 MB per-contig bracket, so `plan_sharded` now returns
+  `PlanError::InsufficientMemory` — its message names both remedies: "max_mem
+  is 51200 MB but converting this cohort needs at least 101480 MB for one
+  concurrent contig; raise max_mem or lower chunk_size". The pre-refit law
+  (`base_mb=932.0`, `per_contig_mb=0.0`, `kappa=1.371`) needed only
+  `932 + 0.01115*500,000 + 1.371*5*3,125 ≈ 27,928.9 MB` per contig, so the
+  same 64 GB host used to plan `concurrent_chroms=2` (`floor((51,200 −
+  6,507)/27,928.9) = 2`) and ran.
+- A **128 GB host** (`102,400 MB`) has `headroom_mb ≈ 96,434.0 MB`, just
+  above the ~95,514.3 MB bracket, so it still plans `concurrent_chroms=1` —
+  but clears by `(96,434.0 − 95,514.3) / 95,514.3 ≈ 0.96%`, under 1% of
+  headroom. The pre-refit law planned `concurrent_chroms=4` here.
 
 ## The interaction-term check (Phase 0) does not speak to the extrapolation this law is actually used for
 
@@ -211,8 +238,11 @@ ladder (six launches differing only in `concurrent_chroms`, R² 0.9903, RMSE
 of magnitude above measurement noise: the four-term law does not describe
 the mechanism, consistent with check 4's finding that `per_contig_mb` is not
 actually constant across cohort widths. The envelope fit is safe regardless
-— that is the entire point of fitting a bound rather than a mean — but #158
-stays open as a research question about the missing interaction term.
+— that is the entire point of fitting a bound rather than a mean. As stated
+under "What remains open" below, #158's own substance (a measured, non-zero
+`per_contig_mb` fitted the right way, as an envelope) is closed by this
+refit; the missing interaction term / true functional form is a separate,
+still-open research question, not #158 itself.
 
 ## What the data cannot identify
 

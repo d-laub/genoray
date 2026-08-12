@@ -96,8 +96,14 @@ def test_na_in_one_cpu_column_does_not_misalign_the_other_series():
 
 def test_parse_trace_extracts_realised_concurrent_chroms():
     # Both backends emit a "pipeline config" line; the VCF one is bare, the
-    # PGEN one is suffixed. tracing's fmt layer prints the message first, then
-    # the fields, so `concurrent_chroms=` follows the message text.
+    # PGEN one is suffixed. This is tracing's stderr FMT-LAYER format
+    # (message first, then `key=value` fields) -- NOT the format that
+    # actually crosses the channel from the Python CLI path, which strips
+    # every field but `message`/`chrom` (see `FieldGrab` in `src/logging.rs`,
+    # and issue #162). These two tests exercise `parse_trace`'s regex/field
+    # extraction in isolation; they do not exercise -- and would not catch a
+    # regression in -- the real probe.py subprocess integration, where
+    # `concurrent_chroms_used` is currently always `None`.
     vcf = (
         "2026-08-11T00:00:00Z  INFO genoray: pipeline config "
         "concurrent_chroms=4 htslib_threads=2 monolithic_reader_active=8 "

@@ -61,8 +61,19 @@ CONCURRENCY_READER_WORKERS = 3
 # width. The `cc` lever arm wants many contigs and the `chunk_MB` lever arm
 # wants few, and at a fixed cell budget they are in direct conflict. Hence the
 # constant-cells grid below for cc, plus ONE oversized corpus (VCF_BIGCHUNK)
-# whose only job is to carry kappa out to ~100 MB, cutting the extrapolation to
-# production's 256 MiB chunks from ~16x to ~2.7x.
+# whose only job is to carry kappa out to ~100 MB. That is NOT the ~16x-to-2.7x
+# cut this comment used to claim -- that number compared against
+# `_auto_chunk_size`'s 256 MiB target, but `from_vcf` (`RamLaw::VCF`'s only
+# consumer) takes a fixed `chunk_size: int = 25_000` and never calls
+# `_auto_chunk_size` (that helper serves only `from_pgen`/`from_vcf_list`/
+# `from_svar1`). Against `from_vcf`'s actual fixed chunk size, VCF_BIGCHUNK's
+# ~100 MB cuts the extrapolation from ~50x (15.9 MB) to ~8x at S=128,000
+# (chunk_MB=800), and from ~197x to ~31x at S=500,000 (chunk_MB=3,125) --
+# still large, and compounded a further ~5x by `reader_workers` going 1->3 in
+# production, for `kappa` applied at roughly 156x its measured range overall.
+# See `RamLaw::VCF`'s doc comment in `src/budget.rs` and
+# `docs/superpowers/plans/results/2026-08-11-vcf-ram-law-crossed.md` for the
+# full derivation.
 VCF_CONTIGS = tuple(f"chr{i}" for i in range(1, 23))
 
 # Cohort widths for the crossed grid. V is derived (CELLS_BUDGET // S) so every
