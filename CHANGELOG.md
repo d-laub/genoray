@@ -1,3 +1,14 @@
+## 4.0.1 (2026-08-21)
+
+### Fix
+
+- **deps**: gate tracing behind `conversion` so query-only consumers skip it
+- **bench**: close six seam defects from the final whole-branch review
+- **bench**: generate holdout_f0 and pre-flight every plan corpus
+- **bench**: abort on an unobserved concurrent_chroms, for every family
+- **bench**: key sweep resume on (point_id, code_id)
+- **svar2**: carry structured tracing fields through the log channel
+
 ## 4.0.0 (2026-08-12)
 
 ### BREAKING CHANGE
