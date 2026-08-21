@@ -13,8 +13,16 @@ crate-type = ["cdylib", "rlib"]
 # alignment guarantee, so `cast_slice` would panic).
 bytemuck = { version = "1.25.0", features = ["extern_crate_alloc"] }
 crossbeam-channel = "0.5.15"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+# Optional and enabled by `conversion`: every module that emits `tracing` events
+# (writer, vcf_reader, vcf_list_reader, shard_exec, merge, executor, orchestrator,
+# chunk_assembler, contig_cost, monitor) is itself conversion-gated, as is the
+# `logging` module that installs the subscriber. Query-only consumers that link
+# this crate with `default-features = false` (e.g. GenVarLoader) would otherwise
+# pay for tracing-subscriber's dependency tree -- matchers, sharded-slab,
+# thread_local, nu-ansi-term, tracing-log, valuable -- for events they can never
+# emit or observe.
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"], optional = true }
 half = "2"
 libc = "0.2"
 memmap2 = "0.9.10"
@@ -55,7 +63,7 @@ pyo3 = { version = "0.29", features = ["auto-initialize"] }
 # `conversion` pulls in rust-htslib and gates the VCF→svar2 write/convert
 # pipeline. Off => query-only core (what gvl links as a path-dep).
 default = ["conversion", "extension-module"]
-conversion = ["dep:rust-htslib", "dep:zstd"]
+conversion = ["dep:rust-htslib", "dep:zstd", "dep:tracing", "dep:tracing-subscriber"]
 extension-module = ["pyo3/extension-module"]
 # abi3 (stable ABI) is opt-in ONLY at wheel-build time (`maturin build --features
 # abi3`) so lint hooks (default features) and `cargo test --no-default-features`
