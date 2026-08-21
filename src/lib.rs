@@ -40,6 +40,7 @@ pub mod field;
 // `py_convert` and `streams` below.
 pub mod field_finalize;
 pub mod layout;
+#[cfg(feature = "conversion")]
 pub mod logging;
 #[cfg(feature = "conversion")]
 pub mod max_del;
