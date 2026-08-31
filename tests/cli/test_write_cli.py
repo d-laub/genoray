@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -392,6 +393,21 @@ def test_write_vcf_list_dispatches(tmp_path: Path):
     assert r.returncode == 0, r.stderr
     sv = SparseVar2(out)
     assert sv.available_samples == ["S0", "S1"]
+
+
+def test_write_vcf_bgz_suffix_dispatches_to_single_vcf(tmp_path: Path):
+    """Issue #166: `.vcf.bgz` is the same BGZF bytes as `.vcf.gz` (All of Us
+    ships its phased callsets that way), so the CLI's source-kind resolution
+    must route it to the single-VCF `from_vcf` path -- not fall through to the
+    vcf-list form, which would read the binary file as a manifest."""
+    gz = _vcf(tmp_path, symbolic=False)
+    bgz = tmp_path / "in.vcf.bgz"
+    shutil.copyfile(gz, bgz)
+    shutil.copyfile(gz.with_name(gz.name + ".csi"), bgz.with_name(bgz.name + ".csi"))
+    out = tmp_path / "bgz_out"
+    r = _run(["write", "vcf", str(bgz), str(out), "--no-reference", "--threads", "1"])
+    assert r.returncode == 0, r.stderr
+    assert SparseVar2(out).available_samples == ["S0", "S1"]
 
 
 def test_write_svar1_regions_and_samples(tmp_path: Path):

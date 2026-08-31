@@ -50,8 +50,24 @@ def format_memory(memory: int):
     return f"{value:.2f} {units[exponent]}"
 
 
-_VCF_EXT = re.compile(r"\.[vb]cf(\.gz)?$")
+#: Filename suffixes naming a BGZF-compressed VCF. `.vcf.gz` is the
+#: convention, but `.vcf.bgz` names the exact same BGZF bytes and is what
+#: several large cohorts ship (e.g. All of Us v9 phased callsets). htslib
+#: sniffs the format from the file's magic bytes, not its name, so both are
+#: accepted wherever a bgzipped VCF is (issue #166).
+BGZF_VCF_SUFFIXES = (".vcf.gz", ".vcf.bgz")
+
+_VCF_EXT = re.compile(r"\.[vb]cf(\.b?gz)?$")
 _PGEN_EXT = re.compile(r"\.(pgen|pvar|psam)$")
+
+
+def is_bgzf_vcf(path: str | Path) -> bool:
+    """Whether `path`'s name marks it a BGZF-compressed VCF.
+
+    See :data:`BGZF_VCF_SUFFIXES` — `.vcf.bgz` is an accepted alias for
+    `.vcf.gz`.
+    """
+    return Path(path).name.endswith(BGZF_VCF_SUFFIXES)
 
 
 def variant_file_type(path: str | Path) -> Literal["vcf", "pgen"] | None:

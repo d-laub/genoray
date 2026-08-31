@@ -255,8 +255,8 @@ dropped = SparseVar2.from_vcf("out.svar2", "file.vcf.gz", no_reference=True)
 
 Signature: `from_vcf(out, source, reference=None, *, regions=None, samples=None, merge_overlapping=False, regions_overlap="pos", no_reference=False, skip_out_of_scope=False, ploidy=2, chunk_size=25_000, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False, info_fields=None, format_fields=None, check_ref="e", progress=False, log_level="info", max_mem=None) -> int`
 
-- `source` — a bgzipped VCF (`.vcf.gz`) or BCF (`.bcf`). Auto-indexes (`.csi`) if
-  no `.csi`/`.tbi` is found. For a PLINK2 PGEN source, use `from_pgen` instead
+- `source` — a bgzipped VCF (`.vcf.gz`, or the equivalent `.vcf.bgz` spelling)
+  or BCF (`.bcf`). Auto-indexes (`.csi`) if no `.csi`/`.tbi` is found. For a PLINK2 PGEN source, use `from_pgen` instead
   (below).
 - **`regions=`/`merge_overlapping=`/`regions_overlap=`** — restricts conversion
   to one or more indexed VCF fetch intervals. Region strings use the existing
@@ -540,7 +540,8 @@ from genoray import SparseVar2
 # Explicit list
 dropped = SparseVar2.from_vcf_list("out.svar2", ["s1.vcf.gz", "s2.bcf"], "ref.fa")
 
-# A directory of single-sample files (non-recursive: all *.vcf.gz, then all *.bcf)
+# A directory of single-sample files
+# (non-recursive: all *.vcf.gz/*.vcf.bgz, then all *.bcf)
 dropped = SparseVar2.from_vcf_list("out.svar2", "vcfs/", "ref.fa")
 
 # A manifest file (one path per line; blank/`#`-comment lines skipped;
@@ -570,9 +571,10 @@ multi-sample VCF.
 - `sources` — one of three forms, resolved by module-level
   `_resolve_vcf_sources`:
   - a `Sequence[str | Path]` — explicit files, in the given order.
-  - a single directory `Path` — every `*.vcf.gz` then every `*.bcf` directly
-    inside it (non-recursive), each group `natsort`-ordered.
-  - a single file `Path` — `.vcf.gz`/`.bcf` is taken as one file; anything
+  - a single directory `Path` — every bgzipped VCF (`*.vcf.gz`/`*.vcf.bgz`)
+    then every `*.bcf` directly inside it (non-recursive), each group
+    `natsort`-ordered.
+  - a single file `Path` — `.vcf.gz`/`.vcf.bgz`/`.bcf` is taken as one file; anything
     else is a manifest (one path per line, blank/`#`-comment lines skipped,
     relative entries resolved against the manifest's parent directory).
   - Resolving to zero files raises `ValueError`.
@@ -1054,8 +1056,8 @@ the offending record and continues — mirrors `bcftools norm --check-ref`), and
 to `from_vcf_list`; its single-file form forwards both to `from_vcf`.
 
 - `genoray write vcf` (`SparseVar2.from_vcf`/`from_vcf_list`): `source` is a
-  single `.vcf.gz`/`.bcf` → `from_vcf`; anything else (a directory, or a file
-  that isn't `.vcf.gz`/`.bcf`) → the vcf-list form (a directory of
+  single `.vcf.gz`/`.vcf.bgz`/`.bcf` → `from_vcf`; anything else (a directory,
+  or a file that isn't `.vcf.gz`/`.vcf.bgz`/`.bcf`) → the vcf-list form (a directory of
   single-sample VCFs/BCFs, or a manifest listing them) → `from_vcf_list` — a
   `.svar` (SVAR1) source belongs under `write svar1` instead, not here.
   `--samples`/`--samples-file` work only for the single-file form — they

@@ -893,7 +893,7 @@ class VCF:
         """Return the oxbow reader callable appropriate for this file's extension."""
         if self.path.suffix == ".bcf":
             return oxbow.from_bcf
-        elif re.search(r"\.vcf(\.gz)?$", self.path.name) is not None:
+        elif re.search(r"\.vcf(\.b?gz)?$", self.path.name) is not None:
             return oxbow.from_vcf
         else:
             raise ValueError(f"Unsupported file extension: {self.path.suffix}")

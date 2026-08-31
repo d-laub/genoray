@@ -129,10 +129,10 @@ def write_vcf(
     """Convert a bgzipped VCF or BCF (or a directory/manifest of single-sample VCFs/BCFs) to an SVAR2 store.
 
     Args:
-        source: Path to a bgzipped VCF (``.vcf.gz``) or BCF (``.bcf``). Auto-indexed
+        source: Path to a bgzipped VCF (``.vcf.gz``/``.vcf.bgz``) or BCF (``.bcf``). Auto-indexed
             (``.csi``) if no index is present. A directory or any other file is
             treated as the multi-file (vcf-list) form: a directory of
-            single-sample ``*.vcf.gz``/``*.bcf`` files, or a manifest listing
+            single-sample ``*.vcf.gz``/``*.vcf.bgz``/``*.bcf`` files, or a manifest listing
             them one per line; see :meth:`SparseVar2.from_vcf_list`.
         out: Path to the output SVAR2 directory.
         reference: Path to a reference FASTA (with ``.fai``). Used to validate REF and
@@ -183,6 +183,7 @@ def write_vcf(
     """
     from genoray import SparseVar2
     from genoray._svar2_fields import _parse_cli_field_specs
+    from genoray._utils import is_bgzf_vcf
 
     regions_arg, samples_arg = _resolve_regions_samples(
         regions=regions,
@@ -199,7 +200,7 @@ def write_vcf(
 
     skip_out_of_scope = skip_symbolics_and_breakends
     is_single_vcf = source.is_file() and (
-        source.name.endswith(".vcf.gz") or source.suffix == ".bcf"
+        is_bgzf_vcf(source) or source.suffix == ".bcf"
     )
     if not is_single_vcf:
         # Directory of VCFs, or a manifest file listing them (vcf-list form).
