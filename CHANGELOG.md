@@ -1,3 +1,9 @@
+## 4.0.2 (2026-08-31)
+
+### Fix
+
+- **vcf**: accept `.vcf.bgz` as an alias for `.vcf.gz`
+
 ## 4.0.1 (2026-08-21)
 
 ### Fix
