@@ -25,7 +25,12 @@ from genoray._svar2_fields import (
 )
 from genoray._svar2_mutcat import _MutcatMixin
 from genoray._svar2_ops import Mode, _assert_concat_compatible, _load_meta, _write_store
-from genoray._utils import detect_memory_budget, parse_memory
+from genoray._utils import (
+    BGZF_VCF_SUFFIXES,
+    detect_memory_budget,
+    is_bgzf_vcf,
+    parse_memory,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -42,9 +47,11 @@ def _resolve_vcf_sources(sources: "str | Path | Sequence[str | Path]") -> list[P
 
     - a `Sequence` (list/tuple, not `str`/`Path`) of file paths, taken as-is
       and in the given order.
-    - a single directory `Path`: every `*.vcf.gz` then every `*.bcf` directly
-      inside it (non-recursive), each group name-sorted (`natsort`).
-    - a single file `Path` ending in `.vcf.gz` or `.bcf`: that one file.
+    - a single directory `Path`: every bgzipped VCF (`*.vcf.gz`/`*.vcf.bgz`)
+      then every `*.bcf` directly inside it (non-recursive), each group
+      name-sorted (`natsort`).
+    - a single file `Path` ending in `.vcf.gz`/`.vcf.bgz` or `.bcf`: that one
+      file.
     - any other single file `Path`: treated as a manifest -- one path per
       line, blank lines and `#`-prefixed comment lines skipped, relative
       entries resolved against the manifest's parent directory.
@@ -52,8 +59,9 @@ def _resolve_vcf_sources(sources: "str | Path | Sequence[str | Path]") -> list[P
     if isinstance(sources, (str, Path)):
         path = Path(sources)
         if path.is_dir():
-            paths = natsorted(path.glob("*.vcf.gz")) + natsorted(path.glob("*.bcf"))
-        elif path.name.endswith(".vcf.gz") or path.suffix == ".bcf":
+            vcfs = [p for suf in BGZF_VCF_SUFFIXES for p in path.glob(f"*{suf}")]
+            paths = natsorted(vcfs) + natsorted(path.glob("*.bcf"))
+        elif is_bgzf_vcf(path) or path.suffix == ".bcf":
             paths = [path]
         elif path.suffix == ".vcf":
             # Without this, a bare `.vcf` single-path `sources` falls into the
@@ -62,7 +70,7 @@ def _resolve_vcf_sources(sources: "str | Path | Sequence[str | Path]") -> list[P
             # *path* -- producing a bewildering downstream error far from the
             # real problem. `_ensure_bgzipped` always raises here (this
             # branch is reached only when the suffix is exactly `.vcf`, which
-            # is neither `.bcf` nor `.vcf.gz`); the `paths = []` afterward is
+            # is neither `.bcf` nor a bgzipped VCF); the `paths = []` afterward is
             # unreachable but keeps this branch's static type honest.
             _ensure_bgzipped(path)
             paths = cast("list[Path]", [])
@@ -87,10 +95,10 @@ def _resolve_vcf_sources(sources: "str | Path | Sequence[str | Path]") -> list[P
 def _ensure_bgzipped(source: Path) -> None:
     """Reject a plain (uncompressed) VCF — it can't be tabix/csi-indexed."""
     is_bcf = source.suffix == ".bcf"
-    is_vcfgz = source.name.endswith(".vcf.gz")
-    if not (is_bcf or is_vcfgz):
+    if not (is_bcf or is_bgzf_vcf(source)):
         raise ValueError(
-            f"{source} must be a BCF (.bcf) or bgzipped VCF (.vcf.gz); bgzip it first."
+            f"{source} must be a BCF (.bcf) or bgzipped VCF "
+            f"({'/'.join(BGZF_VCF_SUFFIXES)}); bgzip it first."
         )
 
 
@@ -659,7 +667,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         log_level: Literal["off", "warning", "info", "debug"] = "info",
         max_mem: int | str | None = None,
     ) -> int:
-        """Convert a bgzipped VCF or BCF to an SVAR2 store.
+        """Convert a bgzipped VCF (`.vcf.gz`/`.vcf.bgz`) or BCF (`.bcf`) to an SVAR2 store.
 
         Exactly one of `reference` or `no_reference=True` is required. With a
         reference, indels are validated against and left-aligned to the FASTA;
@@ -1347,10 +1355,11 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         `_resolve_vcf_sources`):
 
         - a `Sequence` of paths -- explicit, in the given order.
-        - a single directory `Path` -- every `*.vcf.gz` then every `*.bcf`
-          directly inside it (non-recursive), each group name-sorted.
-        - a single file `Path` -- if it ends in `.vcf.gz`/`.bcf`, that one
-          file; otherwise treated as a manifest (one path per line, blank
+        - a single directory `Path` -- every bgzipped VCF
+          (`*.vcf.gz`/`*.vcf.bgz`) then every `*.bcf` directly inside it
+          (non-recursive), each group name-sorted.
+        - a single file `Path` -- if it ends in `.vcf.gz`/`.vcf.bgz`/`.bcf`,
+          that one file; otherwise treated as a manifest (one path per line, blank
           and `#`-comment lines skipped, relative entries resolved against
           the manifest's directory).
 
