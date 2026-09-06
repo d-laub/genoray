@@ -178,10 +178,6 @@ impl PendingBacklog {
 /// The other two blocking edges are ordinary backpressure, not deadlock: a
 /// worker blocked on the bounded `tx_res` is drained by the collector, and a
 /// collector blocked on the bounded `tx_dense` is drained by the executor.
-// TODO(step 7): remove once `run` wires `Frontier` into the worker/collector
-// loops -- until then it is only reachable from `#[cfg(test)]`, which the
-// non-test lib target's dead-code lint (`-D warnings`) flags as unused.
-#[allow(dead_code)]
 pub(crate) struct Frontier {
     state: Mutex<FrontierState>,
     cv: std::sync::Condvar,
@@ -194,13 +190,11 @@ pub(crate) struct Frontier {
 /// predicate reads a consistent pair. Split atomics would let a waiter see a
 /// stale head against fresh bytes and park after the head had already passed
 /// it -- a lost wakeup with no one left to issue another.
-#[allow(dead_code)]
 struct FrontierState {
     head: usize,
     pending_bytes: u64,
 }
 
-#[allow(dead_code)]
 impl Frontier {
     pub(crate) fn new(budget_bytes: u64) -> Self {
         Self {
@@ -320,6 +314,11 @@ pub struct ShardTotals {
 /// waiting, not the arriving one, and an in-order stream that never buffers
 /// anything records 0.
 ///
+/// `pending_budget_bytes` bounds that same backlog: once its bytes exceed the
+/// budget, [`Frontier::admit`] parks every worker except the one whose unit
+/// owns the reorder buffer's head, so the backlog can shrink instead of
+/// growing without limit. Pass `u64::MAX` to disable the gate.
+///
 /// Returns the [`ShardTotals`] (summed `dropped_out_of_scope`, `ref_excluded`,
 /// and `normalized_total`) across every unit, or the first error encountered
 /// (context-decorated).
@@ -334,6 +333,7 @@ pub fn run<F, G>(
     tx_dense: &Sender<DenseChunk>,
     worker_tids: &Mutex<Vec<i32>>,
     pending_gauge: &crate::monitor::PendingGauge,
+    pending_budget_bytes: u64,
 ) -> Result<ShardTotals, ConversionError>
 where
     F: Fn(&WorkUnit) -> Result<ChunkAssembler, ConversionError> + Sync,
@@ -349,6 +349,7 @@ where
     }
     let workers = workers.max(1);
     let cancel = Arc::new(AtomicBool::new(false));
+    let frontier = Arc::new(Frontier::new(pending_budget_bytes));
 
     // Seed every unit up front on an unbounded queue, then drop the sending
     // half: a worker's `rx_work.recv()` returns `Err` once the queue is
@@ -369,6 +370,7 @@ where
             let rx_work = rx_work.clone();
             let tx_res = tx_res.clone();
             let cancel = Arc::clone(&cancel);
+            let frontier = Arc::clone(&frontier);
             // `F`/`G` are `Sync`, so `&F`/`&G` are `Send` -- borrowing them
             // (rather than requiring `Clone`) into every scoped worker is
             // sound and avoids cloning the closures' captured state.
@@ -409,6 +411,7 @@ where
                             Err(e) => {
                                 let _ = tx_res.send(Msg::Err(err_context(e, &unit)));
                                 cancel.store(true, Ordering::Relaxed);
+                                frontier.wake_all();
                                 return;
                             }
                         };
@@ -419,6 +422,10 @@ where
                             }
                             match asm.read_next_chunk(chunk_size, local, None) {
                                 Ok(Some(chunk)) => {
+                                    frontier.admit(unit.ordinal, &cancel);
+                                    if cancel.load(Ordering::Relaxed) {
+                                        return;
+                                    }
                                     trace_ll!(
                                         "[trace {chrom}] reader: shard {i} assembled chunk \
                                          (unit ordinal {}) local={local} rows={}",
@@ -442,6 +449,7 @@ where
                                 Err(e) => {
                                     let _ = tx_res.send(Msg::Err(err_context(e, &unit)));
                                     cancel.store(true, Ordering::Relaxed);
+                                    frontier.wake_all();
                                     return;
                                 }
                             }
@@ -515,6 +523,7 @@ where
                             }
                         });
                     }
+                    frontier.publish(pending.bytes, rb.head());
                 }
                 Msg::Done {
                     unit_ordinal,
@@ -537,6 +546,7 @@ where
                             }
                         });
                     }
+                    frontier.publish(pending.bytes, rb.head());
                     if done_count == n_units {
                         // Every unit accounted for -- no further messages
                         // are possible. Don't wait for the channel to
@@ -550,6 +560,7 @@ where
                         first_err = Some(e);
                     }
                     cancel.store(true, Ordering::Relaxed);
+                    frontier.wake_all();
                     // Keep draining (don't `break`): a worker may be
                     // blocked on `tx_res.send` for a message already
                     // in flight, and only stops once it observes `cancel`
@@ -560,6 +571,13 @@ where
                 }
             }
         }
+
+        // Defensive: any producer still parked on `admit` after the recv
+        // loop exits (e.g. the collector broke out via `done_count ==
+        // n_units` while a non-head unit was mid-wait) must be woken so its
+        // worker thread can observe `cancel` (if set) or simply return --
+        // otherwise the `join()` below would hang on it.
+        frontier.wake_all();
 
         for (name, handle) in handles {
             if handle.join().is_err() && first_err.is_none() {

@@ -616,6 +616,7 @@ pub fn process_chromosome(
                                 &tx_dense,
                                 &shard_worker_tids,
                                 &pending_gauge,
+                                u64::MAX,
                             )?;
                             report_ref_excluded(&chr, totals.ref_excluded);
                             report_normalized(&chr, totals.normalized_total);
@@ -807,6 +808,7 @@ pub fn process_chromosome(
                                 &tx_dense,
                                 &shard_worker_tids,
                                 &pending_gauge,
+                                u64::MAX,
                             )?;
                             report_ref_excluded(&chr, totals.ref_excluded);
                             report_normalized(&chr, totals.normalized_total);
