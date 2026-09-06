@@ -162,7 +162,7 @@ fn processing_threads(usable_cores: usize, concurrent: usize, htslib: usize) -> 
 /// ```text
 ///   peak_rss_mb ~ base_mb
 ///               + per_sample_mb * samples
-///               + cc * (per_contig_mb + kappa * (w + pending) * chunk_MB)
+///               + cc * (per_contig_mb + kappa * w * chunk_MB + in_flight_MB(w))
 /// ```
 ///
 /// where `cc` is the concurrently-processed contig count. Everything inside
@@ -190,7 +190,9 @@ pub struct RamLaw {
     /// `chunk_bytes` -- staging buffers and per-contig bookkeeping. Charged
     /// per concurrent contig alongside the `kappa` term, so the per-contig
     /// bracket `plan_sharded` divides headroom by is
-    /// `per_contig_mb + kappa * (w + pending) * chunk_MB`.
+    /// `per_contig_mb + kappa * w * chunk_MB + in_flight_MB(w)`, where
+    /// `in_flight_MB` is [`in_flight_budget_bytes`] -- an additive term
+    /// outside `kappa`, priced separately (see `memory_fits`'s doc comment).
     ///
     /// `0.0` means "not fitted for this backend", which leaves the law
     /// exactly as it behaved before this field existed.
@@ -271,15 +273,18 @@ impl RamLaw {
     /// `chunk_size: int = 25_000`, which is 800 MB at S=128,000 and 3,125 MB
     /// at S=500,000: **8x and 31x** the largest chunk this sweep measured
     /// (`VCF_BIGCHUNK`, 100 MB). And every one of the 48 measured rows pinned
-    /// `reader_workers = 1`, but production hard-codes
-    /// `DEFAULT_READER_WORKERS = 3` (`src/lib.rs`), so the `(w + pending)`
-    /// multiplier `plan_sharded` applies is 5 in production against 1 as
-    /// measured -- a further 5x. Combined, `kappa` is applied at roughly
-    /// **156x** the largest measured `(w+pending)*chunk_MB` product when
-    /// `from_vcf` runs at S=500,000. `RamLaw::PGEN` carries no equivalent `w`
-    /// extrapolation: `from_pgen` pins `reader_workers = 1` in production
-    /// (`src/lib.rs`), matching its own measured domain exactly, so this
-    /// asymmetry is VCF-specific.
+    /// `reader_workers = 1`, but `plan_sharded`'s VCF call site passes
+    /// `Some(DEFAULT_READER_WORKERS)` = `Some(3)` today (`src/lib.rs`), so
+    /// `kappa * w * chunk_MB` is applied at ~3x the measured `w` -- ~93x
+    /// combined with the 31x chunk extrapolation at S=500,000. Once a later
+    /// task switches this call site to the derive path, `w` reaches ~10 on
+    /// the machine issue #169 was measured on: ~10x the measured `w`, ~312x
+    /// combined. `in_flight_budget_bytes`'s contribution is additive and
+    /// sits OUTSIDE `kappa`, so it carries no `kappa` extrapolation of its
+    /// own -- only the `kappa * w * chunk_MB` term above does. `RamLaw::PGEN`
+    /// carries no equivalent `w` extrapolation: `from_pgen` pins
+    /// `reader_workers = Some(1)` in production (`src/lib.rs`), matching its
+    /// own measured domain exactly, so this asymmetry is VCF-specific.
     ///
     /// `cc = 16` sits OUTSIDE the production domain. Unlike the PGEN path,
     /// nothing in `lib.rs` clamps VCF `concurrent_chroms`, so `cc=16` is
@@ -519,9 +524,17 @@ impl std::fmt::Display for PlanError {
 ///    `processing_threads_for` sizes `merge.rs`'s var_key gather pool and
 ///    `dense_merge`'s bit-transpose from whatever the readers leave over;
 ///    spending every leftover core on readers floors that pool at 1 and gives
-///    back the 2.77-2.82x merge-tiling win from commit c49d1d7.
-/// 2. Choose `cc`, preferring depth ([`W_TARGET`] readers per contig) over
-///    breadth.
+///    back the 2.77-2.82x merge-tiling win from commit c49d1d7. This holds
+///    only up to the reader pool: an explicit `reader_workers` larger than
+///    the pool is still honoured (never silently shrunk) and can starve the
+///    merge pool to 1, because refusing a request is reserved for the memory
+///    budget, not the core count.
+/// 2. Choose `cc`. On the derive path (`inp.reader_workers == None`), prefer
+///    depth ([`W_TARGET`] readers per contig) over breadth. On the explicit
+///    path, size concurrency from the CALLER's own `w` instead -- a caller
+///    who asked for 1 reader per contig has already told us its per-contig
+///    demand, and sizing its `cc` off `W_TARGET` (a derive-path default it
+///    never asked for) needlessly starves concurrency.
 /// 3. Fill the depth: one core for the contig's executor, the rest for its
 ///    readers.
 /// 4. Re-check memory, giving back READERS before contigs when it's tight.
@@ -536,15 +549,15 @@ pub fn plan_sharded(inp: PlanInputs) -> Result<ShardedPlan, PlanError> {
     let n_contigs = inp.n_contigs.max(1);
     // Step 1: reserve the merge tail before anything else claims cores.
     let pool = reader_pool_cores(inp.usable_cores);
-    // Step 2: choose the contig concurrency, preferring depth.
-    let depth_cap = (pool / (1 + W_TARGET)).max(1);
-    let mut cc = std::cmp::min(n_contigs, depth_cap);
 
     // An explicit request is honoured or refused. Concurrency may still come
     // down to make it fit -- that is the planner's own knob, not the
-    // caller's.
+    // caller's. Size `cc` from the caller's own `w`, not from `W_TARGET`:
+    // the caller has already told us its per-contig demand.
     if let Some(req) = inp.reader_workers {
         let w = req.max(1);
+        let cc_cap = (pool / (1 + w)).max(1);
+        let mut cc = std::cmp::min(n_contigs, cc_cap);
         while cc > 1 && memory_fits(&inp, cc, w).is_err() {
             cc -= 1;
         }
@@ -555,6 +568,9 @@ pub fn plan_sharded(inp: PlanInputs) -> Result<ShardedPlan, PlanError> {
         });
     }
 
+    // Step 2: choose the contig concurrency, preferring depth.
+    let depth_cap = (pool / (1 + W_TARGET)).max(1);
+    let mut cc = std::cmp::min(n_contigs, depth_cap);
     loop {
         // Step 3: fill the depth -- one core for this contig's executor, the
         // rest for its readers.
@@ -591,8 +607,15 @@ pub fn plan_sharded(inp: PlanInputs) -> Result<ShardedPlan, PlanError> {
 /// quadratic-ish in `w`, which is what made a large reader count unaffordable.
 /// `shard_exec::Frontier` now ENFORCES a fixed backlog ceiling, so it becomes
 /// an explicit additive budget. This is not a refit of `RamLaw::VCF`: the
-/// fitted coefficients are untouched, and replacing a fitted `(w-1)` term with
-/// enforced ceilings is strictly more conservative per unit of `w`.
+/// fitted coefficients are untouched. It is NOT uniformly more conservative,
+/// though. Per unit of `w` the old term charged `2 * kappa` (12.21 chunk-MB)
+/// against this one's `kappa + 2` (8.11), so the two cross at
+/// `w = 14.1058 / 4.1058 ~= 3.44`: at `w <= 3` this law charges MORE, at
+/// `w >= 4` it charges LESS -- 21% less per contig at `w = 10`, which is what
+/// the derive path picks on the machine in issue #169. That is defensible
+/// only because `Frontier` now ENFORCES the backlog ceiling the `(w-1)` term
+/// merely fitted; if that enforcement is ever removed or bypassed, this law
+/// under-predicts peak RSS at exactly the reader counts #169 exists to reach.
 ///
 /// `in_flight_MB` is [`in_flight_budget_bytes`], NOT `pending_budget_bytes`:
 /// the enforced backlog ceiling plus the `workers * 2` capacity of
@@ -724,12 +747,12 @@ mod tests {
     }
 
     // 48 cores -> 47 usable. pool = 47 - ceil(47/4) = 47 - 12 = 35.
-    // depth_cap = 35 / (1 + W_TARGET=8) = 3. n_contigs=22 doesn't bind
-    // (3 < 22), so cc = 3. reader_workers is explicit (Some(2)) and
+    // reader_workers is explicit (Some(2)), so cc seeds from the caller's
+    // own w, not W_TARGET (Finding 2, issue #169 review): cc_cap = 35 /
+    // (1+2) = 11. n_contigs=22 doesn't bind (11 < 22), so cc = 11.
     // max_mem_bytes is None, so memory_fits always succeeds and w=2 is
-    // honoured as-is. The OLD planner returned 15 here (core-bound via
-    // `usable/(1+w)`), before `plan_sharded` reserved a merge tail or
-    // preferred depth over breadth.
+    // honoured as-is. The OLD planner (before this task) returned 15 here
+    // (core-bound via `usable/(1+w)`, no merge-tail reserve).
     #[test]
     fn core_bound_concurrency() {
         let plan = plan_sharded(PlanInputs {
@@ -745,16 +768,17 @@ mod tests {
         assert_eq!(
             plan,
             ShardedPlan {
-                concurrent_chroms: 3,
+                concurrent_chroms: 11,
                 reader_workers: 2
             }
         );
     }
 
-    // Fewer contigs than the depth cap allows: never spawn a pipeline with no
-    // contig. pool = 47 - ceil(47/4) = 35; depth_cap = 35/9 = 3 > n_contigs=2,
-    // so n_contigs binds instead of depth_cap. reader_workers is explicit and
-    // unconstrained by memory (max_mem_bytes: None).
+    // Fewer contigs than the concurrency cap allows: never spawn a pipeline
+    // with no contig. pool = 47 - ceil(47/4) = 35; reader_workers is
+    // explicit (Some(2)), so cc_cap = 35/(1+2) = 11 > n_contigs=2, so
+    // n_contigs binds instead. Unconstrained by memory (max_mem_bytes:
+    // None).
     #[test]
     fn contig_count_bounds_concurrency() {
         let plan = plan_sharded(PlanInputs {
@@ -787,11 +811,11 @@ mod tests {
     //   per-contig  = 111.426 + 38161.164 + 37500           = 75772.590 MB
     //   cc=3: needed = 5965.963 + 3*75772.590 = 233283.733 MB > 200,000 -> fails
     //   cc=2: needed = 5965.963 + 2*75772.590 = 157511.143 MB <= 200,000 -> fits
-    // depth_cap (pool=35, W_TARGET=8) is 3, so the scan starts at cc=3 and
-    // gives back one contig to fit -- the huge in-flight term at this chunk
-    // size dominates over the old core bound (which alone would have allowed
-    // min(22, depth_cap)=3, not the 15 the pre-frontier core-bound formula
-    // gave).
+    // reader_workers is explicit (Some(2)): cc_cap = pool/(1+w) = 35/3 = 11,
+    // so the scan starts at cc=min(22,11)=11 and the shrink loop gives back
+    // contigs until it fits at cc=2 -- the huge in-flight term at this chunk
+    // size dominates regardless of where the scan starts, since per-contig
+    // cost here does not depend on cc.
     #[test]
     fn memory_bound_beats_core_bound_at_biobank_scale() {
         let plan = plan_sharded(PlanInputs {
@@ -1145,11 +1169,15 @@ mod tests {
         // with chunk_bytes=0 keeps the bracket purely proportional.
         //
         // baseline = 1000 + 0*1000 = 1000 MB; headroom = 3000 - 1000 = 2000 MB.
-        //   per_contig_mb=500:  needed(cc=5..2) = 3500,3000,2500,2000 MB
-        //     cc=5,4,3 > 3000 budget -> fail; cc=4: needed=1000+4*500=3000 <= 3000 -> a=4
-        //   per_contig_mb=1000: needed(cc=5..2) = 6000,5000,4000,3000 MB
-        //     cc=5,4,3 > 3000 -> fail; cc=2: needed=1000+2*1000=3000 <= 3000 -> b=2
-        // depth_cap (pool=48, W_TARGET=8) is 5, so both scans start at cc=5.
+        // pool = reader_pool_cores(64) = 64 - ceil(64/4) = 48. reader_workers
+        // is `Some(1)` (explicit), so cc seeds from the caller's own w, not
+        // W_TARGET: cc_cap = (48 / (1+1)).max(1) = 24, cc = min(n_contigs=32,
+        // 24) = 24 for both arms. The while loop then shrinks cc by 1 until
+        // memory_fits passes.
+        //   per_contig_mb=500:  needed(cc) = 1000 + cc*500; fits once cc <= 4.
+        //     Loop shrinks 24 -> 4: cc=4 -> needed=1000+4*500=3000 <= 3000 -> a=4.
+        //   per_contig_mb=1000: needed(cc) = 1000 + cc*1000; fits once cc <= 2.
+        //     Loop shrinks 24 -> 2: cc=2 -> needed=1000+2*1000=3000 <= 3000 -> b=2.
         let base = PlanInputs {
             usable_cores: 64,
             n_contigs: 32,
