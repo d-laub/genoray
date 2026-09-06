@@ -59,6 +59,13 @@ impl ReorderBuffer {
         }
     }
 
+    /// The ordinal currently being emitted/awaited. The collector publishes
+    /// this to [`Frontier`] so non-head producers know whether they are
+    /// subject to the backlog budget.
+    pub fn head(&self) -> usize {
+        self.head
+    }
+
     /// Record one arrival: either a chunk (`done = false`, tagged
     /// `(ordinal, local)`) or a shard-completion signal (`done = true`;
     /// `local` is ignored). Calls `emit(global_id, (ordinal, local))` for
@@ -144,6 +151,97 @@ impl PendingBacklog {
         let chunk = self.map.remove(tag)?;
         self.bytes = self.bytes.saturating_sub(chunk.approx_bytes());
         Some(chunk)
+    }
+}
+
+/// Producer-side admission gate over the collector's reorder backlog.
+///
+/// `PendingBacklog` is unbounded by construction: every unit ahead of
+/// `ReorderBuffer::head` buffers everything it produces. At biobank cohort
+/// width one buffered chunk is hundreds of MB, so the backlog -- not
+/// `max_mem`, and not `workers * chunk_bytes` -- becomes the dominant peak-RSS
+/// term, and it is invisible to the caller. This gate parks a producer whose
+/// unit is ahead of the head once the backlog exceeds `budget_bytes`.
+///
+/// # Why this cannot deadlock
+///
+/// The unit that owns the current head is NEVER parked. That exemption is
+/// sufficient because the work queue is a FIFO MPMC channel seeded in ordinal
+/// order, so units are dequeued in ascending ordinal order. Let `h` be the
+/// head. If unit `h` were still queued, no worker could be holding any
+/// `j > h` (it would have had to be dequeued before `h`), so every worker
+/// would hold an ordinal `< h` -- but those are all complete by definition of
+/// the head. Contradiction. So `h` is always either already done, or in
+/// flight at a worker that is exempt. That worker runs to its `Done`, the
+/// collector advances the head, and the condvar wakes the next holder.
+///
+/// The other two blocking edges are ordinary backpressure, not deadlock: a
+/// worker blocked on the bounded `tx_res` is drained by the collector, and a
+/// collector blocked on the bounded `tx_dense` is drained by the executor.
+// TODO(step 7): remove once `run` wires `Frontier` into the worker/collector
+// loops -- until then it is only reachable from `#[cfg(test)]`, which the
+// non-test lib target's dead-code lint (`-D warnings`) flags as unused.
+#[allow(dead_code)]
+pub(crate) struct Frontier {
+    state: Mutex<FrontierState>,
+    cv: std::sync::Condvar,
+    /// `u64::MAX` disables the gate (the PGEN path, which runs a single unit,
+    /// and the unit tests).
+    budget_bytes: u64,
+}
+
+/// Head and backlog bytes live under ONE mutex so a parked producer's
+/// predicate reads a consistent pair. Split atomics would let a waiter see a
+/// stale head against fresh bytes and park after the head had already passed
+/// it -- a lost wakeup with no one left to issue another.
+#[allow(dead_code)]
+struct FrontierState {
+    head: usize,
+    pending_bytes: u64,
+}
+
+#[allow(dead_code)]
+impl Frontier {
+    pub(crate) fn new(budget_bytes: u64) -> Self {
+        Self {
+            state: Mutex::new(FrontierState {
+                head: 0,
+                pending_bytes: 0,
+            }),
+            cv: std::sync::Condvar::new(),
+            budget_bytes,
+        }
+    }
+
+    /// Producer side: block until this unit may send another chunk.
+    /// Returns immediately for the unit that owns the head, and on cancel.
+    pub(crate) fn admit(&self, ordinal: usize, cancel: &AtomicBool) {
+        let mut st = self.state.lock().unwrap();
+        while !cancel.load(Ordering::Relaxed)
+            && ordinal > st.head
+            && st.pending_bytes > self.budget_bytes
+        {
+            st = self.cv.wait(st).unwrap();
+        }
+    }
+
+    /// Collector side: publish the whole backlog state after handling one
+    /// message. Publishing the totals (rather than deltas) keeps this
+    /// impossible to get wrong from the collector's two call sites, and the
+    /// cost is one uncontended lock per message.
+    pub(crate) fn publish(&self, pending_bytes: u64, head: usize) {
+        {
+            let mut st = self.state.lock().unwrap();
+            st.pending_bytes = pending_bytes;
+            st.head = head;
+        }
+        self.cv.notify_all();
+    }
+
+    /// Wake every parked producer without changing the state -- the teardown
+    /// path, after `cancel` is set.
+    pub(crate) fn wake_all(&self) {
+        self.cv.notify_all();
     }
 }
 
@@ -588,5 +686,80 @@ mod tests {
             vec![(0, (0, 0)), (1, (1, 0)), (2, (1, 1))],
             "global ids 0,1,2 assigned in (ordinal, local) order"
         );
+    }
+
+    use super::Frontier;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    /// The unit that owns the head is NEVER parked, even with the backlog
+    /// over budget. This is the whole deadlock-freedom argument: if the head
+    /// could park, nothing would ever advance it.
+    #[test]
+    fn admit_never_parks_the_head_unit() {
+        let f = Frontier::new(0);
+        f.publish(u64::MAX, 7);
+        let cancel = AtomicBool::new(false);
+        // Would hang forever if the head were subject to the budget.
+        f.admit(7, &cancel);
+    }
+
+    /// A non-head producer parks while the backlog is over budget, and wakes
+    /// once the head advances past it -- not only when bytes drop.
+    #[test]
+    fn admit_parks_a_non_head_unit_until_the_head_advances() {
+        let f = Frontier::new(0);
+        f.publish(100, 0);
+        let cancel = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let waiter = s.spawn(|| {
+                f.admit(3, &cancel);
+            });
+            // Give the waiter a chance to actually park before we release it.
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(!waiter.is_finished(), "unit 3 must park behind head 0");
+            f.publish(100, 3);
+            waiter.join().unwrap();
+        });
+    }
+
+    /// A parked producer must observe `cancel` so the error path can tear the
+    /// pool down instead of hanging in `join()`.
+    #[test]
+    fn admit_releases_a_parked_unit_on_cancel() {
+        let f = Frontier::new(0);
+        f.publish(100, 0);
+        let cancel = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let waiter = s.spawn(|| {
+                f.admit(3, &cancel);
+            });
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(!waiter.is_finished());
+            cancel.store(true, Ordering::Relaxed);
+            f.wake_all();
+            waiter.join().unwrap();
+        });
+    }
+
+    /// A budget of `u64::MAX` disables the gate entirely -- the PGEN path and
+    /// the existing tests rely on this.
+    #[test]
+    fn an_unbounded_budget_never_parks_anything() {
+        let f = Frontier::new(u64::MAX);
+        f.publish(u64::MAX, 0);
+        let cancel = AtomicBool::new(false);
+        f.admit(99, &cancel);
+    }
+
+    /// The reorder head must be readable by the collector so it can publish
+    /// it; without this the gate has nothing to compare against.
+    #[test]
+    fn reorder_buffer_exposes_its_head() {
+        let mut rb = ReorderBuffer::new(2);
+        assert_eq!(rb.head(), 0);
+        rb.push(0, 0, false, &mut |_gid, _tag| {});
+        rb.push(0, 0, true, &mut |_gid, _tag| {});
+        assert_eq!(rb.head(), 1, "head advances past a completed ordinal");
     }
 }
