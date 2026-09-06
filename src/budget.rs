@@ -611,8 +611,11 @@ pub fn plan_sharded(inp: PlanInputs) -> Result<ShardedPlan, PlanError> {
 /// though. Per unit of `w` the old term charged `2 * kappa` (12.21 chunk-MB)
 /// against this one's `kappa + 2` (8.11), so the two cross at
 /// `w = 14.1058 / 4.1058 ~= 3.44`: at `w <= 3` this law charges MORE, at
-/// `w >= 4` it charges LESS -- 21% less per contig at `w = 10`, which is what
-/// the derive path picks on the machine in issue #169. That is defensible
+/// `w >= 4` it charges LESS -- 21% less per contig at `w = 10` and a 10 MB
+/// chunk, which is what the derive path picks on the machine in issue #169.
+/// That percentage is chunk-dependent, since `per_contig_mb` is not: on the
+/// chunk-scaled part alone the reduction is 23.2%, which is what it approaches
+/// at a production-sized chunk (3125 MB at 500,000 samples). That is defensible
 /// only because `Frontier` now ENFORCES the backlog ceiling the `(w-1)` term
 /// merely fitted; if that enforcement is ever removed or bypassed, this law
 /// under-predicts peak RSS at exactly the reader counts #169 exists to reach.
