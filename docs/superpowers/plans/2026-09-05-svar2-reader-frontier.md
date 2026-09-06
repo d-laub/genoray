@@ -1767,7 +1767,7 @@ which is what validates the model:
 
 | cohort | published (old law, `w=3`) | actual floor now (`w=1`) |
 |---|---|---|
-| S=4,000 | 1,380 MB | **1,015 MB** |
+| S=4,000 | 1,380 MB | **1,016 MB** |
 | S=128,000 | 26,400 MB | **14,864 MB** |
 | S=500,000 | 101,480 MB | **56,408 MB** |
 
@@ -1915,7 +1915,7 @@ fn the_documented_max_mem_floors_match_the_planner() {
     // The floor is the cc=1, w=1 point, because `plan_sharded`'s derive path
     // scans `w` down to 1 before giving up a contig. `chunk_bytes` is
     // `0.25 * n_samples * chunk_size`: two haplotypes at one bit each.
-    for (n_samples, floor_mb) in [(4_000u64, 1_015u64), (128_000, 14_864), (500_000, 56_408)] {
+    for (n_samples, floor_mb) in [(4_000u64, 1_016u64), (128_000, 14_864), (500_000, 56_408)] {
         let chunk_bytes = n_samples * 25_000 / 4;
         let inp = |budget_mb: u64| PlanInputs {
             usable_cores: 31,

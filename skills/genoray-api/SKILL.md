@@ -390,7 +390,7 @@ Signature: `from_vcf(out, source, reference=None, *, regions=None, samples=None,
   concurrent contig, but the per-contig bracket's `kappa` term dominates
   those two numbers completely, so the real floor for even a tiny cohort —
   evaluated at the `cc=1, w=1` point the planner actually lands on when the
-  budget is tight — is **roughly 1.0 GB** (1,015 MB at S=4,000; see the table
+  budget is tight — is **roughly 1.0 GB** (1,016 MB at S=4,000; see the table
   below), not ~600 MB — anything much below that is rejected in practice.
   `from_pgen`'s floor is roughly 2.7 GB plus ~210 MB per concurrent contig,
   putting its floor nearer ~3 GB.
@@ -413,7 +413,7 @@ Signature: `from_vcf(out, source, reference=None, *, regions=None, samples=None,
 
   | cohort | old law, `w=3` (2026-08-11 refit) | current law, `w=3` | actual floor now (`w=1`) |
   |---|---|---|---|
-  | S=4,000 | 1,380 MB | 1,421 MB | **1,015 MB** |
+  | S=4,000 | 1,380 MB | 1,421 MB | **1,016 MB** |
   | S=128,000 | 26,400 MB | 27,833 MB | **14,864 MB** |
   | S=500,000 | 101,480 MB | 107,069 MB | **56,408 MB** |
 

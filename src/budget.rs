@@ -1371,4 +1371,36 @@ mod tests {
         } = err;
         assert!(budget_mb < baseline_mb);
     }
+
+    #[test]
+    fn the_documented_max_mem_floors_match_the_planner() {
+        // These three figures are published in skills/genoray-api/SKILL.md. If
+        // this test fails, the law changed and that document is now lying to
+        // users about how much memory they need -- update BOTH.
+        //
+        // The floor is the cc=1, w=1 point, because `plan_sharded`'s derive path
+        // scans `w` down to 1 before giving up a contig. `chunk_bytes` is
+        // `0.25 * n_samples * chunk_size`: two haplotypes at one bit each.
+        for (n_samples, floor_mb) in [(4_000u64, 1_016u64), (128_000, 14_864), (500_000, 56_408)] {
+            let chunk_bytes = n_samples * 25_000 / 4;
+            let inp = |budget_mb: u64| PlanInputs {
+                usable_cores: 31,
+                n_contigs: 22,
+                n_samples: n_samples as usize,
+                chunk_bytes,
+                max_mem_bytes: Some(budget_mb * 1_000_000),
+                reader_workers: None,
+                ram: RamLaw::VCF,
+            };
+            // One MB under the published floor must refuse...
+            assert!(
+                plan_sharded(inp(floor_mb - 1)).is_err(),
+                "S={n_samples}: planner accepted a budget below the documented floor"
+            );
+            // ...and the floor itself must plan, at exactly one reader.
+            let plan = plan_sharded(inp(floor_mb)).expect("documented floor must plan");
+            assert_eq!(plan.reader_workers, 1, "S={n_samples}");
+            assert_eq!(plan.concurrent_chroms, 1, "S={n_samples}");
+        }
+    }
 }
