@@ -287,7 +287,7 @@ fn run_conversion_pipeline(
                 n_samples: samples.len(),
                 chunk_bytes,
                 max_mem_bytes,
-                reader_workers: DEFAULT_READER_WORKERS,
+                reader_workers: Some(DEFAULT_READER_WORKERS),
                 ram: crate::budget::RamLaw::VCF,
             });
             let sharded = match sharded {
@@ -570,7 +570,7 @@ fn run_pgen_conversion_pipeline(
                 n_samples: samples.len(),
                 chunk_bytes,
                 max_mem_bytes,
-                reader_workers: 1,
+                reader_workers: Some(1),
                 ram: crate::budget::RamLaw::PGEN,
             });
             let sharded = match sharded {
