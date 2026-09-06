@@ -286,7 +286,21 @@ impl Frontier {
 
     /// Wake every parked producer without changing the state -- the teardown
     /// path, after `cancel` is set.
+    ///
+    /// The lock is acquired and immediately dropped ON PURPOSE; do not
+    /// "simplify" it away. `admit`'s predicate reads `cancel`, a plain
+    /// `AtomicBool` this mutex does not protect, so a bare `notify_all` races:
+    /// a worker can evaluate `!cancel` as true while holding the lock, an
+    /// erroring worker can then `cancel.store(true)` and `notify_all` before
+    /// that worker registers on the condvar, and the worker parks forever. It
+    /// never returns, so its `tx_res` clone never drops, so the collector's
+    /// `recv` loop never ends, so `join()` hangs and the conversion stalls
+    /// with no error surfaced. Taking the lock orders store-then-notify
+    /// against check-then-park: either we block until `wait` releases it (the
+    /// worker is parked and will see the notify), or the worker has not yet
+    /// loaded `cancel` and will see `true`.
     pub(crate) fn wake_all(&self) {
+        drop(self.state.lock().unwrap());
         self.cv.notify_all();
     }
 }
@@ -611,7 +625,12 @@ git commit -m "feat(shard): size work units by record count instead of bp span"
   - `pub const MERGE_RESERVE_DIV: usize = 4;`
   - `pub const W_TARGET: usize = 8;`
   - `pub const PENDING_BUDGET_CHUNKS: u64 = 8;`
-  - `pub fn pending_budget_bytes(chunk_bytes: u64) -> u64`
+  - `pub fn pending_budget_bytes(chunk_bytes: u64) -> u64` — the ceiling handed
+    to `shard_exec::run`; the collector's backlog map ONLY
+  - `pub fn in_flight_budget_bytes(chunk_bytes: u64, workers: usize) -> u64` —
+    backlog ceiling + the `workers * 2` bounded-channel capacity; the number
+    the memory law must use. Task 4 passes `pending_budget_bytes` to
+    `shard_exec::run` and never passes this one anywhere.
   - `pub fn reader_pool_cores(usable_cores: usize) -> usize`
   - `PlanInputs { usable_cores, n_contigs, n_samples, chunk_bytes, max_mem_bytes, reader_workers: Option<usize>, ram }`
     — **`reader_workers` changes type from `usize` to `Option<usize>`.**
@@ -666,6 +685,25 @@ Add to the `mod tests` block in `src/budget.rs`:
         // from the other is circular.
         assert_eq!(pending_budget_bytes(10_000_000), 80_000_000);
         assert_eq!(pending_budget_bytes(0), 0);
+    }
+
+    #[test]
+    fn in_flight_budget_adds_the_bounded_result_channel() {
+        // `Frontier` bounds only the collector's backlog map. `shard_exec`'s
+        // `tx_res` holds up to `workers * 2` more assembled chunks, so
+        // planning against the backlog alone under-counts real peak by 2*w
+        // chunks per contig. The readers' own `w` working chunks are NOT
+        // added here -- they live in the planner's `kappa * w` term.
+        //   w=3:  8*10MB + 2*3*10MB  =  80 +  60 = 140 MB
+        //   w=16: 8*10MB + 2*16*10MB =  80 + 320 = 400 MB
+        assert_eq!(in_flight_budget_bytes(10_000_000, 3), 140_000_000);
+        assert_eq!(in_flight_budget_bytes(10_000_000, 16), 400_000_000);
+        // Never cheaper than the backlog ceiling alone, even at w=0.
+        assert_eq!(
+            in_flight_budget_bytes(10_000_000, 0),
+            100_000_000,
+            "workers floors at 1"
+        );
     }
 
     #[test]
@@ -841,7 +879,10 @@ pub const W_TARGET: usize = 8;
 /// STARTING VALUE -- see the same spec, section D.
 pub const PENDING_BUDGET_CHUNKS: u64 = 8;
 
-/// Byte ceiling for `shard_exec`'s reorder backlog.
+/// Byte ceiling for `shard_exec`'s reorder backlog -- the collector's
+/// `PendingBacklog` map ALONE. This is the number handed to
+/// `shard_exec::run`; it is NOT the pipeline's total in-flight bytes. Use
+/// [`in_flight_budget_bytes`] for memory planning.
 ///
 /// Deliberately independent of `max_mem`: `plan_sharded` consumes this budget
 /// to choose `concurrent_chroms`, and `max_mem` is what bounds
@@ -854,6 +895,28 @@ pub const PENDING_BUDGET_CHUNKS: u64 = 8;
 /// calloc, so nominal chunk bytes are address space, not RSS.
 pub fn pending_budget_bytes(chunk_bytes: u64) -> u64 {
     chunk_bytes.saturating_mul(PENDING_BUDGET_CHUNKS.max(2))
+}
+
+/// Chunk-shaped bytes one contig can hold in flight, for the memory law.
+///
+/// `Frontier` bounds only the collector's `PendingBacklog`. Two other places
+/// hold assembled chunks at the same time, and pricing only the backlog
+/// under-counts real peak RSS:
+///
+/// - the collector's `PendingBacklog` map: [`pending_budget_bytes`], enforced;
+/// - `shard_exec`'s bounded result channel `tx_res`, capacity `workers * 2`,
+///   enforced by the channel itself;
+/// - each reader's own working chunk -- including the assembled chunk a parked
+///   producer is holding, since `admit` is called BEFORE `tx_res.send`. That
+///   term is `w` chunks and is already carried by `ram.kappa * w * chunk_MB`
+///   in `plan_sharded`, so it is deliberately NOT repeated here.
+///
+/// So this returns the backlog ceiling plus the channel capacity. Adding the
+/// channel term makes the planner strictly more conservative; it is not a
+/// refit of `RamLaw`'s fitted coefficients.
+pub fn in_flight_budget_bytes(chunk_bytes: u64, workers: usize) -> u64 {
+    pending_budget_bytes(chunk_bytes)
+        .saturating_add(chunk_bytes.saturating_mul(2u64.saturating_mul(workers.max(1) as u64)))
 }
 
 /// Cores available to executors and readers after the merge-tail reserve.
@@ -894,7 +957,6 @@ pub fn plan_sharded(inp: PlanInputs) -> Result<ShardedPlan, PlanError> {
     let n_contigs = inp.n_contigs.max(1);
     // Step 1: reserve the merge tail before anything else claims cores.
     let pool = reader_pool_cores(inp.usable_cores);
-    let pending_mb = pending_budget_bytes(inp.chunk_bytes) as f64 / 1e6;
     // Step 2: choose the contig concurrency, preferring depth.
     let depth_cap = (pool / (1 + W_TARGET)).max(1);
     let mut cc = std::cmp::min(n_contigs, depth_cap);
@@ -904,10 +966,10 @@ pub fn plan_sharded(inp: PlanInputs) -> Result<ShardedPlan, PlanError> {
     // caller's.
     if let Some(req) = inp.reader_workers {
         let w = req.max(1);
-        while cc > 1 && memory_fits(&inp, cc, w, pending_mb).is_err() {
+        while cc > 1 && memory_fits(&inp, cc, w).is_err() {
             cc -= 1;
         }
-        memory_fits(&inp, cc, w, pending_mb)?;
+        memory_fits(&inp, cc, w)?;
         return Ok(ShardedPlan {
             concurrent_chroms: cc,
             reader_workers: w,
@@ -923,7 +985,7 @@ pub fn plan_sharded(inp: PlanInputs) -> Result<ShardedPlan, PlanError> {
         // contig-first loop does not converge.
         if let Some(w) = (1..=w_max)
             .rev()
-            .find(|&w| memory_fits(&inp, cc, w, pending_mb).is_ok())
+            .find(|&w| memory_fits(&inp, cc, w).is_ok())
         {
             return Ok(ShardedPlan {
                 concurrent_chroms: cc,
@@ -932,7 +994,7 @@ pub fn plan_sharded(inp: PlanInputs) -> Result<ShardedPlan, PlanError> {
         }
         if cc == 1 {
             // The scan above covered w=1 at cc=1, so this is a genuine error.
-            return Err(memory_fits(&inp, 1, 1, pending_mb)
+            return Err(memory_fits(&inp, 1, 1)
                 .expect_err("cc=1, w=1 just failed the scan above"));
         }
         cc -= 1;
@@ -943,7 +1005,7 @@ pub fn plan_sharded(inp: PlanInputs) -> Result<ShardedPlan, PlanError> {
 ///
 /// ```text
 ///   baseline   = base_mb + per_sample_mb * samples
-///   per_contig = per_contig_mb + kappa * w * chunk_MB + pending_budget_MB
+///   per_contig = per_contig_mb + kappa * w * chunk_MB + in_flight_MB(w)
 ///   fits       <=> budget - baseline >= cc * per_contig
 /// ```
 ///
@@ -952,8 +1014,15 @@ pub fn plan_sharded(inp: PlanInputs) -> Result<ShardedPlan, PlanError> {
 /// `shard_exec::Frontier` now ENFORCES a fixed backlog ceiling, so it becomes
 /// an explicit additive budget. This is not a refit of `RamLaw::VCF`: the
 /// fitted coefficients are untouched, and replacing a fitted `(w-1)` term with
-/// an enforced constant is strictly more conservative per unit of `w`.
-fn memory_fits(inp: &PlanInputs, cc: usize, w: usize, pending_mb: f64) -> Result<(), PlanError> {
+/// enforced ceilings is strictly more conservative per unit of `w`.
+///
+/// `in_flight_MB` is [`in_flight_budget_bytes`], NOT `pending_budget_bytes`:
+/// the enforced backlog ceiling plus the `workers * 2` capacity of
+/// `shard_exec`'s bounded result channel. Pricing only the backlog
+/// under-counts real peak by up to `2 * w` chunks per contig. The readers'
+/// own `w` working chunks stay in the `kappa` term and are not double-counted
+/// here.
+fn memory_fits(inp: &PlanInputs, cc: usize, w: usize) -> Result<(), PlanError> {
     let Some(budget) = inp.max_mem_bytes else {
         return Ok(());
     };
@@ -961,7 +1030,7 @@ fn memory_fits(inp: &PlanInputs, cc: usize, w: usize, pending_mb: f64) -> Result
     let baseline_mb = inp.ram.base_mb + inp.ram.per_sample_mb * inp.n_samples as f64;
     let per_contig_mb = inp.ram.per_contig_mb
         + inp.ram.kappa * w as f64 * (inp.chunk_bytes as f64 / 1e6)
-        + pending_mb;
+        + in_flight_budget_bytes(inp.chunk_bytes, w) as f64 / 1e6;
     let needed_mb = baseline_mb + per_contig_mb * cc as f64;
     if budget_mb < needed_mb {
         return Err(PlanError::InsufficientMemory {
@@ -1008,16 +1077,19 @@ Every `PlanInputs { .. }` literal in `src/budget.rs`'s test module now needs
 
 ```rust
     // Per-contig memory is now
-    //   per_contig_mb + kappa*w*chunk_MB + pending_budget_MB
-    // The kappa term is linear in `w` (it was kappa*(w + (w-1)) before #169),
-    // and the backlog is a fixed 8-chunk budget the code now ENFORCES rather
-    // than a fitted term. n_samples=1_000, chunk_bytes=10_000_000 (10 MB),
-    // against the 2026-08-11 RamLaw::VCF envelope:
-    //   baseline   = 457.259 + 0.011017*1_000              =  468.276 MB
-    //   pending    = 8 * 10                                =   80.000 MB
-    //   per-contig = 111.426 + 6.105786*w*10 + 80
-    //     w=3  -> 111.426 + 183.174 + 80 =  374.600 MB -> needs   842.876 MB
-    //     w=16 -> 111.426 + 976.926 + 80 = 1168.352 MB -> needs 1636.628 MB
+    //   per_contig_mb + kappa*w*chunk_MB + in_flight_MB(w)
+    // where in_flight_MB = pending ceiling (8 chunks, enforced by
+    // `Frontier`) + tx_res channel capacity (2*w chunks, enforced by the
+    // bounded channel). The kappa term is linear in `w` (it was
+    // kappa*(w + (w-1)) before #169) and carries the readers' own `w` working
+    // chunks, so those are not double-counted below.
+    // n_samples=1_000, chunk_bytes=10_000_000 (10 MB), against the
+    // 2026-08-11 RamLaw::VCF envelope:
+    //   baseline   = 457.259 + 0.011017*1_000  =  468.276 MB
+    //   in_flight  = 8*10 + 2*w*10             =   80 + 20w MB
+    //   per-contig = 111.426 + 61.05786*w + 80 + 20w = 191.426 + 81.05786*w
+    //     w=3  ->  191.426 +  243.174 =  434.600 MB -> needs  902.876 MB
+    //     w=16 ->  191.426 + 1296.926 = 1488.352 MB -> needs 1956.628 MB
     //   budget = 1_200 MB at cc=1: fits w=3, rejects w=16.
     #[test]
     fn a_high_worker_count_can_exceed_a_budget_a_lower_one_fits() {
