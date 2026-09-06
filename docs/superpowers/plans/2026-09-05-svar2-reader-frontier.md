@@ -1543,9 +1543,16 @@ def test_from_vcf_reader_workers_reaches_the_planner(tmp_path: Path, capfd):
             tmp_path / f"w{w}", vcf, no_reference=True,
             reader_workers=w, log_level="info",
         )
-        # `capfd`, NOT `capsys`: the line comes from Rust `tracing` on fd 2.
+        # `capfd`, NOT `capsys`: this crosses the Rust/Python boundary at the
+        # OS fd level. Read BOTH streams: with no `GENORAY_LOG` set the line
+        # arrives only through the Rust-tracing -> Python event channel ->
+        # `rich.console.Console()` path, whose default target is stdout; the
+        # direct-stderr `tracing_subscriber` fmt layer activates only when
+        # `GENORAY_LOG` is set. Combining the two makes the test independent
+        # of whichever the environment routes it to.
+        captured = capfd.readouterr()
         line = next(
-            ln for ln in capfd.readouterr().err.splitlines()
+            ln for ln in (captured.out + captured.err).splitlines()
             if "pipeline config" in ln
         )
         seen.append(int(re.search(r"reader_workers=(\d+)", line).group(1)))
@@ -1567,6 +1574,19 @@ def test_from_vcf_rejects_a_reader_workers_below_one(tmp_path: Path):
 
 Parse the `reader_workers` field out of the line rather than matching the whole
 line, so adding or reordering log fields does not break the test.
+
+Also RENAME the stale `test_from_vcf_reader_workers_that_cannot_fit_max_mem_raises`
+this plan previously specified. It is vacuous for the same reason the bullets
+above give: `max_mem="1M"` is below the fixed 457 MB cohort baseline, so the call
+raises with no `reader_workers` argument at all. What it does genuinely cover is
+that a `PlanError` crosses the pyo3 boundary as a Python exception whose message
+names `max_mem`, which is worth keeping. Rename it to
+`test_from_vcf_planner_refusal_surfaces_to_python`, drop the `reader_workers=64`
+argument (it plays no part in the refusal), and say in the docstring that the
+honour-or-refuse semantics themselves are owned by
+`an_explicit_reader_workers_is_honoured_or_refused_never_shrunk` in
+`src/budget.rs`, which tests them at a realistic 10 MB chunk where `w` actually
+moves the memory law.
 
 `_write_vcf(d, *, symbolic, indexed)` is this module's existing helper — it
 writes a two-record bgzipped, bcftools-indexed `chr1` VCF and returns the
