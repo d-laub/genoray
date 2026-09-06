@@ -658,7 +658,10 @@ written out in full:
    sizes the var_key gather pool and `dense_merge`'s bit-transpose from
    whatever cores the readers leave over. Spending every leftover core on
    readers floors that pool at 1 and gives back the 2.77–2.82× merge-tiling
-   win from commit `c49d1d7`.
+   win from commit `c49d1d7`. The reserve constrains the *derive* path only:
+   an explicit `reader_workers` larger than `pool` is still honoured, because
+   this planner refuses only on the memory budget, never on cores. Say so in
+   the doc rather than claiming the reserve holds unconditionally.
 2. **When memory is tight, shrink `w` first, not `cc`.** Decrementing `cc`
    *raises* `w` (`w = pool / cc − 1`), which raises per-contig memory — a loop
    that decrements `cc` first does not converge.
@@ -957,15 +960,18 @@ pub fn plan_sharded(inp: PlanInputs) -> Result<ShardedPlan, PlanError> {
     let n_contigs = inp.n_contigs.max(1);
     // Step 1: reserve the merge tail before anything else claims cores.
     let pool = reader_pool_cores(inp.usable_cores);
-    // Step 2: choose the contig concurrency, preferring depth.
-    let depth_cap = (pool / (1 + W_TARGET)).max(1);
-    let mut cc = std::cmp::min(n_contigs, depth_cap);
 
-    // An explicit request is honoured or refused. Concurrency may still come
-    // down to make it fit -- that is the planner's own knob, not the
-    // caller's.
+    // An explicit request is honoured or refused -- never silently shrunk.
+    // Note that `w` here is the CALLER's, so concurrency is sized from it and
+    // NOT from `W_TARGET`: the caller has already stated its per-contig reader
+    // demand, and reserving depth for a hypothetical `W_TARGET` readers would
+    // strand cores. PGEN pins `w = 1`, so seeding from `depth_cap` would cost
+    // it 2.7-4x its contig concurrency (48-core host: 8 -> 3). Concurrency may
+    // still come down to make it fit -- that is the planner's own knob, not
+    // the caller's.
     if let Some(req) = inp.reader_workers {
         let w = req.max(1);
+        let mut cc = std::cmp::min(n_contigs, (pool / (1 + w)).max(1));
         while cc > 1 && memory_fits(&inp, cc, w).is_err() {
             cc -= 1;
         }
@@ -975,6 +981,12 @@ pub fn plan_sharded(inp: PlanInputs) -> Result<ShardedPlan, PlanError> {
             reader_workers: w,
         });
     }
+
+    // Step 2: choose the contig concurrency, preferring depth. `W_TARGET` is
+    // the DERIVE path's standing guess at per-contig reader demand; it has no
+    // business on the explicit path above, which knows the real number.
+    let depth_cap = (pool / (1 + W_TARGET)).max(1);
+    let mut cc = std::cmp::min(n_contigs, depth_cap);
 
     loop {
         // Step 3: fill the depth -- one core for this contig's executor, the
@@ -1013,8 +1025,15 @@ pub fn plan_sharded(inp: PlanInputs) -> Result<ShardedPlan, PlanError> {
 /// quadratic-ish in `w`, which is what made a large reader count unaffordable.
 /// `shard_exec::Frontier` now ENFORCES a fixed backlog ceiling, so it becomes
 /// an explicit additive budget. This is not a refit of `RamLaw::VCF`: the
-/// fitted coefficients are untouched, and replacing a fitted `(w-1)` term with
-/// enforced ceilings is strictly more conservative per unit of `w`.
+/// fitted coefficients are untouched. It is NOT uniformly more conservative,
+/// though. Per unit of `w` the old term charged `2 * kappa` (12.21 chunk-MB)
+/// against this one's `kappa + 2` (8.11), so the two cross at
+/// `w = 14.1058 / 4.1058 ~= 3.44`: at `w <= 3` this law charges MORE, at
+/// `w >= 4` it charges LESS -- 21% less per contig at `w = 10`, which is what
+/// the derive path picks on the machine in issue #169. That is defensible
+/// only because `Frontier` now ENFORCES the backlog ceiling the `(w-1)` term
+/// merely fitted; if that enforcement is ever removed or bypassed, this law
+/// under-predicts peak RSS at exactly the reader counts #169 exists to reach.
 ///
 /// `in_flight_MB` is [`in_flight_budget_bytes`], NOT `pending_budget_bytes`:
 /// the enforced backlog ceiling plus the `workers * 2` capacity of
