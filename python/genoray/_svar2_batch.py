@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
+from functools import cached_property
 from typing import TYPE_CHECKING, Any, TypedDict
 
 import numpy as np
@@ -127,14 +128,34 @@ class _BatchQueryMixin:
         e = np.atleast_1d(np.asarray(ends))
         return [(int(a), int(b)) for a, b in zip(s, e)]
 
+    @cached_property
+    def _sample_lookup(self) -> dict[str, int]:
+        """Sample name -> column index, first occurrence winning.
+
+        Built once per reader and reused by every query, because
+        :meth:`_sample_idxs` runs on each ``read_ranges``/``find_ranges`` call.
+
+        A plain dict rather than the ``hirola.HashTable`` the other readers keep
+        as ``_s2i``: that table's key dtype is the store's own fixed-width name
+        dtype, so a query name wider than any stored name would be truncated
+        into a false match. The dict does membership and index in one lookup
+        with no width hazard, and keeps hirola off this module's import path.
+        """
+        lookup: dict[str, int] = {}
+        for i, s in enumerate(self.available_samples):
+            lookup.setdefault(s, i)
+        return lookup
+
     def _sample_idxs(self, samples: "ArrayLike | None") -> list[int] | None:
         if samples is None:
             return None
+        lookup = self._sample_lookup
         idxs = []
         for s in np.atleast_1d(np.asarray(samples)).tolist():
-            if s not in self.available_samples:
+            i = lookup.get(s)
+            if i is None:
                 raise ValueError(f"Sample {s!r} not found in the dataset.")
-            idxs.append(self.available_samples.index(s))
+            idxs.append(i)
         return idxs
 
     def read_ranges(
