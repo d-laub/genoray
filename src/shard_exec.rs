@@ -611,10 +611,18 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{Frontier, PendingBacklog, ReorderBuffer};
+    use super::{Frontier, PendingBacklog, ReorderBuffer, ShardTotals, run};
+    use crate::chunk_assembler::ChunkAssembler;
+    use crate::error::ConversionError;
     use crate::monitor::PendingGauge;
+    use crate::normalize::CheckRef;
+    use crate::record_source::{Calls, FormatVals, RawRecord, RecordSource};
+    use crate::shard::WorkUnit;
     use crate::types::{BitGrid3, DenseChunk};
+    use crossbeam_channel::unbounded;
+    use std::collections::{HashMap, VecDeque};
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
     use std::thread;
@@ -837,5 +845,245 @@ mod tests {
         rb.push(0, 0, false, &mut |_gid, _tag| {});
         rb.push(0, 0, true, &mut |_gid, _tag| {});
         assert_eq!(rb.head(), 1, "head advances past a completed ordinal");
+    }
+
+    // ---- `run()` integration coverage ----
+    //
+    // Everything above drives `Frontier` directly through `publish`/`admit`.
+    // Nothing exercises the INTEGRATION: real scoped worker threads, the FIFO
+    // work queue, the reorder buffer, and the admission gate running
+    // together through `run()` itself. `RecordSource` is a one-method trait
+    // behind a `Box<dyn>` (see `record_source.rs`), so a stub source is a
+    // `VecDeque<RawRecord>` plus an optional per-record sleep.
+
+    const N_SAMPLES: usize = 1;
+    const PLOIDY: usize = 2;
+    /// Records per unit. Both fit in a single `read_next_chunk` call (well
+    /// under the `chunk_size` used below), so each unit produces exactly one
+    /// `DenseChunk`.
+    const RECORDS_PER_UNIT: u32 = 2;
+    const N_UNITS: usize = 8;
+
+    /// A `RecordSource` over an in-memory queue, optionally sleeping before
+    /// each record. Used to make ordinal 0 finish LAST despite being
+    /// dequeued first, forcing every other unit's chunk to buffer behind the
+    /// still-open reorder head instead of streaming through by accident --
+    /// which is exactly how the end-to-end conversion measurement (Task 4)
+    /// missed this path (it observed zero park events).
+    struct VecSource {
+        records: VecDeque<RawRecord>,
+        delay_per_record: Option<Duration>,
+    }
+
+    impl RecordSource for VecSource {
+        fn next_record(&mut self) -> Result<Option<RawRecord>, ConversionError> {
+            if let Some(d) = self.delay_per_record {
+                thread::sleep(d);
+            }
+            Ok(self.records.pop_front())
+        }
+    }
+
+    /// One biallelic SNV atom: dense calls sized for `N_SAMPLES * PLOIDY`
+    /// columns, no INFO/FORMAT fields (the `ChunkAssembler` below is built
+    /// with `fields: &[]`), no reference (`fasta_path: None`).
+    fn record(pos: u32) -> RawRecord {
+        RawRecord {
+            pos,
+            reference: b"A".to_vec(),
+            alts: vec![b"C".to_vec()],
+            calls: Calls::Dense(vec![1, 0]),
+            info_raw: Vec::new(),
+            format_vals: FormatVals::Dense(Vec::new()),
+            global_idx: pos as i32,
+        }
+    }
+
+    /// `N_UNITS` work units, ordinals `0..N_UNITS`, each fed `RECORDS_PER_UNIT`
+    /// records at globally-distinct positions. Ordinal 0's records carry the
+    /// artificial per-record delay described on `VecSource`.
+    fn seed_units() -> (Vec<WorkUnit>, Arc<HashMap<usize, Vec<RawRecord>>>) {
+        let mut units = Vec::with_capacity(N_UNITS);
+        let mut records_by_ordinal = HashMap::with_capacity(N_UNITS);
+        for ordinal in 0..N_UNITS {
+            let base = (ordinal as u32) * 100;
+            units.push(WorkUnit {
+                own_start: base,
+                own_end: base + RECORDS_PER_UNIT,
+                fetch_start: base,
+                fetch_end: base + RECORDS_PER_UNIT,
+                ordinal,
+            });
+            let records: Vec<RawRecord> = (0..RECORDS_PER_UNIT).map(|i| record(base + i)).collect();
+            records_by_ordinal.insert(ordinal, records);
+        }
+        (units, Arc::new(records_by_ordinal))
+    }
+
+    /// Builds the `make_assembler` closure `run` requires: a fresh
+    /// `ChunkAssembler` per unit wrapping a fresh `VecSource` cloned out of
+    /// the shared record table. Only ordinal 0 gets the artificial delay.
+    fn make_assembler_fn(
+        records_by_ordinal: Arc<HashMap<usize, Vec<RawRecord>>>,
+    ) -> impl Fn(&WorkUnit) -> Result<ChunkAssembler, ConversionError> + Sync + 'static {
+        move |unit: &WorkUnit| {
+            let records = records_by_ordinal
+                .get(&unit.ordinal)
+                .cloned()
+                .unwrap_or_default();
+            let delay_per_record = (unit.ordinal == 0).then(|| Duration::from_millis(5));
+            let source: Box<dyn RecordSource + Send> = Box::new(VecSource {
+                records: records.into(),
+                delay_per_record,
+            });
+            ChunkAssembler::new(
+                source,
+                N_SAMPLES,
+                PLOIDY,
+                None, // fasta_path: no reference needed
+                "chrTest",
+                false, // skip_out_of_scope
+                CheckRef::Error,
+                &[], // fields: no INFO/FORMAT requested
+            )
+        }
+    }
+
+    /// Runs `run(...)` on its own thread and joins with a timeout. Required
+    /// per the task brief: a broken head-exemption HANGS rather than fails,
+    /// and a hung `cargo test` reads as infrastructure trouble, not a red
+    /// test, so a bare `handle.join()` is not an option here.
+    fn run_with_deadlock_guard(
+        units: Vec<WorkUnit>,
+        records_by_ordinal: Arc<HashMap<usize, Vec<RawRecord>>>,
+        workers: usize,
+        chunk_size: usize,
+        pending_budget_bytes: u64,
+    ) -> (
+        Result<ShardTotals, ConversionError>,
+        Vec<DenseChunk>,
+        Arc<PendingGauge>,
+    ) {
+        let (tx_dense, rx_dense) = unbounded::<DenseChunk>();
+        let gauge = Arc::new(PendingGauge::default());
+        let (result_tx, result_rx) = mpsc::channel();
+        {
+            let gauge = Arc::clone(&gauge);
+            let make_assembler = make_assembler_fn(records_by_ordinal);
+            thread::spawn(move || {
+                let worker_tids: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+                let res = run(
+                    "chrTest",
+                    units,
+                    workers,
+                    make_assembler,
+                    |e, _u| e,
+                    chunk_size,
+                    &tx_dense,
+                    &worker_tids,
+                    &gauge,
+                    pending_budget_bytes,
+                );
+                let _ = result_tx.send(res);
+            });
+        }
+        let result = match result_rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(res) => res,
+            Err(_) => panic!(
+                "shard_exec::run deadlocked -- the head-exemption did not release a \
+                 parked producer within 10s (pending_budget_bytes={pending_budget_bytes})"
+            ),
+        };
+        let mut chunks = Vec::new();
+        while let Ok(c) = rx_dense.try_recv() {
+            chunks.push(c);
+        }
+        (result, chunks, gauge)
+    }
+
+    #[test]
+    fn run_emits_every_unit_in_order_under_a_bounded_backlog() {
+        let (units, records_by_ordinal) = seed_units();
+        // ~1.4 chunks' worth: one `DenseChunk` of RECORDS_PER_UNIT=2 atoms at
+        // N_SAMPLES=1/PLOIDY=2 (no staged fields) costs, per
+        // `DenseChunk::approx_bytes`: meta (pos+global_idx+ilens 4B/atom,
+        // alt 1B/atom, alt_offsets (v+1)*4B) + genos (1 word) =
+        // (8+8+8+2+12) + 8 = 46 bytes. A budget of 64 lets exactly one
+        // shard's chunk through before a second non-head arrival (92 bytes
+        // total) genuinely exceeds it.
+        let pending_budget_bytes = 64u64;
+        let (result, chunks, gauge) =
+            run_with_deadlock_guard(units, records_by_ordinal, 4, 100, pending_budget_bytes);
+        let totals = result.expect("run must succeed");
+
+        assert!(
+            gauge.len_highwater.load(Ordering::Relaxed) > 0,
+            "ordinal 0 was made to lag on purpose -- a real backlog must have \
+             been observed, or admission control was never exercised"
+        );
+
+        assert_eq!(chunks.len(), N_UNITS, "one chunk per unit expected");
+        for (expect_id, c) in chunks.iter().enumerate() {
+            assert_eq!(
+                c.chunk_id, expect_id,
+                "chunks must arrive on tx_dense in ascending ordinal order"
+            );
+        }
+        let total_records: usize = chunks.iter().map(|c| c.pos.len()).sum();
+        assert_eq!(
+            total_records,
+            N_UNITS * RECORDS_PER_UNIT as usize,
+            "every record fed to a unit must reach tx_dense inside some chunk"
+        );
+        assert_eq!(totals.dropped_out_of_scope, 0);
+        assert_eq!(totals.ref_excluded, 0);
+        assert_eq!(totals.normalized_total, 0);
+    }
+
+    #[test]
+    fn bounded_and_unbounded_backlogs_produce_identical_output() {
+        #[allow(clippy::type_complexity)]
+        fn chunk_signature(
+            c: &DenseChunk,
+        ) -> (
+            usize,
+            Vec<u32>,
+            Vec<i32>,
+            Vec<i32>,
+            Vec<u8>,
+            Vec<u32>,
+            Vec<u64>,
+            (usize, usize, usize),
+        ) {
+            (
+                c.chunk_id,
+                c.pos.clone(),
+                c.global_idx.clone(),
+                c.ilens.clone(),
+                c.alt.clone(),
+                c.alt_offsets.clone(),
+                c.genos.words.clone(),
+                c.genos.shape,
+            )
+        }
+
+        let (units_a, records_a) = seed_units();
+        let (result_a, chunks_a, _) = run_with_deadlock_guard(units_a, records_a, 4, 100, u64::MAX);
+
+        let (units_b, records_b) = seed_units();
+        let (result_b, chunks_b, _) = run_with_deadlock_guard(units_b, records_b, 4, 100, 64);
+
+        let totals_a = result_a.expect("unbounded run must succeed");
+        let totals_b = result_b.expect("bounded run must succeed");
+        assert_eq!(totals_a.dropped_out_of_scope, totals_b.dropped_out_of_scope);
+        assert_eq!(totals_a.ref_excluded, totals_b.ref_excluded);
+        assert_eq!(totals_a.normalized_total, totals_b.normalized_total);
+
+        let sig_a: Vec<_> = chunks_a.iter().map(chunk_signature).collect();
+        let sig_b: Vec<_> = chunks_b.iter().map(chunk_signature).collect();
+        assert_eq!(
+            sig_a, sig_b,
+            "admission control must change WHEN a chunk is produced, never WHAT"
+        );
     }
 }

@@ -14,9 +14,12 @@ from genoray import SparseVar2
 
 from tests import _oracle
 
-# (concurrent_chroms, reader_workers) -- spans the corners the planner can now
+# (concurrent_chroms, reader_workers) -- spans the corners the planner can
 # reach: one contig at a time with many readers, and many contigs with few.
-SCHEDULES = [(1, 1), (1, 12), (4, 3), (8, 2)]
+# The wide-w rows matter more since #169: `reader_workers` is now derived from
+# cores rather than pinned at 3, so a schedule the planner never used to
+# produce is now the default on a large host.
+SCHEDULES = [(1, 1), (1, 12), (1, 32), (4, 3), (8, 2)]
 
 # Small enough that the largest contig (chr8, 32 records) spans multiple
 # chunks (4) while the smallest (chr1, 4 records) still fits in one. Chunk
@@ -126,3 +129,50 @@ def test_max_mem_too_small_raises_rather_than_writing_an_empty_store(
             max_mem="1M",
         )
     assert not out.exists(), "a rejected max_mem budget must not create the store dir"
+
+
+def test_digest_is_invariant_across_frontier_granularities(
+    multi_contig_vcf, tmp_path, monkeypatch
+):
+    """Unit granularity must not move a single output byte.
+
+    Since #169 the work-unit count comes from the contig's RECORD count
+    (`shard::plan_unit_count`), not from `workers * OVERSHARD_FACTOR`, and the
+    reorder backlog is bounded so non-head readers park mid-stream. Both
+    change WHEN a chunk reaches the collector; neither may change what is
+    written. The `GENORAY_OVERSHARD` values below drive the no-exact-counts
+    fallback path, which this small fixture takes.
+    """
+    digests = {}
+    for overshard in (1, 4, 40):
+        monkeypatch.setenv("GENORAY_OVERSHARD", str(overshard))
+        out = tmp_path / f"ov{overshard}.svar"
+        digests[overshard] = _convert(multi_contig_vcf, out, 1, 8, monkeypatch)
+    assert len(set(digests.values())) == 1, (
+        f"unit granularity changed output: {digests}"
+    )
+
+
+def test_explicit_reader_workers_matches_the_derived_default(
+    multi_contig_vcf, tmp_path, monkeypatch
+):
+    """The public knob and the planner's own choice must agree byte-for-byte.
+
+    `_convert` sets GENORAY_READER_WORKERS; this asserts the public
+    `reader_workers=` argument lands on the same code path and produces the
+    same store.
+    """
+    env_out = tmp_path / "via_env.svar"
+    env_digest = _convert(multi_contig_vcf, env_out, 1, 6, monkeypatch)
+
+    monkeypatch.delenv("GENORAY_READER_WORKERS", raising=False)
+    monkeypatch.delenv("GENORAY_CONCURRENT_CHROMS", raising=False)
+    arg_out = tmp_path / "via_arg.svar"
+    SparseVar2.from_vcf(
+        arg_out,
+        multi_contig_vcf,
+        no_reference=True,
+        chunk_size=CHUNK_SIZE,
+        reader_workers=6,
+    )
+    assert _oracle.store_digest(arg_out) == env_digest
