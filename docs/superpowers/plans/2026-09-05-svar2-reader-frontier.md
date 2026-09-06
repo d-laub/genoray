@@ -1495,38 +1495,78 @@ git commit -m "feat(convert): make reader_workers a planned, logged, overridable
 - Consumes: `_core.run_conversion_pipeline(..., reader_workers=...)` (Task 4).
 - Produces:
   - `SparseVar2.from_vcf(..., threads=None, reader_workers=None, ...) -> int`
-    — new keyword-only argument, placed immediately after `threads`.
-  - `genoray write vcf --reader-workers N`
+    — new keyword-only argument, placed immediately after `threads`. `None`
+    selects the planner's derive path; an `int` selects honour-or-refuse; a
+    value below 1 raises `ValueError` rather than being clamped to 1 by the
+    Rust side, where the clamp would silently deliver the explicit path to a
+    caller who meant the derive path.
+  - `genoray write vcf --reader-workers N`, with the same rejection, and a
+    multi-file guard tested the way `tests/cli/test_write_cli.py` already tests
+    the analogous `--samples` guard.
 
 - [ ] **Step 1: Write the failing tests**
 
 Append to `tests/test_svar2_from_vcf.py`:
 
+Both tests must be able to FAIL if `reader_workers` stops reaching the planner.
+That rules out the two obvious shapes, and the reasons are worth stating because
+both were written into an earlier draft of this plan and both shipped vacuous:
+
+- **A byte-identity assertion cannot work here.** Identical output across reader
+  counts must hold whether or not the knob is wired at all — that is the whole
+  point of Tasks 1-4, and `tests/test_svar2_schedule_invariance.py` already owns
+  it. Such a test passes with the argument deleted.
+- **A `max_mem` boundary cannot work here either.** On this fixture `chunk_MB` is
+  about 0.000128, so `w` barely moves the memory law; the only term separating the
+  paths is `cc`, which depends on the host's core count. A budget tuned on a
+  48-core machine misfires on a 4-core CI runner. It is also easy to pick a budget
+  so small it cannot fit the fixed 457 MB baseline, in which case the call raises
+  for a reason having nothing to do with `reader_workers`.
+
+Assert on the effective-config log instead — Task 4 added it precisely so the
+planner's actual choice is observable — and make the assertion RELATIVE, so it
+carries no assumption about the host:
+
 ```python
-def test_from_vcf_reader_workers_does_not_change_output(tmp_path: Path):
-    """`reader_workers` is a scheduling knob: it must reach the planner and it
-    must not move a single output byte."""
-    from tests import _oracle
+def test_from_vcf_reader_workers_reaches_the_planner(tmp_path: Path, capfd):
+    """An explicit `reader_workers` must arrive at `plan_sharded` unchanged.
 
+    Two different requests are compared against each other rather than against a
+    fixed number: if the argument stops being threaded through, both runs fall
+    back to the same planner-derived value and the inequality fails on every
+    machine. Anything asserting a constant would encode this host's core count.
+    """
     vcf = _write_vcf(tmp_path, symbolic=False, indexed=True)
-    a = tmp_path / "auto"
-    b = tmp_path / "w7"
-    SparseVar2.from_vcf(a, vcf, no_reference=True)
-    SparseVar2.from_vcf(b, vcf, no_reference=True, reader_workers=7)
-    assert _oracle.store_digest(a) == _oracle.store_digest(b)
-
-
-def test_from_vcf_reader_workers_that_cannot_fit_max_mem_raises(tmp_path: Path):
-    """An explicit request is honoured or refused, never silently shrunk -- a
-    caller who asked for 64 readers and got 3 has no way to find out."""
-    vcf = _write_vcf(tmp_path, symbolic=False, indexed=True)
-    out = tmp_path / "refused"
-    with pytest.raises(Exception, match="max_mem"):
+    seen = []
+    for w in (1, 5):
         SparseVar2.from_vcf(
-            out, vcf, no_reference=True, reader_workers=64, max_mem="1M"
+            tmp_path / f"w{w}", vcf, no_reference=True,
+            reader_workers=w, log_level="info",
         )
-    assert not out.exists()
+        # `capfd`, NOT `capsys`: the line comes from Rust `tracing` on fd 2.
+        line = next(
+            ln for ln in capfd.readouterr().err.splitlines()
+            if "pipeline config" in ln
+        )
+        seen.append(int(re.search(r"reader_workers=(\d+)", line).group(1)))
+    assert seen == [1, 5]
+
+
+def test_from_vcf_rejects_a_reader_workers_below_one(tmp_path: Path):
+    """`0` must not silently become 1.
+
+    `plan_sharded` clamps with `req.max(1)`, so a caller passing 0 to mean "let
+    the planner choose" would instead get the EXPLICIT path with one reader and
+    `cc` sized off `w=1` -- the opposite of the intent, with no warning. `None`
+    is the way to ask for the derive path.
+    """
+    vcf = _write_vcf(tmp_path, symbolic=False, indexed=True)
+    with pytest.raises(ValueError, match="reader_workers"):
+        SparseVar2.from_vcf(tmp_path / "zero", vcf, no_reference=True, reader_workers=0)
 ```
+
+Parse the `reader_workers` field out of the line rather than matching the whole
+line, so adding or reordering log fields does not break the test.
 
 `_write_vcf(d, *, symbolic, indexed)` is this module's existing helper — it
 writes a two-record bgzipped, bcftools-indexed `chr1` VCF and returns the
