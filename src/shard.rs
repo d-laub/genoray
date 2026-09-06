@@ -36,6 +36,14 @@ pub const UNITS_TARGET_CHUNKS: usize = 4;
 /// fetch, so this is also a per-contig seek cap -- the guard against a
 /// pathological `chunk_size`/record-count combination asking for millions of
 /// seeks. The cap wins over the worker floor.
+///
+/// STARTING VALUE, not a fitted constant. 4096 is a round power-of-two
+/// ceiling chosen as a pathological-input guard, not a measured seek budget;
+/// no sweep has bounded it. It is inert in the regime this was designed for
+/// -- chr21 at 5,000-record chunks targets ~505 units, an order of magnitude
+/// below the cap -- so it binds only on inputs far outside that range. If a
+/// real workload ever reaches it, measure the seek cost before raising it and
+/// record the measurement here.
 pub const MAX_UNITS_PER_CONTIG: usize = 4096;
 
 /// How many work units to split one contig into.
