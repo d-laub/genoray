@@ -18,6 +18,59 @@ pub struct WorkUnit {
     pub ordinal: usize,
 }
 
+/// How many `chunk_size`-record chunks one work unit should cover.
+///
+/// This is the knob that trades indexed-fetch padding against reorder-frontier
+/// width. Every unit re-decodes `normalize::L_MAX` (1000) bp of padding on
+/// each side, so smaller units cost redundant decode; larger units make the
+/// reorder head advance in coarser jumps, which is what starved the executor
+/// in issue #169. At 4 chunks of 5,000 records on chr21 density (~220
+/// records/kbp) a unit spans ~91 kbp, so padding is ~2% of decoded records.
+///
+/// STARTING VALUE, not a fitted constant -- set it from the sweep in
+/// `docs/superpowers/specs/2026-09-05-svar2-reader-frontier-design.md`
+/// section D and record the measurement here when you do.
+pub const UNITS_TARGET_CHUNKS: usize = 4;
+
+/// Hard cap on work units per contig. Each unit is an independent indexed
+/// fetch, so this is also a per-contig seek cap -- the guard against a
+/// pathological `chunk_size`/record-count combination asking for millions of
+/// seeks. The cap wins over the worker floor.
+pub const MAX_UNITS_PER_CONTIG: usize = 4096;
+
+/// How many work units to split one contig into.
+///
+/// `contig_records` is `Some` ONLY when the caller holds EXACT per-contig
+/// record counts (`contig_cost::ContigCosts::exact_counts`). The
+/// header-length fallback tier's values are base pairs, a different unit
+/// entirely, and feeding them here would mis-size the frontier by orders of
+/// magnitude -- pass `None` and take the pre-#169 `workers * overshard_factor`
+/// shape instead.
+pub fn plan_unit_count(
+    contig_records: Option<u64>,
+    workers: usize,
+    chunk_size: usize,
+    overshard_factor: usize,
+) -> usize {
+    let workers = workers.max(1);
+    match contig_records {
+        None => workers
+            .saturating_mul(overshard_factor.max(1))
+            .clamp(1, MAX_UNITS_PER_CONTIG),
+        Some(records) => {
+            let per_unit = (UNITS_TARGET_CHUNKS as u64).saturating_mul(chunk_size.max(1) as u64);
+            let target = records.div_ceil(per_unit.max(1));
+            // Order matters: the worker floor keeps every worker fed on a
+            // small contig, then the seek cap overrides it -- a worker count
+            // above the cap gets the cap, not a runaway unit count.
+            usize::try_from(target)
+                .unwrap_or(MAX_UNITS_PER_CONTIG)
+                .max(workers)
+                .clamp(1, MAX_UNITS_PER_CONTIG)
+        }
+    }
+}
+
 /// Split coalesced, sorted, disjoint `owned` ranges into ordered units of
 /// ~`target_span`, capped at `max_shards`, padding fetch by `pad` (saturating)
 /// on each side.
@@ -94,5 +147,50 @@ mod tests {
         // workers=4, factor=4 => up to 16 units over a big contig.
         let u = plan_ranges(&[(0, 16000)], 16, 1000, 5);
         assert_eq!(u.len(), 16);
+    }
+
+    #[test]
+    fn plan_unit_count_falls_back_to_overshard_without_exact_counts() {
+        // No exact record count -> the pre-#169 shape, so a header-length
+        // fallback tier's base-pair values can never be mistaken for records.
+        assert_eq!(plan_unit_count(None, 20, 5_000, 4), 80);
+        assert_eq!(plan_unit_count(None, 1, 5_000, 4), 4);
+    }
+
+    #[test]
+    fn plan_unit_count_targets_four_chunks_of_records_per_unit() {
+        // chr21 of the #169 report: 10.1M records at chunk_size 5,000.
+        // 4 chunks/unit -> 20,000 records/unit -> 505 units, versus the 80
+        // the old `workers * OVERSHARD_FACTOR` shape produced at w=20.
+        assert_eq!(plan_unit_count(Some(10_100_000), 20, 5_000, 4), 505);
+        // Independent of the worker count once the record floor dominates.
+        assert_eq!(plan_unit_count(Some(10_100_000), 3, 5_000, 4), 505);
+    }
+
+    #[test]
+    fn plan_unit_count_floors_at_the_worker_count() {
+        // A tiny contig must still give every worker something to steal.
+        assert_eq!(plan_unit_count(Some(100), 20, 5_000, 4), 20);
+    }
+
+    #[test]
+    fn plan_unit_count_caps_at_max_units_per_contig() {
+        // Each unit is an independent indexed fetch, so the unit count is
+        // also a seek count -- the cap wins over both the record target and
+        // the worker floor.
+        assert_eq!(
+            plan_unit_count(Some(u64::MAX), 20, 1, 4),
+            MAX_UNITS_PER_CONTIG
+        );
+        assert_eq!(
+            plan_unit_count(Some(100), 100_000, 5_000, 4),
+            MAX_UNITS_PER_CONTIG
+        );
+    }
+
+    #[test]
+    fn plan_unit_count_is_never_zero() {
+        assert_eq!(plan_unit_count(Some(0), 1, 5_000, 4), 1);
+        assert_eq!(plan_unit_count(None, 0, 0, 0), 1);
     }
 }
