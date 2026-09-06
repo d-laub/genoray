@@ -193,7 +193,12 @@ pub struct DenseChunk {
 }
 
 /// Bytes every `DenseChunk` pays per variant regardless of cohort width:
-/// `pos` + `global_idx` + `ilens`, 4 bytes each, from `approx_bytes` below.
+/// `pos` + `global_idx` + `ilens` + `alt_offsets`, 4 bytes each, from
+/// `approx_bytes` below. `alt_offsets` counts because it is a CSR offset
+/// array of length `variants + 1` (see `rvk.rs`), so it costs one `u32` per
+/// variant plus a single sentinel; the sentinel is a per-chunk constant, not
+/// a per-variant cost, so it is not carried here. `alt` is deliberately
+/// EXCLUDED -- it is variable-length ALT byte content, not a fixed cost.
 /// NOT a tuning knob and NOT a fitted value -- it is a floor read directly
 /// off this struct's own layout. `lib.rs` clamps `per_variant_bytes` to it so
 /// a narrow cohort cannot round a chunk's cost to zero: `samples * ploidy / 8`
@@ -207,7 +212,7 @@ pub struct DenseChunk {
 /// no-conversion query-core build (`cargo check --no-default-features`,
 /// what GenVarLoader links) doesn't warn on dead code.
 #[cfg(feature = "conversion")]
-pub(crate) const DENSE_CHUNK_META_BYTES_PER_VARIANT: u64 = 12;
+pub(crate) const DENSE_CHUNK_META_BYTES_PER_VARIANT: u64 = 16;
 
 impl DenseChunk {
     /// Approximate heap bytes held by this chunk.
