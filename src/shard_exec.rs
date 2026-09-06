@@ -234,7 +234,21 @@ impl Frontier {
 
     /// Wake every parked producer without changing the state -- the teardown
     /// path, after `cancel` is set.
+    ///
+    /// Takes and immediately drops the state lock before notifying -- do not
+    /// "simplify" this away. `admit`'s predicate reads `cancel`, a plain
+    /// `AtomicBool` the state lock does not otherwise guard, so without this
+    /// a caller could set `cancel` and call `notify_all` in the window
+    /// between a waiter re-checking the predicate (false) and actually
+    /// registering on the condvar via `wait` -- a lost wakeup that parks the
+    /// waiter forever, since nothing else is guaranteed to notify it again.
+    /// Acquiring the lock here forces a happens-before edge: either the
+    /// waiter already holds the lock (this call blocks until its `wait`
+    /// atomically releases it and parks, so the notify is guaranteed to
+    /// reach it), or it has not yet re-locked to re-check the predicate (so
+    /// it observes the now-`true` `cancel` on its next check).
     pub(crate) fn wake_all(&self) {
+        drop(self.state.lock().unwrap());
         self.cv.notify_all();
     }
 }
@@ -422,6 +436,8 @@ where
                             }
                             match asm.read_next_chunk(chunk_size, local, None) {
                                 Ok(Some(chunk)) => {
+                                    // Park if the backlog is over budget and this unit is not the
+                                    // head. See `Frontier` for the deadlock argument.
                                     frontier.admit(unit.ordinal, &cancel);
                                     if cancel.load(Ordering::Relaxed) {
                                         return;
@@ -595,10 +611,14 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{PendingBacklog, ReorderBuffer};
+    use super::{Frontier, PendingBacklog, ReorderBuffer};
     use crate::monitor::PendingGauge;
     use crate::types::{BitGrid3, DenseChunk};
-    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
 
     /// A trivially small, distinctly-non-empty chunk -- just enough that
     /// `approx_bytes()` is nonzero so the byte high-water is exercisable too.
@@ -706,68 +726,106 @@ mod tests {
         );
     }
 
-    use super::Frontier;
-    use std::sync::atomic::AtomicBool;
-    use std::time::Duration;
+    /// Runs `f.admit(ordinal, &cancel)` on its own thread (never `thread::scope`,
+    /// whose implicit join at scope-exit would itself hang if `admit` never
+    /// returns) and reports whether it completed within `timeout`. A
+    /// still-parked thread is simply abandoned -- process teardown reclaims
+    /// it, and letting it leak is what lets a regression here fail the
+    /// assertion below instead of hanging the whole test binary (fatal on
+    /// this project's Slurm/NFS cluster, where a hung process can't always be
+    /// killed and can drain a compute node).
+    fn admit_completes_within(f: Arc<Frontier>, ordinal: usize, timeout: Duration) -> bool {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            f.admit(ordinal, &cancel);
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(timeout).is_ok()
+    }
 
     /// The unit that owns the head is NEVER parked, even with the backlog
     /// over budget. This is the whole deadlock-freedom argument: if the head
     /// could park, nothing would ever advance it.
     #[test]
     fn admit_never_parks_the_head_unit() {
-        let f = Frontier::new(0);
+        let f = Arc::new(Frontier::new(0));
         f.publish(u64::MAX, 7);
-        let cancel = AtomicBool::new(false);
-        // Would hang forever if the head were subject to the budget.
-        f.admit(7, &cancel);
+        assert!(
+            admit_completes_within(f, 7, Duration::from_secs(2)),
+            "the head unit must never park, even over budget"
+        );
     }
 
     /// A non-head producer parks while the backlog is over budget, and wakes
     /// once the head advances past it -- not only when bytes drop.
     #[test]
     fn admit_parks_a_non_head_unit_until_the_head_advances() {
-        let f = Frontier::new(0);
+        let f = Arc::new(Frontier::new(0));
         f.publish(100, 0);
-        let cancel = AtomicBool::new(false);
-        std::thread::scope(|s| {
-            let waiter = s.spawn(|| {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        {
+            let f = Arc::clone(&f);
+            let cancel = Arc::clone(&cancel);
+            thread::spawn(move || {
                 f.admit(3, &cancel);
+                let _ = tx.send(());
             });
-            // Give the waiter a chance to actually park before we release it.
-            std::thread::sleep(Duration::from_millis(50));
-            assert!(!waiter.is_finished(), "unit 3 must park behind head 0");
-            f.publish(100, 3);
-            waiter.join().unwrap();
-        });
+        }
+        assert_eq!(
+            rx.recv_timeout(Duration::from_millis(200)),
+            Err(mpsc::RecvTimeoutError::Timeout),
+            "unit 3 must park behind head 0"
+        );
+        f.publish(100, 3);
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(2)),
+            Ok(()),
+            "unit 3 must wake once the head advances past it"
+        );
     }
 
     /// A parked producer must observe `cancel` so the error path can tear the
     /// pool down instead of hanging in `join()`.
     #[test]
     fn admit_releases_a_parked_unit_on_cancel() {
-        let f = Frontier::new(0);
+        let f = Arc::new(Frontier::new(0));
         f.publish(100, 0);
-        let cancel = AtomicBool::new(false);
-        std::thread::scope(|s| {
-            let waiter = s.spawn(|| {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        {
+            let f = Arc::clone(&f);
+            let cancel = Arc::clone(&cancel);
+            thread::spawn(move || {
                 f.admit(3, &cancel);
+                let _ = tx.send(());
             });
-            std::thread::sleep(Duration::from_millis(50));
-            assert!(!waiter.is_finished());
-            cancel.store(true, Ordering::Relaxed);
-            f.wake_all();
-            waiter.join().unwrap();
-        });
+        }
+        assert_eq!(
+            rx.recv_timeout(Duration::from_millis(200)),
+            Err(mpsc::RecvTimeoutError::Timeout),
+            "unit 3 must park behind head 0"
+        );
+        cancel.store(true, Ordering::Relaxed);
+        f.wake_all();
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(2)),
+            Ok(()),
+            "a parked unit must observe cancel and return"
+        );
     }
 
     /// A budget of `u64::MAX` disables the gate entirely -- the PGEN path and
     /// the existing tests rely on this.
     #[test]
     fn an_unbounded_budget_never_parks_anything() {
-        let f = Frontier::new(u64::MAX);
+        let f = Arc::new(Frontier::new(u64::MAX));
         f.publish(u64::MAX, 0);
-        let cancel = AtomicBool::new(false);
-        f.admit(99, &cancel);
+        assert!(
+            admit_completes_within(f, 99, Duration::from_secs(2)),
+            "u64::MAX must disable the gate entirely"
+        );
     }
 
     /// The reorder head must be readable by the collector so it can publish
