@@ -551,6 +551,14 @@ pub fn process_chromosome(
                         // override) so the `pipeline config` line in lib.rs
                         // prints what actually ran -- issue #169 proposal 4.
                         let shard_htslib = crate::budget::SHARDED_VCF_HTSLIB_THREADS_PER_READER;
+                        // Two different `chunk_size`-shaped values meet right
+                        // here, deliberately: `plan_unit_count` takes the RAW
+                        // `chunk_size` -- the actual records-per-chunk this
+                        // contig emits -- while `pending_budget_bytes` (used
+                        // below, in `shard_exec::run`) was derived in `lib.rs`
+                        // from `resident_chunk_size`, the largest-contig-
+                        // narrowed value the RAM law was fitted against. Both
+                        // are correct for what they size; do not "unify" them.
                         let shards = if overlap == crate::svar2_view::OverlapMode::Pos {
                             crate::vcf_reader::plan_vcf_shards(
                                 &regions,

@@ -230,8 +230,13 @@ fn run_conversion_pipeline(
                 .iter()
                 .filter(|f| f.category == crate::field::FieldCategory::Format)
                 .count();
-            let per_variant_bytes =
-                (samples.len() * ploidy / 8 + n_format * samples.len() * 4) as u64;
+            // Clamped to `DENSE_CHUNK_META_BYTES_PER_VARIANT`: below 4
+            // haplotypes `samples * ploidy / 8` integer-divides to 0, which
+            // would zero `chunk_bytes` and, downstream, `pending_budget_bytes`
+            // -- see that constant's doc comment.
+            let per_variant_bytes = ((samples.len() * ploidy / 8 + n_format * samples.len() * 4)
+                as u64)
+                .max(crate::types::DENSE_CHUNK_META_BYTES_PER_VARIANT);
 
             // Longest-first cost estimate for the dispatch order (Step 3),
             // computed once: `estimate_contig_costs` opens the VCF and its
@@ -253,18 +258,17 @@ fn run_conversion_pipeline(
             // badly under-estimate. When it isn't known to be safe, fall
             // back to the nominal (over-estimating, never under-estimating)
             // size.
-            let resident_chunk_size = if costs.exact_counts {
-                costs
-                    .values
-                    .values()
-                    .copied()
-                    .max()
-                    .map_or(chunk_size, |max_records| {
-                        chunk_size.min(max_records as usize)
-                    })
+            // Also the record count `plan_unit_count` uses below for the
+            // `pipeline config` log's `planned_units` -- both readings of
+            // "the largest contig" should agree, so compute it once.
+            let max_contig_records = if costs.exact_counts {
+                costs.values.values().copied().max()
             } else {
-                chunk_size
+                None
             };
+            let resident_chunk_size = max_contig_records.map_or(chunk_size, |max_records| {
+                chunk_size.min(max_records as usize)
+            });
             let chunk_bytes = per_variant_bytes * resident_chunk_size as u64;
 
             // BENCH-ONLY overrides are resolved HERE, not in
@@ -295,6 +299,17 @@ fn run_conversion_pipeline(
             let reader_workers = sharded.reader_workers;
             let overshard = orchestrator::bench_overshard();
             let pending_budget_bytes = crate::budget::pending_budget_bytes(chunk_bytes);
+            // `plan_unit_count` is monotonic in the record count, so the
+            // largest contig's plan upper-bounds every other contig's --
+            // a single representative number for a log line that (unlike
+            // `shard plan` in orchestrator.rs) runs once per pipeline, before
+            // any specific contig is dispatched.
+            let planned_units = crate::shard::plan_unit_count(
+                max_contig_records,
+                reader_workers,
+                chunk_size,
+                overshard,
+            );
             // Sized against the concurrency this path actually dispatches
             // (`concurrent_chroms`, from `plan_sharded`) — NOT against
             // `plan_thread_budget`'s own `concurrent_chroms`, which models the
@@ -317,7 +332,13 @@ fn run_conversion_pipeline(
                 htslib_threads,
                 monolithic_reader_active,
                 reader_workers,
+                // `overshard` only drives `plan_unit_count` when a contig has
+                // no exact record count (the header-length fallback tier);
+                // `exact_counts` says whether that's the live tier for this
+                // run, so the log doesn't advertise an inert knob.
                 overshard,
+                exact_counts = costs.exact_counts,
+                planned_units,
                 pending_budget_mb = pending_budget_bytes as f64 / 1e6,
                 sharded_vcf_active,
                 processing_threads,

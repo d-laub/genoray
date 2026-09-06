@@ -192,6 +192,23 @@ pub struct DenseChunk {
     pub format_by_carrier: Option<Vec<Arc<FormatVals>>>,
 }
 
+/// Bytes every `DenseChunk` pays per variant regardless of cohort width:
+/// `pos` + `global_idx` + `ilens`, 4 bytes each, from `approx_bytes` below.
+/// NOT a tuning knob and NOT a fitted value -- it is a floor read directly
+/// off this struct's own layout. `lib.rs` clamps `per_variant_bytes` to it so
+/// a narrow cohort cannot round a chunk's cost to zero: `samples * ploidy / 8`
+/// integer-divides to 0 below 4 haplotypes, which zeroed `pending_budget_bytes`
+/// and serialized `shard_exec`'s frontier back to its head. Inert in
+/// production -- at 535,662 diploid samples the genotype term alone is
+/// 133,915 bytes per variant, four orders of magnitude above this floor.
+///
+/// Only consumed by `run_conversion_pipeline` (`lib.rs`), which is itself
+/// gated behind `conversion` -- gate the constant the same way so the
+/// no-conversion query-core build (`cargo check --no-default-features`,
+/// what GenVarLoader links) doesn't warn on dead code.
+#[cfg(feature = "conversion")]
+pub(crate) const DENSE_CHUNK_META_BYTES_PER_VARIANT: u64 = 12;
+
 impl DenseChunk {
     /// Approximate heap bytes held by this chunk.
     ///
