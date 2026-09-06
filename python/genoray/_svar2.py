@@ -695,11 +695,14 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         order and de-duplicating first occurrences.
 
         `reader_workers` sets how many independent indexed shard readers run
-        per concurrent contig. `None` (the default) derives it from the core
-        budget: the planner reserves a quarter of usable cores for the merge
-        tail, picks contig concurrency preferring depth, then spends the rest
-        on readers. Pass an explicit value to override; a value that cannot
-        fit `max_mem` raises rather than being silently reduced. This is a
+        per concurrent contig. `None` (the default) lets the planner choose:
+        it derives the count from the core budget, reserving a quarter of
+        usable cores for the merge tail, picking contig concurrency
+        preferring depth, then spending the rest on readers. Pass an
+        explicit value >= 1 to override; a value that cannot fit `max_mem`
+        raises rather than being silently reduced, and a value below 1
+        raises `ValueError` rather than being silently coerced up to 1 --
+        pass `None` instead if you want the planner to decide. This is a
         scheduling knob only — output is byte-identical at every value.
 
         signatures: if True, classify SBS96/ID83 codes during the write and
@@ -774,6 +777,11 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
             raise ValueError(
                 "regions_overlap must be one of 'pos', 'record', or 'variant'; "
                 f"got {regions_overlap!r}"
+            )
+        if reader_workers is not None and reader_workers < 1:
+            raise ValueError(
+                "reader_workers must be None (let the planner choose) or an "
+                f"integer >= 1; got {reader_workers!r}"
             )
 
         out = Path(out)

@@ -166,7 +166,7 @@ def write_vcf(
         ploidy: Ploidy of the samples. Default 2.
         chunk_size: Variants per conversion chunk. Defaults to 25000.
         threads: Number of threads. Defaults to all available cores.
-        reader_workers: Independent shard readers per concurrent contig. Defaults to a core-derived value. Single-file input only.
+        reader_workers: Independent shard readers per concurrent contig. Omit (None) to let the planner derive it from the core budget; values below 1 are rejected. Single-file input only.
         long_allele_capacity: Advanced: byte budget for the streaming long-allele buffer.
         overwrite: Overwrite the output directory if it exists.
         skip_symbolics_and_breakends: Drop records whose ALT is symbolic (``<DEL>``, ``<INS>``, …) or a

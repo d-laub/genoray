@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 
@@ -562,15 +563,56 @@ def test_from_vcf_check_ref_invalid_value_raises(tmp_path: Path):
         SparseVar2.from_vcf(tmp_path / "s", vcf, ref, check_ref="z", threads=1)  # type: ignore[arg-type]
 
 
-def test_from_vcf_reader_workers_does_not_change_output(tmp_path: Path):
-    """`reader_workers` is a scheduling knob: it must reach the planner and it
-    must not move a single output byte."""
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
+
+def _pipeline_reader_workers(captured_text: str) -> int:
+    """Extract the `reader_workers=` field logged on the "pipeline config"
+    tracing event, tolerant of Rich's ANSI styling and line-wrapping."""
+    plain = _ANSI_RE.sub("", captured_text)
+    collapsed = re.sub(r"\s+", " ", plain)
+    m = re.search(r"reader_workers=(\d+)", collapsed)
+    assert m is not None, (
+        f"no reader_workers field found in captured output:\n{captured_text!r}"
+    )
+    return int(m.group(1))
+
+
+def test_from_vcf_reader_workers_reaches_the_planner(tmp_path: Path, capfd):
+    """`reader_workers` must reach the planner, not just be accepted and
+    dropped. A byte-identity check can't tell (schedule invariance already
+    covers that, in tests/test_svar2_schedule_invariance.py); a max_mem
+    boundary can't either (it's machine-dependent). Instead read the
+    planner's *actual choice* off the effective-config log line for two
+    different explicit values and assert they differ from each other and
+    from what was requested.
+
+    Note: this line is emitted via Rust `tracing` -> the Python event
+    channel -> `rich.console.Console()`, whose default target is stdout, not
+    stderr (confirmed empirically: with no GENORAY_LOG set, the line is
+    entirely absent from fd 2 and entirely present on fd 1). `capfd` (not
+    `capsys`, since this crosses the Rust/Python boundary at the OS fd
+    level) is checked on both streams so the assertion holds regardless of
+    which one the environment routes it to.
+    """
     vcf = _write_vcf(tmp_path, symbolic=False, indexed=True)
-    a = tmp_path / "auto"
-    b = tmp_path / "w7"
-    SparseVar2.from_vcf(a, vcf, no_reference=True)
-    SparseVar2.from_vcf(b, vcf, no_reference=True, reader_workers=7)
+
+    a = tmp_path / "w1"
+    SparseVar2.from_vcf(a, vcf, no_reference=True, reader_workers=1, log_level="info")
+    captured_a = capfd.readouterr()
+    workers_a = _pipeline_reader_workers(captured_a.out + captured_a.err)
+
+    b = tmp_path / "w5"
+    SparseVar2.from_vcf(b, vcf, no_reference=True, reader_workers=5, log_level="info")
+    captured_b = capfd.readouterr()
+    workers_b = _pipeline_reader_workers(captured_b.out + captured_b.err)
+
+    assert workers_a == 1
+    assert workers_b == 5
+    assert workers_a != workers_b
+
+    # Bonus: still byte-identical across schedules. Not this test's job to
+    # own (tests/test_svar2_schedule_invariance.py does), but free to check.
     assert _oracle.store_digest(a) == _oracle.store_digest(b)
 
 
@@ -583,4 +625,14 @@ def test_from_vcf_reader_workers_that_cannot_fit_max_mem_raises(tmp_path: Path):
         SparseVar2.from_vcf(
             out, vcf, no_reference=True, reader_workers=64, max_mem="1M"
         )
+    assert not out.exists()
+
+
+def test_from_vcf_reader_workers_below_one_raises(tmp_path: Path):
+    """`reader_workers=0` must not silently coerce to 1 (the opposite of
+    "let the planner decide"); it must be rejected."""
+    vcf = _write_vcf(tmp_path, symbolic=False, indexed=True)
+    out = tmp_path / "rejected"
+    with pytest.raises(ValueError, match="reader_workers"):
+        SparseVar2.from_vcf(out, vcf, no_reference=True, reader_workers=0)
     assert not out.exists()
