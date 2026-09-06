@@ -405,20 +405,23 @@ Signature: `from_vcf(out, source, reference=None, *, regions=None, samples=None,
   default — `None` derives it, and `plan_sharded` scans `w` downward from
   `w_max` to `1` before giving up a contig, so a tight budget now yields a
   smaller `w` instead of a refusal. The floor the shipped planner actually
-  enforces at its new default is the `cc=1, w=1` point, well below the
-  `w=3` figures above:
+  enforces at its new default is the `cc=1, w=1` point, well below either
+  `w=3` figure below. The "old law" column is the 2026-08-11 refit number
+  quoted just above; the "current law" column is what an explicit
+  `reader_workers=3` actually costs today under the `w * (kappa + 2) + 8`
+  charge — the two are not the same number, so don't read them as one:
 
-  | cohort | `w=3` (illustrative, matches the refit numbers above) | actual floor now (`w=1`) |
-  |---|---|---|
-  | S=4,000 | 1,380 MB | **1,015 MB** |
-  | S=128,000 | 26,400 MB | **14,864 MB** |
-  | S=500,000 | 101,480 MB | **56,408 MB** |
+  | cohort | old law, `w=3` (2026-08-11 refit) | current law, `w=3` | actual floor now (`w=1`) |
+  |---|---|---|---|
+  | S=4,000 | 1,380 MB | 1,421 MB | **1,015 MB** |
+  | S=128,000 | 26,400 MB | 27,833 MB | **14,864 MB** |
+  | S=500,000 | 101,480 MB | 107,069 MB | **56,408 MB** |
 
   An explicit `reader_workers` raises the floor above this `w=1` minimum
   (a larger `w` costs more per the `w * (kappa + 2) + 8` charge above),
   because an explicit value is honoured or refused rather than silently
-  degraded to whatever `w` fits — passing `reader_workers=3` demands
-  whatever the current law prices `w=3` at, or raises
+  degraded to whatever `w` fits — passing `reader_workers=3` demands the
+  current-law `w=3` figure above (e.g. 107,069 MB at S=500,000), or raises
   `PlanError::InsufficientMemory`, never a silent downgrade to `w=1`. The
   direction is still safe (a larger requirement means more over-allocation
   or an outright refusal to plan, never an OOM). At S=500,000, a **64 GB
