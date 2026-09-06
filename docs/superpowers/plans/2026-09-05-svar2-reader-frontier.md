@@ -1786,7 +1786,7 @@ floor is the `cc=1, w=1` point, that an explicit `reader_workers` raises the
 floor because it is honoured or refused rather than degraded, and give the
 `w=3` column only as the illustrative comparison it now is.
 
-- [ ] **Step 4: Verify nothing else in SKILL.md still claims there is no knob**
+- [ ] **Step 5: Verify nothing else in SKILL.md still claims there is no knob**
 
 ```bash
 rg -n "no separate knob|reader_workers|--reader-workers" skills/genoray-api/SKILL.md
@@ -1798,7 +1798,7 @@ times before this task (in the `max_mem` floor passage that Step 4 rewrites),
 so the count after your edits will be higher. Check that every remaining
 mention is TRUE, not that they number three.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add skills/genoray-api/SKILL.md
@@ -1938,7 +1938,68 @@ If a value here disagrees with the planner, the PLANNER is right: fix the
 number in both this test and `SKILL.md`, and say so in the commit message.
 Do not adjust the tolerance to make it pass.
 
-- [ ] **Step 3: Run the gate**
+- [ ] **Step 4: Cover `shard_exec::run` with a finite backlog budget**
+
+**This is the most important test in the task.** `shard_exec::run` currently has
+**zero test callers** -- `rg -n 'shard_exec::run' src/` finds only the two
+production sites in `orchestrator.rs`. `Frontier` itself is well unit-tested
+(`admit_never_parks_the_head_unit`,
+`admit_parks_a_non_head_unit_until_the_head_advances`,
+`admit_releases_a_parked_unit_on_cancel`,
+`an_unbounded_budget_never_parks_anything`), but those drive `Frontier` directly
+through `publish`/`admit`. Nothing exercises the INTEGRATION: real scoped worker
+threads, the FIFO work queue, the reorder buffer and the admission gate running
+together. When Task 4 instrumented `Frontier::admit` during an end-to-end
+conversion it measured **zero park events** -- so the head-exemption, the
+property the entire deadlock-freedom argument rests on, has never actually run.
+
+No verbatim code is given for this step, deliberately. Constructing `RawRecord`
+(`Calls`, `FormatVals`, `info_raw`) and `ChunkAssembler::new`'s eight arguments
+correctly cannot be done from the summaries in this plan, and four defects on
+this branch already came from plan-supplied code that did not survive contact
+with the source. Write it TDD-style against the real signatures and report what
+you land. The contract below is binding; the shape is yours.
+
+The seam that makes this cheap: `RecordSource` (`src/record_source.rs:40`) is a
+**one-method trait** --
+`fn next_record(&mut self) -> Result<Option<RawRecord>, ConversionError>` --
+and `ChunkAssembler::new` takes `Box<dyn RecordSource + Send>`. A stub source is
+therefore a `Vec<RawRecord>` plus a cursor. Build records with no reference
+(`fasta_path: None`) and no INFO/FORMAT fields so nothing needs a FASTA or a
+real header.
+
+Two tests, both in `src/shard_exec.rs`'s `mod tests`:
+
+1. `run_emits_every_unit_in_order_under_a_bounded_backlog`
+   - Seed enough units (ordinals `0..=7`) that a small `pending_budget_bytes` --
+     about two chunks' worth -- is genuinely exceeded.
+   - **Force the backlog to build deterministically.** Left alone, units may
+     complete in order and never park, which is precisely how the end-to-end
+     measurement missed this path. Make the stub source for **ordinal 0** sleep
+     briefly per record (~5 ms) so later units finish first and pile up behind
+     the head.
+   - **Assert the gate was actually exercised:** the run's `pending_gauge`
+     high-water mark must be **> 0**. A test that never observes a non-zero
+     backlog has not tested admission control and must fail loudly rather than
+     pass vacuously. This assertion is the point of the test.
+   - Assert chunks arrive on `tx_dense` in ascending ordinal order and that the
+     returned `ShardTotals` accounts for every record.
+
+2. `bounded_and_unbounded_backlogs_produce_identical_output`
+   - Run the same units twice: once at `pending_budget_bytes = u64::MAX` (gate
+     disabled -- the PGEN path's setting) and once at test 1's tiny budget.
+     Assert the two runs emit identical `DenseChunk` sequences and equal
+     `ShardTotals`. This is the invariant the feature claims: admission control
+     changes WHEN a chunk is produced, never WHAT.
+
+**Deadlock guard, required on both tests.** A bug in the head-exemption
+deadlocks rather than failing, and a deadlocked `cargo test` hangs until the
+harness kills it -- which reads as infrastructure trouble, not a test failure.
+Run each `run(...)` call on a spawned thread and join with a timeout (10 s is
+generous for microsecond workloads plus the sleeps); on timeout, fail with a
+message naming the deadlock. Do not use a bare `handle.join()`.
+
+- [ ] **Step 5: Run the gate**
 
 ```bash
 export CARGO_TARGET_DIR=/tmp/genoray-target-dlaub
@@ -1949,7 +2010,7 @@ pixi run test tests/test_svar2_schedule_invariance.py -v
 Expected: PASS, every test. A failure here means the reorder or bank ordering
 broke and nothing else in this plan matters.
 
-- [ ] **Step 4: Run the full suite**
+- [ ] **Step 6: Run the full suite**
 
 ```bash
 pixi run test
@@ -1958,7 +2019,7 @@ pixi run test
 Expected: PASS. Compare the pass count against `git stash`-free `main` if
 anything looks off; do not accept a lower collected count as "fine".
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add tests/test_svar2_schedule_invariance.py
