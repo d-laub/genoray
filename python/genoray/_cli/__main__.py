@@ -113,6 +113,7 @@ def write_vcf(
     ploidy: int = 2,
     chunk_size: int | None = None,
     threads: Annotated[int | None, Parameter(name=["--threads", "-@"])] = None,
+    reader_workers: Annotated[int | None, Parameter(name="--reader-workers")] = None,
     long_allele_capacity: int = 8 * 1024 * 1024,
     overwrite: bool = False,
     skip_symbolics_and_breakends: Annotated[
@@ -165,6 +166,7 @@ def write_vcf(
         ploidy: Ploidy of the samples. Default 2.
         chunk_size: Variants per conversion chunk. Defaults to 25000.
         threads: Number of threads. Defaults to all available cores.
+        reader_workers: Independent shard readers per concurrent contig. Defaults to a core-derived value. Single-file input only.
         long_allele_capacity: Advanced: byte budget for the streaming long-allele buffer.
         overwrite: Overwrite the output directory if it exists.
         skip_symbolics_and_breakends: Drop records whose ALT is symbolic (``<DEL>``, ``<INS>``, …) or a
@@ -209,6 +211,12 @@ def write_vcf(
                 "--samples is not supported for multi-file (vcf-list) input; "
                 "each input file contributes its own sample."
             )
+        if reader_workers is not None:
+            raise ValueError(
+                "--reader-workers is not supported for multi-file (vcf-list) "
+                "input; that path uses one reader per contig and does not "
+                "shard within a contig."
+            )
         dropped = SparseVar2.from_vcf_list(
             out,
             source,
@@ -243,6 +251,7 @@ def write_vcf(
             ploidy=ploidy,
             chunk_size=chunk_size if chunk_size is not None else 25_000,
             threads=threads,
+            reader_workers=reader_workers,
             overwrite=overwrite,
             long_allele_capacity=long_allele_capacity,
             info_fields=info_fields,

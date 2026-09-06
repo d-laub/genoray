@@ -8,6 +8,7 @@ import pytest
 
 import genoray._utils as _utils
 from genoray import SparseVar2
+from tests import _oracle
 
 _REF = "ACAGTACATGGGTACTAGCTAGGCTAACCGGTTAACCGGT"
 _BOUNDARY_REF = "CAAAATCAGAGT"
@@ -559,3 +560,27 @@ def test_from_vcf_check_ref_invalid_value_raises(tmp_path: Path):
     vcf = _write_vcf_bad_ref(tmp_path)
     with pytest.raises(ValueError, match="check_ref"):
         SparseVar2.from_vcf(tmp_path / "s", vcf, ref, check_ref="z", threads=1)  # type: ignore[arg-type]
+
+
+def test_from_vcf_reader_workers_does_not_change_output(tmp_path: Path):
+    """`reader_workers` is a scheduling knob: it must reach the planner and it
+    must not move a single output byte."""
+
+    vcf = _write_vcf(tmp_path, symbolic=False, indexed=True)
+    a = tmp_path / "auto"
+    b = tmp_path / "w7"
+    SparseVar2.from_vcf(a, vcf, no_reference=True)
+    SparseVar2.from_vcf(b, vcf, no_reference=True, reader_workers=7)
+    assert _oracle.store_digest(a) == _oracle.store_digest(b)
+
+
+def test_from_vcf_reader_workers_that_cannot_fit_max_mem_raises(tmp_path: Path):
+    """An explicit request is honoured or refused, never silently shrunk -- a
+    caller who asked for 64 readers and got 3 has no way to find out."""
+    vcf = _write_vcf(tmp_path, symbolic=False, indexed=True)
+    out = tmp_path / "refused"
+    with pytest.raises(Exception, match="max_mem"):
+        SparseVar2.from_vcf(
+            out, vcf, no_reference=True, reader_workers=64, max_mem="1M"
+        )
+    assert not out.exists()
