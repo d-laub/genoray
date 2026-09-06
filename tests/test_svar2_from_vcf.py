@@ -616,15 +616,23 @@ def test_from_vcf_reader_workers_reaches_the_planner(tmp_path: Path, capfd):
     assert _oracle.store_digest(a) == _oracle.store_digest(b)
 
 
-def test_from_vcf_reader_workers_that_cannot_fit_max_mem_raises(tmp_path: Path):
-    """An explicit request is honoured or refused, never silently shrunk -- a
-    caller who asked for 64 readers and got 3 has no way to find out."""
+def test_from_vcf_planner_refusal_surfaces_to_python(tmp_path: Path):
+    """A planner `PlanError` crosses the pyo3 boundary as a Python exception
+    whose message names `max_mem`.
+
+    That is all this test proves. It does NOT prove an explicit
+    `reader_workers` is honoured or refused rather than silently shrunk:
+    `max_mem="1M"` sits below this cohort's fixed ~457 MB baseline, so the
+    call raises with no `reader_workers` argument at all. Those semantics are
+    owned by `an_explicit_reader_workers_is_honoured_or_refused_never_shrunk`
+    in `src/budget.rs`, which tests them at a realistic 10 MB chunk where `w`
+    actually moves the memory law -- unlike this fixture, whose `chunk_MB` is
+    about 0.000128.
+    """
     vcf = _write_vcf(tmp_path, symbolic=False, indexed=True)
     out = tmp_path / "refused"
     with pytest.raises(Exception, match="max_mem"):
-        SparseVar2.from_vcf(
-            out, vcf, no_reference=True, reader_workers=64, max_mem="1M"
-        )
+        SparseVar2.from_vcf(out, vcf, no_reference=True, max_mem="1M")
     assert not out.exists()
 
 
