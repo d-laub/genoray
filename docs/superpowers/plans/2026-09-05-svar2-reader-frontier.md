@@ -26,7 +26,7 @@ pytest, prek/ruff.
   Dropping `extension-module` is required or the pyo3 test binary will not
   link; keeping `conversion` is required or you silently skip the entire
   conversion path (341 tests vs 189).
-- **`export CARGO_TARGET_DIR=/tmp/genoray-target-$USER` before any cargo
+- **`export CARGO_TARGET_DIR=/tmp/genoray-target-dlaub` before any cargo
   invocation.** The repo lives on NFS and cargo bus-errors trying to mmap
   object files from an NFS `target/`. This applies to `git commit` too — the
   prek hooks run `cargo check`/`cargo clippy`.
@@ -181,7 +181,7 @@ Add to the `mod tests` block at the bottom of `src/shard_exec.rs`:
 - [ ] **Step 2: Run the tests to verify they fail**
 
 ```bash
-export CARGO_TARGET_DIR=/tmp/genoray-target-$USER
+export CARGO_TARGET_DIR=/tmp/genoray-target-dlaub
 cargo test --no-default-features --features conversion --lib shard_exec
 ```
 
@@ -309,7 +309,7 @@ impl Frontier {
 - [ ] **Step 5: Run the tests to verify they pass**
 
 ```bash
-export CARGO_TARGET_DIR=/tmp/genoray-target-$USER
+export CARGO_TARGET_DIR=/tmp/genoray-target-dlaub
 cargo test --no-default-features --features conversion --lib shard_exec
 ```
 
@@ -429,7 +429,7 @@ budget through the VCF one. Add the argument after `&pending_gauge`:
 - [ ] **Step 9: Verify the whole Rust suite still passes**
 
 ```bash
-export CARGO_TARGET_DIR=/tmp/genoray-target-$USER
+export CARGO_TARGET_DIR=/tmp/genoray-target-dlaub
 cargo test --no-default-features --features conversion
 ```
 
@@ -526,7 +526,7 @@ Add to the `mod tests` block at the bottom of `src/shard.rs`:
 - [ ] **Step 2: Run the tests to verify they fail**
 
 ```bash
-export CARGO_TARGET_DIR=/tmp/genoray-target-$USER
+export CARGO_TARGET_DIR=/tmp/genoray-target-dlaub
 cargo test --no-default-features --features conversion --lib shard
 ```
 
@@ -596,7 +596,7 @@ pub fn plan_unit_count(
 - [ ] **Step 4: Run the tests to verify they pass**
 
 ```bash
-export CARGO_TARGET_DIR=/tmp/genoray-target-$USER
+export CARGO_TARGET_DIR=/tmp/genoray-target-dlaub
 cargo test --no-default-features --features conversion --lib shard
 ```
 
@@ -836,7 +836,7 @@ Add to the `mod tests` block in `src/budget.rs`:
 - [ ] **Step 2: Run the tests to verify they fail**
 
 ```bash
-export CARGO_TARGET_DIR=/tmp/genoray-target-$USER
+export CARGO_TARGET_DIR=/tmp/genoray-target-dlaub
 cargo test --no-default-features --features conversion --lib budget
 ```
 
@@ -1150,7 +1150,7 @@ derivation.
 - [ ] **Step 8: Run the tests to verify they pass**
 
 ```bash
-export CARGO_TARGET_DIR=/tmp/genoray-target-$USER
+export CARGO_TARGET_DIR=/tmp/genoray-target-dlaub
 cargo test --no-default-features --features conversion --lib budget
 ```
 
@@ -1461,7 +1461,7 @@ At `src/lib.rs:573`, `reader_workers: 1,` becomes:
 - [ ] **Step 9: Build and run the whole Rust suite**
 
 ```bash
-export CARGO_TARGET_DIR=/tmp/genoray-target-$USER
+export CARGO_TARGET_DIR=/tmp/genoray-target-dlaub
 cargo check --no-default-features
 cargo test --no-default-features --features conversion
 ```
@@ -1675,7 +1675,7 @@ and in the `else:` branch's `SparseVar2.from_vcf(...)` call, after
 - [ ] **Step 6: Rebuild the extension and run the tests**
 
 ```bash
-export CARGO_TARGET_DIR=/tmp/genoray-target-$USER
+export CARGO_TARGET_DIR=/tmp/genoray-target-dlaub
 maturin develop --release
 pixi run test tests/test_svar2_from_vcf.py -k reader_workers
 ```
@@ -1747,14 +1747,56 @@ In the shared-`write`-options paragraph at ~line 1045, after the
 passing it with a directory/manifest raises).
 ```
 
+- [ ] **Step 4: Correct the stale `max_mem` floor passage**
+
+`SKILL.md` around lines 380-405 publishes concrete `max_mem` floor figures
+qualified as "at `from_vcf`'s own defaults (`chunk_size=25_000`,
+`reader_workers=3`)". Both halves of that qualifier are now wrong. `from_vcf`
+no longer pins `w=3` -- it defaults to `reader_workers=None`, and the derive
+path in `plan_sharded` scans `w` DOWNWARD from `w_max` to 1 before it gives up
+a contig, so a tight budget now yields a smaller `w` instead of a refusal.
+Task 3 also changed the per-`w` charge from `kappa * (2w - 1)` to
+`w * (kappa + 2) + 8` per chunk-MB.
+
+The published numbers were computed under the old law at a fixed `w=3`. Replace
+them with the floors that the shipped planner actually enforces at the new
+default, i.e. at `cc=1, w=1`. Use these values verbatim -- they are computed
+from the law's own coefficients and reproduce the three currently-published
+figures to within 0.29%, 0.01% and 0.00% when evaluated under the OLD law,
+which is what validates the model:
+
+| cohort | published (old law, `w=3`) | actual floor now (`w=1`) |
+|---|---|---|
+| S=4,000 | 1,380 MB | **1,015 MB** |
+| S=128,000 | 26,400 MB | **14,864 MB** |
+| S=500,000 | 101,480 MB | **56,408 MB** |
+
+Two consequences stated in that passage must be corrected too:
+
+- The 64 GB host claim SURVIVES: `max_mem` defaults to 80% of detected RAM
+  (52,429 MB), still below the 56,408 MB floor at S=500,000, so it does still
+  raise `PlanError::InsufficientMemory`. Keep the claim; the margin is now
+  narrow (52.4 vs 56.4 GB) rather than enormous.
+- The 128 GB host claim is now WRONG. It no longer "clears by under 1% of
+  headroom": at 104,858 MB it plans `cc=1, w=2` with roughly 48 GB to spare.
+  Say that instead.
+
+Rewrite the passage so it does NOT quote a fixed default `w`. State that the
+floor is the `cc=1, w=1` point, that an explicit `reader_workers` raises the
+floor because it is honoured or refused rather than degraded, and give the
+`w=3` column only as the illustrative comparison it now is.
+
 - [ ] **Step 4: Verify nothing else in SKILL.md still claims there is no knob**
 
 ```bash
 rg -n "no separate knob|reader_workers|--reader-workers" skills/genoray-api/SKILL.md
 ```
 
-Expected: no `no separate knob` hit remains; three `reader_workers` hits
-(signature, bullet, CLI).
+Expected: no `no separate knob` hit remains. Do NOT expect exactly three
+`reader_workers` hits -- `SKILL.md` already mentioned `reader_workers` four
+times before this task (in the `max_mem` floor passage that Step 4 rewrites),
+so the count after your edits will be higher. Check that every remaining
+mention is TRUE, not that they number three.
 
 - [ ] **Step 5: Commit**
 
@@ -1850,10 +1892,56 @@ def test_explicit_reader_workers_matches_the_derived_default(
     assert _oracle.store_digest(arg_out) == env_digest
 ```
 
+- [ ] **Step 3: Pin the documented `max_mem` floors against the planner**
+
+Task 6 rewrites `skills/genoray-api/SKILL.md`'s published `max_mem` floor
+figures. Those numbers came from a hand evaluation of the RAM law and nothing
+stops them drifting silently the next time a coefficient or the per-`w` charge
+moves -- which is exactly how they became wrong in the first place. Add a test
+to `src/budget.rs`'s `mod tests` that pins them to the planner itself:
+
+```rust
+#[test]
+fn the_documented_max_mem_floors_match_the_planner() {
+    // These three figures are published in skills/genoray-api/SKILL.md. If
+    // this test fails, the law changed and that document is now lying to
+    // users about how much memory they need -- update BOTH.
+    //
+    // The floor is the cc=1, w=1 point, because `plan_sharded`'s derive path
+    // scans `w` down to 1 before giving up a contig. `chunk_bytes` is
+    // `0.25 * n_samples * chunk_size`: two haplotypes at one bit each.
+    for (n_samples, floor_mb) in [(4_000u64, 1_015u64), (128_000, 14_864), (500_000, 56_408)] {
+        let chunk_bytes = n_samples * 25_000 / 4;
+        let inp = |budget_mb: u64| PlanInputs {
+            usable_cores: 31,
+            n_contigs: 22,
+            n_samples: n_samples as usize,
+            chunk_bytes,
+            max_mem_bytes: Some(budget_mb * 1_000_000),
+            reader_workers: None,
+            ram: RamLaw::VCF,
+        };
+        // One MB under the published floor must refuse...
+        assert!(
+            plan_sharded(inp(floor_mb - 1)).is_err(),
+            "S={n_samples}: planner accepted a budget below the documented floor"
+        );
+        // ...and the floor itself must plan, at exactly one reader.
+        let plan = plan_sharded(inp(floor_mb)).expect("documented floor must plan");
+        assert_eq!(plan.reader_workers, 1, "S={n_samples}");
+        assert_eq!(plan.concurrent_chroms, 1, "S={n_samples}");
+    }
+}
+```
+
+If a value here disagrees with the planner, the PLANNER is right: fix the
+number in both this test and `SKILL.md`, and say so in the commit message.
+Do not adjust the tolerance to make it pass.
+
 - [ ] **Step 3: Run the gate**
 
 ```bash
-export CARGO_TARGET_DIR=/tmp/genoray-target-$USER
+export CARGO_TARGET_DIR=/tmp/genoray-target-dlaub
 maturin develop --release
 pixi run test tests/test_svar2_schedule_invariance.py -v
 ```
