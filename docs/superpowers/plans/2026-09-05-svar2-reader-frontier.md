@@ -1778,8 +1778,13 @@ Two consequences stated in that passage must be corrected too:
   raise `PlanError::InsufficientMemory`. Keep the claim; the margin is now
   narrow (52.4 vs 56.4 GB) rather than enormous.
 - The 128 GB host claim is now WRONG. It no longer "clears by under 1% of
-  headroom": at 104,858 MB it plans `cc=1, w=2` with roughly 48 GB to spare.
-  Say that instead.
+  headroom": at 104,858 MB it plans `cc=1, w=2`, which needs 81,739 MB -- about
+  23 GB of headroom. It stops at `w=2` because `w=3` needs 107,069 MB, just over
+  the budget. Say that instead.
+  (An earlier revision of this step said "roughly 48 GB to spare". That was
+  wrong: 48 GB is the gap to the `w=1` FLOOR, 104,858 - 56,408, not to the plan
+  the host actually gets. Measure headroom against what the planner chooses, not
+  against the cheapest plan it could have chosen.)
 
 Rewrite the passage so it does NOT quote a fixed default `w`. State that the
 floor is the `cc=1, w=1` point, that an explicit `reader_workers` raises the

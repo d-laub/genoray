@@ -71,9 +71,15 @@ regions per contig raise — use `pos`/`record`, or convert separately.
 
 ### Parallel conversion
 
-Single-file `SparseVar2.from_vcf` shards **within a contig**, driven by the same
-`threads=` budget shown above — no new argument. Sub-contig sharding only kicks
-in for the default whole-contig (`regions_overlap="pos"`) path. The planner uses
+Single-file `SparseVar2.from_vcf` shards **within a contig**. `threads=` sets
+the overall budget shown above; `reader_workers=` sets how many indexed shard
+readers each concurrent contig gets, which is the knob that controls sub-contig
+read parallelism. Leaving it `None` derives it from the core budget — a quarter
+of usable cores is reserved for the merge tail, contig concurrency is chosen
+preferring depth, and the remainder goes to readers. An explicit value is
+honoured or refused, never silently reduced: one that cannot fit `max_mem`
+raises rather than quietly planning something slower. Sub-contig sharding only
+kicks in for the default whole-contig (`regions_overlap="pos"`) path. The planner uses
 a backend-specific reader budget: indexed shard readers decompress inline and
 replace, rather than run alongside, the monolithic reader's HTSlib pool. This
 lets medium-sized single-contig runs use their available cores without

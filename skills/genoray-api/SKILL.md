@@ -431,7 +431,9 @@ Signature: `from_vcf(out, source, reference=None, *, regions=None, samples=None,
   both remedies in its message, "raise `max_mem` or lower `chunk_size`" —
   though the margin is now narrow (52.4 vs 56.4 GB) rather than the old
   law's enormous gap. A **128 GB host** (`104,858 MB`) is no longer a near
-  miss: it plans `cc=1, w=2` with roughly 48 GB to spare.
+  miss: it plans `cc=1, w=2`, which needs `81,739 MB` -- about 23 GB of
+  headroom. (It stops at `w=2` because `w=3` would need `107,069 MB`, just
+  over the budget.)
 - **`progress=False`/`log_level="info"`** — write-time progress/logging,
   shared by `from_vcf`/`from_pgen`/`from_vcf_list`/`from_svar1`/`write_view`.
   `progress=True` renders live progress: in a terminal or Jupyter, a `rich`
