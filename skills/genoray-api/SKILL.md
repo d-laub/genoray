@@ -308,12 +308,14 @@ Signature: `from_vcf(out, source, reference=None, *, regions=None, samples=None,
   contig, the knob that sets sub-contig read parallelism. `None` derives it
   from the core budget: a quarter of usable cores is reserved for the merge
   tail, contig concurrency is chosen preferring depth (~8 readers per contig),
-  and the rest goes to readers. An explicit value is honoured or refused —
-  one that cannot fit `max_mem` raises `InsufficientMemory` rather than being
-  silently reduced. Output is byte-identical at every value. (`from_vcf_list`,
-  the N-single-sample-VCF merge path, does not shard within a contig and does
-  not accept this argument.) See "Parallel conversion" in
-  `docs/source/svar.md` for scaling numbers.
+  and the rest goes to readers. An explicit value must be `None` or an
+  integer `>= 1`; anything below 1 raises `ValueError` before conversion
+  starts (checked in Python, ahead of the planner — a value that instead
+  fits `max_mem` but cannot otherwise be honoured raises `InsufficientMemory`
+  rather than being silently reduced). Output is byte-identical at every
+  valid value. (`from_vcf_list`, the N-single-sample-VCF merge path, does not
+  shard within a contig and does not accept this argument.) See "Parallel
+  conversion" in `docs/source/svar.md` for scaling numbers.
 - `signatures=False` — when `True`, classifies every SNP/indel into its
   SBS96/ID83 mutation-type code during the write and stores a `mutcat`
   sidecar per contig (factored into the write's dense/var_key cost model).
@@ -1086,7 +1088,9 @@ the offending record and continues — mirrors `bcftools norm --check-ref`), and
 to `from_vcf_list`; its single-file form forwards both to `from_vcf`.
 
 `write vcf` additionally accepts `--reader-workers N` (single-file input only;
-passing it with a directory/manifest raises).
+passing it with a directory/manifest raises). The single-file form forwards
+`N` straight through to `from_vcf`'s `reader_workers=`, so `N < 1` raises the
+same `ValueError` there — the CLI has no separate check for the lower bound.
 
 - `genoray write vcf` (`SparseVar2.from_vcf`/`from_vcf_list`): `source` is a
   single `.vcf.gz`/`.vcf.bgz`/`.bcf` → `from_vcf`; anything else (a directory,
