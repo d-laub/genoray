@@ -14,7 +14,7 @@ session:
   `squeue -u dlaub` showed nine of the user's own jobs already running
   (eight `nf-ASCA_*` plus `atac_pool`), three of them started within the
   previous 15 minutes — an actively-submitting production Nextflow pipeline.
-  `frontier.sbatch` requests `--exclusive` for up to 8 hours on a pinned node,
+  `frontier.sbatch` requests `--exclusive` for up to 48 hours on a pinned node,
   which would hold a whole node against that live pipeline and would itself
   sit `PENDING` until a node drained (the longest of those jobs were 19-20h
   in), producing no result in any case.
