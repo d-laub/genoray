@@ -270,6 +270,44 @@ impl Frontier {
     }
 }
 
+/// RAII guard held for the whole lifetime of one worker's closure, so its
+/// `Drop` runs on every exit path -- a normal return, an early `return` on an
+/// ordinary error, AND an unwinding panic. The panic case is the one nothing
+/// else in this file reaches: every explicit `cancel.store` / `wake_all` pair
+/// above sits on a path this worker chooses to take, but a panic unwinds
+/// straight past all of them. Without this guard, a worker that panics while
+/// it owns the reorder head leaves every other worker parked in
+/// `Frontier::admit` forever -- the head-exemption argument on `Frontier`
+/// says the head is the ONLY thing that can ever unpark them, and a dead
+/// thread can't advance it. The result channel then never closes (the
+/// parked workers still hold their `tx_res` clones), so the collector's
+/// `rx_res.recv()` loop -- and the `wake_all()` after it at the bottom of
+/// `run` -- never runs, and `join()` (which is what would turn this panic
+/// into `ConversionError::WorkerPanicked`) is never reached either.
+///
+/// Order matters: `cancel` is set BEFORE waking, mirroring the same hazard
+/// `Frontier::wake_all`'s doc comment describes -- a woken waiter that
+/// re-checks its predicate before `cancel` is visible just re-parks, and
+/// nothing else is guaranteed to wake it again.
+struct PanicGuard {
+    cancel: Arc<AtomicBool>,
+    frontier: Arc<Frontier>,
+}
+
+impl Drop for PanicGuard {
+    fn drop(&mut self) {
+        if thread::panicking() {
+            self.cancel.store(true, Ordering::Relaxed);
+        }
+        // Runs on the non-panic paths too: a spuriously woken parked worker
+        // just re-evaluates its `while` condition in `Frontier::admit` and
+        // re-parks, which `record_park` already counts as a real park by
+        // design -- so this is a harmless no-op there and load-bearing only
+        // on the panic path above.
+        self.frontier.wake_all();
+    }
+}
+
 /// One worker's report to the collector.
 // `DenseChunk` legitimately outgrew clippy's large-enum-variant threshold when
 // `global_idx: Vec<i32>` was added alongside `pos`/`ilens`/`alt_offsets`; every
@@ -426,6 +464,14 @@ where
                     let _ = &worker_tids;
                     #[cfg(target_os = "linux")]
                     worker_tids.lock().unwrap().push(current_tid());
+                    // See `PanicGuard`'s doc comment: this must live for the
+                    // whole closure so a panic anywhere below -- not just an
+                    // explicit `Err` return -- still cancels the pool and
+                    // wakes every parked worker.
+                    let _panic_guard = PanicGuard {
+                        cancel: Arc::clone(&cancel),
+                        frontier: Arc::clone(&frontier),
+                    };
                     while !cancel.load(Ordering::Relaxed) {
                         let unit = match rx_work.recv() {
                             Ok(u) => u,
@@ -908,15 +954,24 @@ mod tests {
     /// still-open reorder head instead of streaming through by accident --
     /// which is exactly how the end-to-end conversion measurement (Task 4)
     /// missed this path (it observed zero park events).
+    ///
+    /// `panic_after_delay`, when set, panics (after the delay, if any)
+    /// instead of ever returning a record -- the injection point for the
+    /// `PanicGuard` regression test: a worker that panics mid-unit instead of
+    /// returning `Ok`/`Err` normally.
     struct VecSource {
         records: VecDeque<RawRecord>,
         delay_per_record: Option<Duration>,
+        panic_after_delay: bool,
     }
 
     impl RecordSource for VecSource {
         fn next_record(&mut self) -> Result<Option<RawRecord>, ConversionError> {
             if let Some(d) = self.delay_per_record {
                 thread::sleep(d);
+            }
+            if self.panic_after_delay {
+                panic!("VecSource: injected panic for PanicGuard regression test");
             }
             Ok(self.records.pop_front())
         }
@@ -998,8 +1053,12 @@ mod tests {
     /// Builds the `make_assembler` closure `run` requires: a fresh
     /// `ChunkAssembler` per unit wrapping a fresh `VecSource` cloned out of
     /// the shared record table. Only ordinal 0 gets the artificial delay.
+    /// `panic_ordinal`, when `Some`, makes that one ordinal's `VecSource`
+    /// panic instead of ever returning a record (see `VecSource::panic_after_delay`)
+    /// -- the `PanicGuard` regression test's injection point.
     fn make_assembler_fn(
         records_by_ordinal: Arc<HashMap<usize, Vec<RawRecord>>>,
+        panic_ordinal: Option<usize>,
     ) -> impl Fn(&WorkUnit) -> Result<ChunkAssembler, ConversionError> + Sync + 'static {
         move |unit: &WorkUnit| {
             let records = records_by_ordinal
@@ -1007,9 +1066,11 @@ mod tests {
                 .cloned()
                 .unwrap_or_default();
             let delay_per_record = (unit.ordinal == 0).then(|| Duration::from_millis(5));
+            let panic_after_delay = panic_ordinal == Some(unit.ordinal);
             let source: Box<dyn RecordSource + Send> = Box::new(VecSource {
                 records: records.into(),
                 delay_per_record,
+                panic_after_delay,
             });
             ChunkAssembler::new(
                 source,
@@ -1034,6 +1095,7 @@ mod tests {
         workers: usize,
         chunk_size: usize,
         pending_budget_bytes: u64,
+        panic_ordinal: Option<usize>,
     ) -> (
         Result<ShardTotals, ConversionError>,
         Vec<DenseChunk>,
@@ -1044,7 +1106,7 @@ mod tests {
         let (result_tx, result_rx) = mpsc::channel();
         {
             let gauge = Arc::clone(&gauge);
-            let make_assembler = make_assembler_fn(records_by_ordinal);
+            let make_assembler = make_assembler_fn(records_by_ordinal, panic_ordinal);
             thread::spawn(move || {
                 let worker_tids: Mutex<Vec<i32>> = Mutex::new(Vec::new());
                 let res = run(
@@ -1087,8 +1149,14 @@ mod tests {
         // shard's chunk through before a second non-head arrival (92 bytes
         // total) genuinely exceeds it.
         let pending_budget_bytes = 64u64;
-        let (result, chunks, gauge) =
-            run_with_deadlock_guard(units, records_by_ordinal, 4, 100, pending_budget_bytes);
+        let (result, chunks, gauge) = run_with_deadlock_guard(
+            units,
+            records_by_ordinal,
+            4,
+            100,
+            pending_budget_bytes,
+            None,
+        );
         let totals = result.expect("run must succeed");
 
         assert!(
@@ -1176,10 +1244,11 @@ mod tests {
         // one -- both runs use the same shape, so the comparison remains
         // apples-to-apples.
         let (units_a, records_a) = seed_units_with_a_multi_chunk_unit();
-        let (result_a, chunks_a, _) = run_with_deadlock_guard(units_a, records_a, 4, 2, u64::MAX);
+        let (result_a, chunks_a, _) =
+            run_with_deadlock_guard(units_a, records_a, 4, 2, u64::MAX, None);
 
         let (units_b, records_b) = seed_units_with_a_multi_chunk_unit();
-        let (result_b, chunks_b, _) = run_with_deadlock_guard(units_b, records_b, 4, 2, 64);
+        let (result_b, chunks_b, _) = run_with_deadlock_guard(units_b, records_b, 4, 2, 64, None);
 
         let totals_a = result_a.expect("unbounded run must succeed");
         let totals_b = result_b.expect("bounded run must succeed");
@@ -1217,5 +1286,47 @@ mod tests {
             sig_a, sig_b,
             "admission control must change WHEN a chunk is produced, never WHAT"
         );
+    }
+
+    /// `PanicGuard` regression test: ordinal 0 -- the reorder head -- panics
+    /// instead of ever completing, while its usual artificial delay (see
+    /// `VecSource`'s doc comment) gives the other, undelayed units time to
+    /// fill the backlog past `pending_budget_bytes` and genuinely park in
+    /// `Frontier::admit` behind the still-open head. That is exactly the
+    /// finding's scenario: a dead head with parked workers behind it and no
+    /// one left who can ever advance it. Without `PanicGuard`, this hangs
+    /// instead of returning -- caught only because it is routed through
+    /// `run_with_deadlock_guard`, whose 10s `recv_timeout` turns that hang
+    /// into a failing assertion instead of a wedged `cargo test` process.
+    #[test]
+    fn panicking_head_worker_returns_worker_panicked_instead_of_hanging() {
+        let (units, records_by_ordinal) = seed_units();
+        // Same arithmetic as `run_emits_every_unit_in_order_under_a_bounded_backlog`:
+        // one chunk costs 46 bytes, so a budget of 64 admits exactly one
+        // non-head chunk before the next one (92 bytes total) genuinely
+        // exceeds it and must park.
+        let pending_budget_bytes = 64u64;
+        let (result, _chunks, gauge) = run_with_deadlock_guard(
+            units,
+            records_by_ordinal,
+            4,
+            100,
+            pending_budget_bytes,
+            Some(0),
+        );
+
+        assert!(
+            gauge.parks.load(Ordering::Relaxed) > 0,
+            "a non-head worker must have actually parked behind ordinal 0 \
+             before it panicked, or this test never reaches the deadlock \
+             PanicGuard is meant to prevent"
+        );
+        match result {
+            Err(ConversionError::WorkerPanicked { .. }) => {}
+            Ok(_) => panic!("expected Err(ConversionError::WorkerPanicked {{ .. }}), got Ok(_)"),
+            Err(other) => {
+                panic!("expected Err(ConversionError::WorkerPanicked {{ .. }}), got Err({other})")
+            }
+        }
     }
 }
