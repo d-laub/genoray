@@ -692,7 +692,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     /// A trivially small, distinctly-non-empty chunk -- just enough that
     /// `approx_bytes()` is nonzero so the byte high-water is exercisable too.
@@ -946,31 +946,84 @@ mod tests {
     /// under the `chunk_size` used below), so each unit produces exactly one
     /// `DenseChunk`.
     const RECORDS_PER_UNIT: u32 = 2;
-    const N_UNITS: usize = 8;
-
-    /// A `RecordSource` over an in-memory queue, optionally sleeping before
-    /// each record. Used to make ordinal 0 finish LAST despite being
-    /// dequeued first, forcing every other unit's chunk to buffer behind the
-    /// still-open reorder head instead of streaming through by accident --
-    /// which is exactly how the end-to-end conversion measurement (Task 4)
-    /// missed this path (it observed zero park events).
+    /// Enough units that a park is FORCED by channel capacity rather than won
+    /// by a scheduling race.
     ///
-    /// `panic_after_delay`, when set, panics (after the delay, if any)
-    /// instead of ever returning a record -- the injection point for the
-    /// `PanicGuard` regression test: a worker that panics mid-unit instead of
-    /// returning `Ok`/`Err` normally.
+    /// `run` calls `Frontier::admit` once per assembled chunk, immediately
+    /// before pushing it onto `tx_res` -- and `tx_res` is `bounded(workers * 2)`,
+    /// so with `workers = 4` the first 8 messages (each unit sends a `Chunk`
+    /// plus a `Done`, so the first four non-head units) are buffered without
+    /// the collector ever having to run. Until the collector runs, nothing is
+    /// added to the backlog, `pending_bytes` stays 0, and every `admit` in that
+    /// window passes.
+    ///
+    /// At the old value of 8 there were only 7 non-head units, so that free
+    /// window covered most of the run and whether ANY `admit` ever saw a
+    /// non-empty backlog came down to how promptly the collector thread got
+    /// scheduled. On a 48-core dev node it always did; on a 2-core CI runner it
+    /// did not, and `parks > 0` failed against a perfectly healthy gate.
+    ///
+    /// With 32 units the buffer saturates, `tx_res.send` blocks, and the
+    /// collector MUST drain to let the producers continue. Two drained chunks
+    /// (92 bytes) already exceed the 64-byte budget the tests use, and the head
+    /// is held open meanwhile, so the backlog only grows -- leaving ~27 further
+    /// admits that must park. That is a capacity argument, not a timing one.
+    const N_UNITS: usize = 32;
+
+    /// How long ordinal 0 waits for the first park before giving up and letting
+    /// its test's `parks > 0` assertion report the real failure. Comfortably
+    /// inside `run_with_deadlock_guard`'s 10s `recv_timeout`, so a gate that
+    /// never parks still fails with the assertion's message rather than the
+    /// guard's misleading "deadlocked" one.
+    const PARK_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
+
+    /// Blocks until `gauge` records its first park, or `PARK_HANDSHAKE_TIMEOUT`
+    /// elapses.
+    ///
+    /// This handshake is what makes ordinal 0 finish LAST *deterministically*.
+    /// It replaces a 5ms-per-record `thread::sleep`, which only held the head
+    /// open for as long as the other workers needed if they happened to get
+    /// enough CPU inside those 5ms. Waiting on the park counter itself takes
+    /// the machine out of that question: ordinal 0 proceeds exactly when a
+    /// non-head worker has actually parked behind it, on any number of cores,
+    /// and holds the head open for as long as that takes.
+    ///
+    /// This is one half of the fix for a CI failure ("zero parks recorded") that
+    /// reproduced only on a 2-core runner; `N_UNITS` carries the other half and
+    /// the fuller explanation. Holding the head open is not on its own enough to
+    /// force a park -- there also has to be more work than `tx_res` can buffer.
+    fn wait_for_first_park(gauge: &PendingGauge) {
+        let deadline = Instant::now() + PARK_HANDSHAKE_TIMEOUT;
+        while gauge.parks.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// A `RecordSource` over an in-memory queue that, for ordinal 0, blocks
+    /// until some other worker has parked. Used to make ordinal 0 finish LAST
+    /// despite being dequeued first, forcing every other unit's chunk to buffer
+    /// behind the still-open reorder head instead of streaming through by
+    /// accident -- which is exactly how the end-to-end conversion measurement
+    /// (Task 4) missed this path (it observed zero park events).
+    ///
+    /// `panic_after_wait`, when set, panics (after the wait, if any) instead of
+    /// ever returning a record -- the injection point for the `PanicGuard`
+    /// regression test: a worker that panics mid-unit instead of returning
+    /// `Ok`/`Err` normally. Pairing it with `wait_for_park` is what guarantees
+    /// the panic lands with workers already parked behind the head, which is
+    /// the only arrangement that reaches the deadlock `PanicGuard` prevents.
     struct VecSource {
         records: VecDeque<RawRecord>,
-        delay_per_record: Option<Duration>,
-        panic_after_delay: bool,
+        wait_for_park: Option<Arc<PendingGauge>>,
+        panic_after_wait: bool,
     }
 
     impl RecordSource for VecSource {
         fn next_record(&mut self) -> Result<Option<RawRecord>, ConversionError> {
-            if let Some(d) = self.delay_per_record {
-                thread::sleep(d);
+            if let Some(gauge) = &self.wait_for_park {
+                wait_for_first_park(gauge);
             }
-            if self.panic_after_delay {
+            if self.panic_after_wait {
                 panic!("VecSource: injected panic for PanicGuard regression test");
             }
             Ok(self.records.pop_front())
@@ -1052,25 +1105,27 @@ mod tests {
 
     /// Builds the `make_assembler` closure `run` requires: a fresh
     /// `ChunkAssembler` per unit wrapping a fresh `VecSource` cloned out of
-    /// the shared record table. Only ordinal 0 gets the artificial delay.
+    /// the shared record table. Only ordinal 0 gets the park handshake, which
+    /// is what holds the reorder head open until the backlog behind it is real.
     /// `panic_ordinal`, when `Some`, makes that one ordinal's `VecSource`
-    /// panic instead of ever returning a record (see `VecSource::panic_after_delay`)
+    /// panic instead of ever returning a record (see `VecSource::panic_after_wait`)
     /// -- the `PanicGuard` regression test's injection point.
     fn make_assembler_fn(
         records_by_ordinal: Arc<HashMap<usize, Vec<RawRecord>>>,
         panic_ordinal: Option<usize>,
+        gauge: Arc<PendingGauge>,
     ) -> impl Fn(&WorkUnit) -> Result<ChunkAssembler, ConversionError> + Sync + 'static {
         move |unit: &WorkUnit| {
             let records = records_by_ordinal
                 .get(&unit.ordinal)
                 .cloned()
                 .unwrap_or_default();
-            let delay_per_record = (unit.ordinal == 0).then(|| Duration::from_millis(5));
-            let panic_after_delay = panic_ordinal == Some(unit.ordinal);
+            let wait_for_park = (unit.ordinal == 0).then(|| Arc::clone(&gauge));
+            let panic_after_wait = panic_ordinal == Some(unit.ordinal);
             let source: Box<dyn RecordSource + Send> = Box::new(VecSource {
                 records: records.into(),
-                delay_per_record,
-                panic_after_delay,
+                wait_for_park,
+                panic_after_wait,
             });
             ChunkAssembler::new(
                 source,
@@ -1106,7 +1161,8 @@ mod tests {
         let (result_tx, result_rx) = mpsc::channel();
         {
             let gauge = Arc::clone(&gauge);
-            let make_assembler = make_assembler_fn(records_by_ordinal, panic_ordinal);
+            let make_assembler =
+                make_assembler_fn(records_by_ordinal, panic_ordinal, Arc::clone(&gauge));
             thread::spawn(move || {
                 let worker_tids: Mutex<Vec<i32>> = Mutex::new(Vec::new());
                 let res = run(
@@ -1289,9 +1345,9 @@ mod tests {
     }
 
     /// `PanicGuard` regression test: ordinal 0 -- the reorder head -- panics
-    /// instead of ever completing, while its usual artificial delay (see
-    /// `VecSource`'s doc comment) gives the other, undelayed units time to
-    /// fill the backlog past `pending_budget_bytes` and genuinely park in
+    /// instead of ever completing, and its park handshake (see `VecSource`'s
+    /// doc comment) holds that panic back until the other units have filled the
+    /// backlog past `pending_budget_bytes` and genuinely parked in
     /// `Frontier::admit` behind the still-open head. That is exactly the
     /// finding's scenario: a dead head with parked workers behind it and no
     /// one left who can ever advance it. Without `PanicGuard`, this hangs
