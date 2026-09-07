@@ -168,7 +168,6 @@ def _preexec(rss_ceiling_mb: int | None):
 def _build_env(point: SweepPoint) -> dict[str, str]:
     env = dict(os.environ) | {
         "GENORAY_READER_WORKERS": str(point.reader_workers),
-        "GENORAY_SHARD_HTSLIB": str(point.shard_htslib),
         "GENORAY_OVERSHARD": str(point.overshard),
         "GENORAY_LOG": "genoray::monitor=trace",
         "GENORAY_SAMPLE_INTERVAL": "1",

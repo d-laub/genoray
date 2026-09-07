@@ -64,6 +64,18 @@ class SweepPoint:
     corpus: str
     reader_workers: int
     concurrent_chroms: int | None
+    # VESTIGIAL: no Rust code reads `GENORAY_SHARD_HTSLIB` any more --
+    # `src/orchestrator.rs` binds `shard_htslib` from the compile-time
+    # constant `budget::SHARDED_VCF_HTSLIB_THREADS_PER_READER`, not the
+    # environment, so this field no longer controls anything a probe run
+    # does. Kept anyway, unused, because `point_id` hashes
+    # `dataclasses.asdict(self)` with `sort_keys=True` over ALL fields:
+    # removing it would change `point_id` for every point, historical and
+    # new, and silently invalidate `sweep.py`'s resume-by-`(point_id,
+    # code_id)` against every existing `*.ndjson` results file (see the
+    # `backend` field's comment above for the same hazard in the other
+    # direction -- adding a field). Leave it at its default (0) in every new
+    # `SweepPoint`.
     shard_htslib: int
     overshard: int
     chunk_size: int
