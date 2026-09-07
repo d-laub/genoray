@@ -144,27 +144,12 @@ fn index_vcf(path: String) -> PyResult<()> {
     index_bcf_csi(&path).map_err(pyo3::exceptions::PyRuntimeError::new_err)
 }
 
-// Low end of the scale bench's measured reader-worker knee (3-7). Chosen at
-// the low end because the executor is the bottleneck, not the reader, and
-// surplus readers steal cores from *other* concurrently-dispatched contigs'
-// executors rather than speeding up their own.
-//
-// This is the ONLY source of the per-contig reader count. An opt-in runtime
-// probe (`tune=`) that measured `t_read`/`t_exec` on the actual input and
-// derived `w` from the ratio was built and then removed: it re-read a prefix
-// of the largest contig before every dispatch, and the ratio it recovered
-// landed inside the fitted knee often enough that it never paid for that
-// read. Keep the fitted value; if it ever needs to move, move it here rather
-// than reintroducing a per-run measurement.
-#[cfg(feature = "conversion")]
-const DEFAULT_READER_WORKERS: usize = 3;
-
 //The Python Wrapper and resource allocator
 #[cfg(feature = "conversion")]
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 #[pyfunction]
-#[pyo3(signature = (vcf_path, reference_path, chroms, output_dir, samples, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false, signatures=false, info_fields=Vec::new(), format_fields=Vec::new(), check_ref="e".to_string(), region_ranges=Vec::new(), regions_overlap="pos".to_string(), max_mem_bytes=None, log_level = "info".to_string(), receiver = None))]
+#[pyo3(signature = (vcf_path, reference_path, chroms, output_dir, samples, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false, signatures=false, info_fields=Vec::new(), format_fields=Vec::new(), check_ref="e".to_string(), region_ranges=Vec::new(), regions_overlap="pos".to_string(), max_mem_bytes=None, reader_workers=None, log_level = "info".to_string(), receiver = None))]
 fn run_conversion_pipeline(
     py: Python,
     vcf_path: String,
@@ -184,6 +169,7 @@ fn run_conversion_pipeline(
     region_ranges: Vec<(String, u32, u32)>,
     regions_overlap: String,
     max_mem_bytes: Option<u64>,
+    reader_workers: Option<usize>,
     log_level: String,
     receiver: Option<Py<PyEventReceiver>>,
 ) -> PyResult<usize> {
@@ -244,8 +230,13 @@ fn run_conversion_pipeline(
                 .iter()
                 .filter(|f| f.category == crate::field::FieldCategory::Format)
                 .count();
-            let per_variant_bytes =
-                (samples.len() * ploidy / 8 + n_format * samples.len() * 4) as u64;
+            // Clamped to `DENSE_CHUNK_META_BYTES_PER_VARIANT`: below 4
+            // haplotypes `samples * ploidy / 8` integer-divides to 0, which
+            // would zero `chunk_bytes` and, downstream, `pending_budget_bytes`
+            // -- see that constant's doc comment.
+            let per_variant_bytes = ((samples.len() * ploidy / 8 + n_format * samples.len() * 4)
+                as u64)
+                .max(crate::types::DENSE_CHUNK_META_BYTES_PER_VARIANT);
 
             // Longest-first cost estimate for the dispatch order (Step 3),
             // computed once: `estimate_contig_costs` opens the VCF and its
@@ -267,19 +258,25 @@ fn run_conversion_pipeline(
             // badly under-estimate. When it isn't known to be safe, fall
             // back to the nominal (over-estimating, never under-estimating)
             // size.
-            let resident_chunk_size = if costs.exact_counts {
-                costs
-                    .values
-                    .values()
-                    .copied()
-                    .max()
-                    .map_or(chunk_size, |max_records| {
-                        chunk_size.min(max_records as usize)
-                    })
+            // Also the record count `plan_unit_count` uses below for the
+            // `pipeline config` log's `planned_units` -- both readings of
+            // "the largest contig" should agree, so compute it once.
+            let max_contig_records = if costs.exact_counts {
+                costs.values.values().copied().max()
             } else {
-                chunk_size
+                None
             };
+            let resident_chunk_size = max_contig_records.map_or(chunk_size, |max_records| {
+                chunk_size.min(max_records as usize)
+            });
             let chunk_bytes = per_variant_bytes * resident_chunk_size as u64;
+
+            // BENCH-ONLY overrides are resolved HERE, not in
+            // `process_chromosome`, so the `pipeline config` line below prints
+            // what actually ran. Before #169 the override was applied
+            // per-contig and the log printed the planner's value, making a
+            // 20-worker run indistinguishable from a 3-worker one in the logs.
+            let requested_workers = orchestrator::bench_env_reader_workers().or(reader_workers);
 
             let sharded = crate::budget::plan_sharded(crate::budget::PlanInputs {
                 usable_cores: available_cores.saturating_sub(1).max(1),
@@ -287,7 +284,7 @@ fn run_conversion_pipeline(
                 n_samples: samples.len(),
                 chunk_bytes,
                 max_mem_bytes,
-                reader_workers: DEFAULT_READER_WORKERS,
+                reader_workers: requested_workers,
                 ram: crate::budget::RamLaw::VCF,
             });
             let sharded = match sharded {
@@ -300,6 +297,19 @@ fn run_conversion_pipeline(
                 orchestrator::bench_concurrent_chroms(sharded.concurrent_chroms);
             let htslib_threads = plan.htslib_threads; // monolithic path only
             let reader_workers = sharded.reader_workers;
+            let overshard = orchestrator::bench_overshard();
+            let pending_budget_bytes = crate::budget::pending_budget_bytes(chunk_bytes);
+            // `plan_unit_count` is monotonic in the record count, so the
+            // largest contig's plan upper-bounds every other contig's --
+            // a single representative number for a log line that (unlike
+            // `shard plan` in orchestrator.rs) runs once per pipeline, before
+            // any specific contig is dispatched.
+            let planned_units = crate::shard::plan_unit_count(
+                max_contig_records,
+                reader_workers,
+                chunk_size,
+                overshard,
+            );
             // Sized against the concurrency this path actually dispatches
             // (`concurrent_chroms`, from `plan_sharded`) — NOT against
             // `plan_thread_budget`'s own `concurrent_chroms`, which models the
@@ -322,6 +332,14 @@ fn run_conversion_pipeline(
                 htslib_threads,
                 monolithic_reader_active,
                 reader_workers,
+                // `overshard` only drives `plan_unit_count` when a contig has
+                // no exact record count (the header-length fallback tier);
+                // `exact_counts` says whether that's the live tier for this
+                // run, so the log doesn't advertise an inert knob.
+                overshard,
+                exact_counts = costs.exact_counts,
+                planned_units,
+                pending_budget_mb = pending_budget_bytes as f64 / 1e6,
                 sharded_vcf_active,
                 processing_threads,
                 "pipeline config"
@@ -362,6 +380,17 @@ fn run_conversion_pipeline(
                                 vcf_path: vcf_path.clone(),
                                 htslib_threads,
                                 reader_workers,
+                                overshard,
+                                // `costs.values` is a record count ONLY on the
+                                // exact tier; the fallback tier holds base-pair
+                                // contig lengths, which would mis-size the
+                                // frontier by orders of magnitude.
+                                contig_records: if costs.exact_counts {
+                                    costs.values.get(chrom.as_str()).copied()
+                                } else {
+                                    None
+                                },
+                                pending_budget_bytes,
                                 regions: ranges_by_chrom.get(chrom).cloned().unwrap_or_default(),
                                 overlap: overlap_mode,
                             },
@@ -570,7 +599,7 @@ fn run_pgen_conversion_pipeline(
                 n_samples: samples.len(),
                 chunk_bytes,
                 max_mem_bytes,
-                reader_workers: 1,
+                reader_workers: Some(1),
                 ram: crate::budget::RamLaw::PGEN,
             });
             let sharded = match sharded {

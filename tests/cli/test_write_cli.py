@@ -377,6 +377,27 @@ def test_write_vcf_list_rejects_samples(tmp_path: Path):
     assert "not supported for multi-file" in (r.stdout + r.stderr).lower()
 
 
+def test_write_vcf_list_rejects_reader_workers(tmp_path: Path):
+    vcf_dir = tmp_path / "vcfs"
+    vcf_dir.mkdir()
+    _single_sample_vcf(vcf_dir, "a", "S0", "chr1\t3\t.\tA\tG\t.\t.\t.\tGT\t1|0\n")
+    _single_sample_vcf(vcf_dir, "b", "S1", "chr1\t7\t.\tC\tCAT\t.\t.\t.\tGT\t0|1\n")
+    out = tmp_path / "list_out"
+    r = _run(
+        [
+            "write",
+            "vcf",
+            str(vcf_dir),
+            str(out),
+            "--no-reference",
+            "--reader-workers",
+            "2",
+        ]
+    )
+    assert r.returncode != 0
+    assert "not supported for multi-file" in (r.stdout + r.stderr).lower()
+
+
 def test_write_vcf_list_dispatches(tmp_path: Path):
     """Sanity check that the vcf-list (directory) form is actually reachable
     (not just erroring) now that source-kind resolution routes it to

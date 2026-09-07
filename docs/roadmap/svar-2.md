@@ -413,6 +413,29 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
   input file per contig). Full scaling results in
   [`svar2-conversion-baseline-2026-07-15.md`](svar2-conversion-baseline-2026-07-15.md).
 
+- [x] **M16. Reader-frontier: user-controllable width and a bounded backlog (#169).**
+  Builds on M15. At biobank cohort width (All of Us v9, 535,662 samples)
+  `SparseVar2.from_vcf` took ~4h37m per chromosome, from three coupled causes:
+  the reader pool width was not user-controllable, reorder-head gating idled
+  the executor, and the pending backlog was unbounded. This milestone makes
+  `reader_workers` a real, planned, logged knob (**this is a public API
+  change** — it supersedes M15's "public API is unchanged" note above, which
+  described M15 only); sizes work units by record count instead of bp span so
+  a unit's cost tracks its actual decode work; and adds a head-exempt byte
+  admission gate (`shard_exec::Frontier`) so the backlog is bounded without
+  deadlocking — a worker holding the current head ordinal never parks. See the
+  design spec
+  [`../superpowers/specs/2026-09-05-svar2-reader-frontier-design.md`](../superpowers/specs/2026-09-05-svar2-reader-frontier-design.md)
+  and plan
+  [`../superpowers/plans/2026-09-05-svar2-reader-frontier.md`](../superpowers/plans/2026-09-05-svar2-reader-frontier.md).
+  Byte-identity across frontier width and backlog budget is gated by tests.
+  **Not measured:** the wide-cohort A/B repro
+  (`scripts/bench_svar2/frontier.sbatch`) is written and parse-verified but has
+  never been run, so `W_TARGET`, `MERGE_RESERVE_DIV`, `UNITS_TARGET_CHUNKS`
+  and `PENDING_BUDGET_CHUNKS` remain unconstrained by measurement — see
+  [`../superpowers/plans/results/2026-09-05-reader-frontier.md`](../superpowers/plans/results/2026-09-05-reader-frontier.md).
+  Executor parallelism was deliberately deferred to #170.
+
 ### Longer term
 
 - [ ] **M10. Checkpointing / resume during conversion.**

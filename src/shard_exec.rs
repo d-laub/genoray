@@ -59,6 +59,13 @@ impl ReorderBuffer {
         }
     }
 
+    /// The ordinal currently being emitted/awaited. The collector publishes
+    /// this to [`Frontier`] so non-head producers know whether they are
+    /// subject to the backlog budget.
+    pub fn head(&self) -> usize {
+        self.head
+    }
+
     /// Record one arrival: either a chunk (`done = false`, tagged
     /// `(ordinal, local)`) or a shard-completion signal (`done = true`;
     /// `local` is ignored). Calls `emit(global_id, (ordinal, local))` for
@@ -147,6 +154,160 @@ impl PendingBacklog {
     }
 }
 
+/// Producer-side admission gate over the collector's reorder backlog.
+///
+/// `PendingBacklog` is unbounded by construction: every unit ahead of
+/// `ReorderBuffer::head` buffers everything it produces. At biobank cohort
+/// width one buffered chunk is hundreds of MB, so the backlog -- not
+/// `max_mem`, and not `workers * chunk_bytes` -- becomes the dominant peak-RSS
+/// term, and it is invisible to the caller. This gate parks a producer whose
+/// unit is ahead of the head once the backlog exceeds `budget_bytes`.
+///
+/// # Why this cannot deadlock
+///
+/// The unit that owns the current head is NEVER parked. That exemption is
+/// sufficient because the work queue is a FIFO MPMC channel seeded in ordinal
+/// order, so units are dequeued in ascending ordinal order. Let `h` be the
+/// head. If unit `h` were still queued, no worker could be holding any
+/// `j > h` (it would have had to be dequeued before `h`), so every worker
+/// would hold an ordinal `< h` -- but those are all complete by definition of
+/// the head. Contradiction. So `h` is always either already done, or in
+/// flight at a worker that is exempt. That worker runs to its `Done`, the
+/// collector advances the head, and the condvar wakes the next holder.
+///
+/// The other two blocking edges are ordinary backpressure, not deadlock: a
+/// worker blocked on the bounded `tx_res` is drained by the collector, and a
+/// collector blocked on the bounded `tx_dense` is drained by the executor.
+pub(crate) struct Frontier {
+    state: Mutex<FrontierState>,
+    cv: std::sync::Condvar,
+    /// `u64::MAX` disables the gate (the PGEN path, which runs a single unit,
+    /// and the unit tests).
+    budget_bytes: u64,
+    /// Diagnostic counter (`PendingGauge::parks`) incremented each time a
+    /// non-head worker actually blocks in [`Frontier::admit`]. A nonzero
+    /// backlog high-water mark proves records piled up in the reorder
+    /// buffer, but not that admission control did anything about it -- this
+    /// is the only signal that the parking branch itself ran.
+    ///
+    /// Owned (`Arc`, not a borrow): `admit`'s deadlock-guard tests spawn a
+    /// detached, non-scoped `thread::spawn` that may outlive the test
+    /// function on a regression (that's the whole point -- see
+    /// `admit_completes_within`'s doc comment), which requires `Frontier`
+    /// itself to be `'static`.
+    gauge: Arc<crate::monitor::PendingGauge>,
+}
+
+/// Head and backlog bytes live under ONE mutex so a parked producer's
+/// predicate reads a consistent pair. Split atomics would let a waiter see a
+/// stale head against fresh bytes and park after the head had already passed
+/// it -- a lost wakeup with no one left to issue another.
+struct FrontierState {
+    head: usize,
+    pending_bytes: u64,
+}
+
+impl Frontier {
+    pub(crate) fn new(budget_bytes: u64, gauge: Arc<crate::monitor::PendingGauge>) -> Self {
+        Self {
+            state: Mutex::new(FrontierState {
+                head: 0,
+                pending_bytes: 0,
+            }),
+            cv: std::sync::Condvar::new(),
+            budget_bytes,
+            gauge,
+        }
+    }
+
+    /// Producer side: block until this unit may send another chunk.
+    /// Returns immediately for the unit that owns the head, and on cancel.
+    pub(crate) fn admit(&self, ordinal: usize, cancel: &AtomicBool) {
+        let mut st = self.state.lock().unwrap();
+        while !cancel.load(Ordering::Relaxed)
+            && ordinal > st.head
+            && st.pending_bytes > self.budget_bytes
+        {
+            // This IS the head-exemption path: a non-head worker is about to
+            // block. Record it before waiting so a spurious wakeup that
+            // re-parks counts again -- each `wait` call is a real park.
+            self.gauge.record_park();
+            st = self.cv.wait(st).unwrap();
+        }
+    }
+
+    /// Collector side: publish the whole backlog state after handling one
+    /// message. Publishing the totals (rather than deltas) keeps this
+    /// impossible to get wrong from the collector's two call sites, and the
+    /// cost is one uncontended lock per message.
+    pub(crate) fn publish(&self, pending_bytes: u64, head: usize) {
+        {
+            let mut st = self.state.lock().unwrap();
+            st.pending_bytes = pending_bytes;
+            st.head = head;
+        }
+        self.cv.notify_all();
+    }
+
+    /// Wake every parked producer without changing the state -- the teardown
+    /// path, after `cancel` is set.
+    ///
+    /// Takes and immediately drops the state lock before notifying -- do not
+    /// "simplify" this away. `admit`'s predicate reads `cancel`, a plain
+    /// `AtomicBool` the state lock does not otherwise guard, so without this
+    /// a caller could set `cancel` and call `notify_all` in the window
+    /// between a waiter re-checking the predicate (false) and actually
+    /// registering on the condvar via `wait` -- a lost wakeup that parks the
+    /// waiter forever, since nothing else is guaranteed to notify it again.
+    /// Acquiring the lock here forces a happens-before edge: either the
+    /// waiter already holds the lock (this call blocks until its `wait`
+    /// atomically releases it and parks, so the notify is guaranteed to
+    /// reach it), or it has not yet re-locked to re-check the predicate (so
+    /// it observes the now-`true` `cancel` on its next check).
+    pub(crate) fn wake_all(&self) {
+        drop(self.state.lock().unwrap());
+        self.cv.notify_all();
+    }
+}
+
+/// RAII guard held for the whole lifetime of one worker's closure, so its
+/// `Drop` runs on every exit path -- a normal return, an early `return` on an
+/// ordinary error, AND an unwinding panic. The panic case is the one nothing
+/// else in this file reaches: every explicit `cancel.store` / `wake_all` pair
+/// above sits on a path this worker chooses to take, but a panic unwinds
+/// straight past all of them. Without this guard, a worker that panics while
+/// it owns the reorder head leaves every other worker parked in
+/// `Frontier::admit` forever -- the head-exemption argument on `Frontier`
+/// says the head is the ONLY thing that can ever unpark them, and a dead
+/// thread can't advance it. The result channel then never closes (the
+/// parked workers still hold their `tx_res` clones), so the collector's
+/// `rx_res.recv()` loop -- and the `wake_all()` after it at the bottom of
+/// `run` -- never runs, and `join()` (which is what would turn this panic
+/// into `ConversionError::WorkerPanicked`) is never reached either.
+///
+/// Order matters: `cancel` is set BEFORE waking, mirroring the same hazard
+/// `Frontier::wake_all`'s doc comment describes -- a woken waiter that
+/// re-checks its predicate before `cancel` is visible just re-parks, and
+/// nothing else is guaranteed to wake it again.
+struct PanicGuard {
+    cancel: Arc<AtomicBool>,
+    frontier: Arc<Frontier>,
+}
+
+impl Drop for PanicGuard {
+    fn drop(&mut self) {
+        if thread::panicking() {
+            self.cancel.store(true, Ordering::Relaxed);
+        }
+        // Runs on the non-panic paths too: a spuriously woken parked worker
+        // just re-evaluates its `while` condition in `Frontier::admit` and
+        // re-parks, which `record_park` already counts as a real park by
+        // design -- so this is a harmless no-op there and load-bearing only
+        // on the panic path above.
+        self.frontier.wake_all();
+    }
+}
+
 /// One worker's report to the collector.
 // `DenseChunk` legitimately outgrew clippy's large-enum-variant threshold when
 // `global_idx: Vec<i32>` was added alongside `pos`/`ilens`/`alt_offsets`; every
@@ -222,6 +383,11 @@ pub struct ShardTotals {
 /// waiting, not the arriving one, and an in-order stream that never buffers
 /// anything records 0.
 ///
+/// `pending_budget_bytes` bounds that same backlog: once its bytes exceed the
+/// budget, [`Frontier::admit`] parks every worker except the one whose unit
+/// owns the reorder buffer's head, so the backlog can shrink instead of
+/// growing without limit. Pass `u64::MAX` to disable the gate.
+///
 /// Returns the [`ShardTotals`] (summed `dropped_out_of_scope`, `ref_excluded`,
 /// and `normalized_total`) across every unit, or the first error encountered
 /// (context-decorated).
@@ -235,7 +401,8 @@ pub fn run<F, G>(
     chunk_size: usize,
     tx_dense: &Sender<DenseChunk>,
     worker_tids: &Mutex<Vec<i32>>,
-    pending_gauge: &crate::monitor::PendingGauge,
+    pending_gauge: &Arc<crate::monitor::PendingGauge>,
+    pending_budget_bytes: u64,
 ) -> Result<ShardTotals, ConversionError>
 where
     F: Fn(&WorkUnit) -> Result<ChunkAssembler, ConversionError> + Sync,
@@ -251,6 +418,10 @@ where
     }
     let workers = workers.max(1);
     let cancel = Arc::new(AtomicBool::new(false));
+    let frontier = Arc::new(Frontier::new(
+        pending_budget_bytes,
+        Arc::clone(pending_gauge),
+    ));
 
     // Seed every unit up front on an unbounded queue, then drop the sending
     // half: a worker's `rx_work.recv()` returns `Err` once the queue is
@@ -271,6 +442,7 @@ where
             let rx_work = rx_work.clone();
             let tx_res = tx_res.clone();
             let cancel = Arc::clone(&cancel);
+            let frontier = Arc::clone(&frontier);
             // `F`/`G` are `Sync`, so `&F`/`&G` are `Send` -- borrowing them
             // (rather than requiring `Clone`) into every scoped worker is
             // sound and avoids cloning the closures' captured state.
@@ -292,6 +464,14 @@ where
                     let _ = &worker_tids;
                     #[cfg(target_os = "linux")]
                     worker_tids.lock().unwrap().push(current_tid());
+                    // See `PanicGuard`'s doc comment: this must live for the
+                    // whole closure so a panic anywhere below -- not just an
+                    // explicit `Err` return -- still cancels the pool and
+                    // wakes every parked worker.
+                    let _panic_guard = PanicGuard {
+                        cancel: Arc::clone(&cancel),
+                        frontier: Arc::clone(&frontier),
+                    };
                     while !cancel.load(Ordering::Relaxed) {
                         let unit = match rx_work.recv() {
                             Ok(u) => u,
@@ -311,6 +491,7 @@ where
                             Err(e) => {
                                 let _ = tx_res.send(Msg::Err(err_context(e, &unit)));
                                 cancel.store(true, Ordering::Relaxed);
+                                frontier.wake_all();
                                 return;
                             }
                         };
@@ -321,6 +502,12 @@ where
                             }
                             match asm.read_next_chunk(chunk_size, local, None) {
                                 Ok(Some(chunk)) => {
+                                    // Park if the backlog is over budget and this unit is not the
+                                    // head. See `Frontier` for the deadlock argument.
+                                    frontier.admit(unit.ordinal, &cancel);
+                                    if cancel.load(Ordering::Relaxed) {
+                                        return;
+                                    }
                                     trace_ll!(
                                         "[trace {chrom}] reader: shard {i} assembled chunk \
                                          (unit ordinal {}) local={local} rows={}",
@@ -344,6 +531,7 @@ where
                                 Err(e) => {
                                     let _ = tx_res.send(Msg::Err(err_context(e, &unit)));
                                     cancel.store(true, Ordering::Relaxed);
+                                    frontier.wake_all();
                                     return;
                                 }
                             }
@@ -417,6 +605,7 @@ where
                             }
                         });
                     }
+                    frontier.publish(pending.bytes, rb.head());
                 }
                 Msg::Done {
                     unit_ordinal,
@@ -439,6 +628,7 @@ where
                             }
                         });
                     }
+                    frontier.publish(pending.bytes, rb.head());
                     if done_count == n_units {
                         // Every unit accounted for -- no further messages
                         // are possible. Don't wait for the channel to
@@ -452,6 +642,7 @@ where
                         first_err = Some(e);
                     }
                     cancel.store(true, Ordering::Relaxed);
+                    frontier.wake_all();
                     // Keep draining (don't `break`): a worker may be
                     // blocked on `tx_res.send` for a message already
                     // in flight, and only stops once it observes `cancel`
@@ -462,6 +653,13 @@ where
                 }
             }
         }
+
+        // Defensive: any producer still parked on `admit` after the recv
+        // loop exits (e.g. the collector broke out via `done_count ==
+        // n_units` while a non-head unit was mid-wait) must be woken so its
+        // worker thread can observe `cancel` (if set) or simply return --
+        // otherwise the `join()` below would hang on it.
+        frontier.wake_all();
 
         for (name, handle) in handles {
             if handle.join().is_err() && first_err.is_none() {
@@ -479,10 +677,22 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{PendingBacklog, ReorderBuffer};
+    use super::{Frontier, PendingBacklog, ReorderBuffer, ShardTotals, run};
+    use crate::chunk_assembler::ChunkAssembler;
+    use crate::error::ConversionError;
     use crate::monitor::PendingGauge;
+    use crate::normalize::CheckRef;
+    use crate::record_source::{Calls, FormatVals, RawRecord, RecordSource};
+    use crate::shard::WorkUnit;
     use crate::types::{BitGrid3, DenseChunk};
-    use std::sync::atomic::Ordering;
+    use crossbeam_channel::unbounded;
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     /// A trivially small, distinctly-non-empty chunk -- just enough that
     /// `approx_bytes()` is nonzero so the byte high-water is exercisable too.
@@ -588,5 +798,591 @@ mod tests {
             vec![(0, (0, 0)), (1, (1, 0)), (2, (1, 1))],
             "global ids 0,1,2 assigned in (ordinal, local) order"
         );
+    }
+
+    /// Runs `f.admit(ordinal, &cancel)` on its own thread (never `thread::scope`,
+    /// whose implicit join at scope-exit would itself hang if `admit` never
+    /// returns) and reports whether it completed within `timeout`. A
+    /// still-parked thread is simply abandoned -- process teardown reclaims
+    /// it, and letting it leak is what lets a regression here fail the
+    /// assertion below instead of hanging the whole test binary (fatal on
+    /// this project's Slurm/NFS cluster, where a hung process can't always be
+    /// killed and can drain a compute node).
+    fn admit_completes_within(f: Arc<Frontier>, ordinal: usize, timeout: Duration) -> bool {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            f.admit(ordinal, &cancel);
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(timeout).is_ok()
+    }
+
+    /// The unit that owns the head is NEVER parked, even with the backlog
+    /// over budget. This is the whole deadlock-freedom argument: if the head
+    /// could park, nothing would ever advance it.
+    #[test]
+    fn admit_never_parks_the_head_unit() {
+        let gauge = Arc::new(PendingGauge::default());
+        let f = Arc::new(Frontier::new(0, Arc::clone(&gauge)));
+        f.publish(u64::MAX, 7);
+        assert!(
+            admit_completes_within(f, 7, Duration::from_secs(2)),
+            "the head unit must never park, even over budget"
+        );
+        assert_eq!(
+            gauge.parks.load(Ordering::Relaxed),
+            0,
+            "the head-exemption branch must never record a park"
+        );
+    }
+
+    /// A non-head producer parks while the backlog is over budget, and wakes
+    /// once the head advances past it -- not only when bytes drop.
+    #[test]
+    fn admit_parks_a_non_head_unit_until_the_head_advances() {
+        let gauge = Arc::new(PendingGauge::default());
+        let f = Arc::new(Frontier::new(0, Arc::clone(&gauge)));
+        f.publish(100, 0);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        {
+            let f = Arc::clone(&f);
+            let cancel = Arc::clone(&cancel);
+            thread::spawn(move || {
+                f.admit(3, &cancel);
+                let _ = tx.send(());
+            });
+        }
+        assert_eq!(
+            rx.recv_timeout(Duration::from_millis(200)),
+            Err(mpsc::RecvTimeoutError::Timeout),
+            "unit 3 must park behind head 0"
+        );
+        f.publish(100, 3);
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(2)),
+            Ok(()),
+            "unit 3 must wake once the head advances past it"
+        );
+        assert!(
+            gauge.parks.load(Ordering::Relaxed) > 0,
+            "unit 3's block above must have gone through the parking branch"
+        );
+    }
+
+    /// A parked producer must observe `cancel` so the error path can tear the
+    /// pool down instead of hanging in `join()`.
+    #[test]
+    fn admit_releases_a_parked_unit_on_cancel() {
+        let gauge = Arc::new(PendingGauge::default());
+        let f = Arc::new(Frontier::new(0, Arc::clone(&gauge)));
+        f.publish(100, 0);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        {
+            let f = Arc::clone(&f);
+            let cancel = Arc::clone(&cancel);
+            thread::spawn(move || {
+                f.admit(3, &cancel);
+                let _ = tx.send(());
+            });
+        }
+        assert_eq!(
+            rx.recv_timeout(Duration::from_millis(200)),
+            Err(mpsc::RecvTimeoutError::Timeout),
+            "unit 3 must park behind head 0"
+        );
+        cancel.store(true, Ordering::Relaxed);
+        f.wake_all();
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(2)),
+            Ok(()),
+            "a parked unit must observe cancel and return"
+        );
+    }
+
+    /// A budget of `u64::MAX` disables the gate entirely -- the PGEN path and
+    /// the existing tests rely on this.
+    #[test]
+    fn an_unbounded_budget_never_parks_anything() {
+        let gauge = Arc::new(PendingGauge::default());
+        let f = Arc::new(Frontier::new(u64::MAX, Arc::clone(&gauge)));
+        f.publish(u64::MAX, 0);
+        assert!(
+            admit_completes_within(f, 99, Duration::from_secs(2)),
+            "u64::MAX must disable the gate entirely"
+        );
+        assert_eq!(
+            gauge.parks.load(Ordering::Relaxed),
+            0,
+            "an unbounded budget must never invoke the parking branch"
+        );
+    }
+
+    /// The reorder head must be readable by the collector so it can publish
+    /// it; without this the gate has nothing to compare against.
+    #[test]
+    fn reorder_buffer_exposes_its_head() {
+        let mut rb = ReorderBuffer::new(2);
+        assert_eq!(rb.head(), 0);
+        rb.push(0, 0, false, &mut |_gid, _tag| {});
+        rb.push(0, 0, true, &mut |_gid, _tag| {});
+        assert_eq!(rb.head(), 1, "head advances past a completed ordinal");
+    }
+
+    // ---- `run()` integration coverage ----
+    //
+    // Everything above drives `Frontier` directly through `publish`/`admit`.
+    // Nothing exercises the INTEGRATION: real scoped worker threads, the FIFO
+    // work queue, the reorder buffer, and the admission gate running
+    // together through `run()` itself. `RecordSource` is a one-method trait
+    // behind a `Box<dyn>` (see `record_source.rs`), so a stub source is a
+    // `VecDeque<RawRecord>` plus an optional per-record sleep.
+
+    const N_SAMPLES: usize = 1;
+    const PLOIDY: usize = 2;
+    /// Records per unit. Both fit in a single `read_next_chunk` call (well
+    /// under the `chunk_size` used below), so each unit produces exactly one
+    /// `DenseChunk`.
+    const RECORDS_PER_UNIT: u32 = 2;
+    /// Enough units that a park is FORCED by channel capacity rather than won
+    /// by a scheduling race.
+    ///
+    /// `run` calls `Frontier::admit` once per assembled chunk, immediately
+    /// before pushing it onto `tx_res` -- and `tx_res` is `bounded(workers * 2)`,
+    /// so with `workers = 4` the first 8 messages (each unit sends a `Chunk`
+    /// plus a `Done`, so the first four non-head units) are buffered without
+    /// the collector ever having to run. Until the collector runs, nothing is
+    /// added to the backlog, `pending_bytes` stays 0, and every `admit` in that
+    /// window passes.
+    ///
+    /// At the old value of 8 there were only 7 non-head units, so that free
+    /// window covered most of the run and whether ANY `admit` ever saw a
+    /// non-empty backlog came down to how promptly the collector thread got
+    /// scheduled. On a 48-core dev node it always did; on a 2-core CI runner it
+    /// did not, and `parks > 0` failed against a perfectly healthy gate.
+    ///
+    /// With 32 units the buffer saturates, `tx_res.send` blocks, and the
+    /// collector MUST drain to let the producers continue. Two drained chunks
+    /// (92 bytes) already exceed the 64-byte budget the tests use, and the head
+    /// is held open meanwhile, so the backlog only grows -- leaving ~27 further
+    /// admits that must park. That is a capacity argument, not a timing one.
+    const N_UNITS: usize = 32;
+
+    /// How long ordinal 0 waits for the first park before giving up and letting
+    /// its test's `parks > 0` assertion report the real failure. Comfortably
+    /// inside `run_with_deadlock_guard`'s 10s `recv_timeout`, so a gate that
+    /// never parks still fails with the assertion's message rather than the
+    /// guard's misleading "deadlocked" one.
+    const PARK_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
+
+    /// Blocks until `gauge` records its first park, or `PARK_HANDSHAKE_TIMEOUT`
+    /// elapses.
+    ///
+    /// This handshake is what makes ordinal 0 finish LAST *deterministically*.
+    /// It replaces a 5ms-per-record `thread::sleep`, which only held the head
+    /// open for as long as the other workers needed if they happened to get
+    /// enough CPU inside those 5ms. Waiting on the park counter itself takes
+    /// the machine out of that question: ordinal 0 proceeds exactly when a
+    /// non-head worker has actually parked behind it, on any number of cores,
+    /// and holds the head open for as long as that takes.
+    ///
+    /// This is one half of the fix for a CI failure ("zero parks recorded") that
+    /// reproduced only on a 2-core runner; `N_UNITS` carries the other half and
+    /// the fuller explanation. Holding the head open is not on its own enough to
+    /// force a park -- there also has to be more work than `tx_res` can buffer.
+    fn wait_for_first_park(gauge: &PendingGauge) {
+        let deadline = Instant::now() + PARK_HANDSHAKE_TIMEOUT;
+        while gauge.parks.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// A `RecordSource` over an in-memory queue that, for ordinal 0, blocks
+    /// until some other worker has parked. Used to make ordinal 0 finish LAST
+    /// despite being dequeued first, forcing every other unit's chunk to buffer
+    /// behind the still-open reorder head instead of streaming through by
+    /// accident -- which is exactly how the end-to-end conversion measurement
+    /// (Task 4) missed this path (it observed zero park events).
+    ///
+    /// `panic_after_wait`, when set, panics (after the wait, if any) instead of
+    /// ever returning a record -- the injection point for the `PanicGuard`
+    /// regression test: a worker that panics mid-unit instead of returning
+    /// `Ok`/`Err` normally. Pairing it with `wait_for_park` is what guarantees
+    /// the panic lands with workers already parked behind the head, which is
+    /// the only arrangement that reaches the deadlock `PanicGuard` prevents.
+    struct VecSource {
+        records: VecDeque<RawRecord>,
+        wait_for_park: Option<Arc<PendingGauge>>,
+        panic_after_wait: bool,
+    }
+
+    impl RecordSource for VecSource {
+        fn next_record(&mut self) -> Result<Option<RawRecord>, ConversionError> {
+            if let Some(gauge) = &self.wait_for_park {
+                wait_for_first_park(gauge);
+            }
+            if self.panic_after_wait {
+                panic!("VecSource: injected panic for PanicGuard regression test");
+            }
+            Ok(self.records.pop_front())
+        }
+    }
+
+    /// One biallelic SNV atom: dense calls sized for `N_SAMPLES * PLOIDY`
+    /// columns, no INFO/FORMAT fields (the `ChunkAssembler` below is built
+    /// with `fields: &[]`), no reference (`fasta_path: None`).
+    fn record(pos: u32) -> RawRecord {
+        RawRecord {
+            pos,
+            reference: b"A".to_vec(),
+            alts: vec![b"C".to_vec()],
+            calls: Calls::Dense(vec![1, 0]),
+            info_raw: Vec::new(),
+            format_vals: FormatVals::Dense(Vec::new()),
+            global_idx: pos as i32,
+        }
+    }
+
+    /// `N_UNITS` work units, ordinals `0..N_UNITS`, each fed `RECORDS_PER_UNIT`
+    /// records at globally-distinct positions. Ordinal 0's records carry the
+    /// artificial per-record delay described on `VecSource`.
+    fn seed_units() -> (Vec<WorkUnit>, Arc<HashMap<usize, Vec<RawRecord>>>) {
+        let mut units = Vec::with_capacity(N_UNITS);
+        let mut records_by_ordinal = HashMap::with_capacity(N_UNITS);
+        for ordinal in 0..N_UNITS {
+            let base = (ordinal as u32) * 100;
+            units.push(WorkUnit {
+                own_start: base,
+                own_end: base + RECORDS_PER_UNIT,
+                fetch_start: base,
+                fetch_end: base + RECORDS_PER_UNIT,
+                ordinal,
+            });
+            let records: Vec<RawRecord> = (0..RECORDS_PER_UNIT).map(|i| record(base + i)).collect();
+            records_by_ordinal.insert(ordinal, records);
+        }
+        (units, Arc::new(records_by_ordinal))
+    }
+
+    /// Ordinal deliberately given more than `RECORDS_PER_UNIT` records by
+    /// [`seed_units_with_a_multi_chunk_unit`], so it spans several chunks
+    /// under a small `chunk_size` instead of the usual one-chunk-per-unit
+    /// shape every other test here relies on.
+    const MULTI_CHUNK_ORDINAL: usize = 3;
+    const MULTI_CHUNK_RECORDS: u32 = 5;
+
+    /// Like [`seed_units`], except ordinal `MULTI_CHUNK_ORDINAL` gets
+    /// `MULTI_CHUNK_RECORDS` records instead of `RECORDS_PER_UNIT`. At the
+    /// `chunk_size=2` used by its caller this spans 3 chunks
+    /// (`ceil(5 / 2)`), exercising the reorder buffer's multi-`local` path
+    /// -- a single shard streaming more than one chunk -- which no other
+    /// test in this module reaches.
+    fn seed_units_with_a_multi_chunk_unit() -> (Vec<WorkUnit>, Arc<HashMap<usize, Vec<RawRecord>>>)
+    {
+        let mut units = Vec::with_capacity(N_UNITS);
+        let mut records_by_ordinal = HashMap::with_capacity(N_UNITS);
+        for ordinal in 0..N_UNITS {
+            let base = (ordinal as u32) * 100;
+            let count = if ordinal == MULTI_CHUNK_ORDINAL {
+                MULTI_CHUNK_RECORDS
+            } else {
+                RECORDS_PER_UNIT
+            };
+            units.push(WorkUnit {
+                own_start: base,
+                own_end: base + count,
+                fetch_start: base,
+                fetch_end: base + count,
+                ordinal,
+            });
+            let records: Vec<RawRecord> = (0..count).map(|i| record(base + i)).collect();
+            records_by_ordinal.insert(ordinal, records);
+        }
+        (units, Arc::new(records_by_ordinal))
+    }
+
+    /// Builds the `make_assembler` closure `run` requires: a fresh
+    /// `ChunkAssembler` per unit wrapping a fresh `VecSource` cloned out of
+    /// the shared record table. Only ordinal 0 gets the park handshake, which
+    /// is what holds the reorder head open until the backlog behind it is real.
+    /// `panic_ordinal`, when `Some`, makes that one ordinal's `VecSource`
+    /// panic instead of ever returning a record (see `VecSource::panic_after_wait`)
+    /// -- the `PanicGuard` regression test's injection point.
+    fn make_assembler_fn(
+        records_by_ordinal: Arc<HashMap<usize, Vec<RawRecord>>>,
+        panic_ordinal: Option<usize>,
+        gauge: Arc<PendingGauge>,
+    ) -> impl Fn(&WorkUnit) -> Result<ChunkAssembler, ConversionError> + Sync + 'static {
+        move |unit: &WorkUnit| {
+            let records = records_by_ordinal
+                .get(&unit.ordinal)
+                .cloned()
+                .unwrap_or_default();
+            let wait_for_park = (unit.ordinal == 0).then(|| Arc::clone(&gauge));
+            let panic_after_wait = panic_ordinal == Some(unit.ordinal);
+            let source: Box<dyn RecordSource + Send> = Box::new(VecSource {
+                records: records.into(),
+                wait_for_park,
+                panic_after_wait,
+            });
+            ChunkAssembler::new(
+                source,
+                N_SAMPLES,
+                PLOIDY,
+                None, // fasta_path: no reference needed
+                "chrTest",
+                false, // skip_out_of_scope
+                CheckRef::Error,
+                &[], // fields: no INFO/FORMAT requested
+            )
+        }
+    }
+
+    /// Runs `run(...)` on its own thread and joins with a timeout. Required
+    /// per the task brief: a broken head-exemption HANGS rather than fails,
+    /// and a hung `cargo test` reads as infrastructure trouble, not a red
+    /// test, so a bare `handle.join()` is not an option here.
+    fn run_with_deadlock_guard(
+        units: Vec<WorkUnit>,
+        records_by_ordinal: Arc<HashMap<usize, Vec<RawRecord>>>,
+        workers: usize,
+        chunk_size: usize,
+        pending_budget_bytes: u64,
+        panic_ordinal: Option<usize>,
+    ) -> (
+        Result<ShardTotals, ConversionError>,
+        Vec<DenseChunk>,
+        Arc<PendingGauge>,
+    ) {
+        let (tx_dense, rx_dense) = unbounded::<DenseChunk>();
+        let gauge = Arc::new(PendingGauge::default());
+        let (result_tx, result_rx) = mpsc::channel();
+        {
+            let gauge = Arc::clone(&gauge);
+            let make_assembler =
+                make_assembler_fn(records_by_ordinal, panic_ordinal, Arc::clone(&gauge));
+            thread::spawn(move || {
+                let worker_tids: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+                let res = run(
+                    "chrTest",
+                    units,
+                    workers,
+                    make_assembler,
+                    |e, _u| e,
+                    chunk_size,
+                    &tx_dense,
+                    &worker_tids,
+                    &gauge,
+                    pending_budget_bytes,
+                );
+                let _ = result_tx.send(res);
+            });
+        }
+        let result = match result_rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(res) => res,
+            Err(_) => panic!(
+                "shard_exec::run deadlocked -- the head-exemption did not release a \
+                 parked producer within 10s (pending_budget_bytes={pending_budget_bytes})"
+            ),
+        };
+        let mut chunks = Vec::new();
+        while let Ok(c) = rx_dense.try_recv() {
+            chunks.push(c);
+        }
+        (result, chunks, gauge)
+    }
+
+    #[test]
+    fn run_emits_every_unit_in_order_under_a_bounded_backlog() {
+        let (units, records_by_ordinal) = seed_units();
+        // ~1.4 chunks' worth: one `DenseChunk` of RECORDS_PER_UNIT=2 atoms at
+        // N_SAMPLES=1/PLOIDY=2 (no staged fields) costs, per
+        // `DenseChunk::approx_bytes`: meta (pos+global_idx+ilens 4B/atom,
+        // alt 1B/atom, alt_offsets (v+1)*4B) + genos (1 word) =
+        // (8+8+8+2+12) + 8 = 46 bytes. A budget of 64 lets exactly one
+        // shard's chunk through before a second non-head arrival (92 bytes
+        // total) genuinely exceeds it.
+        let pending_budget_bytes = 64u64;
+        let (result, chunks, gauge) = run_with_deadlock_guard(
+            units,
+            records_by_ordinal,
+            4,
+            100,
+            pending_budget_bytes,
+            None,
+        );
+        let totals = result.expect("run must succeed");
+
+        assert!(
+            gauge.len_highwater.load(Ordering::Relaxed) > 0,
+            "ordinal 0 was made to lag on purpose -- a real backlog must have \
+             been observed, or admission control was never exercised"
+        );
+        // `len_highwater > 0` only proves a backlog FORMED, not that
+        // `Frontier::admit`'s parking branch ran -- a no-op gate would let
+        // the same backlog accumulate. `parks` is the only signal that a
+        // non-head worker actually blocked; this is the instrumentation
+        // Task 4's end-to-end measurement found zero of, end to end.
+        assert!(
+            gauge.parks.load(Ordering::Relaxed) > 0,
+            "zero parks recorded -- the head-exemption path in Frontier::admit \
+             never ran, so this test exercised no admission control at all"
+        );
+
+        assert_eq!(chunks.len(), N_UNITS, "one chunk per unit expected");
+        for (expect_id, c) in chunks.iter().enumerate() {
+            assert_eq!(
+                c.chunk_id, expect_id,
+                "chunks must arrive on tx_dense in ascending ordinal order"
+            );
+            // `chunk_id` is assigned by the collector monotonically AT EMIT
+            // TIME regardless of which unit actually produced the chunk, so
+            // the check above alone is vacuous -- it would pass even if
+            // chunk contents were shuffled across units. Tie the payload
+            // itself to the unit that must have produced it: `seed_units`
+            // gives ordinal `o` records starting at `o * 100`
+            // (`record(base + i)` in `seed_units`), and this unit produces
+            // exactly one chunk, so its first record's `pos` pins it to
+            // ordinal `expect_id`.
+            assert_eq!(
+                c.pos[0],
+                (expect_id as u32) * 100,
+                "chunk {expect_id} carries the wrong unit's records"
+            );
+        }
+        let total_records: usize = chunks.iter().map(|c| c.pos.len()).sum();
+        assert_eq!(
+            total_records,
+            N_UNITS * RECORDS_PER_UNIT as usize,
+            "every record fed to a unit must reach tx_dense inside some chunk"
+        );
+        assert_eq!(totals.dropped_out_of_scope, 0);
+        assert_eq!(totals.ref_excluded, 0);
+        assert_eq!(totals.normalized_total, 0);
+    }
+
+    #[test]
+    fn bounded_and_unbounded_backlogs_produce_identical_output() {
+        #[allow(clippy::type_complexity)]
+        fn chunk_signature(
+            c: &DenseChunk,
+        ) -> (
+            usize,
+            Vec<u32>,
+            Vec<i32>,
+            Vec<i32>,
+            Vec<u8>,
+            Vec<u32>,
+            Vec<u64>,
+            (usize, usize, usize),
+        ) {
+            (
+                c.chunk_id,
+                c.pos.clone(),
+                c.global_idx.clone(),
+                c.ilens.clone(),
+                c.alt.clone(),
+                c.alt_offsets.clone(),
+                c.genos.words.clone(),
+                c.genos.shape,
+            )
+        }
+
+        // `seed_units` gives every unit exactly `RECORDS_PER_UNIT` records,
+        // which fits in a single `read_next_chunk` call -- so every unit
+        // ever produces exactly one chunk, and the reorder buffer's
+        // multi-`local` path (a single shard streaming more than one chunk)
+        // is never exercised. `seed_units_with_a_multi_chunk_unit` gives one
+        // ordinal enough records to span several chunks at the
+        // `chunk_size=2` used below, while every other unit still fits in
+        // one -- both runs use the same shape, so the comparison remains
+        // apples-to-apples.
+        let (units_a, records_a) = seed_units_with_a_multi_chunk_unit();
+        let (result_a, chunks_a, _) =
+            run_with_deadlock_guard(units_a, records_a, 4, 2, u64::MAX, None);
+
+        let (units_b, records_b) = seed_units_with_a_multi_chunk_unit();
+        let (result_b, chunks_b, _) = run_with_deadlock_guard(units_b, records_b, 4, 2, 64, None);
+
+        let totals_a = result_a.expect("unbounded run must succeed");
+        let totals_b = result_b.expect("bounded run must succeed");
+        assert_eq!(totals_a.dropped_out_of_scope, totals_b.dropped_out_of_scope);
+        assert_eq!(totals_a.ref_excluded, totals_b.ref_excluded);
+        assert_eq!(totals_a.normalized_total, totals_b.normalized_total);
+
+        // Two empty vectors would trivially compare equal below -- pin both
+        // non-emptiness and the exact expected record/chunk counts (the
+        // oversized unit alone spans multiple chunks) before trusting the
+        // signature comparison that follows.
+        assert!(
+            !chunks_a.is_empty(),
+            "run produced no chunks -- an empty comparison proves nothing"
+        );
+        let expected_total_records =
+            (N_UNITS - 1) * RECORDS_PER_UNIT as usize + MULTI_CHUNK_RECORDS as usize;
+        for (label, chunks) in [("bounded", &chunks_a), ("unbounded", &chunks_b)] {
+            let total_records: usize = chunks.iter().map(|c| c.pos.len()).sum();
+            assert_eq!(
+                total_records, expected_total_records,
+                "{label} run: every record fed to a unit (including the oversized \
+                 one) must reach tx_dense"
+            );
+            assert!(
+                chunks.len() > N_UNITS,
+                "{label} run: the oversized unit must have spanned more than one \
+                 chunk, so total chunks must exceed the unit count"
+            );
+        }
+
+        let sig_a: Vec<_> = chunks_a.iter().map(chunk_signature).collect();
+        let sig_b: Vec<_> = chunks_b.iter().map(chunk_signature).collect();
+        assert_eq!(
+            sig_a, sig_b,
+            "admission control must change WHEN a chunk is produced, never WHAT"
+        );
+    }
+
+    /// `PanicGuard` regression test: ordinal 0 -- the reorder head -- panics
+    /// instead of ever completing, and its park handshake (see `VecSource`'s
+    /// doc comment) holds that panic back until the other units have filled the
+    /// backlog past `pending_budget_bytes` and genuinely parked in
+    /// `Frontier::admit` behind the still-open head. That is exactly the
+    /// finding's scenario: a dead head with parked workers behind it and no
+    /// one left who can ever advance it. Without `PanicGuard`, this hangs
+    /// instead of returning -- caught only because it is routed through
+    /// `run_with_deadlock_guard`, whose 10s `recv_timeout` turns that hang
+    /// into a failing assertion instead of a wedged `cargo test` process.
+    #[test]
+    fn panicking_head_worker_returns_worker_panicked_instead_of_hanging() {
+        let (units, records_by_ordinal) = seed_units();
+        // Same arithmetic as `run_emits_every_unit_in_order_under_a_bounded_backlog`:
+        // one chunk costs 46 bytes, so a budget of 64 admits exactly one
+        // non-head chunk before the next one (92 bytes total) genuinely
+        // exceeds it and must park.
+        let pending_budget_bytes = 64u64;
+        let (result, _chunks, gauge) = run_with_deadlock_guard(
+            units,
+            records_by_ordinal,
+            4,
+            100,
+            pending_budget_bytes,
+            Some(0),
+        );
+
+        assert!(
+            gauge.parks.load(Ordering::Relaxed) > 0,
+            "a non-head worker must have actually parked behind ordinal 0 \
+             before it panicked, or this test never reaches the deadlock \
+             PanicGuard is meant to prevent"
+        );
+        match result {
+            Err(ConversionError::WorkerPanicked { .. }) => {}
+            Ok(_) => panic!("expected Err(ConversionError::WorkerPanicked {{ .. }}), got Ok(_)"),
+            Err(other) => {
+                panic!("expected Err(ConversionError::WorkerPanicked {{ .. }}), got Err({other})")
+            }
+        }
     }
 }

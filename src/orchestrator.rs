@@ -82,6 +82,24 @@ pub(crate) fn bench_concurrent_chroms(planned: usize) -> usize {
         .max(1)
 }
 
+/// BENCH-ONLY: `GENORAY_READER_WORKERS`. Resolved by `lib.rs` alongside the
+/// public `reader_workers=` argument (the env var wins) so the effective
+/// value reaches both the planner and the `pipeline config` log. Before #169
+/// this was read per-contig inside `process_chromosome`, where it could not
+/// reach the log line at all.
+pub(crate) fn bench_env_reader_workers() -> Option<usize> {
+    bench_env("GENORAY_READER_WORKERS").map(|w| w.max(1))
+}
+
+/// BENCH-ONLY: `GENORAY_OVERSHARD`, falling back to [`OVERSHARD_FACTOR`].
+/// Only consulted when a contig has no exact record count -- see
+/// `shard::plan_unit_count`.
+pub(crate) fn bench_overshard() -> usize {
+    bench_env("GENORAY_OVERSHARD")
+        .unwrap_or(OVERSHARD_FACTOR)
+        .max(1)
+}
+
 /// Which backend a contig's records come from. Everything downstream of
 /// `ChunkAssembler` is identical for both.
 pub enum SourceSpec {
@@ -91,6 +109,18 @@ pub enum SourceSpec {
         /// Independent indexed shard readers for this contig. These replace
         /// the monolithic reader's HTSlib pool on the sharded path.
         reader_workers: usize,
+        /// Fallback over-decomposition factor, used ONLY when
+        /// `contig_records` is `None`. Resolved in `lib.rs` (including the
+        /// `GENORAY_OVERSHARD` bench override) so the `pipeline config` log
+        /// prints the effective value.
+        overshard: usize,
+        /// EXACT record count for this contig, or `None` when only the
+        /// header-length fallback tier was available. See
+        /// `shard::plan_unit_count` -- the fallback tier's values are base
+        /// pairs, not records, and must never be passed as records.
+        contig_records: Option<u64>,
+        /// Byte ceiling on `shard_exec`'s reorder backlog for this contig.
+        pending_budget_bytes: u64,
         regions: Vec<(u32, u32)>,
         overlap: crate::svar2_view::OverlapMode,
     },
@@ -492,6 +522,9 @@ pub fn process_chromosome(
                         vcf_path,
                         htslib_threads,
                         reader_workers,
+                        overshard,
+                        contig_records,
+                        pending_budget_bytes,
                         regions,
                         overlap,
                     } => {
@@ -513,21 +546,29 @@ pub fn process_chromosome(
                         // reproduces the whole-contig split byte-for-byte
                         // (`query_window(Pos)` is identity; `keeps(Pos, ..)` is the
                         // half-open POS test the pre-region sharded reader used).
-                        // BENCH-ONLY sweep hooks (see scripts/bench_sharded_vcf).
-                        // Absent env vars leave the planner's values untouched.
-                        let reader_workers = bench_env("GENORAY_READER_WORKERS")
-                            .unwrap_or(reader_workers)
-                            .max(1);
-                        let shard_htslib = bench_env("GENORAY_SHARD_HTSLIB")
-                            .unwrap_or(crate::budget::SHARDED_VCF_HTSLIB_THREADS_PER_READER);
-                        let overshard = bench_env("GENORAY_OVERSHARD")
-                            .unwrap_or(OVERSHARD_FACTOR)
-                            .max(1);
+                        // `reader_workers` and `overshard` arrive already
+                        // resolved (planner value, then any GENORAY_* bench
+                        // override) so the `pipeline config` line in lib.rs
+                        // prints what actually ran -- issue #169 proposal 4.
+                        let shard_htslib = crate::budget::SHARDED_VCF_HTSLIB_THREADS_PER_READER;
+                        // Two different `chunk_size`-shaped values meet right
+                        // here, deliberately: `plan_unit_count` takes the RAW
+                        // `chunk_size` -- the actual records-per-chunk this
+                        // contig emits -- while `pending_budget_bytes` (used
+                        // below, in `shard_exec::run`) was derived in `lib.rs`
+                        // from `resident_chunk_size`, the largest-contig-
+                        // narrowed value the RAM law was fitted against. Both
+                        // are correct for what they size; do not "unify" them.
                         let shards = if overlap == crate::svar2_view::OverlapMode::Pos {
                             crate::vcf_reader::plan_vcf_shards(
                                 &regions,
                                 &chr,
-                                reader_workers.saturating_mul(overshard),
+                                crate::shard::plan_unit_count(
+                                    contig_records,
+                                    reader_workers,
+                                    chunk_size,
+                                    overshard,
+                                ),
                                 chunk_size as u32,
                             )?
                         } else {
@@ -555,6 +596,17 @@ pub fn process_chromosome(
                                 "[plan {chr}] workers={} shards={}",
                                 reader_workers,
                                 units.len()
+                            );
+                            // The frontier width and the backlog ceiling are
+                            // the two terms that decided both wall time and
+                            // peak RSS in issue #169; neither was observable.
+                            tracing::debug!(
+                                chrom = %chr,
+                                reader_workers,
+                                units = units.len(),
+                                pending_budget_mb =
+                                    pending_budget_bytes as f64 / 1e6,
+                                "shard plan"
                             );
                             // Resolve the cohort's header-column indices ONCE for
                             // the whole contig. The closure below runs per shard
@@ -616,6 +668,7 @@ pub fn process_chromosome(
                                 &tx_dense,
                                 &shard_worker_tids,
                                 &pending_gauge,
+                                pending_budget_bytes,
                             )?;
                             report_ref_excluded(&chr, totals.ref_excluded);
                             report_normalized(&chr, totals.normalized_total);
@@ -807,6 +860,7 @@ pub fn process_chromosome(
                                 &tx_dense,
                                 &shard_worker_tids,
                                 &pending_gauge,
+                                u64::MAX,
                             )?;
                             report_ref_excluded(&chr, totals.ref_excluded);
                             report_normalized(&chr, totals.normalized_total);

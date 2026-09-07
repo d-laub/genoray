@@ -253,7 +253,7 @@ dropped = SparseVar2.from_vcf(
 dropped = SparseVar2.from_vcf("out.svar2", "file.vcf.gz", no_reference=True)
 ```
 
-Signature: `from_vcf(out, source, reference=None, *, regions=None, samples=None, merge_overlapping=False, regions_overlap="pos", no_reference=False, skip_out_of_scope=False, ploidy=2, chunk_size=25_000, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False, info_fields=None, format_fields=None, check_ref="e", progress=False, log_level="info", max_mem=None) -> int`
+Signature: `from_vcf(out, source, reference=None, *, regions=None, samples=None, merge_overlapping=False, regions_overlap="pos", no_reference=False, skip_out_of_scope=False, ploidy=2, chunk_size=25_000, threads=None, reader_workers=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False, info_fields=None, format_fields=None, check_ref="e", progress=False, log_level="info", max_mem=None) -> int`
 
 - `source` — a bgzipped VCF (`.vcf.gz`, or the equivalent `.vcf.bgz` spelling)
   or BCF (`.bcf`). Auto-indexes (`.csi`) if no `.csi`/`.tbi` is found. For a PLINK2 PGEN source, use `from_pgen` instead
@@ -302,14 +302,20 @@ Signature: `from_vcf(out, source, reference=None, *, regions=None, samples=None,
   goes through `format_fields=` instead (e.g. a `DS` FORMAT field). No
   `haploid=` OR-collapse, no `max_mem`-based chunking (use `chunk_size`
   instead) — those two remain `SparseVar` (SVAR 1.0)-only for now.
-- `threads=None` — thread budget (autodetected if `None`). For single-file
-  input, conversion shards **within** a contig once the budget clears HTSlib's
-  decode-thread allocation (roughly 15+ threads); below that it runs one
-  un-sharded reader. Sub-contig sharding is driven entirely by this existing
-  `threads` value — no separate knob — and output is byte-identical to serial
-  conversion at every thread count (`from_vcf_list`, the N-single-sample-VCF
-  merge path, does not shard within a contig). See "Parallel conversion" in
-  `docs/source/svar.md` for scaling numbers.
+- `threads=None` — total thread budget (autodetected if `None`). Drives contig
+  concurrency and, through the planner, the per-contig reader count.
+- `reader_workers=None` — independent indexed shard readers per concurrent
+  contig, the knob that sets sub-contig read parallelism. `None` derives it
+  from the core budget: a quarter of usable cores is reserved for the merge
+  tail, contig concurrency is chosen preferring depth (~8 readers per contig),
+  and the rest goes to readers. An explicit value must be `None` or an
+  integer `>= 1`; anything below 1 raises `ValueError` before conversion
+  starts (checked in Python, ahead of the planner — a value that instead
+  fits `max_mem` but cannot otherwise be honoured raises `InsufficientMemory`
+  rather than being silently reduced). Output is byte-identical at every
+  valid value. (`from_vcf_list`, the N-single-sample-VCF merge path, does not
+  shard within a contig and does not accept this argument.) See "Parallel
+  conversion" in `docs/source/svar.md` for scaling numbers.
 - `signatures=False` — when `True`, classifies every SNP/indel into its
   SBS96/ID83 mutation-type code during the write and stores a `mutcat`
   sidecar per contig (factored into the write's dense/var_key cost model).
@@ -383,28 +389,53 @@ Signature: `from_vcf(out, source, reference=None, *, regions=None, samples=None,
   can't cover baseline plus one concurrent contig is rejected with
   `ValueError`, even for a tiny cohort. The floor is **backend-specific**: the
   VCF law's raw LP coefficients are ~457 MB baseline plus ~111 MB per
-  concurrent contig, but at `from_vcf`'s own defaults (`chunk_size=25_000`,
-  `reader_workers=3`) the per-contig bracket's `kappa` term dominates those
-  two numbers completely, so the real floor for even a tiny cohort is
-  **roughly 1.38 GB**, not ~600 MB (see the S=4,000 figure below) — anything
-  much below that is rejected in practice. `from_pgen`'s floor is roughly
-  2.7 GB plus ~210 MB per concurrent contig, putting its floor nearer ~3 GB.
-  **The 2026-08-11 envelope refit roughly quadruples `from_vcf`'s real-world
-  floor at its own defaults** (`chunk_size=25_000`, `reader_workers=3`,
-  cc=1) versus the pre-refit law: the minimum `max_mem` for one concurrent
-  contig goes ~1.15 GB → ~1.38 GB at S=4,000, ~7.8 GB → ~26.4 GB at
-  S=128,000, and ~27.9 GB → ~101.5 GB at S=500,000. The direction is safe (a
-  larger requirement means more over-allocation or an outright refusal to
-  plan, never an OOM), but the size of the jump is large enough to flip
-  outcomes at production scale. At S=500,000 with `from_vcf`'s own defaults
-  (`chunk_size=25_000`, `reader_workers=3`), the floor for
-  `concurrent_chroms=1` is ~101,480 MB: a **64 GB host** (`max_mem` defaults
-  to 80% of detected RAM, i.e. `51,200 MB`) now raises
-  `PlanError::InsufficientMemory` — naming both remedies in its message,
-  "raise `max_mem` or lower `chunk_size`" — where the pre-refit law planned
-  `concurrent_chroms=2` and ran; a **128 GB host** (`102,400 MB`) still
-  clears and plans `concurrent_chroms=1`, but by under 1% of headroom, where
-  the pre-refit law planned 4.
+  concurrent contig, but the per-contig bracket's `kappa` term dominates
+  those two numbers completely, so the real floor for even a tiny cohort —
+  evaluated at the `cc=1, w=1` point the planner actually lands on when the
+  budget is tight — is **roughly 1.0 GB** (1,016 MB at S=4,000; see the table
+  below), not ~600 MB — anything much below that is rejected in practice.
+  `from_pgen`'s floor is roughly 2.7 GB plus ~210 MB per concurrent contig,
+  putting its floor nearer ~3 GB.
+
+  **The 2026-08-11 envelope refit roughly quadrupled `from_vcf`'s real-world
+  floor versus the pre-refit law**, evaluated at a fixed `chunk_size=25_000,
+  reader_workers=3, cc=1` illustrative point: the minimum `max_mem` for one
+  concurrent contig went ~1.15 GB → ~1.38 GB at S=4,000, ~7.8 GB → ~26.4 GB
+  at S=128,000, and ~27.9 GB → ~101.5 GB at S=500,000. Task 3 then changed
+  the per-`w` charge from `kappa * (2w - 1)` to `w * (kappa + 2) + 8` per
+  chunk-MB, and `from_vcf` no longer pins `reader_workers` at a fixed
+  default — `None` derives it, and `plan_sharded` scans `w` downward from
+  `w_max` to `1` before giving up a contig, so a tight budget now yields a
+  smaller `w` instead of a refusal. The floor the shipped planner actually
+  enforces at its new default is the `cc=1, w=1` point, well below either
+  `w=3` figure below. The "old law" column is the 2026-08-11 refit number
+  quoted just above; the "current law" column is what an explicit
+  `reader_workers=3` actually costs today under the `w * (kappa + 2) + 8`
+  charge — the two are not the same number, so don't read them as one:
+
+  | cohort | old law, `w=3` (2026-08-11 refit) | current law, `w=3` | actual floor now (`w=1`) |
+  |---|---|---|---|
+  | S=4,000 | 1,380 MB | 1,421 MB | **1,016 MB** |
+  | S=128,000 | 26,400 MB | 27,833 MB | **14,864 MB** |
+  | S=500,000 | 101,480 MB | 107,069 MB | **56,408 MB** |
+
+  An explicit `reader_workers` raises the floor above this `w=1` minimum
+  (a larger `w` costs more per the `w * (kappa + 2) + 8` charge above),
+  because an explicit value is honoured or refused rather than silently
+  degraded to whatever `w` fits — passing `reader_workers=3` demands the
+  current-law `w=3` figure above (e.g. 107,069 MB at S=500,000), or raises
+  `PlanError::InsufficientMemory`, never a silent downgrade to `w=1`. The
+  direction is still safe (a larger requirement means more over-allocation
+  or an outright refusal to plan, never an OOM). At S=500,000, a **64 GB
+  host** (`max_mem` defaults to 80% of detected RAM, i.e. `52,429 MB`) is
+  still below the `w=1` floor of `56,408 MB`, so it still raises
+  `PlanError::InsufficientMemory` — naming
+  both remedies in its message, "raise `max_mem` or lower `chunk_size`" —
+  though the margin is now narrow (52.4 vs 56.4 GB) rather than the old
+  law's enormous gap. A **128 GB host** (`104,858 MB`) is no longer a near
+  miss: it plans `cc=1, w=2`, which needs `81,739 MB` -- about 23 GB of
+  headroom. (It stops at `w=2` because `w=3` would need `107,069 MB`, just
+  over the budget.)
 - **`progress=False`/`log_level="info"`** — write-time progress/logging,
   shared by `from_vcf`/`from_pgen`/`from_vcf_list`/`from_svar1`/`write_view`.
   `progress=True` renders live progress: in a terminal or Jupyter, a `rich`
@@ -425,7 +456,8 @@ Signature: `from_vcf(out, source, reference=None, *, regions=None, samples=None,
   touching call sites.
   Structured log lines render their fields inline as ` key=value` pairs
   after the message (e.g. `pipeline config concurrent_chroms=8
-  reader_workers=4`), matching what `GENORAY_LOG`'s stderr layer emits.
+  reader_workers=4 exact_counts=true planned_units=32`), matching what
+  `GENORAY_LOG`'s stderr layer emits.
 
 ### Conversion from PGEN
 
@@ -1054,6 +1086,11 @@ the offending record and continues — mirrors `bcftools norm --check-ref`), and
 `progress=`/`log_level=`; see "Conversion" above for behavior — default
 `--no-progress --log-level info`). `write vcf`'s vcf-list form forwards both
 to `from_vcf_list`; its single-file form forwards both to `from_vcf`.
+
+`write vcf` additionally accepts `--reader-workers N` (single-file input only;
+passing it with a directory/manifest raises). The single-file form forwards
+`N` straight through to `from_vcf`'s `reader_workers=`, so `N < 1` raises the
+same `ValueError` there — the CLI has no separate check for the lower bound.
 
 - `genoray write vcf` (`SparseVar2.from_vcf`/`from_vcf_list`): `source` is a
   single `.vcf.gz`/`.vcf.bgz`/`.bcf` → `from_vcf`; anything else (a directory,
