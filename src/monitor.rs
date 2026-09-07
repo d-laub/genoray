@@ -251,6 +251,13 @@ fn sleep_until_tick_or_stop(interval: Duration, stop: &AtomicBool) -> bool {
 pub struct PendingGauge {
     pub len_highwater: AtomicUsize,
     pub bytes_highwater: AtomicU64,
+    /// Count of times a non-head worker actually parked in
+    /// `shard_exec::Frontier::admit`. A nonzero backlog (`len_highwater`/
+    /// `bytes_highwater` above 0) proves records piled up in the reorder
+    /// buffer, but NOT that admission control did anything about it -- a
+    /// no-op gate would still let a backlog accumulate. This counter is the
+    /// only signal that the parking branch itself ran.
+    pub parks: AtomicUsize,
 }
 
 impl PendingGauge {
@@ -260,6 +267,13 @@ impl PendingGauge {
     pub fn observe(&self, len: usize, bytes: u64) {
         self.len_highwater.fetch_max(len, Ordering::Relaxed);
         self.bytes_highwater.fetch_max(bytes, Ordering::Relaxed);
+    }
+
+    /// Record one park event in `Frontier::admit`'s non-head-worker branch.
+    /// `Relaxed` is sufficient: this is a diagnostic counter with no
+    /// happens-before obligation to any other state, same as `observe`.
+    pub fn record_park(&self) {
+        self.parks.fetch_add(1, Ordering::Relaxed);
     }
 }
 

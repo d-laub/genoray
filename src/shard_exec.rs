@@ -184,6 +184,18 @@ pub(crate) struct Frontier {
     /// `u64::MAX` disables the gate (the PGEN path, which runs a single unit,
     /// and the unit tests).
     budget_bytes: u64,
+    /// Diagnostic counter (`PendingGauge::parks`) incremented each time a
+    /// non-head worker actually blocks in [`Frontier::admit`]. A nonzero
+    /// backlog high-water mark proves records piled up in the reorder
+    /// buffer, but not that admission control did anything about it -- this
+    /// is the only signal that the parking branch itself ran.
+    ///
+    /// Owned (`Arc`, not a borrow): `admit`'s deadlock-guard tests spawn a
+    /// detached, non-scoped `thread::spawn` that may outlive the test
+    /// function on a regression (that's the whole point -- see
+    /// `admit_completes_within`'s doc comment), which requires `Frontier`
+    /// itself to be `'static`.
+    gauge: Arc<crate::monitor::PendingGauge>,
 }
 
 /// Head and backlog bytes live under ONE mutex so a parked producer's
@@ -196,7 +208,7 @@ struct FrontierState {
 }
 
 impl Frontier {
-    pub(crate) fn new(budget_bytes: u64) -> Self {
+    pub(crate) fn new(budget_bytes: u64, gauge: Arc<crate::monitor::PendingGauge>) -> Self {
         Self {
             state: Mutex::new(FrontierState {
                 head: 0,
@@ -204,6 +216,7 @@ impl Frontier {
             }),
             cv: std::sync::Condvar::new(),
             budget_bytes,
+            gauge,
         }
     }
 
@@ -215,6 +228,10 @@ impl Frontier {
             && ordinal > st.head
             && st.pending_bytes > self.budget_bytes
         {
+            // This IS the head-exemption path: a non-head worker is about to
+            // block. Record it before waiting so a spurious wakeup that
+            // re-parks counts again -- each `wait` call is a real park.
+            self.gauge.record_park();
             st = self.cv.wait(st).unwrap();
         }
     }
@@ -346,7 +363,7 @@ pub fn run<F, G>(
     chunk_size: usize,
     tx_dense: &Sender<DenseChunk>,
     worker_tids: &Mutex<Vec<i32>>,
-    pending_gauge: &crate::monitor::PendingGauge,
+    pending_gauge: &Arc<crate::monitor::PendingGauge>,
     pending_budget_bytes: u64,
 ) -> Result<ShardTotals, ConversionError>
 where
@@ -363,7 +380,10 @@ where
     }
     let workers = workers.max(1);
     let cancel = Arc::new(AtomicBool::new(false));
-    let frontier = Arc::new(Frontier::new(pending_budget_bytes));
+    let frontier = Arc::new(Frontier::new(
+        pending_budget_bytes,
+        Arc::clone(pending_gauge),
+    ));
 
     // Seed every unit up front on an unbounded queue, then drop the sending
     // half: a worker's `rx_work.recv()` returns `Err` once the queue is
@@ -757,11 +777,17 @@ mod tests {
     /// could park, nothing would ever advance it.
     #[test]
     fn admit_never_parks_the_head_unit() {
-        let f = Arc::new(Frontier::new(0));
+        let gauge = Arc::new(PendingGauge::default());
+        let f = Arc::new(Frontier::new(0, Arc::clone(&gauge)));
         f.publish(u64::MAX, 7);
         assert!(
             admit_completes_within(f, 7, Duration::from_secs(2)),
             "the head unit must never park, even over budget"
+        );
+        assert_eq!(
+            gauge.parks.load(Ordering::Relaxed),
+            0,
+            "the head-exemption branch must never record a park"
         );
     }
 
@@ -769,7 +795,8 @@ mod tests {
     /// once the head advances past it -- not only when bytes drop.
     #[test]
     fn admit_parks_a_non_head_unit_until_the_head_advances() {
-        let f = Arc::new(Frontier::new(0));
+        let gauge = Arc::new(PendingGauge::default());
+        let f = Arc::new(Frontier::new(0, Arc::clone(&gauge)));
         f.publish(100, 0);
         let cancel = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
@@ -792,13 +819,18 @@ mod tests {
             Ok(()),
             "unit 3 must wake once the head advances past it"
         );
+        assert!(
+            gauge.parks.load(Ordering::Relaxed) > 0,
+            "unit 3's block above must have gone through the parking branch"
+        );
     }
 
     /// A parked producer must observe `cancel` so the error path can tear the
     /// pool down instead of hanging in `join()`.
     #[test]
     fn admit_releases_a_parked_unit_on_cancel() {
-        let f = Arc::new(Frontier::new(0));
+        let gauge = Arc::new(PendingGauge::default());
+        let f = Arc::new(Frontier::new(0, Arc::clone(&gauge)));
         f.publish(100, 0);
         let cancel = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
@@ -828,11 +860,17 @@ mod tests {
     /// the existing tests rely on this.
     #[test]
     fn an_unbounded_budget_never_parks_anything() {
-        let f = Arc::new(Frontier::new(u64::MAX));
+        let gauge = Arc::new(PendingGauge::default());
+        let f = Arc::new(Frontier::new(u64::MAX, Arc::clone(&gauge)));
         f.publish(u64::MAX, 0);
         assert!(
             admit_completes_within(f, 99, Duration::from_secs(2)),
             "u64::MAX must disable the gate entirely"
+        );
+        assert_eq!(
+            gauge.parks.load(Ordering::Relaxed),
+            0,
+            "an unbounded budget must never invoke the parking branch"
         );
     }
 
@@ -915,6 +953,43 @@ mod tests {
                 ordinal,
             });
             let records: Vec<RawRecord> = (0..RECORDS_PER_UNIT).map(|i| record(base + i)).collect();
+            records_by_ordinal.insert(ordinal, records);
+        }
+        (units, Arc::new(records_by_ordinal))
+    }
+
+    /// Ordinal deliberately given more than `RECORDS_PER_UNIT` records by
+    /// [`seed_units_with_a_multi_chunk_unit`], so it spans several chunks
+    /// under a small `chunk_size` instead of the usual one-chunk-per-unit
+    /// shape every other test here relies on.
+    const MULTI_CHUNK_ORDINAL: usize = 3;
+    const MULTI_CHUNK_RECORDS: u32 = 5;
+
+    /// Like [`seed_units`], except ordinal `MULTI_CHUNK_ORDINAL` gets
+    /// `MULTI_CHUNK_RECORDS` records instead of `RECORDS_PER_UNIT`. At the
+    /// `chunk_size=2` used by its caller this spans 3 chunks
+    /// (`ceil(5 / 2)`), exercising the reorder buffer's multi-`local` path
+    /// -- a single shard streaming more than one chunk -- which no other
+    /// test in this module reaches.
+    fn seed_units_with_a_multi_chunk_unit() -> (Vec<WorkUnit>, Arc<HashMap<usize, Vec<RawRecord>>>)
+    {
+        let mut units = Vec::with_capacity(N_UNITS);
+        let mut records_by_ordinal = HashMap::with_capacity(N_UNITS);
+        for ordinal in 0..N_UNITS {
+            let base = (ordinal as u32) * 100;
+            let count = if ordinal == MULTI_CHUNK_ORDINAL {
+                MULTI_CHUNK_RECORDS
+            } else {
+                RECORDS_PER_UNIT
+            };
+            units.push(WorkUnit {
+                own_start: base,
+                own_end: base + count,
+                fetch_start: base,
+                fetch_end: base + count,
+                ordinal,
+            });
+            let records: Vec<RawRecord> = (0..count).map(|i| record(base + i)).collect();
             records_by_ordinal.insert(ordinal, records);
         }
         (units, Arc::new(records_by_ordinal))
@@ -1021,12 +1096,36 @@ mod tests {
             "ordinal 0 was made to lag on purpose -- a real backlog must have \
              been observed, or admission control was never exercised"
         );
+        // `len_highwater > 0` only proves a backlog FORMED, not that
+        // `Frontier::admit`'s parking branch ran -- a no-op gate would let
+        // the same backlog accumulate. `parks` is the only signal that a
+        // non-head worker actually blocked; this is the instrumentation
+        // Task 4's end-to-end measurement found zero of, end to end.
+        assert!(
+            gauge.parks.load(Ordering::Relaxed) > 0,
+            "zero parks recorded -- the head-exemption path in Frontier::admit \
+             never ran, so this test exercised no admission control at all"
+        );
 
         assert_eq!(chunks.len(), N_UNITS, "one chunk per unit expected");
         for (expect_id, c) in chunks.iter().enumerate() {
             assert_eq!(
                 c.chunk_id, expect_id,
                 "chunks must arrive on tx_dense in ascending ordinal order"
+            );
+            // `chunk_id` is assigned by the collector monotonically AT EMIT
+            // TIME regardless of which unit actually produced the chunk, so
+            // the check above alone is vacuous -- it would pass even if
+            // chunk contents were shuffled across units. Tie the payload
+            // itself to the unit that must have produced it: `seed_units`
+            // gives ordinal `o` records starting at `o * 100`
+            // (`record(base + i)` in `seed_units`), and this unit produces
+            // exactly one chunk, so its first record's `pos` pins it to
+            // ordinal `expect_id`.
+            assert_eq!(
+                c.pos[0],
+                (expect_id as u32) * 100,
+                "chunk {expect_id} carries the wrong unit's records"
             );
         }
         let total_records: usize = chunks.iter().map(|c| c.pos.len()).sum();
@@ -1067,17 +1166,50 @@ mod tests {
             )
         }
 
-        let (units_a, records_a) = seed_units();
-        let (result_a, chunks_a, _) = run_with_deadlock_guard(units_a, records_a, 4, 100, u64::MAX);
+        // `seed_units` gives every unit exactly `RECORDS_PER_UNIT` records,
+        // which fits in a single `read_next_chunk` call -- so every unit
+        // ever produces exactly one chunk, and the reorder buffer's
+        // multi-`local` path (a single shard streaming more than one chunk)
+        // is never exercised. `seed_units_with_a_multi_chunk_unit` gives one
+        // ordinal enough records to span several chunks at the
+        // `chunk_size=2` used below, while every other unit still fits in
+        // one -- both runs use the same shape, so the comparison remains
+        // apples-to-apples.
+        let (units_a, records_a) = seed_units_with_a_multi_chunk_unit();
+        let (result_a, chunks_a, _) = run_with_deadlock_guard(units_a, records_a, 4, 2, u64::MAX);
 
-        let (units_b, records_b) = seed_units();
-        let (result_b, chunks_b, _) = run_with_deadlock_guard(units_b, records_b, 4, 100, 64);
+        let (units_b, records_b) = seed_units_with_a_multi_chunk_unit();
+        let (result_b, chunks_b, _) = run_with_deadlock_guard(units_b, records_b, 4, 2, 64);
 
         let totals_a = result_a.expect("unbounded run must succeed");
         let totals_b = result_b.expect("bounded run must succeed");
         assert_eq!(totals_a.dropped_out_of_scope, totals_b.dropped_out_of_scope);
         assert_eq!(totals_a.ref_excluded, totals_b.ref_excluded);
         assert_eq!(totals_a.normalized_total, totals_b.normalized_total);
+
+        // Two empty vectors would trivially compare equal below -- pin both
+        // non-emptiness and the exact expected record/chunk counts (the
+        // oversized unit alone spans multiple chunks) before trusting the
+        // signature comparison that follows.
+        assert!(
+            !chunks_a.is_empty(),
+            "run produced no chunks -- an empty comparison proves nothing"
+        );
+        let expected_total_records =
+            (N_UNITS - 1) * RECORDS_PER_UNIT as usize + MULTI_CHUNK_RECORDS as usize;
+        for (label, chunks) in [("bounded", &chunks_a), ("unbounded", &chunks_b)] {
+            let total_records: usize = chunks.iter().map(|c| c.pos.len()).sum();
+            assert_eq!(
+                total_records, expected_total_records,
+                "{label} run: every record fed to a unit (including the oversized \
+                 one) must reach tx_dense"
+            );
+            assert!(
+                chunks.len() > N_UNITS,
+                "{label} run: the oversized unit must have spanned more than one \
+                 chunk, so total chunks must exceed the unit count"
+            );
+        }
 
         let sig_a: Vec<_> = chunks_a.iter().map(chunk_signature).collect();
         let sig_b: Vec<_> = chunks_b.iter().map(chunk_signature).collect();
