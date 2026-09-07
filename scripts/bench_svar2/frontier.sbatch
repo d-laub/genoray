@@ -1,5 +1,9 @@
 #!/bin/bash
 #SBATCH --job-name=genoray-frontier
+# REQUIRED: this cluster declares no default partition, so a job without
+# `--partition` never starts -- it sits PENDING with reason
+# `(PartitionConfig)` indefinitely rather than failing at submit time.
+#SBATCH --partition=carter-compute
 #SBATCH --nodes=1
 #SBATCH --exclusive
 # 48h, not 8h. Corpus generation dominates this job and runs at TWO
