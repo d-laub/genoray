@@ -28,6 +28,24 @@ pub struct TuningIn {
     pub sample_interval: Option<usize>,
 }
 
+/// A resolution in progress: everything except `merge_threads`, which cannot be
+/// defaulted yet because its planner default is `processing_threads`, computed
+/// from `concurrent_chroms` further downstream.
+///
+/// This exists so that "resolved but missing `merge_threads`" is not a state
+/// [`ResolvedTuning`] can be in. The only way out is
+/// [`Self::with_merge_threads`], so a caller cannot forget the second phase and
+/// silently run with a zero merge budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartialTuning {
+    concurrent_chroms: usize,
+    reader_workers: usize,
+    overshard: usize,
+    dense_cap: usize,
+    sample_interval: usize,
+    requested: TuningIn,
+}
+
 /// The concrete values this run uses, plus the request they came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResolvedTuning {
@@ -46,48 +64,59 @@ fn tag(explicit: bool) -> &'static str {
     if explicit { "explicit" } else { "planner" }
 }
 
-impl ResolvedTuning {
-    /// Build from the planner's `(cc, w)` decision plus the caller's request.
+impl TuningIn {
+    /// Apply the planner's `(cc, w)` decision to this request.
     ///
     /// `concurrent_chroms` and `reader_workers` are passed in rather than read
-    /// from `requested` because the planner has already honoured-or-refused
-    /// them against `max_mem`: the value that actually runs is the planner's
-    /// output, and `requested` only supplies the source tag.
+    /// from `self` because the planner has already honoured-or-refused them
+    /// against `max_mem`: the value that actually runs is the planner's output,
+    /// and the request only supplies the source tag.
     ///
-    /// `merge_threads` cannot be defaulted here -- its planner default is
-    /// `processing_threads`, which is computed from `concurrent_chroms`
-    /// downstream -- so it is left at 0 until [`Self::with_merge_threads`].
-    pub fn resolve(requested: TuningIn, concurrent_chroms: usize, reader_workers: usize) -> Self {
-        Self {
+    /// A request that is `Some` is honoured as-is. Values are NOT clamped here:
+    /// the API contract is honour-or-refuse, and Python's `Tuning.__post_init__`
+    /// has already rejected anything below each field's minimum, so a clamp
+    /// could only silently rewrite a pure-Rust caller's explicit choice.
+    pub fn resolve(self, concurrent_chroms: usize, reader_workers: usize) -> PartialTuning {
+        PartialTuning {
             concurrent_chroms,
             reader_workers,
-            overshard: requested
+            overshard: self
                 .overshard
-                .unwrap_or(crate::orchestrator::OVERSHARD_FACTOR)
-                .max(1),
-            dense_cap: requested
+                .unwrap_or(crate::orchestrator::OVERSHARD_FACTOR),
+            dense_cap: self
                 .dense_cap
-                .unwrap_or(crate::orchestrator::VCF_LIST_DENSE_CHANNEL_CAP)
-                .max(1),
-            merge_threads: 0,
-            sample_interval: requested
-                .sample_interval
-                .unwrap_or(DEFAULT_SAMPLE_INTERVAL_SECS),
-            requested,
+                .unwrap_or(crate::orchestrator::VCF_LIST_DENSE_CHANNEL_CAP),
+            sample_interval: self.sample_interval.unwrap_or(DEFAULT_SAMPLE_INTERVAL_SECS),
+            requested: self,
         }
     }
+}
 
-    /// Fill `merge_threads` from the planner's `processing_threads`, unless the
-    /// caller asked for a specific value.
-    pub fn with_merge_threads(mut self, planner_default: usize) -> Self {
-        self.merge_threads = self
+impl PartialTuning {
+    /// Supply the planner's `processing_threads` and finish the resolution.
+    ///
+    /// An explicit request wins; otherwise `planner_default` is used, floored at
+    /// 1 because a computed 0 would mean a merge with no threads at all. The
+    /// floor deliberately applies only to the planner's own value, never to a
+    /// caller's request.
+    pub fn with_merge_threads(self, planner_default: usize) -> ResolvedTuning {
+        let merge_threads = self
             .requested
             .merge_threads
-            .unwrap_or(planner_default)
-            .max(1);
-        self
+            .unwrap_or(planner_default.max(1));
+        ResolvedTuning {
+            concurrent_chroms: self.concurrent_chroms,
+            reader_workers: self.reader_workers,
+            overshard: self.overshard,
+            dense_cap: self.dense_cap,
+            merge_threads,
+            sample_interval: self.sample_interval,
+            requested: self.requested,
+        }
     }
+}
 
+impl ResolvedTuning {
     pub fn concurrent_chroms_src(&self) -> &'static str {
         tag(self.requested.concurrent_chroms.is_some())
     }
@@ -114,7 +143,7 @@ mod tests {
 
     #[test]
     fn unset_fields_take_planner_defaults() {
-        let r = ResolvedTuning::resolve(TuningIn::default(), 4, 6).with_merge_threads(12);
+        let r = TuningIn::default().resolve(4, 6).with_merge_threads(12);
         assert_eq!(r.concurrent_chroms, 4);
         assert_eq!(r.reader_workers, 6);
         assert_eq!(r.overshard, crate::orchestrator::OVERSHARD_FACTOR);
@@ -125,7 +154,7 @@ mod tests {
 
     #[test]
     fn unset_fields_report_the_planner_as_their_source() {
-        let r = ResolvedTuning::resolve(TuningIn::default(), 4, 6).with_merge_threads(12);
+        let r = TuningIn::default().resolve(4, 6).with_merge_threads(12);
         assert_eq!(r.concurrent_chroms_src(), "planner");
         assert_eq!(r.reader_workers_src(), "planner");
         assert_eq!(r.overshard_src(), "planner");
@@ -143,7 +172,7 @@ mod tests {
             sample_interval: Some(0),
             ..TuningIn::default()
         };
-        let r = ResolvedTuning::resolve(requested, 4, 6).with_merge_threads(12);
+        let r = requested.resolve(4, 6).with_merge_threads(12);
         assert_eq!(r.overshard, 40);
         assert_eq!(r.dense_cap, 24);
         assert_eq!(r.merge_threads, 2);
@@ -166,7 +195,7 @@ mod tests {
             reader_workers: Some(20),
             ..TuningIn::default()
         };
-        let r = ResolvedTuning::resolve(requested, 2, 20).with_merge_threads(12);
+        let r = requested.resolve(2, 20).with_merge_threads(12);
         assert_eq!(r.concurrent_chroms, 2);
         assert_eq!(r.reader_workers, 20);
         assert_eq!(r.concurrent_chroms_src(), "explicit");
@@ -179,7 +208,32 @@ mod tests {
             merge_threads: Some(2),
             ..TuningIn::default()
         };
-        let r = ResolvedTuning::resolve(requested, 4, 6).with_merge_threads(99);
+        let r = requested.resolve(4, 6).with_merge_threads(99);
         assert_eq!(r.merge_threads, 2);
+    }
+
+    #[test]
+    fn a_planner_default_of_zero_is_floored_but_a_request_is_not() {
+        // The floor exists for a planner that computed 0 threads, not to
+        // second-guess a caller: honour-or-refuse means an explicit value is
+        // never silently rewritten.
+        let r = TuningIn::default().resolve(4, 6).with_merge_threads(0);
+        assert_eq!(r.merge_threads, 1);
+        assert_eq!(r.merge_threads_src(), "planner");
+    }
+
+    #[test]
+    fn an_explicit_request_is_honoured_verbatim_without_clamping() {
+        // Python rejects these before they get here, so a value this low can
+        // only come from a pure-Rust caller -- who gets what they asked for.
+        let requested = TuningIn {
+            overshard: Some(0),
+            dense_cap: Some(0),
+            ..TuningIn::default()
+        };
+        let r = requested.resolve(4, 6).with_merge_threads(12);
+        assert_eq!(r.overshard, 0);
+        assert_eq!(r.dense_cap, 0);
+        assert_eq!(r.overshard_src(), "explicit");
     }
 }
