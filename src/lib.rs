@@ -107,12 +107,6 @@ pub mod streams;
 pub mod svar2_slice;
 #[cfg(feature = "conversion")]
 pub mod svar2_view;
-// `trace` (GENORAY_TRACE heartbeats, #135 diagnosis) is used only by the
-// conversion-side pipeline modules (shard_exec/executor/orchestrator/monitor),
-// so it's gated the same way; private like `enum_map` -- reachable crate-wide
-// as `crate::trace::...` without needing `pub`.
-#[cfg(feature = "conversion")]
-mod trace;
 // Depends on `orchestrator::{OVERSHARD_FACTOR, VCF_LIST_DENSE_CHANNEL_CAP}`,
 // which are conversion-gated, so `tuning` is gated the same way.
 #[cfg(feature = "conversion")]
@@ -275,20 +269,13 @@ fn run_conversion_pipeline(
             });
             let chunk_bytes = per_variant_bytes * resident_chunk_size as u64;
 
-            // BENCH-ONLY overrides are resolved HERE, not in
-            // `process_chromosome`, so the `pipeline config` line below prints
-            // what actually ran. Before #169 the override was applied
-            // per-contig and the log printed the planner's value, making a
-            // 20-worker run indistinguishable from a 3-worker one in the logs.
-            let requested_workers = orchestrator::bench_env_reader_workers().or(reader_workers);
-
             let sharded = crate::budget::plan_sharded(crate::budget::PlanInputs {
                 usable_cores: available_cores.saturating_sub(1).max(1),
                 n_contigs: chroms.len(),
                 n_samples: samples.len(),
                 chunk_bytes,
                 max_mem_bytes,
-                reader_workers: requested_workers,
+                reader_workers,
                 ram: crate::budget::RamLaw::VCF,
             });
             let sharded = match sharded {
@@ -297,11 +284,10 @@ fn run_conversion_pipeline(
             };
 
             let plan = crate::budget::plan_thread_budget(available_cores, chroms.len());
-            let concurrent_chroms =
-                orchestrator::bench_concurrent_chroms(sharded.concurrent_chroms);
+            let concurrent_chroms = sharded.concurrent_chroms.max(1);
             let htslib_threads = plan.htslib_threads; // monolithic path only
             let reader_workers = sharded.reader_workers;
-            let overshard = orchestrator::bench_overshard();
+            let overshard = orchestrator::OVERSHARD_FACTOR;
             let pending_budget_bytes = crate::budget::pending_budget_bytes(chunk_bytes);
             // `plan_unit_count` is monotonic in the record count, so the
             // largest contig's plan upper-bounds every other contig's --
@@ -324,6 +310,12 @@ fn run_conversion_pipeline(
                 concurrent_chroms,
                 reader_workers,
             );
+            // TODO(Task 6): resolve from the caller's `TuningIn` instead of a
+            // default -- this placeholder just threads the new parameter
+            // through so the pipeline compiles against `ResolvedTuning`.
+            let tuning = crate::tuning::TuningIn::default()
+                .resolve(concurrent_chroms, reader_workers)
+                .with_merge_threads(processing_threads);
 
             let monolithic_reader_active =
                 concurrent_chroms * (crate::budget::PIPELINE_THREADS_PER_CHROM + htslib_threads);
@@ -408,6 +400,7 @@ fn run_conversion_pipeline(
                             skip_out_of_scope,
                             check_ref,
                             processing_threads,
+                            tuning,
                             signatures,
                             &fields,
                             &sink,
@@ -610,23 +603,23 @@ fn run_pgen_conversion_pipeline(
                 Ok(p) => p,
                 Err(e) => return vec![Err(crate::error::ConversionError::from(e))],
             };
-            // Cap the PLAN at the measured knee, then let the bench override
-            // (`GENORAY_CONCURRENT_CHROMS`) apply on top of that cap -- not
-            // before it. Clamping the override itself would make
-            // `PGEN_MAX_CONCURRENT` unfalsifiable: the env var exists
-            // specifically so a maintainer can re-measure past 8 (see its doc
-            // comment), and clamping it defeats that. `processing_threads_for`
+            // Cap the PLAN at the measured knee. `processing_threads_for`
             // below still consumes this final `concurrent_chroms`, so the
             // merge tail stays sized against what is actually dispatched.
-            let planned = sharded
+            let concurrent_chroms = sharded
                 .concurrent_chroms
-                .min(crate::budget::PGEN_MAX_CONCURRENT);
-            let concurrent_chroms = orchestrator::bench_concurrent_chroms(planned);
+                .clamp(1, crate::budget::PGEN_MAX_CONCURRENT);
             let processing_threads = crate::budget::processing_threads_for(
                 available_cores.saturating_sub(1).max(1),
                 concurrent_chroms,
                 sharded.reader_workers,
             );
+            // TODO(Task 6): resolve from the caller's `TuningIn` instead of a
+            // default -- this placeholder just threads the new parameter
+            // through so the pipeline compiles against `ResolvedTuning`.
+            let tuning = crate::tuning::TuningIn::default()
+                .resolve(concurrent_chroms, sharded.reader_workers)
+                .with_merge_threads(processing_threads);
             tracing::info!(cores = available_cores, "using cores");
             tracing::info!(
                 concurrent_chroms,
@@ -691,6 +684,7 @@ fn run_pgen_conversion_pipeline(
                             skip_out_of_scope,
                             check_ref,
                             processing_threads,
+                            tuning,
                             signatures,
                             &fields,
                             &sink,
@@ -1364,8 +1358,17 @@ fn run_svar1_conversion_pipeline(
                 _ => std::thread::available_parallelism().unwrap().get(),
             };
             let plan = crate::budget::plan_thread_budget(available_cores, jobs.len());
-            let concurrent_chroms = orchestrator::bench_concurrent_chroms(plan.concurrent_chroms);
+            let concurrent_chroms = plan.concurrent_chroms.max(1);
             let processing_threads = plan.processing_threads;
+            // SVAR1 reads pre-decoded columnar data directly -- there is no
+            // separate reader-worker pool to size, so, like
+            // `orchestrator::run_vcf_list`, resolve against a nominal 1.
+            // TODO(Task 6): resolve from the caller's `TuningIn` instead of a
+            // default -- this placeholder just threads the new parameter
+            // through so the pipeline compiles against `ResolvedTuning`.
+            let tuning = crate::tuning::TuningIn::default()
+                .resolve(concurrent_chroms, 1)
+                .with_merge_threads(processing_threads);
             tracing::info!(
                 concurrent_chroms,
                 processing_threads,
@@ -1406,6 +1409,7 @@ fn run_svar1_conversion_pipeline(
                             skip_out_of_scope,
                             check_ref,
                             processing_threads,
+                            tuning,
                             signatures,
                             &fields,
                             &sink,

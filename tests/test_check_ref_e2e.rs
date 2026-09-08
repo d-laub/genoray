@@ -87,8 +87,11 @@ fn convert(
         false,     // skip_out_of_scope
         check_ref, // NEW
         1,         // processing_threads
-        false,     // signatures
-        &[],       // fields
+        genoray_core::tuning::TuningIn::default()
+            .resolve(1, 1)
+            .with_merge_threads(1),
+        false, // signatures
+        &[],   // fields
         &genoray_core::logging::EventSink::disabled(),
     )
 }
@@ -241,8 +244,11 @@ fn sharded_ref_excluded_counted_once_in_contig_done() {
         false,             // skip_out_of_scope
         CheckRef::Exclude, // the pos-200 REF mismatch is dropped, not an error
         8,                 // processing_threads -- >1 so shards.len() > 1
-        false,             // signatures
-        &[],               // fields
+        genoray_core::tuning::TuningIn::default()
+            .resolve(1, 1)
+            .with_merge_threads(8),
+        false, // signatures
+        &[],   // fields
         &sink,
     )
     .expect("process_chromosome should succeed despite the excluded record");
@@ -374,6 +380,9 @@ fn sharded_permuted_sample_subset_matches_unsharded_bytes() {
             // instead of silently excluding the record from both runs.
             CheckRef::Error,
             8,
+            genoray_core::tuning::TuningIn::default()
+                .resolve(1, 1)
+                .with_merge_threads(8),
             false,
             &[],
             &EventSink::disabled(),

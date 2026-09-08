@@ -287,9 +287,9 @@ impl RamLaw {
     /// own measured domain exactly, so this asymmetry is VCF-specific.
     ///
     /// `cc = 16` sits OUTSIDE the production domain. Unlike the PGEN path,
-    /// nothing in `lib.rs` clamps VCF `concurrent_chroms`, so `cc=16` is
-    /// reachable only through the bench-only `GENORAY_CONCURRENT_CHROMS`
-    /// override, applied here purely to give the per-contig term a lever arm.
+    /// nothing in `lib.rs` clamps VCF `concurrent_chroms`, so `cc=16` was
+    /// reachable only through a since-removed bench-only sweep override,
+    /// applied here purely to give the per-contig term a lever arm.
     ///
     /// Residual sigma (an unconstrained OLS fit of the same four-term form,
     /// computed for description only, never shipped) is ~336 MB, ~5.3x the
@@ -390,9 +390,9 @@ impl RamLaw {
     ///
     /// `cc <= 8` is enforced in code, not just documented: `src/lib.rs` clamps
     /// every planned `concurrent_chroms` to `PGEN_MAX_CONCURRENT` below, so
-    /// `cc > 8` is reachable only via the bench-only
-    /// `GENORAY_CONCURRENT_CHROMS` override. The `cc=16` rows exist to give
-    /// the per-contig slope a lever arm and sit OUTSIDE the production domain.
+    /// `cc > 8` was reachable only via a since-removed bench-only sweep
+    /// override. The `cc=16` rows exist to give the per-contig slope a lever
+    /// arm and sit OUTSIDE the production domain.
     ///
     /// Still NOT comparable coefficient-by-coefficient with `RamLaw::VCF`,
     /// even though both now come from `vcfixture bulk` against the same

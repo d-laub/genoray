@@ -109,7 +109,10 @@ fn test_e2e_normalized_bcf_pipeline() {
         4096, // long_allele_capacity
         false,
         genoray_core::normalize::CheckRef::Error,
-        1,     // processing_threads
+        1, // processing_threads
+        genoray_core::tuning::TuningIn::default()
+            .resolve(1, 1)
+            .with_merge_threads(1),
         false, // signatures
         &[],   // fields
         &genoray_core::logging::EventSink::disabled(),
@@ -285,7 +288,10 @@ fn test_e2e_max_del_postpass() {
         4096,
         false,
         genoray_core::normalize::CheckRef::Error,
-        1,     // processing_threads
+        1, // processing_threads
+        genoray_core::tuning::TuningIn::default()
+            .resolve(1, 1)
+            .with_merge_threads(1),
         false, // signatures
         &[],   // fields
         &genoray_core::logging::EventSink::disabled(),
@@ -370,7 +376,10 @@ fn test_e2e_dense_snp_roundtrip() {
         4096,
         false,
         genoray_core::normalize::CheckRef::Error,
-        1,     // processing_threads
+        1, // processing_threads
+        genoray_core::tuning::TuningIn::default()
+            .resolve(1, 1)
+            .with_merge_threads(1),
         false, // signatures
         &[],   // fields
         &genoray_core::logging::EventSink::disabled(),
@@ -454,7 +463,10 @@ fn test_e2e_mutation_conservation() {
         4096,
         false,
         genoray_core::normalize::CheckRef::Error,
-        1,     // processing_threads
+        1, // processing_threads
+        genoray_core::tuning::TuningIn::default()
+            .resolve(1, 1)
+            .with_merge_threads(1),
         false, // signatures
         &[],   // fields
         &genoray_core::logging::EventSink::disabled(),
@@ -918,7 +930,10 @@ fn test_missing_chrom_returns_err() {
         1 << 20,
         false,
         genoray_core::normalize::CheckRef::Error,
-        1,     // processing_threads
+        1, // processing_threads
+        genoray_core::tuning::TuningIn::default()
+            .resolve(1, 1)
+            .with_merge_threads(1),
         false, // signatures
         &[],   // fields
         &genoray_core::logging::EventSink::disabled(),
@@ -1032,7 +1047,10 @@ fn regions_overlap_variant_keeps_spanning_deletion_e2e() {
             4096,
             false,
             genoray_core::normalize::CheckRef::Error,
-            1,     // processing_threads
+            1, // processing_threads
+            genoray_core::tuning::TuningIn::default()
+                .resolve(1, 1)
+                .with_merge_threads(1),
             false, // signatures
             &[],   // fields
             &genoray_core::logging::EventSink::disabled(),

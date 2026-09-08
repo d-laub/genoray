@@ -12,7 +12,7 @@
 use pyo3::FromPyObject;
 
 /// Monitor sampling cadence when the caller does not choose one. Matches the
-/// old `GENORAY_SAMPLE_INTERVAL` default.
+/// default of the environment-variable sampler interval this API replaces.
 pub const DEFAULT_SAMPLE_INTERVAL_SECS: usize = 5;
 
 /// A caller's tuning request, extracted from the Python `Tuning` dataclass by

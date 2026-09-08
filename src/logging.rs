@@ -337,8 +337,8 @@ fn ensure_global_subscriber() {
         // The stderr fmt layer is ALWAYS installed, initially filtered to
         // "off" (which costs nothing), so that a later `set_fmt_filter` call
         // can turn it on. Reading a filter once at install time -- as the
-        // old `GENORAY_LOG` version did -- would fix it for the life of the
-        // process and make a per-call filter impossible.
+        // old environment-variable-driven version did -- would fix it for
+        // the life of the process and make a per-call filter impossible.
         let (filter, handle) = tracing_subscriber::reload::Layer::new(off_filter());
         let fmt = tracing_subscriber::fmt::layer()
             .with_target(true)

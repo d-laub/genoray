@@ -193,7 +193,10 @@ pub fn build_contig(
         4096, // long_allele_capacity
         false,
         genoray_core::normalize::CheckRef::Error,
-        1,     // processing_threads
+        1, // processing_threads
+        genoray_core::tuning::TuningIn::default()
+            .resolve(1, 1)
+            .with_merge_threads(1),
         false, // signatures
         &[],   // fields
         &genoray_core::logging::EventSink::disabled(),
