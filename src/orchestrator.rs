@@ -1088,8 +1088,8 @@ pub fn process_chromosome(
     // when Phase 1 does, so this span was previously invisible to every
     // benchmark -- yet it is a near-constant 3-5s that grows to HALF of wall
     // once the reader pool is widened. Emitted on the `genoray::monitor`
-    // target so it survives `GENORAY_LOG="genoray::monitor=trace"`, which is a
-    // filter and drops every other target.
+    // target so it survives a `genoray::monitor=trace` log filter, which drops
+    // every other target.
     macro_rules! stage {
         ($label:expr, $body:expr) => {{
             let t = std::time::Instant::now();

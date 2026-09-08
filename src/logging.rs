@@ -2,7 +2,7 @@
 use crossbeam_channel::Sender;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Mutex, Once, OnceLock};
 use tracing::field::{Field, Visit};
 use tracing::level_filters::LevelFilter;
@@ -301,6 +301,18 @@ static INSTALL: Once = Once::new();
 /// closure that captures the handle sidesteps that entirely.
 static SET_FMT_FILTER: OnceLock<Box<dyn Fn(EnvFilter) + Send + Sync>> = OnceLock::new();
 
+/// Whether our subscriber actually became the global default. False when a host
+/// process installed one first, in which case the reload handle points at a
+/// subscriber nobody consults and every filter request is silently inert.
+static SUBSCRIBER_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+/// Warn at most once that a requested filter cannot take effect.
+static WARNED_NOT_INSTALLED: Once = Once::new();
+
+/// The directives currently applied to the fmt layer, so a nested scope can put
+/// back what it found instead of assuming silence (see `Restore` below).
+static CURRENT_FMT_FILTER: Mutex<Option<String>> = Mutex::new(None);
+
 /// A filter that admits nothing.
 fn off_filter() -> EnvFilter {
     EnvFilter::new("off")
@@ -337,15 +349,30 @@ fn ensure_global_subscriber() {
         let _ = SET_FMT_FILTER.set(Box::new(move |f| {
             let _ = handle.reload(f);
         }));
-        let _ = tracing::subscriber::set_global_default(subscriber);
+        let installed = tracing::subscriber::set_global_default(subscriber).is_ok();
+        SUBSCRIBER_INSTALLED.store(installed, Ordering::Relaxed);
     });
 }
 
 /// Apply `directives` to the stderr fmt layer, or silence it when `None`.
 /// An unparseable directive string silences the layer rather than panicking:
 /// a bad filter must not take down a conversion that is otherwise fine.
-fn set_fmt_filter(directives: Option<&str>) {
+///
+/// Returns the directives that were in effect beforehand, so a caller can put
+/// them back.
+fn set_fmt_filter(directives: Option<&str>) -> Option<String> {
     ensure_global_subscriber();
+    // A filter is now an explicit API argument rather than an environment
+    // variable, so silently dropping it is worse than it used to be: say so
+    // once, rather than leaving the caller to wonder where their logs went.
+    if directives.is_some() && !SUBSCRIBER_INSTALLED.load(Ordering::Relaxed) {
+        WARNED_NOT_INSTALLED.call_once(|| {
+            eprintln!(
+                "genoray: log filter ignored -- another tracing subscriber was \
+                 already installed in this process."
+            );
+        });
+    }
     let filter = match directives {
         Some(d) => EnvFilter::try_new(d).unwrap_or_else(|_| off_filter()),
         None => off_filter(),
@@ -353,6 +380,8 @@ fn set_fmt_filter(directives: Option<&str>) {
     if let Some(set) = SET_FMT_FILTER.get() {
         set(filter);
     }
+    let mut current = CURRENT_FMT_FILTER.lock().unwrap();
+    std::mem::replace(&mut *current, directives.map(str::to_owned))
 }
 
 /// Route `tracing::` events emitted during `f` (from ANY thread, including
@@ -375,7 +404,7 @@ pub fn with_channel_subscriber<R>(
     f: impl FnOnce() -> R,
 ) -> R {
     ensure_global_subscriber();
-    set_fmt_filter(filter);
+    let prev_filter = set_fmt_filter(filter);
     let prev_level = CURRENT_LEVEL.swap(level_rank(level), Ordering::Relaxed);
     let prev_sink = {
         let mut g = CURRENT_SINK.lock().unwrap();
@@ -385,21 +414,24 @@ pub fn with_channel_subscriber<R>(
     struct Restore {
         prev_level: u8,
         prev_sink: Option<EventSink>,
+        prev_filter: Option<String>,
     }
     impl Drop for Restore {
         fn drop(&mut self) {
             CURRENT_LEVEL.store(self.prev_level, Ordering::Relaxed);
             *CURRENT_SINK.lock().unwrap() = self.prev_sink.take();
-            // The fmt filter is restored to silence rather than to a saved
-            // previous value: it is only ever set by a caller of this function
-            // or of `install_fmt_fallback`, both of which set it explicitly on
-            // entry, so there is no ambient value to preserve.
-            set_fmt_filter(None);
+            // Restore the filter we found, symmetrically with the level and the
+            // sink above. Forcing silence instead would work today -- the only
+            // other setter is `install_fmt_fallback`, whose lone caller never
+            // enters this scope -- but that is a reachability accident, and the
+            // first entry point that does both would silently lose its filter.
+            set_fmt_filter(self.prev_filter.take().as_deref());
         }
     }
     let _restore = Restore {
         prev_level,
         prev_sink,
+        prev_filter,
     };
 
     f()
@@ -684,13 +716,33 @@ mod tests {
         assert!(event_rank(&tracing::Level::INFO) > level_rank("warning"));
     }
 
+    /// The reload handle must survive repeated set/restore cycles -- what a
+    /// second `from_vcf` call in one process does -- and each cycle must
+    /// actually change what the subscriber admits.
+    ///
+    /// TRACE is the discriminating level: the channel layer is capped at DEBUG
+    /// (see `ensure_global_subscriber`), so a TRACE callsite is enabled ONLY
+    /// when the reloadable fmt filter admits it. That makes `enabled!` a direct
+    /// probe of the reload path -- gut `set_fmt_filter` to a no-op and this
+    /// test fails, which is precisely what the previous version could not do.
     #[test]
-    fn setting_a_filter_twice_is_accepted() {
-        // The reload handle must survive repeated set/restore cycles: this is
-        // what a second `from_vcf` call in one process does.
-        install_fmt_fallback(Some("genoray=debug"));
+    fn reloading_the_filter_changes_what_the_subscriber_admits() {
+        let _guard = TEST_LOCK.lock().unwrap();
         install_fmt_fallback(Some("genoray::monitor=trace"));
+        assert!(
+            tracing::enabled!(target: "genoray::monitor", tracing::Level::TRACE),
+            "a trace directive must enable a trace callsite"
+        );
+        install_fmt_fallback(Some("genoray=debug"));
+        assert!(
+            !tracing::enabled!(target: "genoray::monitor", tracing::Level::TRACE),
+            "reloading to a debug directive must stop admitting trace"
+        );
         install_fmt_fallback(None);
+        assert!(
+            !tracing::enabled!(target: "genoray::monitor", tracing::Level::TRACE),
+            "reloading to no filter must admit nothing"
+        );
     }
 
     /// `with_channel_subscriber`'s new `filter` parameter is a SEPARATE knob
@@ -726,19 +778,39 @@ mod tests {
 
     /// A second `with_channel_subscriber` call in the same process (mirrors a
     /// second `from_vcf` call) must be able to point the reloadable stderr
-    /// filter at a *different* directive string than the first call used,
-    /// without panicking -- this is exactly what a one-shot (non-reload)
-    /// `EnvFilter` layer could not do.
+    /// filter at a *different* directive string than the first call used --
+    /// exactly what a one-shot (non-reload) `EnvFilter` layer could not do --
+    /// and must restore what it found on the way out rather than forcing
+    /// silence.
     #[test]
     fn with_channel_subscriber_filter_can_change_across_calls() {
         let _guard = TEST_LOCK.lock().unwrap();
-        with_channel_subscriber(EventSink::disabled(), "info", Some("genoray=debug"), || {});
-        with_channel_subscriber(
-            EventSink::disabled(),
-            "info",
-            Some("genoray::monitor=trace"),
-            || {},
+        // An ambient filter set by a pure-Rust entry point, as the bench binary
+        // does before running a conversion.
+        install_fmt_fallback(Some("genoray::monitor=trace"));
+
+        with_channel_subscriber(EventSink::disabled(), "info", Some("genoray=debug"), || {
+            assert!(
+                !tracing::enabled!(target: "genoray::monitor", tracing::Level::TRACE),
+                "the call's own filter must be in effect inside the scope"
+            );
+        });
+        assert!(
+            tracing::enabled!(target: "genoray::monitor", tracing::Level::TRACE),
+            "the ambient filter must survive a nested with_channel_subscriber"
         );
-        with_channel_subscriber(EventSink::disabled(), "info", None, || {});
+
+        with_channel_subscriber(EventSink::disabled(), "info", None, || {
+            assert!(
+                !tracing::enabled!(target: "genoray::monitor", tracing::Level::TRACE),
+                "None must silence the fmt layer for the duration of the call"
+            );
+        });
+        assert!(
+            tracing::enabled!(target: "genoray::monitor", tracing::Level::TRACE),
+            "a None-filtered call must still restore the ambient filter"
+        );
+
+        install_fmt_fallback(None);
     }
 }
