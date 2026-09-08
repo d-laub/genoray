@@ -113,6 +113,10 @@ pub mod svar2_view;
 // as `crate::trace::...` without needing `pub`.
 #[cfg(feature = "conversion")]
 mod trace;
+// Depends on `orchestrator::{OVERSHARD_FACTOR, VCF_LIST_DENSE_CHANNEL_CAP}`,
+// which are conversion-gated, so `tuning` is gated the same way.
+#[cfg(feature = "conversion")]
+pub mod tuning;
 pub mod types;
 #[cfg(feature = "conversion")]
 pub mod vcf_list_reader;
