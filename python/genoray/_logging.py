@@ -10,12 +10,15 @@ from rich.progress import BarColumn, Progress, TaskID, TextColumn, TimeElapsedCo
 
 LOG_LEVELS = ("off", "critical", "error", "warning", "info", "debug")
 LogLevel = Literal["off", "critical", "error", "warning", "info", "debug"]
+# What `parse_log_level` returns. Narrower than `LogLevel`: "critical" is an
+# accepted input spelling but never an output, since it canonicalizes to "error".
+CanonicalLogLevel = Literal["off", "error", "warning", "info", "debug"]
 
 # What Rust's `level_rank` understands. "critical" is an accepted spelling but
 # not a distinct rank: `tracing` has no CRITICAL level, and no genoray call site
 # emits `error!` or `warn!` today, so it gates the same (currently empty) set as
 # "error".
-_CANONICAL: dict[str, str] = {
+_CANONICAL: dict[str, CanonicalLogLevel] = {
     "off": "off",
     "critical": "error",
     "error": "error",
@@ -27,7 +30,7 @@ _CANONICAL: dict[str, str] = {
 # Python `logging` integer thresholds, ascending. An integer that falls between
 # two named levels rounds UP to the more severe one, matching Python's own
 # gate: a logger set to 25 suppresses INFO (20) and admits WARNING (30).
-_INT_LEVELS: tuple[tuple[int, str], ...] = (
+_INT_LEVELS: tuple[tuple[int, CanonicalLogLevel], ...] = (
     (10, "debug"),
     (20, "info"),
     (30, "warning"),
@@ -118,7 +121,7 @@ class ProgressRenderer:
             self._progress = None
 
 
-def parse_log_level(log_level: str | int) -> str:
+def parse_log_level(log_level: str | int) -> CanonicalLogLevel:
     """Normalize a Python-convention level to the name Rust's gate understands.
 
     Accepts the names in `LOG_LEVELS` (case-insensitive) and `logging` integer
@@ -128,7 +131,10 @@ def parse_log_level(log_level: str | int) -> str:
     Python 3.13, so it is a deprecated spelling rather than a convention.
     """
     if isinstance(log_level, bool):  # bool is an int; nobody means this
-        raise ValueError(f"log_level must be a str or int; got {log_level!r}")
+        raise ValueError(
+            f"log_level must not be a bool; got {log_level!r}. Pass one of "
+            f"{LOG_LEVELS} or a logging level int."
+        )
     if isinstance(log_level, int):
         if log_level < 0:
             raise ValueError(

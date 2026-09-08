@@ -79,3 +79,36 @@ def test_accepted_spellings_are_exported():
     # Every advertised spelling must actually parse.
     for name in LOG_LEVELS:
         parse_log_level(name)
+
+
+@pytest.mark.parametrize("bad", [True, False])
+def test_bool_is_rejected_despite_being_an_int(bad: bool):
+    # `bool` is a subclass of `int`, so without an explicit guard
+    # `parse_log_level(True)` would silently mean logging level 1 -> "debug".
+    with pytest.raises(ValueError, match="must not be a bool"):
+        parse_log_level(bad)
+
+
+@pytest.mark.parametrize("bad", [None, 3.5, (), ["info"]])
+def test_non_str_non_int_is_rejected(bad: object):
+    with pytest.raises(ValueError, match="log_level must be one of"):
+        parse_log_level(bad)  # pyrefly: ignore[bad-argument-type]
+
+
+@pytest.mark.parametrize(
+    ("given", "expected"),
+    [
+        (" info ", "info"),
+        ("\tDEBUG\n", "debug"),
+        ("  Critical  ", "error"),
+    ],
+)
+def test_surrounding_whitespace_and_case_are_ignored(given: str, expected: str):
+    assert parse_log_level(given) == expected
+
+
+def test_a_positive_int_below_debug_is_debug():
+    # 1..9 sit below logging.DEBUG (10) but above NOTSET (0); the round-UP rule
+    # makes them the most verbose real level rather than silence.
+    assert parse_log_level(1) == "debug"
+    assert parse_log_level(9) == "debug"
