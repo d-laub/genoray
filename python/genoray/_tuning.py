@@ -7,6 +7,7 @@ are chosen exactly as they are today.
 
 from __future__ import annotations
 
+import operator
 from dataclasses import dataclass, fields
 from typing import Literal
 
@@ -22,7 +23,7 @@ Backend = Literal["vcf", "pgen", "vcf_list", "svar1"]
 # `concurrent_chroms` is unavailable on `from_vcf_list` because that pipeline
 # walks contigs sequentially by design (`orchestrator::run_vcf_list`).
 _ALWAYS = frozenset({"dense_cap", "merge_threads", "sample_interval"})
-_APPLICABLE: dict[str, frozenset[str]] = {
+_APPLICABLE: dict[Backend, frozenset[str]] = {
     "vcf": _ALWAYS | {"concurrent_chroms", "reader_workers", "overshard"},
     "pgen": _ALWAYS | {"concurrent_chroms"},
     "vcf_list": _ALWAYS,
@@ -84,26 +85,48 @@ class Tuning:
             value = getattr(self, f.name)
             if value is None:
                 continue
-            if not isinstance(value, int) or isinstance(value, bool):
+            # `bool` is an `int` and defines `__index__`, so it survives both
+            # checks below; nobody means `reader_workers=True`.
+            if isinstance(value, bool):
                 raise ValueError(f"{f.name} must be None or an int; got {value!r}")
+            try:
+                # `operator.index` rather than `isinstance(value, int)`: this is a
+                # numpy-centric library and a caller who computed a knob from an
+                # array gets an `np.int64`, which is not an `int`. Coercing here
+                # also keeps `_as_ffi` returning plain ints for the FFI seam.
+                coerced = operator.index(value)
+            except TypeError:
+                raise ValueError(
+                    f"{f.name} must be None or an int; got {value!r}"
+                ) from None
             minimum = _MINIMUM[f.name]
-            if value < minimum:
+            if coerced < minimum:
                 raise ValueError(
                     f"{f.name} must be None (let the planner choose) or an "
                     f"integer >= {minimum}; got {value!r}"
                 )
+            if coerced is not value:  # frozen, so go around __setattr__
+                object.__setattr__(self, f.name, coerced)
 
-    def _check_backend(self, backend: str) -> None:
+    def _check_backend(self, backend: Backend) -> None:
         """Raise if any set field cannot be used by `backend`."""
         allowed = _APPLICABLE[backend]  # KeyError on an unknown backend: a bug
-        for f in fields(self):
-            if getattr(self, f.name) is None or f.name in allowed:
-                continue
-            raise ValueError(
-                f"tuning.{f.name} does not apply to the {backend!r} backend "
-                f"(applicable knobs: {', '.join(sorted(allowed))}). Leave it "
-                f"as None."
-            )
+        offenders = [
+            f.name
+            for f in fields(self)
+            if getattr(self, f.name) is not None and f.name not in allowed
+        ]
+        if not offenders:
+            return
+        # Report every offender at once: a caller who set two inapplicable knobs
+        # should not have to discover them one round-trip at a time.
+        names = ", ".join(f"tuning.{n}" for n in offenders)
+        verb, pronoun = ("do", "them") if len(offenders) > 1 else ("does", "it")
+        raise ValueError(
+            f"{names} {verb} not apply to the {backend!r} backend "
+            f"(applicable knobs: {', '.join(sorted(allowed))}). "
+            f"Leave {pronoun} as None."
+        )
 
     def _as_ffi(self) -> dict[str, int | None]:
         """The six fields as a plain dict for `_core`."""
