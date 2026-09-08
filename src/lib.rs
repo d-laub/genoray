@@ -207,7 +207,7 @@ fn run_conversion_pipeline(
     let level = log_level.clone();
 
     let results: Vec<Result<u64, crate::error::ConversionError>> = py.detach(|| {
-        crate::logging::with_channel_subscriber(sink.clone(), &level, || {
+        crate::logging::with_channel_subscriber(sink.clone(), &level, None, || {
             // Step 1 -> HW discovery/override and budgeting
             let available_cores = match max_threads {
                 Some(t) if t > 0 => {
@@ -553,7 +553,7 @@ fn run_pgen_conversion_pipeline(
     let level = log_level.clone();
 
     let results: Vec<Result<u64, crate::error::ConversionError>> = py.detach(|| {
-        crate::logging::with_channel_subscriber(sink.clone(), &level, || {
+        crate::logging::with_channel_subscriber(sink.clone(), &level, None, || {
             let available_cores = match max_threads {
                 Some(t) if t > 0 => t,
                 _ => std::thread::available_parallelism().unwrap().get(),
@@ -1034,7 +1034,7 @@ pub fn run_slice_view(
     };
     let level = log_level.clone();
     let results: Vec<Result<usize, ConversionError>> = py.detach(|| {
-        crate::logging::with_channel_subscriber(sink.clone(), &level, || {
+        crate::logging::with_channel_subscriber(sink.clone(), &level, None, || {
             for c in &skipped_contigs {
                 tracing::debug!(chrom = %c, "contig has no regions; skipped");
             }
@@ -1219,7 +1219,7 @@ fn run_vcf_list_conversion_pipeline(
     let level = log_level.clone();
 
     let dropped: u64 = py.detach(|| {
-        crate::logging::with_channel_subscriber(sink.clone(), &level, || {
+        crate::logging::with_channel_subscriber(sink.clone(), &level, None, || {
             orchestrator::run_vcf_list(
                 &vcf_paths,
                 reference_path.as_deref(),
@@ -1354,7 +1354,7 @@ fn run_svar1_conversion_pipeline(
     let level = log_level.clone();
 
     let results: Vec<Result<u64, crate::error::ConversionError>> = py.detach(|| {
-        crate::logging::with_channel_subscriber(sink.clone(), &level, || {
+        crate::logging::with_channel_subscriber(sink.clone(), &level, None, || {
             let available_cores = match max_threads {
                 Some(t) if t > 0 => t,
                 _ => std::thread::available_parallelism().unwrap().get(),

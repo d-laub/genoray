@@ -45,16 +45,28 @@ fn file_has_contig(path: &str, chrom: &str) -> bool {
 }
 
 fn main() {
-    genoray_core::logging::install_fmt_fallback();
+    let args_raw: Vec<String> = std::env::args().collect();
+    // `--log-filter <directives>` may appear anywhere; strip it out before the
+    // positional-argument parsing below so it doesn't shift other indices.
+    let mut args: Vec<String> = Vec::with_capacity(args_raw.len());
+    let mut log_filter: Option<String> = None;
+    let mut it = args_raw.into_iter();
+    while let Some(a) = it.next() {
+        if a == "--log-filter" {
+            log_filter = it.next();
+        } else {
+            args.push(a);
+        }
+    }
+    genoray_core::logging::install_fmt_fallback(log_filter.as_deref());
 
     #[cfg(feature = "dhat-heap")]
     let _profiler = dhat::Profiler::new_heap();
 
-    let args: Vec<String> = std::env::args().collect();
     if args.len() < 4 {
         eprintln!(
             "usage: {} <manifest> <out_dir> <chrom>[,<chrom>...] [reference.fa] \
-             [format_field:htype,...]",
+             [format_field:htype,...] [--log-filter <directives>]",
             args[0]
         );
         eprintln!(
