@@ -28,10 +28,18 @@ is not hypothetical: on PR #174, a downstream user reported that the 4.0.1
 `pipeline config` banner printed `reader_workers=3` after `GENORAY_READER_WORKERS`
 had set it to 20, and that the mismatch cost them a day of misdiagnosis. #174
 partly fixed that specific case by hoisting the `reader_workers` resolution up
-into `lib.rs` beside the public argument, so it now reaches the banner. The
-general defect stands: `overshard`, `dense_cap`, `merge_threads` and
-`sample_interval` are still resolved deep inside `process_chromosome`, and none
-of them appears in the banner at all.
+into `lib.rs` beside the public argument, so it now reaches the banner — as does
+`overshard` (`lib.rs:300`, logged at `lib.rs:337`).
+
+The general defect stands, in two forms. `dense_cap` (`orchestrator.rs:456`),
+`merge_threads` (`orchestrator.rs:1130`) and `sample_interval`
+(`monitor.rs:181`) are still resolved deep inside `process_chromosome` and
+appear in no banner at all. And the three banners disagree about what they
+report: the VCF one logs ten fields, the PGEN one three
+(`concurrent_chroms`, `reader_workers`, `processing_threads`), and the SVAR1 one
+two (`concurrent_chroms`, `processing_threads`). None of them distinguishes a
+value the caller asked for from one the planner chose, which is the distinction
+that would have ended the misdiagnosis in minutes.
 
 **It is a second, competing configuration channel.** Where a Python argument and
 an environment variable both exist (`reader_workers`, `log_level`), the
@@ -149,15 +157,31 @@ alongside the plan, before any thread spawns, and passed down as data. The late
 reads inside `process_chromosome` (`orchestrator.rs:456`, `:1130`) and
 `monitor.rs:181` are deleted.
 
-**The banner reports every field and its source.** `pipeline config` currently
-logs `concurrent_chroms`, `reader_workers` and `processing_threads`. It gains the
-remaining resolved fields, each tagged `explicit` or `planner`:
+**The banner reports every field and its source.** The three `pipeline config`
+lines converge on one shape: every applicable `Tuning` field, each tagged
+`explicit` or `planner`, alongside the derived values each already reports. A
+field the backend cannot use is omitted rather than printed as a misleading
+default — the PGEN line carries no `overshard`, the SVAR1 line no
+`reader_workers`. The VCF line keeps its existing derived fields
+(`planned_units`, `pending_budget_mb`, `sharded_vcf_active`, `exact_counts`,
+`htslib_threads`, `monolithic_reader_active`), which are diagnostics rather than
+knobs and stay untagged:
 
 ```
-pipeline config concurrent_chroms=2(explicit) reader_workers=20(explicit)
-  overshard=40(explicit) dense_cap=6(planner) merge_threads=12(planner)
-  sample_interval=5(planner) processing_threads=12
+pipeline config concurrent_chroms=2 concurrent_chroms_src=explicit
+  reader_workers=20 reader_workers_src=explicit
+  overshard=40 overshard_src=explicit
+  dense_cap=6 dense_cap_src=planner
+  merge_threads=12 merge_threads_src=planner
+  sample_interval=5 sample_interval_src=planner
+  processing_threads=12 planned_units=160 ...
 ```
+
+The provenance rides in a sibling `<field>_src` field rather than a parenthetical
+inside the value, because `tracing`'s field values must stay scalars for the
+structured channel, and because every existing consumer — `probe.py`, the #174
+banner assertions — already parses this line as flat `key=value` pairs. A
+parenthetical would force all of them to learn a new value grammar.
 
 With no channel able to override a value after it is printed, the line is correct
 by construction rather than by maintenance. This is the specific request made on
