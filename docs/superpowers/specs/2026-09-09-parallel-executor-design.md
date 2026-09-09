@@ -1,8 +1,17 @@
 # A deterministic parallel executor for cohort-width conversion
 
-Status: approved design, revised after adversarial code review; not yet implemented.
+Status: design revised after adversarial code review. **On hold pending #177** —
+not ready to plan or implement.
 Issue: [#176](https://github.com/d-laub/genoray/issues/176).
+Blocked on: [#177](https://github.com/d-laub/genoray/issues/177) (`by_scan`
+blocked-serial rewrite), which ships first and may reduce or eliminate the need
+for this change. Re-argue before planning.
 Depends on: the `Tuning` API (`2026-09-08-explicit-tuning-api-design.md`), unmerged.
+Open question, unanswered: whether the reporting workload passes
+`format_fields=` — asked on
+[#176](https://github.com/d-laub/genoray/issues/176#issuecomment-5609722914). If
+it does, `route_variants`' `O(V_dense × S × F)` second pass caps both #177 and
+this change, and the ordering above has to change.
 
 ## Problem
 
@@ -100,26 +109,38 @@ N times per chunk, and multiply the dense-queue fan-out. Slicing inside one
 executor gets the same near-linear scaling on the per-sample work with none of
 that.
 
-### Do the serial win first
+### The serial win ships first, as #177
 
-Before any fan-out, restructure `by_scan`'s loop to be **64-column-block outer,
-variant inner**, testing one `u64` word per (variant, block) and skipping it
-whole when zero, then emitting per column within the block.
-`bits::for_each_set_bit` (`bits.rs:79`) already implements exactly that
-scan-and-skip idiom over a contiguous window.
+Restructuring `by_scan`'s loop to **64-column-block outer, variant inner** is
+worth an estimated 39–63× on its own — larger than any plausible `exec_workers`,
+and it composes with the fan-out. It is split out as
+[#177](https://github.com/d-laub/genoray/issues/177) and **ships before this
+design**, which carries two consequences for this document:
 
-Work per chunk drops from `V × columns` bit tests (5.36 × 10⁹) to
-`V × columns/64` word loads (83.7 × 10⁶) plus one extraction per set bit. The
-number of *nonzero* words per variant is ≈ its allele count for any variant with
-`x ≪ columns/64` (16,739 at AoU width) — i.e. for the overwhelming majority of a
-biobank cohort's variants. Expected serial win: order 60×, which is larger than
-any plausible `exec_workers` and composes with it. Common variants gain nothing
-(their words are mostly nonzero) but they route Dense and cost O(x) either way.
+1. **`r(S)` cannot be fitted until #177 lands.** Fitting an executor/reader cost
+   ratio against a loop that is about to be replaced fits the wrong constant.
+   Every number in "Thread budget" is downstream of a post-#177 measurement.
+2. **The fan-out's remaining value is unknown until then.** If #177 lands near
+   the top of its range, the executor may no longer be the binding constraint at
+   cohort width, and the `e`-derivation below must be re-argued — possibly down
+   to "not worth building". This spec does not assume it survives.
 
-**This is a prerequisite measurement, not an optional extra.** The bench in
-"Measurement" runs the blocked-serial arm first; if it lands near 60×, the
-fan-out's remaining value is much smaller than this document assumes and the
-`e`-derivation below should be re-argued before it ships.
+The restructure's design detail that matters here, because it is easy to get
+wrong: **bucket by column within each block**. The obvious alternative — keep
+the block's nonzero `(v, mask)` list and test each of the 64 columns against it
+— degrades to the current cost as allele frequency rises, because the nonzero
+list stops being short:
+
+| alt-allele freq | naive per-column test | bucketed |
+|---|---|---|
+| 0.01 % | 45× | **63×** |
+| 0.1 %  | 13× | **59×** |
+| 1 %    | **1.5×** | **39×** |
+
+Note also that `bits::for_each_set_bit` (`bits.rs:79`) is the right *idiom* but
+not directly reusable: it is byte-based over `&[u8]`, while `by_scan` reads
+`BitGrid3::words: Vec<u64>`. And rows are **not** word-aligned —
+`1,071,324 % 64 = 28` — so the window extraction needs a funnel shift. See #177.
 
 ## Determinism
 
@@ -531,11 +552,17 @@ No 535k-sample corpus is needed, and none should be built. A standalone bench
 frequency — and calls the emission path under test. This isolates the executor
 exactly, runs in seconds, and is the same seam the production path uses.
 
-Arms, in this order (the first two decide whether the third is worth shipping):
+Arms, in this order. **Arms 1–2 belong to [#177](https://github.com/d-laub/genoray/issues/177)
+and land with it**; they are listed here because their results are this design's
+inputs, not because this change produces them. Arms 3–4 only run once arms 1–2
+have, and arm 2's result decides whether they are worth running at all.
 
 1. **`by_scan`, today's loop, e = 1.** Establishes the baseline and checks the
    1.6 ms/variant arithmetic in the Problem section against a real number.
-2. **`by_scan`, blocked-serial rewrite, e = 1.** The ~60× claim.
+   (#177)
+2. **`by_scan`, blocked-serial rewrite, e = 1.** The 39–63× claim, across the
+   alt-frequency range — a single frequency cannot distinguish the bucketed
+   rewrite from the naive one. (#177)
 3. **`by_scan`, blocked-serial, e ∈ {1, 2, 4, 8, 16}.** The fan-out.
 4. **Carrier arm, shared vs per-slice counting sort, e ∈ {1, 2, 4, 8}.** Separates
    the cache effect from the core count.
