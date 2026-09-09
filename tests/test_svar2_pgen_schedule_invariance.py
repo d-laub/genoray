@@ -103,6 +103,15 @@ def _convert(pgen, out, cc, monkeypatch):
     return _oracle.store_digest(out)
 
 
+# TODO(Task 8): this test currently passes VACUOUSLY, exactly like its VCF
+# sibling in `test_svar2_schedule_invariance.py`. `_convert` pins the schedule
+# with `GENORAY_CONCURRENT_CHROMS`, which no longer does anything, so every
+# entry in `SCHEDULES` runs the SAME schedule and the digests match trivially.
+# It must be rebuilt on `tuning=Tuning(concurrent_chroms=cc)` (note: PGEN does
+# not accept `reader_workers`, and passing it now raises) AND given a self-guard
+# asserting the schedules actually differed -- read `concurrent_chroms=` off the
+# `pipeline config` banner with `capfd`. Without the guard it will keep proving
+# nothing quietly, which is how this decay went unnoticed in the first place.
 def test_digest_is_invariant_across_schedules(multi_contig_pgen, tmp_path, monkeypatch):
     digests = {}
     outs = {}

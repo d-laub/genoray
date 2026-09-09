@@ -278,6 +278,7 @@ fn run_conversion_pipeline(
                 n_samples: samples.len(),
                 chunk_bytes,
                 max_mem_bytes,
+                concurrent_chroms: requested.concurrent_chroms,
                 reader_workers: requested.reader_workers,
                 ram: crate::budget::RamLaw::VCF,
             });
@@ -288,12 +289,11 @@ fn run_conversion_pipeline(
 
             let plan = crate::budget::plan_thread_budget(available_cores, chroms.len());
             let htslib_threads = plan.htslib_threads; // monolithic path only
-            // An explicit `concurrent_chroms` is honoured; `plan_sharded` has
-            // already refused it against `max_mem` if it did not fit.
-            let concurrent_chroms = requested
-                .concurrent_chroms
-                .unwrap_or(sharded.concurrent_chroms)
-                .max(1);
+            // The plan already carries an explicit `concurrent_chroms`,
+            // honoured or refused against `max_mem` by `plan_sharded` itself.
+            // Overriding it here instead would skip that check -- and leave
+            // `reader_workers` sized for a concurrency that is not running.
+            let concurrent_chroms = sharded.concurrent_chroms;
             let reader_workers = sharded.reader_workers;
             // Resolve now, finish later: `plan_unit_count` and
             // `SourceSpec::Vcf` need `overshard` before `processing_threads`
@@ -613,12 +613,14 @@ fn run_pgen_conversion_pipeline(
             // reader_workers = 1: from_pgen pins P = 1, so a contig's demand
             // is exactly one executor plus one pgenlib reader -- which is
             // what plan_sharded's `1 + reader_workers` already models.
+            let requested = tuning.unwrap_or_default();
             let sharded = crate::budget::plan_sharded(crate::budget::PlanInputs {
                 usable_cores: available_cores.saturating_sub(1).max(1),
                 n_contigs: jobs.len(),
                 n_samples: samples.len(),
                 chunk_bytes,
                 max_mem_bytes,
+                concurrent_chroms: requested.concurrent_chroms,
                 reader_workers: Some(1),
                 ram: crate::budget::RamLaw::PGEN,
             });
@@ -626,23 +628,19 @@ fn run_pgen_conversion_pipeline(
                 Ok(p) => p,
                 Err(e) => return vec![Err(crate::error::ConversionError::from(e))],
             };
-            let requested = tuning.unwrap_or_default();
-            // Cap the PLAN at the measured knee. `processing_threads_for`
-            // below still consumes this final `concurrent_chroms`, so the
-            // merge tail stays sized against what is actually dispatched.
-            // Floored at 1 as well as capped: `ThreadPoolBuilder::num_threads(0)`
-            // means "use the global default", not "run serially", so a zero
-            // here would silently oversubscribe instead of serializing.
-            let planned = sharded
-                .concurrent_chroms
-                .clamp(1, crate::budget::PGEN_MAX_CONCURRENT);
-            // An explicit `concurrent_chroms` is honoured PAST the measured
-            // knee (only warned about): clamping the escape hatch would make
-            // the constant unfalsifiable, which is why the env-var predecessor
-            // of this knob was also applied after the cap.
+            // `processing_threads_for` below consumes this final
+            // `concurrent_chroms`, so the merge tail stays sized against what
+            // is actually dispatched.
             let concurrent_chroms = match requested.concurrent_chroms {
-                Some(cc) => {
-                    let cc = cc.max(1);
+                // An explicit `concurrent_chroms` is honoured PAST the measured
+                // knee (only warned about): clamping the escape hatch would
+                // make the constant unfalsifiable, which is why the env-var
+                // predecessor of this knob was also applied after the cap.
+                // `max_mem` is the one bound that still refuses it, in
+                // `plan_sharded` -- a hard ceiling, where the knee is a
+                // measured shape.
+                Some(_) => {
+                    let cc = sharded.concurrent_chroms;
                     if cc > crate::budget::PGEN_MAX_CONCURRENT {
                         tracing::warn!(
                             concurrent_chroms = cc,
@@ -654,7 +652,13 @@ fn run_pgen_conversion_pipeline(
                     }
                     cc
                 }
-                None => planned,
+                // Floored at 1 as well as capped:
+                // `ThreadPoolBuilder::num_threads(0)` means "use the global
+                // default", not "run serially", so a zero here would silently
+                // oversubscribe instead of serializing.
+                None => sharded
+                    .concurrent_chroms
+                    .clamp(1, crate::budget::PGEN_MAX_CONCURRENT),
             };
             let processing_threads = crate::budget::processing_threads_for(
                 available_cores.saturating_sub(1).max(1),

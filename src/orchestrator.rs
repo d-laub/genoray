@@ -1323,7 +1323,11 @@ pub fn run_vcf_list(
     // `processing_threads` is consumed here.
     let plan = crate::budget::plan_thread_budget(available_cores, VCF_LIST_CONCURRENT_CHROMS);
     let processing_threads = plan.processing_threads;
-    tracing::info!(threads = processing_threads, "pipeline configured");
+    // No separate "pipeline configured" line: it carried only
+    // `processing_threads`, which the banner below now reports as
+    // `merge_threads` with its provenance -- and "pipeline configured" is a
+    // prefix of "pipeline config", so a banner parser scanning for the first
+    // match would have found this line instead of the banner.
     // No `reader_workers` here (single-reader sequential loop below), so
     // resolve against a nominal 1.
     let resolved = requested
