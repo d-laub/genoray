@@ -8,7 +8,6 @@ misdiagnosis on genoray 4.0.1 (PR #174).
 
 from __future__ import annotations
 
-import re
 import subprocess
 from pathlib import Path
 
@@ -20,7 +19,7 @@ REPO = Path(__file__).resolve().parents[1]
 # configuration. Nothing else in src/ may read the environment.
 _ALLOWED = {"src/svar1_reader.rs"}
 
-_ENV_READ = re.compile(r"std::env::var|env::var_os|std::env::var_os")
+_ENV_READ = r"std::env::var|env::var_os"
 
 
 def _rg(pattern: str, *paths: str) -> list[str]:
@@ -38,7 +37,7 @@ def _rg(pattern: str, *paths: str) -> list[str]:
 def test_no_environment_reads_in_rust_sources():
     offenders = [
         line
-        for line in _rg(r"std::env::var|env::var_os", "src")
+        for line in _rg(_ENV_READ, "src")
         if not any(line.startswith(allowed) for allowed in _ALLOWED)
     ]
     assert offenders == [], (
