@@ -7,11 +7,12 @@ Blocked on: [#177](https://github.com/d-laub/genoray/issues/177) (`by_scan`
 blocked-serial rewrite), which ships first and may reduce or eliminate the need
 for this change. Re-argue before planning.
 Depends on: the `Tuning` API (`2026-09-08-explicit-tuning-api-design.md`), unmerged.
-Open question, unanswered: whether the reporting workload passes
-`format_fields=` — asked on
-[#176](https://github.com/d-laub/genoray/issues/176#issuecomment-5609722914). If
-it does, `route_variants`' `O(V_dense × S × F)` second pass caps both #177 and
-this change, and the ordering above has to change.
+Precondition, **answered and satisfied**: the reporting workload passes neither
+`format_fields=` nor `info_fields=` — confirmed by the reporter on
+[#176](https://github.com/d-laub/genoray/issues/176#issuecomment-5609722914).
+`route_variants`' second pass is therefore the `O(V)` arm, not the
+`O(V_dense × S × F)` one, so it caps neither #177 nor this change and the
+ordering above stands.
 
 ## Problem
 
@@ -345,9 +346,13 @@ V_dense = 100/chunk, F = 2 that is 1.07 × 10⁸ `resolve_format`/`is_carrier` c
 per chunk (~0.5–2 s), and it becomes the Amdahl term that caps this whole change.
 
 **Precondition, stated up front:** the speedup this design claims holds for
-conversions that request **no FORMAT fields**. Confirm against the target run's
-`format_fields` before promising a number. Slicing that pass is a different
-change (variant-major output layout); spun out as a follow-up.
+conversions that request **no FORMAT fields**. For #176's target run this is
+**confirmed satisfied** — the reporter passes neither `format_fields=` nor
+`info_fields=`
+([comment](https://github.com/d-laub/genoray/issues/176#issuecomment-5609722914)).
+It remains a precondition for anyone else quoting the number: confirm against
+that run's `format_fields` first. Slicing the pass is a different change
+(variant-major output layout); spun out as a follow-up.
 
 Other per-chunk work that scales with `columns` rather than `V`, checked and
 found benign: `sub.geno_bits = vec![0u8; bits.div_ceil(8)]` (`rvk.rs:396`) is
@@ -641,8 +646,8 @@ exposure is the FORMAT-heavy configuration: with FORMAT fields requested, the
 serial second pass dominates (see "The serial remainder") and every equivalence
 test still passes while the change delivers no speedup at all. That is a
 *performance* regression in expectation, not correctness, and only the
-`format_fields` precondition check catches it. Confirm it against the target run
-before promising a number.
+`format_fields` precondition check catches it. Confirmed clear for #176's target
+run; re-confirm before quoting the number for any other workload.
 
 ## Follow-up issues to open
 
