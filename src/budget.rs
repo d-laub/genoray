@@ -152,7 +152,17 @@ pub fn plan_thread_budget(available_cores: usize, n_chroms: usize) -> ThreadPlan
 
 /// Cores left idle after `concurrent` chroms each claim the pipeline threads plus
 /// `htslib` decode threads. Floored at 1 so the processing pool always builds.
-fn processing_threads(usable_cores: usize, concurrent: usize, htslib: usize) -> usize {
+///
+/// `pub(crate)` so a caller that overrides the planner's `concurrent_chroms`
+/// can re-size the merge tail against the concurrency it actually dispatches,
+/// using this exact formula rather than a second copy of it. Passing the
+/// planner's own `concurrent_chroms` reproduces `ThreadPlan::processing_threads`
+/// exactly, so recomputing unconditionally is safe.
+///
+/// This is the MONOLITHIC-reader shape (`PIPELINE_THREADS_PER_CHROM` + htslib
+/// decode threads per contig). The sharded VCF path bills readers instead and
+/// uses [`processing_threads_for`]; the two are not interchangeable.
+pub(crate) fn processing_threads(usable_cores: usize, concurrent: usize, htslib: usize) -> usize {
     let active = concurrent * (PIPELINE_THREADS_PER_CHROM + htslib);
     usable_cores.saturating_sub(active).max(1)
 }

@@ -1280,6 +1280,12 @@ pub fn run_vcf_list(
     // `SourceSpec::VcfList` so non-member files are never opened for that contig
     // (issue #122).
     contig_membership: Vec<Vec<bool>>,
+    // The caller's tuning request. This pipeline is sequential (no
+    // `concurrent_chroms` to honour) and has no separate reader-worker pool
+    // (no `reader_workers`/`overshard` to honour either) -- only
+    // `dense_cap`/`merge_threads`/`sample_interval` apply, matching
+    // `_APPLICABLE["vcf_list"]` in `python/genoray/_tuning.py`.
+    requested: crate::tuning::TuningIn,
     sink: &crate::logging::EventSink,
 ) -> Result<u64, ConversionError> {
     if contig_membership.len() != chroms.len() {
@@ -1318,14 +1324,20 @@ pub fn run_vcf_list(
     let plan = crate::budget::plan_thread_budget(available_cores, VCF_LIST_CONCURRENT_CHROMS);
     let processing_threads = plan.processing_threads;
     tracing::info!(threads = processing_threads, "pipeline configured");
-    // TODO(Task 6): resolve from the caller's `TuningIn` instead of a
-    // default -- this placeholder just threads the new parameter through so
-    // the pipeline compiles against `ResolvedTuning`. No `reader_workers`
-    // here (single-reader sequential loop below), so resolve against a
-    // nominal 1.
-    let tuning = crate::tuning::TuningIn::default()
+    // No `reader_workers` here (single-reader sequential loop below), so
+    // resolve against a nominal 1.
+    let resolved = requested
         .resolve(VCF_LIST_CONCURRENT_CHROMS, 1)
         .with_merge_threads(processing_threads);
+    tracing::info!(
+        dense_cap = resolved.dense_cap,
+        dense_cap_src = resolved.dense_cap_src(),
+        merge_threads = resolved.merge_threads,
+        merge_threads_src = resolved.merge_threads_src(),
+        sample_interval = resolved.sample_interval,
+        sample_interval_src = resolved.sample_interval_src(),
+        "pipeline config (VCF list)"
+    );
 
     let fasta_ref = reference_path;
     let mut total_dropped: u64 = 0;
@@ -1349,7 +1361,7 @@ pub fn run_vcf_list(
             skip_out_of_scope,
             check_ref,
             processing_threads,
-            tuning,
+            resolved,
             signatures,
             &fields,
             sink,

@@ -110,6 +110,13 @@ def _convert(vcf, out, cc, w, monkeypatch):
     return _oracle.store_digest(out)
 
 
+# TODO(Task 8): this test currently passes VACUOUSLY. `_convert` pins the
+# schedule with `GENORAY_CONCURRENT_CHROMS`/`GENORAY_READER_WORKERS`, which no
+# longer do anything, so every row in `SCHEDULES` runs the SAME schedule and
+# the digests match trivially. It must be rebuilt on `tuning=Tuning(...)` and
+# given the same self-guard as
+# `test_digest_is_invariant_across_frontier_granularities` -- assert the
+# schedules actually differed -- or it will keep proving nothing quietly.
 def test_digest_is_invariant_across_schedules(multi_contig_vcf, tmp_path, monkeypatch):
     digests = {}
     outs = {}
@@ -149,6 +156,16 @@ def test_max_mem_too_small_raises_rather_than_writing_an_empty_store(
     assert not out.exists(), "a rejected max_mem budget must not create the store dir"
 
 
+@pytest.mark.xfail(
+    reason=(
+        "Pins its schedule with GENORAY_READER_WORKERS/GENORAY_CONCURRENT_CHROMS, "
+        "which are now no-ops, so chunk_size no longer moves planned_units and "
+        "the test's own self-guard fires. Task 8 rebuilds it on tuning=Tuning(...), "
+        "which needs the public tuning= kwarg from Task 7 to exist first. "
+        "strict=True so Task 8 must delete this marker rather than inherit it."
+    ),
+    strict=True,
+)
 def test_digest_is_invariant_across_frontier_granularities(
     multi_contig_vcf, tmp_path, monkeypatch, capfd
 ):

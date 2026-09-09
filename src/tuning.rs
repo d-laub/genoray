@@ -93,6 +93,21 @@ impl TuningIn {
 }
 
 impl PartialTuning {
+    /// The resolved shard-oversubscription factor.
+    ///
+    /// Exposed before `with_merge_threads` because the VCF path needs it to
+    /// size `plan_unit_count` and `SourceSpec::Vcf`, and that sizing feeds
+    /// `processing_threads` -- which `with_merge_threads` in turn requires.
+    /// Reading it here is what stops the caller re-deriving `resolve`'s own
+    /// formula and letting the two drift, which would make the `pipeline
+    /// config` banner report a shard count the pipeline never used.
+    ///
+    /// Only `overshard` is exposed: it is the sole knob resolved in phase one
+    /// that a caller must act on before phase two.
+    pub fn overshard(&self) -> usize {
+        self.overshard
+    }
+
     /// Supply the planner's `processing_threads` and finish the resolution.
     ///
     /// An explicit request wins; otherwise `planner_default` is used, floored at

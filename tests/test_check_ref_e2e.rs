@@ -178,6 +178,7 @@ fn vcf_list_ref_mismatch_excluded_under_x() {
         Vec::new(),                                 // region_ranges
         genoray_core::svar2_view::OverlapMode::Pos, // overlap
         vec![vec![true; 2]; 1],                     // contig_membership: both files carry chr1
+        genoray_core::tuning::TuningIn::default(),
         &genoray_core::logging::EventSink::disabled(),
     )
     .unwrap();

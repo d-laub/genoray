@@ -25,6 +25,7 @@ from genoray._svar2_fields import (
 )
 from genoray._svar2_mutcat import _MutcatMixin
 from genoray._svar2_ops import Mode, _assert_concat_compatible, _load_meta, _write_store
+from genoray._tuning import Tuning
 from genoray._utils import (
     BGZF_VCF_SUFFIXES,
     detect_memory_budget,
@@ -916,7 +917,15 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
                 region_ranges,
                 regions_overlap,
                 max_mem_bytes,
-                reader_workers=reader_workers,
+                # `run_conversion_pipeline` takes `reader_workers` inside its
+                # `tuning=` argument now (Task 6); the public `reader_workers=`
+                # parameter above is unchanged (Task 7 replaces it with a
+                # `tuning=` parameter across all five `from_*` methods).
+                tuning=(
+                    Tuning(reader_workers=reader_workers)
+                    if reader_workers is not None
+                    else None
+                ),
                 log_level=level,
                 receiver=rx,
             )
