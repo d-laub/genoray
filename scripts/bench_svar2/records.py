@@ -64,11 +64,13 @@ class SweepPoint:
     corpus: str
     reader_workers: int
     concurrent_chroms: int | None
-    # VESTIGIAL: no Rust code reads `GENORAY_SHARD_HTSLIB` any more --
+    # VESTIGIAL: no code path has ever read this field's value -- it once
+    # corresponded to a `shard_htslib` environment override, but
     # `src/orchestrator.rs` binds `shard_htslib` from the compile-time
-    # constant `budget::SHARDED_VCF_HTSLIB_THREADS_PER_READER`, not the
-    # environment, so this field no longer controls anything a probe run
-    # does. Kept anyway, unused, because `point_id` hashes
+    # constant `budget::SHARDED_VCF_HTSLIB_THREADS_PER_READER`, not any
+    # runtime channel, so it never controlled anything a probe run does, even
+    # before the environment-variable interface was removed entirely. Kept
+    # anyway, unused, because `point_id` hashes
     # `dataclasses.asdict(self)` with `sort_keys=True` over ALL fields:
     # removing it would change `point_id` for every point, historical and
     # new, and silently invalidate `sweep.py`'s resume-by-`(point_id,
@@ -169,6 +171,20 @@ class ProbeRecord:
     # fact, which is what would have let the 2026-08-07 audit attribute rows
     # to jobs without `cmp`-ing against an older file.
     run_id: str = ""
+    # `{knob: "explicit"|"planner"}`, parsed off the `pipeline config`
+    # banner's `<field>_src=` tags (see `probe.RE_FIELD_SRC`). A sweep row
+    # that reports e.g. `reader_workers=16` without saying whether the sweep
+    # pinned it or the planner chose it is exactly the ambiguity the
+    # `Tuning` API exists to remove -- this project has already published
+    # and retracted findings that came from misreading which configuration
+    # actually ran. Whatever `_src` keys the banner emits land here verbatim,
+    # so a knob added later is recorded without a matching change to this
+    # schema or to `probe.py`.
+    #
+    # Defaulted to `{}` (via `field`, not a bare `{}` default -- dataclasses
+    # forbid mutable defaults) so pre-existing rows without this field still
+    # load.
+    tuning_src: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
