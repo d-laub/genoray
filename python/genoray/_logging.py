@@ -9,9 +9,9 @@ from rich.console import Console
 from rich.progress import BarColumn, Progress, TaskID, TextColumn, TimeElapsedColumn
 
 LOG_LEVELS = ("off", "critical", "error", "warning", "info", "debug")
-LogLevel = Literal["off", "critical", "error", "warning", "info", "debug"]
-# What `parse_log_level` returns. Narrower than `LogLevel`: "critical" is an
-# accepted input spelling but never an output, since it canonicalizes to "error".
+# What `parse_log_level` returns. Narrower than the full `LOG_LEVELS` input
+# set: "critical" is an accepted input spelling but never an output, since it
+# canonicalizes to "error".
 CanonicalLogLevel = Literal["off", "error", "warning", "info", "debug"]
 
 # What Rust's `level_rank` understands. "critical" is an accepted spelling but
