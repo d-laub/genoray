@@ -9,7 +9,10 @@ from typing import Annotated, Any, Callable, Literal
 import polars as pl
 from cyclopts import App, Parameter, validators
 
+from genoray._logging import parse_log_level
 from genoray._svar2_ops import Mode
+
+from ._tuning_flags import ConcurrentTuningFlags, VcfTuningFlags
 
 app = App(
     help_on_error=True,
@@ -17,6 +20,21 @@ app = App(
     version_format="rich",
     help="Tools for genoray, including SVAR files.",
 )
+
+
+def _validate_log_level(_type: Any, value: str) -> None:
+    """Cyclopts parameter validator for ``--log-level``.
+
+    ``parse_log_level`` (`genoray._logging`) is the single validator for
+    accepted level names; this just forwards to it so a typo like
+    ``--log-level warn`` is rejected at argument-parsing time instead of
+    surfacing deep inside the write pipeline. `log_level` is widened to plain
+    `str` (rather than a `Literal`) because `parse_log_level` also accepts
+    `logging` integer constants for the Python API -- but the CLI only ever
+    hands it text, so `str | int` here would just invite cyclopts to guess at
+    coercion.
+    """
+    parse_log_level(value)
 
 
 @app.command
@@ -113,7 +131,7 @@ def write_vcf(
     ploidy: int = 2,
     chunk_size: int | None = None,
     threads: Annotated[int | None, Parameter(name=["--threads", "-@"])] = None,
-    reader_workers: Annotated[int | None, Parameter(name="--reader-workers")] = None,
+    flags: VcfTuningFlags = VcfTuningFlags(),
     long_allele_capacity: int = 8 * 1024 * 1024,
     overwrite: bool = False,
     skip_symbolics_and_breakends: Annotated[
@@ -124,8 +142,9 @@ def write_vcf(
         bool, Parameter(name="--progress", negative="--no-progress")
     ] = False,
     log_level: Annotated[
-        Literal["off", "warning", "info", "debug"], Parameter(name="--log-level")
+        str, Parameter(name="--log-level", validator=_validate_log_level)
     ] = "info",
+    log_filter: Annotated[str | None, Parameter(name="--log-filter")] = None,
 ) -> None:
     """Convert a bgzipped VCF or BCF (or a directory/manifest of single-sample VCFs/BCFs) to an SVAR2 store.
 
@@ -166,7 +185,11 @@ def write_vcf(
         ploidy: Ploidy of the samples. Default 2.
         chunk_size: Variants per conversion chunk. Defaults to 25000.
         threads: Number of threads. Defaults to all available cores.
-        reader_workers: Independent shard readers per concurrent contig. Omit (None) to let the planner derive it from the core budget; values below 1 are rejected. Single-file input only.
+        flags: Scheduling knobs shared by every write command, plus (single-file
+            input only) ``--reader-workers`` (independent shard readers per
+            concurrent contig) and ``--overshard`` (work units per reader). Omit
+            any flag (leave it unset) to let the planner derive it; values below
+            each knob's minimum are rejected. See :class:`genoray.Tuning`.
         long_allele_capacity: Advanced: byte budget for the streaming long-allele buffer.
         overwrite: Overwrite the output directory if it exists.
         skip_symbolics_and_breakends: Drop records whose ALT is symbolic (``<DEL>``, ``<INS>``, …) or a
@@ -179,13 +202,16 @@ def write_vcf(
             offending record and continues. Mirrors ``bcftools norm --check-ref``.
         progress: If set, show live write progress (a ``rich`` bar in a terminal, compact
             heartbeat lines otherwise).
-        log_level: Minimum severity for write-time log lines: ``off``, ``warning``,
-            ``info`` (default), or ``debug``. Overridden by the ``GENORAY_LOG`` env var
-            when set to one of the same values.
+        log_level: Minimum severity for write-time log lines: ``off``, ``critical``,
+            ``error``, ``warning``, ``info`` (default), or ``debug`` (case-insensitive).
+        log_filter: Advanced: a ``tracing``-style per-target filter directive (e.g.
+            ``genoray::monitor=trace``), applied on top of ``--log-level``.
     """
-    from genoray import SparseVar2
+    from genoray import SparseVar2, Tuning
     from genoray._svar2_fields import _parse_cli_field_specs
     from genoray._utils import is_bgzf_vcf
+
+    tuning: Tuning = flags.to_tuning()
 
     regions_arg, samples_arg = _resolve_regions_samples(
         regions=regions,
@@ -211,12 +237,7 @@ def write_vcf(
                 "--samples is not supported for multi-file (vcf-list) input; "
                 "each input file contributes its own sample."
             )
-        if reader_workers is not None:
-            raise ValueError(
-                "--reader-workers is not supported for multi-file (vcf-list) "
-                "input; that path uses one reader per contig and does not "
-                "shard within a contig."
-            )
+        tuning._check_backend("vcf_list")
         dropped = SparseVar2.from_vcf_list(
             out,
             source,
@@ -229,6 +250,7 @@ def write_vcf(
             ploidy=ploidy,
             chunk_size=chunk_size if chunk_size is not None else 25_000,
             threads=threads,
+            tuning=tuning,
             overwrite=overwrite,
             long_allele_capacity=long_allele_capacity,
             info_fields=info_fields,
@@ -236,6 +258,7 @@ def write_vcf(
             check_ref=check_ref,
             progress=progress,
             log_level=log_level,
+            log_filter=log_filter,
         )
     else:
         dropped = SparseVar2.from_vcf(
@@ -251,7 +274,7 @@ def write_vcf(
             ploidy=ploidy,
             chunk_size=chunk_size if chunk_size is not None else 25_000,
             threads=threads,
-            reader_workers=reader_workers,
+            tuning=tuning,
             overwrite=overwrite,
             long_allele_capacity=long_allele_capacity,
             info_fields=info_fields,
@@ -259,6 +282,7 @@ def write_vcf(
             check_ref=check_ref,
             progress=progress,
             log_level=log_level,
+            log_filter=log_filter,
         )
     if skip_out_of_scope:
         print(f"Dropped {dropped} out-of-scope (symbolic/breakend) ALT alleles.")
@@ -295,6 +319,7 @@ def write_pgen(
     chunk_size: int | None = None,
     max_mem: Annotated[str | None, Parameter(name="--max-mem")] = None,
     threads: Annotated[int | None, Parameter(name=["--threads", "-@"])] = None,
+    flags: ConcurrentTuningFlags = ConcurrentTuningFlags(),
     long_allele_capacity: int = 8 * 1024 * 1024,
     overwrite: bool = False,
     skip_symbolics_and_breakends: Annotated[
@@ -305,8 +330,9 @@ def write_pgen(
         bool, Parameter(name="--progress", negative="--no-progress")
     ] = False,
     log_level: Annotated[
-        Literal["off", "warning", "info", "debug"], Parameter(name="--log-level")
+        str, Parameter(name="--log-level", validator=_validate_log_level)
     ] = "info",
+    log_filter: Annotated[str | None, Parameter(name="--log-filter")] = None,
 ) -> None:
     """Convert a PLINK2 PGEN to an SVAR2 store.
 
@@ -348,6 +374,8 @@ def write_pgen(
             no readable ``/proc/meminfo``, e.g. on macOS), a warning is issued and
             planning falls back to core-count only.
         threads: Number of threads. Defaults to all available cores.
+        flags: Scheduling knobs shared by every write command, plus
+            ``--concurrent-chroms``. See :class:`genoray.Tuning`.
         long_allele_capacity: Advanced: byte budget for the streaming long-allele buffer.
         overwrite: Overwrite the output directory if it exists.
         skip_symbolics_and_breakends: Drop records whose ALT is symbolic (``<DEL>``, ``<INS>``, …) or a
@@ -358,11 +386,18 @@ def write_pgen(
             offending record and continues. Mirrors ``bcftools norm --check-ref``.
         progress: If set, show live write progress (a ``rich`` bar in a terminal, compact
             heartbeat lines otherwise).
-        log_level: Minimum severity for write-time log lines: ``off``, ``warning``,
-            ``info`` (default), or ``debug``. Overridden by the ``GENORAY_LOG`` env var
-            when set to one of the same values.
+        log_level: Minimum severity for write-time log lines: ``off``, ``critical``,
+            ``error``, ``warning``, ``info`` (default), or ``debug`` (case-insensitive).
+        log_filter: Advanced: a ``tracing``-style per-target filter directive (e.g.
+            ``genoray::monitor=trace``), applied on top of ``--log-level``.
     """
-    from genoray import DosageField, SparseVar2
+    from genoray import DosageField, SparseVar2, Tuning
+
+    tuning: Tuning = flags.to_tuning()
+    # Belt-and-suspenders: `ConcurrentTuningFlags` already makes an inapplicable
+    # knob unspellable, so this should never fire. It exists to catch drift
+    # between this CLI's tiers and `Tuning._APPLICABLE`.
+    tuning._check_backend("pgen")
 
     regions_arg, samples_arg = _resolve_regions_samples(
         regions=regions,
@@ -396,12 +431,14 @@ def write_pgen(
         chunk_size=chunk_size,
         max_mem=max_mem,
         threads=threads,
+        tuning=tuning,
         overwrite=overwrite,
         long_allele_capacity=long_allele_capacity,
         dosages=dosage_specs,
         check_ref=check_ref,
         progress=progress,
         log_level=log_level,
+        log_filter=log_filter,
     )
     if skip_out_of_scope:
         print(f"Dropped {dropped} out-of-scope (symbolic/breakend) ALT alleles.")
@@ -440,6 +477,7 @@ def write_from_svar1(
     regions_overlap: Literal["pos", "record", "variant"] = "pos",
     chunk_size: int | None = None,
     threads: Annotated[int | None, Parameter(name=["--threads", "-@"])] = None,
+    flags: ConcurrentTuningFlags = ConcurrentTuningFlags(),
     long_allele_capacity: int = 8 * 1024 * 1024,
     overwrite: bool = False,
     skip_symbolics_and_breakends: Annotated[
@@ -450,8 +488,9 @@ def write_from_svar1(
         bool, Parameter(name="--progress", negative="--no-progress")
     ] = False,
     log_level: Annotated[
-        Literal["off", "warning", "info", "debug"], Parameter(name="--log-level")
+        str, Parameter(name="--log-level", validator=_validate_log_level)
     ] = "info",
+    log_filter: Annotated[str | None, Parameter(name="--log-filter")] = None,
 ) -> None:
     """Convert a SVAR1 store to an SVAR2 store.
 
@@ -484,6 +523,8 @@ def write_from_svar1(
             whole if any of its alleles truly overlaps).
         chunk_size: Variants per conversion chunk. Defaults to 25000.
         threads: Number of threads. Defaults to all available cores.
+        flags: Scheduling knobs shared by every write command, plus
+            ``--concurrent-chroms``. See :class:`genoray.Tuning`.
         long_allele_capacity: Advanced: byte budget for the streaming long-allele buffer.
         overwrite: Overwrite the output directory if it exists.
         skip_symbolics_and_breakends: Drop records whose ALT is symbolic (``<DEL>``, ``<INS>``, …) or a
@@ -494,11 +535,18 @@ def write_from_svar1(
             offending record and continues. Mirrors ``bcftools norm --check-ref``.
         progress: If set, show live write progress (a ``rich`` bar in a terminal, compact
             heartbeat lines otherwise).
-        log_level: Minimum severity for write-time log lines: ``off``, ``warning``,
-            ``info`` (default), or ``debug``. Overridden by the ``GENORAY_LOG`` env var
-            when set to one of the same values.
+        log_level: Minimum severity for write-time log lines: ``off``, ``critical``,
+            ``error``, ``warning``, ``info`` (default), or ``debug`` (case-insensitive).
+        log_filter: Advanced: a ``tracing``-style per-target filter directive (e.g.
+            ``genoray::monitor=trace``), applied on top of ``--log-level``.
     """
-    from genoray import SparseVar2
+    from genoray import SparseVar2, Tuning
+
+    tuning: Tuning = flags.to_tuning()
+    # Belt-and-suspenders: `ConcurrentTuningFlags` already makes an inapplicable
+    # knob unspellable, so this should never fire. It exists to catch drift
+    # between this CLI's tiers and `Tuning._APPLICABLE`.
+    tuning._check_backend("svar1")
 
     regions_arg, samples_arg = _resolve_regions_samples(
         regions=regions,
@@ -520,12 +568,14 @@ def write_from_svar1(
         skip_out_of_scope=skip_out_of_scope,
         chunk_size=chunk_size,
         threads=threads,
+        tuning=tuning,
         overwrite=overwrite,
         long_allele_capacity=long_allele_capacity,
         fields=[] if empty_fields else fields,
         check_ref=check_ref,
         progress=progress,
         log_level=log_level,
+        log_filter=log_filter,
     )
     if skip_out_of_scope:
         print(f"Dropped {dropped} out-of-scope (symbolic/breakend) ALT alleles.")
@@ -684,8 +734,9 @@ def view_svar2(
         bool, Parameter(name="--progress", negative="--no-progress")
     ] = False,
     log_level: Annotated[
-        Literal["off", "warning", "info", "debug"], Parameter(name="--log-level")
+        str, Parameter(name="--log-level", validator=_validate_log_level)
     ] = "info",
+    log_filter: Annotated[str | None, Parameter(name="--log-filter")] = None,
 ) -> None:
     """Write a region/sample subset of an SVAR2 store.
 
@@ -730,9 +781,10 @@ def view_svar2(
         overwrite: Overwrite the output directory if it already exists.
         threads: Number of threads. Defaults to all available CPUs.
         progress: If set, show a phase-level progress bar while writing the view.
-        log_level: Minimum severity for write-time log lines: ``off``, ``warning``,
-            ``info`` (default), or ``debug``. Overridden by the ``GENORAY_LOG`` env var
-            when set to one of the same values.
+        log_level: Minimum severity for write-time log lines: ``off``, ``critical``,
+            ``error``, ``warning``, ``info`` (default), or ``debug`` (case-insensitive).
+        log_filter: Advanced: a ``tracing``-style per-target filter directive (e.g.
+            ``genoray::monitor=trace``), applied on top of ``--log-level``.
     """
     import polars as pl
 
@@ -798,6 +850,7 @@ def view_svar2(
         threads=threads,
         progress=progress,
         log_level=log_level,
+        log_filter=log_filter,
     )
 
 

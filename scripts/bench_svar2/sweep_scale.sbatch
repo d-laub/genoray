@@ -53,8 +53,8 @@ wants() { case " $SWEEP_FAMILIES " in *" $1 "*) return 0 ;; *) return 1 ;; esac;
 CELLS=1400000000
 
 # `-@ THREADS` is the conversion's TOTAL thread budget and reader workers are
-# carved out of it (probe.py `_build_cmd` passes `--threads`, `_build_env` sets
-# GENORAY_READER_WORKERS). So threads and cpus-per-task must move together:
+# carved out of it (probe.py `_build_cmd` passes both `--threads` and
+# `--reader-workers`). So threads and cpus-per-task must move together:
 # hardcoding 48 here while lowering `--cpus-per-task` would oversubscribe the
 # allocation, and the reader knee -- which is precisely the reader-vs-executor
 # balance -- would be measured against a pool the job does not own. Deriving it

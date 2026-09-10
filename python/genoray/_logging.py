@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import threading
 import time
 from contextlib import contextmanager
@@ -9,8 +8,34 @@ from typing import Iterator, Literal
 from rich.console import Console
 from rich.progress import BarColumn, Progress, TaskID, TextColumn, TimeElapsedColumn
 
-LOG_LEVELS = ("off", "warning", "info", "debug")
-LogLevel = Literal["off", "warning", "info", "debug"]
+LOG_LEVELS = ("off", "critical", "error", "warning", "info", "debug")
+# What `parse_log_level` returns. Narrower than the full `LOG_LEVELS` input
+# set: "critical" is an accepted input spelling but never an output, since it
+# canonicalizes to "error".
+CanonicalLogLevel = Literal["off", "error", "warning", "info", "debug"]
+
+# What Rust's `level_rank` understands. "critical" is an accepted spelling but
+# not a distinct rank: `tracing` has no CRITICAL level, and no genoray call site
+# emits `error!` or `warn!` today, so it gates the same (currently empty) set as
+# "error".
+_CANONICAL: dict[str, CanonicalLogLevel] = {
+    "off": "off",
+    "critical": "error",
+    "error": "error",
+    "warning": "warning",
+    "info": "info",
+    "debug": "debug",
+}
+
+# Python `logging` integer thresholds, ascending. An integer that falls between
+# two named levels rounds UP to the more severe one, matching Python's own
+# gate: a logger set to 25 suppresses INFO (20) and admits WARNING (30).
+_INT_LEVELS: tuple[tuple[int, CanonicalLogLevel], ...] = (
+    (10, "debug"),
+    (20, "info"),
+    (30, "warning"),
+    (40, "error"),
+)
 
 _HEARTBEAT_SECS = 5.0  # min seconds between throttled % lines per contig
 
@@ -96,20 +121,48 @@ class ProgressRenderer:
             self._progress = None
 
 
-def resolve_log_level(log_level: str) -> str:
-    if log_level not in LOG_LEVELS:
-        raise ValueError(f"log_level must be one of {LOG_LEVELS}; got {log_level!r}")
-    env = os.environ.get("GENORAY_LOG", "").strip().lower()
-    if env in LOG_LEVELS:
-        return env
-    return log_level
+def parse_log_level(log_level: str | int) -> CanonicalLogLevel:
+    """Normalize a Python-convention level to the name Rust's gate understands.
+
+    Accepts the names in `LOG_LEVELS` (case-insensitive) and `logging` integer
+    constants. Returns one of "off", "error", "warning", "info", "debug".
+
+    `"warn"` is deliberately NOT accepted: `logging.warn()` was removed in
+    Python 3.13, so it is a deprecated spelling rather than a convention.
+    """
+    if isinstance(log_level, bool):  # bool is an int; nobody means this
+        raise ValueError(
+            f"log_level must not be a bool; got {log_level!r}. Pass one of "
+            f"{LOG_LEVELS} or a logging level int."
+        )
+    if isinstance(log_level, int):
+        if log_level < 0:
+            raise ValueError(
+                f"log_level as an int must be >= 0 (logging.NOTSET); got {log_level!r}"
+            )
+        if log_level == 0:
+            # logging.NOTSET means "inherit from the parent logger"; there is no
+            # parent here, so the only coherent reading is silence.
+            return "off"
+        for threshold, name in _INT_LEVELS:
+            if log_level <= threshold:
+                return name
+        return "error"  # >= CRITICAL
+    if isinstance(log_level, str):
+        canonical = _CANONICAL.get(log_level.strip().lower())
+        if canonical is not None:
+            return canonical
+    raise ValueError(
+        f"log_level must be one of {LOG_LEVELS} (case-insensitive) or a "
+        f"logging level int; got {log_level!r}"
+    )
 
 
 @contextmanager
 def write_reporting(
-    progress: bool, log_level: str
+    progress: bool, log_level: str | int
 ) -> Iterator[tuple[object | None, str]]:
-    level = resolve_log_level(log_level)
+    level = parse_log_level(log_level)
     if not progress and level == "off":
         yield None, level
         return

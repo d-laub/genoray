@@ -24,7 +24,6 @@ use std::thread;
 use crate::chunk_assembler::ChunkAssembler;
 use crate::error::ConversionError;
 use crate::shard::WorkUnit;
-use crate::trace::trace_ll;
 use crate::types::DenseChunk;
 
 #[cfg(target_os = "linux")]
@@ -357,10 +356,6 @@ pub struct ShardTotals {
 /// unit's shard-region context (see `orchestrator::with_vcf_shard_context`);
 /// this module stays backend-agnostic about how a `WorkUnit` is described.
 ///
-/// `chrom` labels the `GENORAY_TRACE` heartbeats emitted at the reader
-/// assembly and `tx_dense`-forward seams (see `trace_ll!` call sites below);
-/// it is not otherwise used when tracing is off.
-///
 /// `worker_tids` is a per-chrom registry each spawned `shard-worker-*`
 /// thread pushes its own OS TID into on startup, for `monitor.rs` to sample.
 /// A shared registry -- rather than resolving TIDs by matching the
@@ -393,7 +388,6 @@ pub struct ShardTotals {
 /// (context-decorated).
 #[allow(clippy::too_many_arguments)]
 pub fn run<F, G>(
-    chrom: &str,
     units: Vec<WorkUnit>,
     workers: usize,
     make_assembler: F,
@@ -508,12 +502,6 @@ where
                                     if cancel.load(Ordering::Relaxed) {
                                         return;
                                     }
-                                    trace_ll!(
-                                        "[trace {chrom}] reader: shard {i} assembled chunk \
-                                         (unit ordinal {}) local={local} rows={}",
-                                        unit.ordinal,
-                                        chunk.pos.len()
-                                    );
                                     if tx_res
                                         .send(Msg::Chunk {
                                             unit_ordinal: unit.ordinal,
@@ -598,9 +586,6 @@ where
                         rb.push(unit_ordinal, local, false, &mut |gid, tag| {
                             if let Some(mut c) = pending.remove(&tag) {
                                 c.chunk_id = gid;
-                                trace_ll!(
-                                    "[trace {chrom}] reader: forwarded ordinal {gid} to tx_dense"
-                                );
                                 tx_dense.send(c).ok();
                             }
                         });
@@ -621,9 +606,6 @@ where
                         rb.push(unit_ordinal, 0, true, &mut |gid, tag| {
                             if let Some(mut c) = pending.remove(&tag) {
                                 c.chunk_id = gid;
-                                trace_ll!(
-                                    "[trace {chrom}] reader: forwarded ordinal {gid} to tx_dense"
-                                );
                                 tx_dense.send(c).ok();
                             }
                         });
@@ -1166,7 +1148,6 @@ mod tests {
             thread::spawn(move || {
                 let worker_tids: Mutex<Vec<i32>> = Mutex::new(Vec::new());
                 let res = run(
-                    "chrTest",
                     units,
                     workers,
                     make_assembler,

@@ -107,12 +107,10 @@ pub mod streams;
 pub mod svar2_slice;
 #[cfg(feature = "conversion")]
 pub mod svar2_view;
-// `trace` (GENORAY_TRACE heartbeats, #135 diagnosis) is used only by the
-// conversion-side pipeline modules (shard_exec/executor/orchestrator/monitor),
-// so it's gated the same way; private like `enum_map` -- reachable crate-wide
-// as `crate::trace::...` without needing `pub`.
+// Depends on `orchestrator::{OVERSHARD_FACTOR, VCF_LIST_DENSE_CHANNEL_CAP}`,
+// which are conversion-gated, so `tuning` is gated the same way.
 #[cfg(feature = "conversion")]
-mod trace;
+pub mod tuning;
 pub mod types;
 #[cfg(feature = "conversion")]
 pub mod vcf_list_reader;
@@ -149,7 +147,7 @@ fn index_vcf(path: String) -> PyResult<()> {
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 #[pyfunction]
-#[pyo3(signature = (vcf_path, reference_path, chroms, output_dir, samples, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false, signatures=false, info_fields=Vec::new(), format_fields=Vec::new(), check_ref="e".to_string(), region_ranges=Vec::new(), regions_overlap="pos".to_string(), max_mem_bytes=None, reader_workers=None, log_level = "info".to_string(), receiver = None))]
+#[pyo3(signature = (vcf_path, reference_path, chroms, output_dir, samples, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false, signatures=false, info_fields=Vec::new(), format_fields=Vec::new(), check_ref="e".to_string(), region_ranges=Vec::new(), regions_overlap="pos".to_string(), max_mem_bytes=None, log_level = "info".to_string(), tuning=None, log_filter=None, receiver = None))]
 fn run_conversion_pipeline(
     py: Python,
     vcf_path: String,
@@ -169,8 +167,9 @@ fn run_conversion_pipeline(
     region_ranges: Vec<(String, u32, u32)>,
     regions_overlap: String,
     max_mem_bytes: Option<u64>,
-    reader_workers: Option<usize>,
     log_level: String,
+    tuning: Option<crate::tuning::TuningIn>,
+    log_filter: Option<String>,
     receiver: Option<Py<PyEventReceiver>>,
 ) -> PyResult<usize> {
     let sample_refs: Vec<&str> = samples.iter().map(|s| s.as_str()).collect();
@@ -207,7 +206,7 @@ fn run_conversion_pipeline(
     let level = log_level.clone();
 
     let results: Vec<Result<u64, crate::error::ConversionError>> = py.detach(|| {
-        crate::logging::with_channel_subscriber(sink.clone(), &level, || {
+        crate::logging::with_channel_subscriber(sink.clone(), &level, log_filter.as_deref(), || {
             // Step 1 -> HW discovery/override and budgeting
             let available_cores = match max_threads {
                 Some(t) if t > 0 => {
@@ -271,12 +270,7 @@ fn run_conversion_pipeline(
             });
             let chunk_bytes = per_variant_bytes * resident_chunk_size as u64;
 
-            // BENCH-ONLY overrides are resolved HERE, not in
-            // `process_chromosome`, so the `pipeline config` line below prints
-            // what actually ran. Before #169 the override was applied
-            // per-contig and the log printed the planner's value, making a
-            // 20-worker run indistinguishable from a 3-worker one in the logs.
-            let requested_workers = orchestrator::bench_env_reader_workers().or(reader_workers);
+            let requested = tuning.unwrap_or_default();
 
             let sharded = crate::budget::plan_sharded(crate::budget::PlanInputs {
                 usable_cores: available_cores.saturating_sub(1).max(1),
@@ -284,7 +278,8 @@ fn run_conversion_pipeline(
                 n_samples: samples.len(),
                 chunk_bytes,
                 max_mem_bytes,
-                reader_workers: requested_workers,
+                concurrent_chroms: requested.concurrent_chroms,
+                reader_workers: requested.reader_workers,
                 ram: crate::budget::RamLaw::VCF,
             });
             let sharded = match sharded {
@@ -293,11 +288,23 @@ fn run_conversion_pipeline(
             };
 
             let plan = crate::budget::plan_thread_budget(available_cores, chroms.len());
-            let concurrent_chroms =
-                orchestrator::bench_concurrent_chroms(sharded.concurrent_chroms);
             let htslib_threads = plan.htslib_threads; // monolithic path only
+            // The plan already carries an explicit `concurrent_chroms`,
+            // honoured or refused against `max_mem` by `plan_sharded` itself.
+            // Overriding it here instead would skip that check -- and leave
+            // `reader_workers` sized for a concurrency that is not running.
+            let concurrent_chroms = sharded.concurrent_chroms;
             let reader_workers = sharded.reader_workers;
-            let overshard = orchestrator::bench_overshard();
+            // Resolve now, finish later: `plan_unit_count` and
+            // `SourceSpec::Vcf` need `overshard` before `processing_threads`
+            // exists, and `processing_threads` is what completes the
+            // resolution. Reading `overshard` off the partial value is what
+            // keeps the shard count the pipeline uses and the one the banner
+            // reports the same number, so an explicit `Tuning(overshard=8)`
+            // cannot leave the banner claiming 8 while the pipeline shards at
+            // the planner default.
+            let partial = requested.resolve(concurrent_chroms, reader_workers);
+            let overshard = partial.overshard();
             let pending_budget_bytes = crate::budget::pending_budget_bytes(chunk_bytes);
             // `plan_unit_count` is monotonic in the record count, so the
             // largest contig's plan upper-bounds every other contig's --
@@ -320,6 +327,7 @@ fn run_conversion_pipeline(
                 concurrent_chroms,
                 reader_workers,
             );
+            let resolved = partial.with_merge_threads(processing_threads);
 
             let monolithic_reader_active =
                 concurrent_chroms * (crate::budget::PIPELINE_THREADS_PER_CHROM + htslib_threads);
@@ -328,15 +336,24 @@ fn run_conversion_pipeline(
                     + reader_workers * (1 + crate::budget::SHARDED_VCF_HTSLIB_THREADS_PER_READER));
             tracing::info!(cores = available_cores, "using cores");
             tracing::info!(
-                concurrent_chroms,
-                htslib_threads,
-                monolithic_reader_active,
-                reader_workers,
+                concurrent_chroms = resolved.concurrent_chroms,
+                concurrent_chroms_src = resolved.concurrent_chroms_src(),
+                reader_workers = resolved.reader_workers,
+                reader_workers_src = resolved.reader_workers_src(),
                 // `overshard` only drives `plan_unit_count` when a contig has
                 // no exact record count (the header-length fallback tier);
                 // `exact_counts` says whether that's the live tier for this
                 // run, so the log doesn't advertise an inert knob.
-                overshard,
+                overshard = resolved.overshard,
+                overshard_src = resolved.overshard_src(),
+                dense_cap = resolved.dense_cap,
+                dense_cap_src = resolved.dense_cap_src(),
+                merge_threads = resolved.merge_threads,
+                merge_threads_src = resolved.merge_threads_src(),
+                sample_interval = resolved.sample_interval,
+                sample_interval_src = resolved.sample_interval_src(),
+                htslib_threads,
+                monolithic_reader_active,
                 exact_counts = costs.exact_counts,
                 planned_units,
                 pending_budget_mb = pending_budget_bytes as f64 / 1e6,
@@ -404,6 +421,7 @@ fn run_conversion_pipeline(
                             skip_out_of_scope,
                             check_ref,
                             processing_threads,
+                            resolved,
                             signatures,
                             &fields,
                             &sink,
@@ -455,7 +473,7 @@ fn run_conversion_pipeline(
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 #[pyfunction]
-#[pyo3(signature = (pgen_path, pvar_path, reference_path, chroms, contig_ranges, output_dir, samples, chunk_size, max_threads, long_allele_capacity, skip_out_of_scope, signatures, dosage_fields, readers, dosage_readers, check_ref, region_ranges, regions_overlap, sample_perm, max_mem_bytes=None, log_level = "info".to_string(), receiver = None))]
+#[pyo3(signature = (pgen_path, pvar_path, reference_path, chroms, contig_ranges, output_dir, samples, chunk_size, max_threads, long_allele_capacity, skip_out_of_scope, signatures, dosage_fields, readers, dosage_readers, check_ref, region_ranges, regions_overlap, sample_perm, max_mem_bytes=None, log_level = "info".to_string(), tuning=None, log_filter=None, receiver = None))]
 fn run_pgen_conversion_pipeline(
     py: Python,
     pgen_path: String,
@@ -479,6 +497,8 @@ fn run_pgen_conversion_pipeline(
     sample_perm: Vec<usize>,
     max_mem_bytes: Option<u64>,
     log_level: String,
+    tuning: Option<crate::tuning::TuningIn>,
+    log_filter: Option<String>,
     receiver: Option<Py<PyEventReceiver>>,
 ) -> PyResult<usize> {
     if chroms.len() != contig_ranges.len() || chroms.len() != readers.len() {
@@ -553,7 +573,7 @@ fn run_pgen_conversion_pipeline(
     let level = log_level.clone();
 
     let results: Vec<Result<u64, crate::error::ConversionError>> = py.detach(|| {
-        crate::logging::with_channel_subscriber(sink.clone(), &level, || {
+        crate::logging::with_channel_subscriber(sink.clone(), &level, log_filter.as_deref(), || {
             let available_cores = match max_threads {
                 Some(t) if t > 0 => t,
                 _ => std::thread::available_parallelism().unwrap().get(),
@@ -593,12 +613,14 @@ fn run_pgen_conversion_pipeline(
             // reader_workers = 1: from_pgen pins P = 1, so a contig's demand
             // is exactly one executor plus one pgenlib reader -- which is
             // what plan_sharded's `1 + reader_workers` already models.
+            let requested = tuning.unwrap_or_default();
             let sharded = crate::budget::plan_sharded(crate::budget::PlanInputs {
                 usable_cores: available_cores.saturating_sub(1).max(1),
                 n_contigs: jobs.len(),
                 n_samples: samples.len(),
                 chunk_bytes,
                 max_mem_bytes,
+                concurrent_chroms: requested.concurrent_chroms,
                 reader_workers: Some(1),
                 ram: crate::budget::RamLaw::PGEN,
             });
@@ -606,26 +628,58 @@ fn run_pgen_conversion_pipeline(
                 Ok(p) => p,
                 Err(e) => return vec![Err(crate::error::ConversionError::from(e))],
             };
-            // Cap the PLAN at the measured knee, then let the bench override
-            // (`GENORAY_CONCURRENT_CHROMS`) apply on top of that cap -- not
-            // before it. Clamping the override itself would make
-            // `PGEN_MAX_CONCURRENT` unfalsifiable: the env var exists
-            // specifically so a maintainer can re-measure past 8 (see its doc
-            // comment), and clamping it defeats that. `processing_threads_for`
-            // below still consumes this final `concurrent_chroms`, so the
-            // merge tail stays sized against what is actually dispatched.
-            let planned = sharded
-                .concurrent_chroms
-                .min(crate::budget::PGEN_MAX_CONCURRENT);
-            let concurrent_chroms = orchestrator::bench_concurrent_chroms(planned);
+            // `processing_threads_for` below consumes this final
+            // `concurrent_chroms`, so the merge tail stays sized against what
+            // is actually dispatched.
+            let concurrent_chroms = match requested.concurrent_chroms {
+                // An explicit `concurrent_chroms` is honoured PAST the measured
+                // knee (only warned about): clamping the escape hatch would
+                // make the constant unfalsifiable, which is why the env-var
+                // predecessor of this knob was also applied after the cap.
+                // `max_mem` is the one bound that still refuses it, in
+                // `plan_sharded` -- a hard ceiling, where the knee is a
+                // measured shape.
+                Some(_) => {
+                    let cc = sharded.concurrent_chroms;
+                    if cc > crate::budget::PGEN_MAX_CONCURRENT {
+                        tracing::warn!(
+                            concurrent_chroms = cc,
+                            measured_knee = crate::budget::PGEN_MAX_CONCURRENT,
+                            "explicit concurrent_chroms exceeds the measured \
+                             PGEN concurrency knee; honouring it so the knee \
+                             stays falsifiable, but peak RSS is unmodelled above it"
+                        );
+                    }
+                    cc
+                }
+                // Floored at 1 as well as capped:
+                // `ThreadPoolBuilder::num_threads(0)` means "use the global
+                // default", not "run serially", so a zero here would silently
+                // oversubscribe instead of serializing.
+                None => sharded
+                    .concurrent_chroms
+                    .clamp(1, crate::budget::PGEN_MAX_CONCURRENT),
+            };
             let processing_threads = crate::budget::processing_threads_for(
                 available_cores.saturating_sub(1).max(1),
                 concurrent_chroms,
                 sharded.reader_workers,
             );
+            let resolved = requested
+                .resolve(concurrent_chroms, sharded.reader_workers)
+                .with_merge_threads(processing_threads);
             tracing::info!(cores = available_cores, "using cores");
             tracing::info!(
-                concurrent_chroms,
+                concurrent_chroms = resolved.concurrent_chroms,
+                concurrent_chroms_src = resolved.concurrent_chroms_src(),
+                dense_cap = resolved.dense_cap,
+                dense_cap_src = resolved.dense_cap_src(),
+                merge_threads = resolved.merge_threads,
+                merge_threads_src = resolved.merge_threads_src(),
+                sample_interval = resolved.sample_interval,
+                sample_interval_src = resolved.sample_interval_src(),
+                // No `overshard`/`reader_workers_src`: `from_pgen` pins P=1 and
+                // never shards within a contig, so those knobs are inert here.
                 reader_workers = sharded.reader_workers,
                 processing_threads,
                 "pipeline config (PGEN)"
@@ -687,6 +741,7 @@ fn run_pgen_conversion_pipeline(
                             skip_out_of_scope,
                             check_ref,
                             processing_threads,
+                            resolved,
                             signatures,
                             &fields,
                             &sink,
@@ -823,7 +878,7 @@ fn merge_regions(mut regions: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
 #[allow(clippy::type_complexity)]
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (store_path, out_dir, contigs, samples, regions, regions_overlap, merge_overlapping, fields, reference=None, reroute=false, max_threads=None, overwrite=false, log_level="info".to_string(), receiver=None))]
+#[pyo3(signature = (store_path, out_dir, contigs, samples, regions, regions_overlap, merge_overlapping, fields, reference=None, reroute=false, max_threads=None, overwrite=false, log_level="info".to_string(), log_filter=None, receiver=None))]
 pub fn run_slice_view(
     py: Python,
     store_path: String,
@@ -839,6 +894,7 @@ pub fn run_slice_view(
     max_threads: Option<usize>,
     overwrite: bool,
     log_level: String,
+    log_filter: Option<String>,
     receiver: Option<Py<PyEventReceiver>>,
 ) -> PyResult<()> {
     use crate::error::ConversionError;
@@ -1034,7 +1090,7 @@ pub fn run_slice_view(
     };
     let level = log_level.clone();
     let results: Vec<Result<usize, ConversionError>> = py.detach(|| {
-        crate::logging::with_channel_subscriber(sink.clone(), &level, || {
+        crate::logging::with_channel_subscriber(sink.clone(), &level, log_filter.as_deref(), || {
             for c in &skipped_contigs {
                 tracing::debug!(chrom = %c, "contig has no regions; skipped");
             }
@@ -1175,7 +1231,7 @@ fn svar2_variant_stats<'py>(
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 #[pyfunction]
-#[pyo3(signature = (vcf_paths, reference_path, chroms, output_dir, samples, contig_membership, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false, signatures=false, info_fields=Vec::new(), format_fields=Vec::new(), check_ref="e".to_string(), region_ranges=Vec::new(), regions_overlap="pos".to_string(), log_level = "info".to_string(), receiver = None))]
+#[pyo3(signature = (vcf_paths, reference_path, chroms, output_dir, samples, contig_membership, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false, signatures=false, info_fields=Vec::new(), format_fields=Vec::new(), check_ref="e".to_string(), region_ranges=Vec::new(), regions_overlap="pos".to_string(), log_level = "info".to_string(), tuning=None, log_filter=None, receiver = None))]
 fn run_vcf_list_conversion_pipeline(
     py: Python,
     vcf_paths: Vec<String>,
@@ -1201,6 +1257,8 @@ fn run_vcf_list_conversion_pipeline(
     region_ranges: Vec<(String, u32, u32)>,
     regions_overlap: String,
     log_level: String,
+    tuning: Option<crate::tuning::TuningIn>,
+    log_filter: Option<String>,
     receiver: Option<Py<PyEventReceiver>>,
 ) -> PyResult<usize> {
     let check_ref: crate::normalize::CheckRef = check_ref.parse().map_err(PyValueError::new_err)?;
@@ -1219,7 +1277,7 @@ fn run_vcf_list_conversion_pipeline(
     let level = log_level.clone();
 
     let dropped: u64 = py.detach(|| {
-        crate::logging::with_channel_subscriber(sink.clone(), &level, || {
+        crate::logging::with_channel_subscriber(sink.clone(), &level, log_filter.as_deref(), || {
             orchestrator::run_vcf_list(
                 &vcf_paths,
                 reference_path.as_deref(),
@@ -1238,6 +1296,7 @@ fn run_vcf_list_conversion_pipeline(
                 region_ranges,
                 overlap_mode,
                 contig_membership,
+                tuning.unwrap_or_default(),
                 &sink,
             )
         })
@@ -1266,7 +1325,7 @@ fn run_vcf_list_conversion_pipeline(
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 #[pyfunction]
-#[pyo3(signature = (svar1_dir, reference_path, chroms, contig_starts, contig_lens, output_dir, samples, ploidy, chunk_size, max_threads, long_allele_capacity, skip_out_of_scope, signatures, pos_per_contig, ref_bytes_per_contig, ref_offsets_per_contig, alt_bytes_per_contig, alt_offsets_per_contig, format_fields, format_src_dtypes, check_ref, region_ranges, regions_overlap, sample_idx, log_level = "info".to_string(), receiver = None))]
+#[pyo3(signature = (svar1_dir, reference_path, chroms, contig_starts, contig_lens, output_dir, samples, ploidy, chunk_size, max_threads, long_allele_capacity, skip_out_of_scope, signatures, pos_per_contig, ref_bytes_per_contig, ref_offsets_per_contig, alt_bytes_per_contig, alt_offsets_per_contig, format_fields, format_src_dtypes, check_ref, region_ranges, regions_overlap, sample_idx, log_level = "info".to_string(), tuning=None, log_filter=None, receiver = None))]
 fn run_svar1_conversion_pipeline(
     py: Python,
     svar1_dir: String,
@@ -1294,6 +1353,8 @@ fn run_svar1_conversion_pipeline(
     regions_overlap: String,
     sample_idx: Vec<usize>,
     log_level: String,
+    tuning: Option<crate::tuning::TuningIn>,
+    log_filter: Option<String>,
     receiver: Option<Py<PyEventReceiver>>,
 ) -> PyResult<usize> {
     let n = chroms.len();
@@ -1354,16 +1415,44 @@ fn run_svar1_conversion_pipeline(
     let level = log_level.clone();
 
     let results: Vec<Result<u64, crate::error::ConversionError>> = py.detach(|| {
-        crate::logging::with_channel_subscriber(sink.clone(), &level, || {
+        crate::logging::with_channel_subscriber(sink.clone(), &level, log_filter.as_deref(), || {
             let available_cores = match max_threads {
                 Some(t) if t > 0 => t,
                 _ => std::thread::available_parallelism().unwrap().get(),
             };
             let plan = crate::budget::plan_thread_budget(available_cores, jobs.len());
-            let concurrent_chroms = orchestrator::bench_concurrent_chroms(plan.concurrent_chroms);
-            let processing_threads = plan.processing_threads;
-            tracing::info!(
+            let requested = tuning.unwrap_or_default();
+            // An explicit `concurrent_chroms` is honoured, same as the VCF path.
+            let concurrent_chroms = requested
+                .concurrent_chroms
+                .unwrap_or(plan.concurrent_chroms)
+                .max(1);
+            // Re-sized against the concurrency actually dispatched, which an
+            // explicit `concurrent_chroms` can change. `plan.processing_threads`
+            // is this same formula evaluated at `plan.concurrent_chroms`, so
+            // this is identical whenever the caller did not override it --
+            // and correct, rather than a merge pool sized for a concurrency
+            // that is not running, when they did.
+            let processing_threads = crate::budget::processing_threads(
+                available_cores.saturating_sub(1).max(1),
                 concurrent_chroms,
+                plan.htslib_threads,
+            );
+            // SVAR1 reads pre-decoded columnar data directly -- there is no
+            // separate reader-worker pool to size, so, like
+            // `orchestrator::run_vcf_list`, resolve against a nominal 1.
+            let resolved = requested
+                .resolve(concurrent_chroms, 1)
+                .with_merge_threads(processing_threads);
+            tracing::info!(
+                concurrent_chroms = resolved.concurrent_chroms,
+                concurrent_chroms_src = resolved.concurrent_chroms_src(),
+                dense_cap = resolved.dense_cap,
+                dense_cap_src = resolved.dense_cap_src(),
+                merge_threads = resolved.merge_threads,
+                merge_threads_src = resolved.merge_threads_src(),
+                sample_interval = resolved.sample_interval,
+                sample_interval_src = resolved.sample_interval_src(),
                 processing_threads,
                 "pipeline config (SVAR1)"
             );
@@ -1402,6 +1491,7 @@ fn run_svar1_conversion_pipeline(
                             skip_out_of_scope,
                             check_ref,
                             processing_threads,
+                            resolved,
                             signatures,
                             &fields,
                             &sink,

@@ -12,7 +12,7 @@ import re
 
 import pytest
 
-from genoray import SparseVar2
+from genoray import SparseVar2, Tuning
 
 from tests import _oracle
 
@@ -30,6 +30,21 @@ def _pipeline_planned_units(captured_text: str) -> int:
         f"no planned_units field found in captured output:\n{captured_text!r}"
     )
     return int(m.group(1))
+
+
+def _pipeline_schedule(captured_text: str) -> tuple[int, int]:
+    """Extract the `concurrent_chroms=`/`reader_workers=` fields logged on the
+    "pipeline config" tracing event, tolerant of Rich's ANSI styling and
+    line-wrapping. Mirrors `_pipeline_planned_units` above."""
+    plain = _ANSI_RE.sub("", captured_text)
+    collapsed = re.sub(r"\s+", " ", plain)
+    cc_m = re.search(r"concurrent_chroms=(\d+)", collapsed)
+    w_m = re.search(r"reader_workers=(\d+)", collapsed)
+    assert cc_m is not None and w_m is not None, (
+        "no concurrent_chroms/reader_workers field found in captured "
+        f"output:\n{captured_text!r}"
+    )
+    return int(cc_m.group(1)), int(w_m.group(1))
 
 
 # (concurrent_chroms, reader_workers) -- spans the corners the planner can
@@ -96,27 +111,31 @@ def multi_contig_vcf(tmp_path_factory):
     return vcf_gz
 
 
-def _convert(vcf, out, cc, w, monkeypatch):
-    # The bench hooks are read in-process by the Rust orchestrator
-    # (src/orchestrator.rs:80 and :448), so they must be set on os.environ --
-    # a subprocess env would never reach this process's pipeline.
-    # `monkeypatch.setenv` mutates `os.environ` in place (satisfying that
-    # requirement) but restores whatever value was there before the test at
-    # teardown, instead of unconditionally deleting the key the way a bare
-    # `os.environ.pop` would.
-    monkeypatch.setenv("GENORAY_CONCURRENT_CHROMS", str(cc))
-    monkeypatch.setenv("GENORAY_READER_WORKERS", str(w))
-    SparseVar2.from_vcf(out, vcf, no_reference=True, chunk_size=CHUNK_SIZE)
+def _convert(vcf, out, cc, w):
+    SparseVar2.from_vcf(
+        out,
+        vcf,
+        no_reference=True,
+        chunk_size=CHUNK_SIZE,
+        tuning=Tuning(concurrent_chroms=cc, reader_workers=w),
+    )
     return _oracle.store_digest(out)
 
 
-def test_digest_is_invariant_across_schedules(multi_contig_vcf, tmp_path, monkeypatch):
+def test_digest_is_invariant_across_schedules(multi_contig_vcf, tmp_path, capfd):
     digests = {}
     outs = {}
+    schedules_seen = set()
     for cc, w in SCHEDULES:
         out = tmp_path / f"cc{cc}_w{w}.svar"
-        digests[(cc, w)] = _convert(multi_contig_vcf, out, cc, w, monkeypatch)
+        digests[(cc, w)] = _convert(multi_contig_vcf, out, cc, w)
+        captured = capfd.readouterr()
+        schedules_seen.add(_pipeline_schedule(captured.out + captured.err))
         outs[(cc, w)] = out
+    assert len(schedules_seen) >= 2, (
+        "concurrent_chroms/reader_workers never varied across SCHEDULES rows "
+        f"-- this test proves nothing about schedule invariance: {schedules_seen}"
+    )
     assert len(set(digests.values())) == 1, f"schedule changed output: {digests}"
 
     # Digest-invariance alone cannot tell "correctly non-empty" from
@@ -150,7 +169,7 @@ def test_max_mem_too_small_raises_rather_than_writing_an_empty_store(
 
 
 def test_digest_is_invariant_across_frontier_granularities(
-    multi_contig_vcf, tmp_path, monkeypatch, capfd
+    multi_contig_vcf, tmp_path, capfd
 ):
     """Unit granularity must not move a single output byte.
 
@@ -159,9 +178,9 @@ def test_digest_is_invariant_across_frontier_granularities(
     non-head readers park mid-stream. Both change WHEN a chunk reaches the
     collector; neither may change what is written.
 
-    `GENORAY_OVERSHARD` only feeds `plan_unit_count` on the no-exact-counts
+    `Tuning(overshard=)` only feeds `plan_unit_count` on the no-exact-counts
     (header-length fallback) tier -- this fixture is indexed, so
-    `exact_counts` is always true and that env var moves nothing here.
+    `exact_counts` is always true and that knob moves nothing here.
     Drive granularity via `chunk_size` instead, at `reader_workers=1` so the
     `.max(workers)` floor in `plan_unit_count` can't paper over the effect:
     on the largest contig (chr8, 32 records),
@@ -174,10 +193,6 @@ def test_digest_is_invariant_across_frontier_granularities(
     the test fails loudly if a future change makes the granularity axis
     inert again, instead of passing vacuously.
     """
-    monkeypatch.delenv("GENORAY_OVERSHARD", raising=False)
-    monkeypatch.setenv("GENORAY_READER_WORKERS", "1")
-    monkeypatch.setenv("GENORAY_CONCURRENT_CHROMS", "1")
-
     digests = {}
     planned_units_seen = {}
     for chunk_size in (2, 4, 8):
@@ -187,6 +202,7 @@ def test_digest_is_invariant_across_frontier_granularities(
             multi_contig_vcf,
             no_reference=True,
             chunk_size=chunk_size,
+            tuning=Tuning(concurrent_chroms=1, reader_workers=1),
             log_level="info",
         )
         captured = capfd.readouterr()
@@ -202,39 +218,3 @@ def test_digest_is_invariant_across_frontier_granularities(
     assert len(set(digests.values())) == 1, (
         f"unit granularity changed output: {digests} (planned_units={planned_units_seen})"
     )
-
-
-def test_explicit_reader_workers_matches_the_derived_default(
-    multi_contig_vcf, tmp_path, monkeypatch
-):
-    """The public `reader_workers=` knob must be a valid schedule that agrees
-    byte-for-byte with the planner's own env-driven choice.
-
-    This does NOT prove the public argument reaches the same internal code
-    path as `GENORAY_READER_WORKERS` -- digest invariance across `w` is
-    already established by `test_digest_is_invariant_across_schedules`
-    above, so even an ignored `reader_workers=` argument (silently falling
-    back to the planner's own derived default) would still produce a
-    matching digest here, just via a different `w`. What this test actually
-    pins down is that passing `reader_workers=6` explicitly produces a
-    store byte-identical to one built via the env var at the same value --
-    i.e. the public knob is at least a valid, deterministic schedule choice.
-    `test_from_vcf_reader_workers_reaches_the_planner` in
-    tests/test_svar2_from_vcf.py is the test that actually proves the
-    argument reaches the planner (by reading the resulting `reader_workers`
-    back off the "pipeline config" log for two different explicit values).
-    """
-    env_out = tmp_path / "via_env.svar"
-    env_digest = _convert(multi_contig_vcf, env_out, 1, 6, monkeypatch)
-
-    monkeypatch.delenv("GENORAY_READER_WORKERS", raising=False)
-    monkeypatch.delenv("GENORAY_CONCURRENT_CHROMS", raising=False)
-    arg_out = tmp_path / "via_arg.svar"
-    SparseVar2.from_vcf(
-        arg_out,
-        multi_contig_vcf,
-        no_reference=True,
-        chunk_size=CHUNK_SIZE,
-        reader_workers=6,
-    )
-    assert _oracle.store_digest(arg_out) == env_digest

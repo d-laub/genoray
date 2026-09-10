@@ -152,7 +152,17 @@ pub fn plan_thread_budget(available_cores: usize, n_chroms: usize) -> ThreadPlan
 
 /// Cores left idle after `concurrent` chroms each claim the pipeline threads plus
 /// `htslib` decode threads. Floored at 1 so the processing pool always builds.
-fn processing_threads(usable_cores: usize, concurrent: usize, htslib: usize) -> usize {
+///
+/// `pub(crate)` so a caller that overrides the planner's `concurrent_chroms`
+/// can re-size the merge tail against the concurrency it actually dispatches,
+/// using this exact formula rather than a second copy of it. Passing the
+/// planner's own `concurrent_chroms` reproduces `ThreadPlan::processing_threads`
+/// exactly, so recomputing unconditionally is safe.
+///
+/// This is the MONOLITHIC-reader shape (`PIPELINE_THREADS_PER_CHROM` + htslib
+/// decode threads per contig). The sharded VCF path bills readers instead and
+/// uses [`processing_threads_for`]; the two are not interchangeable.
+pub(crate) fn processing_threads(usable_cores: usize, concurrent: usize, htslib: usize) -> usize {
     let active = concurrent * (PIPELINE_THREADS_PER_CHROM + htslib);
     usable_cores.saturating_sub(active).max(1)
 }
@@ -287,9 +297,9 @@ impl RamLaw {
     /// own measured domain exactly, so this asymmetry is VCF-specific.
     ///
     /// `cc = 16` sits OUTSIDE the production domain. Unlike the PGEN path,
-    /// nothing in `lib.rs` clamps VCF `concurrent_chroms`, so `cc=16` is
-    /// reachable only through the bench-only `GENORAY_CONCURRENT_CHROMS`
-    /// override, applied here purely to give the per-contig term a lever arm.
+    /// nothing in `lib.rs` clamps VCF `concurrent_chroms`, so `cc=16` was
+    /// reachable only through a since-removed bench-only sweep override,
+    /// applied here purely to give the per-contig term a lever arm.
     ///
     /// Residual sigma (an unconstrained OLS fit of the same four-term form,
     /// computed for description only, never shipped) is ~336 MB, ~5.3x the
@@ -390,9 +400,9 @@ impl RamLaw {
     ///
     /// `cc <= 8` is enforced in code, not just documented: `src/lib.rs` clamps
     /// every planned `concurrent_chroms` to `PGEN_MAX_CONCURRENT` below, so
-    /// `cc > 8` is reachable only via the bench-only
-    /// `GENORAY_CONCURRENT_CHROMS` override. The `cc=16` rows exist to give
-    /// the per-contig slope a lever arm and sit OUTSIDE the production domain.
+    /// `cc > 8` was reachable only via a since-removed bench-only sweep
+    /// override. The `cc=16` rows exist to give the per-contig slope a lever
+    /// arm and sit OUTSIDE the production domain.
     ///
     /// Still NOT comparable coefficient-by-coefficient with `RamLaw::VCF`,
     /// even though both now come from `vcfixture bulk` against the same
@@ -451,6 +461,14 @@ pub struct PlanInputs {
     pub chunk_bytes: u64,
     /// `None` means the caller declined a budget; only the core bound applies.
     pub max_mem_bytes: Option<u64>,
+    /// `None` asks the planner to choose the contig concurrency. `Some(cc)`
+    /// is an explicit caller request, honoured or refused with
+    /// `InsufficientMemory` -- the same contract as `reader_workers`, and for
+    /// the same reason. It is planned here rather than applied to the returned
+    /// plan because overriding `concurrent_chroms` afterwards would leave
+    /// `reader_workers` sized for a concurrency that is not running, and would
+    /// skip the memory check entirely.
+    pub concurrent_chroms: Option<usize>,
     /// `None` asks the planner to derive the reader count from the core
     /// budget. `Some(w)` is an explicit caller request, honoured or refused
     /// with `InsufficientMemory` -- never silently shrunk, because a caller
@@ -549,6 +567,52 @@ pub fn plan_sharded(inp: PlanInputs) -> Result<ShardedPlan, PlanError> {
     let n_contigs = inp.n_contigs.max(1);
     // Step 1: reserve the merge tail before anything else claims cores.
     let pool = reader_pool_cores(inp.usable_cores);
+
+    // An explicit contig concurrency is the caller's to set, so it is honoured
+    // or refused -- never silently shrunk, and never applied after the fact.
+    // Deriving `w` AT that `cc` is the point of doing this here: a caller's
+    // `cc` stamped onto a plan whose `w` was sized for a different
+    // concurrency is a shape the planner never validated and never would.
+    if let Some(req_cc) = inp.concurrent_chroms {
+        let cc = req_cc.max(1);
+        // Same precedent as the PGEN concurrency knee (`lib.rs`): an explicit
+        // request past the modelled domain is honoured, not clamped -- but a
+        // `cc` past the contig count is strictly more obviously wrong than
+        // past a measured constant, so it gets the same warning. The excess
+        // contig-pool threads will never receive work.
+        if cc > n_contigs {
+            tracing::warn!(
+                concurrent_chroms = cc,
+                n_contigs,
+                "explicit concurrent_chroms exceeds the number of contigs; \
+                 honouring it, but the excess contig threads will be idle"
+            );
+        }
+        if let Some(req_w) = inp.reader_workers {
+            let w = req_w.max(1);
+            memory_fits(&inp, cc, w)?;
+            return Ok(ShardedPlan {
+                concurrent_chroms: cc,
+                reader_workers: w,
+            });
+        }
+        // Same give-back order as the planner's own loop: readers before
+        // contigs, because `cc` is fixed here and only `w` can yield.
+        let w_max = (pool / cc).saturating_sub(1).max(1);
+        if let Some(w) = (1..=w_max)
+            .rev()
+            .find(|&w| memory_fits(&inp, cc, w).is_ok())
+        {
+            return Ok(ShardedPlan {
+                concurrent_chroms: cc,
+                reader_workers: w,
+            });
+        }
+        // w=1 is the cheapest shape at this `cc`; if it does not fit, nothing
+        // does, and the caller gets the budget error rather than a quiet
+        // downgrade.
+        return Err(memory_fits(&inp, cc, 1).expect_err("w=1 just failed the scan above"));
+    }
 
     // An explicit request is honoured or refused. Concurrency may still come
     // down to make it fit -- that is the planner's own knob, not the
@@ -759,6 +823,7 @@ mod tests {
     #[test]
     fn core_bound_concurrency() {
         let plan = plan_sharded(PlanInputs {
+            concurrent_chroms: None,
             usable_cores: 47,
             n_contigs: 22,
             n_samples: 4_000,
@@ -785,6 +850,7 @@ mod tests {
     #[test]
     fn contig_count_bounds_concurrency() {
         let plan = plan_sharded(PlanInputs {
+            concurrent_chroms: None,
             usable_cores: 47,
             n_contigs: 2,
             n_samples: 4_000,
@@ -822,6 +888,7 @@ mod tests {
     #[test]
     fn memory_bound_beats_core_bound_at_biobank_scale() {
         let plan = plan_sharded(PlanInputs {
+            concurrent_chroms: None,
             usable_cores: 47,
             n_contigs: 22,
             n_samples: 500_000,
@@ -840,6 +907,93 @@ mod tests {
         );
     }
 
+    // An explicit `concurrent_chroms` is the caller's, so a roomy budget must
+    // return it verbatim rather than the planner's own preference. Asking for
+    // fewer contigs than the planner would choose is the interesting
+    // direction: a plan that quietly raised it would oversubscribe a caller
+    // who lowered it on purpose.
+    #[test]
+    fn explicit_concurrent_chroms_is_returned_verbatim() {
+        let plan = plan_sharded(PlanInputs {
+            concurrent_chroms: Some(2),
+            usable_cores: 47,
+            n_contigs: 22,
+            n_samples: 1_000,
+            chunk_bytes: 1_000_000,
+            max_mem_bytes: None,
+            reader_workers: None,
+            ram: RamLaw::VCF,
+        })
+        .unwrap();
+        assert_eq!(plan.concurrent_chroms, 2);
+        assert!(plan.reader_workers >= 1);
+    }
+
+    // `cc` and `w` together, both explicit: neither may be adjusted to
+    // accommodate the other.
+    #[test]
+    fn explicit_concurrent_chroms_and_reader_workers_are_both_honoured() {
+        let plan = plan_sharded(PlanInputs {
+            concurrent_chroms: Some(3),
+            usable_cores: 47,
+            n_contigs: 22,
+            n_samples: 1_000,
+            chunk_bytes: 1_000_000,
+            max_mem_bytes: None,
+            reader_workers: Some(5),
+            ram: RamLaw::VCF,
+        })
+        .unwrap();
+        assert_eq!(plan.concurrent_chroms, 3);
+        assert_eq!(plan.reader_workers, 5);
+    }
+
+    // The contract this whole field exists for: an explicit `cc` that does not
+    // fit `max_mem` is REFUSED, not silently shrunk. Before it was planned
+    // here it was stamped onto the plan afterwards in `lib.rs`, which skipped
+    // the memory check entirely -- an explicit `cc` could blow the budget with
+    // no error and no warning.
+    #[test]
+    fn explicit_concurrent_chroms_that_busts_the_budget_is_refused() {
+        let err = plan_sharded(PlanInputs {
+            concurrent_chroms: Some(16),
+            usable_cores: 47,
+            n_contigs: 22,
+            n_samples: 500_000,
+            chunk_bytes: 3_125_000_000,
+            max_mem_bytes: Some(64_000 * 1_000_000),
+            reader_workers: None,
+            ram: RamLaw::VCF,
+        })
+        .unwrap_err();
+        match err {
+            PlanError::InsufficientMemory {
+                needed_mb,
+                budget_mb,
+                ..
+            } => assert!(needed_mb > budget_mb),
+        }
+    }
+
+    // The same budget with the planner choosing must SUCCEED -- otherwise the
+    // test above would prove only that the budget is impossible, not that the
+    // explicit request is what broke it.
+    #[test]
+    fn the_same_budget_is_plannable_without_the_explicit_request() {
+        let plan = plan_sharded(PlanInputs {
+            concurrent_chroms: None,
+            usable_cores: 47,
+            n_contigs: 22,
+            n_samples: 500_000,
+            chunk_bytes: 3_125_000_000,
+            max_mem_bytes: Some(64_000 * 1_000_000),
+            reader_workers: None,
+            ram: RamLaw::VCF,
+        })
+        .unwrap();
+        assert!(plan.concurrent_chroms < 16);
+    }
+
     // A budget below the cohort baseline cannot fit even one contig. Failing
     // loudly beats planning cc=0 (which dispatches nothing and "succeeds"
     // with an empty store) or cc=1 (which OOMs). Assertions are formula-
@@ -848,6 +1002,7 @@ mod tests {
     #[test]
     fn budget_below_baseline_is_an_error() {
         let err = plan_sharded(PlanInputs {
+            concurrent_chroms: None,
             usable_cores: 47,
             n_contigs: 22,
             n_samples: 500_000,
@@ -878,6 +1033,7 @@ mod tests {
     #[test]
     fn insufficient_memory_message_names_remedies() {
         let err = plan_sharded(PlanInputs {
+            concurrent_chroms: None,
             usable_cores: 47,
             n_contigs: 1,
             n_samples: 1_000,
@@ -902,6 +1058,7 @@ mod tests {
     #[test]
     fn insufficient_memory_message_names_both_remedies_when_baseline_fits() {
         let err = plan_sharded(PlanInputs {
+            concurrent_chroms: None,
             usable_cores: 47,
             n_contigs: 1,
             n_samples: 1_000,
@@ -922,6 +1079,7 @@ mod tests {
     #[test]
     fn single_core_single_contig_still_runs() {
         let plan = plan_sharded(PlanInputs {
+            concurrent_chroms: None,
             usable_cores: 1,
             n_contigs: 1,
             n_samples: 250,
@@ -944,6 +1102,7 @@ mod tests {
     #[test]
     fn zero_contigs_clamps_to_one() {
         let plan = plan_sharded(PlanInputs {
+            concurrent_chroms: None,
             usable_cores: 47,
             n_contigs: 0,
             n_samples: 250,
@@ -980,6 +1139,7 @@ mod tests {
     #[test]
     fn a_high_worker_count_can_exceed_a_budget_a_lower_one_fits() {
         let inp = PlanInputs {
+            concurrent_chroms: None,
             usable_cores: 47,
             n_contigs: 1,
             n_samples: 1_000,
@@ -994,6 +1154,7 @@ mod tests {
         ));
         assert_eq!(
             plan_sharded(PlanInputs {
+                concurrent_chroms: None,
                 reader_workers: Some(3),
                 ..inp
             })
@@ -1102,6 +1263,7 @@ mod tests {
         let budget = ((baseline_mb + 2.5 * per_contig_mb) * 1e6) as u64;
 
         let plan = plan_sharded(PlanInputs {
+            concurrent_chroms: None,
             usable_cores: 64,
             n_contigs: 22,
             n_samples: 1_000,
@@ -1125,6 +1287,7 @@ mod tests {
         // so this exercises the baseline-dominated branch: `chunk_size`
         // cannot help here, only `max_mem` (or a smaller cohort) can.
         let err = plan_sharded(PlanInputs {
+            concurrent_chroms: None,
             usable_cores: 64,
             n_contigs: 22,
             n_samples: 1_000_000,
@@ -1182,6 +1345,7 @@ mod tests {
         //   per_contig_mb=1000: needed(cc) = 1000 + cc*1000; fits once cc <= 2.
         //     Loop shrinks 24 -> 2: cc=2 -> needed=1000+2*1000=3000 <= 3000 -> b=2.
         let base = PlanInputs {
+            concurrent_chroms: None,
             usable_cores: 64,
             n_contigs: 32,
             n_samples: 1_000,
@@ -1196,6 +1360,7 @@ mod tests {
             },
         };
         let doubled = PlanInputs {
+            concurrent_chroms: None,
             ram: RamLaw {
                 per_contig_mb: 1000.0,
                 ..base.ram
@@ -1258,6 +1423,7 @@ mod tests {
         //   w         = 23 / 2 - 1 = 10
         // Today the same machine yields cc=7, w=3.
         let plan = plan_sharded(PlanInputs {
+            concurrent_chroms: None,
             usable_cores: 31,
             n_contigs: 22,
             n_samples: 535_662,
@@ -1279,6 +1445,7 @@ mod tests {
     #[test]
     fn plan_never_exceeds_the_contig_count() {
         let plan = plan_sharded(PlanInputs {
+            concurrent_chroms: None,
             usable_cores: 96,
             n_contigs: 1,
             n_samples: 1_000,
@@ -1299,6 +1466,7 @@ mod tests {
         // per-contig memory -- the loop would not converge. The plan must
         // give back readers first.
         let roomy = plan_sharded(PlanInputs {
+            concurrent_chroms: None,
             usable_cores: 31,
             n_contigs: 22,
             n_samples: 1_000,
@@ -1309,6 +1477,7 @@ mod tests {
         })
         .unwrap();
         let tight = plan_sharded(PlanInputs {
+            concurrent_chroms: None,
             usable_cores: 31,
             n_contigs: 22,
             n_samples: 1_000,
@@ -1328,6 +1497,7 @@ mod tests {
     #[test]
     fn an_explicit_reader_workers_is_honoured_or_refused_never_shrunk() {
         let inp = PlanInputs {
+            concurrent_chroms: None,
             usable_cores: 31,
             n_contigs: 22,
             n_samples: 1_000,
@@ -1342,6 +1512,7 @@ mod tests {
         // than quietly hand back a slower plan the caller did not ask for.
         assert!(matches!(
             plan_sharded(PlanInputs {
+                concurrent_chroms: None,
                 max_mem_bytes: Some(600_000_000),
                 ..inp
             }),
@@ -1355,6 +1526,7 @@ mod tests {
         // one that tells a caller chunk_size cannot help them; keep it
         // reachable.
         let err = plan_sharded(PlanInputs {
+            concurrent_chroms: None,
             usable_cores: 31,
             n_contigs: 1,
             n_samples: 10_000_000,
@@ -1384,6 +1556,7 @@ mod tests {
         for (n_samples, floor_mb) in [(4_000u64, 1_016u64), (128_000, 14_864), (500_000, 56_408)] {
             let chunk_bytes = n_samples * 25_000 / 4;
             let inp = |budget_mb: u64| PlanInputs {
+                concurrent_chroms: None,
                 usable_cores: 31,
                 n_contigs: 22,
                 n_samples: n_samples as usize,

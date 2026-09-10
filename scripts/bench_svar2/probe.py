@@ -40,7 +40,17 @@ RE_UNIT = re.compile(r"shard unit done .*?unit_secs=([0-9.]+)")
 # The fields ride the message across the channel (see `FieldGrab::render` in
 # src/logging.rs -- issue #162); `test_run_point_records_the_realised_
 # concurrent_chroms` pins the end-to-end path.
+#
+# The same banner also carries one `<field>_src=explicit|planner` tag per
+# `Tuning` knob (e.g. `reader_workers_src=explicit`), recording whether this
+# run's command line pinned the value or the planner derived it -- see
+# `RE_FIELD_SRC` below.
 RE_PIPELINE_CONFIG = re.compile(r"pipeline config.*")
+# Generic `<knob>_src=<value>` extractor. Deliberately not a fixed list of the
+# six `Tuning` fields: a knob added later shows up in the banner and this
+# regex picks it up unchanged, so `ProbeRecord.tuning_src` (Ruling D) never
+# needs a matching update here.
+RE_FIELD_SRC = re.compile(r"(\w+)_src=(\w+)")
 
 
 def _field(line: str, key: str) -> str | None:
@@ -84,10 +94,13 @@ def parse_trace(text: str) -> dict:
             execp.append(float(ev.rstrip("%")))
 
     cc_used: int | None = None
+    tuning_src: dict[str, str] = {}
     for line in RE_PIPELINE_CONFIG.findall(plain):
         v = _field(line, "concurrent_chroms")
         if v is not None:
             cc_used = int(v)
+        for field_name, src in RE_FIELD_SRC.findall(line):
+            tuning_src[field_name] = src
 
     return {
         "phase1_s": phase1,
@@ -99,6 +112,7 @@ def parse_trace(text: str) -> dict:
         "pending_bytes_highwater": pending_bytes_hw,
         "shard_unit_secs": tuple(float(x) for x in RE_UNIT.findall(plain)),
         "concurrent_chroms_used": cc_used,
+        "tuning_src": tuning_src,
     }
 
 
@@ -167,10 +181,6 @@ def _preexec(rss_ceiling_mb: int | None):
 
 def _build_env(point: SweepPoint) -> dict[str, str]:
     env = dict(os.environ) | {
-        "GENORAY_READER_WORKERS": str(point.reader_workers),
-        "GENORAY_OVERSHARD": str(point.overshard),
-        "GENORAY_LOG": "genoray::monitor=trace",
-        "GENORAY_SAMPLE_INTERVAL": "1",
         # The realised concurrent_chroms is parsed out of the `pipeline
         # config ...` line rendered by a `rich.Console()` writing to a
         # non-tty, which defaults to 80 columns. At 80 columns that line can
@@ -182,8 +192,6 @@ def _build_env(point: SweepPoint) -> dict[str, str]:
         # concurrent_chroms_used check in sweep_scale.sbatch/sweep_pgen.sbatch).
         "COLUMNS": "400",
     }
-    if point.concurrent_chroms is not None:
-        env["GENORAY_CONCURRENT_CHROMS"] = str(point.concurrent_chroms)
     if point.rss_ceiling_mb is not None:
         # See `_preexec`: RLIMIT_AS bounds virtual address space, and
         # glibc's default per-thread arena allocator can reserve VA far
@@ -228,7 +236,26 @@ def _build_cmd(point: SweepPoint, manifest: CorpusManifest, store: Path) -> list
         # serves both backends and there is no second condition to get wrong
         # later.
         "--skip-symbolics-and-breakends",
+        # Formerly the pre-5.0 environment-variable log/sample-interval
+        # overrides. Unconditional for both backends -- `sample_interval`
+        # applies to every write command (Ruling A) -- and needed so
+        # `parse_trace` sees the `pipeline sampler`/`pipeline config` lines
+        # it depends on.
+        "--log-filter",
+        "genoray::monitor=trace",
+        "--sample-interval",
+        "1",
     ]
+    if point.backend == "vcf":
+        # `--reader-workers`/`--overshard` are sharded-VCF only (Ruling A):
+        # PGEN pins P=1 and neither the vcf-list nor the svar1 path shards
+        # within a contig, so passing either flag to a non-"vcf" backend now
+        # raises instead of being silently ignored the way the old
+        # environment-variable overrides were.
+        cmd += ["--reader-workers", str(point.reader_workers)]
+        cmd += ["--overshard", str(point.overshard)]
+    if point.concurrent_chroms is not None:
+        cmd += ["--concurrent-chroms", str(point.concurrent_chroms)]
     return cmd
 
 
@@ -320,8 +347,8 @@ def _run_child(
     """Run one child to completion; return (exit_status, rusage, stdout, stderr).
 
     Fix P4: the child's stdout/stderr are redirected to FILES, not
-    `subprocess.PIPE`. `run_point` sets `GENORAY_LOG=genoray::monitor=trace`
-    with `GENORAY_SAMPLE_INTERVAL=1`, so a multi-minute real conversion emits
+    `subprocess.PIPE`. `_build_cmd` passes `--log-filter genoray::monitor=trace`
+    with `--sample-interval 1`, so a multi-minute real conversion emits
     far more than a pipe's ~64 KiB kernel buffer. A `subprocess.PIPE` is
     never drained until after `os.wait4` returns, so the child blocks in
     `write(2)`, the parent blocks in `wait4`, and the run deadlocks forever.
@@ -423,6 +450,7 @@ def run_point(
             shard_unit_secs=t["shard_unit_secs"],
             node=platform.node(),
             concurrent_chroms_used=t["concurrent_chroms_used"],
+            tuning_src=t["tuning_src"],
         )
         # Min-of-N on wall time; the cluster is shared, so the minimum is the
         # least contended estimate.

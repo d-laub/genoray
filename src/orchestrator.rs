@@ -10,7 +10,6 @@ use crate::enum_map::EnumKey;
 use crate::error::ConversionError;
 use crate::nrvk::LongAlleleTableWriter;
 use crate::streams::{REGISTRY, StreamMap, StreamTag};
-use crate::trace::trace_ll;
 use crate::{executor, merge, monitor, writer};
 
 /*
@@ -57,49 +56,6 @@ parallel memory architecture.
 /// `SourceSpec::Pgen` branch below for the unchanged `max_shards` calc.
 pub(crate) const OVERSHARD_FACTOR: usize = 4;
 
-/// BENCH-ONLY: read a `usize` sweep override from the environment.
-///
-/// Lets one build sweep the sharded-VCF `(reader_workers, per-shard HTSlib
-/// threads, overshard factor)` space instead of rebuilding per configuration.
-/// Unset or unparseable leaves the planner's value in place.
-fn bench_env(key: &str) -> Option<usize> {
-    std::env::var(key).ok()?.parse::<usize>().ok()
-}
-
-/// BENCH-ONLY: override the planner's contig concurrency via
-/// `GENORAY_CONCURRENT_CHROMS`. Required to hold TOTAL reader workers constant
-/// while varying how they are partitioned across contigs --
-/// `GENORAY_READER_WORKERS` alone cannot separate "too few readers" from
-/// "readers on the wrong contig".
-///
-/// Lives here beside the other `GENORAY_*` sweep hooks, but is applied by the
-/// callers in `lib.rs` that size the per-run rayon chrom pool: `plan` is not in
-/// scope inside `process_chromosome`, which sees one contig at a time.
-/// Unset or unparseable leaves `planned` in place.
-pub(crate) fn bench_concurrent_chroms(planned: usize) -> usize {
-    bench_env("GENORAY_CONCURRENT_CHROMS")
-        .unwrap_or(planned)
-        .max(1)
-}
-
-/// BENCH-ONLY: `GENORAY_READER_WORKERS`. Resolved by `lib.rs` alongside the
-/// public `reader_workers=` argument (the env var wins) so the effective
-/// value reaches both the planner and the `pipeline config` log. Before #169
-/// this was read per-contig inside `process_chromosome`, where it could not
-/// reach the log line at all.
-pub(crate) fn bench_env_reader_workers() -> Option<usize> {
-    bench_env("GENORAY_READER_WORKERS").map(|w| w.max(1))
-}
-
-/// BENCH-ONLY: `GENORAY_OVERSHARD`, falling back to [`OVERSHARD_FACTOR`].
-/// Only consulted when a contig has no exact record count -- see
-/// `shard::plan_unit_count`.
-pub(crate) fn bench_overshard() -> usize {
-    bench_env("GENORAY_OVERSHARD")
-        .unwrap_or(OVERSHARD_FACTOR)
-        .max(1)
-}
-
 /// Which backend a contig's records come from. Everything downstream of
 /// `ChunkAssembler` is identical for both.
 pub enum SourceSpec {
@@ -110,9 +66,8 @@ pub enum SourceSpec {
         /// the monolithic reader's HTSlib pool on the sharded path.
         reader_workers: usize,
         /// Fallback over-decomposition factor, used ONLY when
-        /// `contig_records` is `None`. Resolved in `lib.rs` (including the
-        /// `GENORAY_OVERSHARD` bench override) so the `pipeline config` log
-        /// prints the effective value.
+        /// `contig_records` is `None`. Resolved in `lib.rs` so the
+        /// `pipeline config` log prints the effective value.
         overshard: usize,
         /// EXACT record count for this contig, or `None` when only the
         /// header-length fallback tier was available. See
@@ -390,6 +345,7 @@ pub fn process_chromosome(
     skip_out_of_scope: bool,
     check_ref: crate::normalize::CheckRef,
     processing_threads: usize,
+    tuning: crate::tuning::ResolvedTuning,
     signatures: bool,
     fields: &[crate::field::FieldSpec],
     sink: &crate::logging::EventSink,
@@ -446,17 +402,7 @@ pub fn process_chromosome(
     //   doc comment above for why.
     // - tx_sparse=8: SparseChunks are tiny (~hundreds of KB); deeper queue is free.
     // - tx_long=2: each buffer is up to long_allele_capacity bytes — keep small.
-    // BENCH-ONLY: `GENORAY_DENSE_CAP` overrides the dense queue depth. A
-    // 6-deep queue is ample for the one-reader `VcfList` branch this constant
-    // was tuned for, but the sharded branch has `reader_workers` producers
-    // against it, so it is a candidate throttle there. Does NOT touch the
-    // exported constant, so Python's `from_vcf_list` derivation is unaffected.
-    // Measured 2026-08-05: no effect (within +-3% at 6/12/24 on both shapes),
-    // so this is a sweep hook for future work, not a knob with a known win.
-    let dense_cap = bench_env("GENORAY_DENSE_CAP")
-        .unwrap_or(VCF_LIST_DENSE_CHANNEL_CAP)
-        .max(1);
-    let (tx_dense, rx_dense) = bounded::<crate::types::DenseChunk>(dense_cap);
+    let (tx_dense, rx_dense) = bounded::<crate::types::DenseChunk>(tuning.dense_cap);
     let (tx_sparse, rx_sparse) = bounded::<crate::types::SparseChunk>(8);
     let (tx_long, rx_long) = bounded::<Vec<u8>>(2);
 
@@ -492,6 +438,7 @@ pub fn process_chromosome(
             exec_worker_tids: Arc::clone(&exec_worker_tids),
             pending_gauge: Arc::clone(&pending_gauge),
         },
+        tuning.sample_interval as u64,
     );
 
     // Step 1 -> The Producer
@@ -547,9 +494,9 @@ pub fn process_chromosome(
                         // (`query_window(Pos)` is identity; `keeps(Pos, ..)` is the
                         // half-open POS test the pre-region sharded reader used).
                         // `reader_workers` and `overshard` arrive already
-                        // resolved (planner value, then any GENORAY_* bench
-                        // override) so the `pipeline config` line in lib.rs
-                        // prints what actually ran -- issue #169 proposal 4.
+                        // resolved by the planner so the `pipeline config`
+                        // line in lib.rs prints what actually ran -- issue
+                        // #169 proposal 4.
                         let shard_htslib = crate::budget::SHARDED_VCF_HTSLIB_THREADS_PER_READER;
                         // Two different `chunk_size`-shaped values meet right
                         // here, deliberately: `plan_unit_count` takes the RAW
@@ -592,11 +539,6 @@ pub fn process_chromosome(
                                     ordinal: s.ordinal,
                                 })
                                 .collect();
-                            trace_ll!(
-                                "[plan {chr}] workers={} shards={}",
-                                reader_workers,
-                                units.len()
-                            );
                             // The frontier width and the backlog ceiling are
                             // the two terms that decided both wall time and
                             // peak RSS in issue #169; neither was observable.
@@ -624,7 +566,6 @@ pub fn process_chromosome(
                                     &vcf_path, &s_refs,
                                 )?;
                             let totals = crate::shard_exec::run(
-                                &chr,
                                 units,
                                 reader_workers,
                                 |unit| {
@@ -804,13 +745,7 @@ pub fn process_chromosome(
                             // `readers.len()` above.
                             let readers_pool: Vec<Mutex<Option<pyo3::Py<pyo3::PyAny>>>> =
                                 readers.into_iter().map(|r| Mutex::new(Some(r))).collect();
-                            trace_ll!(
-                                "[plan {chr}] workers={} shards={}",
-                                processing_threads,
-                                units.len()
-                            );
                             let totals = crate::shard_exec::run(
-                                &chr,
                                 units,
                                 processing_threads,
                                 |unit| {
@@ -1088,8 +1023,8 @@ pub fn process_chromosome(
     // when Phase 1 does, so this span was previously invisible to every
     // benchmark -- yet it is a near-constant 3-5s that grows to HALF of wall
     // once the reader pool is widened. Emitted on the `genoray::monitor`
-    // target so it survives `GENORAY_LOG="genoray::monitor=trace"`, which is a
-    // filter and drops every other target.
+    // target so it survives a `genoray::monitor=trace` log filter, which drops
+    // every other target.
     macro_rules! stage {
         ($label:expr, $body:expr) => {{
             let t = std::time::Instant::now();
@@ -1122,14 +1057,7 @@ pub fn process_chromosome(
         }
     })?;
 
-    // BENCH-ONLY: `GENORAY_MERGE_THREADS` overrides the gather budget for the
-    // var_key merges. Setting it to 1 reproduces the pre-fix behaviour exactly
-    // (those gathers used to inherit `lib.rs`'s `concurrent_chroms`-sized pool
-    // and so always ran single-threaded), which is what makes serial-vs-parallel
-    // measurable from ONE build instead of needing two checkouts.
-    let merge_threads = bench_env("GENORAY_MERGE_THREADS")
-        .unwrap_or(processing_threads)
-        .max(1);
+    let merge_threads = tuning.merge_threads;
 
     // num_chunks is identical across streams — one ledger row per chunk.
     let num_chunks = ledgers.get(StreamTag::VarKeyIndel).len();
@@ -1352,6 +1280,12 @@ pub fn run_vcf_list(
     // `SourceSpec::VcfList` so non-member files are never opened for that contig
     // (issue #122).
     contig_membership: Vec<Vec<bool>>,
+    // The caller's tuning request. This pipeline is sequential (no
+    // `concurrent_chroms` to honour) and has no separate reader-worker pool
+    // (no `reader_workers`/`overshard` to honour either) -- only
+    // `dense_cap`/`merge_threads`/`sample_interval` apply, matching
+    // `_APPLICABLE["vcf_list"]` in `python/genoray/_tuning.py`.
+    requested: crate::tuning::TuningIn,
     sink: &crate::logging::EventSink,
 ) -> Result<u64, ConversionError> {
     if contig_membership.len() != chroms.len() {
@@ -1389,7 +1323,31 @@ pub fn run_vcf_list(
     // `processing_threads` is consumed here.
     let plan = crate::budget::plan_thread_budget(available_cores, VCF_LIST_CONCURRENT_CHROMS);
     let processing_threads = plan.processing_threads;
-    tracing::info!(threads = processing_threads, "pipeline configured");
+    // No separate "pipeline configured" line: it carried only
+    // `processing_threads`, which the banner below now reports as
+    // `merge_threads` with its provenance -- and "pipeline configured" is a
+    // prefix of "pipeline config", so a banner parser scanning for the first
+    // match would have found this line instead of the banner.
+    // No `reader_workers` here (single-reader sequential loop below), so
+    // resolve against a nominal 1.
+    let resolved = requested
+        .resolve(VCF_LIST_CONCURRENT_CHROMS, 1)
+        .with_merge_threads(processing_threads);
+    tracing::info!(
+        dense_cap = resolved.dense_cap,
+        dense_cap_src = resolved.dense_cap_src(),
+        merge_threads = resolved.merge_threads,
+        merge_threads_src = resolved.merge_threads_src(),
+        sample_interval = resolved.sample_interval,
+        sample_interval_src = resolved.sample_interval_src(),
+        // Matches the VCF/PGEN/SVAR1 banners, which all still report this
+        // alongside `merge_threads`: they are equal only while `merge_threads`
+        // is unset (planner-derived), and diverge once `--merge-threads` sets
+        // it explicitly, so dropping this field would leave the thread budget
+        // unreported in that case.
+        processing_threads,
+        "pipeline config (VCF list)"
+    );
 
     let fasta_ref = reference_path;
     let mut total_dropped: u64 = 0;
@@ -1413,6 +1371,7 @@ pub fn run_vcf_list(
             skip_out_of_scope,
             check_ref,
             processing_threads,
+            resolved,
             signatures,
             &fields,
             sink,

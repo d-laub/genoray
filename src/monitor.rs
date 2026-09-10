@@ -174,16 +174,6 @@ fn read_thread_cpu_ticks(tid: i32) -> u64 {
     utime + stime
 }
 
-// Sample cadence in seconds. Read once at sampler-spawn time from
-// `GENORAY_SAMPLE_INTERVAL` (default 5). Set to "0" to disable monitoring entirely
-// for production runs where stderr volume matters.
-fn sample_interval_secs() -> u64 {
-    std::env::var("GENORAY_SAMPLE_INTERVAL")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(5)
-}
-
 /// Granularity at which a sleeping sampler notices it has been asked to stop.
 ///
 /// Small enough to be invisible against a contig, large enough that the wakeup
@@ -313,6 +303,7 @@ pub fn spawn_sampler(
     tx_long: Sender<Vec<u8>>,
     stop: Arc<AtomicBool>,
     probes: PipelineProbes,
+    interval_secs: u64,
 ) -> thread::JoinHandle<()> {
     let PipelineProbes {
         shard_worker_tids,
@@ -322,7 +313,6 @@ pub fn spawn_sampler(
     thread::Builder::new()
         .name(format!("samp-{}", chrom))
         .spawn(move || {
-            let interval_secs = sample_interval_secs();
             // Disabled — drop Sender clones and exit immediately.
             if interval_secs == 0 {
                 return;

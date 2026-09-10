@@ -1,13 +1,13 @@
 import hashlib
 import io
+import re
 import subprocess
 import threading
 from pathlib import Path
 
 import genoray._core as core
-import pytest
 from genoray import SparseVar2
-from genoray._logging import ProgressRenderer, resolve_log_level, write_reporting
+from genoray._logging import ProgressRenderer, write_reporting
 from rich.console import Console
 
 
@@ -50,15 +50,6 @@ def test_progress_false_suppresses_percent_lines():
     # summaries still present, but no "%" throttled progress line
     assert "chr1 done" in out
     assert "%" not in out
-
-
-def test_resolve_log_level_validates_and_env(monkeypatch):
-    assert resolve_log_level("info") == "info"
-    monkeypatch.setenv("GENORAY_LOG", "debug")
-    assert resolve_log_level("info") == "debug"
-    monkeypatch.delenv("GENORAY_LOG", raising=False)
-    with pytest.raises(ValueError):
-        resolve_log_level("loud")
 
 
 def test_write_reporting_disabled_yields_none():
@@ -248,67 +239,61 @@ def test_below_pool_logs_surface_at_debug(tmp_path, capsys):
     assert "exclud" in lower, captured.out
 
 
-def test_genoray_log_env_overrides_rendered_verbosity(tmp_path, capsys, monkeypatch):
-    """Regression guard for the bug where `GENORAY_LOG` was resolved on the
-    Python side but the RAW `log_level` argument was still forwarded to the
-    Rust `_core.*` call, so the channel/renderer never saw the override.
+# Emitted by `tracing::debug!` in `orchestrator::process_chromosome` (search
+# `"Phase 1 complete"` in src/orchestrator.rs), so it is on the path of every
+# successful `from_vcf` and is gated by `log_level` alone.
+_DEBUG_ONLY = "phase 1 complete"
 
-    Reuses the `check_ref="x"` REF-mismatch fixture from
-    `test_below_pool_logs_surface_at_debug`. That fixture actually fires two
-    "excluded" messages: a per-contig `tracing::info!` summary
-    (`report_ref_excluded` in `orchestrator.rs`, always visible at "info")
-    and a below-pool `tracing::debug!` first-offender detail in
-    `chunk_assembler.rs` ("... further exclusions on this contig are
-    counted, not logged individually") that's genuinely gated by the
-    resolved level. Assert on the latter's unique text, not the generic
-    "exclud" substring, since the info-level summary would make that
-    substring present regardless of the bug.
 
-    Calling with `log_level="info"`:
-    - without `GENORAY_LOG` set, the effective level is "info" -> the debug
-      detail line must NOT reach stdout.
-    - with `GENORAY_LOG=debug`, the effective level must be raised to
-      "debug" -> the debug detail line MUST reach stdout.
-    Fails under the pre-fix code because the raw (unresolved) "info" reaches
-    the Rust channel gate regardless of GENORAY_LOG.
+def _rendered(capfd) -> str:
+    """Everything the renderer wrote, de-styled and de-wrapped.
+
+    Rich injects ANSI codes and hard-wraps to the console width, so a phrase
+    can arrive split across lines; collapsing whitespace makes a substring
+    search mean what it looks like it means.
     """
-    ref = tmp_path / "ref.fa"
-    ref.write_text(f">chr1\n{_REF}\n")
-    subprocess.run(["samtools", "faidx", str(ref)], check=True)
-    body = (
-        "##fileformat=VCFv4.2\n"
-        "##contig=<ID=1,length=40>\n"
-        '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n'
-        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS0\tS1\n"
-        # pos 3 is really 'A' in _REF -- 'T' here is a deliberate REF mismatch.
-        "1\t3\t.\tT\tG\t.\t.\t.\tGT\t1|0\t0|0\n"
-        "1\t7\t.\tC\tCAT\t.\t.\t.\tGT\t0|1\t1|1\n"
-    )
-    plain = tmp_path / "in.vcf"
-    plain.write_text(body)
-    gz = tmp_path / "in.vcf.gz"
-    with open(gz, "wb") as fh:
-        subprocess.run(["bgzip", "-c", str(plain)], check=True, stdout=fh)
-    subprocess.run(["bcftools", "index", str(gz)], check=True)
+    captured = capfd.readouterr()
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", captured.out + captured.err)
+    return re.sub(r"\s+", " ", plain).lower()
 
-    monkeypatch.delenv("GENORAY_LOG", raising=False)
-    out_no_env = tmp_path / "out_no_env.svar2"
-    SparseVar2.from_vcf(
-        out_no_env, gz, ref, check_ref="x", progress=False, log_level="info"
-    )
-    captured = capsys.readouterr()
-    lower = captured.out.lower()
-    assert "done" in lower, captured.out
-    assert "not logged individually" not in lower, captured.out
 
-    monkeypatch.setenv("GENORAY_LOG", "debug")
-    out_with_env = tmp_path / "out_with_env.svar2"
+def test_log_level_argument_reaches_the_channel_gate(tmp_path, small_vcf, capfd):
+    """A debug-level line must reach the Python renderer only when asked for.
+
+    The old version of this test drove the level through GENORAY_LOG, which
+    also silently overrode the argument. The argument is now the only channel.
+
+    Both halves are load-bearing. Asserting only that SOMETHING was printed
+    proves nothing: `contig_done` is not level-gated at all (see
+    `EventSink::contig_done` in src/logging.rs and the `"contig_done"` branch
+    of `ProgressRenderer.handle`), so its `[svar2] ... done:` line appears at
+    every level and would keep this test green even if `log_level` were
+    ignored outright. The control run at `warning` is what makes the debug
+    assertion mean something.
+
+    `progress=False` on both runs for the same reason: `progress=True` wires
+    the event channel up regardless of the level, which is exactly the
+    coupling this test must not depend on.
+    """
+    debug_out = tmp_path / "debug.svar"
     SparseVar2.from_vcf(
-        out_with_env, gz, ref, check_ref="x", progress=False, log_level="info"
+        debug_out, small_vcf, no_reference=True, progress=False, log_level="debug"
     )
-    captured = capsys.readouterr()
-    lower = captured.out.lower()
-    assert "not logged individually" in lower, captured.out
+    at_debug = _rendered(capfd)
+
+    warn_out = tmp_path / "warn.svar"
+    SparseVar2.from_vcf(
+        warn_out, small_vcf, no_reference=True, progress=False, log_level="warning"
+    )
+    at_warning = _rendered(capfd)
+
+    assert _DEBUG_ONLY in at_debug, (
+        f"log_level='debug' did not deliver a debug line:\n{at_debug!r}"
+    )
+    assert _DEBUG_ONLY not in at_warning, (
+        "log_level='warning' delivered a debug-only line -- the level "
+        f"argument is not gating the channel:\n{at_warning!r}"
+    )
 
 
 def test_from_svar1_emits_summary(tmp_path, capsys):

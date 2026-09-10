@@ -204,8 +204,8 @@ def test_run_point_survives_a_chatty_child_beyond_the_pipe_buffer(
     `os.wait4` returns. A pipe's kernel buffer is ~64 KiB; a child that
     writes more than that before the parent drains it blocks in `write(2)`
     forever, and the parent blocks in `wait4` forever right along with it --
-    deadlock. `GENORAY_LOG=genoray::monitor=trace` with
-    `GENORAY_SAMPLE_INTERVAL=1` makes a multi-minute real conversion do
+    deadlock. `log_filter="genoray::monitor=trace"` with
+    `Tuning(sample_interval=1)` makes a multi-minute real conversion do
     exactly this. Reproduce the shape of the bug cheaply with a fake command
     that emits 200_000 bytes (well over 64 KiB) on each of stdout and
     stderr, standing in for the real `genoray._cli` invocation `run_point`
