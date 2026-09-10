@@ -575,6 +575,19 @@ pub fn plan_sharded(inp: PlanInputs) -> Result<ShardedPlan, PlanError> {
     // concurrency is a shape the planner never validated and never would.
     if let Some(req_cc) = inp.concurrent_chroms {
         let cc = req_cc.max(1);
+        // Same precedent as the PGEN concurrency knee (`lib.rs`): an explicit
+        // request past the modelled domain is honoured, not clamped -- but a
+        // `cc` past the contig count is strictly more obviously wrong than
+        // past a measured constant, so it gets the same warning. The excess
+        // contig-pool threads will never receive work.
+        if cc > n_contigs {
+            tracing::warn!(
+                concurrent_chroms = cc,
+                n_contigs,
+                "explicit concurrent_chroms exceeds the number of contigs; \
+                 honouring it, but the excess contig threads will be idle"
+            );
+        }
         if let Some(req_w) = inp.reader_workers {
             let w = req_w.max(1);
             memory_fits(&inp, cc, w)?;

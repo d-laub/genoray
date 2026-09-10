@@ -356,7 +356,9 @@ fn ensure_global_subscriber() {
 
 /// Apply `directives` to the stderr fmt layer, or silence it when `None`.
 /// An unparseable directive string silences the layer rather than panicking:
-/// a bad filter must not take down a conversion that is otherwise fine.
+/// a bad filter must not take down a conversion that is otherwise fine. It
+/// still reports the rejection to stderr, naming the directive, so the
+/// caller learns why their logs went silent instead of just losing them.
 ///
 /// Returns the directives that were in effect beforehand, so a caller can put
 /// them back.
@@ -374,7 +376,12 @@ fn set_fmt_filter(directives: Option<&str>) -> Option<String> {
         });
     }
     let filter = match directives {
-        Some(d) => EnvFilter::try_new(d).unwrap_or_else(|_| off_filter()),
+        Some(d) => EnvFilter::try_new(d).unwrap_or_else(|_| {
+            eprintln!(
+                "genoray: log filter {d:?} could not be parsed -- logging is off for this call."
+            );
+            off_filter()
+        }),
         None => off_filter(),
     };
     if let Some(set) = SET_FMT_FILTER.get() {
@@ -707,13 +714,57 @@ mod tests {
         assert_eq!(event_rank(&tracing::Level::TRACE), 4);
     }
 
+    /// End-to-end gate test: a `tracing::warn!` must actually be dropped when
+    /// routed through `with_channel_subscriber` at `"error"`, and actually
+    /// kept at `"warning"`. The arithmetic-only predecessor of this test
+    /// asserted `event_rank`/`level_rank` relationships that
+    /// `level_ranks_split_error_from_warning` and `event_ranks_match_level_ranks`
+    /// already pin exactly, so it could not fail independently of those two.
+    /// This drives the real gate (`on_event`'s rank comparison) instead.
     #[test]
     fn a_warning_is_dropped_at_error_level_but_kept_at_warning() {
-        // Rank ordering is the whole contract of the channel gate: an event is
-        // dropped when its rank exceeds the active level's rank.
-        assert!(event_rank(&tracing::Level::WARN) > level_rank("error"));
-        assert!(event_rank(&tracing::Level::WARN) <= level_rank("warning"));
-        assert!(event_rank(&tracing::Level::INFO) > level_rank("warning"));
+        use crossbeam_channel::unbounded;
+        let _guard = TEST_LOCK.lock().unwrap();
+        let own_target = module_path!();
+
+        let (tx, rx) = unbounded();
+        let sink = EventSink::new(tx, 1);
+        with_channel_subscriber(sink, "error", None, || {
+            tracing::warn!("should be dropped at error level");
+        });
+        let kept: Vec<String> = rx
+            .try_iter()
+            .filter_map(|e| match e {
+                Event::Log {
+                    message, target, ..
+                } if target == own_target => Some(message),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            kept.is_empty(),
+            "a warning must be dropped when the active level is \"error\", got {kept:?}"
+        );
+
+        let (tx, rx) = unbounded();
+        let sink = EventSink::new(tx, 1);
+        with_channel_subscriber(sink, "warning", None, || {
+            tracing::warn!("should be kept at warning level");
+        });
+        let kept: Vec<String> = rx
+            .try_iter()
+            .filter_map(|e| match e {
+                Event::Log {
+                    message, target, ..
+                } if target == own_target => Some(message),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            kept.len(),
+            1,
+            "a warning must be kept when the active level is \"warning\""
+        );
     }
 
     /// The reload handle must survive repeated set/restore cycles -- what a

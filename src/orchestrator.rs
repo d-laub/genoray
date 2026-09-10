@@ -1340,6 +1340,12 @@ pub fn run_vcf_list(
         merge_threads_src = resolved.merge_threads_src(),
         sample_interval = resolved.sample_interval,
         sample_interval_src = resolved.sample_interval_src(),
+        // Matches the VCF/PGEN/SVAR1 banners, which all still report this
+        // alongside `merge_threads`: they are equal only while `merge_threads`
+        // is unset (planner-derived), and diverge once `--merge-threads` sets
+        // it explicitly, so dropping this field would leave the thread budget
+        // unreported in that case.
+        processing_threads,
         "pipeline config (VCF list)"
     );
 
