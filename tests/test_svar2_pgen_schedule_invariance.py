@@ -12,14 +12,31 @@ vcfixture bulk CLI is not available there.
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 
 import pytest
 
-from genoray import SparseVar2
+from genoray import SparseVar2, Tuning
 
 from tests import _oracle
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _pipeline_concurrent_chroms(captured_text: str) -> int:
+    """Extract the `concurrent_chroms=` field logged on the "pipeline config
+    (PGEN)" tracing event, tolerant of Rich's ANSI styling and line-wrapping.
+    Mirrors `_pipeline_planned_units` in tests/test_svar2_schedule_invariance.py."""
+    plain = _ANSI_RE.sub("", captured_text)
+    collapsed = re.sub(r"\s+", " ", plain)
+    m = re.search(r"concurrent_chroms=(\d+)", collapsed)
+    assert m is not None, (
+        f"no concurrent_chroms field found in captured output:\n{captured_text!r}"
+    )
+    return int(m.group(1))
+
 
 # PGEN pins P=1, so reader_workers has no axis to sweep -- only cc moves.
 SCHEDULES = [1, 2, 4, 8]
@@ -93,32 +110,31 @@ def multi_contig_pgen(tmp_path_factory):
     return d / "sched.pgen"
 
 
-def _convert(pgen, out, cc, monkeypatch):
-    # Read in-process by the Rust orchestrator, so it must be set on
-    # os.environ -- a subprocess env would never reach this pipeline.
-    monkeypatch.setenv("GENORAY_CONCURRENT_CHROMS", str(cc))
+def _convert(pgen, out, cc):
     SparseVar2.from_pgen(
-        out, pgen, no_reference=True, chunk_size=CHUNK_SIZE, log_level="off"
+        out,
+        pgen,
+        no_reference=True,
+        chunk_size=CHUNK_SIZE,
+        tuning=Tuning(concurrent_chroms=cc),
     )
     return _oracle.store_digest(out)
 
 
-# TODO(Task 8): this test currently passes VACUOUSLY, exactly like its VCF
-# sibling in `test_svar2_schedule_invariance.py`. `_convert` pins the schedule
-# with `GENORAY_CONCURRENT_CHROMS`, which no longer does anything, so every
-# entry in `SCHEDULES` runs the SAME schedule and the digests match trivially.
-# It must be rebuilt on `tuning=Tuning(concurrent_chroms=cc)` (note: PGEN does
-# not accept `reader_workers`, and passing it now raises) AND given a self-guard
-# asserting the schedules actually differed -- read `concurrent_chroms=` off the
-# `pipeline config` banner with `capfd`. Without the guard it will keep proving
-# nothing quietly, which is how this decay went unnoticed in the first place.
-def test_digest_is_invariant_across_schedules(multi_contig_pgen, tmp_path, monkeypatch):
+def test_digest_is_invariant_across_schedules(multi_contig_pgen, tmp_path, capfd):
     digests = {}
     outs = {}
+    schedules_seen = set()
     for cc in SCHEDULES:
         out = tmp_path / f"cc{cc}.svar"
-        digests[cc] = _convert(multi_contig_pgen, out, cc, monkeypatch)
+        digests[cc] = _convert(multi_contig_pgen, out, cc)
+        captured = capfd.readouterr()
+        schedules_seen.add(_pipeline_concurrent_chroms(captured.out + captured.err))
         outs[cc] = out
+    assert len(schedules_seen) >= 2, (
+        "concurrent_chroms never varied across SCHEDULES rows -- this test "
+        f"proves nothing about schedule invariance: {schedules_seen}"
+    )
     assert len(set(digests.values())) == 1, f"schedule changed output: {digests}"
 
     # Digest-invariance alone cannot tell "correctly non-empty" from
@@ -137,13 +153,13 @@ def test_digest_is_invariant_across_schedules(multi_contig_pgen, tmp_path, monke
 
 
 def test_dispatch_order_is_longest_first_and_still_writes_meta_in_file_order(
-    multi_contig_pgen, tmp_path, monkeypatch
+    multi_contig_pgen, tmp_path
 ):
     """Dispatch order must not leak into the store's layout: meta.json's
     contig order is part of the on-disk format and comes from `chroms`, not
     from the (reordered) dispatch list."""
     out = tmp_path / "order.svar"
-    _convert(multi_contig_pgen, out, 4, monkeypatch)
+    _convert(multi_contig_pgen, out, 4)
     sv = SparseVar2(out)
     assert sv.contigs == [f"chr{i}" for i in range(1, 9)]
 

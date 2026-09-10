@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 import genoray._utils as _utils
-from genoray import SparseVar2
+from genoray import SparseVar2, Tuning
 from tests import _oracle
 
 _REF = "ACAGTACATGGGTACTAGCTAGGCTAACCGGTTAACCGGT"
@@ -598,12 +598,24 @@ def test_from_vcf_reader_workers_reaches_the_planner(tmp_path: Path, capfd):
     vcf = _write_vcf(tmp_path, symbolic=False, indexed=True)
 
     a = tmp_path / "w1"
-    SparseVar2.from_vcf(a, vcf, no_reference=True, reader_workers=1, log_level="info")
+    SparseVar2.from_vcf(
+        a,
+        vcf,
+        no_reference=True,
+        tuning=Tuning(reader_workers=1),
+        log_level="info",
+    )
     captured_a = capfd.readouterr()
     workers_a = _pipeline_reader_workers(captured_a.out + captured_a.err)
 
     b = tmp_path / "w5"
-    SparseVar2.from_vcf(b, vcf, no_reference=True, reader_workers=5, log_level="info")
+    SparseVar2.from_vcf(
+        b,
+        vcf,
+        no_reference=True,
+        tuning=Tuning(reader_workers=5),
+        log_level="info",
+    )
     captured_b = capfd.readouterr()
     workers_b = _pipeline_reader_workers(captured_b.out + captured_b.err)
 
@@ -642,5 +654,7 @@ def test_from_vcf_reader_workers_below_one_raises(tmp_path: Path):
     vcf = _write_vcf(tmp_path, symbolic=False, indexed=True)
     out = tmp_path / "rejected"
     with pytest.raises(ValueError, match="reader_workers"):
-        SparseVar2.from_vcf(out, vcf, no_reference=True, reader_workers=0)
+        SparseVar2.from_vcf(
+            out, vcf, no_reference=True, tuning=Tuning(reader_workers=0)
+        )
     assert not out.exists()

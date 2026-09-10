@@ -238,6 +238,20 @@ def test_below_pool_logs_surface_at_debug(tmp_path, capsys):
     assert "exclud" in lower, captured.out
 
 
+def test_log_level_argument_reaches_the_channel_gate(tmp_path, small_vcf, capfd):
+    """A debug-level line must reach the Python renderer when asked for.
+
+    The old version of this test drove the level through GENORAY_LOG, which
+    also silently overrode the argument. The argument is now the only channel.
+    """
+    out = tmp_path / "lvl.svar"
+    SparseVar2.from_vcf(
+        out, small_vcf, no_reference=True, progress=True, log_level="debug"
+    )
+    captured = capfd.readouterr()
+    assert "[svar2]" in captured.out + captured.err
+
+
 def test_from_svar1_emits_summary(tmp_path, capsys):
     from genoray import SparseVar
     from genoray import VCF as _V1VCF
