@@ -648,13 +648,16 @@ def test_from_vcf_planner_refusal_surfaces_to_python(tmp_path: Path):
     assert not out.exists()
 
 
-def test_from_vcf_reader_workers_below_one_raises(tmp_path: Path):
+def test_from_vcf_reader_workers_below_one_raises():
     """`reader_workers=0` must not silently coerce to 1 (the opposite of
-    "let the planner decide"); it must be rejected."""
-    vcf = _write_vcf(tmp_path, symbolic=False, indexed=True)
-    out = tmp_path / "rejected"
+    "let the planner decide"); it must be rejected.
+
+    `Tuning.__post_init__` raises while the `Tuning` itself is being
+    constructed -- `from_vcf` is never entered -- so the raise must be
+    provoked by building `Tuning(reader_workers=0)` directly. Wrapping a
+    `SparseVar2.from_vcf(...)` call in `pytest.raises` here would be a
+    tautology: the exception already happened by the time that call is
+    reached, so the assertion cannot fail regardless of what `from_vcf` does.
+    """
     with pytest.raises(ValueError, match="reader_workers"):
-        SparseVar2.from_vcf(
-            out, vcf, no_reference=True, tuning=Tuning(reader_workers=0)
-        )
-    assert not out.exists()
+        Tuning(reader_workers=0)
