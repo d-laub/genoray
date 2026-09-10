@@ -22,12 +22,34 @@ from genoray import SparseVar2, Tuning
 # below Python, so only an OS-fd-level capture (`capfd`) can see it.
 
 
+# `tracing-subscriber` is declared without `default-features = false`, so its
+# `ansi` feature is on and the fmt layer styles FIELD NAMES: what reaches fd 2
+# is `\x1b[1mreader_workers\x1b[0m=2`, not `reader_workers=2`. Parsing that
+# with a bare `(\w+)=` captures the `0m` of the reset escape as the key, so
+# every field in the banner collapses onto the single key `0m` and the line
+# appears to contain no knobs at all. De-style first, or this helper silently
+# returns a one-entry dict and every lookup raises `KeyError`.
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
 def _banner(caplog_text: str) -> dict[str, str]:
     """Parse the flat `key=value` pairs out of the `pipeline config` line."""
     for line in caplog_text.splitlines():
         if "pipeline config" not in line:
             continue
-        return dict(re.findall(r"(\w+)=([^\s]+)", line))
+        plain = _ANSI.sub("", line)
+        # `tracing` renders string field values quoted and numeric ones bare:
+        # `reader_workers=2 reader_workers_src="explicit"`. Strip the quotes so
+        # callers compare against `explicit`, not `"explicit"` -- otherwise
+        # every provenance assertion in this file fails on the quoting alone.
+        fields = {
+            key: value.strip('"') for key, value in re.findall(r"(\w+)=([^\s]+)", plain)
+        }
+        # A banner that parsed to nothing means the de-styling above stopped
+        # matching the emitter's escapes. Fail saying so, rather than handing
+        # back an empty dict for a caller to trip over as a bare KeyError.
+        assert fields, f"`pipeline config` line parsed to no fields: {line!r}"
+        return fields
     raise AssertionError(f"no `pipeline config` line found in:\n{caplog_text}")
 
 
