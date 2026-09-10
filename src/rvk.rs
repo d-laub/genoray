@@ -550,6 +550,39 @@ fn dense2sparse_vk_by_scan(
     // misses, not 64x cheaper ones. What remains is O(calls) emission, which no
     // amount of scan restructuring removes.
     //
+    // THOSE FIGURES ARE THE BEST CASE FOR THE OLD LOOP, because they were
+    // measured with transparent huge pages working. The dominant resource here
+    // is not cache but the TLB, and that changes the numbers by almost an order
+    // of magnitude.
+    //
+    // Both loops walk the same footprint: the inner stride is `columns` bits
+    // (131 KB at S = 535,662), so V consecutive reads touch V distinct pages.
+    // At V = 5000 that is 5000 pages -- well past a ~1536-entry STLB with 4 KB
+    // pages, and only ~313 entries with 2 MB pages, which fits. The old loop
+    // walks that footprint once PER COLUMN (1,071,324 times); this one walks it
+    // once per BLOCK (16,739 times). Same cliff, 64x fewer trips over it.
+    //
+    // Measured by re-running the same two binaries under
+    // `prctl(PR_SET_THP_DISABLE)` (`scripts/nothp.c`, `scripts/issue177_thp.sbatch`;
+    // cn-02, V = 2000, digests identical across all four arms):
+    //
+    //                    THP on    THP off   degradation   dTLB miss rate
+    //     old, AF 0.01%   4.53 s   48.97 s      10.8x       0.008% -> 33%
+    //     new, AF 0.01%   0.71 s    1.06 s       1.49x      0.002% -> 8.6%
+    //     old, AF 1%      5.40 s   52.99 s       9.8x       0.006% -> 30%
+    //     new, AF 1%      1.30 s    2.29 s       1.76x      0.001% -> 5.8%
+    //
+    // So the speedup is 6.4x when the memory system is healthy and 46x when it
+    // is not, and the new loop with THP DISABLED still beats the old loop with
+    // THP working (1.06 s vs 4.53 s). This is not hypothetical: #176 reports
+    // the executor's cost per unit varying ~6x WITHIN one contig while
+    // saturated and alone on the host, 1.6 ms/variant to 26-37 ms/variant --
+    // which brackets the 2.27 -> 24.5 ms/variant above. That variance was read
+    // there as data-dependent; holding the data fixed and changing only the
+    // page size reproduces it, so it is memory-system state. The practical
+    // consequence is that this loop removes host THP/fragmentation state as a
+    // variable, collapsing that 10.8x sensitivity to 1.49x.
+    //
     // Emission order is unchanged and must stay that way: columns ascending,
     // and variants ascending within a column (which buckets get for free, as
     // they are filled in ascending `v`). `merge` reads `sample_lengths`
