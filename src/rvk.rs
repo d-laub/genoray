@@ -456,12 +456,14 @@ fn route_variants(
     }
 }
 
-// Today's Dense-to-Sparse Matrix Transposer: a column-outer, variant-inner
-// scan that walks every (variant, column) presence bit to find the carriers.
+// Today's Dense-to-Sparse Matrix Transposer: a 64-column-blocked scan that
+// reads each variant's presence bits one machine word at a time, skipping
+// variants with no carrier in the block, and buckets the survivors by column
+// (#177). It recovers the carriers from `genos` rather than being handed them.
 // Its routing pre-pass (`route_variants`) and emission arms (`emit_call`) are
 // shared with `dense2sparse_vk`'s carrier-driven path below -- the two
-// functions differ only in *iteration order*: this one walks the full grid,
-// the carrier-driven path walks only the carrier list. Used two ways: as the
+// functions differ only in *iteration order*: this one recovers carriers from
+// the grid, the carrier-driven path is handed them. Used two ways: as the
 // production path for chunks whose source is natively dense
 // (`chunk.carriers == None`, where scanning `genos` is both correct and
 // cheapest -- see `DenseChunk::carriers` in types.rs), and as one side of
@@ -515,31 +517,85 @@ fn dense2sparse_vk_by_scan(
 
     let words: &[u64] = &chunk.genos.words;
 
-    // Sample-major transpose; route each set call to its stream or dense bit.
-    for s in 0..num_samples {
-        for p in 0..ploidy {
+    // Blocked transpose (#177). The grid is (V, S, P) with `columns` bits per
+    // variant, so 64 CONSECUTIVE COLUMNS OF ONE VARIANT share a `u64`. Walking
+    // column-outer/variant-inner therefore costs one strided bit test per
+    // (variant, column) slot -- `V * columns`, which is 5.36e9 per chunk at
+    // 535,662 samples and is what made the executor the bottleneck in #176.
+    //
+    // Instead, take one 64-column block at a time: read each variant's 64-bit
+    // window once and skip the variant outright when it is zero, then BUCKET
+    // the surviving set bits by column. Cost becomes `V * columns/64` window
+    // reads + O(calls) + O(columns).
+    //
+    // The bucketing is load-bearing, not a tidiness choice. The obvious
+    // alternative -- keep the block's nonzero windows and test each of the 64
+    // columns against them -- reverts to the old cost as allele frequency
+    // rises, because the nonzero set stops being small: measured 45x/13x/1.5x
+    // at 0.01%/0.1%/1% alt-allele frequency, versus 63x/59x/39x bucketed.
+    //
+    // Emission order is unchanged and must stay that way: columns ascending,
+    // and variants ascending within a column (which buckets get for free, as
+    // they are filled in ascending `v`). `merge` reads `sample_lengths`
+    // positionally, so a reordered or short push shifts every downstream
+    // column rather than corrupting one value -- hence `sample_lengths` is
+    // still pushed for EVERY column, including empty ones.
+    const BLOCK: usize = 64;
+    // One bucket per column in the block, reused across blocks. Holds variant
+    // indices, ascending by construction.
+    let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); BLOCK];
+
+    for block in 0..columns.div_ceil(BLOCK) {
+        let col0 = block * BLOCK;
+        let width = BLOCK.min(columns - col0);
+        for bucket in buckets[..width].iter_mut() {
+            bucket.clear();
+        }
+
+        for v in 0..v_variants {
+            let start = (v * columns) + col0;
+            let wi = start >> 6;
+            let sh = start & 63;
+            // SAFETY: `col0 < columns` and `v < v_variants`, so `start <
+            // v_variants * columns == total_bits` (the `BitGrid3`'s (V, S, P)
+            // shape product) and `words.len() == total_bits.div_ceil(64)`,
+            // making `wi` a valid word index.
+            let mut window = unsafe { *words.get_unchecked(wi) } >> sh;
+            // Rows are NOT word-aligned in general: a variant's row starts at
+            // bit `v * columns`, and `columns` need not be a multiple of 64
+            // (1,071,324 % 64 == 28 at cohort width). When the window straddles
+            // two words, funnel in the low bits of the next one. The `sh != 0`
+            // guard is required -- `w << 64` is UB in Rust, not zero -- and
+            // `get` covers the final block of the final variant, where there
+            // is no next word.
+            if sh != 0
+                && let Some(&next) = words.get(wi + 1)
+            {
+                window |= next << (64 - sh);
+            }
+            // A partial tail block would otherwise pull in bits belonging to
+            // variant `v + 1`. Guarded because `1u64 << 64` is UB.
+            if width < BLOCK {
+                window &= (1u64 << width) - 1;
+            }
+            while window != 0 {
+                let k = window.trailing_zeros() as usize;
+                buckets[k].push(v as u32);
+                window &= window - 1; // clear lowest set bit
+            }
+        }
+
+        for (k, bucket) in buckets[..width].iter().enumerate() {
+            let hap = col0 + k; // hap index in sample-major order
+            let s = hap / ploidy;
             // per-tag running counts for this column
             let mut counts = crate::streams::StreamMap::from_fn(|_| 0u32);
-            let base_idx = (s * ploidy) + p;
-            let hap = base_idx; // hap index in sample-major order
-            let stride = columns;
-
-            for v in 0..v_variants {
-                let flat_idx = (v * stride) + base_idx;
-                // SAFETY: `stride == columns == num_samples * ploidy` and
-                // `base_idx = s * ploidy + p < columns`, so for `v <
-                // v_variants` we have `flat_idx < v_variants * columns ==
-                // total_bits` (the `BitGrid3`'s (V, S, P) shape product).
-                // `words.len() == total_bits.div_ceil(64)`, so `flat_idx >>
-                // 6` is a valid word index.
-                let word = unsafe { *words.get_unchecked(flat_idx >> 6) };
-                if (word >> (flat_idx & 63)) & 1 == 0 {
-                    continue;
-                }
-                // SAFETY: `routes` was built by the pre-pass loop above,
-                // which pushes exactly one `Route` per `v in 0..v_variants`,
-                // so `routes.len() == v_variants` and `routes[v]` is in
-                // bounds here for the same `v`.
+            for &v in bucket.iter() {
+                let v = v as usize;
+                // SAFETY: `routes` was built by the pre-pass loop above, which
+                // pushes exactly one `Route` per `v in 0..v_variants`, so
+                // `routes.len() == v_variants`. Bucket entries come from the
+                // `0..v_variants` loop above, so `v` is in bounds.
                 let route = unsafe { routes.get_unchecked(v) };
                 emit_call(
                     route,
@@ -572,15 +628,15 @@ fn dense2sparse_vk_by_scan(
 // caller uses. Routes each chunk by how its presence data arrived:
 //
 // - `chunk.carriers == None` (a natively dense source -- a multi-sample VCF,
-//   PGEN): falls straight through to `dense2sparse_vk_by_scan`, today's
-//   grid-scan, unchanged. For these sources `genos` IS the cheapest and only
-//   source of truth (see `DenseChunk::carriers` in types.rs).
+//   PGEN): falls straight through to `dense2sparse_vk_by_scan`, the blocked
+//   grid scan. This is the path `from_vcf` takes, and therefore the one #176
+//   measured. For these sources `genos` IS the cheapest and only source of
+//   truth (see `DenseChunk::carriers` in types.rs).
 // - `chunk.carriers == Some(..)` (the k-way merge over single-sample VCFs):
 //   runs the carrier-driven emission below, which counting-sorts the chunk's
 //   carriers by column and walks only the (variant, column) pairs that are
-//   actually present -- replacing a scan of every (variant, column) slot
-//   (`dense2sparse_vk_by_scan`'s ~O(V x N) bit-test) with O(carriers +
-//   columns) work. Sparse-routed variants never touch `chunk.genos` here; the
+//   actually present -- O(carriers + columns), with no need to recover them
+//   from the grid at all. Sparse-routed variants never touch `chunk.genos`; the
 //   routing pre-pass and emission arms are shared with
 //   `dense2sparse_vk_by_scan` (`route_variants`, `emit_call`) rather than
 //   duplicated -- the two functions differ only in iteration order, so the
@@ -970,6 +1026,226 @@ mod tests {
                 via_carriers, via_scan,
                 "carrier-driven and grid-scan emission diverged at {v_variants}x{n_samples}"
             );
+        }
+    }
+
+    // Frozen copy of `dense2sparse_vk_by_scan`'s pre-#177 emission loop:
+    // column-outer, variant-inner, one bit test per (variant, column) slot.
+    // `by_scan` itself is now 64-column blocked (#177), so this is the only
+    // remaining witness to the original iteration order. Keep it byte-exact --
+    // it is an oracle, not code to tidy. Everything except the loop
+    // (`route_variants`, `emit_call`, the stream setup) is deliberately shared
+    // with the real function so a divergence can only come from the loop.
+    fn by_scan_rowwise_reference(
+        chunk: &DenseChunk,
+        bank: &mut LongAlleleTableWriter,
+        sidecar_bits_enabled: bool,
+        fields: &[FieldSpec],
+    ) -> SparseChunk {
+        let (v_variants, num_samples, ploidy) = chunk.genos.shape;
+        let columns = num_samples * ploidy;
+
+        let RoutingPrePass {
+            routes,
+            mut dense,
+            per_cat,
+        } = route_variants(
+            chunk,
+            bank,
+            sidecar_bits_enabled,
+            fields,
+            v_variants,
+            num_samples,
+            ploidy,
+            columns,
+            |v| chunk.genos.popcount_plane(v),
+        );
+
+        let format_specs: Vec<&FieldSpec> = fields
+            .iter()
+            .filter(|f| f.category == FieldCategory::Format)
+            .collect();
+
+        let estimated_nnz = (v_variants * columns) / 20;
+        let mut streams = crate::streams::StreamMap::from_fn(|tag| {
+            let spec = &crate::streams::REGISTRY[tag.index()];
+            SparseSubStream::with_capacity(spec.key_bytes, estimated_nnz, columns)
+        });
+        for (_tag, st) in streams.iter_mut() {
+            st.field_calls = fields
+                .iter()
+                .map(|f| StagedColumn::with_capacity(f.stage_is_float(), estimated_nnz))
+                .collect();
+        }
+
+        let words: &[u64] = &chunk.genos.words;
+        for s in 0..num_samples {
+            for p in 0..ploidy {
+                let mut counts = crate::streams::StreamMap::from_fn(|_| 0u32);
+                let base_idx = (s * ploidy) + p;
+                let hap = base_idx;
+                // Index form, not `routes.iter().enumerate()`: this function is
+                // a transcription of the loop that shipped, and its value as a
+                // reference comes from looking like it. Rewriting it to please a
+                // style lint would make future readers unable to diff it by eye
+                // against the version in git history.
+                #[allow(clippy::needless_range_loop)]
+                for v in 0..v_variants {
+                    let flat_idx = (v * columns) + base_idx;
+                    let word = words[flat_idx >> 6];
+                    if (word >> (flat_idx & 63)) & 1 == 0 {
+                        continue;
+                    }
+                    emit_call(
+                        &routes[v],
+                        chunk,
+                        v,
+                        s,
+                        hap,
+                        num_samples,
+                        &per_cat,
+                        &format_specs,
+                        &mut streams,
+                        &mut dense,
+                        &mut counts,
+                    );
+                }
+                for (tag, c) in counts.into_iter_tagged() {
+                    streams.get_mut(tag).sample_lengths.push(c);
+                }
+            }
+        }
+
+        SparseChunk {
+            chunk_id: chunk.chunk_id,
+            streams,
+            dense,
+        }
+    }
+
+    // Deterministic pseudo-random chunk with `carriers == None` (the by_scan
+    // path). `density_pct` drives the alt-call rate, which is what decides
+    // whether `choose_representation` routes a variant VarKey or Dense -- so
+    // sweeping it is what gets both `emit_call` arms under test. ALTs cycle
+    // SNP / INS / DEL / long-INS so both streams and the long-allele bank are
+    // exercised.
+    fn scan_chunk(
+        v_variants: usize,
+        n_samples: usize,
+        ploidy: usize,
+        density_pct: u32,
+        seed: u64,
+    ) -> DenseChunk {
+        let mut state = seed | 1;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        let bits: Vec<bool> = (0..v_variants * n_samples * ploidy)
+            .map(|_| next() % 100 < density_pct)
+            .collect();
+
+        let long_alt = [b'T'; 20];
+        let refs: Vec<&[u8]> = (0..v_variants)
+            .map(|v| match v % 4 {
+                2 => &b"AT"[..], // pure DEL: ref longer than alt
+                _ => &b"A"[..],
+            })
+            .collect();
+        let alts: Vec<&[u8]> = (0..v_variants)
+            .map(|v| match v % 4 {
+                0 => &b"C"[..],     // SNP        (ilen 0)
+                1 => &b"AT"[..],    // INS        (ilen +1, inline)
+                2 => &b"A"[..],     // pure DEL   (ilen -1)
+                _ => &long_alt[..], // long INS   (ilen +19, spills to bank)
+            })
+            .collect();
+
+        let mut chunk = build_test_chunk(v_variants, n_samples, ploidy, &refs, &alts, &bits);
+        // Stage two dense FORMAT columns unconditionally. `emit_call` and
+        // `route_variants`' dense second pass index `format_staged[idx]` at
+        // `v * num_samples + s` whenever a FORMAT field is requested, so a
+        // chunk with fields but no staging panics. Harmless when `fields` is
+        // empty: `per_cat` is then empty and nothing reads these.
+        chunk.format_staged = vec![
+            StagedColumn::Int((0..v_variants * n_samples).map(|i| i as i32).collect()),
+            StagedColumn::Int(
+                (0..v_variants * n_samples)
+                    .map(|i| (i * 2) as i32)
+                    .collect(),
+            ),
+        ];
+        chunk
+    }
+
+    // #177: the blocked rewrite must be byte-identical to the row-wise loop it
+    // replaces -- same calls, same order, same `sample_lengths`, same dense
+    // bits. Order is not cosmetic: `merge` reads `sample_lengths` positionally,
+    // so a short or reordered push shifts every downstream column rather than
+    // corrupting one value.
+    //
+    // Shapes are chosen to stress the block scanner's edges, since `columns`
+    // is what it slices on:
+    //   - `columns` a multiple of 64 (aligned) and not (a partial tail block)
+    //   - `columns` < 64 (a single partial block)
+    //   - `v_variants * columns` not a multiple of 64, so each variant's row
+    //     starts mid-word and the window needs a funnel shift
+    //   - density 0 (every column empty -- `sample_lengths` must still be
+    //     pushed for every column) and 100 (every word nonzero, no skipping)
+    #[test]
+    fn blocked_by_scan_matches_the_rowwise_reference_on_edge_shapes() {
+        let shapes = [
+            (1usize, 1usize, 1usize), // columns = 1
+            (7, 5, 1),                // columns = 5, single partial block
+            (3, 32, 2),               // columns = 64, aligned
+            (5, 64, 2),               // columns = 128, aligned, 5 rows
+            (9, 33, 2),               // columns = 66, tail block of 2
+            (4, 70, 1),               // columns = 70, odd ploidy 1
+            (17, 37, 3),              // columns = 111, ploidy 3
+        ];
+        for (v, s, p) in shapes {
+            for density in [0u32, 1, 12, 50, 100] {
+                for fields in [Vec::new(), two_format_fields()] {
+                    let chunk = scan_chunk(v, s, p, density, 0xC0FFEE);
+                    let mut bank_ref = make_bank();
+                    let expected = by_scan_rowwise_reference(&chunk, &mut bank_ref, false, &fields);
+                    let mut bank_new = make_bank();
+                    let actual = dense2sparse_vk(&chunk, &mut bank_new, false, &fields);
+                    assert_eq!(
+                        expected,
+                        actual,
+                        "blocked by_scan diverged at v={v} s={s} p={p} \
+                         columns={} density={density} fields={}",
+                        s * p,
+                        fields.len()
+                    );
+                }
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(96))]
+
+        // The randomized companion to the edge-shape test above. Ranges are
+        // kept small enough to stay fast but wide enough that `columns` lands
+        // on both sides of 64 and rows are usually word-unaligned.
+        #[test]
+        fn prop_blocked_by_scan_matches_the_rowwise_reference(
+            v_variants in 1usize..24,
+            n_samples in 1usize..70,
+            ploidy in 1usize..4,
+            density_pct in 0u32..101,
+            seed in any::<u64>(),
+        ) {
+            let chunk = scan_chunk(v_variants, n_samples, ploidy, density_pct, seed);
+            let mut bank_ref = make_bank();
+            let expected = by_scan_rowwise_reference(&chunk, &mut bank_ref, false, &[]);
+            let mut bank_new = make_bank();
+            let actual = dense2sparse_vk(&chunk, &mut bank_new, false, &[]);
+            prop_assert_eq!(expected, actual);
         }
     }
 
