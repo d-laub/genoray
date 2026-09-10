@@ -66,7 +66,9 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
   proven byte-identical by proptest; a bit-packed dense read buffer (`BitGrid3`); a
   streaming long-allele LUT; and a memory-bounded parallel tile merge. Covered by 30
   in-source unit/proptests + 5 e2e tests. An optional per-contig monitoring sampler
-  (`GENORAY_SAMPLE_INTERVAL`) reports channel fill and per-thread CPU%. Exposed to
+  reports channel fill and per-thread CPU%, its cadence set via
+  `Tuning(sample_interval=)` / `--sample-interval` (formerly the
+  `GENORAY_SAMPLE_INTERVAL` environment variable, removed in M17). Exposed to
   Python as `run_conversion_pipeline` (PyO3). *Done — its former preconditions all
   landed:* variant normalization (M2) and left-alignment (M2b) are integrated into
   the reader, and the on-disk filenames were finalized in M3. The
@@ -462,9 +464,11 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
   `GENORAY_LOG` (levels or directives) and `GENORAY_TRACE` respectively — the
   `genoray::monitor=trace` directive a downstream All-of-Us pipeline used via
   `GENORAY_LOG` in production now reads `log_filter="genoray::monitor=trace"`.
-  The removal is enforced by `tests/test_no_env_vars.py`, a guard that reads
-  every `GENORAY_*` name that used to be read and asserts none of them are
-  consulted; the byte-identity oracle from M15/M16
+  The removal is enforced by `tests/test_no_env_vars.py`, a guard that greps
+  `src/` for `std::env::var`/`env::var_os` reads and greps `src/` + `python/`
+  for the `GENORAY_[A-Z_]+` name *shape* — stronger than enumerating the eight
+  removed names, since it would also catch a newly invented one; the
+  byte-identity oracle from M15/M16
   (`tests/test_svar2_schedule_invariance.py`,
   `tests/test_svar2_pgen_schedule_invariance.py`) was extended across
   `Tuning` values to confirm every knob above is scheduling-only. See
