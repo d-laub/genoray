@@ -89,3 +89,11 @@ debug = true
 [[bin]]
 name = "bench_from_vcf_list"
 required-features = ["conversion"]
+
+# Isolates the per-contig executor's emission stage (dense2sparse_vk) on a
+# synthetic DenseChunk, so #177's loop restructure can be measured at cohort
+# width without building a cohort-width corpus. Reports a content digest
+# alongside the timing -- the change's bar is byte-identical output.
+[[bin]]
+name = "bench_dense2sparse"
+required-features = ["conversion"]
