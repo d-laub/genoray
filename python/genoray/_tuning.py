@@ -93,7 +93,8 @@ class Tuning:
                 # `operator.index` rather than `isinstance(value, int)`: this is a
                 # numpy-centric library and a caller who computed a knob from an
                 # array gets an `np.int64`, which is not an `int`. Coercing here
-                # also keeps `_as_ffi` returning plain ints for the FFI seam.
+                # also keeps every field a plain int at the FFI seam, where pyo3
+                # extracts `TuningIn` by attribute from this dataclass instance.
                 coerced = operator.index(value)
             except TypeError:
                 raise ValueError(
@@ -127,7 +128,3 @@ class Tuning:
             f"(applicable knobs: {', '.join(sorted(allowed))}). "
             f"Leave {pronoun} as None."
         )
-
-    def _as_ffi(self) -> dict[str, int | None]:
-        """The six fields as a plain dict for `_core`."""
-        return {f.name: getattr(self, f.name) for f in fields(self)}

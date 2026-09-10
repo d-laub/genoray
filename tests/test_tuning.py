@@ -9,7 +9,7 @@ from genoray import Tuning
 
 def test_defaults_are_all_none():
     t = Tuning()
-    assert t._as_ffi() == {
+    assert dataclasses.asdict(t) == {
         "concurrent_chroms": None,
         "reader_workers": None,
         "overshard": None,
@@ -122,7 +122,7 @@ def test_numpy_integers_are_accepted_and_coerced():
     assert type(t.reader_workers) is int
     assert t.sample_interval == 0
     assert type(t.sample_interval) is int
-    assert all(v is None or type(v) is int for v in t._as_ffi().values())
+    assert all(v is None or type(v) is int for v in dataclasses.asdict(t).values())
 
 
 def test_numpy_integers_below_the_minimum_are_still_rejected():
@@ -140,3 +140,24 @@ def test_every_inapplicable_field_is_reported_at_once():
     assert "reader_workers" in msg
     assert "overshard" in msg
     assert "pgen" in msg
+
+
+def test_from_vcf_rejects_the_old_flat_reader_workers_kwarg(tmp_path, small_vcf):
+    from genoray import SparseVar2
+
+    with pytest.raises(TypeError, match="reader_workers"):
+        SparseVar2.from_vcf(
+            tmp_path / "x.svar", small_vcf, no_reference=True, reader_workers=2
+        )
+
+
+def test_from_pgen_rejects_a_vcf_only_knob(tmp_path, small_pgen):
+    from genoray import SparseVar2, Tuning
+
+    with pytest.raises(ValueError, match="overshard"):
+        SparseVar2.from_pgen(
+            tmp_path / "x.svar",
+            small_pgen,
+            no_reference=True,
+            tuning=Tuning(overshard=4),
+        )

@@ -183,7 +183,7 @@ def write_vcf(
             ``info`` (default), or ``debug``. Overridden by the ``GENORAY_LOG`` env var
             when set to one of the same values.
     """
-    from genoray import SparseVar2
+    from genoray import SparseVar2, Tuning
     from genoray._svar2_fields import _parse_cli_field_specs
     from genoray._utils import is_bgzf_vcf
 
@@ -251,7 +251,15 @@ def write_vcf(
             ploidy=ploidy,
             chunk_size=chunk_size if chunk_size is not None else 25_000,
             threads=threads,
-            reader_workers=reader_workers,
+            # Transitional shim: `from_vcf` takes its scheduling knobs inside
+            # `tuning=` now, and the CLI still spells only this one as a flag.
+            # The tuning-flags task replaces the whole `--reader-workers`
+            # parameter with a shared flag group covering all six knobs.
+            tuning=(
+                Tuning(reader_workers=reader_workers)
+                if reader_workers is not None
+                else None
+            ),
             overwrite=overwrite,
             long_allele_capacity=long_allele_capacity,
             info_fields=info_fields,
