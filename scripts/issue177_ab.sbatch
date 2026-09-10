@@ -5,10 +5,12 @@
 # `(PartitionConfig)` indefinitely rather than failing at submit time.
 #SBATCH --partition=carter-compute
 #SBATCH --nodes=1
-# Pinned. Node speed varies 2.08x across this partition (cn-03 151.9 s vs
-# cn-04 73.2 s on one job), so an A/B whose arms could land on different
-# nodes measures the node, not the change. Both arms run in THIS job.
-#SBATCH --nodelist=carter-cn-03
+# Both arms run inside THIS one allocation. Node speed varies 2.08x across
+# this partition (cn-03 151.9 s vs cn-04 73.2 s on one job), so arms landing on
+# different nodes would measure the node, not the change. cn-03 is excluded
+# rather than pinned: it is carrying several of my own long nextflow jobs, and
+# a co-tenant that heavy adds noise to both arms.
+#SBATCH --exclude=carter-cn-03
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
 #SBATCH --time=04:00:00
@@ -18,6 +20,14 @@ set -euo pipefail
 # MUST be first: $CLAUDE_JOB_DIR points at node-local scratch on the
 # SUBMITTING node and dangles here, and helpers read the variable themselves.
 unset CLAUDE_JOB_DIR
+
+# The interactive shell exports RUSTC_WRAPPER=sccache and `--export=ALL` carries
+# it in. The sccache server is a per-node daemon shared with every other job on
+# the node; when it died on a loaded cn-03 a build failed with "Failed to read
+# response header" -- an infrastructure flake that looks nothing like a code
+# error. It would also make the two arms share a compilation cache, which is
+# exactly the coupling this job's binary-hash check exists to rule out.
+unset RUSTC_WRAPPER
 
 REPO=/carter/users/dlaub/projects/genoray
 BRANCH_TREE="$REPO/.claude/worktrees/issue-177-by-scan-blocked"

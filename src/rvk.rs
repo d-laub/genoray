@@ -530,9 +530,25 @@ fn dense2sparse_vk_by_scan(
     //
     // The bucketing is load-bearing, not a tidiness choice. The obvious
     // alternative -- keep the block's nonzero windows and test each of the 64
-    // columns against them -- reverts to the old cost as allele frequency
-    // rises, because the nonzero set stops being small: measured 45x/13x/1.5x
-    // at 0.01%/0.1%/1% alt-allele frequency, versus 63x/59x/39x bucketed.
+    // columns against them -- reverts toward the old cost as allele frequency
+    // rises, because the nonzero set stops being small. That comparison is an
+    // OPERATION-COUNT MODEL and was never built or measured; take it as a
+    // reason to prefer bucketing, not as a number.
+    //
+    // MEASURED speedup of this loop over the one it replaced, from
+    // `src/bin/bench_dense2sparse.rs` (one allocation on cn-02, V = 2000, a
+    // separate target dir per arm, output confirmed byte-identical by digest):
+    //
+    //     S = 535,662    AF 0.01%: 6.3x   0.1%: 5.9x   1%: 3.7x
+    //     S =  16,000    AF 0.01%: 7.4x   0.1%: 6.1x   1%: 3.0x
+    //
+    // That is ~10x SHORT of what the operation-count model predicted
+    // (63x/59x/39x), and the gap is instructive: window reads do drop 64-fold,
+    // but both arms are bound by memory LATENCY rather than instruction count.
+    // Consecutive variants within a block are still `columns` bits apart, so
+    // every window read is its own cache line -- the change buys 64x fewer
+    // misses, not 64x cheaper ones. What remains is O(calls) emission, which no
+    // amount of scan restructuring removes.
     //
     // Emission order is unchanged and must stay that way: columns ascending,
     // and variants ascending within a column (which buckets get for free, as
