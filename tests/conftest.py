@@ -24,7 +24,7 @@ chr1\t12\t.\tGTA\tG\t.\t.\t.\tGT\t1|1\t0|1
 """
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="session")
 def small_vcf(tmp_path_factory) -> Path:
     """A tiny (3-record, 2-sample, single-contig) BCF+CSI store."""
     d = tmp_path_factory.mktemp("banner-vcf")
@@ -36,7 +36,7 @@ def small_vcf(tmp_path_factory) -> Path:
     return bcf
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="session")
 def small_pgen(tmp_path_factory) -> Path:
     """The same 3-record, 2-sample, single-contig cohort as `small_vcf`, as a PGEN."""
     d = tmp_path_factory.mktemp("banner-pgen")

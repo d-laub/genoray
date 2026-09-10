@@ -115,7 +115,8 @@ def test_bool_is_rejected_despite_being_an_int(bad: bool):
 def test_numpy_integers_are_accepted_and_coerced():
     # This is a numpy-centric library: a caller who derives a knob from an array
     # gets an np.int64, which is not an `int`. It must be accepted, and it must
-    # reach the FFI seam as a plain `int`.
+    # be COERCED at construction -- pyo3 extracts these fields as `usize`, so a
+    # surviving np.int64 would fail at the FFI seam rather than here.
     np = pytest.importorskip("numpy")
     t = Tuning(reader_workers=np.int64(4), sample_interval=np.uint8(0))
     assert t.reader_workers == 4
