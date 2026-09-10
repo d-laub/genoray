@@ -20,6 +20,7 @@ description: Use when writing or modifying Python code that imports `genoray` to
 - `genoray.SparseVar2` — next-gen sparse variant store (VCF/BCF → SVAR2 conversion via `from_vcf` (supports `regions=`/`samples=`/`merge_overlapping=`/`regions_overlap=`), PLINK2 PGEN → SVAR2 conversion via `from_pgen`, N single-sample VCFs/BCFs → one SVAR2 store via a native k-way merge in `from_vcf_list` (`reference`/`no_reference` supported like `from_vcf`, absent sites fill hom-ref; supports `regions=`/`merge_overlapping=`/`regions_overlap=` but **no `samples=`** — the cohort is the file set), SVAR1 (`SparseVar`) → SVAR2 native migration via `from_svar1` (reads no VCF/htslib; biallelic SVAR1 only; supports `regions=`/`samples=`/`merge_overlapping=`/`regions_overlap=` like `from_vcf`/`from_pgen`); range queries via `decode`/`region_counts`/`read_ranges`; mutational-signature support (SBS96/DBS78/ID83) via `annotate_mutations`/`mutation_matrix`/`assign_signatures`, or classify during the write with `from_vcf(signatures=True)`/`from_pgen(signatures=True)`/`from_svar1(signatures=True)`; scalar-numeric INFO/FORMAT field extraction during the write via `from_vcf(info_fields=, format_fields=)`/`from_vcf_list(info_fields=, format_fields=)` (`from_vcf_list` merges INFO first-carrier-wins, FORMAT per-sample); `from_pgen` instead stores per-sample **dosage** tracks as FORMAT fields via `dosages=Sequence[DosageField]` (from the hardcall `.pgen` itself via `source="self"`, or a separate `.pgen`) — it still has no `info_fields=`/`format_fields=` (PGEN has no VCF INFO/FORMAT); `from_svar1` carries SVAR1's existing fields through selectively via `fields=` (`None` default = all, `[]` = none, or a name subset) — read back opt-in via `fields=`/`with_fields`/`available_fields` and attached to `decode`'s result)
 - `genoray.InfoField` / `genoray.FormatField` — frozen dataclasses (`name`, `dtype=None`, `default=None`) configuring a single INFO/FORMAT field for `SparseVar2.from_vcf`; a bare `str` name uses inferred defaults instead
 - `genoray.DosageField` — frozen dataclass (`name="dosage"`, `source="self"|Path`, `dtype="f16"|"f32"="f32"`, `default=None`) configuring a PGEN dosage FORMAT field for `SparseVar2.from_pgen`
+- `genoray.Tuning` — frozen dataclass of six explicit scheduling knobs (`concurrent_chroms`, `reader_workers`, `overshard`, `dense_cap`, `merge_threads`, `sample_interval`, all `int | None`) passed as `tuning=` to every `SparseVar2.from_*` writer; replaces the removed legacy environment-variable configuration (see "Tuning" under "SparseVar2 — quick reference", below, and "migrating from environment variables" in `docs/source/svar.md`) — **no environment variable configures genoray**
 - `genoray.exprs` — polars filter expressions for `.gvi` indexes
 - `genoray.cosmic_signatures` — fetch/cache COSMIC reference signatures
 - `genoray.fit_signatures` — sparse forward-selection signature refit
@@ -239,6 +240,73 @@ encoding + per-variant dense/sparse cost model). Two halves: **conversion**
 / `read_ranges`, further below) read it back. All coordinates are 0-based
 half-open `[start, end)`, as everywhere else in genoray.
 
+### Tuning (`genoray.Tuning`)
+
+Every `SparseVar2.from_*` write method (`from_vcf`, `from_pgen`,
+`from_vcf_list`, `from_svar1`) accepts `tuning: Tuning | None = None`.
+`Tuning` is the explicit scheduling-knob object that replaced the old
+environment-variable configuration — **no environment variable configures
+genoray**; every knob is now a constructor argument (or a CLI flag, see
+"CLI" below).
+
+```python
+from genoray import SparseVar2, Tuning
+
+SparseVar2.from_vcf(
+    "out.svar2", "file.vcf.gz", "ref.fa",
+    tuning=Tuning(reader_workers=4, dense_cap=64),
+)
+```
+
+Six fields, all `int | None`, keyword-only, on a frozen dataclass:
+
+| field | meaning | minimum |
+|---|---|---|
+| `concurrent_chroms` | contigs converted concurrently | 1 |
+| `reader_workers` | independent indexed shard readers per concurrent contig | 1 |
+| `overshard` | work units per reader (consulted only when a contig has no exact record count) | 1 |
+| `dense_cap` | depth of the dense-chunk channel between reader and executor | 1 |
+| `merge_threads` | gather threads for the per-contig var_key merge tail | 1 |
+| `sample_interval` | monitor sampling cadence in seconds; `0` disables it | 0 |
+
+`None` (the default for every field) means **"let the planner choose"** — not
+"off" — the same value the planner would pick with no `Tuning` at all. A
+field you *do* set is **honoured or refused, never silently shrunk**: an
+explicit `reader_workers` that cannot fit `max_mem` raises
+`InsufficientMemory` rather than being downgraded to something that fits.
+This is the whole point of the object — the old environment variables could
+be silently ignored by a backend that never read them; `Tuning` cannot be.
+
+Not every backend can use every knob. Setting one it can't use raises
+`ValueError` naming the offending field(s) rather than being silently
+ignored:
+
+| field | `from_vcf` | `from_pgen` | `from_vcf_list` | `from_svar1` |
+|---|---|---|---|---|
+| `concurrent_chroms` | yes | yes | no | yes |
+| `reader_workers` | yes | no | no | no |
+| `overshard` | yes | no | no | no |
+| `dense_cap` | yes | yes | yes | yes |
+| `merge_threads` | yes | yes | yes | yes |
+| `sample_interval` | yes | yes | yes | yes |
+
+Why:
+
+- **`reader_workers`/`overshard` are sharded-VCF only.** `from_pgen` pins
+  `reader_workers=1` and never shards within a contig — `pgenlib` holds the
+  GIL through decode, so sub-contig sharding there is pure overhead. Neither
+  `from_vcf_list` (already one file descriptor per input file per contig) nor
+  `from_svar1` (no VCF/htslib reader at all) shards within a contig either.
+- **`concurrent_chroms` is unavailable on `from_vcf_list`** because that
+  pipeline walks contigs sequentially by design.
+
+A field you do set is reported in the `pipeline config` log line tagged
+`explicit`; a field left `None` is reported tagged `planner` — so the log
+line itself tells you which knobs came from you versus the planner.
+
+`Tuning` is a pure scheduling knob everywhere it applies: output is
+byte-identical at every value (gated by a store-hash oracle).
+
 ### Conversion
 
 ```python
@@ -253,7 +321,7 @@ dropped = SparseVar2.from_vcf(
 dropped = SparseVar2.from_vcf("out.svar2", "file.vcf.gz", no_reference=True)
 ```
 
-Signature: `from_vcf(out, source, reference=None, *, regions=None, samples=None, merge_overlapping=False, regions_overlap="pos", no_reference=False, skip_out_of_scope=False, ploidy=2, chunk_size=25_000, threads=None, reader_workers=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False, info_fields=None, format_fields=None, check_ref="e", progress=False, log_level="info", max_mem=None) -> int`
+Signature: `from_vcf(out, source, reference=None, *, regions=None, samples=None, merge_overlapping=False, regions_overlap="pos", no_reference=False, skip_out_of_scope=False, ploidy=2, chunk_size=25_000, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False, info_fields=None, format_fields=None, check_ref="e", progress=False, tuning=None, log_level="info", log_filter=None, max_mem=None) -> int`
 
 - `source` — a bgzipped VCF (`.vcf.gz`, or the equivalent `.vcf.bgz` spelling)
   or BCF (`.bcf`). Auto-indexes (`.csi`) if no `.csi`/`.tbi` is found. For a PLINK2 PGEN source, use `from_pgen` instead
@@ -304,18 +372,20 @@ Signature: `from_vcf(out, source, reference=None, *, regions=None, samples=None,
   instead) — those two remain `SparseVar` (SVAR 1.0)-only for now.
 - `threads=None` — total thread budget (autodetected if `None`). Drives contig
   concurrency and, through the planner, the per-contig reader count.
-- `reader_workers=None` — independent indexed shard readers per concurrent
-  contig, the knob that sets sub-contig read parallelism. `None` derives it
-  from the core budget: a quarter of usable cores is reserved for the merge
-  tail, contig concurrency is chosen preferring depth (~8 readers per contig),
-  and the rest goes to readers. An explicit value must be `None` or an
-  integer `>= 1`; anything below 1 raises `ValueError` before conversion
-  starts (checked in Python, ahead of the planner — a value that instead
-  fits `max_mem` but cannot otherwise be honoured raises `InsufficientMemory`
-  rather than being silently reduced). Output is byte-identical at every
+- `tuning.reader_workers` (set via `tuning=Tuning(reader_workers=N)`, see
+  "Tuning" above) — independent indexed shard readers per concurrent contig,
+  the knob that sets sub-contig read parallelism. Leaving it `None` derives
+  it from the core budget: a quarter of usable cores is reserved for the
+  merge tail, contig concurrency is chosen preferring depth (~8 readers per
+  contig), and the rest goes to readers. An explicit value must be `None` or
+  an integer `>= 1`; anything below 1 raises `ValueError` at `Tuning`
+  construction time, before conversion starts — a value that instead fits
+  `max_mem` but cannot otherwise be honoured raises `InsufficientMemory`
+  rather than being silently reduced. Output is byte-identical at every
   valid value. (`from_vcf_list`, the N-single-sample-VCF merge path, does not
-  shard within a contig and does not accept this argument.) See "Parallel
-  conversion" in `docs/source/svar.md` for scaling numbers.
+  shard within a contig and rejects `reader_workers`/`overshard` — see the
+  applicability table above.) See "Parallel conversion" in
+  `docs/source/svar.md` for scaling numbers.
 - `signatures=False` — when `True`, classifies every SNP/indel into its
   SBS96/ID83 mutation-type code during the write and stores a `mutcat`
   sidecar per contig (factored into the write's dense/var_key cost model).
@@ -436,28 +506,51 @@ Signature: `from_vcf(out, source, reference=None, *, regions=None, samples=None,
   miss: it plans `cc=1, w=2`, which needs `81,739 MB` -- about 23 GB of
   headroom. (It stops at `w=2` because `w=3` would need `107,069 MB`, just
   over the budget.)
-- **`progress=False`/`log_level="info"`** — write-time progress/logging,
-  shared by `from_vcf`/`from_pgen`/`from_vcf_list`/`from_svar1`/`write_view`.
+- **`progress=False`/`log_level="info"`/`log_filter=None`** — write-time
+  progress/logging, shared by
+  `from_vcf`/`from_pgen`/`from_vcf_list`/`from_svar1`/`write_view`.
   `progress=True` renders live progress: in a terminal or Jupyter, a `rich`
   bar (one row per in-flight contig); elsewhere, compact heartbeat lines
   throttled to roughly one per 5s per contig (`"chr1 42% (12,345/29,000)
   ..."`). Regardless of `progress`, a one-line `"[svar2] chrom done: N kept,
   M excluded (Ts)"` summary prints per contig once it finishes, unless
-  `log_level="off"`. `log_level` is the minimum severity for structured
-  write-time log lines — `"off"` (disables everything, including the
-  per-contig summaries and progress rendering — a pure no-op, zero
-  overhead), `"warning"`, `"info"` (default; also includes thread-budget
-  selection, per-contig start/finish, and contig-name resolution against the
-  reference when it differs from the source's own spelling), or `"debug"`
-  (additionally surfaces per-record detail: a record excluded for a
-  REF/FASTA mismatch, and each indel that gets left-aligned). The
-  `GENORAY_LOG` environment variable overrides the `log_level` argument when
-  set to one of the same four values (e.g. `GENORAY_LOG=debug`), without
-  touching call sites.
+  `log_level="off"`.
+
+  `log_level` is the minimum severity for structured write-time log lines.
+  Accepted, case-insensitive: `"off"`, `"critical"`, `"error"`, `"warning"`,
+  `"info"` (default), `"debug"`, or a `logging` module integer constant
+  (`logging.DEBUG` and friends — an in-between int rounds UP to the more
+  severe named level, matching `logging`'s own gate). Canonical ranks:
+  `off=0, error=1, warning=2, info=3, debug=4`. `"critical"` is accepted but
+  is an **alias for `"error"`** — there is no distinct CRITICAL rank.
+  **`"warn"` is rejected** (`ValueError`), on purpose: `logging.warn()` was
+  removed in Python 3.13, so genoray does not accept that spelling either —
+  use `"warning"`. `"off"` disables everything, including the per-contig
+  summaries and progress rendering (a pure no-op, zero overhead); `"info"`
+  additionally includes thread-budget selection, per-contig start/finish,
+  and contig-name resolution against the reference when it differs from the
+  source's own spelling; `"debug"` additionally surfaces per-record detail
+  (a record excluded for a REF/FASTA mismatch, each indel that gets
+  left-aligned). See `parse_log_level` for the exact mapping.
+
+  `log_filter` is an optional `tracing`-style `EnvFilter` directive string
+  applied to genoray's own stderr diagnostic output, independent of
+  `log_level` (which gates only the structured progress/summary events
+  above). `None` (default) leaves stderr silent; an unparseable directive
+  silences stderr rather than raising. Use it for module/target-scoped
+  tracing that `log_level` can't express, e.g.
+  `log_filter="genoray::monitor=trace"`.
+
+  **No environment variable configures genoray.** `log_level`/`log_filter`
+  (and every `Tuning` field, above) replace all eight former environment
+  variables that used to configure this pipeline — see "migrating from
+  environment variables" in `docs/source/svar.md` for the full mapping,
+  including the migration for the log-tracing variable's
+  `genoray::monitor=trace` directive to `log_filter="genoray::monitor=trace"`.
+
   Structured log lines render their fields inline as ` key=value` pairs
   after the message (e.g. `pipeline config concurrent_chroms=8
-  reader_workers=4 exact_counts=true planned_units=32`), matching what
-  `GENORAY_LOG`'s stderr layer emits.
+  reader_workers=4 exact_counts=true planned_units=32`).
 
 ### Conversion from PGEN
 
@@ -470,7 +563,7 @@ dropped = SparseVar2.from_pgen(
 )
 ```
 
-Signature: `from_pgen(out, source, reference=None, *, regions=None, samples=None, merge_overlapping=False, regions_overlap="pos", no_reference=False, skip_out_of_scope=False, chunk_size=None, max_mem=None, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False, dosages=None, check_ref="e", progress=False, log_level="info") -> int`
+Signature: `from_pgen(out, source, reference=None, *, regions=None, samples=None, merge_overlapping=False, regions_overlap="pos", no_reference=False, skip_out_of_scope=False, chunk_size=None, max_mem=None, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False, dosages=None, check_ref="e", progress=False, tuning=None, log_level="info", log_filter=None) -> int`
 
 - `source` — a `.pgen` file. Variant metadata is read from the sibling
   `.pvar`/`.pvar.zst`, sample names from the sibling `.psam`.
@@ -562,7 +655,10 @@ Signature: `from_pgen(out, source, reference=None, *, regions=None, samples=None
   ```
 - Unphased heterozygotes resolve haplotypes in the allele-code order
   `pgenlib` returns — the same caveat `from_vcf` carries for unphased `GT`.
-- **`progress=False`/`log_level="info"`** — same as `from_vcf` (above).
+- **`progress=False`/`log_level="info"`/`log_filter=None`** — same as
+  `from_vcf` (above). `tuning=` accepts `concurrent_chroms`, `dense_cap`,
+  `merge_threads`, `sample_interval`; setting `reader_workers`/`overshard`
+  raises (`from_pgen` pins a single reader per contig — see "Tuning" above).
 
 ### Conversion from a list of single-sample VCFs
 
@@ -581,7 +677,7 @@ dropped = SparseVar2.from_vcf_list("out.svar2", "vcfs/", "ref.fa")
 dropped = SparseVar2.from_vcf_list("out.svar2", "manifest.txt", "ref.fa")
 ```
 
-Signature: `from_vcf_list(out, sources, reference=None, *, regions=None, merge_overlapping=False, regions_overlap="pos", no_reference=False, skip_out_of_scope=False, ploidy=2, chunk_size=None, max_mem=None, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False, info_fields=None, format_fields=None, check_ref="e", progress=False, log_level="info") -> int`
+Signature: `from_vcf_list(out, sources, reference=None, *, regions=None, merge_overlapping=False, regions_overlap="pos", no_reference=False, skip_out_of_scope=False, ploidy=2, chunk_size=None, max_mem=None, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False, info_fields=None, format_fields=None, check_ref="e", progress=False, tuning=None, log_level="info", log_filter=None) -> int`
 
 Builds **one** SVAR2 store from **N single-sample** VCFs/BCFs with different
 site lists, via a native k-way merge — no `bcftools merge`, no intermediate
@@ -734,7 +830,11 @@ multi-sample VCF.
   when `no_reference=True`): under `"x"`, a bad record is excluded from its
   own file only (not the whole merged site), and the per-contig log reports
   the total excluded across every input file.
-- **`progress=False`/`log_level="info"`** — same as `from_vcf` (above).
+- **`progress=False`/`log_level="info"`/`log_filter=None`** — same as
+  `from_vcf` (above). `tuning=` accepts only `dense_cap`, `merge_threads`,
+  `sample_interval` — setting `concurrent_chroms`, `reader_workers`, or
+  `overshard` raises (this pipeline walks contigs sequentially and never
+  shards within a contig — see "Tuning" above).
 
 ### Conversion from SVAR1
 
@@ -747,7 +847,7 @@ dropped = SparseVar2.from_svar1(
 )
 ```
 
-Signature: `from_svar1(out, source, reference=None, *, regions=None, samples=None, merge_overlapping=False, regions_overlap="pos", no_reference=False, skip_out_of_scope=False, chunk_size=None, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False, fields=None, check_ref="e", progress=False, log_level="info") -> int`
+Signature: `from_svar1(out, source, reference=None, *, regions=None, samples=None, merge_overlapping=False, regions_overlap="pos", no_reference=False, skip_out_of_scope=False, chunk_size=None, threads=None, overwrite=False, long_allele_capacity=8*1024*1024, signatures=False, fields=None, check_ref="e", progress=False, tuning=None, log_level="info", log_filter=None) -> int`
 
 Migrates an existing SVAR 1.0 (`SparseVar`) store to SVAR2 natively — reads no
 VCF and no htslib; SVAR1 is already sparse, so this reconstructs variant
@@ -800,7 +900,11 @@ records from SVAR1's arrays and reuses the same conversion spine as `from_vcf`.
   routing.
 - **No `info_fields=`/`format_fields=` kwargs** — those names are VCF-specific;
   use `fields=` (above) instead to select which SVAR1 fields carry.
-- **`progress=False`/`log_level="info"`** — same as `from_vcf` (above).
+- **`progress=False`/`log_level="info"`/`log_filter=None`** — same as
+  `from_vcf` (above). `tuning=` accepts `concurrent_chroms`, `dense_cap`,
+  `merge_threads`, `sample_interval`; setting `reader_workers`/`overshard`
+  raises (`from_svar1` reads no VCF/htslib and never shards within a contig
+  — see "Tuning" above).
 
 ### Range queries
 
@@ -1081,16 +1185,31 @@ symbolic ALTs (`<DEL>`, `<INS>`, …) or breakends into nucleotides, so they're
 dropped together and print a `Dropped {n} out-of-scope (symbolic/breakend) ALT
 alleles.` line when set), `--check-ref {e,x}` (default `e`, ignored with
 `--no-reference`; `e` aborts on the first REF/FASTA disagreement, `x` drops
-the offending record and continues — mirrors `bcftools norm --check-ref`), and
+the offending record and continues — mirrors `bcftools norm --check-ref`),
 `--progress`/`--no-progress` + `--log-level {off,warning,info,debug}` (map to
 `progress=`/`log_level=`; see "Conversion" above for behavior — default
-`--no-progress --log-level info`). `write vcf`'s vcf-list form forwards both
-to `from_vcf_list`; its single-file form forwards both to `from_vcf`.
+`--no-progress --log-level info`), and `--log-filter DIRECTIVE` (maps to
+`log_filter=`; a `tracing`-style `EnvFilter` string, e.g. `--log-filter
+"genoray::monitor=trace"`, independent of `--log-level`; unset/`None` by
+default). `write vcf`'s vcf-list form forwards these to `from_vcf_list`; its
+single-file form forwards them to `from_vcf`.
 
-`write vcf` additionally accepts `--reader-workers N` (single-file input only;
-passing it with a directory/manifest raises). The single-file form forwards
-`N` straight through to `from_vcf`'s `reader_workers=`, so `N < 1` raises the
-same `ValueError` there — the CLI has no separate check for the lower bound.
+Every `write` subcommand also exposes `Tuning`'s always-applicable knobs as
+`--dense-cap N`, `--merge-threads N`, and `--sample-interval N` (map to
+`tuning=Tuning(dense_cap=, merge_threads=, sample_interval=)`, see "Tuning"
+above). `--concurrent-chroms N` is additionally available on `write vcf`,
+`write pgen`, and `write svar1` — not on the vcf-list form (`from_vcf_list`
+walks contigs sequentially by design; see "Tuning" above). As with the
+Python `tuning=` kwarg, an explicit flag value is honoured or refused —
+never silently reduced — and passing a flag a backend can't use raises
+rather than being ignored.
+
+`write vcf` additionally accepts `--reader-workers N` and `--overshard N`
+(single-file input only; passing either with a directory/manifest raises —
+the vcf-list form never shards within a contig). The single-file form
+forwards both straight through to `tuning=Tuning(reader_workers=N,
+overshard=N)`, so `N < 1` raises the same `ValueError` there — the CLI has no
+separate check for the lower bound.
 
 - `genoray write vcf` (`SparseVar2.from_vcf`/`from_vcf_list`): `source` is a
   single `.vcf.gz`/`.vcf.bgz`/`.bcf` → `from_vcf`; anything else (a directory,
@@ -1123,9 +1242,11 @@ same `ValueError` there — the CLI has no separate check for the lower bound.
   `--no-breakend` (independent flags here, unlike the SVAR2 `write`
   subcommands' single `--skip-symbolics-and-breakends`), `--threads`/`-@`,
   `--overwrite`. No `--regions`/`--samples`/`--fields`/`--reference`/
-  `--check-ref`/`--progress`/`--log-level` — those are SVAR2-`write`-only
-  (the legacy `SparseVar.from_vcf`/`from_pgen` backends don't accept
-  `progress=`/`log_level=`).
+  `--check-ref`/`--progress`/`--log-level`/`--log-filter`, and none of the
+  `Tuning`-backed flags (`--dense-cap`/`--merge-threads`/`--sample-interval`/
+  `--concurrent-chroms`/`--reader-workers`/`--overshard`) — those are all
+  SVAR2-`write`-only (the legacy `SparseVar.from_vcf`/`from_pgen` backends
+  don't accept `progress=`/`log_level=`/`log_filter=`/`tuning=`).
 
 ### `genoray view`
 
@@ -1147,9 +1268,12 @@ Both subcommands share the same `-r/--regions`, `-R/--regions-file`,
 `--no-progress` options and the same no-op guard (at least one of
 regions/samples is required) and mutex checks (`--regions`/`--regions-file`
 and `--samples`/`--samples-file` are each mutually exclusive). `genoray view`
-(SVAR2) additionally has `--log-level {off,warning,info,debug}`; `genoray
-view svar1` does not — its `SparseVar.write_view` backend has no
-`log_level=` kwarg.
+(SVAR2) additionally has `--log-level {off,warning,info,debug}` and
+`--log-filter DIRECTIVE` (same semantics as `write`, above); `genoray view
+svar1` does not — its `SparseVar.write_view` backend has no
+`log_level=`/`log_filter=` kwarg. Neither `view` subcommand has any
+`Tuning`-backed flag — `write_view` isn't a conversion pipeline, so none of
+`Tuning`'s knobs apply.
 
 - `genoray view` (SVAR2, thin wrapper over `SparseVar2.write_view`): when
   `--regions`/`--regions-file` is omitted, "all variants" defaults to one
@@ -1180,10 +1304,10 @@ view svar1` does not — its `SparseVar.write_view` backend has no
   Both `--reference` (recomputes `mutcat` from scratch on the subset) and
   `-@/--threads` (caps contigs sliced concurrently; autodetected when
   omitted) are real on both `--reroute` and `--no-reroute` — there is no
-  longer an "accepted but ignored/unused" caveat on either path. `--progress`
-  and `--log-level` are both real here — see "`write_view` progress bar"
-  below for the coarse, one-line-per-contig rendering and log-level
-  semantics. `write_view`'s underlying `reroute=` kwarg only accepts
+  longer an "accepted but ignored/unused" caveat on either path. `--progress`,
+  `--log-level`, and `--log-filter` are all real here — see "`write_view`
+  progress bar" below for the coarse, one-line-per-contig rendering and
+  log-level semantics. `write_view`'s underlying `reroute=` kwarg only accepts
   `"auto"`, `True`, or `False` — any other value (e.g. `reroute=1`) raises
   `ValueError` rather than silently falling through to the `reroute=False`
   slicer.
@@ -1342,21 +1466,24 @@ genoray view svar1 in.svar out.svar -r chr1:1-1000 -s A,B --progress
 The bar is cosmetic: output bytes, schema, and dtypes are identical whether or
 not it is enabled.
 
-`SparseVar2.write_view(..., progress=False, log_level="info")` renders live
-write progress the same way the `from_*` writers do (see "Conversion" above),
-with one difference: unlike the `from_*` writers, `write_view` has no
-per-record stream to sample from, so its progress is COARSE — one line per
-contig, no within-contig bar movement. In a terminal or Jupyter, `progress=True`
-shows a live-updating list of in-flight/finished contigs; elsewhere, a compact
-"chrom done" line prints as each contig finishes. Regardless of `progress`, a
-one-line `"[svar2] chrom done: N kept, 0 excluded (Ts)"` summary prints per
-contig once it finishes, unless `log_level="off"` (slicing never excludes
-variants, so `excluded` is always `0`). `log_level` and the `GENORAY_LOG` env
-override behave identically to the `from_*` writers. The `genoray view` CLI
-exposes both as `--progress`/`--no-progress` and `--log-level` (see the
+`SparseVar2.write_view(..., progress=False, log_level="info", log_filter=None)`
+renders live write progress the same way the `from_*` writers do (see
+"Conversion" above), with one difference: unlike the `from_*` writers,
+`write_view` has no per-record stream to sample from, so its progress is
+COARSE — one line per contig, no within-contig bar movement. In a terminal or
+Jupyter, `progress=True` shows a live-updating list of in-flight/finished
+contigs; elsewhere, a compact "chrom done" line prints as each contig
+finishes. Regardless of `progress`, a one-line `"[svar2] chrom done: N kept,
+0 excluded (Ts)"` summary prints per contig once it finishes, unless
+`log_level="off"` (slicing never excludes variants, so `excluded` is always
+`0`). `log_level` (including the `"critical"` alias and `"warn"` rejection)
+and `log_filter` behave identically to the `from_*` writers, above; note
+`write_view` has no `tuning=` parameter — it isn't a conversion pipeline, so
+none of `Tuning`'s knobs apply. The `genoray view` CLI exposes both as
+`--progress`/`--no-progress`, `--log-level`, and `--log-filter` (see the
 `genoray view` CLI section above); `genoray view svar1` (SVAR 1.0) exposes
 only `--progress` — its `SparseVar.write_view` backend (above) has no
-`log_level` kwarg.
+`log_level`/`log_filter` kwarg.
 
 ### Atomic crash-safe writes
 

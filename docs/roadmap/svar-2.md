@@ -436,6 +436,42 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
   [`../superpowers/plans/results/2026-09-05-reader-frontier.md`](../superpowers/plans/results/2026-09-05-reader-frontier.md).
   Executor parallelism was deliberately deferred to #170.
 
+- [x] **M17. Explicit tuning API: `genoray.Tuning`, Python-convention log
+  levels, `log_filter`, no environment variables.** Builds on M16. All eight
+  `GENORAY_*` environment variables that used to configure conversion
+  scheduling and logging (`GENORAY_CONCURRENT_CHROMS`, `GENORAY_READER_WORKERS`,
+  `GENORAY_OVERSHARD`, `GENORAY_DENSE_CAP`, `GENORAY_MERGE_THREADS`,
+  `GENORAY_SAMPLE_INTERVAL`, `GENORAY_TRACE`, `GENORAY_LOG`) are gone. In
+  their place: a frozen `genoray.Tuning` dataclass with six `int | None`
+  fields (`concurrent_chroms`, `reader_workers`, `overshard`, `dense_cap`,
+  `merge_threads`, `sample_interval`), passed as `tuning=` to every
+  `SparseVar2.from_*` writer and threaded through the FFI to a single
+  `ResolvedTuning::resolve` construction point in the orchestrator; a value
+  is honoured or refused, never silently shrunk, and every knob (explicit or
+  planner-derived) is reported with its provenance in the `pipeline config`
+  log line. **This is a public API change** — it supersedes M16's
+  `reader_workers` note above, the same way M16 superseded M15's "public API
+  is unchanged" note: `reader_workers` moved from a top-level `from_vcf`
+  keyword into `Tuning` and was never released as a standalone kwarg, so
+  there is no deprecation path for it. Logging separately gained
+  Python-`logging`-convention levels (`parse_log_level`: `"off"`,
+  `"critical"` (alias for `"error"`), `"error"`, `"warning"`, `"info"`,
+  `"debug"`, case-insensitive, plus `logging` integer constants;
+  `"warn"` is rejected — removed from Python in 3.13) and an independent
+  `log_filter=` `tracing`-`EnvFilter` directive string, replacing
+  `GENORAY_LOG` (levels or directives) and `GENORAY_TRACE` respectively — the
+  `genoray::monitor=trace` directive a downstream All-of-Us pipeline used via
+  `GENORAY_LOG` in production now reads `log_filter="genoray::monitor=trace"`.
+  The removal is enforced by `tests/test_no_env_vars.py`, a guard that reads
+  every `GENORAY_*` name that used to be read and asserts none of them are
+  consulted; the byte-identity oracle from M15/M16
+  (`tests/test_svar2_schedule_invariance.py`,
+  `tests/test_svar2_pgen_schedule_invariance.py`) was extended across
+  `Tuning` values to confirm every knob above is scheduling-only. See
+  `skills/genoray-api/SKILL.md` ("Tuning") and `docs/source/svar.md`
+  ("Tuning and logging" / "migrating from environment variables") for the
+  full field/CLI-flag mapping.
+
 ### Longer term
 
 - [ ] **M10. Checkpointing / resume during conversion.**

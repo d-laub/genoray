@@ -69,16 +69,101 @@ truly overlaps the region; individual non-overlapping alleles are not
 dropped. `variant` currently requires at most one region per contig; multiple
 regions per contig raise — use `pos`/`record`, or convert separately.
 
+### Tuning (`genoray.Tuning`) and logging
+
+Every `SparseVar2.from_*` write method (`from_vcf`, `from_pgen`,
+`from_vcf_list`, `from_svar1`) accepts an explicit `tuning=` argument — a
+`genoray.Tuning` object holding six scheduling knobs, all `int | None`,
+keyword-only:
+
+| field | meaning |
+|---|---|
+| `concurrent_chroms` | contigs converted concurrently |
+| `reader_workers` | independent indexed shard readers per concurrent contig |
+| `overshard` | work units per reader (used only when a contig has no exact record count) |
+| `dense_cap` | depth of the dense-chunk channel between reader and executor |
+| `merge_threads` | gather threads for the per-contig var_key merge tail |
+| `sample_interval` | monitor sampling cadence in seconds; `0` disables it |
+
+`None` (every field's default) means "let the planner choose", not "off" —
+the same choice the planner makes with no `Tuning` at all. A field you set
+explicitly is **honoured or refused, never silently shrunk**: for example, an
+explicit `reader_workers` that cannot fit `max_mem` raises
+`InsufficientMemory` instead of quietly falling back to something smaller.
+
+Not every knob applies to every backend — setting one a backend can't use
+raises `ValueError` rather than being silently ignored:
+
+| field | `from_vcf` | `from_pgen` | `from_vcf_list` | `from_svar1` |
+|---|---|---|---|---|
+| `concurrent_chroms` | yes | yes | no | yes |
+| `reader_workers` | yes | no | no | no |
+| `overshard` | yes | no | no | no |
+| `dense_cap` | yes | yes | yes | yes |
+| `merge_threads` | yes | yes | yes | yes |
+| `sample_interval` | yes | yes | yes | yes |
+
+`reader_workers`/`overshard` are sharded-VCF only: `from_pgen` pins a single
+reader per contig because `pgenlib` holds the GIL through genotype decode, so
+sub-contig sharding there is pure overhead, and neither `from_vcf_list` nor
+`from_svar1` shards within a contig at all. `concurrent_chroms` is
+unavailable on `from_vcf_list` because that pipeline walks contigs
+sequentially by design.
+
+```python
+from genoray import SparseVar2, Tuning
+
+SparseVar2.from_vcf(
+    "out.svar2", "file.vcf.gz", "ref.fa",
+    tuning=Tuning(reader_workers=4, dense_cap=64),
+)
+```
+
+Logging and progress reporting are separate from `tuning=`:
+
+- `log_level` — minimum severity for structured write-time log lines.
+  Accepted (case-insensitive): `"off"`, `"critical"`, `"error"`, `"warning"`,
+  `"info"` (default), `"debug"`, or a `logging` module integer constant.
+  `"critical"` is an alias for `"error"` (there is no distinct CRITICAL
+  rank). **`"warn"` is rejected** — `logging.warn()` was removed in Python
+  3.13, so genoray does not accept that spelling either; use `"warning"`.
+- `log_filter` — an optional `tracing`-style `EnvFilter` directive string
+  applied to genoray's own stderr diagnostic output, independent of
+  `log_level`. For example, `log_filter="genoray::monitor=trace"` turns on
+  trace-level output for just the conversion monitor.
+
+**No environment variable configures genoray.** Every knob above is a
+constructor argument or a CLI flag; there is no runtime environment-variable
+override for any of them.
+
+#### Migrating from environment variables
+
+An earlier version of genoray read eight `GENORAY_*` environment variables.
+All eight are gone — pass the equivalent explicitly instead:
+
+| removed | replacement |
+|---|---|
+| `GENORAY_CONCURRENT_CHROMS` | `Tuning(concurrent_chroms=)` / `--concurrent-chroms` |
+| `GENORAY_READER_WORKERS` | `Tuning(reader_workers=)` / `--reader-workers` |
+| `GENORAY_OVERSHARD` | `Tuning(overshard=)` / `--overshard` |
+| `GENORAY_DENSE_CAP` | `Tuning(dense_cap=)` / `--dense-cap` |
+| `GENORAY_MERGE_THREADS` | `Tuning(merge_threads=)` / `--merge-threads` |
+| `GENORAY_SAMPLE_INTERVAL` | `Tuning(sample_interval=)` / `--sample-interval` |
+| `GENORAY_TRACE` | `log_filter="genoray=trace"` |
+| `GENORAY_LOG` | `log_level=` (levels) or `log_filter=` (directives) |
+
 ### Parallel conversion
 
 Single-file `SparseVar2.from_vcf` shards **within a contig**. `threads=` sets
-the overall budget shown above; `reader_workers=` sets how many indexed shard
-readers each concurrent contig gets, which is the knob that controls sub-contig
-read parallelism. Leaving it `None` derives it from the core budget — a quarter
-of usable cores is reserved for the merge tail, contig concurrency is chosen
-preferring depth, and the remainder goes to readers. An explicit value is
-honoured or refused, never silently reduced: one that cannot fit `max_mem`
-raises rather than quietly planning something slower. Sub-contig sharding only
+the overall budget shown above; `tuning.reader_workers` (via
+`tuning=Tuning(reader_workers=N)`, see "Tuning" above) sets how many indexed
+shard readers each concurrent contig gets, which is the knob that controls
+sub-contig read parallelism. Leaving it `None` derives it from the core
+budget — a quarter of usable cores is reserved for the merge tail, contig
+concurrency is chosen preferring depth, and the remainder goes to readers. An
+explicit value is honoured or refused, never silently reduced: one that
+cannot fit `max_mem` raises rather than quietly planning something slower.
+Sub-contig sharding only
 kicks in for the default whole-contig (`regions_overlap="pos"`) path. The planner uses
 a backend-specific reader budget: indexed shard readers decompress inline and
 replace, rather than run alongside, the monolithic reader's HTSlib pool. This
