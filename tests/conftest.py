@@ -25,6 +25,44 @@ chr1\t12\t.\tGTA\tG\t.\t.\t.\tGT\t1|1\t0|1
 
 
 @pytest.fixture(scope="session")
+def small_vcf(tmp_path_factory) -> Path:
+    """A tiny (3-record, 2-sample, single-contig) BCF+CSI store."""
+    d = tmp_path_factory.mktemp("banner-vcf")
+    vcf = d / "in.vcf"
+    vcf.write_text(_VCF)
+    bcf = d / "in.bcf"
+    subprocess.run(["bcftools", "view", "-Ob", "-o", str(bcf), str(vcf)], check=True)
+    subprocess.run(["bcftools", "index", str(bcf)], check=True)
+    return bcf
+
+
+@pytest.fixture(scope="session")
+def small_pgen(tmp_path_factory) -> Path:
+    """The same 3-record, 2-sample, single-contig cohort as `small_vcf`, as a PGEN."""
+    d = tmp_path_factory.mktemp("banner-pgen")
+    vcf = d / "in.vcf"
+    vcf.write_text(_VCF)
+    gz = d / "in.vcf.gz"
+    with open(gz, "wb") as fh:
+        subprocess.run(["bgzip", "-c", str(vcf)], check=True, stdout=fh)
+    subprocess.run(["bcftools", "index", str(gz)], check=True)
+    subprocess.run(
+        [
+            "plink2",
+            "--make-pgen",
+            "--output-chr",
+            "chrM",
+            "--vcf",
+            str(gz),
+            "--out",
+            str(d / "in"),
+        ],
+        check=True,
+    )
+    return d / "in.pgen"
+
+
+@pytest.fixture(scope="session")
 def svar2_store(tmp_path_factory) -> Path:
     d = tmp_path_factory.mktemp("svar2")
     ref = d / "ref.fa"

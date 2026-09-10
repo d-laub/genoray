@@ -45,16 +45,41 @@ fn file_has_contig(path: &str, chrom: &str) -> bool {
 }
 
 fn main() {
-    genoray_core::logging::install_fmt_fallback();
+    let args_raw: Vec<String> = std::env::args().collect();
+    // `--log-filter <directives>` (or `--log-filter=<directives>`) may appear
+    // anywhere; strip it out before the positional-argument parsing below so it
+    // doesn't shift other indices. The `=` form is accepted because otherwise it
+    // falls through as a positional and lands in the `reference` slot, where it
+    // is opened as a FASTA -- a confusing failure a long way from its cause.
+    let mut args: Vec<String> = Vec::with_capacity(args_raw.len());
+    let mut log_filter: Option<String> = None;
+    let mut it = args_raw.into_iter();
+    while let Some(a) = it.next() {
+        if let Some(d) = a.strip_prefix("--log-filter=") {
+            log_filter = Some(d.to_owned());
+        } else if a == "--log-filter" {
+            // A trailing `--log-filter` with no value must not silently mean
+            // "no filter": the caller asked for logs and would get none.
+            match it.next() {
+                Some(d) => log_filter = Some(d),
+                None => {
+                    eprintln!("error: --log-filter requires a directive string");
+                    std::process::exit(2);
+                }
+            }
+        } else {
+            args.push(a);
+        }
+    }
+    genoray_core::logging::install_fmt_fallback(log_filter.as_deref());
 
     #[cfg(feature = "dhat-heap")]
     let _profiler = dhat::Profiler::new_heap();
 
-    let args: Vec<String> = std::env::args().collect();
     if args.len() < 4 {
         eprintln!(
             "usage: {} <manifest> <out_dir> <chrom>[,<chrom>...] [reference.fa] \
-             [format_field:htype,...]",
+             [format_field:htype,...] [--log-filter <directives>]",
             args[0]
         );
         eprintln!(
@@ -140,6 +165,7 @@ fn main() {
         Vec::new(),       // region_ranges: empty => whole contig, as the bench intends
         OverlapMode::Pos, // overlap (inert with no regions; mirrors the default)
         contig_membership,
+        genoray_core::tuning::TuningIn::default(),
         &genoray_core::logging::EventSink::disabled(),
     )
     .expect("run_vcf_list");

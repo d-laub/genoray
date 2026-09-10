@@ -25,6 +25,7 @@ from genoray._svar2_fields import (
 )
 from genoray._svar2_mutcat import _MutcatMixin
 from genoray._svar2_ops import Mode, _assert_concat_compatible, _load_meta, _write_store
+from genoray._tuning import Tuning, resolve_tuning
 from genoray._utils import (
     BGZF_VCF_SUFFIXES,
     detect_memory_budget,
@@ -489,7 +490,8 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         overwrite: bool = False,
         threads: int | None = None,
         progress: bool = False,
-        log_level: Literal["off", "warning", "info", "debug"] = "info",
+        log_level: str | int = "info",
+        log_filter: str | None = None,
     ) -> None:
         """Write a region/sample subset of this store to `output`.
 
@@ -543,12 +545,19 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         from those summaries.
 
         `log_level`: minimum severity for structured write-time log lines --
-        one of `"off"`, `"warning"`, `"info"` (default), or `"debug"`.
-        `"off"` disables all output, including the per-contig summaries and
-        progress rendering (a pure no-op, zero overhead). The environment
-        variable `GENORAY_LOG` overrides this argument when set to one of
-        the same four values (e.g. `GENORAY_LOG=debug` for troubleshooting
-        without touching call sites).
+        one of `"off"`, `"critical"`, `"error"`, `"warning"`, `"info"`
+        (default), or `"debug"` (case-insensitive), or a `logging` integer
+        level. `"off"` disables all output, including the per-contig
+        summaries and progress rendering (a pure no-op, zero overhead).
+        `"critical"` is an alias for `"error"`; see `parse_log_level` for the
+        exact mapping.
+
+        `log_filter`: an optional `tracing`-style `EnvFilter` directive
+        string (e.g. `"genoray=debug"`) applied to genoray's own stderr
+        diagnostic output, independent of `log_level` (which gates the
+        structured progress/summary events surfaced above). `None` (default)
+        leaves stderr silent; an unparseable directive silences stderr
+        rather than raising.
 
         `threads` caps the number of contigs sliced concurrently (autodetected
         from available CPUs when `None`), same convention as `from_vcf`.
@@ -638,6 +647,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
                 threads,
                 overwrite,
                 log_level=level,
+                log_filter=log_filter,
                 receiver=rx,
             )
 
@@ -657,7 +667,6 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         ploidy: int = 2,
         chunk_size: int = 25_000,
         threads: int | None = None,
-        reader_workers: int | None = None,
         overwrite: bool = False,
         long_allele_capacity: int = 8 * 1024 * 1024,
         signatures: bool = False,
@@ -665,7 +674,9 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         format_fields: Sequence[str | FormatField] | None = None,
         check_ref: Literal["e", "x"] = "e",
         progress: bool = False,
-        log_level: Literal["off", "warning", "info", "debug"] = "info",
+        tuning: Tuning | None = None,
+        log_level: str | int = "info",
+        log_filter: str | None = None,
         max_mem: int | str | None = None,
     ) -> int:
         """Convert a bgzipped VCF (`.vcf.gz`/`.vcf.bgz`) or BCF (`.bcf`) to an SVAR2 store.
@@ -694,16 +705,18 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         `samples` selects and reorders VCF samples by name, preserving caller
         order and de-duplicating first occurrences.
 
-        `reader_workers` sets how many independent indexed shard readers run
-        per concurrent contig. `None` (the default) lets the planner choose:
-        it derives the count from the core budget, reserving a quarter of
-        usable cores for the merge tail, picking contig concurrency
-        preferring depth, then spending the rest on readers. Pass an
-        explicit value >= 1 to override; a value that cannot fit `max_mem`
-        raises rather than being silently reduced, and a value below 1
-        raises `ValueError` rather than being silently coerced up to 1 --
-        pass `None` instead if you want the planner to decide. This is a
-        scheduling knob only — output is byte-identical at every value.
+        `tuning`: explicit scheduling knobs (see `Tuning`), replacing the old
+        `GENORAY_*` environment variables. `None` (the default) is the same
+        as `Tuning()`: every knob is planner-derived. `from_vcf` accepts all
+        six `Tuning` fields, including `reader_workers` (independent indexed
+        shard readers per concurrent contig) and `overshard` (work units per
+        reader). A field you do set is honoured or refused (e.g. a
+        `reader_workers` that cannot fit `max_mem` raises) -- never silently
+        shrunk -- and is reported in the `pipeline config` log line tagged
+        `explicit`; every field left `None` is reported tagged `planner`.
+        Setting a field outside a backend's applicable set (see `Tuning`'s
+        table) raises `ValueError`. This is a scheduling knob only -- output
+        is byte-identical at every value.
 
         signatures: if True, classify SBS96/ID83 codes during the write and
         store the mutcat sidecar (factored into the dense/var_key cost model).
@@ -735,12 +748,19 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         from those summaries.
 
         log_level: minimum severity for structured write-time log lines —
-        one of `"off"`, `"warning"`, `"info"` (default), or `"debug"`.
-        `"off"` disables all output, including the per-contig summaries and
-        progress rendering (a pure no-op, zero overhead). The environment
-        variable `GENORAY_LOG` overrides this argument when set to one of
-        the same four values (e.g. `GENORAY_LOG=debug` for troubleshooting
-        without touching call sites).
+        one of `"off"`, `"critical"`, `"error"`, `"warning"`, `"info"`
+        (default), or `"debug"` (case-insensitive), or a `logging` integer
+        level. `"off"` disables all output, including the per-contig
+        summaries and progress rendering (a pure no-op, zero overhead).
+        `"critical"` is an alias for `"error"`; see `parse_log_level` for the
+        exact mapping.
+
+        log_filter: an optional `tracing`-style `EnvFilter` directive string
+        (e.g. `"genoray=debug"`) applied to genoray's own stderr diagnostic
+        output, independent of `log_level` (which gates the structured
+        progress/summary events surfaced above). `None` (default) leaves
+        stderr silent; an unparseable directive silences stderr rather than
+        raising.
 
         max_mem: byte budget the concurrency planner may use, as an int or a
         string like `"64GiB"` (see `parse_memory`). **This is a WHOLE-PROCESS
@@ -773,15 +793,12 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         from cyvcf2 import VCF as _CyVCF
         from genoray._sample_select import _normalize_samples
 
+        tuning = resolve_tuning(tuning, "vcf")
+
         if regions_overlap not in {"pos", "record", "variant"}:
             raise ValueError(
                 "regions_overlap must be one of 'pos', 'record', or 'variant'; "
                 f"got {regions_overlap!r}"
-            )
-        if reader_workers is not None and reader_workers < 1:
-            raise ValueError(
-                "reader_workers must be None (let the planner choose) or an "
-                f"integer >= 1; got {reader_workers!r}"
             )
 
         out = Path(out)
@@ -916,7 +933,8 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
                 region_ranges,
                 regions_overlap,
                 max_mem_bytes,
-                reader_workers=reader_workers,
+                tuning=tuning,
+                log_filter=log_filter,
                 log_level=level,
                 receiver=rx,
             )
@@ -943,7 +961,9 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         dosages: "Sequence[DosageField] | None" = None,
         check_ref: Literal["e", "x"] = "e",
         progress: bool = False,
-        log_level: Literal["off", "warning", "info", "debug"] = "info",
+        tuning: Tuning | None = None,
+        log_level: str | int = "info",
+        log_filter: str | None = None,
     ) -> int:
         """Convert a PLINK2 PGEN to an SVAR2 store.
 
@@ -1055,17 +1075,38 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         unless `log_level="off"`. Default False keeps writes silent aside
         from those summaries.
 
+        `tuning`: explicit scheduling knobs (see `Tuning`), replacing the
+        old `GENORAY_*` environment variables. `None` (the default) is the
+        same as `Tuning()`: every knob is planner-derived. `from_pgen` pins
+        `reader_workers=1` and never shards within a contig (pgenlib holds
+        the GIL through decode, so sub-contig sharding is pure overhead), so
+        setting `tuning.reader_workers` or `tuning.overshard` raises
+        `ValueError`; `concurrent_chroms`, `dense_cap`, `merge_threads`, and
+        `sample_interval` are honoured. A field you do set is honoured or
+        refused -- never silently shrunk -- and is reported in the `pipeline
+        config` log line tagged `explicit`; every field left `None` is
+        reported tagged `planner`.
+
         log_level: minimum severity for structured write-time log lines --
-        one of `"off"`, `"warning"`, `"info"` (default), or `"debug"`.
-        `"off"` disables all output, including the per-contig summaries and
-        progress rendering (a pure no-op, zero overhead). The environment
-        variable `GENORAY_LOG` overrides this argument when set to one of
-        the same four values (e.g. `GENORAY_LOG=debug` for troubleshooting
-        without touching call sites).
+        one of `"off"`, `"critical"`, `"error"`, `"warning"`, `"info"`
+        (default), or `"debug"` (case-insensitive), or a `logging` integer
+        level. `"off"` disables all output, including the per-contig
+        summaries and progress rendering (a pure no-op, zero overhead).
+        `"critical"` is an alias for `"error"`; see `parse_log_level` for the
+        exact mapping.
+
+        log_filter: an optional `tracing`-style `EnvFilter` directive string
+        (e.g. `"genoray=debug"`) applied to genoray's own stderr diagnostic
+        output, independent of `log_level` (which gates the structured
+        progress/summary events surfaced above). `None` (default) leaves
+        stderr silent; an unparseable directive silences stderr rather than
+        raising.
         """
         from genoray._pgen import _read_psam
         from genoray._sample_select import _normalize_samples
         from genoray._svar2_fields import _dosage_field_to_tuple
+
+        tuning = resolve_tuning(tuning, "pgen")
 
         if regions_overlap not in {"pos", "record", "variant"}:
             raise ValueError(
@@ -1321,6 +1362,8 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
                 regions_overlap,
                 sample_perm,
                 max_mem_bytes,
+                tuning=tuning,
+                log_filter=log_filter,
                 log_level=level,
                 receiver=rx,
             )
@@ -1348,7 +1391,9 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         format_fields: "Sequence[str | FormatField] | None" = None,
         check_ref: Literal["e", "x"] = "e",
         progress: bool = False,
-        log_level: Literal["off", "warning", "info", "debug"] = "info",
+        tuning: Tuning | None = None,
+        log_level: str | int = "info",
+        log_filter: str | None = None,
     ) -> int:
         """Build one SVAR2 store from many **single-sample** VCFs/BCFs via a native k-way merge (no `bcftools merge`, no intermediate multi-sample VCF).
 
@@ -1549,15 +1594,35 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         unless `log_level="off"`. Default False keeps writes silent aside
         from those summaries.
 
+        `tuning`: explicit scheduling knobs (see `Tuning`), replacing the
+        old `GENORAY_*` environment variables. `None` (the default) is the
+        same as `Tuning()`: every knob is planner-derived. `from_vcf_list`
+        walks contigs strictly sequentially by design, so it accepts only
+        `dense_cap`, `merge_threads`, and `sample_interval` -- setting
+        `concurrent_chroms`, `reader_workers`, or `overshard` raises
+        `ValueError`. A field you do set is honoured or refused -- never
+        silently shrunk -- and is reported in the `pipeline config` log line
+        tagged `explicit`; every field left `None` is reported tagged
+        `planner`.
+
         log_level: minimum severity for structured write-time log lines --
-        one of `"off"`, `"warning"`, `"info"` (default), or `"debug"`.
-        `"off"` disables all output, including the per-contig summaries and
-        progress rendering (a pure no-op, zero overhead). The environment
-        variable `GENORAY_LOG` overrides this argument when set to one of
-        the same four values (e.g. `GENORAY_LOG=debug` for troubleshooting
-        without touching call sites).
+        one of `"off"`, `"critical"`, `"error"`, `"warning"`, `"info"`
+        (default), or `"debug"` (case-insensitive), or a `logging` integer
+        level. `"off"` disables all output, including the per-contig
+        summaries and progress rendering (a pure no-op, zero overhead).
+        `"critical"` is an alias for `"error"`; see `parse_log_level` for the
+        exact mapping.
+
+        log_filter: an optional `tracing`-style `EnvFilter` directive string
+        (e.g. `"genoray=debug"`) applied to genoray's own stderr diagnostic
+        output, independent of `log_level` (which gates the structured
+        progress/summary events surfaced above). `None` (default) leaves
+        stderr silent; an unparseable directive silences stderr rather than
+        raising.
         """
         from cyvcf2 import VCF as _CyVCF
+
+        tuning = resolve_tuning(tuning, "vcf_list")
 
         if regions_overlap not in {"pos", "record", "variant"}:
             raise ValueError(
@@ -1733,6 +1798,8 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
                 check_ref,
                 region_ranges,
                 regions_overlap,
+                tuning=tuning,
+                log_filter=log_filter,
                 log_level=level,
                 receiver=rx,
             )
@@ -1758,7 +1825,9 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         fields: "Sequence[str] | None" = None,
         check_ref: Literal["e", "x"] = "e",
         progress: bool = False,
-        log_level: Literal["off", "warning", "info", "debug"] = "info",
+        tuning: Tuning | None = None,
+        log_level: str | int = "info",
+        log_filter: str | None = None,
     ) -> int:
         """Convert a SVAR1 (``SparseVar``) store to an SVAR2 store natively.
 
@@ -1822,16 +1891,35 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         unless `log_level="off"`. Default False keeps writes silent aside
         from those summaries.
 
+        `tuning`: explicit scheduling knobs (see `Tuning`), replacing the
+        old `GENORAY_*` environment variables. `None` (the default) is the
+        same as `Tuning()`: every knob is planner-derived. `from_svar1`
+        never shards within a contig, so setting `tuning.reader_workers` or
+        `tuning.overshard` raises `ValueError`; `concurrent_chroms`,
+        `dense_cap`, `merge_threads`, and `sample_interval` are honoured. A
+        field you do set is honoured or refused -- never silently shrunk --
+        and is reported in the `pipeline config` log line tagged `explicit`;
+        every field left `None` is reported tagged `planner`.
+
         log_level: minimum severity for structured write-time log lines --
-        one of `"off"`, `"warning"`, `"info"` (default), or `"debug"`.
-        `"off"` disables all output, including the per-contig summaries and
-        progress rendering (a pure no-op, zero overhead). The environment
-        variable `GENORAY_LOG` overrides this argument when set to one of
-        the same four values (e.g. `GENORAY_LOG=debug` for troubleshooting
-        without touching call sites).
+        one of `"off"`, `"critical"`, `"error"`, `"warning"`, `"info"`
+        (default), or `"debug"` (case-insensitive), or a `logging` integer
+        level. `"off"` disables all output, including the per-contig
+        summaries and progress rendering (a pure no-op, zero overhead).
+        `"critical"` is an alias for `"error"`; see `parse_log_level` for the
+        exact mapping.
+
+        log_filter: an optional `tracing`-style `EnvFilter` directive string
+        (e.g. `"genoray=debug"`) applied to genoray's own stderr diagnostic
+        output, independent of `log_level` (which gates the structured
+        progress/summary events surfaced above). `None` (default) leaves
+        stderr silent; an unparseable directive silences stderr rather than
+        raising.
         """
         from genoray._svar import SparseVar
         from genoray._sample_select import _normalize_samples
+
+        tuning = resolve_tuning(tuning, "svar1")
 
         if regions_overlap not in {"pos", "record", "variant"}:
             raise ValueError(
@@ -1963,6 +2051,8 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
                 region_ranges,
                 regions_overlap,
                 sample_idx,
+                tuning=tuning,
+                log_filter=log_filter,
                 log_level=level,
                 receiver=rx,
             )

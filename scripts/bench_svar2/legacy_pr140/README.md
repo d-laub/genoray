@@ -1,5 +1,11 @@
 # Sharded-VCF reader budget benchmark (PR #140 review)
 
+> **Superseded.** These scripts drive the pre-5.0 `GENORAY_*` environment
+> interface, which no longer exists. They are kept for provenance of the PR #140
+> measurements and will not run against current genoray. The equivalent knobs
+> are now `genoray write vcf --reader-workers/--overshard/...` and
+> `genoray.Tuning`.
+
 Harness + measurements for `SparseVar2.from_vcf`'s sub-contig sharded reader
 budget, built to evaluate [PR #140](https://github.com/d-laub/genoray/pull/140)
 (`perf(svar2): rebalance sharded VCF worker budget`).

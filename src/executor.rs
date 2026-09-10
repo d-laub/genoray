@@ -2,7 +2,6 @@ use crate::dense::DenseMap;
 use crate::nrvk::LongAlleleTableWriter;
 use crate::rvk::dense2sparse_vk;
 use crate::streams::StreamMap;
-use crate::trace::trace_ll;
 use crate::types::{DenseChunk, SparseChunk};
 use crossbeam_channel::{Receiver, Sender};
 
@@ -74,11 +73,8 @@ pub fn run_compute_engine(
     let mut kept_total: u64 = 0;
 
     while let Ok(chunk) = rx_dense.recv() {
-        let chunk_id = chunk.chunk_id;
         let n = chunk.pos.len() as u64;
-        trace_ll!("[trace {chrom}] exec: dense2sparse enter chunk {chunk_id}");
         let sparse_chunk = dense2sparse_vk(&chunk, &mut bank, sidecar_bits_enabled, fields);
-        trace_ll!("[trace {chrom}] exec: dense2sparse exit chunk {chunk_id}");
 
         for (tag, sub) in sparse_chunk.streams.iter() {
             var_key_ledgers
@@ -94,7 +90,6 @@ pub fn run_compute_engine(
         tx_sparse
             .send(sparse_chunk)
             .expect("Failed to send SparseChunk to Writer");
-        trace_ll!("[trace {chrom}] exec: sent SparseChunk {chunk_id}");
 
         sink.tick(chrom, n);
         kept_total += n;

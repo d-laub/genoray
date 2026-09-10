@@ -81,7 +81,7 @@ VCF_CONTIGS = tuple(f"chr{i}" for i in range(1, 23))
 VCF_CROSSED_SAMPLES = (4_000, 32_000, 128_000)
 
 # cc=16 exceeds any production clamp and is reachable only through the
-# bench-only GENORAY_CONCURRENT_CHROMS override. It is here for LEVER ARM on
+# bench-only `--concurrent-chroms` override. It is here for LEVER ARM on
 # the per-contig term and sits OUTSIDE the production domain -- the same role
 # and the same caveat as the PGEN law's cc=16 rows.
 VCF_CROSSED_CC = (1, 4, 8, 16)
@@ -287,12 +287,12 @@ PGEN_CONCURRENCY_AT = (4_000, 1_000_000)
 # 1. `concurrent_chroms`. The six ladder rows share S, chunk_bytes and (w+p),
 #    so the law predicts ONE value (2870.6 MB) for measurements spanning
 #    1977.9 -> 3835.0 MB. But the deeper defect is that cc is not merely
-#    unidentified, it is UNOBSERVED: `probe.py` sets
-#    GENORAY_CONCURRENT_CHROMS only when a point pins it, `ProbeRecord` has no
-#    field for the value the planner picked, and 12 of the 18 rows left it
-#    unset. Coding those rows as cc=1 to fit them is what produced a pooled
-#    per-contig estimate of 41 MB against the ladder's own well-determined
-#    89.67. Hence: every point on these axes PINS cc, so the regressor exists.
+#    unidentified, it is UNOBSERVED: `probe.py` passed `--concurrent-chroms`
+#    only when a point pins it, `ProbeRecord` had no field for the value the
+#    planner picked, and 12 of the 18 rows left it unset. Coding those rows
+#    as cc=1 to fit them is what produced a pooled per-contig estimate of 41
+#    MB against the ladder's own well-determined 89.67. Hence: every point on
+#    these axes PINS cc, so the regressor exists.
 #
 # 2. A per-chunk-cycle term. Peak RSS is NON-MONOTONE in chunk bytes at fixed
 #    S -- at S=4,000 the 3.1 -> 7.8 MB step DROPS RSS by 586 MB, 9.3x the

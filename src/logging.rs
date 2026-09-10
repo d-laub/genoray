@@ -2,10 +2,11 @@
 use crossbeam_channel::Sender;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Mutex, Once};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Mutex, Once, OnceLock};
 use tracing::field::{Field, Visit};
 use tracing::level_filters::LevelFilter;
+use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::{Context, Layer};
 use tracing_subscriber::prelude::*;
 
@@ -224,28 +225,33 @@ impl Visit for FieldGrab {
 // duration of a write via `with_channel_subscriber`; `None` otherwise (e.g.
 // pure-Rust bench runs, or between writes).
 static CURRENT_SINK: Mutex<Option<EventSink>> = Mutex::new(None);
-// Current channel log level as a rank: off=0, warning=1, info=2, debug=3.
-static CURRENT_LEVEL: AtomicU8 = AtomicU8::new(2); // info
+// Current channel log level as a rank: off=0, error=1, warning=2, info=3, debug=4.
+static CURRENT_LEVEL: AtomicU8 = AtomicU8::new(3); // info
 
 fn level_rank(s: &str) -> u8 {
     match s {
         "off" => 0,
-        "warning" => 1,
-        "info" => 2,
-        "debug" => 3,
-        _ => 2,
+        "error" => 1,
+        "warning" => 2,
+        "info" => 3,
+        "debug" => 4,
+        // Python canonicalizes before this point (`parse_log_level`), so an
+        // unknown spelling here means a pure-Rust caller; default to info.
+        _ => 3,
     }
 }
 
 fn event_rank(l: &tracing::Level) -> u8 {
     match *l {
-        tracing::Level::ERROR | tracing::Level::WARN => 1,
-        tracing::Level::INFO => 2,
+        tracing::Level::ERROR => 1,
+        tracing::Level::WARN => 2,
+        tracing::Level::INFO => 3,
         // TRACE is treated as debug for channel gating, but TRACE events
         // never reach `on_event` in the first place: the channel layer is
         // filtered to max DEBUG at install time (see `ensure_global_subscriber`)
-        // so `genoray::monitor`'s trace-level sampler stays GENORAY_LOG-only.
-        tracing::Level::DEBUG | tracing::Level::TRACE => 3,
+        // so the monitor sampler's trace-level output stays reachable only
+        // through the stderr fmt layer's filter.
+        tracing::Level::DEBUG | tracing::Level::TRACE => 4,
     }
 }
 
@@ -289,13 +295,37 @@ impl<S: tracing::Subscriber> Layer<S> for ChannelLayer {
 
 static INSTALL: Once = Once::new();
 
+/// Type-erased setter for the stderr fmt layer's `EnvFilter`, published by
+/// `ensure_global_subscriber`. Naming `reload::Handle`'s generic parameter
+/// would mean spelling out the whole `Layered<..>` subscriber type; a boxed
+/// closure that captures the handle sidesteps that entirely.
+static SET_FMT_FILTER: OnceLock<Box<dyn Fn(EnvFilter) + Send + Sync>> = OnceLock::new();
+
+/// Whether our subscriber actually became the global default. False when a host
+/// process installed one first, in which case the reload handle points at a
+/// subscriber nobody consults and every filter request is silently inert.
+static SUBSCRIBER_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+/// Warn at most once that a requested filter cannot take effect.
+static WARNED_NOT_INSTALLED: Once = Once::new();
+
+/// The directives currently applied to the fmt layer, so a nested scope can put
+/// back what it found instead of assuming silence (see `Restore` below).
+static CURRENT_FMT_FILTER: Mutex<Option<String>> = Mutex::new(None);
+
+/// A filter that admits nothing.
+fn off_filter() -> EnvFilter {
+    EnvFilter::new("off")
+}
+
 /// Install the single process-global tracing subscriber, at most once per
 /// process. Combines the channel layer (routes to `CURRENT_SINK`, gated by
-/// `CURRENT_LEVEL`) with an optional stderr fmt layer driven by `GENORAY_LOG`.
-/// A library installing a global default is impolite but REQUIRED for
-/// cross-thread routing (see module-level comment above); if the host
-/// process already installed a global default, `set_global_default` fails
-/// and we ignore the error — channel logging degrades gracefully (the
+/// `CURRENT_LEVEL`) with a stderr fmt layer whose filter is reloadable via
+/// `set_fmt_filter` -- there is no environment-variable input anywhere in
+/// this module. A library installing a global default is impolite but
+/// REQUIRED for cross-thread routing (see module-level comment above); if
+/// the host process already installed a global default, `set_global_default`
+/// fails and we ignore the error — channel logging degrades gracefully (the
 /// progress bar is unaffected: it uses direct `EventSink` sends, not
 /// `tracing`).
 fn ensure_global_subscriber() {
@@ -304,22 +334,66 @@ fn ensure_global_subscriber() {
         // debug events at all; the real per-write gate is `CURRENT_LEVEL`
         // inside `on_event`. TRACE stays out of the channel entirely.
         let channel = ChannelLayer::new().with_filter(LevelFilter::DEBUG);
-        // Optional stderr fmt layer, only active when GENORAY_LOG is set.
-        let fmt_filter = tracing_subscriber::EnvFilter::try_from_env("GENORAY_LOG").ok();
-        let fmt = fmt_filter.map(|f| {
-            tracing_subscriber::fmt::layer()
-                .with_target(true)
-                .compact()
-                .with_writer(std::io::stderr)
-                .with_filter(f)
-        });
+        // The stderr fmt layer is ALWAYS installed, initially filtered to
+        // "off" (which costs nothing), so that a later `set_fmt_filter` call
+        // can turn it on. Reading a filter once at install time -- as the
+        // old environment-variable-driven version did -- would fix it for
+        // the life of the process and make a per-call filter impossible.
+        let (filter, handle) = tracing_subscriber::reload::Layer::new(off_filter());
+        let fmt = tracing_subscriber::fmt::layer()
+            .with_target(true)
+            .compact()
+            .with_writer(std::io::stderr)
+            .with_filter(filter);
         let subscriber = tracing_subscriber::registry().with(channel).with(fmt);
-        let _ = tracing::subscriber::set_global_default(subscriber);
+        let _ = SET_FMT_FILTER.set(Box::new(move |f| {
+            let _ = handle.reload(f);
+        }));
+        let installed = tracing::subscriber::set_global_default(subscriber).is_ok();
+        SUBSCRIBER_INSTALLED.store(installed, Ordering::Relaxed);
     });
 }
 
+/// Apply `directives` to the stderr fmt layer, or silence it when `None`.
+/// An unparseable directive string silences the layer rather than panicking:
+/// a bad filter must not take down a conversion that is otherwise fine. It
+/// still reports the rejection to stderr, naming the directive, so the
+/// caller learns why their logs went silent instead of just losing them.
+///
+/// Returns the directives that were in effect beforehand, so a caller can put
+/// them back.
+fn set_fmt_filter(directives: Option<&str>) -> Option<String> {
+    ensure_global_subscriber();
+    // A filter is now an explicit API argument rather than an environment
+    // variable, so silently dropping it is worse than it used to be: say so
+    // once, rather than leaving the caller to wonder where their logs went.
+    if directives.is_some() && !SUBSCRIBER_INSTALLED.load(Ordering::Relaxed) {
+        WARNED_NOT_INSTALLED.call_once(|| {
+            eprintln!(
+                "genoray: log filter ignored -- another tracing subscriber was \
+                 already installed in this process."
+            );
+        });
+    }
+    let filter = match directives {
+        Some(d) => EnvFilter::try_new(d).unwrap_or_else(|_| {
+            eprintln!(
+                "genoray: log filter {d:?} could not be parsed -- logging is off for this call."
+            );
+            off_filter()
+        }),
+        None => off_filter(),
+    };
+    if let Some(set) = SET_FMT_FILTER.get() {
+        set(filter);
+    }
+    let mut current = CURRENT_FMT_FILTER.lock().unwrap();
+    std::mem::replace(&mut *current, directives.map(str::to_owned))
+}
+
 /// Route `tracing::` events emitted during `f` (from ANY thread, including
-/// OS threads spawned below a rayon pool) to `sink` at `level`.
+/// OS threads spawned below a rayon pool) to `sink` at `level`, and point the
+/// stderr fmt layer at `filter` for the duration of the call.
 ///
 /// NOTE on concurrency: `CURRENT_SINK`/`CURRENT_LEVEL` are process-global
 /// slots, not thread-local or call-scoped. Nested/sequential calls on one
@@ -330,8 +404,14 @@ fn ensure_global_subscriber() {
 /// last writer wins. This is an accepted limitation: the progress bar is
 /// unaffected (it sends directly to its `EventSink`, bypassing `tracing`),
 /// and concurrent in-process writes are not a supported logging scenario.
-pub fn with_channel_subscriber<R>(sink: EventSink, level: &str, f: impl FnOnce() -> R) -> R {
+pub fn with_channel_subscriber<R>(
+    sink: EventSink,
+    level: &str,
+    filter: Option<&str>,
+    f: impl FnOnce() -> R,
+) -> R {
     ensure_global_subscriber();
+    let prev_filter = set_fmt_filter(filter);
     let prev_level = CURRENT_LEVEL.swap(level_rank(level), Ordering::Relaxed);
     let prev_sink = {
         let mut g = CURRENT_SINK.lock().unwrap();
@@ -341,30 +421,36 @@ pub fn with_channel_subscriber<R>(sink: EventSink, level: &str, f: impl FnOnce()
     struct Restore {
         prev_level: u8,
         prev_sink: Option<EventSink>,
+        prev_filter: Option<String>,
     }
     impl Drop for Restore {
         fn drop(&mut self) {
             CURRENT_LEVEL.store(self.prev_level, Ordering::Relaxed);
             *CURRENT_SINK.lock().unwrap() = self.prev_sink.take();
+            // Restore the filter we found, symmetrically with the level and the
+            // sink above. Forcing silence instead would work today -- the only
+            // other setter is `install_fmt_fallback`, whose lone caller never
+            // enters this scope -- but that is a reachability accident, and the
+            // first entry point that does both would silently lose its filter.
+            set_fmt_filter(self.prev_filter.take().as_deref());
         }
     }
     let _restore = Restore {
         prev_level,
         prev_sink,
+        prev_filter,
     };
 
     f()
 }
 
-/// Install the global tracing subscriber, at most once per process, so a
-/// pure-Rust entry point (bench bin) gets the `GENORAY_LOG` stderr fmt layer.
-/// Called by `src/bin/bench_from_vcf_list.rs` — NOT by the Python pipeline,
-/// which uses `with_channel_subscriber` instead. Since `CURRENT_SINK` stays
-/// `None` outside of a `with_channel_subscriber` scope, only the fmt layer
-/// fires here (when `GENORAY_LOG` is set) — same observable behavior as the
-/// old thread-local-only fallback.
-pub fn install_fmt_fallback() {
-    ensure_global_subscriber();
+/// Install the global tracing subscriber and point its stderr fmt layer at
+/// `filter`, for a pure-Rust entry point (the bench bin). NOT used by the
+/// Python pipeline, which goes through `with_channel_subscriber`. Since
+/// `CURRENT_SINK` stays `None` outside that scope, only the fmt layer fires
+/// here.
+pub fn install_fmt_fallback(filter: Option<&str>) {
+    set_fmt_filter(filter);
 }
 
 #[cfg(test)]
@@ -489,7 +575,7 @@ mod tests {
         // this exact target, while every foreign module's call site does
         // not, regardless of which OS thread happens to run it.
         let own_target = module_path!();
-        with_channel_subscriber(sink, "info", || {
+        with_channel_subscriber(sink, "info", None, || {
             tracing::info!(chrom = "chr1", "excluded 12 records");
             tracing::debug!(chrom = "chr1", "chr1:100 REF mismatch"); // filtered out at info
         });
@@ -526,7 +612,7 @@ mod tests {
         // is process-global, so filter to this module's own target or a
         // concurrently running foreign test leaks events into `rx`.
         let own_target = module_path!();
-        with_channel_subscriber(sink, "info", || {
+        with_channel_subscriber(sink, "info", None, || {
             tracing::info!(
                 concurrent_chroms = 8usize,
                 reader_workers = 4usize,
@@ -579,7 +665,7 @@ mod tests {
         // thread actually emits it, while every foreign module's events do
         // not.
         let own_target = module_path!();
-        with_channel_subscriber(sink, "debug", || {
+        with_channel_subscriber(sink, "debug", None, || {
             std::thread::spawn(|| {
                 tracing::info!(chrom = "chrX", "from worker");
             })
@@ -605,5 +691,177 @@ mod tests {
         );
         assert_eq!(logs[0].0, "chrX");
         assert!(logs[0].1.contains("from worker"));
+    }
+
+    #[test]
+    fn level_ranks_split_error_from_warning() {
+        assert_eq!(level_rank("off"), 0);
+        assert_eq!(level_rank("error"), 1);
+        assert_eq!(level_rank("warning"), 2);
+        assert_eq!(level_rank("info"), 3);
+        assert_eq!(level_rank("debug"), 4);
+        // Unknown spellings fall back to info, as before -- Python has already
+        // validated and canonicalized by the time a level reaches here.
+        assert_eq!(level_rank("nonsense"), 3);
+    }
+
+    #[test]
+    fn event_ranks_match_level_ranks() {
+        assert_eq!(event_rank(&tracing::Level::ERROR), 1);
+        assert_eq!(event_rank(&tracing::Level::WARN), 2);
+        assert_eq!(event_rank(&tracing::Level::INFO), 3);
+        assert_eq!(event_rank(&tracing::Level::DEBUG), 4);
+        assert_eq!(event_rank(&tracing::Level::TRACE), 4);
+    }
+
+    /// End-to-end gate test: a `tracing::warn!` must actually be dropped when
+    /// routed through `with_channel_subscriber` at `"error"`, and actually
+    /// kept at `"warning"`. The arithmetic-only predecessor of this test
+    /// asserted `event_rank`/`level_rank` relationships that
+    /// `level_ranks_split_error_from_warning` and `event_ranks_match_level_ranks`
+    /// already pin exactly, so it could not fail independently of those two.
+    /// This drives the real gate (`on_event`'s rank comparison) instead.
+    #[test]
+    fn a_warning_is_dropped_at_error_level_but_kept_at_warning() {
+        use crossbeam_channel::unbounded;
+        let _guard = TEST_LOCK.lock().unwrap();
+        let own_target = module_path!();
+
+        let (tx, rx) = unbounded();
+        let sink = EventSink::new(tx, 1);
+        with_channel_subscriber(sink, "error", None, || {
+            tracing::warn!("should be dropped at error level");
+        });
+        let kept: Vec<String> = rx
+            .try_iter()
+            .filter_map(|e| match e {
+                Event::Log {
+                    message, target, ..
+                } if target == own_target => Some(message),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            kept.is_empty(),
+            "a warning must be dropped when the active level is \"error\", got {kept:?}"
+        );
+
+        let (tx, rx) = unbounded();
+        let sink = EventSink::new(tx, 1);
+        with_channel_subscriber(sink, "warning", None, || {
+            tracing::warn!("should be kept at warning level");
+        });
+        let kept: Vec<String> = rx
+            .try_iter()
+            .filter_map(|e| match e {
+                Event::Log {
+                    message, target, ..
+                } if target == own_target => Some(message),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            kept.len(),
+            1,
+            "a warning must be kept when the active level is \"warning\""
+        );
+    }
+
+    /// The reload handle must survive repeated set/restore cycles -- what a
+    /// second `from_vcf` call in one process does -- and each cycle must
+    /// actually change what the subscriber admits.
+    ///
+    /// TRACE is the discriminating level: the channel layer is capped at DEBUG
+    /// (see `ensure_global_subscriber`), so a TRACE callsite is enabled ONLY
+    /// when the reloadable fmt filter admits it. That makes `enabled!` a direct
+    /// probe of the reload path -- gut `set_fmt_filter` to a no-op and this
+    /// test fails, which is precisely what the previous version could not do.
+    #[test]
+    fn reloading_the_filter_changes_what_the_subscriber_admits() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        install_fmt_fallback(Some("genoray::monitor=trace"));
+        assert!(
+            tracing::enabled!(target: "genoray::monitor", tracing::Level::TRACE),
+            "a trace directive must enable a trace callsite"
+        );
+        install_fmt_fallback(Some("genoray=debug"));
+        assert!(
+            !tracing::enabled!(target: "genoray::monitor", tracing::Level::TRACE),
+            "reloading to a debug directive must stop admitting trace"
+        );
+        install_fmt_fallback(None);
+        assert!(
+            !tracing::enabled!(target: "genoray::monitor", tracing::Level::TRACE),
+            "reloading to no filter must admit nothing"
+        );
+    }
+
+    /// `with_channel_subscriber`'s new `filter` parameter is a SEPARATE knob
+    /// from the channel gate (`level`/`CURRENT_LEVEL`/`CURRENT_SINK`): it only
+    /// ever touches the stderr fmt layer. Passing an unparseable directive
+    /// string must not panic (a bad `log_filter=` string must never take down
+    /// an otherwise-fine conversion -- see `set_fmt_filter`'s doc comment) and
+    /// must not disturb channel routing, which stays gated purely by `level`.
+    #[test]
+    fn with_channel_subscriber_survives_a_bad_filter_and_still_routes() {
+        use crossbeam_channel::unbounded;
+        let _guard = TEST_LOCK.lock().unwrap();
+        let (tx, rx) = unbounded();
+        let sink = EventSink::new(tx, 1);
+        // See the identical reasoning in `channel_layer_routes_events_at_level`:
+        // `CURRENT_SINK` is process-global, so filter to this module's own
+        // target to isolate this test from concurrently running foreign tests.
+        let own_target = module_path!();
+        with_channel_subscriber(sink, "info", Some("not( a valid filter"), || {
+            tracing::info!(chrom = "chr1", "still routed");
+        });
+        let logs: Vec<String> = rx
+            .try_iter()
+            .filter_map(|e| match e {
+                Event::Log {
+                    message, target, ..
+                } if target == own_target => Some(message),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(logs, vec!["still routed".to_string()]);
+    }
+
+    /// A second `with_channel_subscriber` call in the same process (mirrors a
+    /// second `from_vcf` call) must be able to point the reloadable stderr
+    /// filter at a *different* directive string than the first call used --
+    /// exactly what a one-shot (non-reload) `EnvFilter` layer could not do --
+    /// and must restore what it found on the way out rather than forcing
+    /// silence.
+    #[test]
+    fn with_channel_subscriber_filter_can_change_across_calls() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        // An ambient filter set by a pure-Rust entry point, as the bench binary
+        // does before running a conversion.
+        install_fmt_fallback(Some("genoray::monitor=trace"));
+
+        with_channel_subscriber(EventSink::disabled(), "info", Some("genoray=debug"), || {
+            assert!(
+                !tracing::enabled!(target: "genoray::monitor", tracing::Level::TRACE),
+                "the call's own filter must be in effect inside the scope"
+            );
+        });
+        assert!(
+            tracing::enabled!(target: "genoray::monitor", tracing::Level::TRACE),
+            "the ambient filter must survive a nested with_channel_subscriber"
+        );
+
+        with_channel_subscriber(EventSink::disabled(), "info", None, || {
+            assert!(
+                !tracing::enabled!(target: "genoray::monitor", tracing::Level::TRACE),
+                "None must silence the fmt layer for the duration of the call"
+            );
+        });
+        assert!(
+            tracing::enabled!(target: "genoray::monitor", tracing::Level::TRACE),
+            "a None-filtered call must still restore the ambient filter"
+        );
+
+        install_fmt_fallback(None);
     }
 }

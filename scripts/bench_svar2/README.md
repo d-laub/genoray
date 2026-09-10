@@ -60,12 +60,23 @@ seed, only re-obtainable by rerunning the probe.
 - **`unit_secs` includes downstream backpressure, not just shard work.** The
   shard workers' result channel is bounded (`tx_res` at `workers * 2`, feeding
   a `tx_dense` bounded at 6), so a worker blocks inside its chunk loop
-  whenever the executor is behind. As `GENORAY_READER_WORKERS` rises past the
-  executor's drain rate, every unit's time converges on that drain rate and
+  whenever the executor is behind. As `tuning.reader_workers`
+  (`--reader-workers` on the CLI; the `GENORAY_READER_WORKERS` environment
+  variable this used to be is gone -- see `docs/source/svar.md`'s "migrating
+  from environment variables" table) rises past the executor's drain rate,
+  every unit's time converges on that drain rate and
   the per-shard spread collapses -- so a skew fitter can wrongly read a
   *narrow* `unit_secs` spread as "readers are evenly loaded" when the real
   limiter is downstream. Treat a narrow spread at high worker counts as
   suspect, not as evidence of balance.
+- **Every sweep row should now record a `<field>_src` provenance tag for each
+  `Tuning`-backed field it sets** (e.g. alongside `reader_workers`, a
+  `reader_workers_src` of `"explicit"` or `"planner"`), matching the
+  provenance the `pipeline config` log line itself tags each knob with. A
+  point that doesn't distinguish "I passed `reader_workers=3`" from "the
+  planner picked 3 on its own" cannot tell a genuinely explicit tuning sweep
+  apart from one that happens to land on the planner's default -- exactly the
+  ambiguity `Tuning`'s honour-or-refuse contract exists to remove.
 - **`pending` / `pending_bytes` are per-contig high-water marks, not a time
   series.** They are non-decreasing within a contig (`3 -> 5 -> 5`, never
   down), so they cannot be diffed to recover instantaneous backlog, and they

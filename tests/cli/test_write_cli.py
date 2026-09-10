@@ -374,6 +374,8 @@ def test_write_vcf_list_rejects_samples(tmp_path: Path):
         ["write", "vcf", str(vcf_dir), str(out), "--no-reference", "--samples", "S0"]
     )
     assert r.returncode != 0
+    # `--samples` rejection is unrelated to the tuning knobs: its message is
+    # unchanged by this branch, so it stays pinned to the real wording.
     assert "not supported for multi-file" in (r.stdout + r.stderr).lower()
 
 
@@ -395,7 +397,14 @@ def test_write_vcf_list_rejects_reader_workers(tmp_path: Path):
         ]
     )
     assert r.returncode != 0
-    assert "not supported for multi-file" in (r.stdout + r.stderr).lower()
+    # Assert on the two facts that must hold rather than on a sentence: the
+    # error names the knob the user actually passed, and the backend it does
+    # not apply to. The wording moved when the applicability table replaced
+    # the old per-call "not supported for multi-file" string, and a test
+    # pinned to the prose broke without the behaviour changing at all.
+    combined = (r.stdout + r.stderr).lower()
+    assert "reader_workers" in combined
+    assert "vcf_list" in combined
 
 
 def test_write_vcf_list_dispatches(tmp_path: Path):

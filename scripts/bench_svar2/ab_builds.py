@@ -3,9 +3,12 @@
 The scale sweep (`sweep.py`) characterizes one build across a plan of
 configurations. This answers the other question -- "what does merging this
 branch actually buy a user?" -- and so it deliberately does the opposite:
-one configuration, two builds, **no `GENORAY_*` overrides at all**. Every
-sweep hook (`GENORAY_READER_WORKERS`, `GENORAY_CONCURRENT_CHROMS`, ...) is
-stripped from the child's environment, because a number measured with the
+one configuration, two builds, **every knob left at the planner's default**.
+There is no environment channel left to override that with -- every sweep
+hook is now an explicit CLI flag (`--reader-workers`, `--concurrent-chroms`,
+...) that this script simply never passes -- but `run_once` still asserts
+the environment is clean before it launches a child: a stray `GENORAY_*`
+would mean the channel has grown back, and a number measured with the
 planner overridden is not the number a user gets.
 
 A build is identified by its interpreter: each arm is a separate checkout with
@@ -38,19 +41,6 @@ import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-
-# Sweep hooks. Cleared for every child: this harness measures DEFAULTS, and an
-# inherited override from the surrounding shell would silently become part of
-# the result.
-BENCH_ENV_VARS = (
-    "GENORAY_READER_WORKERS",
-    "GENORAY_OVERSHARD",
-    "GENORAY_CONCURRENT_CHROMS",
-    "GENORAY_DENSE_CAP",
-    "GENORAY_MERGE_THREADS",
-    "GENORAY_SAMPLE_INTERVAL",
-    "GENORAY_LOG",
-)
 
 
 @dataclass(frozen=True)
@@ -104,7 +94,18 @@ def run_once(
     `log` keeps the child's output even on success. The conversion logs the
     plan it chose (`concurrent_chroms`, `reader_workers`) at info level, and
     a result table without the plan that produced it cannot be acted on."""
-    env = {k: v for k, v in os.environ.items() if k not in BENCH_ENV_VARS}
+    # Every knob is now an explicit CLI argument, so there is nothing to scrub
+    # -- but a stray GENORAY_* in the environment would mean the channel has
+    # grown back and this run's configuration is not what the command line
+    # says it is. Checked here, at the point a child is actually launched,
+    # rather than at import: an import-time check would fire on `--help` and
+    # on anything that merely imports this module.
+    stale = sorted(k for k in os.environ if k.startswith("GENORAY_"))
+    if stale:
+        raise SystemExit(
+            f"GENORAY_* variables are set but no longer do anything: {stale}. "
+            "Pass the knobs as CLI flags instead."
+        )
     cmd = [
         python,
         "-m",
@@ -130,9 +131,7 @@ def run_once(
     # accumulate across every child the driver has ever reaped and report a
     # running maximum, which silently turns arm B's peak RSS into
     # `max(A, B)` once A has run.
-    proc = subprocess.Popen(
-        cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-    )
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     _, status, ru = os.wait4(proc.pid, 0)
     wall = time.perf_counter() - t0
     err = proc.stderr.read().decode(errors="replace") if proc.stderr else ""
