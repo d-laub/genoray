@@ -46,14 +46,6 @@ def test_no_environment_reads_in_rust_sources():
     )
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Task 7 rewrites the GENORAY_* docstrings in _svar2.py and Task 9 the "
-        "ones in _cli/__main__.py. strict=True so whichever task finishes the "
-        "job has to delete this marker rather than inherit a silent xfail."
-    ),
-    strict=True,
-)
 def test_no_genoray_env_var_names_anywhere_in_the_package():
     offenders = _rg(r"GENORAY_[A-Z_]+", "src", "python")
     assert offenders == [], "GENORAY_* names found in shipped code:\n" + "\n".join(
