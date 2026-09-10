@@ -1,0 +1,97 @@
+name: Preview wheel
+
+# Builds an INSTALLABLE wheel from an arbitrary commit, with no version bump and
+# nothing published. This exists because `release.yaml`'s wheel job is
+# `needs: bump` and checks out the bumped tag, so before this there was no way to
+# hand anyone a wheel built from a branch -- which blocked external validation of
+# a PR by anyone without a Rust toolchain (see #176).
+#
+# Trigger by pushing a `preview-*` tag at the commit you want built:
+#
+#     git tag preview-177-1 <sha> && git push origin preview-177-1
+#
+# A tag trigger is used rather than `workflow_dispatch` alone because dispatch
+# only lists workflows present on the DEFAULT branch, and the point is to build
+# commits that are not on main yet. `preview-*` cannot collide with commitizen,
+# whose `tag_format` is a bare `$version`.
+on:
+  push:
+    tags:
+      - 'preview-*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build preview wheel (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # linux-64 only by default: this is for handing a reviewer something
+          # to install, not for shipping. Add a matrix line if another platform
+          # is ever actually needed.
+          - runner: ubuntu-latest
+            platform: linux-64
+    steps:
+      - name: Check out
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # A preview wheel MUST NOT be mistakable for a release. Without this it
+      # would carry the plain pyproject version (e.g. 4.0.2) and shadow the real
+      # 4.0.2 in a cache or a pip resolution. `+g<sha>` is a PEP 440 local
+      # version: it sorts above the plain release, prints in `pip show`, and is
+      # rejected by PyPI, so it cannot be published by accident.
+      - name: Stamp a local version
+        id: stamp
+        run: |
+          set -euo pipefail
+          base=$(grep -m1 '^version = ' pyproject.toml | cut -d'"' -f2)
+          local_ver="${base}+g$(git rev-parse --short HEAD)"
+          sed -i "0,/^version = \"${base}\"/s//version = \"${local_ver}\"/" pyproject.toml
+          grep -m1 '^version = ' pyproject.toml
+          echo "version=${local_ver}" >> "$GITHUB_OUTPUT"
+
+      - name: Setup pixi (wheel build env)
+        uses: prefix-dev/setup-pixi@v0.9.5
+        with:
+          pixi-version: v0.70.2
+          manifest-path: ci/wheel/pixi.toml
+
+      - name: Build wheel
+        run: pixi run --manifest-path ci/wheel/pixi.toml build
+
+      # auditwheel bundles the conda .so dependencies and assigns the manylinux
+      # tag. Skipping it yields a wheel that only runs on this runner image.
+      - name: Repair wheel
+        run: pixi run --manifest-path ci/wheel/pixi.toml repair
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: preview-wheel-${{ matrix.platform }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+      - name: Summarize
+        run: |
+          {
+            echo "### Preview wheel"
+            echo
+            echo "- ref: \`${GITHUB_REF_NAME}\` (\`$(git rev-parse --short HEAD)\`)"
+            echo "- version: \`${{ steps.stamp.outputs.version }}\`"
+            echo "- platform: \`${{ matrix.platform }}\`"
+            echo
+            echo "Download the \`preview-wheel-${{ matrix.platform }}\` artifact below, then:"
+            echo
+            echo '```'
+            echo "pip install ./genoray-*.whl"
+            echo '```'
+            echo
+            echo "Not published to PyPI. The \`+g<sha>\` local version marks it as a build"
+            echo "from a specific commit rather than a release."
+          } >> "$GITHUB_STEP_SUMMARY"
+          ls -la dist/
