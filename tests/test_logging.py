@@ -1,5 +1,6 @@
 import hashlib
 import io
+import re
 import subprocess
 import threading
 from pathlib import Path
@@ -238,18 +239,61 @@ def test_below_pool_logs_surface_at_debug(tmp_path, capsys):
     assert "exclud" in lower, captured.out
 
 
+# Emitted by `tracing::debug!` in `orchestrator::process_chromosome` (search
+# `"Phase 1 complete"` in src/orchestrator.rs), so it is on the path of every
+# successful `from_vcf` and is gated by `log_level` alone.
+_DEBUG_ONLY = "phase 1 complete"
+
+
+def _rendered(capfd) -> str:
+    """Everything the renderer wrote, de-styled and de-wrapped.
+
+    Rich injects ANSI codes and hard-wraps to the console width, so a phrase
+    can arrive split across lines; collapsing whitespace makes a substring
+    search mean what it looks like it means.
+    """
+    captured = capfd.readouterr()
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", captured.out + captured.err)
+    return re.sub(r"\s+", " ", plain).lower()
+
+
 def test_log_level_argument_reaches_the_channel_gate(tmp_path, small_vcf, capfd):
-    """A debug-level line must reach the Python renderer when asked for.
+    """A debug-level line must reach the Python renderer only when asked for.
 
     The old version of this test drove the level through GENORAY_LOG, which
     also silently overrode the argument. The argument is now the only channel.
+
+    Both halves are load-bearing. Asserting only that SOMETHING was printed
+    proves nothing: `contig_done` is not level-gated at all (see
+    `EventSink::contig_done` in src/logging.rs and the `"contig_done"` branch
+    of `ProgressRenderer.handle`), so its `[svar2] ... done:` line appears at
+    every level and would keep this test green even if `log_level` were
+    ignored outright. The control run at `warning` is what makes the debug
+    assertion mean something.
+
+    `progress=False` on both runs for the same reason: `progress=True` wires
+    the event channel up regardless of the level, which is exactly the
+    coupling this test must not depend on.
     """
-    out = tmp_path / "lvl.svar"
+    debug_out = tmp_path / "debug.svar"
     SparseVar2.from_vcf(
-        out, small_vcf, no_reference=True, progress=True, log_level="debug"
+        debug_out, small_vcf, no_reference=True, progress=False, log_level="debug"
     )
-    captured = capfd.readouterr()
-    assert "[svar2]" in captured.out + captured.err
+    at_debug = _rendered(capfd)
+
+    warn_out = tmp_path / "warn.svar"
+    SparseVar2.from_vcf(
+        warn_out, small_vcf, no_reference=True, progress=False, log_level="warning"
+    )
+    at_warning = _rendered(capfd)
+
+    assert _DEBUG_ONLY in at_debug, (
+        f"log_level='debug' did not deliver a debug line:\n{at_debug!r}"
+    )
+    assert _DEBUG_ONLY not in at_warning, (
+        "log_level='warning' delivered a debug-only line -- the level "
+        f"argument is not gating the channel:\n{at_warning!r}"
+    )
 
 
 def test_from_svar1_emits_summary(tmp_path, capsys):

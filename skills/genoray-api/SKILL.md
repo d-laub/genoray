@@ -1186,9 +1186,17 @@ dropped together and print a `Dropped {n} out-of-scope (symbolic/breakend) ALT
 alleles.` line when set), `--check-ref {e,x}` (default `e`, ignored with
 `--no-reference`; `e` aborts on the first REF/FASTA disagreement, `x` drops
 the offending record and continues — mirrors `bcftools norm --check-ref`),
-`--progress`/`--no-progress` + `--log-level {off,warning,info,debug}` (map to
+`--progress`/`--no-progress` + `--log-level LEVEL` (map to
 `progress=`/`log_level=`; see "Conversion" above for behavior — default
-`--no-progress --log-level info`), and `--log-filter DIRECTIVE` (maps to
+`--no-progress --log-level info`. `LEVEL` is one of `off`, `critical`,
+`error`, `warning`, `info`, `debug`, case-insensitive — every name
+`parse_log_level` accepts. `warn` is rejected: `logging.warn()` was removed
+in Python 3.13, so it is a deprecated spelling, not a convention. The
+parameter is a validated `str` rather than a fixed choice list precisely so
+it cannot drift from `parse_log_level`, which is the single source of truth;
+the integer `logging` constants that function also accepts are reachable
+from `log_level=` in Python, not from this flag), and
+`--log-filter DIRECTIVE` (maps to
 `log_filter=`; a `tracing`-style `EnvFilter` string, e.g. `--log-filter
 "genoray::monitor=trace"`, independent of `--log-level`; unset/`None` by
 default). `write vcf`'s vcf-list form forwards these to `from_vcf_list`; its
