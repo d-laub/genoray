@@ -19,11 +19,20 @@ def test_unset_flags_stay_none():
 
 
 def _cli(*args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [sys.executable, "-m", "genoray", *args],
+    # `-m genoray._cli`, not `-m genoray`: the package has no `__main__.py`, and
+    # the console script points at `genoray._cli.__main__:app`. Getting this
+    # wrong is silent -- the subprocess dies with an empty stdout, so a
+    # `flag not in out` assertion passes for the wrong reason. Hence the
+    # returncode check below: every flag assertion in this file reads stdout,
+    # and an empty stdout must fail loudly rather than agree with whatever was
+    # asked of it.
+    proc = subprocess.run(
+        [sys.executable, "-m", "genoray._cli", *args],
         capture_output=True,
         text=True,
     )
+    assert proc.returncode == 0, (args, proc.returncode, proc.stderr)
+    return proc
 
 
 def test_vcf_only_flags_are_absent_from_the_pgen_command():

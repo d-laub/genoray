@@ -1276,7 +1276,8 @@ Both subcommands share the same `-r/--regions`, `-R/--regions-file`,
 `--no-progress` options and the same no-op guard (at least one of
 regions/samples is required) and mutex checks (`--regions`/`--regions-file`
 and `--samples`/`--samples-file` are each mutually exclusive). `genoray view`
-(SVAR2) additionally has `--log-level {off,warning,info,debug}` and
+(SVAR2) additionally has `--log-level LEVEL` (the same six names as
+`write`, above) and
 `--log-filter DIRECTIVE` (same semantics as `write`, above); `genoray view
 svar1` does not — its `SparseVar.write_view` backend has no
 `log_level=`/`log_filter=` kwarg. Neither `view` subcommand has any
