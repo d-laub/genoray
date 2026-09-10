@@ -128,3 +128,24 @@ class Tuning:
             f"(applicable knobs: {', '.join(sorted(allowed))}). "
             f"Leave {pronoun} as None."
         )
+
+
+def resolve_tuning(tuning: Tuning | None, backend: Backend) -> Tuning:
+    """Default `tuning=None` to `Tuning()` and validate it against `backend`.
+
+    Shared by every `from_*` entry point so the `tuning=` parameter is
+    type-checked in exactly one place. The pyo3 FFI seam extracts `TuningIn`
+    by ATTRIBUTE (`#[derive(FromPyObject)]` with no `#[pyo3(item)]`), so a
+    caller who passes a `dict` -- a plausible mistake given that `Tuning`'s
+    field names read like kwargs -- would otherwise fail deep inside
+    `_check_backend` with `AttributeError: 'dict' object has no attribute
+    '_check_backend'`, naming neither `tuning` nor the type it actually needs.
+    """
+    if tuning is None:
+        tuning = Tuning()
+    elif not isinstance(tuning, Tuning):
+        raise TypeError(
+            f"tuning must be a genoray.Tuning or None; got {type(tuning).__name__!r}"
+        )
+    tuning._check_backend(backend)
+    return tuning

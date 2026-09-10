@@ -276,6 +276,9 @@ explicit `reader_workers` that cannot fit `max_mem` raises
 `InsufficientMemory` rather than being downgraded to something that fits.
 This is the whole point of the object — the old environment variables could
 be silently ignored by a backend that never read them; `Tuning` cannot be.
+`tuning=` must be a `Tuning` instance or `None` — passing e.g. a `dict` raises
+`TypeError` naming the parameter, since the field names could otherwise look
+like plausible kwargs.
 
 Not every backend can use every knob. Setting one it can't use raises
 `ValueError` naming the offending field(s) rather than being silently

@@ -25,7 +25,7 @@ from genoray._svar2_fields import (
 )
 from genoray._svar2_mutcat import _MutcatMixin
 from genoray._svar2_ops import Mode, _assert_concat_compatible, _load_meta, _write_store
-from genoray._tuning import Tuning
+from genoray._tuning import Tuning, resolve_tuning
 from genoray._utils import (
     BGZF_VCF_SUFFIXES,
     detect_memory_budget,
@@ -793,8 +793,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         from cyvcf2 import VCF as _CyVCF
         from genoray._sample_select import _normalize_samples
 
-        tuning = tuning if tuning is not None else Tuning()
-        tuning._check_backend("vcf")
+        tuning = resolve_tuning(tuning, "vcf")
 
         if regions_overlap not in {"pos", "record", "variant"}:
             raise ValueError(
@@ -1107,8 +1106,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         from genoray._sample_select import _normalize_samples
         from genoray._svar2_fields import _dosage_field_to_tuple
 
-        tuning = tuning if tuning is not None else Tuning()
-        tuning._check_backend("pgen")
+        tuning = resolve_tuning(tuning, "pgen")
 
         if regions_overlap not in {"pos", "record", "variant"}:
             raise ValueError(
@@ -1624,8 +1622,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         """
         from cyvcf2 import VCF as _CyVCF
 
-        tuning = tuning if tuning is not None else Tuning()
-        tuning._check_backend("vcf_list")
+        tuning = resolve_tuning(tuning, "vcf_list")
 
         if regions_overlap not in {"pos", "record", "variant"}:
             raise ValueError(
@@ -1922,8 +1919,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         from genoray._svar import SparseVar
         from genoray._sample_select import _normalize_samples
 
-        tuning = tuning if tuning is not None else Tuning()
-        tuning._check_backend("svar1")
+        tuning = resolve_tuning(tuning, "svar1")
 
         if regions_overlap not in {"pos", "record", "variant"}:
             raise ValueError(

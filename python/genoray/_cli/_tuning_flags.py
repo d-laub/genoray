@@ -28,7 +28,7 @@ from cyclopts import Parameter
 from .._tuning import Tuning
 
 
-@dataclass
+@dataclass(frozen=True)
 class TuningFlags:
     """Scheduling knobs applicable to every write command."""
 
@@ -40,7 +40,7 @@ class TuningFlags:
         return Tuning(**{f.name: getattr(self, f.name) for f in fields(self)})
 
 
-@dataclass
+@dataclass(frozen=True)
 class ConcurrentTuningFlags(TuningFlags):
     """Adds `concurrent_chroms`.
 
@@ -53,7 +53,7 @@ class ConcurrentTuningFlags(TuningFlags):
     )
 
 
-@dataclass
+@dataclass(frozen=True)
 class VcfTuningFlags(ConcurrentTuningFlags):
     """Adds `reader_workers`/`overshard`, the sharded-VCF-only knobs."""
 
