@@ -186,6 +186,33 @@ pub fn plan_thread_budget(available_cores: usize, n_chroms: usize) -> ThreadPlan
     }
 }
 
+/// HTSlib decode threads for the MONOLITHIC reader when the SHARDED planner
+/// chose the concurrency.
+///
+/// `process_chromosome` falls back to the single monolithic `VcfRecordSource`
+/// whenever a contig's shard plan yields at most one shard, and takes it for
+/// EVERY contig under `Record`/`Variant` overlap (POS-ownership would drop kept
+/// records). The concurrency those contigs run at came from `plan_sharded`,
+/// which bills a contig `1 + reader_workers` cores -- an executor plus its
+/// readers -- while [`plan_thread_budget`] bills the monolithic shape
+/// `PIPELINE_THREADS_PER_CHROM + htslib_threads` at a `concurrent_chroms` of
+/// its own. Taking the decode count from that other planner is what
+/// oversubscribes the allocation: at 48 cores and 22 contigs the sharded
+/// planner picks `cc = 11`, and the monolithic figure for `cc = 7` is then
+/// spent 11 times over (#152).
+///
+/// So spend the contig's OWN billed budget instead: of the `1 + w` cores
+/// `plan_sharded` reserved for it, one is the executor and one is the single
+/// reader thread it actually runs, leaving `w - 1` for htslib decode. The
+/// fallback then costs exactly what was planned for it, whatever `w` is.
+///
+/// Zero is a legitimate result (`w = 1`) and means "no decode pool" --
+/// `vcf_reader::open_vcf` skips `set_threads` entirely at 0, which is the
+/// htslib default rather than an error.
+pub fn fallback_htslib_threads(reader_workers: usize) -> usize {
+    reader_workers.saturating_sub(1)
+}
+
 /// Cores left idle after `concurrent` chroms each claim the pipeline threads plus
 /// `htslib` decode threads. Floored at 1 so the processing pool always builds.
 ///
@@ -1258,6 +1285,32 @@ mod tests {
             RamLaw::VCF.per_contig_mb > 0.0,
             "VCF's per-contig term is measured, not optional"
         );
+    }
+
+    #[test]
+    fn the_monolithic_fallback_never_costs_more_than_the_sharded_plan_billed() {
+        // `plan_sharded` bills a contig `1 + w` cores (executor + readers) and
+        // sizes `concurrent_chroms` against that. A contig that falls back to
+        // the monolithic reader runs an executor, ONE reader thread, and
+        // `fallback_htslib_threads(w)` decode threads -- which must fit inside
+        // the same bill, or the fallback oversubscribes a concurrency that was
+        // never planned for it (#152).
+        for w in 1..=64 {
+            let billed = 1 + w;
+            let spent = 1 + 1 + fallback_htslib_threads(w);
+            assert!(
+                spent <= billed,
+                "w={w}: monolithic fallback spends {spent} of {billed} billed cores"
+            );
+        }
+        // And it spends the whole bill rather than leaving decode threads on
+        // the table: the fallback is not meant to be slower than it was paid
+        // for.
+        assert_eq!(fallback_htslib_threads(8), 7);
+        // `w = 1` leaves nothing for a decode pool. 0 is "htslib default", not
+        // an error -- see `vcf_reader::zero_htslib_threads_opens_without_a_decode_pool`.
+        assert_eq!(fallback_htslib_threads(1), 0);
+        assert_eq!(fallback_htslib_threads(0), 0);
     }
 
     #[test]
