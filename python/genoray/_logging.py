@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import threading
 import time
 from contextlib import contextmanager
@@ -36,6 +37,12 @@ _INT_LEVELS: tuple[tuple[int, CanonicalLogLevel], ...] = (
     (30, "warning"),
     (40, "error"),
 )
+
+# A `logging` constant written as text, which is all the CLI can deliver.
+# Anchored via `fullmatch`, so "10 " is fine (stripped) but "info10" is not.
+# `[0-9]` rather than `\d`: `\d` is Unicode-aware, and accepting "１０" as a log
+# level would be an accident rather than a feature.
+_INT_TEXT_RE = re.compile(r"[+-]?[0-9]+")
 
 _HEARTBEAT_SECS = 5.0  # min seconds between throttled % lines per contig
 
@@ -124,8 +131,13 @@ class ProgressRenderer:
 def parse_log_level(log_level: str | int) -> CanonicalLogLevel:
     """Normalize a Python-convention level to the name Rust's gate understands.
 
-    Accepts the names in `LOG_LEVELS` (case-insensitive) and `logging` integer
-    constants. Returns one of "off", "error", "warning", "info", "debug".
+    Accepts the names in `LOG_LEVELS` (case-insensitive), `logging` integer
+    constants, and the decimal spelling of those integers (`"10"`). Returns one
+    of "off", "error", "warning", "info", "debug".
+
+    The digit-string spelling exists for the CLI: `--log-level` can only hand
+    this function text, so without it `log_level=10` would work from Python
+    while `--log-level 10` was rejected (#179).
 
     `"warn"` is deliberately NOT accepted: `logging.warn()` was removed in
     Python 3.13, so it is a deprecated spelling rather than a convention.
@@ -149,12 +161,17 @@ def parse_log_level(log_level: str | int) -> CanonicalLogLevel:
                 return name
         return "error"  # >= CRITICAL
     if isinstance(log_level, str):
-        canonical = _CANONICAL.get(log_level.strip().lower())
+        text = log_level.strip()
+        canonical = _CANONICAL.get(text.lower())
         if canonical is not None:
             return canonical
+        if _INT_TEXT_RE.fullmatch(text):
+            # Delegate rather than re-deriving, so the digit spelling inherits
+            # the round-up rule and the negative rejection unchanged.
+            return parse_log_level(int(text))
     raise ValueError(
         f"log_level must be one of {LOG_LEVELS} (case-insensitive) or a "
-        f"logging level int; got {log_level!r}"
+        f"logging level int (or its decimal spelling); got {log_level!r}"
     )
 
 

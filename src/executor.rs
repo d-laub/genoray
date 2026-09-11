@@ -1,16 +1,20 @@
 use crate::dense::DenseMap;
 use crate::nrvk::LongAlleleTableWriter;
 use crate::rvk::dense2sparse_vk;
-use crate::streams::StreamMap;
 use crate::types::{DenseChunk, SparseChunk};
 use crossbeam_channel::{Receiver, Sender};
 
 /// Phase-1 outputs consumed by the merge stage.
 pub struct Phase1Output {
-    /// One row per chunk of per-column call counts, per var_key stream.
-    pub var_key_ledgers: StreamMap<Vec<Vec<u32>>>,
+    /// How many `DenseChunk`s this stage consumed. The var_key ledgers used to
+    /// supply this incidentally (`ledgers.get(tag).len()`); they now live on
+    /// disk (see [`crate::layout::ledger`]), so the count is returned directly.
+    pub num_chunks: usize,
     /// One scalar per chunk (n_dense_variants), per dense class. Rectangular:
     /// every hap contributes the same count, so no per-column matrix.
+    ///
+    /// Unlike the var_key ledgers this stays in RAM: it is `O(chunks)`, not
+    /// `O(chunks x columns)` -- a few KB per contig rather than tens of GB.
     pub dense_ledgers: DenseMap<Vec<u32>>,
     pub long_allele_offsets: Vec<u64>,
     /// Total kept (emitted) variants across every `DenseChunk` this stage
@@ -36,9 +40,14 @@ pub struct ExecutorParams<'a> {
 }
 
 // Pulls raw chunks, encodes/splits, manages the bank, streams to the writer.
-// Returns Phase1Output — a ledger per active stream tag (each row a chunk's
-// per-column call counts), a scalar ledger per dense class, and the
-// long-allele bank offsets.
+// Returns Phase1Output — the chunk count, a scalar ledger per dense class, and
+// the long-allele bank offsets.
+//
+// The per-column var_key ledgers are NOT here: this used to clone each stream's
+// `sample_lengths` per chunk and hold every row for the whole contig, which is
+// `2 streams x columns x 4 B` per chunk -- ~19 GB by the end of a chr12-sized
+// contig at 535,662 diploid samples (#183). The writer spills those rows to
+// each stream's `ledger.bin` instead, and the merge reads them back in tiles.
 pub fn run_compute_engine(
     rx_dense: Receiver<DenseChunk>,
     tx_sparse: Sender<SparseChunk>,
@@ -67,20 +76,15 @@ pub fn run_compute_engine(
         .unwrap()
         .push(crate::monitor::current_tid());
 
-    let mut var_key_ledgers: StreamMap<Vec<Vec<u32>>> =
-        StreamMap::from_fn(|_| Vec::with_capacity(10_000));
     let mut dense_ledgers: DenseMap<Vec<u32>> = DenseMap::from_fn(|_| Vec::with_capacity(10_000));
     let mut kept_total: u64 = 0;
+    let mut num_chunks: usize = 0;
 
     while let Ok(chunk) = rx_dense.recv() {
         let n = chunk.pos.len() as u64;
         let sparse_chunk = dense2sparse_vk(&chunk, &mut bank, sidecar_bits_enabled, fields);
 
-        for (tag, sub) in sparse_chunk.streams.iter() {
-            var_key_ledgers
-                .get_mut(tag)
-                .push(sub.sample_lengths.clone());
-        }
+        num_chunks += 1;
         for (class, sub) in sparse_chunk.dense.iter() {
             dense_ledgers
                 .get_mut(class)
@@ -102,7 +106,7 @@ pub fn run_compute_engine(
     let long_allele_offsets: Vec<u64> = bank.finalize();
 
     Phase1Output {
-        var_key_ledgers,
+        num_chunks,
         dense_ledgers,
         long_allele_offsets,
         kept_total,
@@ -113,7 +117,6 @@ pub fn run_compute_engine(
 mod tests {
     use super::*;
     use crate::dense::DenseClass;
-    use crate::streams::StreamTag;
     use crate::types::BitGrid3;
     use crate::types::DenseChunk;
     use crossbeam_channel::bounded;
@@ -164,7 +167,7 @@ mod tests {
         );
 
         // one chunk processed → one ledger row per stream and per dense class
-        assert_eq!(out.var_key_ledgers.get(StreamTag::VarKeySnp).len(), 1);
+        assert_eq!(out.num_chunks, 1);
         assert_eq!(out.dense_ledgers.get(DenseClass::Snp).len(), 1);
         assert_eq!(out.dense_ledgers.get(DenseClass::Indel).len(), 1);
         assert_eq!(out.kept_total, 1);

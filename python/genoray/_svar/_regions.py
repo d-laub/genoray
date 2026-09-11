@@ -24,12 +24,46 @@ if TYPE_CHECKING:
 _REGION_STR_RE = re.compile(r"^(?P<chrom>[^:]+):(?P<start>\d+)-(?P<end>\d+)$")
 
 
+def _merge_regions(regions: pl.DataFrame) -> pl.DataFrame:
+    """Merge overlapping and bookended regions, per contig.
+
+    Equivalent to the `PyRanges.merge()` (slack=0) round-trip this replaced, which
+    genoray only ever used to answer two questions: did anything overlap, and what
+    are the ranges once it doesn't. Both are one sort and one running maximum in
+    polars, so the pyranges dependency bought nothing -- and cost `pip install
+    genoray` a C toolchain (#185).
+
+    Matching `merge()` exactly means merging BOOKENDED intervals too: [0, 10) and
+    [10, 20) become [0, 20), and a nested interval collapses into its container. The
+    caller compares heights to detect overlap, so widening or narrowing this rule
+    would change which region sets raise.
+
+    Args:
+        regions: BED-like frame with columns ``chrom`` (Utf8), ``start``, ``end``.
+
+    Returns:
+        The same schema, one row per merged run, sorted by contig then start.
+    """
+    prev_max_end = pl.col("end").cum_max().shift(1).over("chrom")
+    return (
+        regions.sort("chrom", "start", "end")
+        .with_columns(
+            _run=(prev_max_end.is_null() | (pl.col("start") > prev_max_end))
+            .cum_sum()
+            .over("chrom")
+        )
+        .group_by("chrom", "_run", maintain_order=True)
+        .agg(start=pl.col("start").min(), end=pl.col("end").max())
+        .select("chrom", "start", "end")
+    )
+
+
 def _coerce_bed_schema(df: pl.DataFrame) -> pl.DataFrame:
     """Coerce a BED-like frame to columns chrom (Utf8), start (Int32), end (Int32).
 
     Handles both the seqpro convention (chromStart/chromEnd) and the
     polars-bio convention (start/end), as well as PyRanges-style
-    (Chromosome/Start/End) via sp.bed.from_pyr.
+    (Chromosome/Start/End), which a caller can hand in directly.
     """
     rename: dict[str, str] = {}
     cols = set(df.columns)
@@ -220,21 +254,11 @@ def _resolve_kept_rows(
         return np.empty(0, dtype=V_IDX_TYPE)
 
     # --- overlap detection / optional merge ---
-    # sp.bed.to_pyr requires chromStart/chromEnd column names.
-    pyr_input = regions.rename({"start": "chromStart", "end": "chromEnd"})
-    pyr = sp.bed.to_pyr(pyr_input)  # type: ignore[bad-argument-type]
-    mod = type(pyr).__module__.split(".")[0]
-    if mod == "pyranges":
-        merged = pyr.merge()
-    elif mod == "pyranges1":
-        merged = pyr.merge_overlaps()
-    else:
-        raise RuntimeError(f"Unexpected PyRanges module: {type(pyr)!r}")
-
-    if len(merged) != regions.height:
+    merged = _merge_regions(regions)
+    if merged.height != regions.height:
         if not merge_overlapping:
             raise ValueError("regions overlap; pass merge_overlapping=True to dedupe")
-        regions = _coerce_bed_schema(sp.bed.from_pyr(merged))
+        regions = merged
 
     # --- collect candidate index values via var_ranges ---
     kept_chunks: list[NDArray[V_IDX_TYPE]] = []

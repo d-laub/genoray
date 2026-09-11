@@ -5,7 +5,7 @@ use ndarray_npy::write_npy;
 use rayon::prelude::*;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Target peak RAM for one `gather_columns` call AS A WHOLE — not per worker.
 /// Each worker holds one tile buffer at a time, so the per-worker share is this
@@ -25,37 +25,123 @@ const TILE_RAM_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 /// rather than unbounded.
 const MIN_TILE_RAM_BYTES: u64 = 8 * 1024 * 1024;
 
-/// Phase A (shared): derive global per-column offsets and per-chunk local
-/// offsets from the RAM Ledger. Both `merge_mini_sc` and
-/// `merge_var_key_field_values` need the identical column-major schedule —
-/// field values are staged 1:1 with calls, so the same reordering applies
-/// regardless of per-item byte width.
+/// Width, in `u32`s, of one spilled-ledger row. See [`crate::layout::ledger`]
+/// for the file's layout.
+#[inline]
+fn ledger_row_len(total_columns: usize) -> usize {
+    total_columns + 1
+}
+
+/// Read chunk `chunk_id`'s ledger prefix offsets for columns
+/// `[start_col, start_col + out.len() - 1]` into `out`.
 ///
-/// Returns `(final_offsets, chunk_offsets)`:
-/// - `final_offsets[col]` is the global item index where column `col` starts
-///   (length `total_columns + 1`, monotonically increasing).
-/// - `chunk_offsets[chunk_id][col]` is the local item index within
-///   `chunk_id`'s own stream where column `col` starts.
-fn derive_offsets(
+/// One contiguous `pread`, which is the whole reason the ledger stores prefix
+/// sums rather than raw counts: a tile needs each chunk's *local start offset*
+/// for its first column, and a count-only row could only produce that by
+/// summing from column zero.
+fn read_ledger_slice(
+    ledger: &File,
+    total_columns: usize,
+    chunk_id: usize,
+    start_col: usize,
+    out: &mut [u32],
+) -> Result<(), ConversionError> {
+    let row_len = ledger_row_len(total_columns);
+    let byte_offset = ((chunk_id * row_len + start_col) * std::mem::size_of::<u32>()) as u64;
+    ledger
+        .read_exact_at(bytemuck::cast_slice_mut(out), byte_offset)
+        .map_err(|e| ConversionError::Io {
+            context: format!("pread ledger row {chunk_id} at column {start_col}"),
+            source: e,
+        })
+}
+
+/// Phase A (shared): derive global per-column offsets by streaming the spilled
+/// ledger once. Both `merge_mini_sc` and `merge_var_key_field_values` need the
+/// identical column-major schedule — field values are staged 1:1 with calls, so
+/// the same reordering applies regardless of per-item byte width.
+///
+/// `final_offsets[col]` is the global item index where column `col` starts
+/// (length `total_columns + 1`, monotonically increasing).
+///
+/// The per-chunk local offsets this used to return alongside it are *not*
+/// materialized: they were a second `num_chunks x total_columns` array — ~19 GB
+/// at 535,662 diploid samples over a chr12-sized contig, on top of the identical
+/// amount the executor was already retaining (#183). Each tile now preads its
+/// own slice of them from the ledger instead, so RAM here is `O(total_columns)`
+/// regardless of chunk count.
+fn derive_final_offsets(
+    ledger: &File,
     num_chunks: usize,
     total_columns: usize,
-    ram_ledger: &[Vec<u32>],
-) -> (Vec<u64>, Vec<Vec<u32>>) {
+) -> Result<Vec<u64>, ConversionError> {
+    // Accumulate per-column totals in place, then prefix-sum them, so this is
+    // the single `total_columns`-sized allocation of the whole pass.
     let mut final_offsets = vec![0u64; total_columns + 1];
-    let mut chunk_offsets = vec![vec![0u32; total_columns + 1]; num_chunks];
+    let mut row = vec![0u32; ledger_row_len(total_columns)];
 
-    for col in 0..total_columns {
-        let mut col_total = 0u64;
-
-        for chunk_id in 0..num_chunks {
-            let calls = ram_ledger[chunk_id][col];
-            chunk_offsets[chunk_id][col + 1] = chunk_offsets[chunk_id][col] + calls;
-            col_total += calls as u64;
+    for chunk_id in 0..num_chunks {
+        read_ledger_slice(ledger, total_columns, chunk_id, 0, &mut row)?;
+        for col in 0..total_columns {
+            final_offsets[col + 1] += (row[col + 1] - row[col]) as u64;
         }
-        final_offsets[col + 1] = final_offsets[col] + col_total;
+    }
+    for col in 0..total_columns {
+        final_offsets[col + 1] += final_offsets[col];
     }
 
-    (final_offsets, chunk_offsets)
+    Ok(final_offsets)
+}
+
+/// A stream's spilled ledger, opened once and scanned once.
+///
+/// Both merge entry points need the same two things from it -- the open file to
+/// pread tile slices from, and the global per-column offsets -- and a stream is
+/// merged once for its pos/key payloads plus once per field. Deriving the
+/// offsets inside each call would re-read the whole ledger `n_fields + 1` times
+/// (the previous in-RAM version rebuilt the equivalent array just as often, but
+/// from memory, where a redundant pass is far cheaper).
+///
+/// Ownership of the file's lifetime sits with the caller: [`Self::remove`]
+/// deletes it, and must be called only after every merge for the stream.
+pub struct LedgerView {
+    file: File,
+    path: PathBuf,
+    /// `final_offsets[col]` is the global item index where column `col` starts
+    /// (length `total_columns + 1`, monotonically increasing).
+    final_offsets: Vec<u64>,
+}
+
+impl LedgerView {
+    /// Open `stream_dir`'s ledger and derive its global per-column offsets.
+    pub fn open(
+        stream_dir: &Path,
+        num_chunks: usize,
+        total_columns: usize,
+    ) -> Result<Self, ConversionError> {
+        let path = layout::ledger(stream_dir);
+        let file = File::open(&path).map_err(|e| ConversionError::Io {
+            context: format!("opening {}", path.display()),
+            source: e,
+        })?;
+        let final_offsets = derive_final_offsets(&file, num_chunks, total_columns)?;
+        Ok(Self {
+            file,
+            path,
+            final_offsets,
+        })
+    }
+
+    /// Total items across every column — the length of the merged stream.
+    pub fn total_items(&self) -> u64 {
+        self.final_offsets[self.final_offsets.len() - 1]
+    }
+
+    /// Delete the backing file. Call once the stream's every merge has run.
+    pub fn remove(self) {
+        drop(self.file);
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 /// How many columns one tile spans, given a thread budget.
@@ -100,32 +186,39 @@ struct Payload<'a> {
 
 /// Phase B (shared): adaptive-tile, parallel pread→interleave→pwrite gather.
 ///
-/// Each rayon worker owns one tile (a contiguous run of columns). For every
-/// payload it allocates one `Vec<u8>` sized `tile_items * item_width`, reads
-/// each chunk's contributing slice via positional reads, scatters bytes
-/// column-major into the tile buffer via per-column write heads (tracked in
-/// items, applied in bytes), then `pwrite`s the assembled tile to its
-/// pre-computed byte range in the payload's destination file.
+/// Each rayon worker owns one tile (a contiguous run of columns) and one
+/// `Vec<u8>` per payload, sized `tile_items * item_width`. It walks the chunks
+/// in order; for each it preads that chunk's slice of the ledger (the tile's
+/// prefix offsets), then each payload's contributing bytes, and scatters them
+/// column-major into that payload's tile buffer via per-column write heads
+/// (tracked in items, applied in bytes). Assembled tiles are `pwrite`n to their
+/// pre-computed byte ranges at the end.
 ///
-/// Per-column write heads depend only on `final_offsets`/`ram_ledger` (not on
-/// any payload's data), so they are identical across payloads for the same
-/// tile — computed once per tile and reused (cloned) for each payload.
+/// Chunks are the outer loop and payloads the inner one so that each chunk's
+/// ledger slice is read **once** and shared across payloads; reading it per
+/// payload instead would multiply this stage's pread count by the payload
+/// count. The cost is that every payload's tile buffer is live at once, which
+/// is exactly what `bytes_per_item` below already budgets for.
+///
+/// Per-column write heads depend only on `final_offsets` and the ledger (not on
+/// any payload's data), so they start identical across payloads for the same
+/// tile — computed once per tile and cloned per payload.
 fn gather_columns(
     total_columns: usize,
     num_chunks: usize,
-    ram_ledger: &[Vec<u32>],
+    ledger: &File,
     final_offsets: &[u64],
-    chunk_offsets: &[Vec<u32>],
     payloads: &[Payload],
     threads: usize,
 ) -> Result<(), ConversionError> {
     let total_items: u64 = final_offsets[total_columns];
     let threads = threads.max(1);
 
-    // Payloads are gathered sequentially below (one tile_buffer live at a
-    // time), but we size against the sum of all payload item widths (e.g. pos
-    // + key for merge_mini_sc) as a conservative bound that keeps peak tile RAM
-    // under budget even if the gather were made concurrent.
+    // Every payload's tile buffer is live at once (see the note above on loop
+    // order), so the budget must be against the SUM of the payload item widths
+    // (e.g. pos + key for merge_mini_sc) rather than the widest single one.
+    // This was already the sizing rule when payloads were gathered one at a
+    // time -- it was conservative then and is exact now.
     let bytes_per_item: u64 = payloads.iter().map(|p| p.item_width as u64).sum();
     let columns_per_tile = tile_columns(total_items, total_columns, bytes_per_item, threads);
 
@@ -166,20 +259,38 @@ fn gather_columns(
             tile_write_heads_base[i] = (final_offsets[col] as usize) - tile_start_item;
         }
 
-        for payload in payloads {
-            let item_width = payload.item_width;
-            let mut tile_buffer = vec![0u8; tile_total_items * item_width];
-            let mut tile_write_heads = tile_write_heads_base.clone();
+        let mut tile_buffers: Vec<Vec<u8>> = payloads
+            .iter()
+            .map(|p| vec![0u8; tile_total_items * p.item_width])
+            .collect();
+        let mut tile_write_heads: Vec<Vec<usize>> = payloads
+            .iter()
+            .map(|_| tile_write_heads_base.clone())
+            .collect();
 
-            // gather from chunks
-            for chunk_id in 0..num_chunks {
-                let chunk_start_item = chunk_offsets[chunk_id][tile_start_col] as usize;
-                let chunk_end_item = chunk_offsets[chunk_id][tile_end_col] as usize;
-                let chunk_items_to_read = chunk_end_item - chunk_start_item;
+        // This tile's slice of one chunk's ledger row: the prefix offsets for
+        // columns [tile_start_col, tile_end_col]. `tile_n_cols + 1` u32s, so a
+        // few KB even at cohort width, and the only per-chunk metadata a worker
+        // ever holds.
+        let mut ledger_slice = vec![0u32; tile_n_cols + 1];
 
-                if chunk_items_to_read == 0 {
-                    continue;
-                }
+        for chunk_id in 0..num_chunks {
+            read_ledger_slice(
+                ledger,
+                total_columns,
+                chunk_id,
+                tile_start_col,
+                &mut ledger_slice,
+            )?;
+
+            let chunk_start_item = ledger_slice[0] as usize;
+            let chunk_items_to_read = ledger_slice[tile_n_cols] as usize - chunk_start_item;
+            if chunk_items_to_read == 0 {
+                continue;
+            }
+
+            for (p_ix, payload) in payloads.iter().enumerate() {
+                let item_width = payload.item_width;
 
                 // Stateless positional read — multiple workers can read the
                 // same File concurrently without locking or seek contention.
@@ -193,33 +304,36 @@ fn gather_columns(
                     })?;
 
                 // stitch this chunk's block into the main Tile buffer
+                let tile_buffer = &mut tile_buffers[p_ix];
+                let heads = &mut tile_write_heads[p_ix];
                 let mut local_chunk_cursor = 0usize;
                 #[allow(clippy::needless_range_loop)]
                 for i in 0..tile_n_cols {
-                    let col = tile_start_col + i;
-                    let calls = ram_ledger[chunk_id][col] as usize;
+                    let calls = (ledger_slice[i + 1] - ledger_slice[i]) as usize;
                     if calls == 0 {
                         continue;
                     }
 
-                    let dest_start = tile_write_heads[i] * item_width;
+                    let dest_start = heads[i] * item_width;
                     let src_start = local_chunk_cursor * item_width;
                     tile_buffer[dest_start..dest_start + calls * item_width]
                         .copy_from_slice(&chunk_bytes[src_start..src_start + calls * item_width]);
 
-                    tile_write_heads[i] += calls;
+                    heads[i] += calls;
                     local_chunk_cursor += calls;
                 }
             }
+        }
 
-            // pwrite the assembled tile to its known byte range in the
-            // destination file. Tiles are disjoint by construction
-            // (final_offsets is monotonically increasing), so concurrent
-            // write_all_at calls touch non-overlapping regions.
-            let tile_byte_offset = (tile_start_item * item_width) as u64;
+        // pwrite each assembled tile to its known byte range in the destination
+        // file. Tiles are disjoint by construction (final_offsets is
+        // monotonically increasing), so concurrent write_all_at calls touch
+        // non-overlapping regions.
+        for (p_ix, payload) in payloads.iter().enumerate() {
+            let tile_byte_offset = (tile_start_item * payload.item_width) as u64;
             payload
                 .dest
-                .write_all_at(&tile_buffer, tile_byte_offset)
+                .write_all_at(&tile_buffers[p_ix], tile_byte_offset)
                 .map_err(|e| ConversionError::Io {
                     context: "pwrite payload".into(),
                     source: e,
@@ -258,13 +372,21 @@ fn gather_columns(
 
 /// Performs the Tile-Based Interleaving Merge.
 ///
-/// Phase A: in-memory metadata pass — derives global per-column offsets and per-chunk
-///          local offsets from the RAM Ledger, writes `offsets.npy`.
-/// Phase B: parallel tile gather — each rayon worker owns one tile, reads the slice
-///          of every chunk via positional reads, scatters into per-column slots,
-///          then `pwrite`s the assembled tile to its pre-computed byte range in
-///          `positions.bin` / `alleles.bin`.
+/// Phase A: metadata pass — streams the stream's spilled ledger
+///          ([`crate::layout::ledger`]) to derive global per-column offsets,
+///          writes `offsets.npy`.
+/// Phase B: parallel tile gather — each rayon worker owns one tile, preads its
+///          slice of every chunk's ledger row and payload, scatters into
+///          per-column slots, then `pwrite`s the assembled tile to its
+///          pre-computed byte range in `positions.bin` / `alleles.bin`.
 /// Phase C: cleanup of per-chunk temp files.
+///
+/// The ledger arrives on disk rather than as an argument: held in RAM it was
+/// `num_chunks x total_columns x 4 B` per stream, ~19 GB by the end of a
+/// chr12-sized contig at 535,662 diploid samples, and Phase A doubled it (#183).
+/// This does NOT delete it -- the caller owns that, via
+/// [`LedgerView::remove`], because the stream's field merges read the same
+/// ledger.
 ///
 /// `threads` is the budget for the Phase B gather. Like
 /// [`crate::dense_merge::DenseMergeParams::threads`] it is passed in rather than
@@ -279,19 +401,16 @@ pub fn merge_mini_sc(
     ploidy: usize,
     output_dir: &str,
     threads: usize,
-    ram_ledger: Vec<Vec<u32>>,
+    ledger: &LedgerView,
 ) -> Result<(), ConversionError> {
     let output_dir_path = Path::new(output_dir);
     let total_columns = num_samples * ploidy;
     let pos_size = std::mem::size_of::<u32>(); // positions are always u32
 
-    tracing::debug!("Phase A -> Executing In-Memory Metadata Pass");
-
-    // pre-compute global offsets and local chunk offsets using the RAM Ledger
-    let (final_offsets, chunk_offsets) = derive_offsets(num_chunks, total_columns, &ram_ledger);
+    let final_offsets = &ledger.final_offsets;
 
     // save the global offsets array immediately
-    let offsets_array = Array1::from_vec(final_offsets.clone());
+    let offsets_array = Array1::from_vec(final_offsets.to_vec());
     write_npy(layout::offsets(output_dir_path), &offsets_array).map_err(|source| {
         ConversionError::Npy {
             path: layout::offsets(output_dir_path)
@@ -362,9 +481,8 @@ pub fn merge_mini_sc(
     gather_columns(
         total_columns,
         num_chunks,
-        &ram_ledger,
-        &final_offsets,
-        &chunk_offsets,
+        &ledger.file,
+        final_offsets,
         &[
             Payload {
                 item_width: pos_size,
@@ -401,10 +519,10 @@ pub fn merge_mini_sc(
 ///
 /// `item_width` is the staged per-value byte width (4 for the i32/f32 staged
 /// representation Task 7 writes — narrowing to a final storage dtype happens later,
-/// at finalize time, not here). `ram_ledger` is the SAME calls-per-(chunk, column)
-/// ledger `merge_mini_sc` uses for the pos/key streams — field values are staged
-/// 1:1 with calls, so the identical column-major reordering applies; only the
-/// per-item width differs.
+/// at finalize time, not here). This reads the SAME spilled ledger
+/// ([`crate::layout::ledger`]) `merge_mini_sc` uses for the pos/key streams —
+/// field values are staged 1:1 with calls, so the identical column-major
+/// reordering applies; only the per-item width differs.
 ///
 /// This calls the same `derive_offsets` (Phase A) + `gather_columns` (Phase B)
 /// helpers `merge_mini_sc` uses, with a single `Payload` for the flat byte
@@ -423,7 +541,7 @@ pub fn merge_var_key_field_values(
     num_chunks: usize,
     num_samples: usize,
     ploidy: usize,
-    ram_ledger: &[Vec<u32>],
+    ledger: &LedgerView,
     field_ix: usize,
     item_width: usize,
     dest_values_bin: &Path,
@@ -432,14 +550,10 @@ pub fn merge_var_key_field_values(
     let output_dir_path = Path::new(output_dir);
     let total_columns = num_samples * ploidy;
 
-    // Phase A (shared): derive global per-column offsets + per-chunk local
-    // offsets from the RAM Ledger. Identical schedule merge_mini_sc uses for
-    // the pos/key streams — field values are staged 1:1 with calls, so the
-    // same column-major reordering applies.
-    let (final_offsets, chunk_offsets) = derive_offsets(num_chunks, total_columns, ram_ledger);
-
-    let total_items: u64 = final_offsets[total_columns];
-    let total_bytes: u64 = total_items * item_width as u64;
+    // Phase A is already done: the caller derived this stream's global
+    // per-column offsets once. Field values are staged 1:1 with calls, so the
+    // schedule merge_mini_sc uses for the pos/key streams applies unchanged.
+    let total_bytes: u64 = ledger.total_items() * item_width as u64;
 
     // Pre-create the monolithic output at full size so worker pwrites land in
     // disjoint byte ranges (sparse file — no disk space consumed until written).
@@ -471,9 +585,8 @@ pub fn merge_var_key_field_values(
     gather_columns(
         total_columns,
         num_chunks,
-        ram_ledger,
-        &final_offsets,
-        &chunk_offsets,
+        &ledger.file,
+        &ledger.final_offsets,
         &[Payload {
             item_width,
             chunk_files: &chunk_files,
@@ -588,6 +701,24 @@ mod tests {
         kf.write_all(bytemuck::cast_slice(key)).unwrap();
     }
 
+    /// Helper: spill a per-(chunk, column) call-count ledger to the file the
+    /// merge reads, in the prefix-sum form the writer produces. Tests keep
+    /// stating raw counts because that is what `sample_lengths` holds and what
+    /// the expected interleavings are easiest to reason about.
+    fn spill_ledger(dir: &Path, ram_ledger: &[Vec<u32>]) {
+        let mut f = File::create(layout::ledger(dir)).unwrap();
+        for row in ram_ledger {
+            let mut prefixed = Vec::with_capacity(row.len() + 1);
+            let mut acc = 0u32;
+            prefixed.push(acc);
+            for &calls in row {
+                acc += calls;
+                prefixed.push(acc);
+            }
+            f.write_all(bytemuck::cast_slice(&prefixed)).unwrap();
+        }
+    }
+
     fn read_u32_bin(path: &Path) -> Vec<u32> {
         // std::fs::read returns a Vec<u8> with u8 alignment; bytemuck::cast_slice
         // would fail TargetAlignmentGreater when the buffer happens to be unaligned
@@ -606,13 +737,57 @@ mod tests {
     }
 
     #[test]
-    fn derive_offsets_matches_inline() {
+    fn derive_final_offsets_matches_inline() {
         // 2 chunks, 3 columns
-        let ledger = vec![vec![2u32, 0, 1], vec![1u32, 3, 0]];
-        let (final_offsets, chunk_offsets) = derive_offsets(2, 3, &ledger);
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        spill_ledger(dir, &[vec![2u32, 0, 1], vec![1u32, 3, 0]]);
+        let ledger = File::open(layout::ledger(dir)).unwrap();
+
+        let final_offsets = derive_final_offsets(&ledger, 2, 3).unwrap();
         assert_eq!(final_offsets, vec![0, 3, 6, 7]); // col totals 3,3,1
-        assert_eq!(chunk_offsets[0], vec![0, 2, 2, 3]);
-        assert_eq!(chunk_offsets[1], vec![0, 1, 4, 4]);
+    }
+
+    // The per-chunk local offsets `derive_offsets` used to materialize are now
+    // read a tile at a time from the ledger. Same numbers, same meaning: pin
+    // both the full rows and a mid-row tile slice, since the tile read is where
+    // an offset error would actually bite.
+    #[test]
+    fn ledger_slices_carry_the_per_chunk_local_offsets() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        spill_ledger(dir, &[vec![2u32, 0, 1], vec![1u32, 3, 0]]);
+        let ledger = File::open(layout::ledger(dir)).unwrap();
+
+        let mut row = vec![0u32; ledger_row_len(3)];
+        read_ledger_slice(&ledger, 3, 0, 0, &mut row).unwrap();
+        assert_eq!(row, vec![0, 2, 2, 3]);
+        read_ledger_slice(&ledger, 3, 1, 0, &mut row).unwrap();
+        assert_eq!(row, vec![0, 1, 4, 4]);
+
+        // A tile covering columns [1, 3) reads 3 prefix offsets starting at
+        // column 1 -- chunk 1's calls there are 3 and 0.
+        let mut tile = vec![0u32; 3];
+        read_ledger_slice(&ledger, 3, 1, 1, &mut tile).unwrap();
+        assert_eq!(tile, vec![1, 4, 4]);
+    }
+
+    // The ledger outlives every merge for its stream and the caller deletes it.
+    // Pin that: merging must NOT remove it, and `remove` must.
+    #[test]
+    fn ledger_view_owns_the_files_lifetime() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        spill_ledger(dir, &[vec![1u32, 1]]);
+        write_chunk_files(dir, 0, &[100, 200], &[10, 20]);
+
+        let ledger = LedgerView::open(dir, 1, 2).unwrap();
+        assert_eq!(ledger.total_items(), 2);
+        merge_mini_sc(4, 1, 2, 1, dir.to_str().unwrap(), TEST_THREADS, &ledger).unwrap();
+        assert!(layout::ledger(dir).exists());
+
+        ledger.remove();
+        assert!(!layout::ledger(dir).exists());
     }
 
     // Single chunk passthrough: with one chunk the final files should byte-equal
@@ -628,7 +803,9 @@ mod tests {
         let key: Vec<u32> = vec![10, 20, 30, 40, 50, 60];
         write_chunk_files(dir, 0, &pos, &key);
 
-        merge_mini_sc(4, 1, 2, 2, dir.to_str().unwrap(), TEST_THREADS, ram_ledger).unwrap();
+        spill_ledger(dir, &ram_ledger);
+        let ledger = LedgerView::open(dir, 1, 2 * 2).unwrap();
+        merge_mini_sc(4, 1, 2, 2, dir.to_str().unwrap(), TEST_THREADS, &ledger).unwrap();
 
         let final_pos = read_u32_bin(&dir.join("positions.bin"));
         let final_key = read_u32_bin(&dir.join("alleles.bin"));
@@ -657,7 +834,9 @@ mod tests {
         write_chunk_files(dir, 0, &[100, 200, 300], &[1, 2, 3]);
         write_chunk_files(dir, 1, &[400, 500, 600], &[4, 5, 6]);
 
-        merge_mini_sc(4, 2, 2, 1, dir.to_str().unwrap(), TEST_THREADS, ram_ledger).unwrap();
+        spill_ledger(dir, &ram_ledger);
+        let ledger = LedgerView::open(dir, 2, 2).unwrap();
+        merge_mini_sc(4, 2, 2, 1, dir.to_str().unwrap(), TEST_THREADS, &ledger).unwrap();
 
         let final_pos = read_u32_bin(&dir.join("positions.bin"));
         let final_key = read_u32_bin(&dir.join("alleles.bin"));
@@ -677,7 +856,9 @@ mod tests {
         let ram_ledger = vec![vec![0u32; 4]];
         write_chunk_files(dir, 0, &[], &[]);
 
-        merge_mini_sc(4, 1, 2, 2, dir.to_str().unwrap(), TEST_THREADS, ram_ledger).unwrap();
+        spill_ledger(dir, &ram_ledger);
+        let ledger = LedgerView::open(dir, 1, 2 * 2).unwrap();
+        merge_mini_sc(4, 1, 2, 2, dir.to_str().unwrap(), TEST_THREADS, &ledger).unwrap();
 
         let final_pos = read_u32_bin(&dir.join("positions.bin"));
         let final_off = read_offsets_npy(&dir.join("offsets.npy"));
@@ -697,7 +878,9 @@ mod tests {
         write_chunk_files(dir, 0, &[], &[]);
         write_chunk_files(dir, 1, &[10, 20, 30, 40, 50], &[1, 2, 3, 4, 5]);
 
-        merge_mini_sc(4, 2, 2, 1, dir.to_str().unwrap(), TEST_THREADS, ram_ledger).unwrap();
+        spill_ledger(dir, &ram_ledger);
+        let ledger = LedgerView::open(dir, 2, 2).unwrap();
+        merge_mini_sc(4, 2, 2, 1, dir.to_str().unwrap(), TEST_THREADS, &ledger).unwrap();
 
         let final_pos = read_u32_bin(&dir.join("positions.bin"));
         let final_off = read_offsets_npy(&dir.join("offsets.npy"));
@@ -734,7 +917,9 @@ mod tests {
             kf.write_all(&[4u8, 5, 6]).unwrap();
         }
 
-        merge_mini_sc(1, 2, 2, 1, dir.to_str().unwrap(), TEST_THREADS, ram_ledger).unwrap();
+        spill_ledger(dir, &ram_ledger);
+        let ledger = LedgerView::open(dir, 2, 2).unwrap();
+        merge_mini_sc(1, 2, 2, 1, dir.to_str().unwrap(), TEST_THREADS, &ledger).unwrap();
 
         let final_pos = read_u32_bin(&dir.join("positions.bin"));
         let final_key = read_u8_bin(&dir.join("alleles.bin"));
@@ -783,12 +968,14 @@ mod tests {
         std::fs::create_dir_all(&dest).unwrap();
         let dest_values_bin = dest.join("values.bin");
 
+        spill_ledger(dir, &ram_ledger);
+        let ledger = LedgerView::open(dir, 2, 2).unwrap();
         merge_var_key_field_values(
             dir.to_str().unwrap(),
             2,
             2,
             1,
-            &ram_ledger,
+            &ledger,
             0,
             4,
             &dest_values_bin,
@@ -867,7 +1054,10 @@ mod tests {
                 write_chunk_files(dir, chunk_id, &pos_buf, &key_buf);
             }
 
-            merge_mini_sc(4, num_chunks, num_samples, ploidy, dir.to_str().unwrap(), threads, ram_ledger.clone()).unwrap();
+            spill_ledger(dir, &ram_ledger);
+            let ledger = LedgerView::open(dir, num_chunks, num_samples * ploidy).unwrap();
+            merge_mini_sc(4, num_chunks, num_samples, ploidy, dir.to_str().unwrap(), threads, &ledger)
+                .unwrap();
 
             let final_pos = read_u32_bin(&dir.join("positions.bin"));
             let final_key = read_u32_bin(&dir.join("alleles.bin"));
