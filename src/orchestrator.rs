@@ -9,7 +9,7 @@ use std::thread;
 use crate::enum_map::EnumKey;
 use crate::error::ConversionError;
 use crate::nrvk::LongAlleleTableWriter;
-use crate::streams::{REGISTRY, StreamMap, StreamTag};
+use crate::streams::{REGISTRY, StreamMap};
 use crate::{executor, merge, monitor, writer};
 
 /*
@@ -400,7 +400,13 @@ pub fn process_chromosome(
     //   jitter so the executor never starves on `rx_dense.recv()`. Each DenseChunk
     //   is ~chunk_size × S × P / 8 bytes. Exported to Python -- see the constant's
     //   doc comment above for why.
-    // - tx_sparse=8: SparseChunks are tiny (~hundreds of KB); deeper queue is free.
+    // - tx_sparse=8: a SparseChunk IN FLIGHT is small -- its calls, plus one
+    //   `sample_lengths` row per stream, so `2 x columns x 4 B` of the total.
+    //   That is ~8.6 MB at 535,662 diploid samples, not the "hundreds of KB"
+    //   this comment used to claim; a queue of 8 is still cheap, but the
+    //   reassurance was about the wrong object. What did NOT survive cohort
+    //   width was RETAINING those rows for the whole contig (#183) -- the
+    //   writer now spills them to each stream's ledger.bin instead.
     // - tx_long=2: each buffer is up to long_allele_capacity bytes — keep small.
     let (tx_dense, rx_dense) = bounded::<crate::types::DenseChunk>(tuning.dense_cap);
     let (tx_sparse, rx_sparse) = bounded::<crate::types::SparseChunk>(8);
@@ -991,7 +997,7 @@ pub fn process_chromosome(
         thread: format!("exec-{}", chrom),
     })?;
     let crate::executor::Phase1Output {
-        var_key_ledgers: ledgers,
+        num_chunks,
         dense_ledgers,
         long_allele_offsets,
         kept_total,
@@ -1059,18 +1065,20 @@ pub fn process_chromosome(
 
     let merge_threads = tuning.merge_threads;
 
-    // num_chunks is identical across streams — one ledger row per chunk.
-    let num_chunks = ledgers.get(StreamTag::VarKeyIndel).len();
-    let mut ledgers = ledgers; // make mutable to move rows out
     for spec in &REGISTRY {
         let dir = stream_dirs.get(spec.tag).clone();
 
+        // Open this stream's spilled ledger ONCE: every merge below reads the
+        // same one, and deriving its per-column offsets means a full scan. The
+        // view owns the file's lifetime, so it is dropped (and the file
+        // deleted) only after the last merge for this stream.
+        let ledger = merge::LedgerView::open(dir.as_path(), num_chunks, samples.len() * ploidy)?;
+
         // Var_key field values are staged 1:1 with calls, so they share the
         // ledger's column-major reordering with the pos/key streams merged
-        // below. Merge every field FIRST (borrowing the ledger) — merge_mini_sc
-        // moves the ledger out right after, and the two merges touch disjoint
-        // per-chunk files (chunk_{c}_field*.bin vs chunk_{c}_pos/key.bin), so
-        // ordering between them doesn't matter for correctness.
+        // below. The two merges touch disjoint per-chunk files
+        // (chunk_{c}_field*.bin vs chunk_{c}_pos/key.bin), so ordering between
+        // them doesn't matter for correctness.
         let sub_label = spec.subdir.replace('/', "_");
         for (field_ix, field) in fields.iter().enumerate() {
             let dest_dir = std::path::Path::new(base_out_dir)
@@ -1091,7 +1099,7 @@ pub fn process_chromosome(
                     num_chunks,
                     samples.len(),
                     ploidy,
-                    ledgers.get(spec.tag),
+                    &ledger,
                     field_ix,
                     4, // staged width (i32/f32); narrowed to final dtype at finalize (Task 9)
                     &dest_values_bin,
@@ -1100,7 +1108,6 @@ pub fn process_chromosome(
             )?;
         }
 
-        let ledger = std::mem::take(ledgers.get_mut(spec.tag));
         stage!(
             format!("merge_mini_sc/{}", spec.subdir),
             merge::merge_mini_sc(
@@ -1110,9 +1117,10 @@ pub fn process_chromosome(
                 ploidy,
                 dir.to_str().unwrap(),
                 merge_threads,
-                ledger,
+                &ledger,
             )
         )?;
+        ledger.remove();
         if let Some(hook) = spec.post_merge {
             stage!(format!("post_merge/{}", spec.subdir), hook(&dir))?;
         }
