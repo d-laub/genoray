@@ -401,3 +401,64 @@ def test_from_svar1_unknown_sample_raises(tmp_path: Path):
         SparseVar2.from_svar1(
             tmp_path / "out", src, no_reference=True, samples=["nope"], threads=1
         )
+
+
+def _spy_on_chunk_budget(monkeypatch) -> list[dict]:
+    """Record every `_auto_chunk_size` call `from_svar1` makes, still returning
+    the real answer.
+
+    The ARGUMENTS are the observable, not the returned chunk size: at fixture
+    cohort width the budget affords the 25,000 cap whether FORMAT fields are
+    counted or not, so asserting on the number would pass against the #157 bug.
+    Pinning the arguments is also what pins the acceptance condition -- the
+    other converters call this same helper, so identical arguments are exactly
+    "derives the same chunk_size as `from_vcf_list` at the same width and field
+    count".
+    """
+    import genoray._svar2 as _svar2
+
+    calls: list[dict] = []
+    real = _svar2._auto_chunk_size
+
+    def spy(n_samples, ploidy, n_format_fields=0, max_mem=None):
+        calls.append(
+            {
+                "n_samples": n_samples,
+                "ploidy": ploidy,
+                "n_format_fields": n_format_fields,
+            }
+        )
+        return real(n_samples, ploidy, n_format_fields, max_mem)
+
+    monkeypatch.setattr(_svar2, "_auto_chunk_size", spy)
+    return calls
+
+
+def test_from_svar1_budgets_the_format_fields_it_carries(tmp_path: Path, monkeypatch):
+    # Every SVAR1 custom field is FORMAT and `fields=None` carries all of them,
+    # so the count the budget sees must be the manifest length. Passing 0 sized
+    # the chunk against the packed grid alone, which the FORMAT term outweighs
+    # by `32 * F / ploidy` (#157).
+    ref, v1_out = _build_svar1_with_dosages(tmp_path)
+    calls = _spy_on_chunk_budget(monkeypatch)
+    SparseVar2.from_svar1(tmp_path / "out.svar2", v1_out, ref, threads=1)
+    assert calls == [{"n_samples": 2, "ploidy": 2, "n_format_fields": 1}]
+
+
+def test_from_svar1_budgets_nothing_for_fields_it_was_told_to_drop(
+    tmp_path: Path, monkeypatch
+):
+    # The count tracks what is actually carried, not what the store holds.
+    ref, v1_out = _build_svar1_with_dosages(tmp_path)
+    calls = _spy_on_chunk_budget(monkeypatch)
+    SparseVar2.from_svar1(tmp_path / "out.svar2", v1_out, ref, fields=[], threads=1)
+    assert calls == [{"n_samples": 2, "ploidy": 2, "n_format_fields": 0}]
+
+
+def test_from_svar1_does_not_derive_a_budget_for_an_explicit_chunk_size(
+    tmp_path: Path, monkeypatch
+):
+    ref, v1_out = _build_svar1_with_dosages(tmp_path)
+    calls = _spy_on_chunk_budget(monkeypatch)
+    SparseVar2.from_svar1(tmp_path / "out.svar2", v1_out, ref, chunk_size=64, threads=1)
+    assert calls == []

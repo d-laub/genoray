@@ -865,12 +865,9 @@ records from SVAR1's arrays and reuses the same conversion spine as `from_vcf`.
 - `chunk_size=None` derives a variant-count budget from cohort size the same
   way as `from_pgen`/`from_vcf_list` (`_auto_chunk_size`) and warns under the
   same below-256-variant condition — see `from_vcf_list`'s `chunk_size` entry
-  above for the details. **Known gap:** this call site always passes
-  `n_format_fields=0`, even though `fields=` (below) selects SVAR1 FORMAT
-  fields and defaults to carrying all of them — so unlike `from_pgen`, the
-  budget here does not account for staged FORMAT bytes and can under-size
-  the chunk when `fields=` carries a wide FORMAT set. Tracked in
-  [#157](https://github.com/d-laub/genoray/issues/157).
+  above for the details. The budget counts the FORMAT fields `fields=` carries
+  (all of them by default), so a wide SVAR1 store derives a smaller chunk, the
+  same as `from_pgen` does for `dosages=`.
 - **Biallelic SVAR1 only** — raises `ValueError` if the source store has
   multiallelic variants (SVAR1's `geno==1` model); re-create the SVAR1 store
   biallelically first.
