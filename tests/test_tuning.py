@@ -143,22 +143,35 @@ def test_every_inapplicable_field_is_reported_at_once():
     assert "pgen" in msg
 
 
-def test_from_vcf_rejects_the_old_flat_reader_workers_kwarg(tmp_path, small_vcf):
+# The two converter tests below pass a source path that does not exist, and
+# that is the assertion: both rejections must happen while validating
+# arguments, before the converter touches the filesystem. Taking the
+# `small_vcf`/`small_pgen` cohorts instead would make this file depend on
+# bcftools/bgzip/plink2 to test pure-Python validation, and skip on a runner
+# missing any of them (#181). If either test ever starts raising
+# `FileNotFoundError`, the validation moved *after* the path check and the
+# regression is real, not a fixture problem.
+
+
+def test_from_vcf_rejects_the_old_flat_reader_workers_kwarg(tmp_path):
     from genoray import SparseVar2
 
     with pytest.raises(TypeError, match="reader_workers"):
         SparseVar2.from_vcf(
-            tmp_path / "x.svar", small_vcf, no_reference=True, reader_workers=2
+            tmp_path / "x.svar",
+            tmp_path / "absent.bcf",
+            no_reference=True,
+            reader_workers=2,
         )
 
 
-def test_from_pgen_rejects_a_vcf_only_knob(tmp_path, small_pgen):
+def test_from_pgen_rejects_a_vcf_only_knob(tmp_path):
     from genoray import SparseVar2, Tuning
 
     with pytest.raises(ValueError, match="overshard"):
         SparseVar2.from_pgen(
             tmp_path / "x.svar",
-            small_pgen,
+            tmp_path / "absent.pgen",
             no_reference=True,
             tuning=Tuning(overshard=4),
         )

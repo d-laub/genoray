@@ -76,26 +76,62 @@ pub fn pending_budget_bytes(chunk_bytes: u64) -> u64 {
     chunk_bytes.saturating_mul(PENDING_BUDGET_CHUNKS.max(2))
 }
 
+/// Whether the path being planned actually runs `shard_exec`'s reorder
+/// frontier -- i.e. whether [`pending_budget_bytes`] is a ceiling that exists.
+///
+/// An explicit discriminator rather than something derived from
+/// [`PlanInputs::ram`]: `RamLaw` is a struct of fitted `f64` coefficients, and
+/// deciding a control-flow question by comparing floats for identity would
+/// break silently the first time a law is refitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BacklogGate {
+    /// `shard_exec::run` is handed [`pending_budget_bytes`], and `Frontier`
+    /// parks producers at that ceiling -- so the ceiling is real memory the
+    /// plan must afford. The sharded VCF path (`orchestrator.rs`).
+    Enforced,
+    /// `shard_exec::run` is handed `u64::MAX`: no backlog ceiling is enforced,
+    /// so no memory is reserved for one. The PGEN path (`orchestrator.rs`),
+    /// which also pins `reader_workers = 1` -- one producer per contig means
+    /// chunks arrive in order and the collector's `PendingBacklog` never fills.
+    ///
+    /// Both halves of that matter. Charging nothing here is sound BECAUSE the
+    /// path is single-producer; re-enabling PGEN sub-contig sharding while
+    /// still passing `u64::MAX` would make this term under-count real peak
+    /// RSS, which is the one direction that risks an OOM. `debug_assert`ed in
+    /// [`in_flight_budget_bytes`].
+    Disabled,
+}
+
 /// Chunk-shaped bytes one contig can hold in flight, for the memory law.
 ///
 /// `Frontier` bounds only the collector's `PendingBacklog`. Two other places
 /// hold assembled chunks at the same time, and pricing only the backlog
 /// under-counts real peak RSS:
 ///
-/// - the collector's `PendingBacklog` map: [`pending_budget_bytes`], enforced;
+/// - the collector's `PendingBacklog` map: [`pending_budget_bytes`], enforced
+///   only when `gate` is [`BacklogGate::Enforced`] (see that type);
 /// - `shard_exec`'s bounded result channel `tx_res`, capacity `workers * 2`,
-///   enforced by the channel itself;
+///   enforced by the channel itself on BOTH backends;
 /// - each reader's own working chunk -- including the assembled chunk a parked
 ///   producer is holding, since `admit` is called BEFORE `tx_res.send`. That
 ///   term is `w` chunks and is already carried by `ram.kappa * w * chunk_MB`
 ///   in `plan_sharded`, so it is deliberately NOT repeated here.
 ///
-/// So this returns the backlog ceiling plus the channel capacity. Adding the
-/// channel term makes the planner strictly more conservative; it is not a
-/// refit of `RamLaw`'s fitted coefficients.
-pub fn in_flight_budget_bytes(chunk_bytes: u64, workers: usize) -> u64 {
-    pending_budget_bytes(chunk_bytes)
-        .saturating_add(chunk_bytes.saturating_mul(2u64.saturating_mul(workers.max(1) as u64)))
+/// So this returns the channel capacity, plus the backlog ceiling when one is
+/// enforced. Adding the channel term makes the planner strictly more
+/// conservative; it is not a refit of `RamLaw`'s fitted coefficients, and
+/// neither is gating the backlog term -- the `in_flight` term was added on top
+/// of the fitted laws as deliberate extra conservatism.
+pub fn in_flight_budget_bytes(chunk_bytes: u64, workers: usize, gate: BacklogGate) -> u64 {
+    debug_assert!(
+        gate == BacklogGate::Enforced || workers <= 1,
+        "BacklogGate::Disabled is only sound single-producer; got workers={workers}"
+    );
+    let backlog = match gate {
+        BacklogGate::Enforced => pending_budget_bytes(chunk_bytes),
+        BacklogGate::Disabled => 0,
+    };
+    backlog.saturating_add(chunk_bytes.saturating_mul(2u64.saturating_mul(workers.max(1) as u64)))
 }
 
 /// Cores available to executors and readers after the merge-tail reserve.
@@ -148,6 +184,33 @@ pub fn plan_thread_budget(available_cores: usize, n_chroms: usize) -> ThreadPlan
             processing_threads: processing,
         }
     }
+}
+
+/// HTSlib decode threads for the MONOLITHIC reader when the SHARDED planner
+/// chose the concurrency.
+///
+/// `process_chromosome` falls back to the single monolithic `VcfRecordSource`
+/// whenever a contig's shard plan yields at most one shard, and takes it for
+/// EVERY contig under `Record`/`Variant` overlap (POS-ownership would drop kept
+/// records). The concurrency those contigs run at came from `plan_sharded`,
+/// which bills a contig `1 + reader_workers` cores -- an executor plus its
+/// readers -- while [`plan_thread_budget`] bills the monolithic shape
+/// `PIPELINE_THREADS_PER_CHROM + htslib_threads` at a `concurrent_chroms` of
+/// its own. Taking the decode count from that other planner is what
+/// oversubscribes the allocation: at 48 cores and 22 contigs the sharded
+/// planner picks `cc = 11`, and the monolithic figure for `cc = 7` is then
+/// spent 11 times over (#152).
+///
+/// So spend the contig's OWN billed budget instead: of the `1 + w` cores
+/// `plan_sharded` reserved for it, one is the executor and one is the single
+/// reader thread it actually runs, leaving `w - 1` for htslib decode. The
+/// fallback then costs exactly what was planned for it, whatever `w` is.
+///
+/// Zero is a legitimate result (`w = 1`) and means "no decode pool" --
+/// `vcf_reader::open_vcf` skips `set_threads` entirely at 0, which is the
+/// htslib default rather than an error.
+pub fn fallback_htslib_threads(reader_workers: usize) -> usize {
+    reader_workers.saturating_sub(1)
 }
 
 /// Cores left idle after `concurrent` chroms each claim the pipeline threads plus
@@ -476,6 +539,10 @@ pub struct PlanInputs {
     pub reader_workers: Option<usize>,
     /// Which backend's fitted peak-RSS law to plan against.
     pub ram: RamLaw,
+    /// Whether this path enforces `shard_exec`'s reorder-backlog ceiling, and
+    /// so has to afford it. Separate from `ram` on purpose -- see
+    /// [`BacklogGate`].
+    pub backlog: BacklogGate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -685,11 +752,13 @@ pub fn plan_sharded(inp: PlanInputs) -> Result<ShardedPlan, PlanError> {
 /// under-predicts peak RSS at exactly the reader counts #169 exists to reach.
 ///
 /// `in_flight_MB` is [`in_flight_budget_bytes`], NOT `pending_budget_bytes`:
-/// the enforced backlog ceiling plus the `workers * 2` capacity of
-/// `shard_exec`'s bounded result channel. Pricing only the backlog
-/// under-counts real peak by up to `2 * w` chunks per contig. The readers'
-/// own `w` working chunks stay in the `kappa` term and are not double-counted
-/// here.
+/// the `workers * 2` capacity of `shard_exec`'s bounded result channel, plus
+/// the backlog ceiling on the paths that enforce one (`inp.backlog`; see
+/// [`BacklogGate`]). Pricing only the backlog under-counts real peak by up to
+/// `2 * w` chunks per contig, and charging a ceiling the path never enforces
+/// over-counts it by `PENDING_BUDGET_CHUNKS` chunks -- which refuses PGEN
+/// plans that would in fact fit (#173). The readers' own `w` working chunks
+/// stay in the `kappa` term and are not double-counted here.
 fn memory_fits(inp: &PlanInputs, cc: usize, w: usize) -> Result<(), PlanError> {
     let Some(budget) = inp.max_mem_bytes else {
         return Ok(());
@@ -698,7 +767,7 @@ fn memory_fits(inp: &PlanInputs, cc: usize, w: usize) -> Result<(), PlanError> {
     let baseline_mb = inp.ram.base_mb + inp.ram.per_sample_mb * inp.n_samples as f64;
     let per_contig_mb = inp.ram.per_contig_mb
         + inp.ram.kappa * w as f64 * (inp.chunk_bytes as f64 / 1e6)
-        + in_flight_budget_bytes(inp.chunk_bytes, w) as f64 / 1e6;
+        + in_flight_budget_bytes(inp.chunk_bytes, w, inp.backlog) as f64 / 1e6;
     let needed_mb = baseline_mb + per_contig_mb * cc as f64;
     if budget_mb < needed_mb {
         return Err(PlanError::InsufficientMemory {
@@ -831,6 +900,7 @@ mod tests {
             max_mem_bytes: None,
             reader_workers: Some(2),
             ram: RamLaw::VCF,
+            backlog: BacklogGate::Enforced,
         })
         .unwrap();
         assert_eq!(
@@ -858,6 +928,7 @@ mod tests {
             max_mem_bytes: None,
             reader_workers: Some(2),
             ram: RamLaw::VCF,
+            backlog: BacklogGate::Enforced,
         })
         .unwrap();
         assert_eq!(
@@ -896,6 +967,7 @@ mod tests {
             max_mem_bytes: Some(200_000 * 1_000_000),
             reader_workers: Some(2),
             ram: RamLaw::VCF,
+            backlog: BacklogGate::Enforced,
         })
         .unwrap();
         assert_eq!(
@@ -923,6 +995,7 @@ mod tests {
             max_mem_bytes: None,
             reader_workers: None,
             ram: RamLaw::VCF,
+            backlog: BacklogGate::Enforced,
         })
         .unwrap();
         assert_eq!(plan.concurrent_chroms, 2);
@@ -942,6 +1015,7 @@ mod tests {
             max_mem_bytes: None,
             reader_workers: Some(5),
             ram: RamLaw::VCF,
+            backlog: BacklogGate::Enforced,
         })
         .unwrap();
         assert_eq!(plan.concurrent_chroms, 3);
@@ -964,6 +1038,7 @@ mod tests {
             max_mem_bytes: Some(64_000 * 1_000_000),
             reader_workers: None,
             ram: RamLaw::VCF,
+            backlog: BacklogGate::Enforced,
         })
         .unwrap_err();
         match err {
@@ -989,6 +1064,7 @@ mod tests {
             max_mem_bytes: Some(64_000 * 1_000_000),
             reader_workers: None,
             ram: RamLaw::VCF,
+            backlog: BacklogGate::Enforced,
         })
         .unwrap();
         assert!(plan.concurrent_chroms < 16);
@@ -1010,6 +1086,7 @@ mod tests {
             max_mem_bytes: Some(5_000 * 1_000_000),
             reader_workers: Some(2),
             ram: RamLaw::VCF,
+            backlog: BacklogGate::Enforced,
         })
         .unwrap_err();
         match err {
@@ -1041,6 +1118,7 @@ mod tests {
             max_mem_bytes: Some(1_000_000), // 1 MB -- far below the cohort baseline
             reader_workers: Some(2),
             ram: RamLaw::VCF,
+            backlog: BacklogGate::Enforced,
         })
         .unwrap_err();
         let msg = err.to_string();
@@ -1066,6 +1144,7 @@ mod tests {
             max_mem_bytes: Some(1_200_000_000), // covers baseline (468.28 MB), not per-contig
             reader_workers: Some(16),
             ram: RamLaw::VCF,
+            backlog: BacklogGate::Enforced,
         })
         .unwrap_err();
         let msg = err.to_string();
@@ -1087,6 +1166,7 @@ mod tests {
             max_mem_bytes: None,
             reader_workers: Some(4),
             ram: RamLaw::VCF,
+            backlog: BacklogGate::Enforced,
         })
         .unwrap();
         assert_eq!(
@@ -1110,6 +1190,7 @@ mod tests {
             max_mem_bytes: None,
             reader_workers: Some(2),
             ram: RamLaw::VCF,
+            backlog: BacklogGate::Enforced,
         })
         .unwrap();
         assert_eq!(
@@ -1147,6 +1228,7 @@ mod tests {
             max_mem_bytes: Some(1_200_000_000),
             reader_workers: Some(16),
             ram: RamLaw::VCF,
+            backlog: BacklogGate::Enforced,
         };
         assert!(matches!(
             plan_sharded(inp),
@@ -1206,6 +1288,32 @@ mod tests {
     }
 
     #[test]
+    fn the_monolithic_fallback_never_costs_more_than_the_sharded_plan_billed() {
+        // `plan_sharded` bills a contig `1 + w` cores (executor + readers) and
+        // sizes `concurrent_chroms` against that. A contig that falls back to
+        // the monolithic reader runs an executor, ONE reader thread, and
+        // `fallback_htslib_threads(w)` decode threads -- which must fit inside
+        // the same bill, or the fallback oversubscribes a concurrency that was
+        // never planned for it (#152).
+        for w in 1..=64 {
+            let billed = 1 + w;
+            let spent = 1 + 1 + fallback_htslib_threads(w);
+            assert!(
+                spent <= billed,
+                "w={w}: monolithic fallback spends {spent} of {billed} billed cores"
+            );
+        }
+        // And it spends the whole bill rather than leaving decode threads on
+        // the table: the fallback is not meant to be slower than it was paid
+        // for.
+        assert_eq!(fallback_htslib_threads(8), 7);
+        // `w = 1` leaves nothing for a decode pool. 0 is "htslib default", not
+        // an error -- see `vcf_reader::zero_htslib_threads_opens_without_a_decode_pool`.
+        assert_eq!(fallback_htslib_threads(1), 0);
+        assert_eq!(fallback_htslib_threads(0), 0);
+    }
+
+    #[test]
     fn processing_threads_for_returns_the_cores_left_after_executors_and_readers() {
         // 47 usable, 11 contigs at (1 executor + 3 readers) = 44 spent, 3 left.
         assert_eq!(processing_threads_for(47, 11, 3), 3);
@@ -1259,7 +1367,7 @@ mod tests {
         // into a "cc=1" test that still looks like it is asserting 2.
         let per_contig_mb = RamLaw::PGEN.per_contig_mb
             + RamLaw::PGEN.kappa * 1.0 * (chunk_bytes as f64 / 1e6)
-            + in_flight_budget_bytes(chunk_bytes, 1) as f64 / 1e6;
+            + in_flight_budget_bytes(chunk_bytes, 1, BacklogGate::Disabled) as f64 / 1e6;
         let budget = ((baseline_mb + 2.5 * per_contig_mb) * 1e6) as u64;
 
         let plan = plan_sharded(PlanInputs {
@@ -1271,9 +1379,52 @@ mod tests {
             max_mem_bytes: Some(budget),
             reader_workers: Some(1),
             ram: RamLaw::PGEN,
+            backlog: BacklogGate::Disabled,
         })
         .unwrap();
         assert_eq!(plan.concurrent_chroms, 2);
+    }
+
+    #[test]
+    fn a_pgen_plan_is_not_charged_for_a_backlog_ceiling_it_never_enforces() {
+        // The PGEN path hands `shard_exec::run` `u64::MAX`, so `Frontier`
+        // enforces no backlog ceiling and none needs to be afforded. Charging
+        // it anyway reserved `PENDING_BUDGET_CHUNKS` (8) chunks per concurrent
+        // contig against a legitimate 2 -- 4x the real result-channel reserve,
+        // which refuses PGEN plans that would in fact run (#173).
+        //
+        // The budget below is exactly baseline + one contig under the
+        // corrected bracket. Planning the SAME inputs with the gate marked
+        // enforced must refuse: that is the over-charge, isolated.
+        let chunk_bytes = 100_000_000u64;
+        let n_samples = 1_000usize;
+        let baseline_mb = RamLaw::PGEN.base_mb + RamLaw::PGEN.per_sample_mb * n_samples as f64;
+        let per_contig_mb = RamLaw::PGEN.per_contig_mb
+            + RamLaw::PGEN.kappa * (chunk_bytes as f64 / 1e6)
+            + in_flight_budget_bytes(chunk_bytes, 1, BacklogGate::Disabled) as f64 / 1e6;
+        let budget = ((baseline_mb + per_contig_mb) * 1e6).ceil() as u64;
+        let inp = |backlog| PlanInputs {
+            concurrent_chroms: None,
+            usable_cores: 64,
+            n_contigs: 22,
+            n_samples,
+            chunk_bytes,
+            max_mem_bytes: Some(budget),
+            reader_workers: Some(1),
+            ram: RamLaw::PGEN,
+            backlog,
+        };
+        assert_eq!(
+            plan_sharded(inp(BacklogGate::Disabled))
+                .expect("a budget sized to the real bracket must plan")
+                .concurrent_chroms,
+            1
+        );
+        assert!(
+            plan_sharded(inp(BacklogGate::Enforced)).is_err(),
+            "the same budget must be short by the backlog ceiling when it IS \
+             enforced -- otherwise this test is not measuring the over-charge"
+        );
     }
 
     #[test]
@@ -1295,6 +1446,7 @@ mod tests {
             max_mem_bytes: Some(1_000_000),
             reader_workers: Some(1),
             ram: RamLaw::PGEN,
+            backlog: BacklogGate::Disabled,
         })
         .unwrap_err();
         match err {
@@ -1358,6 +1510,7 @@ mod tests {
                 per_contig_mb: 500.0,
                 kappa: 0.0,
             },
+            backlog: BacklogGate::Enforced,
         };
         let doubled = PlanInputs {
             concurrent_chroms: None,
@@ -1404,13 +1557,42 @@ mod tests {
         // added here -- they live in the planner's `kappa * w` term.
         //   w=3:  8*10MB + 2*3*10MB  =  80 +  60 = 140 MB
         //   w=16: 8*10MB + 2*16*10MB =  80 + 320 = 400 MB
-        assert_eq!(in_flight_budget_bytes(10_000_000, 3), 140_000_000);
-        assert_eq!(in_flight_budget_bytes(10_000_000, 16), 400_000_000);
+        assert_eq!(
+            in_flight_budget_bytes(10_000_000, 3, BacklogGate::Enforced),
+            140_000_000
+        );
+        assert_eq!(
+            in_flight_budget_bytes(10_000_000, 16, BacklogGate::Enforced),
+            400_000_000
+        );
         // Never cheaper than the backlog ceiling alone, even at w=0.
         assert_eq!(
-            in_flight_budget_bytes(10_000_000, 0),
+            in_flight_budget_bytes(10_000_000, 0, BacklogGate::Enforced),
             100_000_000,
             "workers floors at 1"
+        );
+    }
+
+    #[test]
+    fn a_disabled_backlog_gate_charges_only_the_result_channel() {
+        // The PGEN path passes `u64::MAX` as `pending_budget_bytes`
+        // (`orchestrator.rs`), so no backlog ceiling exists to pay for -- but
+        // `tx_res` is bounded by the channel itself on every path, so that
+        // half stays (#173).
+        //   enforced, w=1: 8*10MB + 2*1*10MB = 80 + 20 = 100 MB
+        //   disabled, w=1:          2*1*10MB =       20 =  20 MB
+        assert_eq!(
+            in_flight_budget_bytes(10_000_000, 1, BacklogGate::Disabled),
+            20_000_000
+        );
+        assert_eq!(
+            in_flight_budget_bytes(10_000_000, 1, BacklogGate::Enforced),
+            100_000_000
+        );
+        // Still floors `workers` at 1: a zero must not zero the channel term.
+        assert_eq!(
+            in_flight_budget_bytes(10_000_000, 0, BacklogGate::Disabled),
+            20_000_000
         );
     }
 
@@ -1431,6 +1613,7 @@ mod tests {
             max_mem_bytes: None,
             reader_workers: None,
             ram: RamLaw::VCF,
+            backlog: BacklogGate::Enforced,
         })
         .unwrap();
         assert_eq!(
@@ -1453,6 +1636,7 @@ mod tests {
             max_mem_bytes: None,
             reader_workers: None,
             ram: RamLaw::VCF,
+            backlog: BacklogGate::Enforced,
         })
         .unwrap();
         assert_eq!(plan.concurrent_chroms, 1);
@@ -1474,6 +1658,7 @@ mod tests {
             max_mem_bytes: None,
             reader_workers: None,
             ram: RamLaw::VCF,
+            backlog: BacklogGate::Enforced,
         })
         .unwrap();
         let tight = plan_sharded(PlanInputs {
@@ -1485,6 +1670,7 @@ mod tests {
             max_mem_bytes: Some(1_200_000_000),
             reader_workers: None,
             ram: RamLaw::VCF,
+            backlog: BacklogGate::Enforced,
         })
         .unwrap();
         assert!(
@@ -1505,6 +1691,7 @@ mod tests {
             max_mem_bytes: None,
             reader_workers: Some(24),
             ram: RamLaw::VCF,
+            backlog: BacklogGate::Enforced,
         };
         assert_eq!(plan_sharded(inp).unwrap().reader_workers, 24);
 
@@ -1534,6 +1721,7 @@ mod tests {
             max_mem_bytes: Some(1_000_000),
             reader_workers: None,
             ram: RamLaw::VCF,
+            backlog: BacklogGate::Enforced,
         })
         .unwrap_err();
         let PlanError::InsufficientMemory {
@@ -1564,6 +1752,7 @@ mod tests {
                 max_mem_bytes: Some(budget_mb * 1_000_000),
                 reader_workers: None,
                 ram: RamLaw::VCF,
+                backlog: BacklogGate::Enforced,
             };
             // One MB under the published floor must refuse...
             assert!(

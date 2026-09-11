@@ -981,8 +981,38 @@ mod tests {
         }
     }
 
-    /// A `RecordSource` over an in-memory queue that, for ordinal 0, blocks
-    /// until some other worker has parked. Used to make ordinal 0 finish LAST
+    /// Blocks until `flag` is set, or `PARK_HANDSHAKE_TIMEOUT` elapses. Same
+    /// bounded-wait discipline as `wait_for_first_park`: a handshake that never
+    /// completes must let its test's own assertion report the failure, not hang
+    /// inside `run_with_deadlock_guard`'s guard with a misleading message.
+    fn wait_for_flag(flag: &AtomicBool) {
+        let deadline = Instant::now() + PARK_HANDSHAKE_TIMEOUT;
+        while !flag.load(Ordering::Relaxed) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// The unit that raises an ordinary `Err`. Deliberately NOT the head: the
+    /// scenario under test is an error raised *behind* a still-open reorder
+    /// head, with other producers parked in `Frontier::admit` -- the only
+    /// arrangement in which the cancellation `wake_all` is what releases them.
+    const ERR_ORDINAL: usize = 1;
+    /// Payload of the injected error, so the test can tell "the error I
+    /// planted came back" from "some other failure came back".
+    const INJECTED_ERR: &str = "VecSource: injected error for the Msg::Err path";
+
+    /// What, if anything, one unit does instead of producing its records.
+    /// A struct rather than two `Option<usize>` parameters in a row, which
+    /// would be silently transposable at every call site.
+    #[derive(Clone, Copy, Default)]
+    struct Injection {
+        panic_ordinal: Option<usize>,
+        err_ordinal: Option<usize>,
+    }
+
+    /// A `RecordSource` over an in-memory queue that, for ordinal 0 (and for
+    /// the erroring ordinal, if any), blocks until some other worker has
+    /// parked. Used to make ordinal 0 finish LAST
     /// despite being dequeued first, forcing every other unit's chunk to buffer
     /// behind the still-open reorder head instead of streaming through by
     /// accident -- which is exactly how the end-to-end conversion measurement
@@ -998,6 +1028,19 @@ mod tests {
         records: VecDeque<RawRecord>,
         wait_for_park: Option<Arc<PendingGauge>>,
         panic_after_wait: bool,
+        /// Return `Err` (after any wait) instead of ever yielding a record --
+        /// the injection point for the `Msg::Err` regression test, mirroring
+        /// `panic_after_wait` for the ordinary-error path a worker actually
+        /// chooses to take.
+        err_after_wait: bool,
+        /// Raised by the erroring unit immediately before it returns `Err`.
+        signal_err: Option<Arc<AtomicBool>>,
+        /// Awaited by the HEAD unit, so the head is still open when the
+        /// error reaches the collector. Without it the head could complete
+        /// first, advance the reorder buffer, and release the parked
+        /// producers the ordinary way -- leaving the cancellation `wake_all`
+        /// untested even though the test went green.
+        wait_for_err: Option<Arc<AtomicBool>>,
     }
 
     impl RecordSource for VecSource {
@@ -1005,8 +1048,17 @@ mod tests {
             if let Some(gauge) = &self.wait_for_park {
                 wait_for_first_park(gauge);
             }
+            if let Some(flag) = &self.wait_for_err {
+                wait_for_flag(flag);
+            }
             if self.panic_after_wait {
                 panic!("VecSource: injected panic for PanicGuard regression test");
+            }
+            if self.err_after_wait {
+                if let Some(flag) = &self.signal_err {
+                    flag.store(true, Ordering::Relaxed);
+                }
+                return Err(ConversionError::Input(INJECTED_ERR.to_string()));
             }
             Ok(self.records.pop_front())
         }
@@ -1089,25 +1141,38 @@ mod tests {
     /// `ChunkAssembler` per unit wrapping a fresh `VecSource` cloned out of
     /// the shared record table. Only ordinal 0 gets the park handshake, which
     /// is what holds the reorder head open until the backlog behind it is real.
-    /// `panic_ordinal`, when `Some`, makes that one ordinal's `VecSource`
-    /// panic instead of ever returning a record (see `VecSource::panic_after_wait`)
-    /// -- the `PanicGuard` regression test's injection point.
+    /// `injection` names the ordinal (if any) that panics or returns `Err`
+    /// instead of ever yielding a record -- the `PanicGuard` and `Msg::Err`
+    /// regression tests' injection points.
     fn make_assembler_fn(
         records_by_ordinal: Arc<HashMap<usize, Vec<RawRecord>>>,
-        panic_ordinal: Option<usize>,
+        injection: Injection,
         gauge: Arc<PendingGauge>,
+        err_raised: Arc<AtomicBool>,
     ) -> impl Fn(&WorkUnit) -> Result<ChunkAssembler, ConversionError> + Sync + 'static {
         move |unit: &WorkUnit| {
             let records = records_by_ordinal
                 .get(&unit.ordinal)
                 .cloned()
                 .unwrap_or_default();
-            let wait_for_park = (unit.ordinal == 0).then(|| Arc::clone(&gauge));
-            let panic_after_wait = panic_ordinal == Some(unit.ordinal);
+            let panic_after_wait = injection.panic_ordinal == Some(unit.ordinal);
+            let err_after_wait = injection.err_ordinal == Some(unit.ordinal);
+            // The head always waits. So does the erroring unit: raising
+            // immediately would fire before anyone had parked, and the test
+            // would prove nothing about the teardown wake.
+            let wait_for_park = (unit.ordinal == 0 || err_after_wait).then(|| Arc::clone(&gauge));
+            // The head holds itself open until the error has actually been
+            // raised behind it; only the erroring unit signals.
+            let wait_for_err = (unit.ordinal == 0 && injection.err_ordinal.is_some())
+                .then(|| Arc::clone(&err_raised));
+            let signal_err = err_after_wait.then(|| Arc::clone(&err_raised));
             let source: Box<dyn RecordSource + Send> = Box::new(VecSource {
                 records: records.into(),
                 wait_for_park,
                 panic_after_wait,
+                err_after_wait,
+                signal_err,
+                wait_for_err,
             });
             ChunkAssembler::new(
                 source,
@@ -1132,7 +1197,7 @@ mod tests {
         workers: usize,
         chunk_size: usize,
         pending_budget_bytes: u64,
-        panic_ordinal: Option<usize>,
+        injection: Injection,
     ) -> (
         Result<ShardTotals, ConversionError>,
         Vec<DenseChunk>,
@@ -1143,8 +1208,12 @@ mod tests {
         let (result_tx, result_rx) = mpsc::channel();
         {
             let gauge = Arc::clone(&gauge);
-            let make_assembler =
-                make_assembler_fn(records_by_ordinal, panic_ordinal, Arc::clone(&gauge));
+            let make_assembler = make_assembler_fn(
+                records_by_ordinal,
+                injection,
+                Arc::clone(&gauge),
+                Arc::new(AtomicBool::new(false)),
+            );
             thread::spawn(move || {
                 let worker_tids: Mutex<Vec<i32>> = Mutex::new(Vec::new());
                 let res = run(
@@ -1192,7 +1261,7 @@ mod tests {
             4,
             100,
             pending_budget_bytes,
-            None,
+            Injection::default(),
         );
         let totals = result.expect("run must succeed");
 
@@ -1282,10 +1351,11 @@ mod tests {
         // apples-to-apples.
         let (units_a, records_a) = seed_units_with_a_multi_chunk_unit();
         let (result_a, chunks_a, _) =
-            run_with_deadlock_guard(units_a, records_a, 4, 2, u64::MAX, None);
+            run_with_deadlock_guard(units_a, records_a, 4, 2, u64::MAX, Injection::default());
 
         let (units_b, records_b) = seed_units_with_a_multi_chunk_unit();
-        let (result_b, chunks_b, _) = run_with_deadlock_guard(units_b, records_b, 4, 2, 64, None);
+        let (result_b, chunks_b, _) =
+            run_with_deadlock_guard(units_b, records_b, 4, 2, 64, Injection::default());
 
         let totals_a = result_a.expect("unbounded run must succeed");
         let totals_b = result_b.expect("bounded run must succeed");
@@ -1349,7 +1419,10 @@ mod tests {
             4,
             100,
             pending_budget_bytes,
-            Some(0),
+            Injection {
+                panic_ordinal: Some(0),
+                ..Injection::default()
+            },
         );
 
         assert!(
@@ -1363,6 +1436,72 @@ mod tests {
             Ok(_) => panic!("expected Err(ConversionError::WorkerPanicked {{ .. }}), got Ok(_)"),
             Err(other) => {
                 panic!("expected Err(ConversionError::WorkerPanicked {{ .. }}), got Err({other})")
+            }
+        }
+    }
+
+    /// `Msg::Err` regression test: an ordinary error raised by a NON-head unit
+    /// while other producers sit parked in `Frontier::admit` behind a
+    /// still-open reorder head.
+    ///
+    /// Before this (#172) nothing had ever driven a worker's `Err` return from
+    /// `next_record`, the collector's `Msg::Err` arm, or a teardown that has
+    /// to release producers parked in `Frontier::admit`. On the happy path
+    /// those producers are woken when the head advances; on the error path
+    /// nothing ever advances it, so a failure mid-contig that did not wake
+    /// them would STALL silently instead of surfacing a stack trace.
+    ///
+    /// What this pins is that outcome -- the error comes back, and `run`
+    /// returns. It deliberately does not try to pin one wake site: removing
+    /// the `wake_all` from the collector's `Msg::Err` arm alone leaves this
+    /// test green (checked, not assumed), because `Frontier::publish`
+    /// notifies on every later message and `PanicGuard::drop` wakes on every
+    /// worker exit path. That redundancy is the design; the wake primitive
+    /// itself is pinned directly by `admit_releases_a_parked_unit_on_cancel`.
+    ///
+    /// The arrangement is what keeps the outcome non-trivial. Ordinal 0 (the
+    /// head) holds itself open until `ERR_ORDINAL` has actually raised, so the
+    /// head cannot advance and release anyone the ordinary way; `ERR_ORDINAL`
+    /// in turn waits until a non-head worker has genuinely parked, so the
+    /// error lands against a full backlog rather than before one forms. The
+    /// `parks > 0` assertion keeps that from degrading into a test of
+    /// nothing, and `run_with_deadlock_guard`'s 10s timeout turns a hang into
+    /// a failing assertion rather than a wedged `cargo test`.
+    #[test]
+    fn erroring_non_head_worker_surfaces_its_error_instead_of_hanging() {
+        let (units, records_by_ordinal) = seed_units();
+        // Same arithmetic as `run_emits_every_unit_in_order_under_a_bounded_backlog`:
+        // one chunk costs 46 bytes, so a budget of 64 admits exactly one
+        // non-head chunk before the next one (92 bytes total) must park.
+        let pending_budget_bytes = 64u64;
+        let (result, _chunks, gauge) = run_with_deadlock_guard(
+            units,
+            records_by_ordinal,
+            4,
+            100,
+            pending_budget_bytes,
+            Injection {
+                err_ordinal: Some(ERR_ORDINAL),
+                ..Injection::default()
+            },
+        );
+
+        assert!(
+            gauge.parks.load(Ordering::Relaxed) > 0,
+            "no worker ever parked, so the error was raised against an empty \
+             backlog -- this test never reached the teardown wake it exists for"
+        );
+        match result {
+            Err(ConversionError::Input(msg)) => assert_eq!(
+                msg, INJECTED_ERR,
+                "run returned an error, but not the one that was injected"
+            ),
+            Ok(_) => panic!(
+                "expected Err(ConversionError::Input({INJECTED_ERR:?})), got Ok(_) \
+                 -- a worker's Err was swallowed instead of surfacing"
+            ),
+            Err(other) => {
+                panic!("expected Err(ConversionError::Input({INJECTED_ERR:?})), got Err({other})")
             }
         }
     }
