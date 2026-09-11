@@ -12,7 +12,6 @@ vcfixture bulk CLI is not available there.
 
 from __future__ import annotations
 
-import re
 import shutil
 import subprocess
 
@@ -21,22 +20,7 @@ import pytest
 from genoray import SparseVar2, Tuning
 
 from tests import _oracle
-
-_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-
-
-def _pipeline_concurrent_chroms(captured_text: str) -> int:
-    """Extract the `concurrent_chroms=` field logged on the "pipeline config
-    (PGEN)" tracing event, tolerant of Rich's ANSI styling and line-wrapping.
-    Mirrors `_pipeline_planned_units` in tests/test_svar2_schedule_invariance.py."""
-    plain = _ANSI_RE.sub("", captured_text)
-    collapsed = re.sub(r"\s+", " ", plain)
-    m = re.search(r"concurrent_chroms=(\d+)", collapsed)
-    assert m is not None, (
-        f"no concurrent_chroms field found in captured output:\n{captured_text!r}"
-    )
-    return int(m.group(1))
-
+from tests._log_parsing import log_field_int
 
 # PGEN pins P=1, so reader_workers has no axis to sweep -- only cc moves.
 SCHEDULES = [1, 2, 4, 8]
@@ -129,7 +113,9 @@ def test_digest_is_invariant_across_schedules(multi_contig_pgen, tmp_path, capfd
         out = tmp_path / f"cc{cc}.svar"
         digests[cc] = _convert(multi_contig_pgen, out, cc)
         captured = capfd.readouterr()
-        schedules_seen.add(_pipeline_concurrent_chroms(captured.out + captured.err))
+        schedules_seen.add(
+            log_field_int(captured.out + captured.err, "concurrent_chroms")
+        )
         outs[cc] = out
     assert len(schedules_seen) >= 2, (
         "concurrent_chroms never varied across SCHEDULES rows -- this test "

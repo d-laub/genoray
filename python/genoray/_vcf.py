@@ -828,9 +828,16 @@ class VCF:
             start: 0-based start position.
             end: 0-based, exclusive end position.
             fields: List of non-FORMAT, non-INFO fields to include. Returns all by default.
-            info: List of INFO fields to include. Returns all by default.
+            info: List of INFO fields to include, matched case-insensitively against the
+                INFO IDs the header declares. Returns all declared INFO fields by
+                default; pass an empty list for none. Each is returned as its own
+                top-level column, named with the header's spelling of the ID.
             lazy: If True, return a :class:`polars.LazyFrame` instead of collecting to a
                 :class:`polars.DataFrame`.
+
+        Raises:
+            ValueError: If a name in ``info`` is not declared as an INFO field in the
+                header, or if an INFO ID collides with a non-INFO column name.
         """
         if (start is not None or end is not None) and contig is None:
             raise ValueError("start and end must be None if no contig is specified.")
@@ -848,25 +855,50 @@ class VCF:
         if fields is not None:
             fields = [f.lower() for f in fields]
 
+        # INFO names must reach oxbow in the header's own spelling: it matches them
+        # case-sensitively and SILENTLY drops every name it doesn't recognize -- and
+        # when nothing matches, the whole INFO column disappears with no error. This
+        # used to lowercase them, so `info=["AF"]` asked for a field no header declares
+        # and got back a frame with no INFO at all (#139).
         if info is not None:
-            info = [f.lower() for f in info]
+            info = self._resolve_info_fields(info)
 
         reader = self._oxbow_reader()
 
-        df = (
-            cast(
-                pl.LazyFrame,
-                reader(
-                    self.path,
-                    samples=[],
-                    fields=fields,
-                    info_fields=info,
-                    regions=region,
-                ).pl(lazy=True),
-            )
-            .rename(lambda c: c.upper())
-            .with_columns(pl.col("CHROM").cast(pl.Enum(self.contigs)))
-        )
+        df = cast(
+            pl.LazyFrame,
+            reader(
+                self.path,
+                samples=[],
+                fields=fields,
+                info_fields=info,
+                regions=region,
+            ).pl(lazy=True),
+        ).rename(lambda c: c.upper())
+
+        # oxbow nests INFO in a single struct column named after its own internal
+        # layout. Flatten it: callers asked for INFO *fields*, and the rest of genoray
+        # (`_fetch_info_cols`, `_write_gvi_index`'s SVLEN/END/IMPRECISE handling)
+        # already speaks in top-level columns. Unnest AFTER the rename so the struct's
+        # subfield names -- the declared IDs -- survive untouched.
+        schema = df.collect_schema()
+        names = schema.names()
+        if "INFO" in names:
+            info_dtype = schema["INFO"]
+            assert isinstance(info_dtype, pl.Struct)
+            subfields = [f.name for f in info_dtype.fields]
+            collisions = sorted(set(subfields) & (set(names) - {"INFO"}))
+            if collisions:
+                raise ValueError(
+                    f"INFO field(s) {collisions} collide with non-INFO column(s) of the "
+                    "same name. Narrow the request with fields= or info= so the two do "
+                    "not overlap."
+                )
+            df = df.unnest("INFO")
+
+        # fields= can legitimately exclude CHROM; only cast the column if it is there.
+        if "CHROM" in names:
+            df = df.with_columns(pl.col("CHROM").cast(pl.Enum(self.contigs)))
 
         if self._filter is not None:
             df = df.filter(self._filter.expr)
@@ -885,22 +917,56 @@ class VCF:
         else:
             raise ValueError(f"Unsupported file extension: {self.path.suffix}")
 
-    def _declared_info_fields(self, candidates: tuple[str, ...]) -> list[str]:
-        """Return which of ``candidates`` are declared as INFO fields in the VCF header.
+    def _declared_info_ids(self) -> list[str]:
+        """Return the INFO IDs this VCF's header declares, in header order.
 
         Uses ``header_iter()`` rather than ``get_header_type()`` because the latter
         matches both INFO and FORMAT declarations; a FORMAT-only field must NOT be
         treated as an INFO field (it would error when passed to oxbow's info_fields=).
         """
-        info_ids: set[str] = {
+        return [
             h.info()["ID"]
             for h in self._vcf.header_iter()
             if h.info().get("HeaderType") == "INFO"
-        }
+        ]
+
+    def _declared_info_fields(self, candidates: tuple[str, ...]) -> list[str]:
+        """Return which of ``candidates`` are declared as INFO fields in the VCF header."""
+        info_ids = set(self._declared_info_ids())
         return [c for c in candidates if c in info_ids]
+
+    def _resolve_info_fields(self, requested: list[str]) -> list[str]:
+        """Map requested INFO names onto the header's own spelling of those IDs.
+
+        Matching is case-insensitive, but the names returned are the declared ones,
+        because that is the only spelling oxbow will match. An unknown name raises
+        rather than being dropped: oxbow ignores names it does not recognize without
+        complaint, and if none of them match it returns no INFO column at all, which
+        is how #139 stayed silent.
+        """
+        declared = self._declared_info_ids()
+        by_upper = {d.upper(): d for d in declared}
+        resolved: list[str] = []
+        unknown: list[str] = []
+        for name in requested:
+            found = by_upper.get(name.upper())
+            if found is None:
+                unknown.append(name)
+            elif found not in resolved:
+                resolved.append(found)
+        if unknown:
+            raise ValueError(
+                f"INFO field(s) {unknown} are not declared in the header of {self.path}."
+                f" Declared INFO fields: {declared}"
+            )
+        return resolved
 
     def _fetch_info_cols(self, info_names: list[str]) -> pl.LazyFrame:
         """Fetch uppercase INFO fields directly from oxbow as a LazyFrame.
+
+        genoray itself no longer needs this: `get_record_info(info=...)` returns the
+        same columns since #139 was fixed. It is kept because genvarloader imports it
+        to work around that bug against older genoray releases.
 
         Unnests the returned struct, returning a LazyFrame with POS and those INFO
         columns as top-level columns. POS is retained so the caller can cross-check
@@ -942,7 +1008,9 @@ class VCF:
         Args:
             fields: List of non-FORMAT, non-INFO fields to include. At a minimum this index will include
                 columns `CHROM`, `POS` (1-based), `REF`, `ALT`, and `ILEN`.
-            info: List of INFO fields to include.
+            info: List of INFO fields to include, as their own columns. Unlike
+                :meth:`get_record_info`, None means *no* INFO fields rather than all of
+                them: an index is a lookup table, not a copy of the annotations.
             overwrite: Whether to overwrite the index file if it exists.
             only_biallelic: Whether to only use the first ALT alleles for each variant (i.e. assume all variants are biallelic). Better compression if True.
         """
@@ -956,42 +1024,26 @@ class VCF:
             _fields.update(fields)
 
         # Pull SVLEN/END/IMPRECISE when the header declares them so symbolic SVs
-        # can be sized. Requesting an undeclared INFO field can error in oxbow.
+        # can be sized, on top of whatever INFO the caller asked for. Undeclared names
+        # raise, so filter the helpers against the header before requesting them.
         sv_info = self._declared_info_fields(("SVLEN", "END", "IMPRECISE"))
-        user_info_upper = {i.upper() for i in info} if info else set()
+        user_info: list[str] = self._resolve_info_fields(info) if info else []
+        user_info_upper = {i.upper() for i in user_info}
         extra_sv = [f for f in sv_info if f.upper() not in user_info_upper]
 
+        # ONE read. The SV helper columns used to be fetched separately through
+        # `_fetch_info_cols` and positionally concatenated onto this frame -- a
+        # workaround for #139, which made `get_record_info(info=...)` return nothing.
+        # Now that it returns the requested INFO as top-level columns, the second read
+        # and the POS cross-check that guarded its alignment are both unnecessary.
         filt = self._filter
         self._filter = None
         try:
-            index = self.get_record_info(fields=list(_fields), info=info, lazy=True)
+            index = self.get_record_info(
+                fields=list(_fields), info=user_info + extra_sv, lazy=True
+            )
         finally:
             self._filter = filt
-
-        # Fetch SV helper columns directly (oxbow requires uppercase and returns a struct).
-        # Both oxbow reads cover the identical full record set (no region, no filter, same
-        # file order), which is what makes the positional horizontal concat correct.
-        # WARNING: region-scoping or pre-concat filtering either call would silently
-        # misalign SVLEN/END/IMPRECISE to wrong variants, corrupting ILEN.
-        # POS is cross-checked element-wise to confirm the two reads are in identical order.
-        if extra_sv:
-            index_df = index.collect()
-            sv_cols_df = self._fetch_info_cols(extra_sv).collect()
-            if index_df.height != sv_cols_df.height:
-                raise ValueError(
-                    f"Row count mismatch between base index ({index_df.height}) and SV INFO "
-                    f"columns ({sv_cols_df.height}); positional concat would misalign ILEN."
-                )
-            base_pos = index_df.get_column("POS")
-            sv_pos = sv_cols_df.get_column("POS")
-            if not base_pos.equals(sv_pos):
-                raise ValueError(
-                    "POS mismatch between base index and SV INFO columns; "
-                    "positional concat would misalign ILEN. This is a bug — please report it."
-                )
-            # Drop POS from sv_cols_df to avoid duplicate column before horizontal concat
-            sv_cols_df = sv_cols_df.drop("POS")
-            index = pl.concat([index_df, sv_cols_df], how="horizontal").lazy()
 
         # Ensure the columns _symbolic_ilen references exist (nulls when absent).
         schema = index.collect_schema()

@@ -362,6 +362,49 @@ class PGEN:
             assert self._c_norm is not None and self._index is not None
         return var_indices(V_IDX_TYPE, self._c_norm, self._index, contig, starts, ends)
 
+    def var_records(
+        self,
+        contig: str,
+        starts: ArrayLike = 0,
+        ends: ArrayLike = POS_MAX,
+    ) -> pl.DataFrame:
+        """Get the identity -- CHROM, POS, REF, ALT -- of the variants in the given ranges.
+
+        The rows come back aligned 1:1 with the variant axis of :meth:`read` /
+        :meth:`read_ranges` over the same ranges, in the same order, so column ``j`` of
+        a genotype array is row ``j`` here. That is the point of the method: it is what
+        lets an artifact derived from a read (a fitted model, a set of weights) outlive
+        the PGEN it was derived from. Reconstructing this from :meth:`var_idxs` requires
+        reaching into the reader's private index and asserting the lengths line up.
+
+        Args:
+            contig: Contig name.
+            starts: 0-based start positions of the ranges.
+            ends: 0-based, exclusive end positions of the ranges.
+
+        Returns:
+            A :class:`polars.DataFrame` with columns ``range`` (:code:`u32`, which of
+            the query ranges the row belongs to -- all zeros for a single range),
+            ``CHROM``, ``POS`` (1-based), ``REF``, and ``ALT``. ``ALT`` is always
+            :code:`list[str]`, one entry per alternate allele, however the index was
+            built: the on-disk `.gvi` stores it comma-joined for PGEN and for some VCF
+            indexes, and :func:`_load_index` splits it on load.
+
+            ``CHROM`` is the contig name **as the file spells it**, which may differ
+            from the ``contig`` you queried -- genoray normalizes between chr-prefixed
+            and unprefixed names, and the identity worth persisting is the file's.
+
+            Variants the reader's ``filter`` excludes are absent, exactly as they are
+            absent from :meth:`read`.
+        """
+        idxs, offsets = self.var_idxs(contig, starts, ends)
+        assert self._index is not None
+        records = self._index[idxs].select("CHROM", "POS", "REF", "ALT")
+        range_of_row = np.repeat(
+            np.arange(len(offsets) - 1, dtype=np.uint32), np.diff(offsets)
+        )
+        return records.insert_column(0, pl.Series("range", range_of_row))
+
     def _var_idxs_phys(
         self,
         contig: str,

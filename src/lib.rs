@@ -281,20 +281,31 @@ fn run_conversion_pipeline(
                 concurrent_chroms: requested.concurrent_chroms,
                 reader_workers: requested.reader_workers,
                 ram: crate::budget::RamLaw::VCF,
+                // The sharded VCF path hands `shard_exec::run` a real
+                // `pending_budget_bytes`, so the plan must afford that ceiling.
+                backlog: crate::budget::BacklogGate::Enforced,
             });
             let sharded = match sharded {
                 Ok(p) => p,
                 Err(e) => return vec![Err(crate::error::ConversionError::from(e))],
             };
 
-            let plan = crate::budget::plan_thread_budget(available_cores, chroms.len());
-            let htslib_threads = plan.htslib_threads; // monolithic path only
-            // The plan already carries an explicit `concurrent_chroms`,
-            // honoured or refused against `max_mem` by `plan_sharded` itself.
-            // Overriding it here instead would skip that check -- and leave
+            // ONE planner decides the concurrency and every per-contig thread
+            // count that goes with it. `plan_sharded` is that planner: it is
+            // the only one that bounds `max_mem`, and it already carries an
+            // explicit `concurrent_chroms`, honoured or refused against that
+            // budget. Overriding it here would skip the check -- and leave
             // `reader_workers` sized for a concurrency that is not running.
             let concurrent_chroms = sharded.concurrent_chroms;
             let reader_workers = sharded.reader_workers;
+            // The monolithic reader is still what `process_chromosome` falls
+            // back to for a contig with at most one shard, and what every
+            // contig takes under Record/Variant overlap -- but it runs at the
+            // concurrency chosen above, so its decode threads come out of the
+            // budget THAT plan billed for the contig, not out of
+            // `plan_thread_budget`'s figure for a different `concurrent_chroms`
+            // (#152).
+            let htslib_threads = crate::budget::fallback_htslib_threads(reader_workers);
             // Resolve now, finish later: `plan_unit_count` and
             // `SourceSpec::Vcf` need `overshard` before `processing_threads`
             // exists, and `processing_threads` is what completes the
@@ -320,8 +331,8 @@ fn run_conversion_pipeline(
             // Sized against the concurrency this path actually dispatches
             // (`concurrent_chroms`, from `plan_sharded`) — NOT against
             // `plan_thread_budget`'s own `concurrent_chroms`, which models the
-            // monolithic reader's 6-cores-per-contig shape and is only still
-            // consulted here for `htslib_threads`.
+            // monolithic reader's 6-cores-per-contig shape. That planner is no
+            // longer consulted anywhere in this function (#152).
             let processing_threads = crate::budget::processing_threads_for(
                 available_cores.saturating_sub(1).max(1),
                 concurrent_chroms,
@@ -623,6 +634,11 @@ fn run_pgen_conversion_pipeline(
                 concurrent_chroms: requested.concurrent_chroms,
                 reader_workers: Some(1),
                 ram: crate::budget::RamLaw::PGEN,
+                // The PGEN path hands `shard_exec::run` `u64::MAX`
+                // (`orchestrator.rs`), so there is no backlog ceiling to
+                // afford -- and with `reader_workers = 1` there is one
+                // producer per contig, so nothing to reorder either (#173).
+                backlog: crate::budget::BacklogGate::Disabled,
             });
             let sharded = match sharded {
                 Ok(p) => p,
