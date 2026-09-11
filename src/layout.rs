@@ -162,6 +162,19 @@ pub fn alleles(dir: &Path) -> PathBuf {
 pub fn offsets(dir: &Path) -> PathBuf {
     dir.join("offsets.npy")
 }
+/// The per-stream RAM Ledger, spilled to disk by the writer and consumed by the
+/// merge. `num_chunks` fixed-width rows of `total_columns + 1` little-endian
+/// `u32`, row `c` being chunk `c`'s running prefix sum of per-column call
+/// counts, so `row[0] == 0` and `row[col + 1] - row[col]` is chunk `c`'s call
+/// count for column `col`.
+///
+/// Fixed-width rows are what make the merge's tiled gather possible: a tile
+/// spanning columns `[a, b)` is one contiguous `pread` of `b - a + 1` `u32`s
+/// per chunk, so no worker ever holds more than its own tile's slice. See
+/// [`crate::merge`] for why this lives on disk at all (#183).
+pub fn ledger(dir: &Path) -> PathBuf {
+    dir.join("ledger.bin")
+}
 pub fn chunk_geno(dir: &Path, chunk_id: usize) -> PathBuf {
     dir.join(format!("chunk_{}_geno.bin", chunk_id))
 }
