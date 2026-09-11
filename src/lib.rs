@@ -61,6 +61,8 @@ pub mod pgen_reader;
 #[cfg(feature = "conversion")]
 pub mod pgen_shard;
 #[cfg(feature = "conversion")]
+pub mod pipeline_args;
+#[cfg(feature = "conversion")]
 pub mod pvar;
 #[cfg(feature = "conversion")]
 pub mod svar1_reader;
@@ -143,35 +145,53 @@ fn index_vcf(path: String) -> PyResult<()> {
 }
 
 //The Python Wrapper and resource allocator
+// Keyword-only, and three of the clusters arrive as structs. Together those
+// close the hole #153 named: `regions`/`fields`/`plan` are extracted by field
+// name, and every argument that remains -- three bare `String`s and two
+// `Option<String>`s among them -- has no position a caller could get wrong.
 #[cfg(feature = "conversion")]
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::type_complexity)]
 #[pyfunction]
-#[pyo3(signature = (vcf_path, reference_path, chroms, output_dir, samples, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false, signatures=false, info_fields=Vec::new(), format_fields=Vec::new(), check_ref="e".to_string(), region_ranges=Vec::new(), regions_overlap="pos".to_string(), max_mem_bytes=None, log_level = "info".to_string(), tuning=None, log_filter=None, receiver = None))]
+#[pyo3(signature = (*, vcf_path, reference_path, output_dir, regions, fields, plan, ploidy=2, skip_out_of_scope=false, signatures=false, check_ref="e".to_string(), log_level="info".to_string(), tuning=None, log_filter=None, receiver=None))]
 fn run_conversion_pipeline(
     py: Python,
     vcf_path: String,
     reference_path: Option<String>,
-    chroms: Vec<String>, // now taking a vector
     output_dir: String,
-    samples: Vec<String>,
-    chunk_size: usize, // default 25K variants/chunk — halves per-chunk plumbing overhead vs the old 10K
+    regions: crate::pipeline_args::RegionSpec,
+    fields: crate::pipeline_args::FieldSpec,
+    plan: crate::pipeline_args::PlanSettings,
     ploidy: usize,
-    max_threads: Option<usize>,  // accepts an optional integer from Python
-    long_allele_capacity: usize, // default 8MB — old 100MB rarely flushed mid-run, blocking executor at finalize
     skip_out_of_scope: bool,
     signatures: bool,
-    info_fields: Vec<(String, String, String, Option<String>, Option<f64>)>,
-    format_fields: Vec<(String, String, String, Option<String>, Option<f64>)>,
     check_ref: String,
-    region_ranges: Vec<(String, u32, u32)>,
-    regions_overlap: String,
-    max_mem_bytes: Option<u64>,
     log_level: String,
     tuning: Option<crate::tuning::TuningIn>,
     log_filter: Option<String>,
     receiver: Option<Py<PyEventReceiver>>,
 ) -> PyResult<usize> {
+    // Destructured once, here at the boundary. The grouping exists to stop the
+    // caller mixing these up; the body below reasons about them individually
+    // and reads the same as it did before.
+    let crate::pipeline_args::RegionSpec {
+        chroms,
+        samples,
+        region_ranges,
+        regions_overlap,
+    } = regions;
+    let crate::pipeline_args::FieldSpec {
+        info: info_fields,
+        format: format_fields,
+    } = fields;
+    let crate::pipeline_args::PlanSettings {
+        // default 25K variants/chunk -- halves per-chunk plumbing overhead vs the old 10K
+        chunk_size,
+        max_threads,
+        // default 8MB -- old 100MB rarely flushed mid-run, blocking executor at finalize
+        long_allele_capacity,
+        max_mem_bytes,
+    } = plan;
+
     let sample_refs: Vec<&str> = samples.iter().map(|s| s.as_str()).collect();
 
     // Parse the region-overlap mode once, up front, so a bad value raises before
