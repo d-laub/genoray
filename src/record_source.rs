@@ -204,13 +204,78 @@ impl CarrierFormat {
     }
 }
 
+/// One FORMAT field's raw per-sample buffers for one record, stored FLAT.
+///
+/// htslib already hands back a RECTANGULAR buffer -- one fixed-width slice per
+/// sample -- so this keeps it that way: `values` holds `n_samples * stride`
+/// f64s in sample-major order, and sample `s`'s buffer is
+/// `values[s * stride ..][.. stride]`.
+///
+/// The `Vec<Vec<f64>>` this replaced de-rectangularized that buffer into one
+/// separate heap allocation per sample per field per record -- ~56 B of `Vec`
+/// header plus allocator overhead to carry the 8 B a Number=1 field actually
+/// holds. At S = 128,000 with one dosage field that was ~7 MB per record and
+/// ~3.5 GB over a chunk, retained by `AtomMeta` outside both reader byte
+/// budgets (issue #156). Flat, the same field is `S * stride * 8` B -- 1.02 MB
+/// -- in ONE allocation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DenseField {
+    /// `n_samples * stride` values, sample-major.
+    values: Vec<f64>,
+    /// Per-sample width: 1 for Number=1, `n_alts` for Number=A, 0 for a
+    /// zero-width field (which `resolve_scalar` already reads as "absent").
+    stride: usize,
+}
+
+impl DenseField {
+    /// `values` must be rectangular: `stride` entries per sample, in order.
+    pub fn new(values: Vec<f64>, stride: usize) -> Self {
+        debug_assert!(
+            // `is_multiple_of(0)` is `len == 0`, which is exactly the
+            // zero-stride contract: no width means no values.
+            values.len().is_multiple_of(stride),
+            "DenseField values must be rectangular: {} values, stride {stride}",
+            values.len()
+        );
+        Self { values, stride }
+    }
+
+    /// One scalar per sample -- the Number=1 shape every non-VCF source emits.
+    pub fn scalars(values: Vec<f64>) -> Self {
+        Self { values, stride: 1 }
+    }
+
+    /// Sample `s`'s raw buffer, exactly what the nested `Vec<f64>` used to be.
+    #[inline]
+    pub fn sample(&self, s: usize) -> &[f64] {
+        if self.stride == 0 {
+            return &[];
+        }
+        &self.values[s * self.stride..(s + 1) * self.stride]
+    }
+
+    /// Per-sample width.
+    pub fn stride(&self) -> usize {
+        self.stride
+    }
+
+    /// Number of samples this buffer covers.
+    pub fn num_samples(&self) -> usize {
+        if self.stride == 0 {
+            0
+        } else {
+            self.values.len() / self.stride
+        }
+    }
+}
+
 /// Raw FORMAT buffers for one record.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FormatVals {
-    /// Outer index = requested FORMAT `FieldSpec` in spec order, inner index =
-    /// selected sample. Outer `None` = field absent from this record for all
-    /// samples. Natural for sources whose records carry every sample.
-    Dense(Vec<Option<Vec<Vec<f64>>>>),
+    /// Outer index = requested FORMAT `FieldSpec` in spec order, each a flat
+    /// per-selected-sample buffer. Outer `None` = field absent from this record
+    /// for all samples. Natural for sources whose records carry every sample.
+    Dense(Vec<Option<DenseField>>),
     /// Only the calling samples. Natural for a k-way merge of single-sample files.
     ByCarrier(CarrierFormat),
 }
@@ -298,7 +363,7 @@ pub(crate) fn resolve_format(
             .value(s, j)
             .unwrap_or_else(|| resolve_scalar(None, 0, spec)),
         FormatVals::Dense(raw) => {
-            let sample_vals = raw[j].as_ref().map(|v| v[s].as_slice());
+            let sample_vals = raw[j].as_ref().map(|f| f.sample(s));
             resolve_scalar(sample_vals, source_alt_index, spec)
         }
     }
@@ -307,6 +372,49 @@ pub(crate) fn resolve_format(
 #[cfg(test)]
 mod format_vals_tests {
     use super::*;
+
+    // Sample-major, fixed stride: the flat layout has to hand back exactly the
+    // per-sample slice the nested `Vec<f64>` used to be, or every Number=A
+    // resolution silently reads a neighbouring sample's values.
+    #[test]
+    fn dense_field_slices_are_sample_major() {
+        // 3 samples x stride 2.
+        let f = DenseField::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2);
+        assert_eq!(f.num_samples(), 3);
+        assert_eq!(f.stride(), 2);
+        assert_eq!(f.sample(0), [1.0, 2.0]);
+        assert_eq!(f.sample(1), [3.0, 4.0]);
+        assert_eq!(f.sample(2), [5.0, 6.0]);
+    }
+
+    #[test]
+    fn dense_field_scalars_is_stride_one() {
+        let f = DenseField::scalars(vec![0.5, 2.5]);
+        assert_eq!(f.stride(), 1);
+        assert_eq!(f.num_samples(), 2);
+        assert_eq!(f.sample(1), [2.5]);
+    }
+
+    // A zero-width field must read as "absent" rather than panic on the slice
+    // arithmetic -- `resolve_scalar` already maps an empty buffer to the spec
+    // default, so this keeps the two agreeing.
+    #[test]
+    fn dense_field_zero_stride_reads_as_absent() {
+        let f = DenseField::new(Vec::new(), 0);
+        assert_eq!(f.num_samples(), 0);
+        assert!(f.sample(0).is_empty());
+        assert!(f.sample(9_999).is_empty());
+
+        let spec = FieldSpec {
+            name: "DP".into(),
+            category: crate::field::FieldCategory::Format,
+            htype: crate::field::HtslibType::Int,
+            dtype: crate::field::StorageDtype::Auto,
+            default: Some(7.0),
+        };
+        let fv = FormatVals::Dense(vec![Some(f)]);
+        assert_eq!(resolve_format(&fv, &spec, 1, 0, 0), 7.0);
+    }
 
     // FORMAT is per *sample* (not per haplotype column). A non-carrier must resolve to
     // the field default -- the same contract `resolve_scalar` gives an empty buffer

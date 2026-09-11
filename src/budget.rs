@@ -457,7 +457,12 @@ pub struct PlanInputs {
     pub n_contigs: usize,
     pub n_samples: usize,
     /// Bytes of one FULL dense chunk:
-    /// `chunk_size * (n_samples*ploidy/8 + n_format_fields*n_samples*4)`.
+    /// `chunk_size * (n_samples*ploidy/8 + n_format_fields*n_samples*12)`.
+    ///
+    /// The per-field 12 is `crate::types::FORMAT_BYTES_PER_SAMPLE_PER_VARIANT`:
+    /// 8 B of raw `DenseField` retained by `AtomMeta` for the chunk's lifetime
+    /// plus the 4 B staged column. It charged the staged 4 alone until #156,
+    /// which is the cost of the column and not of the buffer behind it.
     pub chunk_bytes: u64,
     /// `None` means the caller declined a budget; only the core bound applies.
     pub max_mem_bytes: Option<u64>,

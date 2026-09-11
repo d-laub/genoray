@@ -233,7 +233,8 @@ fn run_conversion_pipeline(
             // haplotypes `samples * ploidy / 8` integer-divides to 0, which
             // would zero `chunk_bytes` and, downstream, `pending_budget_bytes`
             // -- see that constant's doc comment.
-            let per_variant_bytes = ((samples.len() * ploidy / 8 + n_format * samples.len() * 4)
+            let per_variant_bytes = ((samples.len() * ploidy / 8
+                + n_format * samples.len() * crate::types::FORMAT_BYTES_PER_SAMPLE_PER_VARIANT)
                 as u64)
                 .max(crate::types::DENSE_CHUNK_META_BYTES_PER_VARIANT);
 
@@ -590,8 +591,9 @@ fn run_pgen_conversion_pipeline(
 
             // Every dosage field is FORMAT-category by construction on this
             // path, so unlike the VCF path there is no INFO to filter out.
-            let per_variant_bytes =
-                (samples.len() * ploidy / 8 + fields.len() * samples.len() * 4) as u64;
+            let per_variant_bytes = (samples.len() * ploidy / 8
+                + fields.len() * samples.len() * crate::types::FORMAT_BYTES_PER_SAMPLE_PER_VARIANT)
+                as u64;
 
             // The RAM law was fitted against RESIDENT chunk bytes, not the
             // nominal chunk_size: BitGrid3::zeros is alloc_zeroed, so an

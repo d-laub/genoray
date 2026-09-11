@@ -308,13 +308,14 @@ impl RecordSource for Svar1RecordSource {
                 .fields
                 .iter()
                 .map(|(spec, arr)| {
+                    // Number=1 per sample: non-carriers keep the spec sentinel.
                     let sent = spec.missing_sentinel();
-                    let mut per_sample: Vec<Vec<f64>> = vec![vec![sent]; self.num_samples];
+                    let mut per_sample: Vec<f64> = vec![sent; self.num_samples];
                     for &(col, e) in &self.buckets[v] {
                         let s = col as usize / self.ploidy;
-                        per_sample[s] = vec![arr.value_f64(e as usize)];
+                        per_sample[s] = arr.value_f64(e as usize);
                     }
-                    Some(per_sample)
+                    Some(crate::record_source::DenseField::scalars(per_sample))
                 })
                 .collect();
 
@@ -420,8 +421,8 @@ mod tests {
             panic!("SVAR1 source must produce Dense FormatVals")
         };
         let ds0 = fv0[0].as_ref().unwrap();
-        assert_eq!(ds0[0], vec![0.5]);
-        assert_eq!(ds0[1], vec![2.5]);
+        assert_eq!(ds0.sample(0), [0.5]);
+        assert_eq!(ds0.sample(1), [2.5]);
 
         let r1 = src.next_record().unwrap().unwrap();
         assert_eq!(
@@ -432,8 +433,8 @@ mod tests {
             panic!("SVAR1 source must produce Dense FormatVals")
         };
         let ds1 = fv1[0].as_ref().unwrap();
-        assert!(ds1[0][0].is_nan()); // S0 non-carrier -> missing sentinel (NaN)
-        assert_eq!(ds1[1], vec![1.5]); // S1 carrier
+        assert!(ds1.sample(0)[0].is_nan()); // S0 non-carrier -> missing sentinel (NaN)
+        assert_eq!(ds1.sample(1), [1.5]); // S1 carrier
 
         assert!(src.next_record().unwrap().is_none());
         std::fs::remove_dir_all(&tmp).ok();
