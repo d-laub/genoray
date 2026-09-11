@@ -35,8 +35,8 @@ Prefer reading these over guessing:
 - `docs/source/index.md` — narrative tour with full examples (VCF, PGEN, filtering, chunking)
 - `docs/source/svar.md` — SparseVar usage
 - `genoray/__init__.py` — confirms the public surface
-- `genoray/_vcf.py` — `VCF` class: constructor, `read`, `chunk`, mode constants near the top of the class; `get_record_info(contig=None, start=None, end=None, fields=None, info=None, lazy=False)` — non-FORMAT record-level fields (including INFO) for a range or the whole file, returns `pl.DataFrame` (or `pl.LazyFrame` when `lazy=True`)
-- `genoray/_pgen.py` — `PGEN` class: constructor, `read`, `chunk`, `read_ranges`, `chunk_ranges`, mode constants near the top of the class
+- `genoray/_vcf.py` — `VCF` class: constructor, `read`, `chunk`, mode constants near the top of the class; `get_record_info(contig=None, start=None, end=None, fields=None, info=None, lazy=False)` — non-FORMAT record-level fields (including INFO) for a range or the whole file, returns `pl.DataFrame` (or `pl.LazyFrame` when `lazy=True`). **INFO fields come back as top-level columns, not a nested `INFO` struct**, named with the header's spelling of each ID. `info=` names are matched case-insensitively against the INFO IDs the header declares; `None` means all of them, `[]` means none, and a name the header does not declare raises `ValueError` (it used to be silently dropped along with every other INFO field, #139). An INFO ID that collides with a non-INFO column name (e.g. `INFO/QUAL`) also raises rather than flattening ambiguously.
+- `genoray/_pgen.py` — `PGEN` class: constructor, `read`, `chunk`, `read_ranges`, `chunk_ranges`, mode constants near the top of the class; `var_records(contig, starts=0, ends=POS_MAX)` — the identity of the variants a read over the same ranges returns, as a `pl.DataFrame` of `range` (u32, which query range the row belongs to), `CHROM`, `POS` (1-based), `REF`, `ALT`, aligned 1:1 with the variant axis of `read`/`read_ranges` and honoring the reader's `filter`. `ALT` is always `list[str]` here regardless of how the `.gvi` stored it, and `CHROM` is the contig name **as the file spells it** (which may differ from the queried `contig`). Use this rather than `var_idxs` + the private `_index` when an artifact has to outlive the PGEN it came from
 - `genoray/_svar.py` — `SparseVar`: `__init__`, `from_vcf`, `from_pgen`, `read_ranges`, `read_ranges_with_length(contig, starts=0, ends=POS_MAX, samples=None)` (length-guaranteed range read; returns the same type as `read_ranges` — a `Ragged` or fields-augmented record), `with_fields`, `annotate_mutations`, `mutation_matrix`, `assign_signatures`, `annotate_with_gtf(gtf, level_filter=1, write_back=True, *, strand_encoding=None, codon_null_token=None)` (GTF CDS annotation entry point, returns `pl.DataFrame` with `varID`/`gene_id`/`strand`/`codon_pos`), `cache_afs()` (computes and persists an `AF` column to the `.gvi` index; returns `None`)
 - `genoray/_svar2.py` — `SparseVar2`: `__init__(path, *, fields=None)`, `with_fields(fields)` (new reader over the same store with those fields selected), `available_fields` (`dict[str, StoredField]`, set in `__init__`), `from_vcf` (VCF/BCF → SVAR2 conversion entry point, `signatures=` classifies during the write, `info_fields=`/`format_fields=` extract scalar-numeric fields during the write; supports `regions=`/`samples=`/`merge_overlapping=`/`regions_overlap=`), `from_pgen` (PLINK2 PGEN → SVAR2 conversion entry point; diploid-only, no `ploidy=`/`info_fields=`/`format_fields=`; `dosages=Sequence[DosageField]` stores per-sample dosage tracks as FORMAT fields, read from the hardcall `.pgen` itself (`source="self"`) or a separate `.pgen`; supports `regions=`/`samples=`/`merge_overlapping=`/`regions_overlap=` like `from_vcf`), `from_vcf_list` (N single-sample VCFs/BCFs → one SVAR2 store via a native k-way merge; `sources` accepts a `Sequence`/directory/manifest, resolved by module-level `_resolve_vcf_sources`; `reference`/`no_reference` supported (no_reference skips left-alignment, so cross-file joins require pre-normalized inputs); `info_fields=`/`format_fields=` supported — INFO merges first-carrier-wins, FORMAT stays per-sample; supports `regions=`/`merge_overlapping=`/`regions_overlap=` like `from_vcf`, but **no `samples=`** — the cohort is the file set), `from_svar1` (SVAR1 (`SparseVar`) → SVAR2 native migration entry point; reads no VCF/htslib, `ploidy` from SVAR1 metadata, biallelic SVAR1 only, no `info_fields=`/`format_fields=` (those are VCF-specific) — instead `fields=Sequence[str] | None` selects which SVAR1 fields carry through (`None` default = all, `[]` = none, a subset carries only those names, unknown name raises `ValueError`); `mutcat` is never selectable this way and is always dropped; supports `regions=`/`samples=`/`merge_overlapping=`/`regions_overlap=` like `from_vcf`/`from_pgen`, though regions filter per-record rather than narrowing a covering range up front); `n_samples`/`available_samples`/`contigs`/`ploidy` metadata. Read/query methods live in the mixins: `genoray/_svar2_decode.py` (`decode` — attaches one `Ragged` per selected field, `region_counts`), `genoray/_svar2_batch.py` (public `read_ranges`; internal gvl-only `_overlap_batch`/`_find_ranges`/`_gather_ranges`), and `genoray/_svar2_mutcat.py` (`annotate_mutations`, `mutation_matrix`, `assign_signatures` — COSMIC mutational-signature workflow, mirroring `SparseVar`'s but backed by a per-contig Rust sidecar instead of a `.gvi`-attached field)
 - `genoray/_svar2_fields.py` — `InfoField`/`FormatField`/`DosageField` dataclasses + `FieldDtype` and the header/dtype validation used by `from_vcf(info_fields=, format_fields=)`; `_parse_cli_field_specs` (internal — parses bcftools-style `INFO/x`/`FORMAT/x`/`FMT/x` CLI field strings, used by the `genoray write vcf --fields` CLI); `StoredField` (frozen dataclass: `name`, `category`, `dtype`, `default`, `key`) is the read-side manifest entry type returned by `SparseVar2.available_fields` — not exported at top-level `genoray`, only reached via that dict
@@ -521,9 +521,10 @@ Signature: `from_vcf(out, source, reference=None, *, regions=None, samples=None,
 
   `log_level` is the minimum severity for structured write-time log lines.
   Accepted, case-insensitive: `"off"`, `"critical"`, `"error"`, `"warning"`,
-  `"info"` (default), `"debug"`, or a `logging` module integer constant
+  `"info"` (default), `"debug"`, a `logging` module integer constant
   (`logging.DEBUG` and friends — an in-between int rounds UP to the more
-  severe named level, matching `logging`'s own gate). Canonical ranks:
+  severe named level, matching `logging`'s own gate), or that integer's
+  decimal spelling (`"10"`), which is how the CLI reaches the int path. Canonical ranks:
   `off=0, error=1, warning=2, info=3, debug=4`. `"critical"` is accepted but
   is an **alias for `"error"`** — there is no distinct CRITICAL rank.
   **`"warn"` is rejected** (`ValueError`), on purpose: `logging.warn()` was
@@ -622,7 +623,11 @@ Signature: `from_pgen(out, source, reference=None, *, regions=None, samples=None
   baseline scales with cohort size (`~0.0158 MB/sample`), so this isn't just
   a small-cohort concern: at ~500k samples it alone predicts ~10.6 GB, so a
   *detected* budget on a smaller host will reject the conversion — pass an
-  explicit `max_mem` sized to the host in that case.
+  explicit `max_mem` sized to the host in that case. The per-contig chunk
+  charge is **2 chunk-buffers**, not the 10 the VCF path is charged: the
+  8-chunk reorder-backlog ceiling is a `from_vcf` mechanism that the PGEN
+  pipeline (one reader per contig) never enforces, so budgets between those
+  two brackets that used to raise `ValueError` now plan.
 - **`regions=`/`merge_overlapping=`/`regions_overlap=`** — same convention,
   semantics, and three overlap modes (`"pos"`/`"record"`/`"variant"`) as
   `from_vcf`, restricting conversion to one or more `.pvar` variant-index
@@ -864,12 +869,9 @@ records from SVAR1's arrays and reuses the same conversion spine as `from_vcf`.
 - `chunk_size=None` derives a variant-count budget from cohort size the same
   way as `from_pgen`/`from_vcf_list` (`_auto_chunk_size`) and warns under the
   same below-256-variant condition — see `from_vcf_list`'s `chunk_size` entry
-  above for the details. **Known gap:** this call site always passes
-  `n_format_fields=0`, even though `fields=` (below) selects SVAR1 FORMAT
-  fields and defaults to carrying all of them — so unlike `from_pgen`, the
-  budget here does not account for staged FORMAT bytes and can under-size
-  the chunk when `fields=` carries a wide FORMAT set. Tracked in
-  [#157](https://github.com/d-laub/genoray/issues/157).
+  above for the details. The budget counts the FORMAT fields `fields=` carries
+  (all of them by default), so a wide SVAR1 store derives a smaller chunk, the
+  same as `from_pgen` does for `dosages=`.
 - **Biallelic SVAR1 only** — raises `ValueError` if the source store has
   multiallelic variants (SVAR1's `geno==1` model); re-create the SVAR1 store
   biallelically first.
@@ -1198,7 +1200,8 @@ in Python 3.13, so it is a deprecated spelling, not a convention. The
 parameter is a validated `str` rather than a fixed choice list precisely so
 it cannot drift from `parse_log_level`, which is the single source of truth;
 the integer `logging` constants that function also accepts are reachable
-from `log_level=` in Python, not from this flag), and
+from this flag too, spelled out: `--log-level 10` == `--log-level debug`),
+and
 `--log-filter DIRECTIVE` (maps to
 `log_filter=`; a `tracing`-style `EnvFilter` string, e.g. `--log-filter
 "genoray::monitor=trace"`, independent of `--log-level`; unset/`None` by

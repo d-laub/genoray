@@ -25,6 +25,7 @@ from genoray._svar2_fields import (
 )
 from genoray._svar2_mutcat import _MutcatMixin
 from genoray._svar2_ops import Mode, _assert_concat_compatible, _load_meta, _write_store
+from genoray._pipeline_args import FieldSpec, PlanSettings, RegionSpec
 from genoray._tuning import Tuning, resolve_tuning
 from genoray._utils import (
     BGZF_VCF_SUFFIXES,
@@ -547,7 +548,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         `log_level`: minimum severity for structured write-time log lines --
         one of `"off"`, `"critical"`, `"error"`, `"warning"`, `"info"`
         (default), or `"debug"` (case-insensitive), or a `logging` integer
-        level. `"off"` disables all output, including the per-contig
+        level (or its decimal spelling, `"10"`). `"off"` disables all output, including the per-contig
         summaries and progress rendering (a pure no-op, zero overhead).
         `"critical"` is an alias for `"error"`; see `parse_log_level` for the
         exact mapping.
@@ -750,7 +751,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         log_level: minimum severity for structured write-time log lines —
         one of `"off"`, `"critical"`, `"error"`, `"warning"`, `"info"`
         (default), or `"debug"` (case-insensitive), or a `logging` integer
-        level. `"off"` disables all output, including the per-contig
+        level (or its decimal spelling, `"10"`). `"off"` disables all output, including the per-contig
         summaries and progress rendering (a pure no-op, zero overhead).
         `"critical"` is an alias for `"error"`; see `parse_log_level` for the
         exact mapping.
@@ -916,23 +917,26 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
 
         with write_reporting(progress, log_level) as (rx, level):
             return _core.run_conversion_pipeline(
-                str(source),
-                reference_path,
-                contigs,
-                str(out),
-                selected_samples,
-                chunk_size,
-                ploidy,
-                threads,  # max_threads; None => auto
-                long_allele_capacity,
-                skip_out_of_scope,
-                signatures,
-                info,
-                format_,
-                check_ref,
-                region_ranges,
-                regions_overlap,
-                max_mem_bytes,
+                vcf_path=str(source),
+                reference_path=reference_path,
+                output_dir=str(out),
+                regions=RegionSpec(
+                    chroms=contigs,
+                    samples=selected_samples,
+                    region_ranges=region_ranges,
+                    regions_overlap=regions_overlap,
+                ),
+                fields=FieldSpec(info=info, format=format_),
+                plan=PlanSettings(
+                    chunk_size=chunk_size,
+                    max_threads=threads,  # None => auto
+                    long_allele_capacity=long_allele_capacity,
+                    max_mem_bytes=max_mem_bytes,
+                ),
+                ploidy=ploidy,
+                skip_out_of_scope=skip_out_of_scope,
+                signatures=signatures,
+                check_ref=check_ref,
                 tuning=tuning,
                 log_filter=log_filter,
                 log_level=level,
@@ -1090,7 +1094,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         log_level: minimum severity for structured write-time log lines --
         one of `"off"`, `"critical"`, `"error"`, `"warning"`, `"info"`
         (default), or `"debug"` (case-insensitive), or a `logging` integer
-        level. `"off"` disables all output, including the per-contig
+        level (or its decimal spelling, `"10"`). `"off"` disables all output, including the per-contig
         summaries and progress rendering (a pure no-op, zero overhead).
         `"critical"` is an alias for `"error"`; see `parse_log_level` for the
         exact mapping.
@@ -1608,7 +1612,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         log_level: minimum severity for structured write-time log lines --
         one of `"off"`, `"critical"`, `"error"`, `"warning"`, `"info"`
         (default), or `"debug"` (case-insensitive), or a `logging` integer
-        level. `"off"` disables all output, including the per-contig
+        level (or its decimal spelling, `"10"`). `"off"` disables all output, including the per-contig
         summaries and progress rendering (a pure no-op, zero overhead).
         `"critical"` is an alias for `"error"`; see `parse_log_level` for the
         exact mapping.
@@ -1851,6 +1855,12 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         default/missing sentinel — field output is byte-identical to
         :meth:`from_vcf` only for var_key (carrier-only) routing.
 
+        chunk_size: variants per conversion chunk. `None` (default) derives
+        one from cohort width the same way as `from_pgen`/`from_vcf_list`
+        (`_auto_chunk_size`), budgeting both the packed presence grid and the
+        FORMAT values `fields` carries -- so a wide `fields` set shrinks the
+        chunk instead of overshooting the dense-chunk target.
+
         check_ref: policy for a record whose REF disagrees with the reference
         FASTA (ignored when `no_reference=True`). `"e"` (default) raises and
         aborts the build — matching `bcftools norm --check-ref e`. `"x"` drops
@@ -1904,7 +1914,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         log_level: minimum severity for structured write-time log lines --
         one of `"off"`, `"critical"`, `"error"`, `"warning"`, `"info"`
         (default), or `"debug"` (case-insensitive), or a `logging` integer
-        level. `"off"` disables all output, including the per-contig
+        level (or its decimal spelling, `"10"`). `"off"` disables all output, including the per-contig
         summaries and progress rendering (a pure no-op, zero overhead).
         `"critical"` is an alias for `"error"`; see `parse_log_level` for the
         exact mapping.
@@ -2018,7 +2028,14 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         format_tuples, src_dtypes = _svar1_fields_manifest(selected_fields)
 
         if chunk_size is None:
-            chunk_size = _auto_chunk_size(len(selected_samples), ploidy)
+            # Every SVAR1 custom field is FORMAT and is staged at 4 B per
+            # (variant, sample, field), so the manifest length is the count the
+            # budget needs -- `fields=None` carries all of them. Passing 0 here
+            # sized the chunk against the packed grid alone, which the FORMAT
+            # term outweighs by `32 * F / ploidy` (#157).
+            chunk_size = _auto_chunk_size(
+                len(selected_samples), ploidy, n_format_fields=len(format_tuples)
+            )
 
         out.parent.mkdir(parents=True, exist_ok=True)
         _validate_check_ref(check_ref)
