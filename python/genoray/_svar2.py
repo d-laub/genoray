@@ -2021,13 +2021,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         format_tuples, src_dtypes = _svar1_fields_manifest(selected_fields)
 
         if chunk_size is None:
-            # Every SVAR1 custom field is FORMAT (`_svar1_fields_manifest`), so
-            # `format_tuples` IS the field count the budget has to charge for.
-            # Omitting it sized the chunk as if none were requested, which is
-            # the whole term the budget exists to bound (issues #120, #156).
-            chunk_size = _auto_chunk_size(
-                len(selected_samples), ploidy, n_format_fields=len(format_tuples)
-            )
+            chunk_size = _auto_chunk_size(len(selected_samples), ploidy)
 
         out.parent.mkdir(parents=True, exist_ok=True)
         _validate_check_ref(check_ref)
