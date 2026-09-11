@@ -112,3 +112,49 @@ def test_a_positive_int_below_debug_is_debug():
     # makes them the most verbose real level rather than silence.
     assert parse_log_level(1) == "debug"
     assert parse_log_level(9) == "debug"
+
+
+@pytest.mark.parametrize(
+    ("given", "expected"),
+    [
+        ("0", "off"),
+        ("10", "debug"),
+        ("20", "info"),
+        ("30", "warning"),
+        ("40", "error"),
+        ("50", "error"),
+        # The round-UP rule must hold for the text spelling too.
+        ("25", "warning"),
+        (" 11 ", "info"),
+        ("+20", "info"),
+    ],
+)
+def test_integer_levels_spelled_as_text(given: str, expected: str):
+    # `--log-level` can only deliver text, so the digit spelling is the only
+    # way the CLI can reach the int path `log_level=10` takes from Python.
+    assert parse_log_level(given) == expected
+
+
+def test_negative_int_text_is_rejected_like_the_int():
+    with pytest.raises(ValueError):
+        parse_log_level("-1")
+
+
+@pytest.mark.parametrize("bad", ["1.5", "10info", "info10", "0x10", "1_0", "١٠"])
+def test_text_that_is_not_a_plain_integer_is_still_rejected(bad: str):
+    # Notably "١٠" (Arabic-Indic digits): `int()` accepts it and so would a
+    # `\d`-based check, which would be an accident rather than a feature.
+    with pytest.raises(ValueError, match="log_level must be one of"):
+        parse_log_level(bad)
+
+
+def test_cli_validator_accepts_exactly_what_parse_log_level_accepts():
+    # The `--log-level` gate forwards to `parse_log_level` so the two cannot
+    # drift; #179 was that drift, in the digit-string direction.
+    from genoray._cli.__main__ import _validate_log_level
+
+    for good in ("info", "DEBUG", "critical", "10", "0", " 20 "):
+        _validate_log_level(str, good)  # must not raise
+    for bad in ("warn", "verbose", "-1", "1.5"):
+        with pytest.raises(ValueError):
+            _validate_log_level(str, bad)
