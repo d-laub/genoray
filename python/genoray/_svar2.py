@@ -547,7 +547,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         `log_level`: minimum severity for structured write-time log lines --
         one of `"off"`, `"critical"`, `"error"`, `"warning"`, `"info"`
         (default), or `"debug"` (case-insensitive), or a `logging` integer
-        level. `"off"` disables all output, including the per-contig
+        level (or its decimal spelling, `"10"`). `"off"` disables all output, including the per-contig
         summaries and progress rendering (a pure no-op, zero overhead).
         `"critical"` is an alias for `"error"`; see `parse_log_level` for the
         exact mapping.
@@ -750,7 +750,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         log_level: minimum severity for structured write-time log lines —
         one of `"off"`, `"critical"`, `"error"`, `"warning"`, `"info"`
         (default), or `"debug"` (case-insensitive), or a `logging` integer
-        level. `"off"` disables all output, including the per-contig
+        level (or its decimal spelling, `"10"`). `"off"` disables all output, including the per-contig
         summaries and progress rendering (a pure no-op, zero overhead).
         `"critical"` is an alias for `"error"`; see `parse_log_level` for the
         exact mapping.
@@ -1090,7 +1090,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         log_level: minimum severity for structured write-time log lines --
         one of `"off"`, `"critical"`, `"error"`, `"warning"`, `"info"`
         (default), or `"debug"` (case-insensitive), or a `logging` integer
-        level. `"off"` disables all output, including the per-contig
+        level (or its decimal spelling, `"10"`). `"off"` disables all output, including the per-contig
         summaries and progress rendering (a pure no-op, zero overhead).
         `"critical"` is an alias for `"error"`; see `parse_log_level` for the
         exact mapping.
@@ -1608,7 +1608,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         log_level: minimum severity for structured write-time log lines --
         one of `"off"`, `"critical"`, `"error"`, `"warning"`, `"info"`
         (default), or `"debug"` (case-insensitive), or a `logging` integer
-        level. `"off"` disables all output, including the per-contig
+        level (or its decimal spelling, `"10"`). `"off"` disables all output, including the per-contig
         summaries and progress rendering (a pure no-op, zero overhead).
         `"critical"` is an alias for `"error"`; see `parse_log_level` for the
         exact mapping.
@@ -1904,7 +1904,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         log_level: minimum severity for structured write-time log lines --
         one of `"off"`, `"critical"`, `"error"`, `"warning"`, `"info"`
         (default), or `"debug"` (case-insensitive), or a `logging` integer
-        level. `"off"` disables all output, including the per-contig
+        level (or its decimal spelling, `"10"`). `"off"` disables all output, including the per-contig
         summaries and progress rendering (a pure no-op, zero overhead).
         `"critical"` is an alias for `"error"`; see `parse_log_level` for the
         exact mapping.

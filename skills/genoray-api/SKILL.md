@@ -521,9 +521,10 @@ Signature: `from_vcf(out, source, reference=None, *, regions=None, samples=None,
 
   `log_level` is the minimum severity for structured write-time log lines.
   Accepted, case-insensitive: `"off"`, `"critical"`, `"error"`, `"warning"`,
-  `"info"` (default), `"debug"`, or a `logging` module integer constant
+  `"info"` (default), `"debug"`, a `logging` module integer constant
   (`logging.DEBUG` and friends — an in-between int rounds UP to the more
-  severe named level, matching `logging`'s own gate). Canonical ranks:
+  severe named level, matching `logging`'s own gate), or that integer's
+  decimal spelling (`"10"`), which is how the CLI reaches the int path. Canonical ranks:
   `off=0, error=1, warning=2, info=3, debug=4`. `"critical"` is accepted but
   is an **alias for `"error"`** — there is no distinct CRITICAL rank.
   **`"warn"` is rejected** (`ValueError`), on purpose: `logging.warn()` was
@@ -1198,7 +1199,8 @@ in Python 3.13, so it is a deprecated spelling, not a convention. The
 parameter is a validated `str` rather than a fixed choice list precisely so
 it cannot drift from `parse_log_level`, which is the single source of truth;
 the integer `logging` constants that function also accepts are reachable
-from `log_level=` in Python, not from this flag), and
+from this flag too, spelled out: `--log-level 10` == `--log-level debug`),
+and
 `--log-filter DIRECTIVE` (maps to
 `log_filter=`; a `tracing`-style `EnvFilter` string, e.g. `--log-filter
 "genoray::monitor=trace"`, independent of `--log-level`; unset/`None` by
