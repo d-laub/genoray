@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from genoray import _core
+from genoray._pipeline_args import FieldSpec, PlanSettings, RegionSpec
 
 # 40 bp reference; the REF bases below match this exactly (1-based VCF POS):
 # POS 3 = 'A', POS 7 = 'C', POS 12..14 = 'GTA'.
@@ -77,15 +78,17 @@ def svar2_store(tmp_path_factory) -> Path:
 
     out = d / "store"
     _core.run_conversion_pipeline(
-        str(bcf),  # vcf_path (BCF + .csi, mirrors the Rust harness)
-        str(ref),  # reference_path
-        ["chr1"],  # chroms
-        str(out),  # output_dir
-        ["S0", "S1"],  # samples
-        25_000,  # chunk_size
-        2,  # ploidy
-        1,  # max_threads
-        8 * 1024 * 1024,  # long_allele_capacity
+        vcf_path=str(bcf),  # BCF + .csi, mirrors the Rust harness
+        reference_path=str(ref),
+        output_dir=str(out),
+        regions=RegionSpec(chroms=["chr1"], samples=["S0", "S1"]),
+        fields=FieldSpec(),
+        plan=PlanSettings(
+            chunk_size=25_000,
+            max_threads=1,
+            long_allele_capacity=8 * 1024 * 1024,
+        ),
+        ploidy=2,
     )
     assert (out / "meta.json").exists(), "conversion did not finish"
     return out

@@ -25,6 +25,7 @@ from genoray._svar2_fields import (
 )
 from genoray._svar2_mutcat import _MutcatMixin
 from genoray._svar2_ops import Mode, _assert_concat_compatible, _load_meta, _write_store
+from genoray._pipeline_args import FieldSpec, PlanSettings, RegionSpec
 from genoray._tuning import Tuning, resolve_tuning
 from genoray._utils import (
     BGZF_VCF_SUFFIXES,
@@ -916,23 +917,26 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
 
         with write_reporting(progress, log_level) as (rx, level):
             return _core.run_conversion_pipeline(
-                str(source),
-                reference_path,
-                contigs,
-                str(out),
-                selected_samples,
-                chunk_size,
-                ploidy,
-                threads,  # max_threads; None => auto
-                long_allele_capacity,
-                skip_out_of_scope,
-                signatures,
-                info,
-                format_,
-                check_ref,
-                region_ranges,
-                regions_overlap,
-                max_mem_bytes,
+                vcf_path=str(source),
+                reference_path=reference_path,
+                output_dir=str(out),
+                regions=RegionSpec(
+                    chroms=contigs,
+                    samples=selected_samples,
+                    region_ranges=region_ranges,
+                    regions_overlap=regions_overlap,
+                ),
+                fields=FieldSpec(info=info, format=format_),
+                plan=PlanSettings(
+                    chunk_size=chunk_size,
+                    max_threads=threads,  # None => auto
+                    long_allele_capacity=long_allele_capacity,
+                    max_mem_bytes=max_mem_bytes,
+                ),
+                ploidy=ploidy,
+                skip_out_of_scope=skip_out_of_scope,
+                signatures=signatures,
+                check_ref=check_ref,
                 tuning=tuning,
                 log_filter=log_filter,
                 log_level=level,
