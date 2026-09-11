@@ -1,10 +1,15 @@
 name: Test
 
 on:
+  # Deliberately unfiltered by base branch. A stacked PR is based on the branch
+  # below it, not on a trunk, so a `branches:` allowlist silently skips this
+  # workflow for every layer except the bottom one -- those PRs ran `prek` and
+  # nothing else. Branch protection still requires these checks, so the missing
+  # runs made an atomic `gh stack merge` of a whole stack impossible: it reported
+  # "5 of 6 required status checks are expected" and refused. Stack branch names
+  # are arbitrary (`fix/...`, `perf/...`, `test-hygiene/...`), so no allowlist
+  # can cover them; testing every PR base is the only version that holds.
   pull_request:
-    branches:
-      - main
-      - svar-2
   workflow_dispatch:
 
 jobs:
