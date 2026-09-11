@@ -983,8 +983,11 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         PGEN is diploid, so there is no `ploidy` parameter.
 
         chunk_size: variants per conversion chunk. Defaults to a value derived from
-        a memory budget, since a packed dense chunk costs
-        ``chunk_size * n_samples * 2 / 8`` bytes.
+        a memory budget, since a chunk costs
+        ``chunk_size * (n_samples * 2 / 8 + n_dosage_fields * n_samples * 12)``
+        bytes -- the packed dense grid plus, per dosage field, the 4 B staged
+        value and the 8 B of raw buffer the reader holds for the chunk's
+        lifetime.
 
         max_mem: byte budget the concurrency planner may use, as an int or a
         string like `"64GiB"` (see `parse_memory`). **This is a
@@ -2349,6 +2352,19 @@ def _svar1_fields_manifest(
 _DENSE_CHUNK_TARGET_BYTES = 256 * 1024 * 1024
 # Staged FORMAT is one 4-byte value per (variant, sample, field).
 _STAGED_FORMAT_BYTES = 4
+# The reader ALSO retains the record's raw FORMAT buffer for as long as the
+# chunk's metadata is live (`AtomMeta.format_vals`, src/chunk_assembler.rs):
+# one f64 per (variant, sample, field) for a Number=1 field, held in a flat
+# `DenseField` (src/record_source.rs). This budget charged the staged column
+# alone until #156, where the raw side was a separately heap-allocated
+# `Vec<f64>` per (field, sample) -- ~56 B apiece, ~3.5 GB over a chunk at
+# S=128,000 -- and so was neither shrunk nor counted. A Number=A field of
+# width w retains `8 * w`; the budget does not model w.
+_RETAINED_FORMAT_BYTES = 8
+# What one FORMAT field costs per sample per variant. Mirrored on the Rust side
+# as `crate::types::FORMAT_BYTES_PER_SAMPLE_PER_VARIANT`, which sizes the
+# concurrency plan against the same figure.
+_FORMAT_BYTES_PER_SAMPLE = _STAGED_FORMAT_BYTES + _RETAINED_FORMAT_BYTES
 # How many contigs `from_vcf_list` converts concurrently. Read live from Rust
 # (`orchestrator::VCF_LIST_CONCURRENT_CHROMS`, exported via `_core`'s
 # `#[pymodule]`) instead of duplicated as a Python literal, so this can never
@@ -2382,10 +2398,16 @@ def _auto_chunk_size(
     """Variants per dense chunk, sized so one chunk fits `max_mem`.
 
     Budgets both terms a chunk actually costs: the packed presence grid
-    (`n_samples * ploidy / 8` bytes per variant) and staged FORMAT values
-    (`n_format_fields * n_samples * 4`). The FORMAT term dominates by `32 * F / ploidy`
-    -- 112x at F=7, ploidy=2 -- so budgeting the grid alone is meaningless whenever
-    fields are requested (issue #120).
+    (`n_samples * ploidy / 8` bytes per variant) and FORMAT values
+    (`n_format_fields * n_samples * 12`). The FORMAT term dominates by
+    `96 * F / ploidy` -- 336x at F=7, ploidy=2 -- so budgeting the grid alone is
+    meaningless whenever fields are requested (issue #120).
+
+    The per-field 12 is `_FORMAT_BYTES_PER_SAMPLE`: 4 B staged plus the 8 B of
+    raw buffer the reader retains for the chunk's lifetime. Charging the staged
+    4 alone (through #156) under-counted by 3x what is live, on top of the raw
+    buffer being 7x larger than it needed to be -- together, the ~3.5 GB that
+    issue measured at S=128,000 with one field.
 
     The estimate is deliberately worst-case: it assumes every variant routes dense.
     The dense fraction is a per-chunk, data-dependent routing outcome and is not known
@@ -2401,7 +2423,7 @@ def _auto_chunk_size(
     """
     budget = _DENSE_CHUNK_TARGET_BYTES if max_mem is None else max_mem
     grid_bytes = (n_samples * ploidy) // 8
-    format_bytes = n_format_fields * n_samples * _STAGED_FORMAT_BYTES
+    format_bytes = n_format_fields * n_samples * _FORMAT_BYTES_PER_SAMPLE
     per_variant = max(grid_bytes + format_bytes, 1)
     chunk_size = max(1, min(25_000, budget // per_variant))
     if chunk_size < 256:

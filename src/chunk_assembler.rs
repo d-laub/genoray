@@ -364,10 +364,17 @@ struct AtomMeta {
 // ***********************************************************************
 //
 // When FORMAT/dosage fields ARE requested, `PendingAtom.format_vals` /
-// `AtomMeta.format_vals` retain the record's raw `FormatVals::Dense` -- a
-// separately heap-allocated `Vec<f64>` per (field, sample) -- for as long as
-// `metas` is live, and that retention is covered by NEITHER budget below. It
-// is a pre-existing, separately tracked cost, not something these two bound.
+// `AtomMeta.format_vals` retain the record's raw `FormatVals::Dense` for as
+// long as `metas` is live, and that retention is covered by NEITHER budget
+// below -- it is a separate cost, not something these two bound.
+//
+// It is now `n_samples * stride * 8` B per field per record in ONE allocation
+// (`DenseField`, src/record_source.rs). It used to be a separately
+// heap-allocated `Vec<f64>` per (field, sample): ~56 B each to hold the 8 B a
+// Number=1 field carries, ~7 MB per record at S = 128,000 (issue #156). The
+// planner charges the flat figure per variant (`per_variant_bytes`, src/lib.rs)
+// so `chunk_size` is now sized against it; a Number=A field of width w costs
+// w times that, which the plan does not model.
 //
 // They used to be fixed VARIANT counts (`PACK_WINDOW`/`NORMALIZE_BATCH_RECORDS`,
 // both 1024) multiplying an O(n_samples) payload, giving a live set of
@@ -1169,7 +1176,10 @@ mod tests {
         let spec = format_spec("DP");
         // One sample, Number=A buffer with a DIFFERENT value per source ALT:
         // ALT1 -> 10.0, ALT2 -> 20.0.
-        let dense = FormatVals::Dense(vec![Some(vec![vec![10.0, 20.0]])]);
+        let dense = FormatVals::Dense(vec![Some(crate::record_source::DenseField::new(
+            vec![10.0, 20.0],
+            2,
+        ))]);
         assert_eq!(
             resolve_format(&dense, &spec, 1, 0, 0),
             10.0,
@@ -1208,7 +1218,10 @@ mod tests {
             alts: vec![b"C".to_vec(), b"G".to_vec()],
             calls: Calls::Dense(vec![1, 2]), // irrelevant to FORMAT resolution
             info_raw: Vec::new(),
-            format_vals: FormatVals::Dense(vec![Some(vec![vec![10.0, 20.0]])]),
+            format_vals: FormatVals::Dense(vec![Some(crate::record_source::DenseField::new(
+                vec![10.0, 20.0],
+                2,
+            ))]),
             global_idx: -1,
         };
         let decomposed = decompose_raw_record(
@@ -1258,7 +1271,9 @@ mod tests {
             alts: vec![b"C".to_vec()], // biallelic SNP -> 1 atom
             calls: Calls::Dense(vec![1]),
             info_raw: Vec::new(),
-            format_vals: FormatVals::Dense(vec![Some(vec![vec![10.0]])]),
+            format_vals: FormatVals::Dense(vec![Some(crate::record_source::DenseField::scalars(
+                vec![10.0],
+            ))]),
             global_idx: 7,
         };
         let decomposed = decompose_raw_record(

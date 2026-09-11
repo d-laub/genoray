@@ -285,16 +285,18 @@ impl RecordSource for PgenRecordSource {
             // the same `sample_perm` gather reorders it into output order --
             // mirrors `src/svar1_reader.rs`'s `format_raw` shape.
             let dbase = row * self.num_samples;
-            let format_raw: Vec<Option<Vec<Vec<f64>>>> = (0..self.dosage_readers.len())
-                .map(|i| {
-                    let per_sample: Vec<Vec<f64>> = self
-                        .sample_perm
-                        .iter()
-                        .map(|&src_s| vec![self.host_dosages[i][dbase + src_s] as f64])
-                        .collect();
-                    Some(per_sample)
-                })
-                .collect();
+            let format_raw: Vec<Option<crate::record_source::DenseField>> =
+                (0..self.dosage_readers.len())
+                    .map(|i| {
+                        // Number=1 per sample, so one flat scalar buffer per field.
+                        Some(crate::record_source::DenseField::scalars(
+                            self.sample_perm
+                                .iter()
+                                .map(|&src_s| self.host_dosages[i][dbase + src_s] as f64)
+                                .collect(),
+                        ))
+                    })
+                    .collect();
 
             return Ok(Some(RawRecord {
                 pos: meta.pos,

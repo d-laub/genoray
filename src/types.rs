@@ -214,6 +214,22 @@ pub struct DenseChunk {
 #[cfg(feature = "conversion")]
 pub(crate) const DENSE_CHUNK_META_BYTES_PER_VARIANT: u64 = 16;
 
+/// Bytes one requested FORMAT field costs per sample per variant, as charged by
+/// `per_variant_bytes` in `lib.rs`. Two live copies of the same value:
+///
+/// - 8 B raw. `AtomMeta.format_vals` retains the record's `DenseField` for as
+///   long as the chunk's `metas` are live (`chunk_assembler.rs`), which is one
+///   f64 per sample for a Number=1 field.
+/// - 4 B staged. The `DenseChunk` FORMAT column the RAM law was shaped around.
+///
+/// This used to charge the staged 4 B alone, under-counting the retention by
+/// ~14x when the raw side was a separately heap-allocated `Vec<f64>` per
+/// (field, sample) -- issue #156, which both flattened that buffer and brought
+/// what is left onto the plan. A Number=A field of width w costs `8 * w + 4`
+/// rather than 12; the plan does not model w, so it under-charges those.
+#[cfg(feature = "conversion")]
+pub(crate) const FORMAT_BYTES_PER_SAMPLE_PER_VARIANT: usize = 12;
+
 impl DenseChunk {
     /// Approximate heap bytes held by this chunk.
     ///
@@ -326,6 +342,21 @@ mod tests {
     #![allow(clippy::needless_range_loop)]
     use super::*;
     use proptest::prelude::*;
+
+    // The 12 is not a tuning knob: 8 of it is the raw `DenseField` element the
+    // reader retains for the chunk's lifetime, 4 is the staged column. If that
+    // element type ever changes, the constant is silently wrong and every
+    // dosage conversion re-acquires issue #156's under-count -- which is
+    // exactly what a stale literal did before, charging the staged 4 alone.
+    #[cfg(feature = "conversion")]
+    #[test]
+    fn format_charge_matches_the_representation_it_charges_for() {
+        const STAGED: usize = 4;
+        assert_eq!(
+            super::FORMAT_BYTES_PER_SAMPLE_PER_VARIANT,
+            std::mem::size_of::<f64>() + STAGED
+        );
+    }
 
     // Manual flat-index helper to validate against BitGrid3's internal math.
     fn flat(v: usize, s: usize, p: usize, ns: usize, np: usize) -> usize {

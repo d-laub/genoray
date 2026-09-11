@@ -1,6 +1,6 @@
 use crate::error::ConversionError;
 use crate::field::{FieldCategory, FieldSpec, HtslibType};
-use crate::record_source::{RawRecord, RecordSource};
+use crate::record_source::{DenseField, RawRecord, RecordSource};
 use crate::svar2_view::{self, OverlapMode};
 use rust_htslib::bcf::header::HeaderView;
 use rust_htslib::bcf::record::Record;
@@ -76,33 +76,57 @@ fn decode_info_raw(record: &Record, spec: &FieldSpec) -> Result<Option<Vec<f64>>
     }
 }
 
-// Decode one FORMAT field for the CURRENT record, once, for every VCF sample
-// in the header (not just the selected ones — matches the GT-decode idiom,
-// which indexes into the full per-header-sample buffer via
-// `self.sample_indices`). `Ok(None)` means the field is absent from this
-// record for all samples (htslib reports this as `BcfMissingTag`, a normal,
-// expected per-record occurrence, NOT an error). Any other htslib error is a
-// genuine read failure and surfaces as `ConversionError::Input`.
+/// Gather the SELECTED samples out of htslib's header-sample-indexed,
+/// rectangular FORMAT buffer straight into one flat `DenseField`.
+///
+/// Two things this deliberately does not do: allocate per sample (the nested
+/// `Vec<f64>` this replaced cost ~56 B of header and allocator overhead each,
+/// see `DenseField`), and materialize anything HEADER-width -- a conversion
+/// selecting 100 of 500,000 samples now copies 100 rows, not 500,000.
+fn gather_selected<T>(rows: &[&[T]], sample_indices: &[usize]) -> DenseField
+where
+    T: Copy + Into<f64>,
+{
+    // htslib's buffers are rectangular, so row 0's width is every row's width.
+    let stride = rows.first().map_or(0, |r| r.len());
+    let mut values = Vec::with_capacity(sample_indices.len() * stride);
+    for &vcf_idx in sample_indices {
+        let row = rows[vcf_idx];
+        // Clamp and pad rather than trust the rectangularity: a short row would
+        // otherwise shift every LATER sample's slice, which reads as silently
+        // wrong data rather than as an error. htslib never produces one.
+        debug_assert_eq!(row.len(), stride, "htslib FORMAT buffers are rectangular");
+        values.extend(row.iter().take(stride).map(|&v| v.into()));
+        values.resize(values.len() + stride.saturating_sub(row.len()), f64::NAN);
+    }
+    DenseField::new(values, stride)
+}
+
+// Decode one FORMAT field for the CURRENT record and gather the SELECTED
+// samples into a flat `DenseField` (`gather_selected` above). htslib decodes
+// the full header-width buffer either way -- that is its API -- but only the
+// selected rows are copied out of it, so nothing header-width is retained.
+// `Ok(None)` means the field is absent from this record for all samples
+// (htslib reports this as `BcfMissingTag`, a normal, expected per-record
+// occurrence, NOT an error). Any other htslib error is a genuine read failure
+// and surfaces as `ConversionError::Input`.
 //
 // FORMAT Flag is not valid VCF (Flag is INFO-only); defensively treated as Int.
 fn decode_format_raw(
     record: &Record,
     spec: &FieldSpec,
-) -> Result<Option<Vec<Vec<f64>>>, ConversionError> {
+    sample_indices: &[usize],
+) -> Result<Option<DenseField>, ConversionError> {
     let pos = record.pos();
     let result = match spec.htype {
-        HtslibType::Float => record.format(spec.name.as_bytes()).float().map(|bb| {
-            bb.iter()
-                .map(|s| s.iter().map(|&v| v as f64).collect())
-                .collect::<Vec<Vec<f64>>>()
-        }),
-        HtslibType::Int | HtslibType::Flag => {
-            record.format(spec.name.as_bytes()).integer().map(|bb| {
-                bb.iter()
-                    .map(|s| s.iter().map(|&v| v as f64).collect())
-                    .collect::<Vec<Vec<f64>>>()
-            })
-        }
+        HtslibType::Float => record
+            .format(spec.name.as_bytes())
+            .float()
+            .map(|bb| gather_selected(&bb, sample_indices)),
+        HtslibType::Int | HtslibType::Flag => record
+            .format(spec.name.as_bytes())
+            .integer()
+            .map(|bb| gather_selected(&bb, sample_indices)),
     };
     match result {
         Ok(v) => Ok(Some(v)),
@@ -675,21 +699,13 @@ impl VcfRecordSource {
             .map(|spec| decode_info_raw(&self.record, spec))
             .collect::<Result<_, _>>()?;
 
-        // Remap htslib's header-sample-indexed FORMAT buffers into SELECTED-sample
-        // order, so the assembler never needs to know about `sample_indices`.
-        let format_raw: Vec<Option<Vec<Vec<f64>>>> = self
+        // `decode_format_raw` gathers htslib's header-sample-indexed buffers into
+        // SELECTED-sample order as it decodes, so the assembler never needs to
+        // know about `sample_indices` and nothing header-width is materialized.
+        let format_raw: Vec<Option<DenseField>> = self
             .format_fields
             .iter()
-            .map(|spec| {
-                decode_format_raw(&self.record, spec).map(|opt| {
-                    opt.map(|per_header_sample| {
-                        self.sample_indices
-                            .iter()
-                            .map(|&vcf_idx| per_header_sample[vcf_idx].clone())
-                            .collect()
-                    })
-                })
-            })
+            .map(|spec| decode_format_raw(&self.record, spec, &self.sample_indices))
             .collect::<Result<_, _>>()?;
 
         Ok(Some(RawRecord {
@@ -709,6 +725,27 @@ mod tests {
     use super::*;
     use rust_htslib::bcf::record::GenotypeAllele;
     use rust_htslib::bcf::{Format, Header, Writer};
+
+    // htslib hands back every HEADER sample; a conversion that selected a subset
+    // must get those samples, in selection order, and nothing header-width in
+    // between. An off-by-one here reassigns every FORMAT value to the wrong
+    // sample, which no shape assertion downstream would catch.
+    #[test]
+    fn gather_selected_picks_samples_in_selection_order() {
+        let rows: Vec<&[f32]> = vec![&[1.0, 1.5], &[2.0, 2.5], &[3.0, 3.5], &[4.0, 4.5]];
+        let f = super::gather_selected(&rows, &[2, 0]);
+        assert_eq!(f.stride(), 2);
+        assert_eq!(f.num_samples(), 2);
+        assert_eq!(f.sample(0), [3.0, 3.5]);
+        assert_eq!(f.sample(1), [1.0, 1.5]);
+    }
+
+    #[test]
+    fn gather_selected_handles_an_empty_selection() {
+        let rows: Vec<&[i32]> = vec![&[7], &[8]];
+        let f = super::gather_selected(&rows, &[]);
+        assert_eq!(f.num_samples(), 0);
+    }
 
     // One-sample, CSI-indexed BCF fixture: `records` are (0-based pos, REF,
     // ALT, GT string e.g. "1/1"). Mirrors `vcf_list_reader::tests::write_ss_vcf`

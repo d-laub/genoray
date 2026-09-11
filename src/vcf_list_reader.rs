@@ -202,7 +202,7 @@ impl FileCursor {
                             .iter()
                             .zip(format_raw.iter())
                             .map(|(spec, raw)| {
-                                let sample_vals = raw.as_ref().map(|v| v[0].as_slice());
+                                let sample_vals = raw.as_ref().map(|f| f.sample(0));
                                 resolve_scalar(sample_vals, br.source_alt_index, spec)
                             })
                             .collect();
