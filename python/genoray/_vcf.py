@@ -13,7 +13,6 @@ from hirola import HashTable
 import numpy as np
 import oxbow
 import polars as pl
-import pyranges as pr
 from loguru import logger
 from more_itertools import mark_ends
 from natsort import natsorted
@@ -82,18 +81,6 @@ T = TypeVar("T", Genos8, Genos16, Dosages, Genos8Dosages, Genos16Dosages)
 L = TypeVar("L", Genos8, Genos16, Genos8Dosages, Genos16Dosages)
 G = TypeVar("G", Genos8, Genos16)
 GD = TypeVar("GD", Genos8Dosages, Genos16Dosages)
-
-
-class _Index:
-    gr: pr.PyRanges
-    """PyRanges for range queries, just has Chromosome, Start, End, and index columns."""
-    df: pl.DataFrame
-    """All the other columns in the index that aren't #CHROM, start, end, or index. Facilitates
-    index -> attribute lookups."""
-
-    def __init__(self, gr: pr.PyRanges, df: pl.DataFrame):
-        self.gr = gr
-        self.df = df
 
 
 @dataclass(frozen=True)
