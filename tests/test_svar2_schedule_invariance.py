@@ -8,43 +8,21 @@ load-balancing change matters.
 
 from __future__ import annotations
 
-import re
-
 import pytest
 
 from genoray import SparseVar2, Tuning
 
 from tests import _oracle
-
-_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-
-
-def _pipeline_planned_units(captured_text: str) -> int:
-    """Extract the `planned_units=` field logged on the "pipeline config"
-    tracing event, tolerant of Rich's ANSI styling and line-wrapping.
-    Mirrors `_pipeline_reader_workers` in tests/test_svar2_from_vcf.py."""
-    plain = _ANSI_RE.sub("", captured_text)
-    collapsed = re.sub(r"\s+", " ", plain)
-    m = re.search(r"planned_units=(\d+)", collapsed)
-    assert m is not None, (
-        f"no planned_units field found in captured output:\n{captured_text!r}"
-    )
-    return int(m.group(1))
+from tests._log_parsing import log_field_int
 
 
 def _pipeline_schedule(captured_text: str) -> tuple[int, int]:
-    """Extract the `concurrent_chroms=`/`reader_workers=` fields logged on the
-    "pipeline config" tracing event, tolerant of Rich's ANSI styling and
-    line-wrapping. Mirrors `_pipeline_planned_units` above."""
-    plain = _ANSI_RE.sub("", captured_text)
-    collapsed = re.sub(r"\s+", " ", plain)
-    cc_m = re.search(r"concurrent_chroms=(\d+)", collapsed)
-    w_m = re.search(r"reader_workers=(\d+)", collapsed)
-    assert cc_m is not None and w_m is not None, (
-        "no concurrent_chroms/reader_workers field found in captured "
-        f"output:\n{captured_text!r}"
+    """The `(concurrent_chroms, reader_workers)` pair the planner actually
+    chose, read off the "pipeline config" tracing event."""
+    return (
+        log_field_int(captured_text, "concurrent_chroms"),
+        log_field_int(captured_text, "reader_workers"),
     )
-    return int(cc_m.group(1)), int(w_m.group(1))
 
 
 # (concurrent_chroms, reader_workers) -- spans the corners the planner can
@@ -189,7 +167,7 @@ def test_digest_is_invariant_across_frontier_granularities(
     1 unit at `chunk_size=8` -- confirmed directly against
     `shard::plan_unit_count` rather than assumed. Parse the actual
     `planned_units` off the "pipeline config" log line (via `capfd`,
-    following `_pipeline_reader_workers` in tests/test_svar2_from_vcf.py) so
+    via the shared `log_field_int` in tests/_log_parsing.py) so
     the test fails loudly if a future change makes the granularity axis
     inert again, instead of passing vacuously.
     """
@@ -206,8 +184,8 @@ def test_digest_is_invariant_across_frontier_granularities(
             log_level="info",
         )
         captured = capfd.readouterr()
-        planned_units_seen[chunk_size] = _pipeline_planned_units(
-            captured.out + captured.err
+        planned_units_seen[chunk_size] = log_field_int(
+            captured.out + captured.err, "planned_units"
         )
         digests[chunk_size] = _oracle.store_digest(out)
 

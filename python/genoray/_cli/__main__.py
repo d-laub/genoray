@@ -30,9 +30,9 @@ def _validate_log_level(_type: Any, value: str) -> None:
     ``--log-level warn`` is rejected at argument-parsing time instead of
     surfacing deep inside the write pipeline. `log_level` is widened to plain
     `str` (rather than a `Literal`) because `parse_log_level` also accepts
-    `logging` integer constants for the Python API -- but the CLI only ever
-    hands it text, so `str | int` here would just invite cyclopts to guess at
-    coercion.
+    `logging` integer constants -- the CLI only ever hands it text, and
+    `parse_log_level` reads a digit string as the corresponding int (#179),
+    so `str | int` here would just invite cyclopts to guess at coercion.
     """
     parse_log_level(value)
 
@@ -203,7 +203,9 @@ def write_vcf(
         progress: If set, show live write progress (a ``rich`` bar in a terminal, compact
             heartbeat lines otherwise).
         log_level: Minimum severity for write-time log lines: ``off``, ``critical``,
-            ``error``, ``warning``, ``info`` (default), or ``debug`` (case-insensitive).
+            ``error``, ``warning``, ``info`` (default), or ``debug`` (case-insensitive),
+            or a ``logging`` integer constant written out (``10`` = debug, ``20`` =
+            info, ...; an in-between value rounds up to the more severe level).
         log_filter: Advanced: a ``tracing``-style per-target filter directive (e.g.
             ``genoray::monitor=trace``), applied on top of ``--log-level``.
     """
@@ -387,7 +389,9 @@ def write_pgen(
         progress: If set, show live write progress (a ``rich`` bar in a terminal, compact
             heartbeat lines otherwise).
         log_level: Minimum severity for write-time log lines: ``off``, ``critical``,
-            ``error``, ``warning``, ``info`` (default), or ``debug`` (case-insensitive).
+            ``error``, ``warning``, ``info`` (default), or ``debug`` (case-insensitive),
+            or a ``logging`` integer constant written out (``10`` = debug, ``20`` =
+            info, ...; an in-between value rounds up to the more severe level).
         log_filter: Advanced: a ``tracing``-style per-target filter directive (e.g.
             ``genoray::monitor=trace``), applied on top of ``--log-level``.
     """
@@ -536,7 +540,9 @@ def write_from_svar1(
         progress: If set, show live write progress (a ``rich`` bar in a terminal, compact
             heartbeat lines otherwise).
         log_level: Minimum severity for write-time log lines: ``off``, ``critical``,
-            ``error``, ``warning``, ``info`` (default), or ``debug`` (case-insensitive).
+            ``error``, ``warning``, ``info`` (default), or ``debug`` (case-insensitive),
+            or a ``logging`` integer constant written out (``10`` = debug, ``20`` =
+            info, ...; an in-between value rounds up to the more severe level).
         log_filter: Advanced: a ``tracing``-style per-target filter directive (e.g.
             ``genoray::monitor=trace``), applied on top of ``--log-level``.
     """
@@ -782,7 +788,9 @@ def view_svar2(
         threads: Number of threads. Defaults to all available CPUs.
         progress: If set, show a phase-level progress bar while writing the view.
         log_level: Minimum severity for write-time log lines: ``off``, ``critical``,
-            ``error``, ``warning``, ``info`` (default), or ``debug`` (case-insensitive).
+            ``error``, ``warning``, ``info`` (default), or ``debug`` (case-insensitive),
+            or a ``logging`` integer constant written out (``10`` = debug, ``20`` =
+            info, ...; an in-between value rounds up to the more severe level).
         log_filter: Advanced: a ``tracing``-style per-target filter directive (e.g.
             ``genoray::monitor=trace``), applied on top of ``--log-level``.
     """

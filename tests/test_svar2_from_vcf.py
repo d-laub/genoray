@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 import subprocess
 from pathlib import Path
 
@@ -10,6 +9,7 @@ import pytest
 import genoray._utils as _utils
 from genoray import SparseVar2, Tuning
 from tests import _oracle
+from tests._log_parsing import log_field_int
 
 _REF = "ACAGTACATGGGTACTAGCTAGGCTAACCGGTTAACCGGT"
 _BOUNDARY_REF = "CAAAATCAGAGT"
@@ -563,21 +563,6 @@ def test_from_vcf_check_ref_invalid_value_raises(tmp_path: Path):
         SparseVar2.from_vcf(tmp_path / "s", vcf, ref, check_ref="z", threads=1)  # type: ignore[arg-type]
 
 
-_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-
-
-def _pipeline_reader_workers(captured_text: str) -> int:
-    """Extract the `reader_workers=` field logged on the "pipeline config"
-    tracing event, tolerant of Rich's ANSI styling and line-wrapping."""
-    plain = _ANSI_RE.sub("", captured_text)
-    collapsed = re.sub(r"\s+", " ", plain)
-    m = re.search(r"reader_workers=(\d+)", collapsed)
-    assert m is not None, (
-        f"no reader_workers field found in captured output:\n{captured_text!r}"
-    )
-    return int(m.group(1))
-
-
 def test_from_vcf_reader_workers_reaches_the_planner(tmp_path: Path, capfd):
     """`reader_workers` must reach the planner, not just be accepted and
     dropped. A byte-identity check can't tell (schedule invariance already
@@ -606,7 +591,7 @@ def test_from_vcf_reader_workers_reaches_the_planner(tmp_path: Path, capfd):
         log_level="info",
     )
     captured_a = capfd.readouterr()
-    workers_a = _pipeline_reader_workers(captured_a.out + captured_a.err)
+    workers_a = log_field_int(captured_a.out + captured_a.err, "reader_workers")
 
     b = tmp_path / "w5"
     SparseVar2.from_vcf(
@@ -617,7 +602,7 @@ def test_from_vcf_reader_workers_reaches_the_planner(tmp_path: Path, capfd):
         log_level="info",
     )
     captured_b = capfd.readouterr()
-    workers_b = _pipeline_reader_workers(captured_b.out + captured_b.err)
+    workers_b = log_field_int(captured_b.out + captured_b.err, "reader_workers")
 
     assert workers_a == 1
     assert workers_b == 5

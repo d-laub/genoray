@@ -521,9 +521,10 @@ Signature: `from_vcf(out, source, reference=None, *, regions=None, samples=None,
 
   `log_level` is the minimum severity for structured write-time log lines.
   Accepted, case-insensitive: `"off"`, `"critical"`, `"error"`, `"warning"`,
-  `"info"` (default), `"debug"`, or a `logging` module integer constant
+  `"info"` (default), `"debug"`, a `logging` module integer constant
   (`logging.DEBUG` and friends — an in-between int rounds UP to the more
-  severe named level, matching `logging`'s own gate). Canonical ranks:
+  severe named level, matching `logging`'s own gate), or that integer's
+  decimal spelling (`"10"`), which is how the CLI reaches the int path. Canonical ranks:
   `off=0, error=1, warning=2, info=3, debug=4`. `"critical"` is accepted but
   is an **alias for `"error"`** — there is no distinct CRITICAL rank.
   **`"warn"` is rejected** (`ValueError`), on purpose: `logging.warn()` was
@@ -622,7 +623,11 @@ Signature: `from_pgen(out, source, reference=None, *, regions=None, samples=None
   baseline scales with cohort size (`~0.0158 MB/sample`), so this isn't just
   a small-cohort concern: at ~500k samples it alone predicts ~10.6 GB, so a
   *detected* budget on a smaller host will reject the conversion — pass an
-  explicit `max_mem` sized to the host in that case.
+  explicit `max_mem` sized to the host in that case. The per-contig chunk
+  charge is **2 chunk-buffers**, not the 10 the VCF path is charged: the
+  8-chunk reorder-backlog ceiling is a `from_vcf` mechanism that the PGEN
+  pipeline (one reader per contig) never enforces, so budgets between those
+  two brackets that used to raise `ValueError` now plan.
 - **`regions=`/`merge_overlapping=`/`regions_overlap=`** — same convention,
   semantics, and three overlap modes (`"pos"`/`"record"`/`"variant"`) as
   `from_vcf`, restricting conversion to one or more `.pvar` variant-index
@@ -864,12 +869,9 @@ records from SVAR1's arrays and reuses the same conversion spine as `from_vcf`.
 - `chunk_size=None` derives a variant-count budget from cohort size the same
   way as `from_pgen`/`from_vcf_list` (`_auto_chunk_size`) and warns under the
   same below-256-variant condition — see `from_vcf_list`'s `chunk_size` entry
-  above for the details. **Known gap:** this call site always passes
-  `n_format_fields=0`, even though `fields=` (below) selects SVAR1 FORMAT
-  fields and defaults to carrying all of them — so unlike `from_pgen`, the
-  budget here does not account for staged FORMAT bytes and can under-size
-  the chunk when `fields=` carries a wide FORMAT set. Tracked in
-  [#157](https://github.com/d-laub/genoray/issues/157).
+  above for the details. The budget counts the FORMAT fields `fields=` carries
+  (all of them by default), so a wide SVAR1 store derives a smaller chunk, the
+  same as `from_pgen` does for `dosages=`.
 - **Biallelic SVAR1 only** — raises `ValueError` if the source store has
   multiallelic variants (SVAR1's `geno==1` model); re-create the SVAR1 store
   biallelically first.
@@ -1198,7 +1200,8 @@ in Python 3.13, so it is a deprecated spelling, not a convention. The
 parameter is a validated `str` rather than a fixed choice list precisely so
 it cannot drift from `parse_log_level`, which is the single source of truth;
 the integer `logging` constants that function also accepts are reachable
-from `log_level=` in Python, not from this flag), and
+from this flag too, spelled out: `--log-level 10` == `--log-level debug`),
+and
 `--log-filter DIRECTIVE` (maps to
 `log_filter=`; a `tracing`-style `EnvFilter` string, e.g. `--log-filter
 "genoray::monitor=trace"`, independent of `--log-level`; unset/`None` by
