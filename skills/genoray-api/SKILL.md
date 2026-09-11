@@ -623,7 +623,11 @@ Signature: `from_pgen(out, source, reference=None, *, regions=None, samples=None
   baseline scales with cohort size (`~0.0158 MB/sample`), so this isn't just
   a small-cohort concern: at ~500k samples it alone predicts ~10.6 GB, so a
   *detected* budget on a smaller host will reject the conversion — pass an
-  explicit `max_mem` sized to the host in that case.
+  explicit `max_mem` sized to the host in that case. The per-contig chunk
+  charge is **2 chunk-buffers**, not the 10 the VCF path is charged: the
+  8-chunk reorder-backlog ceiling is a `from_vcf` mechanism that the PGEN
+  pipeline (one reader per contig) never enforces, so budgets between those
+  two brackets that used to raise `ValueError` now plan.
 - **`regions=`/`merge_overlapping=`/`regions_overlap=`** — same convention,
   semantics, and three overlap modes (`"pos"`/`"record"`/`"variant"`) as
   `from_vcf`, restricting conversion to one or more `.pvar` variant-index

@@ -281,6 +281,9 @@ fn run_conversion_pipeline(
                 concurrent_chroms: requested.concurrent_chroms,
                 reader_workers: requested.reader_workers,
                 ram: crate::budget::RamLaw::VCF,
+                // The sharded VCF path hands `shard_exec::run` a real
+                // `pending_budget_bytes`, so the plan must afford that ceiling.
+                backlog: crate::budget::BacklogGate::Enforced,
             });
             let sharded = match sharded {
                 Ok(p) => p,
@@ -623,6 +626,11 @@ fn run_pgen_conversion_pipeline(
                 concurrent_chroms: requested.concurrent_chroms,
                 reader_workers: Some(1),
                 ram: crate::budget::RamLaw::PGEN,
+                // The PGEN path hands `shard_exec::run` `u64::MAX`
+                // (`orchestrator.rs`), so there is no backlog ceiling to
+                // afford -- and with `reader_workers = 1` there is one
+                // producer per contig, so nothing to reorder either (#173).
+                backlog: crate::budget::BacklogGate::Disabled,
             });
             let sharded = match sharded {
                 Ok(p) => p,
