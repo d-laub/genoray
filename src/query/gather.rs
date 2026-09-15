@@ -553,7 +553,6 @@ pub fn find_ranges_haps_sparse(
         flat.extend(b);
     }
     let (ptr, cells) = sort_cells_by_region(&flat, r);
-    drop(flat);
     let max_keys: Vec<u64> = acc.iter().map(|a| a.load(Ordering::Relaxed)).collect();
     (ptr, cells, max_keys)
 }

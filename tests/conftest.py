@@ -128,20 +128,27 @@ def build_two_contig_svar2(tmp_path):
 def build_svar2_singleton_store(tmp_path, n_samples: int = 12) -> Path:
     """An svar2 store whose variants all route to the var_key channel.
 
-    One singleton SNP per sample, all inside ``[0, 20)``, so a single region
-    query returns one non-empty var_key cell per sample with strictly ascending
-    ``cell_id``. That is what makes the sparse emitter's ordering observable:
-    the session ``svar2_store`` fixture has one non-empty var_key cell in 18,
-    because at 2 samples the cost model routes its INS and DEL dense.
+    One singleton variant per sample at 1-based POS ``i + 1``, so every
+    position stays inside ``[0, 40)`` (the reference length) for any
+    ``n_samples <= 40``. Sample ``i`` carries its variant on hap ``i % 2``, so
+    cell ids are ``2*i + (i % 2)`` -- distinct, ascending in ``i``, and not
+    simply ``0..H``.
 
-    Sample ``i`` carries SNP ``i`` on hap ``i % 2``, so cell ids are
-    ``2*i + (i % 2)`` -- distinct, ascending in ``i``, and not simply ``0..H``.
+    Sample 2 carries a 1bp deletion instead of a SNP, so the var_key indel
+    channel is non-empty, and -- because it removes an entry from the SNP
+    channel's packed array -- every later sample's own SNP column has a
+    nonzero packed offset (``o0``) despite being empty. That makes the "don't
+    zero an empty channel's raw start" contract observable: a kernel that
+    special-cased an empty overlap to `start = 0` would pass a SNP-only
+    fixture (whose empty starts are all genuinely 0) but fail this one. Every
+    variant stays a singleton (``x_calls == 1``) so the cost model still
+    routes all of them through var_key: the session ``svar2_store`` fixture
+    has one non-empty var_key cell in 18, because at 2 samples the cost model
+    routes its INS and DEL dense.
     """
-    import subprocess
-    from pathlib import Path
+    assert n_samples <= 40, "keep every singleton inside the 40bp reference"
 
     d = Path(tmp_path)
-    assert n_samples <= 20, "keep every singleton inside [0, 20)"
 
     ref = d / "ref.fa"
     ref.write_text(">chr1\n" + _REF + "\n")
@@ -151,11 +158,16 @@ def build_svar2_singleton_store(tmp_path, n_samples: int = 12) -> Path:
     rows = []
     for i in range(n_samples):
         pos = i + 1  # 1-based VCF POS, so REF is _REF[i]
-        ref_base = _REF[i]
-        alt = "A" if ref_base != "A" else "C"
+        if i == 2:
+            ref_allele, alt_allele = _REF[i : i + 2], _REF[i]  # 1bp deletion
+        else:
+            ref_base = _REF[i]
+            ref_allele, alt_allele = ref_base, ("A" if ref_base != "A" else "C")
         gt = ["0|0"] * n_samples
         gt[i] = "1|0" if i % 2 == 0 else "0|1"
-        rows.append(f"chr1\t{pos}\t.\t{ref_base}\t{alt}\t.\t.\t.\tGT\t" + "\t".join(gt))
+        rows.append(
+            f"chr1\t{pos}\t.\t{ref_allele}\t{alt_allele}\t.\t.\t.\tGT\t" + "\t".join(gt)
+        )
     vcf = d / "singletons.vcf"
     vcf.write_text(
         "##fileformat=VCFv4.2\n"

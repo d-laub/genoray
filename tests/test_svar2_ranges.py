@@ -259,14 +259,33 @@ def _assert_sparse_matches_dense(got, snp, indel, sample_start, ploidy):
         "indel_start",
         "indel_len",
     ]
-    for name, g, w in zip(names, got, want):
+    for name, g, w in zip(names, got, want, strict=True):
         np.testing.assert_array_equal(np.asarray(g), w, err_msg=name)
         assert np.asarray(g).dtype == w.dtype, name
 
 
-def test_sparse_chunk_matches_dense_chunk(svar2_singleton_store: Path):
-    """Binding-level parity, per hap slice, against the np.nonzero reference."""
-    sv = SparseVar2(svar2_singleton_store)
+@pytest.mark.parametrize("n_samples", [12, 32])
+def test_sparse_chunk_matches_dense_chunk(
+    n_samples: int, svar2_singleton_store: Path, tmp_path: Path
+):
+    """Binding-level parity, per hap slice, against the np.nonzero reference.
+
+    Parametrized over sample count so both branches of
+    ``find_ranges_haps_sparse`` run: ``n_samples=12`` (24 haps) stays under
+    ``PAR_COLUMN_THRESHOLD`` (64) and takes the serial path;
+    ``n_samples=32`` (64 haps) meets it and takes the rayon path. The ordered
+    ``collect()`` on that path is what the whole region-major /
+    cell_id-ascending contract rests on, so it needs its own coverage rather
+    than trusting the serial path's result.
+    """
+    from tests.conftest import build_svar2_singleton_store
+
+    store = (
+        svar2_singleton_store
+        if n_samples == 12
+        else build_svar2_singleton_store(tmp_path, n_samples=n_samples)
+    )
+    sv = SparseVar2(store)
     starts, ends = [0, 0], [20, 5]
     reg = list(zip(starts, ends))
     reader = sv._reader("chr1")
@@ -312,7 +331,7 @@ def test_sparse_chunk_cell_ids_ascend_within_each_region(
     for r in range(len(reg)):
         block = cell[ptr[r] : ptr[r + 1]]
         assert np.all(np.diff(block) > 0), f"region {r}: {block}"
-    # Sample i carries SNP i on hap i % 2.
+    # Sample i carries its singleton on hap i % 2.
     np.testing.assert_array_equal(
         cell[ptr[0] : ptr[1]],
         np.array([2 * i + (i % 2) for i in range(S)], np.int32),
