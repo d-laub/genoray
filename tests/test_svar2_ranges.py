@@ -376,3 +376,102 @@ def test_sparse_chunk_rejects_out_of_bounds_hap_slice(svar2_singleton_store: Pat
         reader.find_ranges_chunk_sparse([(0, 20)], None, 0, H + 1)
     with pytest.raises(ValueError, match="out of bounds"):
         reader.find_ranges_chunk_sparse([(0, 20)], None, 2, 1)
+
+
+def _reassemble_sparse(stream):
+    """Concatenate a sparse stream into one region-major CSR table.
+
+    Chunks partition the SAMPLE axis, so each chunk holds a full CSR over all
+    regions; merging chunks means interleaving their region blocks, which is exactly
+    what the consumer's per-contig merge does.
+    """
+    R = stream.n_regions
+    keys = stream.dense_max_end_keys.copy()
+    blocks = [[] for _ in range(R)]
+    for ch in stream.chunks:
+        ptr = np.asarray(ch.region_ptr)
+        for r in range(R):
+            s, e = ptr[r], ptr[r + 1]
+            blocks[r].append(
+                (
+                    np.asarray(ch.cell_id)[s:e],
+                    np.asarray(ch.snp_start)[s:e],
+                    np.asarray(ch.snp_len)[s:e],
+                    np.asarray(ch.indel_start)[s:e],
+                    np.asarray(ch.indel_len)[s:e],
+                )
+            )
+        np.maximum(keys, np.asarray(ch.max_end_keys), out=keys)
+    cols = [np.concatenate([b[i] for r in blocks for b in r]) for i in range(5)]
+    counts = [sum(len(b[0]) for b in r) for r in blocks]
+    ptr = np.concatenate([[0], np.cumsum(counts)]).astype(np.int64)
+    return (ptr, *cols), keys
+
+
+@pytest.mark.parametrize("max_mem", [None, 1 << 30, 1 << 8])
+def test_sparse_stream_matches_dense_stream(svar2_singleton_store: Path, max_mem):
+    """Every chunking, down to one sample per chunk, reassembles identically.
+
+    At two regions and ploidy 2, ``bytes_per_sample`` is 128, so ``1 << 8``
+    sizes chunks at exactly one sample -- the most adversarial split, and the
+    smallest value that does not raise.
+    """
+    sv = SparseVar2(svar2_singleton_store)
+    starts, ends = [0, 0], [20, 5]
+    dense = sv._find_ranges_chunked("chr1", starts, ends, max_mem=max_mem)
+    snp, indel, dense_keys = _reassemble(dense)
+
+    sparse = sv._find_ranges_chunked_sparse("chr1", starts, ends, max_mem=max_mem)
+    got, sparse_keys = _reassemble_sparse(sparse)
+    _assert_sparse_matches_dense(got, snp, indel, 0, sv.ploidy)
+    np.testing.assert_array_equal(sparse_keys, dense_keys)
+
+
+def test_sparse_stream_cell_ids_are_absolute_across_chunks(
+    svar2_singleton_store: Path,
+):
+    """A chunk's cell_id indexes the whole selection, not the chunk."""
+    sv = SparseVar2(svar2_singleton_store)
+    stream = sv._find_ranges_chunked_sparse("chr1", [0], [20], max_mem=1 << 8)
+    P = stream.ploidy
+    seen = []
+    for ch in stream.chunks:
+        cid = np.asarray(ch.cell_id)
+        assert np.all(cid >= ch.sample_start * P)
+        assert np.all(cid < (ch.sample_start + ch.n_samples) * P)
+        seen.append(cid)
+    assert stream.samples_per_chunk < stream.n_samples, "expected several chunks"
+    np.testing.assert_array_equal(
+        np.concatenate(seen),
+        np.array([2 * i + (i % 2) for i in range(stream.n_samples)], np.int32),
+    )
+
+
+def test_sparse_stream_rejects_unusable_max_mem(svar2_singleton_store: Path):
+    sv = SparseVar2(svar2_singleton_store)
+    with pytest.raises(ValueError, match="max_mem"):
+        sv._find_ranges_chunked_sparse("chr1", [0], [20], max_mem=1)
+
+
+def test_sparse_stream_sample_subset(svar2_singleton_store: Path):
+    sv = SparseVar2(svar2_singleton_store)
+    sub = [sv.available_samples[2], sv.available_samples[5]]
+    dense = sv._find_ranges_chunked("chr1", [0], [20], samples=sub)
+    snp, indel, _ = _reassemble(dense)
+    sparse = sv._find_ranges_chunked_sparse("chr1", [0], [20], samples=sub)
+    assert sparse.n_samples == 2
+    got, _ = _reassemble_sparse(sparse)
+    _assert_sparse_matches_dense(got, snp, indel, 0, sv.ploidy)
+
+
+def test_ranges_dataclasses_are_slotted():
+    from dataclasses import fields
+
+    from genoray._svar2_batch import RangesChunk, RangesStream, SparseRangesChunk
+
+    for cls in (RangesChunk, RangesStream, SparseRangesChunk):
+        # `cls.__dict__`, not `hasattr`: an inherited `__slots__` would pass
+        # hasattr while the class itself still carried a per-instance dict.
+        slots = cls.__dict__.get("__slots__")
+        assert slots is not None, cls.__name__
+        assert set(slots) == {f.name for f in fields(cls)}, cls.__name__

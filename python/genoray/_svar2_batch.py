@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from functools import cached_property
-from typing import TYPE_CHECKING, Any, TypedDict
+from typing import TYPE_CHECKING, Any, Generic, TypedDict, TypeVar
 
 import numpy as np
 
@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 MAX_END_SHIFT = 21
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class RangesChunk:
     """One hap slice of a chunked ``_find_ranges``.
 
@@ -43,8 +43,53 @@ class RangesChunk:
     max_end_keys: "np.ndarray"
 
 
-@dataclass(frozen=True)
-class RangesStream:
+@dataclass(frozen=True, slots=True)
+class SparseRangesChunk:
+    """One hap slice of a chunked ``_find_ranges``, sparse and region-major.
+
+    Only the ``(region, sample, ploid)`` windows where at least one channel
+    overlaps. At cohort scale that is well under 1% of the grid, so this is the
+    form to build a region-CSR cache from -- the dense :class:`RangesChunk` is
+    ~128 GB per All of Us chr22 contig, over 99% of it the pair ``(0, 0)``.
+
+    Attributes:
+        sample_start: Offset of this chunk on the SELECTED sample axis.
+        n_samples: Number of selected samples in this chunk.
+        region_ptr: Shape ``(n_regions + 1,)`` int64. CSR offsets;
+            ``region_ptr[0] == 0`` and ``region_ptr[-1] == N``.
+        cell_id: Shape ``(N,)`` int32. ``selected_sample * ploidy + ploid``,
+            absolute within the selection -- NOT relative to this chunk, so
+            every value is in ``[sample_start * ploidy, (sample_start +
+            n_samples) * ploidy)``. Strictly ascending inside each region block.
+        snp_start: Shape ``(N,)`` int64. Absolute start into the SNP channel.
+        snp_len: Shape ``(N,)`` int32. Overlap width; ``0`` when that channel is
+            empty for this cell, in which case ``snp_start`` is still the raw
+            insertion point rather than a synthesized ``0``.
+        indel_start: Shape ``(N,)`` int64. As ``snp_start``, indel channel.
+        indel_len: Shape ``(N,)`` int32. As ``snp_len``, indel channel.
+        max_end_keys: Shape ``(n_regions,)``. Identical to
+            :attr:`RangesChunk.max_end_keys` -- reduce across chunks with an
+            elementwise maximum BEFORE unpacking.
+    """
+
+    sample_start: int
+    n_samples: int
+    region_ptr: "np.ndarray"
+    cell_id: "np.ndarray"
+    snp_start: "np.ndarray"
+    snp_len: "np.ndarray"
+    indel_start: "np.ndarray"
+    indel_len: "np.ndarray"
+    max_end_keys: "np.ndarray"
+
+
+#: Chunk type of a :class:`RangesStream` -- :class:`RangesChunk` (dense) or
+#: :class:`SparseRangesChunk`.
+C = TypeVar("C")
+
+
+@dataclass(frozen=True, slots=True)
+class RangesStream(Generic[C]):
     """Memory-bounded, chunked form of ``_find_ranges``.
 
     The ``O(n_regions)`` arrays are computed eagerly; the
@@ -63,7 +108,7 @@ class RangesStream:
     dense_indel_range: "np.ndarray"
     sample_cols: "np.ndarray"
     dense_max_end_keys: "np.ndarray"
-    chunks: "Iterator[RangesChunk]"
+    chunks: "Iterator[C]"
 
 
 class BatchResult(TypedDict):
@@ -94,6 +139,20 @@ class RangesBundle(TypedDict):
     vk_indel_range: np.ndarray
     dense_snp_range: np.ndarray
     dense_indel_range: np.ndarray
+    n_regions: int
+    n_samples: int
+    ploidy: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ChunkPlan:
+    """Everything both chunked range streams need before they diverge."""
+
+    reader: Any
+    reg: "list[tuple[int, int]]"
+    sample_idxs: "list[int] | None"
+    header: "Mapping[str, Any]"
+    per: int
     n_regions: int
     n_samples: int
     ploidy: int
@@ -240,41 +299,20 @@ class _BatchQueryMixin:
                 )
         return self._reader(contig).gather_ranges(ranges)
 
-    def _find_ranges_chunked(
+    def _ranges_chunk_plan(
         self,
         contig: str,
         starts: "ArrayLike",
         ends: "ArrayLike",
-        samples: "ArrayLike | None" = None,
-        *,
-        max_mem: int | None = None,
-    ) -> RangesStream:
-        """Chunked, memory-bounded ``_find_ranges``.
+        samples: "ArrayLike | None",
+        max_mem: int | None,
+    ) -> _ChunkPlan:
+        """Header plus sample-chunk sizing, shared by the dense and sparse streams.
 
-        ``starts``/``ends`` and ``samples`` behave as in :meth:`read_ranges`.
-
-        The var_key payload is ``n_regions * n_samples * ploidy * 2`` int64
-        pairs per channel, which is tens of GiB at cohort scale. This splits it
-        along the SAMPLE axis -- not the region axis -- because the search is
-        column-outer: chunking regions would re-sweep the whole packed store per
-        chunk, while chunking samples keeps a single sweep.
-
-        Args:
-            contig: Contig name.
-            starts: 0-based start positions of the query regions.
-            ends: 0-based, exclusive end positions of the query regions.
-            samples: Sample names selecting (and reordering) a subset.
-            max_mem: Approximate byte budget for one chunk's payload. ``None``
-                yields a single chunk covering every sample.
-
-        Returns:
-            A :class:`RangesStream` whose ``chunks`` generator yields
-            :class:`RangesChunk` in ascending ``sample_start`` order.
-
-        Raises:
-            ValueError: If ``max_mem`` cannot fit a single sample's payload, or
-                if the contig's largest deletion overflows the max-end key
-                packing width.
+        The budget is computed from the DENSE per-sample payload in both cases.
+        The sparse stream's realized allocation is proportional to the non-empty
+        cells instead -- far smaller -- but sizing it from a measured fill would
+        trade a hard worst-case bound for a heuristic, so the bound stays.
         """
         reg = self._regions(starts, ends)
         sample_idxs = self._sample_idxs(samples)
@@ -307,12 +345,81 @@ class _BatchQueryMixin:
                 )
             per = min(per, max(n_samples, 1))
 
+        return _ChunkPlan(
+            reader=reader,
+            reg=reg,
+            sample_idxs=sample_idxs,
+            header=header,
+            per=per,
+            n_regions=n_regions,
+            n_samples=n_samples,
+            ploidy=ploidy,
+        )
+
+    def _ranges_stream(
+        self, plan: _ChunkPlan, chunks: "Iterator[C]"
+    ) -> "RangesStream[C]":
+        """Wrap a chunk generator in the header both streams share."""
+        return RangesStream(
+            n_regions=plan.n_regions,
+            n_samples=plan.n_samples,
+            ploidy=plan.ploidy,
+            samples_per_chunk=plan.per,
+            region_starts=np.asarray(plan.header["region_starts"]),
+            dense_range=np.asarray(plan.header["dense_range"]),
+            dense_snp_range=np.asarray(plan.header["dense_snp_range"]),
+            dense_indel_range=np.asarray(plan.header["dense_indel_range"]),
+            sample_cols=np.asarray(plan.header["sample_cols"]),
+            dense_max_end_keys=np.asarray(plan.header["dense_max_end_keys"], np.int64),
+            chunks=chunks,
+        )
+
+    def _find_ranges_chunked(
+        self,
+        contig: str,
+        starts: "ArrayLike",
+        ends: "ArrayLike",
+        samples: "ArrayLike | None" = None,
+        *,
+        max_mem: int | None = None,
+    ) -> "RangesStream[RangesChunk]":
+        """Chunked, memory-bounded ``_find_ranges``.
+
+        ``starts``/``ends`` and ``samples`` behave as in :meth:`read_ranges`.
+
+        The var_key payload is ``n_regions * n_samples * ploidy * 2`` int64
+        pairs per channel, which is tens of GiB at cohort scale. This splits it
+        along the SAMPLE axis -- not the region axis -- because the search is
+        column-outer: chunking regions would re-sweep the whole packed store per
+        chunk, while chunking samples keeps a single sweep.
+
+        Args:
+            contig: Contig name.
+            starts: 0-based start positions of the query regions.
+            ends: 0-based, exclusive end positions of the query regions.
+            samples: Sample names selecting (and reordering) a subset.
+            max_mem: Approximate byte budget for one chunk's payload. ``None``
+                yields a single chunk covering every sample.
+
+        Returns:
+            A :class:`RangesStream` whose ``chunks`` generator yields
+            :class:`RangesChunk` in ascending ``sample_start`` order.
+
+        Raises:
+            ValueError: If ``max_mem`` cannot fit a single sample's payload, or
+                if the contig's largest deletion overflows the max-end key
+                packing width.
+        """
+        plan = self._ranges_chunk_plan(contig, starts, ends, samples, max_mem)
+
         def _gen() -> "Iterator[RangesChunk]":
-            for s0 in range(0, n_samples, per):
-                s1 = min(s0 + per, n_samples)
-                d = reader.find_ranges_chunk(reg, sample_idxs, s0 * ploidy, s1 * ploidy)
+            for s0 in range(0, plan.n_samples, plan.per):
+                s1 = min(s0 + plan.per, plan.n_samples)
+                d = plan.reader.find_ranges_chunk(
+                    plan.reg, plan.sample_idxs, s0 * plan.ploidy, s1 * plan.ploidy
+                )
                 cs = s1 - s0
-                shape = (cs, ploidy, n_regions, 2)
+                shape = (cs, plan.ploidy, plan.n_regions, 2)
                 yield RangesChunk(
                     sample_start=s0,
                     n_samples=cs,
@@ -321,16 +428,74 @@ class _BatchQueryMixin:
                     max_end_keys=np.asarray(d["max_end_keys"], np.int64),
                 )
 
-        return RangesStream(
-            n_regions=n_regions,
-            n_samples=n_samples,
-            ploidy=ploidy,
-            samples_per_chunk=per,
-            region_starts=np.asarray(header["region_starts"]),
-            dense_range=np.asarray(header["dense_range"]),
-            dense_snp_range=np.asarray(header["dense_snp_range"]),
-            dense_indel_range=np.asarray(header["dense_indel_range"]),
-            sample_cols=np.asarray(header["sample_cols"]),
-            dense_max_end_keys=np.asarray(header["dense_max_end_keys"], np.int64),
-            chunks=_gen(),
-        )
+        return self._ranges_stream(plan, _gen())
+
+    def _find_ranges_chunked_sparse(
+        self,
+        contig: str,
+        starts: "ArrayLike",
+        ends: "ArrayLike",
+        samples: "ArrayLike | None" = None,
+        *,
+        max_mem: int | None = None,
+    ) -> "RangesStream[SparseRangesChunk]":
+        """Sparse, chunked, memory-bounded ``_find_ranges``.
+
+        Identical to :meth:`_find_ranges_chunked` in header, chunking and
+        arguments; each chunk carries only the non-empty
+        ``(region, sample, ploid)`` windows, region-major, as CSR. Build a
+        region-CSR cache from this rather than from the dense stream: at cohort
+        scale under 1% of the grid is non-empty, so the dense intermediate is
+        ~128 GB per All of Us chr22 contig and a consumer's first act is to
+        throw ~99.55% of it away.
+
+        Chunks partition the SAMPLE axis, so each one is a complete CSR over
+        every region for its samples; merging chunks means interleaving their
+        per-region blocks.
+
+        Args:
+            contig: Contig name.
+            starts: 0-based start positions of the query regions.
+            ends: 0-based, exclusive end positions of the query regions.
+            samples: Sample names selecting (and reordering) a subset.
+            max_mem: Approximate byte budget for one chunk, computed from the
+                DENSE payload. ``None`` yields a single chunk.
+
+        Returns:
+            A :class:`RangesStream` whose ``chunks`` generator yields
+            :class:`SparseRangesChunk` in ascending ``sample_start`` order.
+
+        Raises:
+            ValueError: If ``max_mem`` cannot fit a single sample's payload, or
+                if the contig's largest deletion overflows the max-end key
+                packing width.
+        """
+        plan = self._ranges_chunk_plan(contig, starts, ends, samples, max_mem)
+
+        def _gen() -> "Iterator[SparseRangesChunk]":
+            for s0 in range(0, plan.n_samples, plan.per):
+                s1 = min(s0 + plan.per, plan.n_samples)
+                (
+                    region_ptr,
+                    cell_id,
+                    snp_start,
+                    snp_len,
+                    indel_start,
+                    indel_len,
+                    max_end_keys,
+                ) = plan.reader.find_ranges_chunk_sparse(
+                    plan.reg, plan.sample_idxs, s0 * plan.ploidy, s1 * plan.ploidy
+                )
+                yield SparseRangesChunk(
+                    sample_start=s0,
+                    n_samples=s1 - s0,
+                    region_ptr=np.asarray(region_ptr),
+                    cell_id=np.asarray(cell_id),
+                    snp_start=np.asarray(snp_start),
+                    snp_len=np.asarray(snp_len),
+                    indel_start=np.asarray(indel_start),
+                    indel_len=np.asarray(indel_len),
+                    max_end_keys=np.asarray(max_end_keys, np.int64),
+                )
+
+        return self._ranges_stream(plan, _gen())
