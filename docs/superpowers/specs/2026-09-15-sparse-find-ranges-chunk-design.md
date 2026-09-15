@@ -165,29 +165,36 @@ needs region-axis chunking, which is a different change.
 
 ## Testing
 
-**Parity, under Hypothesis.** For random `R`, `S`, `P`, fill and sample
-selections, the sparse chunk must equal the dense chunk of the same call reduced
-by `np.nonzero`: same `N`, same `(region, cell_id)` sequence in the same order,
-same four payload columns. Fill is drawn to include both endpoints — 0% (so `N`
-= 0 and `region_ptr` is all zeros) and 100% (so sparse degenerates to dense
-order). This is the test the dense path is being kept for.
+Property testing lives in Rust, parity testing in Python. genoray has no
+`hypothesis` dependency, and every Python-side store costs a `bcftools` call
+plus a full conversion, so generating stores per example is not viable.
+`proptest` is already a Rust dev-dependency, and the reorder — the only part of
+this change with a non-obvious invariant — is a pure function over a `Vec`.
 
-**Ordering, explicitly.** `region_ptr` non-decreasing with `region_ptr[-1] == N`;
-`cell_id` strictly ascending inside every `[region_ptr[r], region_ptr[r+1])`
-slice. The counting sort's stability is not observable from a single-hap fixture,
-so this needs a store with several samples non-empty in the same region.
+**Rust properties** over `sort_cells_by_region`, in `gather.rs`'s existing
+`mod tests`: for random hap-ascending input, `region_ptr` is non-decreasing with
+`region_ptr[0] == 0` and `region_ptr[-1] == N`; every cell in
+`[region_ptr[r], region_ptr[r+1])` has `region == r`; `cell_id` strictly ascends
+inside each of those slices (the stability requirement); and the output is a
+permutation of the input. Plus units for `N == 0` and `R == 0`.
 
-**Rust units** in `gather.rs`'s existing `mod tests`: counting-sort stability
-against a hand-built multi-hap case, `n_haps == 0`, `R == 0`, and a chunk where
-every cell is empty.
+**Python parity** against the dense path, which is what the dense path is being
+kept for. The reference is GVL's `nonempty_entries` reimplemented in the test as
+a transpose plus `np.nonzero`; the sparse chunk must match it in `N`, in the
+`(region, cell_id)` sequence *in order*, and in all four payload columns. Run at
+the binding level per hap slice, and at the stream level over several `max_mem`
+values including one sample per chunk. Also: an all-empty query region yields
+`N == 0` with `region_ptr` all zeros, and `max_end_keys` matches the dense
+kernel's exactly — it is accumulated separately in the sparse path, so a
+divergence would otherwise be silent.
 
-**`max_end_keys` parity** between the two kernels — it is accumulated
-identically, and a divergence would be silent.
-
-**Fixture caveat.** The `svar2_store` fixture has one non-empty vk cell in 18,
-which already measurably weakened three tests in GVL #407 (filed there as #406).
-The parity tests here must not depend on it alone; the Hypothesis strategy builds
-its own stores.
+**Fixture.** The session `svar2_store` cannot exercise ordering: at 2 samples
+the cost model (`choose_representation`, `src/cost_model.rs:60`) routes its INS
+and DEL dense — both have 3 carrier calls — leaving one non-empty var_key cell
+in 18. The same gap weakened three tests in GVL #407 (filed there as #406). This
+change adds a `build_svar2_singleton_store` helper: one singleton SNP per
+sample, so `x_calls == 1` routes every variant var_key, and a single region
+returns one non-empty cell per sample with strictly ascending `cell_id`.
 
 **Benchmark.** Dense-fill versus sparse-fill wall time on a synthetic store at a
 realistic fill, reported per chunk. This measures what the change actually
