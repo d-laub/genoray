@@ -25,8 +25,22 @@ use crate::py_convert::{u8_to_pyarray, u32_to_i32_pyarray, usize_to_i64_pyarray}
 use crate::py_query::PyContigReader;
 use crate::query::{
     BatchResult, MAX_END_SHIFT, RangesBundle, dense_max_end_keys, find_ranges, find_ranges_haps,
-    gather_ranges, read_ranges,
+    find_ranges_haps_sparse, gather_ranges, read_ranges,
 };
+
+/// `find_ranges_chunk_sparse`'s return: `(region_ptr, cell_id, snp_start,
+/// snp_len, indel_start, indel_len, max_end_keys)`. A tuple, not a dict: this is
+/// a single-consumer payload with a fixed field set, and the Python layer
+/// unpacks it into a frozen, slotted `SparseRangesChunk` at one call site.
+type SparseChunkArrays<'py> = (
+    Bound<'py, PyArray1<i64>>,
+    Bound<'py, PyArray1<i32>>,
+    Bound<'py, PyArray1<i64>>,
+    Bound<'py, PyArray1<i32>>,
+    Bound<'py, PyArray1<i64>>,
+    Bound<'py, PyArray1<i32>>,
+    Bound<'py, PyArray1<i64>>,
+);
 
 /// Identical to `py_query_batch.rs::overlap_batch`'s dict assembly — the whole
 /// point of the search/gather split is that `read_ranges`/`gather_ranges`
@@ -389,5 +403,78 @@ impl PyContigReader {
         d.set_item("hap_lo", hap_lo)?;
         d.set_item("hap_hi", hap_hi)?;
         Ok(d)
+    }
+
+    /// Sparse twin of `find_ranges_chunk`: only the non-empty
+    /// `(region, sample, ploid)` windows of the hap slice `[hap_lo, hap_hi)`,
+    /// region-major, as CSR.
+    ///
+    /// `cell_id` is `selected_sample * ploidy + ploid` and is absolute within
+    /// the SELECTION, so a chunk starting at sample `s0` emits
+    /// `cell_id >= s0 * ploidy`. It ascends strictly inside each region block.
+    ///
+    /// A cell non-empty in only one channel still carries the other channel's
+    /// raw start with length `0` — see `SparseCell`.
+    pub fn find_ranges_chunk_sparse<'py>(
+        &self,
+        py: Python<'py>,
+        regions: Vec<(u32, u32)>,
+        samples: Option<Vec<usize>>,
+        hap_lo: usize,
+        hap_hi: usize,
+    ) -> PyResult<SparseChunkArrays<'py>> {
+        let sample_cols: Vec<usize> = match &samples {
+            Some(s) => s.clone(),
+            None => (0..self.inner.n_samples).collect(),
+        };
+        let h_total = sample_cols.len() * self.inner.ploidy;
+        if hap_lo > hap_hi || hap_hi > h_total {
+            return Err(PyValueError::new_err(format!(
+                "hap slice [{hap_lo}, {hap_hi}) out of bounds for {h_total} haps"
+            )));
+        }
+
+        let (ptr, cells, max_keys) = py.detach(|| {
+            find_ranges_haps_sparse(&self.inner, &regions, &sample_cols, hap_lo, hap_hi)
+        });
+
+        let n = cells.len();
+        let cell_id = PyArray1::<i32>::zeros(py, [n], false);
+        let snp_start = PyArray1::<i64>::zeros(py, [n], false);
+        let snp_len = PyArray1::<i32>::zeros(py, [n], false);
+        let indel_start = PyArray1::<i64>::zeros(py, [n], false);
+        let indel_len = PyArray1::<i32>::zeros(py, [n], false);
+        {
+            // Fill in place rather than building five Vecs and copying: the
+            // payload then exists once, matching `find_ranges_chunk`'s reason
+            // for writing into freshly allocated arrays.
+            let mut w_cell = cell_id.readwrite();
+            let mut w_ss = snp_start.readwrite();
+            let mut w_sl = snp_len.readwrite();
+            let mut w_is = indel_start.readwrite();
+            let mut w_il = indel_len.readwrite();
+            let c_s = w_cell.as_slice_mut()?;
+            let ss_s = w_ss.as_slice_mut()?;
+            let sl_s = w_sl.as_slice_mut()?;
+            let is_s = w_is.as_slice_mut()?;
+            let il_s = w_il.as_slice_mut()?;
+            for (i, c) in cells.iter().enumerate() {
+                c_s[i] = c.cell_id as i32;
+                ss_s[i] = c.snp_start;
+                sl_s[i] = c.snp_len;
+                is_s[i] = c.indel_start;
+                il_s[i] = c.indel_len;
+            }
+        }
+        let max_keys_i64: Vec<i64> = max_keys.iter().map(|&x| x as i64).collect();
+        Ok((
+            PyArray1::from_slice(py, &ptr),
+            cell_id,
+            snp_start,
+            snp_len,
+            indel_start,
+            indel_len,
+            PyArray1::from_slice(py, &max_keys_i64),
+        ))
     }
 }

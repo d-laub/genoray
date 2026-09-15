@@ -5,6 +5,7 @@
 //! per-hap decode.
 
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rayon::prelude::*;
 
@@ -452,6 +453,109 @@ pub fn find_ranges_haps(
                 },
             )
     }
+}
+
+/// Sparse twin of `find_ranges_haps`: the same column-outer sweep, emitting only
+/// the `(region, hap)` windows where at least one channel overlaps.
+///
+/// Returns `(region_ptr, cells, max_end_keys)` with `cells` region-major and
+/// `cell_id` ascending inside each region — `region_ptr` has length
+/// `regions.len() + 1`.
+///
+/// Peak memory is ~2x the emitted payload (the per-hap blocks, then the
+/// concatenation plus its reorder), against the dense path's
+/// `n_haps * R * 32` bytes. At the All of Us chr22 grid that is ~1 GB per
+/// contig against ~128 GB, because 0.45% of cells hold a variant.
+///
+/// The max-end accumulator is a `Vec<AtomicU64>` of length `R` rather than a
+/// per-hap `Vec<u64>` reduced at the end: rayon's ordered `collect` is what
+/// makes the concatenation hap-ascending (and hence the counting sort stable),
+/// and a `fold`/`reduce` that carried the accumulator would give that up.
+/// `R` atomics cost 8 bytes each; per-hap accumulators would cost `R * n_haps`.
+pub fn find_ranges_haps_sparse(
+    reader: &ContigReader,
+    regions: &[(u32, u32)],
+    sample_cols: &[usize],
+    hap_lo: usize,
+    hap_hi: usize,
+) -> (Vec<i64>, Vec<SparseCell>, Vec<u64>) {
+    let ploidy = reader.ploidy;
+    let r = regions.len();
+    let n_haps = hap_hi - hap_lo;
+    if n_haps == 0 || r == 0 {
+        return (vec![0i64; r + 1], Vec::new(), vec![0u64; r]);
+    }
+
+    let acc: Vec<AtomicU64> = (0..r).map(|_| AtomicU64::new(0)).collect();
+
+    let fill = |h_off: usize, out: &mut Vec<SparseCell>| {
+        let h = hap_lo + h_off;
+        let s = sample_cols[h / ploidy];
+        let p = h % ploidy;
+        let snp_ix = reader.vk_snp_index(s * ploidy + p);
+        let indel_ix = reader.vk_indel_index(s, p);
+        let snp_pos = reader.vk_snp.positions();
+        let indel_pos = reader.vk_indel.positions();
+        let indel_keys = as_u32(&reader.vk_indel.keys);
+        for (ri, &(qs, qe)) in regions.iter().enumerate() {
+            let a = snp_ix.overlap(qs, qe);
+            let b = indel_ix.overlap(qs, qe);
+            if a.end == a.start && b.end == b.start {
+                continue;
+            }
+
+            // Same packing as `find_ranges_haps`: positions are sorted within a
+            // column and the overlap range is contiguous, so the last element is
+            // the highest-position overlapping variant.
+            let mut k = 0u64;
+            if a.end > a.start {
+                let pos = snp_pos[a.end - 1] as u64;
+                k = k.max((pos << MAX_END_SHIFT) | 1); // SNP/INS: ext = 1
+            }
+            if b.end > b.start {
+                let i = b.end - 1;
+                let pos = indel_pos[i] as u64;
+                let ext = 1 + rvk::deletion_len(indel_keys[i]) as u64;
+                k = k.max((pos << MAX_END_SHIFT) | ext);
+            }
+            acc[ri].fetch_max(k, Ordering::Relaxed);
+
+            out.push(SparseCell {
+                region: ri as u32,
+                cell_id: h as u32,
+                snp_start: a.start as i64,
+                indel_start: b.start as i64,
+                snp_len: (a.end - a.start) as i32,
+                indel_len: (b.end - b.start) as i32,
+            });
+        }
+    };
+
+    let one_hap = |h_off: usize| -> Vec<SparseCell> {
+        let mut v = Vec::new();
+        fill(h_off, &mut v);
+        v
+    };
+
+    // Same threshold as `find_ranges_haps`, for the same reason: below it the
+    // serial path keeps `search::search_tree_build_count` (a thread-local)
+    // observable in tests.
+    let blocks: Vec<Vec<SparseCell>> = if n_haps < PAR_COLUMN_THRESHOLD {
+        (0..n_haps).map(one_hap).collect()
+    } else {
+        (0..n_haps).into_par_iter().map(one_hap).collect()
+    };
+
+    let total: usize = blocks.iter().map(Vec::len).sum();
+    let mut flat = Vec::with_capacity(total);
+    // Move each block in and drop it as we go, so peak is 2x the payload, not 3x.
+    for b in blocks {
+        flat.extend(b);
+    }
+    let (ptr, cells) = sort_cells_by_region(&flat, r);
+    drop(flat);
+    let max_keys: Vec<u64> = acc.iter().map(|a| a.load(Ordering::Relaxed)).collect();
+    (ptr, cells, max_keys)
 }
 
 /// Search-only pass: run every `SearchTree::new` up front and record the
