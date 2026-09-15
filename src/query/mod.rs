@@ -37,8 +37,8 @@ pub use decode::{HapCalls, QueryResult};
 pub use field::{FieldValue, FieldView};
 pub use gather::{
     BatchResult, BatchResultSplit, HapRanges, MAX_END_SHIFT, PAR_COLUMN_THRESHOLD, RangesBundle,
-    dense_abs_row, find_ranges, find_ranges_haps, gather_haps_readbound, gather_haps_readbound_src,
-    gather_ranges, overlap_batch, read_ranges,
+    SparseCell, dense_abs_row, find_ranges, find_ranges_haps, gather_haps_readbound,
+    gather_haps_readbound_src, gather_ranges, overlap_batch, read_ranges, sort_cells_by_region,
 };
 pub use reader::{ContigReader, VariantStats};
 pub use union::dense_max_end_keys;

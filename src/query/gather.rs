@@ -289,6 +289,59 @@ pub const PAR_COLUMN_THRESHOLD: usize = 64;
 /// by GenVarLoader's existing `_svar2_region_max_ends`; do not change.
 pub const MAX_END_SHIFT: u32 = 21;
 
+/// One non-empty `(region, hap)` var_key window.
+///
+/// Emitted only when at least one channel overlaps. A cell empty in one channel
+/// still carries that channel's raw `start` with length `0`:
+/// `gather_haps_readbound_impl` derives `j = vs + k` inside the var-key loop and
+/// so never reads an empty range's start, and an unconditionally in-bounds start
+/// is strictly safer than a synthesized one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SparseCell {
+    /// Index into the caller's `regions`.
+    pub region: u32,
+    /// `selected_sample * ploidy + ploid`, absolute within the selection.
+    pub cell_id: u32,
+    /// Absolute start into `vk_snp`'s packed positions/keys.
+    pub snp_start: i64,
+    /// Absolute start into `vk_indel`'s packed positions/keys.
+    pub indel_start: i64,
+    /// Overlap width in the SNP channel; `0` when empty.
+    pub snp_len: i32,
+    /// Overlap width in the indel channel; `0` when empty.
+    pub indel_len: i32,
+}
+
+/// Stable counting sort of `cells` into region-major order, with CSR offsets.
+///
+/// Returns `(region_ptr, reordered)` where `region_ptr` has length `r + 1`,
+/// starts at `0` and ends at `cells.len()`.
+///
+/// Stability is a correctness requirement, not an optimization. The caller
+/// concatenates per-hap blocks in ascending hap order, so preserving input order
+/// within a bucket is exactly what makes `cell_id` ascend inside each region —
+/// the ordering the consumer's CSR lookup binary-searches on.
+///
+/// `O(n + r)`, against `O(n log n)` for a comparison sort: at cohort scale `n`
+/// is ~18e6 entries per contig and this runs once per chunk.
+pub fn sort_cells_by_region(cells: &[SparseCell], r: usize) -> (Vec<i64>, Vec<SparseCell>) {
+    let mut ptr = vec![0i64; r + 1];
+    for c in cells {
+        ptr[c.region as usize + 1] += 1;
+    }
+    for i in 0..r {
+        ptr[i + 1] += ptr[i];
+    }
+    let mut cursor: Vec<i64> = ptr[..r].to_vec();
+    let mut out = vec![SparseCell::default(); cells.len()];
+    for c in cells {
+        let slot = &mut cursor[c.region as usize];
+        out[*slot as usize] = *c;
+        *slot += 1;
+    }
+    (ptr, out)
+}
+
 /// Fill hap-major `[hap_lo, hap_hi)` slices of the two var_key range channels,
 /// and return the per-region max `(pos << MAX_END_SHIFT) | ext` composite key
 /// over this hap slice (`0` when a region has no variant).
@@ -1083,8 +1136,90 @@ impl BatchResult {
 mod tests {
     use super::super::sidecar::mmap_file;
     use super::*;
+    use proptest::prelude::*;
     use svar2_codec::PAYLOAD_TOP_SHIFT;
     use tempfile::tempdir;
+
+    fn cell(region: u32, cell_id: u32) -> SparseCell {
+        SparseCell {
+            region,
+            cell_id,
+            snp_start: cell_id as i64 * 10,
+            indel_start: region as i64 * 100,
+            snp_len: 1,
+            indel_len: 0,
+        }
+    }
+
+    #[test]
+    fn test_sort_cells_by_region_groups_and_keeps_hap_order() {
+        // Hap-ascending input: hap 0 hits regions 0 and 2, hap 1 hits region 0,
+        // hap 2 hits regions 1 and 2. Region-major output must interleave them.
+        let input = vec![cell(0, 0), cell(2, 0), cell(0, 1), cell(1, 2), cell(2, 2)];
+        let (ptr, out) = sort_cells_by_region(&input, 3);
+        assert_eq!(ptr, vec![0, 2, 3, 5]);
+        assert_eq!(
+            out,
+            vec![cell(0, 0), cell(0, 1), cell(1, 2), cell(2, 0), cell(2, 2)]
+        );
+    }
+
+    #[test]
+    fn test_sort_cells_by_region_empty_input() {
+        let (ptr, out) = sort_cells_by_region(&[], 3);
+        assert_eq!(ptr, vec![0, 0, 0, 0]);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn test_sort_cells_by_region_zero_regions() {
+        let (ptr, out) = sort_cells_by_region(&[], 0);
+        assert_eq!(ptr, vec![0]);
+        assert!(out.is_empty());
+    }
+
+    proptest! {
+        #[test]
+        fn prop_sort_cells_is_region_major_and_stable(
+            r in 1usize..8,
+            raw in prop::collection::vec((0u32..8, 0u32..16), 0..64),
+        ) {
+            // Shape the input the way the kernel emits it: hap-ascending
+            // outer, region-ascending inner, no duplicate (hap, region).
+            let mut pairs: Vec<(u32, u32)> = raw
+                .into_iter()
+                .map(|(region, cell_id)| (cell_id, region % r as u32))
+                .collect();
+            pairs.sort_unstable();
+            pairs.dedup();
+            let input: Vec<SparseCell> =
+                pairs.iter().map(|&(c, reg)| cell(reg, c)).collect();
+
+            let (ptr, out) = sort_cells_by_region(&input, r);
+
+            prop_assert_eq!(ptr.len(), r + 1);
+            prop_assert_eq!(ptr[0], 0);
+            prop_assert_eq!(*ptr.last().unwrap(), input.len() as i64);
+            prop_assert!(ptr.windows(2).all(|w| w[0] <= w[1]));
+
+            for reg in 0..r {
+                let s = ptr[reg] as usize;
+                let e = ptr[reg + 1] as usize;
+                for c in &out[s..e] {
+                    prop_assert_eq!(c.region as usize, reg);
+                }
+                // Stability: hap-ascending input => cell_id ascends per region.
+                prop_assert!(out[s..e].windows(2).all(|w| w[0].cell_id < w[1].cell_id));
+            }
+
+            // Output is a permutation of the input.
+            let mut a = input.clone();
+            let mut b = out.clone();
+            a.sort_by_key(|c| (c.region, c.cell_id));
+            b.sort_by_key(|c| (c.region, c.cell_id));
+            prop_assert_eq!(a, b);
+        }
+    }
 
     #[test]
     #[allow(clippy::single_range_in_vec_init)]
