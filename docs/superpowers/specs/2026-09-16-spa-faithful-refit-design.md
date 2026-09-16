@@ -239,14 +239,44 @@ supports are equal the two distances are equal too. "Did not change the
 support" is exactly equivalent, and picking either branch under equality gives
 the same answer.
 
-`add_signatures` is SPA's own greedy add: given a present set, repeatedly add
-whichever remaining signature most improves the score, while the improvement
-exceeds `cutoff`. Here it is called with a single candidate already in
-`present`, so it may still add further signatures beyond `c`.
+`add_signatures` is SPA's own greedy add loop, but here it is called with
+`toBeAdded=[c]`, which restricts its candidate pool to `c` alone. It therefore
+adds `c` if and only if doing so improves the distance by strictly more than
+`add_penalty`, and adds nothing else. The loop, the rounding and the
+`finalRecord` bookkeeping inside it all collapse to:
+
+```
+d_base = d(A_c)                 # +inf when A_c is empty
+d_new  = d(A_c union {c})
+result = A_c union {c} if d_base - d_new > add_penalty else A_c
+```
+
+genoray implements that directly rather than porting the general loop, which
+would be dead generality. The equivalence holds only because `toBeAdded` is a
+singleton at every call site in `cosmic_fit`.
 
 This is item 2. Each layer performs a full add-and-remove sweep per candidate,
 so a decision made early can be undone later, which is what forward selection
 cannot do.
+
+### Rounding drives the support
+
+SPA carries an exposure *vector* between stages, not an index set, and derives
+the active set from `np.nonzero(exposures)`. Both `add_signatures` and
+`remove_all_single_signatures` round what they record — `np.round` and
+`roundConserveSum` respectively, after rescaling to the burden. A signature
+whose rescaled activity is under 0.5 therefore rounds to zero and drops out of
+the support on its own, with no threshold ever testing it.
+
+This is load-bearing at low burden and invisible at high burden, and it is not
+something an index-set implementation reproduces. genoray's internal
+representation is therefore the same as SPA's: a full-length `float64` exposure
+vector, with `_support(h) = np.nonzero(h)[0]`.
+
+One asymmetry to preserve: distances are computed from the **unrounded** NNLS
+reconstruction (`newSample = np.dot(W1, weights)` uses raw weights), while the
+recorded exposures are rounded. Scoring off the rounded vector would be a
+divergence.
 
 ### Stage 4: report
 
@@ -368,9 +398,9 @@ concerns already (the estimator, and a pooch-backed COSMIC download registry).
 The SPA path adds roughly 250 lines and a third. Split into a package:
 
 ```
-python/genoray/_signatures/__init__.py   public fit_signatures, cosmic_signatures,
-                                         Forward, Spa, Criterion, Metric,
-                                         ActivityScale, Strategy; re-exports
+python/genoray/_signatures/__init__.py   re-exports only; no logic
+python/genoray/_signatures/_fit.py       fit_signatures driver, name->index
+                                         resolution, joblib fan-out
 python/genoray/_signatures/_strategy.py  Forward, Spa, the Literal aliases,
                                          strategy resolution
 python/genoray/_signatures/_common.py    _nnls, _cosine, _rel_l2, _poisson_ll,
