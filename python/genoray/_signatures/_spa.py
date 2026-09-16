@@ -121,3 +121,45 @@ def _remove_all_single(
         base = best_d
 
     return _exposure(W, m, active, scale=scale)
+
+
+def _try_add(
+    W: NDArray[np.floating],
+    m: NDArray[np.floating],
+    active: Sequence[int],
+    cand: int,
+    *,
+    cutoff: float,
+    metric: str,
+) -> list[int]:
+    """SPA's ``add_signatures`` restricted to a single candidate.
+
+    ``add_remove_signatures`` always calls ``add_signatures`` with
+    ``toBeAdded=[c]``, which restricts its candidate pool to ``c`` alone. Its
+    loop therefore runs at most one accepting iteration, and the whole
+    routine collapses to: add ``c`` if and only if it improves the distance
+    by strictly more than ``cutoff``.
+
+    The strict inequality is SPA's (``if originalSimilarity - bestSimilarity >
+    cutoff``). An empty active set has infinite distance, so the first
+    signature is always accepted, matching SPA's ``originalSimilarity =
+    np.inf`` initialization.
+    """
+    active = sorted(active)
+    if cand in active:
+        return active
+    base = np.inf if not active else _distance(m, _reconstruction(W, m, active), metric)
+    new = sorted([*active, cand])
+    d_new = _distance(m, _reconstruction(W, m, new), metric)
+    return new if base - d_new > cutoff else active
+
+
+def _expand_connected(
+    active: Sequence[int], groups: tuple[tuple[int, ...], ...]
+) -> list[int]:
+    """SPA's ``add_connected_sigs``: if any group member is active, add them all."""
+    out = set(active)
+    for group in groups:
+        if out.intersection(group):
+            out.update(group)
+    return sorted(out)

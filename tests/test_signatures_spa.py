@@ -349,3 +349,72 @@ def test_removal_never_lowers_relative_l2(seed: int):
         sub = [i for i in full if i != drop]
         d = _rel_l2(m, W[:, sub] @ _nnls(W[:, sub], m))
         assert d >= base - 1e-9, f"dropping {drop} lowered relative L2"
+
+
+def test_try_add_accepts_a_signature_that_helps():
+    from genoray._signatures._spa import _try_add
+
+    W = _identity_ref(3)
+    m = np.array([600.0, 400.0, 0.0])
+    assert _try_add(W, m, [0], 1, cutoff=0.05, metric="l2") == [0, 1]
+
+
+def test_try_add_rejects_a_signature_that_does_not_help_enough():
+    from genoray._signatures._spa import _try_add
+
+    W = _identity_ref(3)
+    m = np.array([1000.0, 1.0, 0.0])
+    # Adding S2 explains 1 of 1001 mutations: an improvement far under 0.05.
+    assert _try_add(W, m, [0], 1, cutoff=0.05, metric="l2") == [0]
+
+
+def test_try_add_on_an_empty_active_set_always_adds():
+    from genoray._signatures._spa import _try_add
+
+    W = _identity_ref(3)
+    m = np.array([600.0, 400.0, 0.0])
+    assert _try_add(W, m, [], 0, cutoff=0.05, metric="l2") == [0]
+
+
+def test_try_add_is_a_noop_when_already_active():
+    from genoray._signatures._spa import _try_add
+
+    W = _identity_ref(3)
+    m = np.array([600.0, 400.0, 0.0])
+    assert _try_add(W, m, [0, 1], 1, cutoff=0.05, metric="l2") == [0, 1]
+
+
+def test_try_add_returns_sorted_indices():
+    from genoray._signatures._spa import _try_add
+
+    W = _identity_ref(4)
+    m = np.array([100.0, 100.0, 100.0, 0.0])
+    assert _try_add(W, m, [2], 0, cutoff=0.01, metric="l2") == [0, 2]
+
+
+def test_expand_connected_pulls_in_the_whole_group():
+    from genoray._signatures._spa import _expand_connected
+
+    groups = ((1, 5), (2, 3, 4))
+    assert _expand_connected([1], groups) == [1, 5]
+    assert _expand_connected([3], groups) == [2, 3, 4]
+
+
+def test_expand_connected_leaves_ungrouped_alone():
+    from genoray._signatures._spa import _expand_connected
+
+    groups = ((1, 5),)
+    assert _expand_connected([0, 7], groups) == [0, 7]
+
+
+def test_expand_connected_handles_multiple_groups_at_once():
+    from genoray._signatures._spa import _expand_connected
+
+    groups = ((1, 5), (2, 3))
+    assert _expand_connected([1, 2], groups) == [1, 2, 3, 5]
+
+
+def test_expand_connected_with_no_groups_is_identity():
+    from genoray._signatures._spa import _expand_connected
+
+    assert _expand_connected([3, 1], ()) == [1, 3]
