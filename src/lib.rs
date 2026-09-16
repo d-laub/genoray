@@ -1709,6 +1709,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "conversion")]
     m.add_class::<PyEventReceiver>()?;
     m.add_class::<crate::py_query::PyContigReader>()?;
+    m.add_class::<crate::py_query_ranges::PyRangesQuery>()?;
     m.add_class::<crate::py_svar1_query::PySvar1Reader>()?;
     Ok(())
 }

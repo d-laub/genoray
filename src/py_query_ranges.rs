@@ -42,6 +42,43 @@ type SparseChunkArrays<'py> = (
     Bound<'py, PyArray1<i64>>,
 );
 
+/// The region list and sample selection of a chunked `find_ranges`, marshalled
+/// from Python ONCE for the whole stream.
+///
+/// Every chunk of a stream asks the same question about a different hap slice,
+/// so passing `regions` and `samples` per chunk re-extracted `O(R + S)` Python
+/// objects each time — work that is invariant across the stream and is paid
+/// `n_chunks` times. At the All of Us chr22 shape (R = 3,734, S = 535,662) that
+/// measured **3.26 ms per chunk**, 93% of it re-reading the same sample list
+/// (#205). Holding the marshalled form makes the per-chunk cost O(1).
+///
+/// Built by [`PyContigReader::ranges_query`], which validates the selection
+/// against the reader it came from, so the chunk calls only have to bounds-check
+/// the hap slice.
+#[pyclass(frozen, module = "genoray._core", name = "RangesQuery")]
+pub struct PyRangesQuery {
+    pub(crate) regions: Vec<(u32, u32)>,
+    /// The resolved selection: `samples` as given, or `0..n_samples`.
+    pub(crate) sample_cols: Vec<usize>,
+    /// Whether the selection was the whole cohort *implicitly* (`samples=None`).
+    /// `dense_max_end_keys` takes a cohort-wide shortcut on it, so an explicit
+    /// `0..n_samples` list is deliberately NOT the same thing.
+    pub(crate) all_samples: bool,
+}
+
+impl PyRangesQuery {
+    /// Validate a hap slice against this query's selection, returning `n_haps`.
+    fn n_haps(&self, ploidy: usize, hap_lo: usize, hap_hi: usize) -> PyResult<usize> {
+        let h_total = self.sample_cols.len() * ploidy;
+        if hap_lo > hap_hi || hap_hi > h_total {
+            return Err(PyValueError::new_err(format!(
+                "hap slice [{hap_lo}, {hap_hi}) out of bounds for {h_total} haps"
+            )));
+        }
+        Ok(hap_hi - hap_lo)
+    }
+}
+
 /// Identical to `py_query_batch.rs::overlap_batch`'s dict assembly — the whole
 /// point of the search/gather split is that `read_ranges`/`gather_ranges`
 /// produce the same numpy contract as `overlap_batch`.
@@ -268,14 +305,44 @@ impl PyContigReader {
         batch_result_to_dict(py, self.inner.lut_arrays(), &br)
     }
 
+    /// Marshal a chunked query's region list and sample selection once, for
+    /// reuse across every chunk of the stream. See [`PyRangesQuery`].
+    ///
+    /// Validates the selection here so the per-chunk calls don't have to: an
+    /// out-of-range sample index would otherwise only surface deep inside the
+    /// search, as an index panic on a hap the chunking happened to reach.
+    pub fn ranges_query(
+        &self,
+        regions: Vec<(u32, u32)>,
+        samples: Option<Vec<usize>>,
+    ) -> PyResult<PyRangesQuery> {
+        let n_samples = self.inner.n_samples;
+        let all_samples = samples.is_none();
+        let sample_cols: Vec<usize> = match samples {
+            Some(s) => {
+                if let Some(&bad) = s.iter().find(|&&i| i >= n_samples) {
+                    return Err(PyValueError::new_err(format!(
+                        "sample index {bad} out of bounds for {n_samples} samples"
+                    )));
+                }
+                s
+            }
+            None => (0..n_samples).collect(),
+        };
+        Ok(PyRangesQuery {
+            regions,
+            sample_cols,
+            all_samples,
+        })
+    }
+
     /// Region-level half of a chunked `find_ranges`: everything whose size is
     /// O(regions) rather than O(regions * samples * ploidy), plus the dense
     /// channel's max-end contribution. Cheap enough to compute eagerly.
     pub fn find_ranges_header<'py>(
         &self,
         py: Python<'py>,
-        regions: Vec<(u32, u32)>,
-        samples: Option<Vec<usize>>,
+        query: &PyRangesQuery,
     ) -> PyResult<Bound<'py, PyDict>> {
         // Fail fast rather than silently corrupting a packed key. `ext` is
         // 1 + deletion_len and must fit below the position field.
@@ -286,11 +353,12 @@ impl PyContigReader {
             ));
         }
 
-        let all_samples = samples.is_none();
-        let sample_cols: Vec<usize> = match &samples {
-            Some(s) => s.clone(),
-            None => (0..self.inner.n_samples).collect(),
-        };
+        let PyRangesQuery {
+            regions,
+            sample_cols,
+            all_samples,
+        } = query;
+        let (regions, sample_cols, all_samples) = (regions, sample_cols, *all_samples);
 
         let dense = self.inner.dense_union();
         let dense_ix = dense.index();
@@ -309,13 +377,7 @@ impl PyContigReader {
             .map(|&(qs, qe)| dense_indel_ix.overlap(qs, qe))
             .collect();
         let region_starts: Vec<u32> = regions.iter().map(|&(qs, _)| qs).collect();
-        let dmax = dense_max_end_keys(
-            &self.inner,
-            &regions,
-            &dense_range,
-            &sample_cols,
-            all_samples,
-        );
+        let dmax = dense_max_end_keys(&self.inner, regions, &dense_range, sample_cols, all_samples);
 
         let pairs_i32 = |v: &[Range<usize>]| -> Vec<i32> {
             let mut o = Vec::with_capacity(v.len() * 2);
@@ -357,22 +419,12 @@ impl PyContigReader {
     pub fn find_ranges_chunk<'py>(
         &self,
         py: Python<'py>,
-        regions: Vec<(u32, u32)>,
-        samples: Option<Vec<usize>>,
+        query: &PyRangesQuery,
         hap_lo: usize,
         hap_hi: usize,
     ) -> PyResult<Bound<'py, PyDict>> {
-        let sample_cols: Vec<usize> = match &samples {
-            Some(s) => s.clone(),
-            None => (0..self.inner.n_samples).collect(),
-        };
-        let h_total = sample_cols.len() * self.inner.ploidy;
-        if hap_lo > hap_hi || hap_hi > h_total {
-            return Err(PyValueError::new_err(format!(
-                "hap slice [{hap_lo}, {hap_hi}) out of bounds for {h_total} haps"
-            )));
-        }
-        let n_haps = hap_hi - hap_lo;
+        let n_haps = query.n_haps(self.inner.ploidy, hap_lo, hap_hi)?;
+        let (regions, sample_cols) = (&query.regions, &query.sample_cols);
         let r = regions.len();
 
         let snp = PyArray2::<i64>::zeros(py, [n_haps * r, 2], false);
@@ -385,8 +437,8 @@ impl PyContigReader {
             py.detach(|| {
                 find_ranges_haps(
                     &self.inner,
-                    &regions,
-                    &sample_cols,
+                    regions,
+                    sample_cols,
                     hap_lo,
                     hap_hi,
                     snp_s,
@@ -423,25 +475,15 @@ impl PyContigReader {
     pub fn find_ranges_chunk_sparse<'py>(
         &self,
         py: Python<'py>,
-        regions: Vec<(u32, u32)>,
-        samples: Option<Vec<usize>>,
+        query: &PyRangesQuery,
         hap_lo: usize,
         hap_hi: usize,
     ) -> PyResult<SparseChunkArrays<'py>> {
-        let sample_cols: Vec<usize> = match &samples {
-            Some(s) => s.clone(),
-            None => (0..self.inner.n_samples).collect(),
-        };
-        let h_total = sample_cols.len() * self.inner.ploidy;
-        if hap_lo > hap_hi || hap_hi > h_total {
-            return Err(PyValueError::new_err(format!(
-                "hap slice [{hap_lo}, {hap_hi}) out of bounds for {h_total} haps"
-            )));
-        }
+        query.n_haps(self.inner.ploidy, hap_lo, hap_hi)?;
+        let (regions, sample_cols) = (&query.regions, &query.sample_cols);
 
-        let (ptr, cells, max_keys) = py.detach(|| {
-            find_ranges_haps_sparse(&self.inner, &regions, &sample_cols, hap_lo, hap_hi)
-        });
+        let (ptr, cells, max_keys) = py
+            .detach(|| find_ranges_haps_sparse(&self.inner, regions, sample_cols, hap_lo, hap_hi));
 
         let n = cells.len();
         let cell_id = PyArray1::<i32>::zeros(py, [n], false);
