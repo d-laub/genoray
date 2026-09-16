@@ -501,38 +501,52 @@ fn run_conversion_pipeline(
 /// `pgenlib.PgenReader`s for `chroms[i]` -- one per potential shard -- since
 /// readers seek independently and must never be shared, whether across contigs
 /// or across shards of the same contig.
+///
+/// Keyword-only (#200). `chroms`/`samples`/`region_ranges`/`regions_overlap`
+/// arrive grouped in `regions`, and `chunk_size`/`max_threads`/
+/// `long_allele_capacity`/`max_mem_bytes` in `plan`; both are destructured at
+/// the top of the body, so the names used below are those fields.
 #[cfg(feature = "conversion")]
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 #[pyfunction]
-#[pyo3(signature = (pgen_path, pvar_path, reference_path, chroms, contig_ranges, output_dir, samples, chunk_size, max_threads, long_allele_capacity, skip_out_of_scope, signatures, dosage_fields, readers, dosage_readers, check_ref, region_ranges, regions_overlap, sample_perm, max_mem_bytes=None, log_level = "info".to_string(), tuning=None, log_filter=None, receiver = None))]
+#[pyo3(signature = (*, pgen_path, pvar_path, reference_path, output_dir, regions, plan, contig_ranges, dosage_fields, readers, dosage_readers, sample_perm, skip_out_of_scope=false, signatures=false, check_ref="e".to_string(), log_level="info".to_string(), tuning=None, log_filter=None, receiver=None))]
 fn run_pgen_conversion_pipeline(
     py: Python,
     pgen_path: String,
     pvar_path: String,
     reference_path: Option<String>,
-    chroms: Vec<String>,
-    contig_ranges: Vec<(usize, usize)>,
     output_dir: String,
-    samples: Vec<String>,
-    chunk_size: usize,
-    max_threads: Option<usize>,
-    long_allele_capacity: usize,
-    skip_out_of_scope: bool,
-    signatures: bool,
-    dosage_fields: Vec<(String, String, String, Option<String>, Option<f64>)>,
+    regions: crate::pipeline_args::RegionSpec,
+    plan: crate::pipeline_args::PlanSettings,
+    contig_ranges: Vec<(usize, usize)>,
+    dosage_fields: Vec<crate::pipeline_args::FieldTuple>,
     readers: Vec<Vec<Py<PyAny>>>,
     dosage_readers: Vec<Vec<Vec<Py<PyAny>>>>,
-    check_ref: String,
-    region_ranges: Vec<(String, u32, u32)>,
-    regions_overlap: String,
     sample_perm: Vec<usize>,
-    max_mem_bytes: Option<u64>,
+    skip_out_of_scope: bool,
+    signatures: bool,
+    check_ref: String,
     log_level: String,
     tuning: Option<crate::tuning::TuningIn>,
     log_filter: Option<String>,
     receiver: Option<Py<PyEventReceiver>>,
 ) -> PyResult<usize> {
+    // Destructured once, here at the boundary -- same shape as
+    // `run_conversion_pipeline`: the grouping exists to stop a caller mixing
+    // these up, and the body below reads exactly as it did before.
+    let crate::pipeline_args::RegionSpec {
+        chroms,
+        samples,
+        region_ranges,
+        regions_overlap,
+    } = regions;
+    let crate::pipeline_args::PlanSettings {
+        chunk_size,
+        max_threads,
+        long_allele_capacity,
+        max_mem_bytes,
+    } = plan;
     if chroms.len() != contig_ranges.len() || chroms.len() != readers.len() {
         return Err(PyValueError::new_err(
             "chroms, contig_ranges, and readers must be the same length",
@@ -912,21 +926,22 @@ fn merge_regions(mut regions: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
 /// `svar2_slice::Routing`. Contigs are sliced concurrently across a rayon pool
 /// sized by `max_threads` (`None` autodetects); slicing is independent per
 /// contig, so this changes wall time only, never a single output byte.
+///
+/// Keyword-only (#200). The contigs/samples/ranges/overlap quartet arrives
+/// grouped in `regions`; this pipeline's local names `contigs` and `regions`
+/// are `RegionSpec`'s `chroms` and `region_ranges`, rebound on destructuring.
 #[cfg(feature = "conversion")]
 #[allow(clippy::type_complexity)]
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (store_path, out_dir, contigs, samples, regions, regions_overlap, merge_overlapping, fields, reference=None, reroute=false, max_threads=None, overwrite=false, log_level="info".to_string(), log_filter=None, receiver=None))]
+#[pyo3(signature = (*, store_path, out_dir, regions, fields, merge_overlapping, reference=None, reroute=false, max_threads=None, overwrite=false, log_level="info".to_string(), log_filter=None, receiver=None))]
 pub fn run_slice_view(
     py: Python,
     store_path: String,
     out_dir: String,
-    contigs: Vec<String>,
-    samples: Vec<String>,
-    regions: Vec<(String, u32, u32)>,
-    regions_overlap: String,
-    merge_overlapping: bool,
+    regions: crate::pipeline_args::RegionSpec,
     fields: Vec<(String, String, String, Option<f64>)>,
+    merge_overlapping: bool,
     reference: Option<String>,
     reroute: bool,
     max_threads: Option<usize>,
@@ -939,6 +954,20 @@ pub fn run_slice_view(
     use crate::field::{FieldCategory, FieldSpec, HtslibType, StorageDtype};
     use crate::field_finalize::ResolvedField;
     use crate::svar2_slice::Routing;
+
+    // Destructured once, here at the boundary -- same shape as
+    // `run_conversion_pipeline`. `contigs`/`regions` were this pipeline's local
+    // names for `RegionSpec`'s `chroms`/`region_ranges`; the struct's names are
+    // the shared ones, so they are rebound here rather than renamed throughout
+    // the body. (Note the local `FieldSpec` imported just above is
+    // `field::FieldSpec`, unrelated to `pipeline_args::FieldSpec` -- which is
+    // why every `pipeline_args` type here stays fully qualified.)
+    let crate::pipeline_args::RegionSpec {
+        chroms: contigs,
+        samples,
+        region_ranges: regions,
+        regions_overlap,
+    } = regions;
 
     // --- fail-fast band: every raise here happens BEFORE the output dir is
     // created, so a rejected request leaves no bytes. ---
@@ -1265,40 +1294,68 @@ fn svar2_variant_stats<'py>(
 /// `samples[i]` -- the two lists are parallel, one file per sample. Contigs
 /// run sequentially (see `orchestrator::run_vcf_list`'s docs); `signatures`
 /// requires a reference (validated Python-side).
+///
+/// Keyword-only (#200), which is what removes this pipeline's copy of the #153
+/// hazard: `info_fields` and `format_fields` now arrive as named members of
+/// `fields` rather than as an adjacent, identically typed, interchangeable
+/// pair. `regions` and `plan` group the rest. This path plans by core count
+/// and never honours a byte budget, so a non-`None` `plan.max_mem_bytes` is
+/// rejected up front rather than silently dropped.
 #[cfg(feature = "conversion")]
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 #[pyfunction]
-#[pyo3(signature = (vcf_paths, reference_path, chroms, output_dir, samples, contig_membership, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false, signatures=false, info_fields=Vec::new(), format_fields=Vec::new(), check_ref="e".to_string(), region_ranges=Vec::new(), regions_overlap="pos".to_string(), log_level = "info".to_string(), tuning=None, log_filter=None, receiver = None))]
+#[pyo3(signature = (*, vcf_paths, reference_path, output_dir, regions, fields, plan, contig_membership, ploidy=2, skip_out_of_scope=false, signatures=false, check_ref="e".to_string(), log_level="info".to_string(), tuning=None, log_filter=None, receiver=None))]
 fn run_vcf_list_conversion_pipeline(
     py: Python,
     vcf_paths: Vec<String>,
     reference_path: Option<String>,
-    chroms: Vec<String>,
     output_dir: String,
-    samples: Vec<String>,
+    regions: crate::pipeline_args::RegionSpec,
+    fields: crate::pipeline_args::FieldSpec,
+    plan: crate::pipeline_args::PlanSettings,
     // `contig_membership[c][i]` == whether `vcf_paths[i]` has records on
     // `chroms[c]` (computed Python-side via the same cyvcf2 probe that builds
     // the contig union). Parallel: outer to `chroms`, inner to `vcf_paths`.
     // Threaded down so a file with no records on a contig is never opened/seeked
     // for it (issue #122).
     contig_membership: Vec<Vec<bool>>,
-    chunk_size: usize,
     ploidy: usize,
-    max_threads: Option<usize>,
-    long_allele_capacity: usize,
     skip_out_of_scope: bool,
     signatures: bool,
-    info_fields: Vec<(String, String, String, Option<String>, Option<f64>)>,
-    format_fields: Vec<(String, String, String, Option<String>, Option<f64>)>,
     check_ref: String,
-    region_ranges: Vec<(String, u32, u32)>,
-    regions_overlap: String,
     log_level: String,
     tuning: Option<crate::tuning::TuningIn>,
     log_filter: Option<String>,
     receiver: Option<Py<PyEventReceiver>>,
 ) -> PyResult<usize> {
+    // Destructured once, here at the boundary -- same shape as
+    // `run_conversion_pipeline`: the grouping exists to stop a caller mixing
+    // these up, and the body below reads exactly as it did before.
+    let crate::pipeline_args::RegionSpec {
+        chroms,
+        samples,
+        region_ranges,
+        regions_overlap,
+    } = regions;
+    let crate::pipeline_args::FieldSpec {
+        info: info_fields,
+        format: format_fields,
+    } = fields;
+    let crate::pipeline_args::PlanSettings {
+        chunk_size,
+        max_threads,
+        long_allele_capacity,
+        max_mem_bytes,
+    } = plan;
+    // This path never plans against a byte budget. Rather than accept
+    // `max_mem_bytes` and drop it silently -- trading a positional hazard for a
+    // semantic one (#200) -- reject it, so a caller that sets one finds out.
+    if max_mem_bytes.is_some() {
+        return Err(PyValueError::new_err(
+            "max_mem_bytes is not honoured by this pipeline; leave it None",
+        ));
+    }
     let check_ref: crate::normalize::CheckRef = check_ref.parse().map_err(PyValueError::new_err)?;
     // Parse the region-overlap mode once, up front, so a bad value raises
     // before any output byte is written -- mirrors `run_conversion_pipeline`.
@@ -1359,42 +1416,67 @@ fn run_vcf_list_conversion_pipeline(
 /// the ORIGINAL SVAR1 sample index that OUTPUT column `out_s` (`samples[out_s]`)
 /// reads from -- the same permutation for every contig, threaded down to
 /// `Svar1RecordSource::new`'s bucket remap.
+///
+/// Keyword-only (#200), which is what removes the hazard specific to this
+/// signature: `ref_bytes_per_contig`, `ref_offsets_per_contig`,
+/// `alt_bytes_per_contig` and `alt_offsets_per_contig` are four vectors whose
+/// types make any permutation of them compile. `regions` and `plan` group the
+/// usual quartets; as with the VCF-list path, a non-`None` `plan.max_mem_bytes`
+/// is rejected rather than ignored.
 #[cfg(feature = "conversion")]
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 #[pyfunction]
-#[pyo3(signature = (svar1_dir, reference_path, chroms, contig_starts, contig_lens, output_dir, samples, ploidy, chunk_size, max_threads, long_allele_capacity, skip_out_of_scope, signatures, pos_per_contig, ref_bytes_per_contig, ref_offsets_per_contig, alt_bytes_per_contig, alt_offsets_per_contig, format_fields, format_src_dtypes, check_ref, region_ranges, regions_overlap, sample_idx, log_level = "info".to_string(), tuning=None, log_filter=None, receiver = None))]
+#[pyo3(signature = (*, svar1_dir, reference_path, output_dir, regions, plan, contig_starts, contig_lens, pos_per_contig, ref_bytes_per_contig, ref_offsets_per_contig, alt_bytes_per_contig, alt_offsets_per_contig, format_fields, format_src_dtypes, sample_idx, ploidy=2, skip_out_of_scope=false, signatures=false, check_ref="e".to_string(), log_level="info".to_string(), tuning=None, log_filter=None, receiver=None))]
 fn run_svar1_conversion_pipeline(
     py: Python,
     svar1_dir: String,
     reference_path: Option<String>,
-    chroms: Vec<String>,
+    output_dir: String,
+    regions: crate::pipeline_args::RegionSpec,
+    plan: crate::pipeline_args::PlanSettings,
     contig_starts: Vec<usize>,
     contig_lens: Vec<usize>,
-    output_dir: String,
-    samples: Vec<String>,
-    ploidy: usize,
-    chunk_size: usize,
-    max_threads: Option<usize>,
-    long_allele_capacity: usize,
-    skip_out_of_scope: bool,
-    signatures: bool,
     pos_per_contig: Vec<Vec<u32>>,
     ref_bytes_per_contig: Vec<Vec<u8>>,
     ref_offsets_per_contig: Vec<Vec<i64>>,
     alt_bytes_per_contig: Vec<Vec<u8>>,
     alt_offsets_per_contig: Vec<Vec<i64>>,
-    format_fields: Vec<(String, String, String, Option<String>, Option<f64>)>,
+    format_fields: Vec<crate::pipeline_args::FieldTuple>,
     format_src_dtypes: Vec<String>,
-    check_ref: String,
-    region_ranges: Vec<(String, u32, u32)>,
-    regions_overlap: String,
     sample_idx: Vec<usize>,
+    ploidy: usize,
+    skip_out_of_scope: bool,
+    signatures: bool,
+    check_ref: String,
     log_level: String,
     tuning: Option<crate::tuning::TuningIn>,
     log_filter: Option<String>,
     receiver: Option<Py<PyEventReceiver>>,
 ) -> PyResult<usize> {
+    // Destructured once, here at the boundary -- same shape as
+    // `run_conversion_pipeline`: the grouping exists to stop a caller mixing
+    // these up, and the body below reads exactly as it did before.
+    let crate::pipeline_args::RegionSpec {
+        chroms,
+        samples,
+        region_ranges,
+        regions_overlap,
+    } = regions;
+    let crate::pipeline_args::PlanSettings {
+        chunk_size,
+        max_threads,
+        long_allele_capacity,
+        max_mem_bytes,
+    } = plan;
+    // This path never plans against a byte budget. Rather than accept
+    // `max_mem_bytes` and drop it silently -- trading a positional hazard for a
+    // semantic one (#200) -- reject it, so a caller that sets one finds out.
+    if max_mem_bytes.is_some() {
+        return Err(PyValueError::new_err(
+            "max_mem_bytes is not honoured by this pipeline; leave it None",
+        ));
+    }
     let n = chroms.len();
     if [
         contig_starts.len(),
