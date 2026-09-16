@@ -133,8 +133,9 @@ def test_signatures_is_a_package():
 
 
 def test_internal_importers_still_work():
-    from genoray._svar._annotate import SparseVar  # noqa: F401
-    from genoray._svar2_mutcat import Svar2MutcatMixin  # noqa: F401
+    """The two sibling modules that import from _signatures directly."""
+    from genoray._svar._annotate import SparseVarAnnotateMixin  # noqa: F401
+    from genoray._svar2_mutcat import _MutcatMixin  # noqa: F401
 ```
 
 - [ ] **Step 2: Run it to confirm the package test fails**
@@ -143,7 +144,7 @@ Run: `pixi run pytest tests/test_signatures_package.py -v`
 
 Expected: `test_signatures_is_a_package` FAILS (`_signatures` is a module, no `__path__`). The `PRESERVED_NAMES` tests pass already — that is correct, they are the regression guard.
 
-If `test_internal_importers_still_work` fails on the `Svar2MutcatMixin` name, open `python/genoray/_svar2_mutcat.py`, read the actual mixin class name, and use it. Do not delete the test.
+The two class names in `test_internal_importers_still_work` were verified against the source before this plan was written: `SparseVarAnnotateMixin` at `python/genoray/_svar/_annotate.py:192`, `_MutcatMixin` at `python/genoray/_svar2_mutcat.py:33`. Note that `SparseVar` itself lives in `python/genoray/_svar/_core.py`, not in `_annotate.py`. If either import fails, read the source and use the real name — do not delete the test.
 
 - [ ] **Step 3: Create the package directory and move the numeric primitives**
 
@@ -242,31 +243,25 @@ import numpy as np
 import polars as pl
 from joblib import Parallel, delayed
 
-from ._common import _cosine, _nnls  # noqa: F401  (re-exported for callers)
 from ._forward import Criterion, _fit_one
 ```
 
+`fit_signatures` calls neither `_cosine` nor `_nnls` directly — it delegates to
+`_fit_one` — so do not import them here. `__init__.py` re-exports them from
+`_common`, which is what preserves `genoray._signatures._cosine`.
+
 - [ ] **Step 7: Write the re-export `__init__.py`**
 
-Create `python/genoray/_signatures/__init__.py`:
+Create `python/genoray/_signatures/__init__.py`. **Copy the module docstring
+out of `python/genoray/_signatures.py` verbatim** — the whole triple-quoted
+block from line 1 to the closing `"""`, including the paragraph stating that
+SPA's behaviours are "not reproduced here". That paragraph is still true at
+this commit; task 11 rewrites it once `Spa` exists. A task must not document
+code that has not been written yet.
+
+Then, below the docstring:
 
 ```python
-"""COSMIC mutational-signature refitting.
-
-Two strategies decompose a mutation catalogue into per-sample activities
-against a set of reference signatures. Pure numpy/scipy/polars; no
-SigProfiler dependency.
-
-``Forward`` (the default) is genoray's own greedy forward selection from the
-empty set. ``Spa`` is a faithful reimplementation of SigProfilerAssignment's
-``cosmic_fit``: backward elimination from the saturated set. See
-``fit_signatures``.
-
-Neither score is burden-aware. Only ``Forward(criterion="bic")`` is a
-consistent estimator; the other stop rules are scale-invariant and plateau as
-burden grows.
-"""
-
 from __future__ import annotations
 
 from ._common import _cosine, _nnls, _poisson_ll
@@ -1980,7 +1975,7 @@ def test_assign_signatures_accepts_strategy_on_both_readers():
     """Both readers must expose the same refit knobs as fit_signatures."""
     import inspect
 
-    from genoray._svar._annotate import SparseVar
+    from genoray import SparseVar
     from genoray._svar2 import SparseVar2
 
     for cls in (SparseVar, SparseVar2):
@@ -2265,14 +2260,14 @@ def _spa_activities(tmp_path, catalogue: pl.DataFrame, tag: str) -> dict[str, fl
 
 
 @pytest.mark.parametrize(
-    ("truth", "burden", "tag"),
+    ("truth", "burden", "tag", "seed"),
     [
-        (["SBS1", "SBS2", "SBS7a", "SBS17b"], 100_000, "distinct_high"),
-        (["SBS1", "SBS2", "SBS7a", "SBS17b"], 1_000, "distinct_low"),
-        (["SBS1", "SBS5", "SBS40a", "SBS2"], 100_000, "flat_high"),
+        (["SBS1", "SBS2", "SBS7a", "SBS17b"], 100_000, "distinct_high", 11),
+        (["SBS1", "SBS2", "SBS7a", "SBS17b"], 1_000, "distinct_low", 22),
+        (["SBS1", "SBS5", "SBS40a", "SBS2"], 100_000, "flat_high", 33),
     ],
 )
-def test_spa_strategy_reproduces_cosmic_fit(tmp_path, truth, burden, tag):
+def test_spa_strategy_reproduces_cosmic_fit(tmp_path, truth, burden, tag, seed):
     """strategy=Spa() must agree with real cosmic_fit on support and activities.
 
     This is the test that earns the word "faithful". If it fails, the
@@ -2281,7 +2276,9 @@ def test_spa_strategy_reproduces_cosmic_fit(tmp_path, truth, burden, tag):
     from genoray import Spa
 
     ref = cosmic_signatures("SBS96")
-    rng = np.random.default_rng(hash(tag) % (2**32))
+    # An explicit seed, not hash(tag): str hashing is PYTHONHASHSEED-randomized,
+    # and a test that claims faithfulness has to draw the same data every run.
+    rng = np.random.default_rng(seed)
     W = ref.select(truth).to_numpy()
     W = W / W.sum(axis=0)
     h = rng.dirichlet(np.ones(len(truth))) * burden
