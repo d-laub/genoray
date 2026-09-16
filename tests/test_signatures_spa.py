@@ -287,15 +287,16 @@ def test_remove_keeps_a_signature_the_data_needs():
 
 
 def test_remove_respects_protected():
+    """Protection beats an unbounded cutoff that strips everything else."""
     from genoray._signatures._spa import _exposure, _remove_all_single, _support
 
     W = _identity_ref(3)
     m = np.array([600.0, 400.0, 10.0])
     h = _exposure(W, m, [0, 1, 2], scale="burden")
-    out = _remove_all_single(
-        W, m, h, cutoff=0.05, metric="l2", protected=frozenset({2})
-    )
-    assert 2 in _support(out)
+    out = _remove_all_single(W, m, h, cutoff=1e9, metric="l2", protected=frozenset({2}))
+    # Every removal is accepted at this cutoff, so only protection can keep a
+    # signature. The two unprotected signatures go; signature 2 is what is left.
+    assert _support(out) == [2]
 
 
 def test_protected_is_what_saves_the_signature():
@@ -316,13 +317,15 @@ def test_protected_is_what_saves_the_signature():
 
 
 def test_remove_never_empties_the_support():
+    """The sweep stops at one signature, never zero, however large the cutoff."""
     from genoray._signatures._spa import _exposure, _remove_all_single, _support
 
     W = _identity_ref(3)
-    m = np.array([1000.0, 0.0, 0.0])
+    m = np.array([600.0, 400.0, 10.0])
     h = _exposure(W, m, [0, 1, 2], scale="burden")
-    out = _remove_all_single(W, m, h, cutoff=1.0, metric="l2", protected=frozenset())
-    assert len(_support(out)) >= 1
+    assert len(_support(h)) == 3  # the sweep really does start from three
+    out = _remove_all_single(W, m, h, cutoff=1e9, metric="l2", protected=frozenset())
+    assert len(_support(out)) == 1
 
 
 @pytest.mark.parametrize("seed", range(20))
