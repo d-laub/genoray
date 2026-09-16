@@ -1,4 +1,4 @@
-"""Tests for issue #153: the conversion pipeline's grouped arguments.
+"""Tests for issues #153 and #200: the conversion pipelines' grouped arguments.
 
 `run_conversion_pipeline` had grown to 20 user-facing parameters, most of them
 positionally interchangeable by type. The two field manifests were the sharp
@@ -9,6 +9,13 @@ section and vice versa.
 These tests pin the two properties that make that unrepresentable rather than
 merely unlikely -- the entry point takes no positional arguments at all, and the
 structs cannot be built positionally either.
+
+#200 extended the same treatment to the four sibling entry points. Two of them
+carried their own version of the hazard: `run_vcf_list_conversion_pipeline` has
+the identical `info_fields`/`format_fields` pair #153 names, and
+`run_svar1_conversion_pipeline` has four identically typed
+`{ref,alt}_{bytes,offsets}_per_contig` vectors. The tests below cover all five
+entry points together, since the point of #200 is that they now agree.
 """
 
 from __future__ import annotations
@@ -81,4 +88,82 @@ def test_run_conversion_pipeline_reads_the_specs_by_attribute():
             regions=RegionSpec(chroms=["chr1"], regions_overlap="nonsense"),
             fields=FieldSpec(),
             plan=PlanSettings(),
+        )
+
+
+# ---- #200: the four sibling entry points ----
+
+_ENTRY_POINTS = [
+    "run_conversion_pipeline",
+    "run_pgen_conversion_pipeline",
+    "run_vcf_list_conversion_pipeline",
+    "run_svar1_conversion_pipeline",
+    "run_slice_view",
+]
+
+
+@pytest.mark.parametrize("name", _ENTRY_POINTS)
+def test_entry_points_take_no_positional_arguments(name):
+    """Item 1 of #200. This alone removes the positional hazard for the bare
+    strings, and for svar1's four interchangeable per-contig byte vectors."""
+    with pytest.raises(TypeError):
+        getattr(_core, name)("some-path")
+
+
+def test_vcf_list_rejects_max_mem_bytes():
+    """#200's caveat: this path plans by core count and never honours a byte
+    budget. `PlanSettings` carries the field for the pipelines that do use it,
+    so this one rejects it rather than dropping it silently -- a silent drop
+    would trade a positional hazard for a semantic one."""
+    with pytest.raises(ValueError, match="max_mem_bytes"):
+        _core.run_vcf_list_conversion_pipeline(
+            vcf_paths=["does-not-exist.vcf"],
+            reference_path=None,
+            output_dir="out",
+            regions=RegionSpec(chroms=["chr1"]),
+            fields=FieldSpec(),
+            plan=PlanSettings(max_mem_bytes=1 << 30),
+            contig_membership=[[True]],
+        )
+
+
+def test_svar1_rejects_max_mem_bytes():
+    """Same contract as the VCF-list path."""
+    with pytest.raises(ValueError, match="max_mem_bytes"):
+        _core.run_svar1_conversion_pipeline(
+            svar1_dir="does-not-exist",
+            reference_path=None,
+            output_dir="out",
+            regions=RegionSpec(chroms=["chr1"], samples=["S0"]),
+            plan=PlanSettings(max_mem_bytes=1 << 30),
+            contig_starts=[0],
+            contig_lens=[0],
+            pos_per_contig=[[]],
+            ref_bytes_per_contig=[[]],
+            ref_offsets_per_contig=[[0]],
+            alt_bytes_per_contig=[[]],
+            alt_offsets_per_contig=[[0]],
+            format_fields=[],
+            format_src_dtypes=[],
+            sample_idx=[0],
+        )
+
+
+def test_pgen_still_honours_max_mem_bytes():
+    """The counterpart: `max_mem_bytes` is real on the PGEN path, so setting it
+    must NOT raise. A bad `regions_overlap` proves the call got past the budget
+    check and into the fail-fast band, before any output byte is written."""
+    with pytest.raises(ValueError, match="overlap"):
+        _core.run_pgen_conversion_pipeline(
+            pgen_path="does-not-exist.pgen",
+            pvar_path="does-not-exist.pvar",
+            reference_path=None,
+            output_dir="out",
+            regions=RegionSpec(chroms=["chr1"], regions_overlap="nonsense"),
+            plan=PlanSettings(max_mem_bytes=1 << 30),
+            contig_ranges=[(0, 0)],
+            dosage_fields=[],
+            readers=[[]],
+            dosage_readers=[[]],
+            sample_perm=[],
         )
