@@ -23,7 +23,8 @@ description: Use when writing or modifying Python code that imports `genoray` to
 - `genoray.Tuning` — frozen dataclass of six explicit scheduling knobs (`concurrent_chroms`, `reader_workers`, `overshard`, `dense_cap`, `merge_threads`, `sample_interval`, all `int | None`) passed as `tuning=` to every `SparseVar2.from_*` writer; replaces the removed legacy environment-variable configuration (see "Tuning" under "SparseVar2 — quick reference", below, and "migrating from environment variables" in `docs/source/svar.md`) — **no environment variable configures genoray**
 - `genoray.exprs` — polars filter expressions for `.gvi` indexes
 - `genoray.cosmic_signatures` — fetch/cache COSMIC reference signatures
-- `genoray.fit_signatures` — sparse forward-selection signature refit
+- `genoray.fit_signatures` — mutation-catalogue signature refit; `strategy=` selects `Forward()` (default, sparse forward selection) or `Spa()` (SigProfilerAssignment-faithful backward elimination)
+- `genoray.Forward` / `genoray.Spa` — `fit_signatures` strategy dataclasses (frozen); `genoray.Strategy` is their union, `genoray.Metric` / `genoray.ActivityScale` are `Spa`'s literal option types
 
 Nothing else is public. Anything starting with `_` (e.g. `genoray._vcf`) is
 internal — do not import it from user code.
@@ -41,7 +42,7 @@ Prefer reading these over guessing:
 - `genoray/_svar2.py` — `SparseVar2`: `__init__(path, *, fields=None)`, `with_fields(fields)` (new reader over the same store with those fields selected), `available_fields` (`dict[str, StoredField]`, set in `__init__`), `from_vcf` (VCF/BCF → SVAR2 conversion entry point, `signatures=` classifies during the write, `info_fields=`/`format_fields=` extract scalar-numeric fields during the write; supports `regions=`/`samples=`/`merge_overlapping=`/`regions_overlap=`), `from_pgen` (PLINK2 PGEN → SVAR2 conversion entry point; diploid-only, no `ploidy=`/`info_fields=`/`format_fields=`; `dosages=Sequence[DosageField]` stores per-sample dosage tracks as FORMAT fields, read from the hardcall `.pgen` itself (`source="self"`) or a separate `.pgen`; supports `regions=`/`samples=`/`merge_overlapping=`/`regions_overlap=` like `from_vcf`), `from_vcf_list` (N single-sample VCFs/BCFs → one SVAR2 store via a native k-way merge; `sources` accepts a `Sequence`/directory/manifest, resolved by module-level `_resolve_vcf_sources`; `reference`/`no_reference` supported (no_reference skips left-alignment, so cross-file joins require pre-normalized inputs); `info_fields=`/`format_fields=` supported — INFO merges first-carrier-wins, FORMAT stays per-sample; supports `regions=`/`merge_overlapping=`/`regions_overlap=` like `from_vcf`, but **no `samples=`** — the cohort is the file set), `from_svar1` (SVAR1 (`SparseVar`) → SVAR2 native migration entry point; reads no VCF/htslib, `ploidy` from SVAR1 metadata, biallelic SVAR1 only, no `info_fields=`/`format_fields=` (those are VCF-specific) — instead `fields=Sequence[str] | None` selects which SVAR1 fields carry through (`None` default = all, `[]` = none, a subset carries only those names, unknown name raises `ValueError`); `mutcat` is never selectable this way and is always dropped; supports `regions=`/`samples=`/`merge_overlapping=`/`regions_overlap=` like `from_vcf`/`from_pgen`, though regions filter per-record rather than narrowing a covering range up front); `n_samples`/`available_samples`/`contigs`/`ploidy` metadata. Read/query methods live in the mixins: `genoray/_svar2_decode.py` (`decode` — attaches one `Ragged` per selected field, `region_counts`), `genoray/_svar2_batch.py` (public `read_ranges`; internal gvl-only `_overlap_batch`/`_find_ranges`/`_gather_ranges`), and `genoray/_svar2_mutcat.py` (`annotate_mutations`, `mutation_matrix`, `assign_signatures` — COSMIC mutational-signature workflow, mirroring `SparseVar`'s but backed by a per-contig Rust sidecar instead of a `.gvi`-attached field)
 - `genoray/_svar2_fields.py` — `InfoField`/`FormatField`/`DosageField` dataclasses + `FieldDtype` and the header/dtype validation used by `from_vcf(info_fields=, format_fields=)`; `_parse_cli_field_specs` (internal — parses bcftools-style `INFO/x`/`FORMAT/x`/`FMT/x` CLI field strings, used by the `genoray write vcf --fields` CLI); `StoredField` (frozen dataclass: `name`, `category`, `dtype`, `default`, `key`) is the read-side manifest entry type returned by `SparseVar2.available_fields` — not exported at top-level `genoray`, only reached via that dict
 - `genoray/_cli/__main__.py` — the `genoray` CLI (`index`, `write vcf`/`write pgen`/`write svar1` (all → SVAR2), top-level `write-svar1` (legacy VCF/PGEN → SVAR1), `view` / `view svar1`, `concat`, `split`)
-- `genoray/_signatures.py` — `cosmic_signatures`, `fit_signatures`
+- `genoray/_signatures/` — `cosmic_signatures`, `fit_signatures`, `Forward`, `Spa`, `Strategy`, `Metric`, `ActivityScale`. `fit_signatures(..., strategy=Forward()|Spa())` selects the refit algorithm; `Forward` is genoray's own greedy forward selection (the default), `Spa` reimplements SigProfilerAssignment's `cosmic_fit` (backward elimination from the saturated signature set, then add-remove refinement)
 - `genoray/_reference.py` — `Reference`: `from_path`, `fetch`, `contig_array`
 - `genoray/exprs.py` — the *complete* set of pre-built filter expressions (currently 7: `is_snp`, `is_indel`, `is_biallelic`, `is_symbolic`, `is_breakend`, `is_imprecise`, `ILEN`)
 
@@ -1629,10 +1630,15 @@ Decompose a catalogue into per-sample COSMIC signature activities.
 
 ```python
 import genoray
+from genoray import Forward, Spa
 
 ref = genoray.cosmic_signatures("SBS96")        # pooch-fetched + cached
 cat = svar.mutation_matrix("SBS96")              # MutationType + sample cols
 act = genoray.fit_signatures(cat, ref)           # activities + cosine_similarity
+
+# strategy=: pick the refit algorithm and its parameters explicitly
+act = genoray.fit_signatures(cat, ref, strategy=Forward(max_delta=0.02))
+act = genoray.fit_signatures(cat, ref, strategy=Spa())  # SPA's cosmic_fit, faithfully
 
 # convenience: mutation_matrix -> fit_signatures in one call
 act = svar.assign_signatures("SBS96")                       # default COSMIC ref
@@ -1645,18 +1651,50 @@ Signatures:
   — fetches/caches the COSMIC reference set for `kind ∈ {"SBS96","DBS78","ID83"}`.
   Returns a `MutationType` column (canonical codebook order) + one column per
   signature. `genome` is ignored for `ID83`.
-- `fit_signatures(catalogue, reference, *, max_delta=0.01, min_activity=0.005, n_jobs=1, backend="loky") -> pl.DataFrame`
-  — sparse forward-selection refit (NNLS + cosine-guided add + min-activity
-  prune). Aligns rows by joining on `MutationType` (raises `ValueError` if the
-  catalogue has a type missing from the reference). Returns one row per sample:
-  `Sample`, one Float column per signature (counts; `0.0` if unselected), and
-  `cosine_similarity`. `n_jobs=1` (default) is serial; `n_jobs=-1` uses all
-  cores. Results are identical regardless of `n_jobs`/`backend`.
+- `fit_signatures(catalogue, reference, *, strategy=None, max_delta=0.01, min_activity=0.005, criterion="cosine", n_jobs=1, backend="loky") -> pl.DataFrame`
+  — refits `catalogue` against `reference`. Aligns rows by joining on
+  `MutationType` (raises `ValueError` if the catalogue has a type missing from
+  the reference). Returns one row per sample: `Sample`, one Float column per
+  signature (activities; `0.0` if unselected), and `cosine_similarity`.
+  `n_jobs=1` (default) is serial; `n_jobs=-1` uses all cores. Results are
+  identical regardless of `n_jobs`/`backend`.
+
+  `strategy=` selects the algorithm and **cannot be combined** with
+  `max_delta`/`min_activity`/`criterion` (raises `ValueError` if both are
+  given, even at their default values) — those three are permanent shorthand
+  for `strategy=Forward(...)`, not deprecated:
+  - `Forward(max_delta=0.01, min_activity=0.005, criterion="cosine")` (the
+    default when `strategy` is omitted) — genoray's own sparse greedy forward
+    selection: NNLS + criterion-guided add + min-activity prune.
+    `criterion="cosine"` stops on cosine-similarity plateau (scale-invariant,
+    so blind to mutation burden); `criterion="bic"` stops on a Poisson-BIC
+    test (burden-aware, more consistent above ~1,000 mutations, but
+    over-selects at very low burden). Returned activities are raw NNLS
+    weights — they need not sum to anything in particular.
+  - `Spa(metric="l2", initial_remove_penalty=0.05, add_penalty=0.05, remove_penalty=0.01, background_sigs=("SBS1","SBS5"), connected_sigs=True, activity_scale="burden")`
+    — a from-scratch reimplementation of SigProfilerAssignment's `cosmic_fit`
+    (`solver="nnls"`, `pcawg_rule=False`), pure numpy/scipy/polars with no
+    SigProfiler dependency: saturate over every reference signature, prune
+    backward on relative L2 error, then refine with add-remove layers.
+    `background_sigs` names are always kept once refinement starts (names
+    absent from `reference` are ignored, which is what makes the SBS1/SBS5
+    default inert on DBS78/ID83 references); `connected_sigs=True` force-adds
+    co-occurring SBS partners (e.g. SBS2/SBS13) once any member is selected,
+    `False` disables it, or pass your own `Sequence[Sequence[str]]` of
+    signature-name groups. Under the default `activity_scale="burden"`,
+    activities are rescaled and integer-rounded so each sample's signature
+    columns sum to its mutation burden; `activity_scale="raw"` returns
+    unscaled NNLS weights instead, like `Forward` does. Deterministic (touches
+    no RNG), unlike upstream SPA. Recovers more true signatures than
+    `Forward` at every burden measured but, like `Forward`'s `"cosine"`
+    criterion, is scale-invariant and so not a consistent estimator either.
+    Roughly one to two orders of magnitude slower per sample than `Forward`.
 - `SparseVar.assign_signatures(kind, *, reference=None, count="allele", max_delta=0.01, min_activity=0.005, n_jobs=1, backend="loky") -> pl.DataFrame`
   — `mutation_matrix(kind, count=...)` then `fit_signatures(...)`. `reference`
   accepts a `pl.DataFrame`, a TSV path, or `None` (defaults to `cosmic_signatures(kind)`).
   Forwards `n_jobs`/`backend` to `fit_signatures` for per-sample parallelism
-  (`n_jobs=1` (default) is serial; `n_jobs=-1` uses all cores).
+  (`n_jobs=1` (default) is serial; `n_jobs=-1` uses all cores). Does **not**
+  accept `strategy=` yet — only the legacy `Forward` shorthand arguments.
 
 Out of scope (v1): de novo extraction, opportunity normalization, bootstrap CIs,
 plotting.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 import numpy as np
@@ -9,7 +10,8 @@ import polars as pl
 from joblib import Parallel, delayed
 
 from ._forward import Criterion, _fit_one_forward
-from ._strategy import Forward, Strategy
+from ._spa import _fit_one_spa
+from ._strategy import SPA_CONNECTED_GROUPS, Forward, Spa, Strategy
 
 # Sentinel distinguishing "argument not passed" from "argument passed its
 # default value". Needed so `strategy=Spa(), max_delta=0.01` is still a
@@ -64,6 +66,41 @@ def _resolve_strategy(
     return strategy
 
 
+def _resolve_sig_names(
+    sig_cols: list[str], spec: Spa
+) -> tuple[frozenset[int], tuple[tuple[int, ...], ...]]:
+    """Map ``Spa``'s signature *names* onto column indices of the reference.
+
+    Names absent from the reference are dropped silently, matching SPA's
+    ``get_indeces``. That is what makes the default ``("SBS1", "SBS5")``
+    background and the SBS-only connected groups inert for DBS78 and ID83
+    without a special case.
+
+    Resolution happens once, here, rather than per sample: it needs the
+    reference's column names, and the fan-out below would otherwise repeat it
+    once per sample.
+    """
+    index_of = {name: i for i, name in enumerate(sig_cols)}
+
+    protected = frozenset(
+        index_of[n] for n in (spec.background_sigs or ()) if n in index_of
+    )
+
+    if spec.connected_sigs is True:
+        raw_groups: Sequence[Sequence[str]] = SPA_CONNECTED_GROUPS
+    elif spec.connected_sigs is False:
+        raw_groups = ()
+    else:
+        raw_groups = spec.connected_sigs
+
+    groups = tuple(
+        tuple(sorted(index_of[n] for n in g if n in index_of)) for g in raw_groups
+    )
+    # A group with fewer than two present members can never expand anything.
+    groups = tuple(g for g in groups if len(g) > 1)
+    return protected, groups
+
+
 def fit_signatures(
     catalogue: pl.DataFrame,
     reference: pl.DataFrame,
@@ -86,6 +123,16 @@ def fit_signatures(
         strategy: The refit algorithm and its parameters: :class:`Forward` (the
             default, ``Forward()``) or :class:`Spa`. Cannot be combined with
             ``max_delta``, ``min_activity``, or ``criterion``.
+
+            :class:`Spa` reimplements SigProfilerAssignment's ``cosmic_fit``:
+            saturate over every reference signature, prune backward on
+            relative L2 error, then refine with add-remove layers (with
+            SBS1/SBS5 background protection and connected-signature groups
+            on by default). Under its default ``activity_scale="burden"``,
+            the signature columns hold integer-valued floats that sum to
+            each sample's mutation burden, unlike the forward path (and
+            ``Spa(activity_scale="raw")``), which report raw NNLS weights
+            that need not sum to anything in particular.
         max_delta: Shorthand for ``strategy=Forward(max_delta=...)``. Minimum
             cosine-similarity improvement to keep adding a signature. Only used
             when ``criterion="cosine"``; ignored otherwise. Default ``0.01``.
@@ -174,8 +221,10 @@ def fit_signatures(
             delayed(_fit_one_forward)(W, M[:, j], spec) for j in range(len(sample_cols))
         )
     else:
-        raise NotImplementedError(
-            "strategy=Spa() is not wired up yet; see task 7 of the plan."
+        protected, groups = _resolve_sig_names(sig_cols, spec)
+        results = Parallel(n_jobs=n_jobs, backend=backend)(
+            delayed(_fit_one_spa)(W, M[:, j], spec, protected=protected, groups=groups)
+            for j in range(len(sample_cols))
         )
     for j, (h, cos) in enumerate(results):
         activities[j] = h

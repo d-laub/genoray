@@ -441,3 +441,180 @@ def test_try_add_rejects_an_improvement_exactly_equal_to_the_cutoff():
     )
     # Exactly at the cutoff: strict ">" rejects, ">=" would accept.
     assert _try_add(W, m, [0], 1, cutoff=gain, metric="l2") == [0]
+
+
+def test_spa_recovers_a_clean_two_signature_mixture():
+    from genoray import Spa, fit_signatures
+
+    cat, ref = _toy_problem()
+    out = fit_signatures(cat, ref, strategy=Spa(background_sigs=None))
+    assert out["S1"].item() == pytest.approx(600.0)
+    assert out["S2"].item() == pytest.approx(400.0)
+    assert out["S3"].item() == 0.0
+
+
+def test_spa_burden_scale_activities_sum_to_burden():
+    from genoray import Spa, fit_signatures
+
+    cat, ref = _toy_problem()
+    out = fit_signatures(cat, ref, strategy=Spa(background_sigs=None))
+    total = sum(out[c].item() for c in ("S1", "S2", "S3"))
+    assert total == pytest.approx(1000.0)
+
+
+def test_spa_burden_scale_activities_are_integers():
+    from genoray import Spa, fit_signatures
+
+    cat, ref = _toy_problem()
+    out = fit_signatures(cat, ref, strategy=Spa(background_sigs=None))
+    for c in ("S1", "S2", "S3"):
+        v = out[c].item()
+        assert v == float(int(v))
+
+
+def test_spa_raw_scale_does_not_conserve_burden():
+    """raw returns NNLS weights, which need not sum to the burden."""
+    from genoray import Spa, fit_signatures
+    import polars as pl
+
+    ref = pl.DataFrame(
+        {
+            "MutationType": ["A", "B"],
+            "S1": [0.5, 0.5],
+            "S2": [1.0, 0.0],
+        }
+    )
+    cat = pl.DataFrame({"MutationType": ["A", "B"], "s1": [600.0, 400.0]})
+    out = fit_signatures(
+        cat, ref, strategy=Spa(background_sigs=None, activity_scale="raw")
+    )
+    total = out["S1"].item() + out["S2"].item()
+    assert total == pytest.approx(1000.0, rel=0.5)  # same ballpark, not exact
+
+
+def test_spa_output_schema_matches_forward():
+    from genoray import Spa, fit_signatures
+
+    cat, ref = _toy_problem()
+    fwd = fit_signatures(cat, ref)
+    spa = fit_signatures(cat, ref, strategy=Spa(background_sigs=None))
+    assert fwd.columns == spa.columns
+    assert spa.columns[-1] == "cosine_similarity"
+
+
+def test_spa_is_deterministic():
+    """SPA draws from the global RNG; this implementation must not."""
+    from genoray import Spa, fit_signatures
+
+    cat, ref = _toy_problem()
+    a = fit_signatures(cat, ref, strategy=Spa())
+    np.random.seed(0)
+    b = fit_signatures(cat, ref, strategy=Spa())
+    np.random.seed(12345)
+    c = fit_signatures(cat, ref, strategy=Spa())
+    assert a.equals(b) and b.equals(c)
+
+
+def test_spa_zero_count_sample_returns_zeros():
+    from genoray import Spa, fit_signatures
+    import polars as pl
+
+    ref = pl.DataFrame({"MutationType": ["A", "B"], "S1": [1.0, 0.0], "S2": [0.0, 1.0]})
+    cat = pl.DataFrame({"MutationType": ["A", "B"], "s1": [0.0, 0.0]})
+    out = fit_signatures(cat, ref, strategy=Spa(background_sigs=None))
+    assert out["S1"].item() == 0.0
+    assert out["S2"].item() == 0.0
+    assert out["cosine_similarity"].item() == 0.0
+
+
+def test_spa_background_sigs_are_kept():
+    """Protection changes the outcome: S3 explains little, but survives."""
+    import polars as pl
+
+    from genoray import Spa, fit_signatures
+
+    ref = pl.DataFrame(
+        {
+            "MutationType": ["A", "B", "C", "D"],
+            "S1": [1.0, 0.0, 0.0, 0.0],
+            "S2": [0.0, 1.0, 0.0, 0.0],
+            "S3": [0.0, 0.0, 1.0, 1.0],
+        }
+    )
+    cat = pl.DataFrame(
+        {"MutationType": ["A", "B", "C", "D"], "s1": [600.0, 400.0, 5.0, 5.0]}
+    )
+    kept = fit_signatures(cat, ref, strategy=Spa(background_sigs=("S3",)))
+    dropped = fit_signatures(cat, ref, strategy=Spa(background_sigs=None))
+    assert kept["S3"].item() > 0.0
+    assert dropped["S3"].item() == 0.0
+
+
+def test_spa_background_sigs_absent_from_reference_are_ignored():
+    """The default ("SBS1","SBS5") must be inert on a non-SBS reference."""
+    from genoray import Spa, fit_signatures
+
+    cat, ref = _toy_problem()
+    out = fit_signatures(cat, ref, strategy=Spa())  # default background sigs
+    assert out["S1"].item() > 0.0
+
+
+def test_spa_connected_sigs_force_add_partners():
+    """SBS13 never clears add_penalty on merit; the group is what pulls it in."""
+    import polars as pl
+
+    from genoray import Spa, fit_signatures
+
+    ref = pl.DataFrame(
+        {
+            "MutationType": ["A", "B", "C"],
+            "SBS2": [1.0, 0.0, 0.0],
+            "SBS13": [0.0, 1.0, 0.0],
+            "SBS40a": [0.0, 0.0, 1.0],
+        }
+    )
+    cat = pl.DataFrame({"MutationType": ["A", "B", "C"], "s1": [1000.0, 30.0, 0.0]})
+    on = fit_signatures(cat, ref, strategy=Spa(background_sigs=None))
+    off = fit_signatures(
+        cat, ref, strategy=Spa(background_sigs=None, connected_sigs=False)
+    )
+    assert on["SBS13"].item() > 0.0
+    assert off["SBS13"].item() == 0.0
+
+
+def test_spa_custom_connected_groups():
+    import polars as pl
+
+    from genoray import Spa, fit_signatures
+
+    ref = pl.DataFrame(
+        {
+            "MutationType": ["A", "B"],
+            "X": [1.0, 0.0],
+            "Y": [0.0, 1.0],
+        }
+    )
+    cat = pl.DataFrame({"MutationType": ["A", "B"], "s1": [1000.0, 0.0]})
+    out = fit_signatures(
+        cat,
+        ref,
+        strategy=Spa(background_sigs=None, connected_sigs=[["X", "Y"]]),
+    )
+    assert out["X"].item() > 0.0
+
+
+def test_spa_matches_across_n_jobs():
+    from genoray import Spa, fit_signatures
+    import polars as pl
+
+    rng = np.random.default_rng(7)
+    types = [f"T{i}" for i in range(12)]
+    ref = pl.DataFrame({"MutationType": types}).with_columns(
+        **{f"S{k}": pl.Series(rng.random(12)) for k in range(5)}
+    )
+    cat = pl.DataFrame({"MutationType": types}).with_columns(
+        **{f"s{j}": pl.Series(rng.integers(0, 500, 12).astype(float)) for j in range(4)}
+    )
+    a = fit_signatures(cat, ref, strategy=Spa(background_sigs=None), n_jobs=1)
+    b = fit_signatures(cat, ref, strategy=Spa(background_sigs=None), n_jobs=2)
+    assert a.equals(b)

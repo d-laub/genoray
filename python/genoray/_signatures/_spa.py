@@ -18,11 +18,15 @@ from the unrounded NNLS reconstruction.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import numpy as np
 from numpy.typing import NDArray
 
-from ._common import _distance, _nnls, _round_conserve_sum
+from ._common import _cosine, _distance, _nnls, _round_conserve_sum
+
+if TYPE_CHECKING:  # pragma: no cover
+    from ._strategy import Spa
 
 
 def _support(h: NDArray[np.floating]) -> list[int]:
@@ -171,3 +175,88 @@ def _expand_connected(
         if original.intersection(group):
             out.update(group)
     return sorted(out)
+
+
+def _fit_one_spa(
+    W: NDArray[np.floating],
+    m: NDArray[np.floating],
+    spec: "Spa",
+    *,
+    protected: frozenset[int],
+    groups: tuple[tuple[int, ...], ...],
+) -> tuple[NDArray[np.float64], float]:
+    """Refit one sample by SPA's ``cosmic_fit``.
+
+    Four stages, matching ``process_sample`` then ``add_remove_signatures``:
+    saturate over every signature, prune backward, refine with add-remove
+    layers, then report on the requested activity scale.
+
+    Returns ``(activities, cosine)``, the same contract as the forward path.
+    """
+    n_sigs = W.shape[1]
+    empty = np.zeros(n_sigs, dtype=np.float64)
+    if float(np.sum(m)) == 0.0:
+        return empty, 0.0
+
+    metric = spec.metric
+
+    # Stage 1: saturate. SPA seeds every signature nonzero via a random dummy
+    # exposure matrix; the draw's only effect is that every entry is nonzero.
+    h = _exposure(W, m, range(n_sigs), scale="burden")
+    if not _support(h):
+        return empty, 0.0
+
+    # Stage 2: initial prune. SPA passes background_sigs=[] here, so the
+    # background signatures are NOT protected at this stage.
+    h = _remove_all_single(
+        W,
+        m,
+        h,
+        cutoff=spec.initial_remove_penalty,
+        metric=metric,
+        protected=frozenset(),
+    )
+
+    # Stage 3: add-remove refinement layers.
+    active = sorted(set(_support(h)) | set(protected))
+    best_d = np.inf
+    best_active = active
+    while True:
+        present = _expand_connected(active, groups)
+        layer_d = np.inf
+        layer_active: list[int] | None = None
+        for cand in range(n_sigs):
+            if cand in present:
+                continue
+            added = _try_add(
+                W, m, present, cand, cutoff=spec.add_penalty, metric=metric
+            )
+            h_add = _exposure(W, m, added, scale="burden")
+            h_rem = _remove_all_single(
+                W,
+                m,
+                h_add,
+                cutoff=spec.remove_penalty,
+                metric=metric,
+                protected=protected,
+            )
+            # SPA compares the add and remove supports here with a convoluted
+            # expression that is not load-bearing: the removal sweep can only
+            # shrink the support, so equal shapes already imply equal
+            # supports, and equal supports imply equal distances. Taking the
+            # post-removal support directly is exactly equivalent.
+            pick = _support(h_rem)
+            d = _distance(m, _reconstruction(W, m, pick), metric)
+            if d < layer_d:
+                layer_d = d
+                layer_active = pick
+        if layer_active is None or layer_d >= best_d:
+            break
+        best_d = layer_d
+        best_active = layer_active
+        active = layer_active
+
+    # Stage 4: report.
+    h = _exposure(W, m, best_active, scale=spec.activity_scale)
+    cos = _cosine(m, W @ h) if _support(h) else 0.0
+    return h, cos
