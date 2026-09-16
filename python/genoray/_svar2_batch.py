@@ -92,10 +92,12 @@ C = TypeVar("C")
 class RangesStream(Generic[C]):
     """Memory-bounded, chunked form of ``_find_ranges``.
 
-    The ``O(n_regions)`` arrays are computed eagerly; the
-    ``O(n_regions * n_samples * ploidy)`` payload arrives via ``chunks``.
-    ``n_samples`` is the progress denominator and each ``RangesChunk`` reports
-    how many samples it advanced by.
+    The ``O(n_regions)`` arrays are computed eagerly. The per-chunk payload
+    arrives via ``chunks``: ``O(n_regions * n_samples * ploidy)`` for
+    ``RangesStream[RangesChunk]`` (dense), or O(non-empty cells) for
+    ``RangesStream[SparseRangesChunk]`` (sparse). ``n_samples`` is the
+    progress denominator and each chunk reports how many samples it advanced
+    by.
     """
 
     n_regions: int
@@ -356,9 +358,8 @@ class _BatchQueryMixin:
             ploidy=ploidy,
         )
 
-    def _ranges_stream(
-        self, plan: _ChunkPlan, chunks: "Iterator[C]"
-    ) -> "RangesStream[C]":
+    @staticmethod
+    def _ranges_stream(plan: _ChunkPlan, chunks: "Iterator[C]") -> "RangesStream[C]":
         """Wrap a chunk generator in the header both streams share."""
         return RangesStream(
             n_regions=plan.n_regions,

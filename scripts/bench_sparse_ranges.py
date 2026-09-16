@@ -3,7 +3,7 @@
 Not a CI gate -- a cohort-scale store is too expensive to build per run. Run it
 by hand when changing either kernel:
 
-    pixi run python scripts/bench_sparse_ranges.py --samples 20 --regions 400
+    pixi run python scripts/bench_sparse_ranges.py --samples 1000 --regions 400
 
 Reports per-chunk wall time and the realized fill, which is the number that
 decides whether the sparse path is worth anything: at the All of Us chr22 grid
@@ -39,9 +39,12 @@ def _time(fn, reps: int) -> float:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    # The fixture puts one singleton per sample inside a 40 bp contig, so 20 is
-    # its ceiling. Raising it means a bigger reference, not a bigger flag.
-    ap.add_argument("--samples", type=int, default=20)
+    # The fixture generates a reference sized to the sample count (one
+    # singleton per sample), so there is no ceiling on --samples; the bench's
+    # query regions stay confined to the store's low positions, so a bigger
+    # --samples dilutes the fill rate toward the production regime instead of
+    # producing more hits.
+    ap.add_argument("--samples", type=int, default=1000)
     ap.add_argument("--regions", type=int, default=400)
     ap.add_argument("--reps", type=int, default=5)
     args = ap.parse_args()
@@ -49,6 +52,7 @@ def main() -> int:
     # A fresh directory per run: the conversion pipeline writes a new store and
     # will not overwrite one left behind by the last invocation.
     tmp = Path(tempfile.mkdtemp(prefix="genoray-bench-sparse-"))
+    print(f"store dir: {tmp}")
     store = build_svar2_singleton_store(tmp, n_samples=args.samples)
     sv = SparseVar2(store)
 

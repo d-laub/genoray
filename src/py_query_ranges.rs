@@ -415,6 +415,11 @@ impl PyContigReader {
     ///
     /// A cell non-empty in only one channel still carries the other channel's
     /// raw start with length `0` — see `SparseCell`.
+    ///
+    /// Unlike `find_ranges_chunk`, the GIL is only released for the search
+    /// itself (`find_ranges_haps_sparse`, under `py.detach`). The O(n) transpose
+    /// from `Vec<SparseCell>` into the five numpy columns below runs with the
+    /// GIL held, since it writes through `PyArray` handles.
     pub fn find_ranges_chunk_sparse<'py>(
         &self,
         py: Python<'py>,

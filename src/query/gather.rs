@@ -325,9 +325,21 @@ pub struct SparseCell {
 ///
 /// `O(n + r)`, against `O(n log n)` for a comparison sort: at cohort scale `n`
 /// is ~18e6 entries per contig and this runs once per chunk.
+///
+/// # Preconditions
+///
+/// Every `cell.region` in `cells` must satisfy `cell.region < r as u32`. This
+/// is not checked in release builds: `ptr[c.region as usize + 1]` and
+/// `cursor[c.region as usize]` index unchecked, so an out-of-range region
+/// panics on an opaque out-of-bounds index rather than a clear message.
 pub fn sort_cells_by_region(cells: &[SparseCell], r: usize) -> (Vec<i64>, Vec<SparseCell>) {
     let mut ptr = vec![0i64; r + 1];
     for c in cells {
+        debug_assert!(
+            (c.region as usize) < r,
+            "cell.region {} out of bounds for r={r}",
+            c.region
+        );
         ptr[c.region as usize + 1] += 1;
     }
     for i in 0..r {
@@ -548,7 +560,13 @@ pub fn find_ranges_haps_sparse(
 
     let total: usize = blocks.iter().map(Vec::len).sum();
     let mut flat = Vec::with_capacity(total);
-    // Move each block in and drop it as we go, so peak is 2x the payload, not 3x.
+    // Move each block in and drop it as we go, well short of the naive 3x
+    // (`blocks` + `flat` + `sort_cells_by_region`'s output all live at once).
+    // Each per-hap block still carries `push`-driven doubling slack, `flat`
+    // allocates a full 1x while `blocks` is still partly alive, and
+    // `sort_cells_by_region` allocates another 1x while `flat` lives, so the
+    // worst-case instantaneous peak is closer to 2.5-3x than a clean 2x --
+    // still far below `n_haps * R * 32` (the dense payload this avoids).
     for b in blocks {
         flat.extend(b);
     }
