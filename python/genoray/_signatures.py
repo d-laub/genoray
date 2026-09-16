@@ -6,12 +6,14 @@ numpy/scipy/polars; no SigProfiler dependency.
 
 The *shape* follows SigProfilerAssignment's ``add_signatures`` -- greedily add
 the signature that most improves the fit, stop once the improvement is too
-small, then prune negligible activities -- but this is a simplification, not a
-port. SigProfilerAssignment scores on relative L2 error against a 0.05
-threshold, interleaves a backward removal pass after every addition, force-adds
-known co-occurring partner signatures (``connected_sigs=True``), and rounds
-activities so they sum to the sample's total burden. None of that is reproduced
-here, and the defaults differ.
+small, then prune negligible activities -- but this is not a port, and the
+difference is larger than the defaults. SigProfilerAssignment's ``cosmic_fit``
+does not select forward at all: it runs one NNLS over the *entire* signature set
+and then eliminates backward on relative L2 error. It also scores on relative L2
+rather than cosine, force-includes SBS1/SBS5 as protected background signatures,
+force-adds known co-occurring partners (``connected_sigs=True``), and rescales
+and integer-rounds activities so they sum to the sample's total burden. None of
+that is reproduced here. See the audit issue for the full comparison.
 
 See ``fit_signatures``' ``criterion`` argument for the choice of stop rule, and
 why the default is not the statistically consistent one.
