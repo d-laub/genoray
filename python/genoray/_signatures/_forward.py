@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 from numpy.typing import NDArray
 
 from ._common import _cosine, _nnls, _poisson_ll
+
+if TYPE_CHECKING:  # pragma: no cover
+    from ._strategy import Forward
 
 #: Forward-selection stop rules. See ``fit_signatures``.
 Criterion = Literal["cosine", "bic"]
@@ -99,3 +102,18 @@ def _fit_one(
     for i, sig in enumerate(active):
         full[sig] = h_sub[i]
     return full, cos
+
+
+def _fit_one_forward(
+    W: NDArray[np.floating],
+    m: NDArray[np.floating],
+    spec: "Forward",
+) -> tuple[NDArray[np.float64], float]:
+    """Adapt ``_fit_one`` to the strategy-object calling convention."""
+    return _fit_one(
+        W,
+        m,
+        max_delta=spec.max_delta,
+        min_activity=spec.min_activity,
+        criterion=spec.criterion,
+    )

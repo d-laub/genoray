@@ -8,8 +8,9 @@ silently ignored keyword argument.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal, Sequence, Union
+from typing import Literal
 
 from ._forward import Criterion
 
@@ -110,4 +111,4 @@ class Spa:
 
 
 #: Either refit strategy. Accepted by ``fit_signatures(strategy=...)``.
-Strategy = Union[Forward, Spa]
+Strategy = Forward | Spa

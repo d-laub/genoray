@@ -152,3 +152,66 @@ def test_strategies_exported_from_genoray():
     assert "Forward" in genoray.__all__
     assert "Spa" in genoray.__all__
     assert genoray.Forward().criterion == "cosine"
+
+
+def _toy_problem():
+    """A 4-type, 3-signature toy catalogue with a known 2-signature answer."""
+    import polars as pl
+
+    ref = pl.DataFrame(
+        {
+            "MutationType": ["A", "B", "C", "D"],
+            "S1": [1.0, 0.0, 0.0, 0.0],
+            "S2": [0.0, 1.0, 0.0, 0.0],
+            "S3": [0.0, 0.0, 1.0, 1.0],
+        }
+    )
+    cat = pl.DataFrame(
+        {"MutationType": ["A", "B", "C", "D"], "s1": [600.0, 400.0, 0.0, 0.0]}
+    )
+    return cat, ref
+
+
+def test_strategy_forward_matches_legacy_kwargs():
+    from genoray import Forward, fit_signatures
+
+    cat, ref = _toy_problem()
+    legacy = fit_signatures(cat, ref, max_delta=0.02, min_activity=0.01)
+    viastrategy = fit_signatures(
+        cat, ref, strategy=Forward(max_delta=0.02, min_activity=0.01)
+    )
+    assert legacy.equals(viastrategy)
+
+
+def test_default_is_forward_and_unchanged():
+    from genoray import Forward, fit_signatures
+
+    cat, ref = _toy_problem()
+    assert fit_signatures(cat, ref).equals(fit_signatures(cat, ref, strategy=Forward()))
+
+
+def test_strategy_conflicts_with_legacy_kwarg():
+    from genoray import Spa, fit_signatures
+
+    cat, ref = _toy_problem()
+    with pytest.raises(ValueError, match="max_delta"):
+        fit_signatures(cat, ref, strategy=Spa(), max_delta=0.02)
+
+
+def test_strategy_conflict_names_every_offender():
+    from genoray import Forward, fit_signatures
+
+    cat, ref = _toy_problem()
+    with pytest.raises(ValueError) as exc:
+        fit_signatures(cat, ref, strategy=Forward(), max_delta=0.02, min_activity=0.01)
+    msg = str(exc.value)
+    assert "max_delta" in msg and "min_activity" in msg
+
+
+def test_passing_the_default_value_explicitly_still_conflicts():
+    """The sentinel must distinguish 'not passed' from 'passed the default'."""
+    from genoray import Spa, fit_signatures
+
+    cat, ref = _toy_problem()
+    with pytest.raises(ValueError, match="max_delta"):
+        fit_signatures(cat, ref, strategy=Spa(), max_delta=0.01)

@@ -2,20 +2,76 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 import polars as pl
 from joblib import Parallel, delayed
 
-from ._forward import Criterion, _fit_one
+from ._forward import Criterion, _fit_one_forward
+from ._strategy import Forward, Strategy
+
+# Sentinel distinguishing "argument not passed" from "argument passed its
+# default value". Needed so `strategy=Spa(), max_delta=0.01` is still a
+# conflict rather than silently accepted.
+_UNSET: Any = object()
+
+#: Real defaults for the legacy shorthand arguments. Kept here so the
+#: docstring and the resolution agree in one place.
+_FORWARD_DEFAULTS = Forward()
+
+
+def _resolve_strategy(
+    strategy: Strategy | None,
+    max_delta: Any,
+    min_activity: Any,
+    criterion: Any,
+) -> Strategy:
+    """Reconcile ``strategy=`` with the legacy flat keyword arguments.
+
+    The flat arguments are permanent shorthand for the forward path, not
+    deprecated. Combining them with an explicit ``strategy`` is an error
+    rather than a silent drop.
+    """
+    passed = {
+        "max_delta": max_delta,
+        "min_activity": min_activity,
+        "criterion": criterion,
+    }
+    explicit = [name for name, val in passed.items() if val is not _UNSET]
+
+    if strategy is None:
+        return Forward(
+            max_delta=(
+                _FORWARD_DEFAULTS.max_delta if max_delta is _UNSET else max_delta
+            ),
+            min_activity=(
+                _FORWARD_DEFAULTS.min_activity
+                if min_activity is _UNSET
+                else min_activity
+            ),
+            criterion=(
+                _FORWARD_DEFAULTS.criterion if criterion is _UNSET else criterion
+            ),
+        )
+
+    if explicit:
+        raise ValueError(
+            f"strategy= was given together with {', '.join(sorted(explicit))}. "
+            "The flat arguments are shorthand for the forward path; pass them "
+            "inside Forward(...) instead, or drop strategy=."
+        )
+    return strategy
 
 
 def fit_signatures(
     catalogue: pl.DataFrame,
     reference: pl.DataFrame,
     *,
-    max_delta: float = 0.01,
-    min_activity: float = 0.005,
-    criterion: Criterion = "cosine",
+    strategy: Strategy | None = None,
+    max_delta: float = _UNSET,
+    min_activity: float = _UNSET,
+    criterion: Criterion = _UNSET,
     n_jobs: int = 1,
     backend: str = "loky",
 ) -> pl.DataFrame:
@@ -27,10 +83,19 @@ def fit_signatures(
         reference: A ``MutationType`` column followed by one column per reference signature.
             Columns need not be pre-normalized; each is scaled to sum 1 so reported
             activities are in mutation-count units.
-        max_delta: Minimum cosine-similarity improvement to keep adding a signature.
-            Only used when ``criterion="cosine"``; ignored otherwise.
-        min_activity: Minimum fractional contribution; signatures below this are pruned.
-        criterion: Forward-selection stop rule.
+        strategy: The refit algorithm and its parameters: :class:`Forward` (the
+            default, ``Forward()``) or :class:`Spa`. Cannot be combined with
+            ``max_delta``, ``min_activity``, or ``criterion``.
+        max_delta: Shorthand for ``strategy=Forward(max_delta=...)``. Minimum
+            cosine-similarity improvement to keep adding a signature. Only used
+            when ``criterion="cosine"``; ignored otherwise. Default ``0.01``.
+            Cannot be combined with ``strategy=``.
+        min_activity: Shorthand for ``strategy=Forward(min_activity=...)``.
+            Minimum fractional contribution; signatures below this are pruned.
+            Default ``0.005``. Cannot be combined with ``strategy=``.
+        criterion: Shorthand for ``strategy=Forward(criterion=...)``.
+            Forward-selection stop rule. Default ``"cosine"``. Cannot be
+            combined with ``strategy=``.
 
             ``"cosine"`` (default) stops when the best candidate improves cosine
             similarity by less than ``max_delta``. Cosine is scale-invariant, so this
@@ -66,12 +131,12 @@ def fit_signatures(
         column for the final reconstruction.
 
     Raises:
-        ValueError: If ``criterion`` is not one of ``"cosine"`` / ``"bic"``, or if a
-            ``MutationType`` present in the catalogue is missing from the reference
-            (rows cannot be aligned).
+        ValueError: If ``criterion`` is not one of ``"cosine"`` / ``"bic"``, if
+            ``strategy=`` is combined with any of ``max_delta``, ``min_activity``,
+            or ``criterion``, or if a ``MutationType`` present in the catalogue is
+            missing from the reference (rows cannot be aligned).
     """
-    if criterion not in ("cosine", "bic"):
-        raise ValueError(f"criterion must be 'cosine' or 'bic', got {criterion!r}.")
+    spec = _resolve_strategy(strategy, max_delta, min_activity, criterion)
     if "MutationType" not in catalogue.columns:
         raise ValueError("catalogue must have a 'MutationType' column.")
     if "MutationType" not in reference.columns:
@@ -104,16 +169,14 @@ def fit_signatures(
 
     activities = np.zeros((len(sample_cols), len(sig_cols)), dtype=np.float64)
     cosines = np.zeros(len(sample_cols), dtype=np.float64)
-    results = Parallel(n_jobs=n_jobs, backend=backend)(
-        delayed(_fit_one)(
-            W,
-            M[:, j],
-            max_delta=max_delta,
-            min_activity=min_activity,
-            criterion=criterion,
+    if isinstance(spec, Forward):
+        results = Parallel(n_jobs=n_jobs, backend=backend)(
+            delayed(_fit_one_forward)(W, M[:, j], spec) for j in range(len(sample_cols))
         )
-        for j in range(len(sample_cols))
-    )
+    else:
+        raise NotImplementedError(
+            "strategy=Spa() is not wired up yet; see task 7 of the plan."
+        )
     for j, (h, cos) in enumerate(results):
         activities[j] = h
         cosines[j] = cos
