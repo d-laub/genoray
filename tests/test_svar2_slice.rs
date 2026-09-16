@@ -16,6 +16,7 @@ use genoray_core::field::{FieldCategory, FieldSpec, HtslibType, StorageDtype};
 use genoray_core::layout::{ContigPaths, FieldSub};
 use genoray_core::meta::{FORMAT_VERSION, write_meta};
 use genoray_core::mutcat::annotate::annotate_contig;
+use genoray_core::pipeline_args::RegionSpec;
 use genoray_core::query::field::{FieldValue, FieldView};
 use genoray_core::query::{ContigReader, oracle::overlap_sample};
 use genoray_core::run_slice_view;
@@ -1043,16 +1044,18 @@ fn run_slice_view_full_coverage_carries_genos_fields_and_mutcat() {
             py,
             src.to_str().unwrap().to_string(),
             out.to_str().unwrap().to_string(),
-            vec!["chr1".to_string()],
-            samples.iter().map(|s| s.to_string()).collect(),
-            vec![("chr1".to_string(), 0u32, u32::MAX)],
-            "variant".to_string(),
-            false,
+            RegionSpec {
+                chroms: vec!["chr1".to_string()],
+                samples: samples.iter().map(|s| s.to_string()).collect(),
+                region_ranges: vec![("chr1".to_string(), 0u32, u32::MAX)],
+                regions_overlap: "variant".to_string(),
+            },
             field_tuples,
-            Some(fasta.to_str().unwrap().to_string()),
-            false, // reroute
-            None,  // max_threads
-            false,
+            false,                                     // merge_overlapping
+            Some(fasta.to_str().unwrap().to_string()), // reference
+            false,                                     // reroute
+            None,                                      // max_threads
+            false,                                     // overwrite
             "info".to_string(),
             None, // log_filter
             None, // receiver
@@ -1106,16 +1109,18 @@ fn run_slice_view_without_reference_skips_mutcat() {
             py,
             src.to_str().unwrap().to_string(),
             out.to_str().unwrap().to_string(),
-            vec!["chr1".to_string()],
-            samples.iter().map(|s| s.to_string()).collect(),
-            vec![("chr1".to_string(), 0u32, u32::MAX)],
-            "variant".to_string(),
-            false,
+            RegionSpec {
+                chroms: vec!["chr1".to_string()],
+                samples: samples.iter().map(|s| s.to_string()).collect(),
+                region_ranges: vec![("chr1".to_string(), 0u32, u32::MAX)],
+                regions_overlap: "variant".to_string(),
+            },
             Vec::new(),
+            false, // merge_overlapping
             None,  // no reference -> no mutcat
             false, // reroute
             None,  // max_threads
-            false,
+            false, // overwrite
             "info".to_string(),
             None, // log_filter
             None, // receiver
@@ -1153,16 +1158,18 @@ fn run_slice_view_bad_reference_fails_before_any_output() {
             py,
             src.to_str().unwrap().to_string(),
             out.to_str().unwrap().to_string(),
-            vec!["chr1".to_string()],
-            samples.iter().map(|s| s.to_string()).collect(),
-            vec![("chr1".to_string(), 0u32, u32::MAX)],
-            "variant".to_string(),
-            false,
+            RegionSpec {
+                chroms: vec!["chr1".to_string()],
+                samples: samples.iter().map(|s| s.to_string()).collect(),
+                region_ranges: vec![("chr1".to_string(), 0u32, u32::MAX)],
+                regions_overlap: "variant".to_string(),
+            },
             Vec::new(),
-            Some(bad_fasta.to_str().unwrap().to_string()),
-            false, // reroute
-            None,  // max_threads
-            false,
+            false,                                         // merge_overlapping
+            Some(bad_fasta.to_str().unwrap().to_string()), // reference
+            false,                                         // reroute
+            None,                                          // max_threads
+            false,                                         // overwrite
             "info".to_string(),
             None, // log_filter
             None, // receiver
@@ -1205,16 +1212,18 @@ fn run_slice_view_reference_missing_contig_fails_before_any_output() {
             py,
             src.to_str().unwrap().to_string(),
             out.to_str().unwrap().to_string(),
-            vec!["chr1".to_string()],
-            samples.iter().map(|s| s.to_string()).collect(),
-            vec![("chr1".to_string(), 0u32, u32::MAX)],
-            "variant".to_string(),
-            false,
+            RegionSpec {
+                chroms: vec!["chr1".to_string()],
+                samples: samples.iter().map(|s| s.to_string()).collect(),
+                region_ranges: vec![("chr1".to_string(), 0u32, u32::MAX)],
+                regions_overlap: "variant".to_string(),
+            },
             Vec::new(),
-            Some(other_fasta.to_str().unwrap().to_string()),
-            false, // reroute
-            None,  // max_threads
-            false,
+            false,                                           // merge_overlapping
+            Some(other_fasta.to_str().unwrap().to_string()), // reference
+            false,                                           // reroute
+            None,                                            // max_threads
+            false,                                           // overwrite
             "info".to_string(),
             None, // log_filter
             None, // receiver
@@ -1878,16 +1887,18 @@ fn slice_all_contigs(src: &Path, out: &Path, threads: Option<usize>) {
             py,
             src.to_str().unwrap().to_string(),
             out.to_str().unwrap().to_string(),
-            chroms.iter().map(|s| s.to_string()).collect(),
-            vec!["S0".to_string(), "S1".to_string()],
-            regions,
-            "variant".to_string(),
-            false,
+            RegionSpec {
+                chroms: chroms.iter().map(|s| s.to_string()).collect(),
+                samples: vec!["S0".to_string(), "S1".to_string()],
+                region_ranges: regions,
+                regions_overlap: "variant".to_string(),
+            },
             Vec::new(),
-            None,  // reference
-            false, // reroute
-            threads,
-            false, // overwrite
+            false,   // merge_overlapping
+            None,    // reference
+            false,   // reroute
+            threads, // max_threads
+            false,   // overwrite
             "info".to_string(),
             None, // log_filter
             None, // receiver
