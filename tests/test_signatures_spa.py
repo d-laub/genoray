@@ -621,8 +621,7 @@ def test_assign_signatures_accepts_strategy_on_both_readers():
     """Both readers must expose the same refit knobs as fit_signatures."""
     import inspect
 
-    from genoray import SparseVar
-    from genoray._svar2 import SparseVar2
+    from genoray import SparseVar, SparseVar2
 
     for cls in (SparseVar, SparseVar2):
         params = inspect.signature(cls.assign_signatures).parameters

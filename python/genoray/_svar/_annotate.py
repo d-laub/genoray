@@ -536,7 +536,8 @@ class SparseVarAnnotateMixin:
                 ``None`` (default) uses forward selection configured by the
                 ``max_delta``/``min_activity``/``criterion`` arguments below.
                 Pass :class:`genoray.Spa` for SigProfilerAssignment's algorithm.
-                Cannot be combined with those three arguments.
+                The ``max_delta``/``min_activity``/``criterion`` arguments are
+                ignored when ``strategy`` is given.
             max_delta: Forwarded to :func:`genoray.fit_signatures`.
             min_activity: Forwarded to :func:`genoray.fit_signatures`.
             criterion: Forward-selection stop rule, forwarded to

@@ -1059,7 +1059,9 @@ act = sv.assign_signatures("SBS96")                  # mutation_matrix + fit_sig
   `criterion=` are forwarded to `fit_signatures` exactly like the top-level
   function — pass `strategy=Spa()` for SPA's algorithm, or leave it `None` to
   use the `max_delta`/`min_activity`/`criterion` forward-selection shorthand
-  (same "cannot combine `strategy=` with the legacy trio" rule applies).
+  (unlike `fit_signatures`, `assign_signatures` does not raise when both are
+  given — `max_delta`/`min_activity`/`criterion` are simply ignored whenever
+  `strategy=` is not `None`).
 - Same classification rules as v1 (shared Rust classifier): **DBS78 arises
   only from isolated adjacent same-haplotype SNV pairs** — runs of ≥3
   adjacent SNVs stay as individual SBS96 entries, native MNVs > 2bp are
@@ -1703,7 +1705,9 @@ Signatures:
   and `criterion=` are forwarded exactly like `fit_signatures` itself — pass
   `strategy=Spa()` for SigProfilerAssignment's algorithm, or leave `strategy`
   `None` (default) and use `max_delta`/`min_activity`/`criterion` to configure
-  the `Forward` shorthand (`strategy=` cannot be combined with those three).
+  the `Forward` shorthand (unlike `fit_signatures`, passing both does not
+  raise — `max_delta`/`min_activity`/`criterion` are simply ignored when
+  `strategy=` is given).
   `SparseVar2.assign_signatures` has the identical signature.
 
 Out of scope (v1): de novo extraction, opportunity normalization, bootstrap CIs,
