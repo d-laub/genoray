@@ -24,7 +24,7 @@ use pyo3::types::{PyDict, PyDictMethods};
 use crate::py_convert::{u8_to_pyarray, u32_to_i32_pyarray, usize_to_i64_pyarray};
 use crate::py_query::PyContigReader;
 use crate::query::{
-    BatchResult, MAX_END_SHIFT, RangesBundle, dense_max_end_keys, find_ranges, find_ranges_haps,
+    BatchResult, MAX_END_SHIFT, RangesBundle, dense_max_end_keys, find_ranges,
     find_ranges_haps_sparse, gather_ranges, read_ranges,
 };
 
@@ -408,58 +408,15 @@ impl PyContigReader {
         Ok(d)
     }
 
-    /// One hap slice `[hap_lo, hap_hi)` of a chunked `find_ranges`. Fills freshly
-    /// allocated numpy arrays IN PLACE, so the payload exists exactly once —
-    /// unlike `find_ranges`, whose `Vec<Range<usize>>` -> `Vec<i64>` ->
-    /// `ToPyArray` chain holds three copies at peak. Releases the GIL for the
-    /// search so rayon and the caller's progress bar can both run.
+    /// One hap slice `[hap_lo, hap_hi)` of a chunked `find_ranges`: only the
+    /// non-empty `(region, sample, ploid)` windows, region-major, as CSR.
     ///
     /// `vk_snp_range` / `vk_indel_range` come back hap-major, shape
     /// `(n_haps * R, 2)`; reshape to `(n_haps_samples, ploidy, R, 2)` in Python.
-    pub fn find_ranges_chunk<'py>(
-        &self,
-        py: Python<'py>,
-        query: &PyRangesQuery,
-        hap_lo: usize,
-        hap_hi: usize,
-    ) -> PyResult<Bound<'py, PyDict>> {
-        let n_haps = query.n_haps(self.inner.ploidy, hap_lo, hap_hi)?;
-        let (regions, sample_cols) = (&query.regions, &query.sample_cols);
-        let r = regions.len();
-
-        let snp = PyArray2::<i64>::zeros(py, [n_haps * r, 2], false);
-        let indel = PyArray2::<i64>::zeros(py, [n_haps * r, 2], false);
-        let max_keys = {
-            let mut snp_rw = snp.readwrite();
-            let mut indel_rw = indel.readwrite();
-            let snp_s = snp_rw.as_slice_mut()?;
-            let indel_s = indel_rw.as_slice_mut()?;
-            py.detach(|| {
-                find_ranges_haps(
-                    &self.inner,
-                    regions,
-                    sample_cols,
-                    hap_lo,
-                    hap_hi,
-                    snp_s,
-                    indel_s,
-                )
-            })
-        };
-
-        let keys_i64: Vec<i64> = max_keys.iter().map(|&x| x as i64).collect();
-        let d = PyDict::new(py);
-        d.set_item("vk_snp_range", snp)?;
-        d.set_item("vk_indel_range", indel)?;
-        d.set_item("max_end_keys", PyArray1::from_slice(py, &keys_i64))?;
-        d.set_item("hap_lo", hap_lo)?;
-        d.set_item("hap_hi", hap_hi)?;
-        Ok(d)
-    }
-
-    /// Sparse twin of `find_ranges_chunk`: only the non-empty
-    /// `(region, sample, ploid)` windows of the hap slice `[hap_lo, hap_hi)`,
-    /// region-major, as CSR.
+    /// The dense twin this was once measured against is gone (#204): at cohort
+    /// scale under 1% of the grid is non-empty, so materializing it cost ~128 GB
+    /// per All of Us chr22 contig for a payload the consumer immediately
+    /// discarded.
     ///
     /// `cell_id` is `selected_sample * ploidy + ploid` and is absolute within
     /// the SELECTION, so a chunk starting at sample `s0` emits
@@ -468,10 +425,10 @@ impl PyContigReader {
     /// A cell non-empty in only one channel still carries the other channel's
     /// raw start with length `0` — see `SparseCell`.
     ///
-    /// Unlike `find_ranges_chunk`, the GIL is only released for the search
-    /// itself (`find_ranges_haps_sparse`, under `py.detach`). The O(n) transpose
-    /// from `Vec<SparseCell>` into the five numpy columns below runs with the
-    /// GIL held, since it writes through `PyArray` handles.
+    /// The GIL is released for the search itself (`find_ranges_haps_sparse`,
+    /// under `py.detach`) but not beyond it: the O(n) transpose from
+    /// `Vec<SparseCell>` into the five numpy columns below runs with the GIL
+    /// held, since it writes through `PyArray` handles.
     pub fn find_ranges_chunk_sparse<'py>(
         &self,
         py: Python<'py>,
@@ -492,9 +449,10 @@ impl PyContigReader {
         let indel_start = PyArray1::<i64>::zeros(py, [n], false);
         let indel_len = PyArray1::<i32>::zeros(py, [n], false);
         {
-            // Fill in place rather than building five Vecs and copying: the
-            // payload then exists once, matching `find_ranges_chunk`'s reason
-            // for writing into freshly allocated arrays.
+            // Fill in place rather than building five Vecs and copying, so
+            // the payload exists exactly once -- unlike `find_ranges`, whose
+            // `Vec<Range<usize>>` -> `Vec<i64>` -> `ToPyArray` chain holds
+            // three copies at peak.
             let mut w_cell = cell_id.readwrite();
             let mut w_ss = snp_start.readwrite();
             let mut w_sl = snp_len.readwrite();

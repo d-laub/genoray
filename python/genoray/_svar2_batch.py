@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from functools import cached_property
-from typing import TYPE_CHECKING, Any, Generic, TypedDict, TypeVar
+from typing import TYPE_CHECKING, Any, TypedDict
 
 import numpy as np
 
@@ -21,36 +21,13 @@ MAX_END_SHIFT = 21
 
 
 @dataclass(frozen=True, slots=True)
-class RangesChunk:
-    """One hap slice of a chunked ``_find_ranges``.
-
-    Attributes:
-        sample_start: Offset of this chunk on the SELECTED sample axis.
-        n_samples: Number of selected samples in this chunk.
-        vk_snp_range: Shape ``(n_samples, ploidy, n_regions, 2)``, hap-major.
-        vk_indel_range: Shape ``(n_samples, ploidy, n_regions, 2)``, hap-major.
-        max_end_keys: Shape ``(n_regions,)``. Packed ``(pos << MAX_END_SHIFT) |
-            ext`` maxima over this chunk's haps; ``0`` means no variant. Reduce
-            across chunks with an elementwise maximum BEFORE unpacking -- the
-            ordering rule is position first, end second, so reducing unpacked
-            ends would pick the wrong variant.
-    """
-
-    sample_start: int
-    n_samples: int
-    vk_snp_range: "np.ndarray"
-    vk_indel_range: "np.ndarray"
-    max_end_keys: "np.ndarray"
-
-
-@dataclass(frozen=True, slots=True)
 class SparseRangesChunk:
     """One hap slice of a chunked ``_find_ranges``, sparse and region-major.
 
     Only the ``(region, sample, ploid)`` windows where at least one channel
-    overlaps. At cohort scale that is well under 1% of the grid, so this is the
-    form to build a region-CSR cache from -- the dense :class:`RangesChunk` is
-    ~128 GB per All of Us chr22 contig, over 99% of it the pair ``(0, 0)``.
+    overlaps. At cohort scale that is well under 1% of the grid, which is why
+    the dense form this replaced was deleted (#204): it ran ~128 GB per All of
+    Us chr22 contig, over 99% of it the pair ``(0, 0)``.
 
     Attributes:
         sample_start: Offset of this chunk on the SELECTED sample axis.
@@ -67,9 +44,11 @@ class SparseRangesChunk:
             insertion point rather than a synthesized ``0``.
         indel_start: Shape ``(N,)`` int64. As ``snp_start``, indel channel.
         indel_len: Shape ``(N,)`` int32. As ``snp_len``, indel channel.
-        max_end_keys: Shape ``(n_regions,)``. Identical to
-            :attr:`RangesChunk.max_end_keys` -- reduce across chunks with an
-            elementwise maximum BEFORE unpacking.
+        max_end_keys: Shape ``(n_regions,)``. Packed ``(pos << MAX_END_SHIFT)
+            | ext`` maxima over this chunk's haps; ``0`` means no variant.
+            Reduce across chunks with an elementwise maximum BEFORE unpacking
+            -- the ordering rule is position first, end second, so reducing
+            unpacked ends would pick the wrong variant.
     """
 
     sample_start: int
@@ -83,19 +62,12 @@ class SparseRangesChunk:
     max_end_keys: "np.ndarray"
 
 
-#: Chunk type of a :class:`RangesStream` -- :class:`RangesChunk` (dense) or
-#: :class:`SparseRangesChunk`.
-C = TypeVar("C")
-
-
 @dataclass(frozen=True, slots=True)
-class RangesStream(Generic[C]):
+class RangesStream:
     """Memory-bounded, chunked form of ``_find_ranges``.
 
     The ``O(n_regions)`` arrays are computed eagerly. The per-chunk payload
-    arrives via ``chunks``: ``O(n_regions * n_samples * ploidy)`` for
-    ``RangesStream[RangesChunk]`` (dense), or O(non-empty cells) for
-    ``RangesStream[SparseRangesChunk]`` (sparse). ``n_samples`` is the
+    arrives via ``chunks``, O(non-empty cells) each. ``n_samples`` is the
     progress denominator and each chunk reports how many samples it advanced
     by.
     """
@@ -110,7 +82,7 @@ class RangesStream(Generic[C]):
     dense_indel_range: "np.ndarray"
     sample_cols: "np.ndarray"
     dense_max_end_keys: "np.ndarray"
-    chunks: "Iterator[C]"
+    chunks: "Iterator[SparseRangesChunk]"
 
 
 class BatchResult(TypedDict):
@@ -361,8 +333,10 @@ class _BatchQueryMixin:
         )
 
     @staticmethod
-    def _ranges_stream(plan: _ChunkPlan, chunks: "Iterator[C]") -> "RangesStream[C]":
-        """Wrap a chunk generator in the header both streams share."""
+    def _ranges_stream(
+        plan: _ChunkPlan, chunks: "Iterator[SparseRangesChunk]"
+    ) -> "RangesStream":
+        """Wrap a chunk generator in its eagerly computed ``O(n_regions)`` header."""
         return RangesStream(
             n_regions=plan.n_regions,
             n_samples=plan.n_samples,
@@ -377,62 +351,6 @@ class _BatchQueryMixin:
             chunks=chunks,
         )
 
-    def _find_ranges_chunked(
-        self,
-        contig: str,
-        starts: "ArrayLike",
-        ends: "ArrayLike",
-        samples: "ArrayLike | None" = None,
-        *,
-        max_mem: int | None = None,
-    ) -> "RangesStream[RangesChunk]":
-        """Chunked, memory-bounded ``_find_ranges``.
-
-        ``starts``/``ends`` and ``samples`` behave as in :meth:`read_ranges`.
-
-        The var_key payload is ``n_regions * n_samples * ploidy * 2`` int64
-        pairs per channel, which is tens of GiB at cohort scale. This splits it
-        along the SAMPLE axis -- not the region axis -- because the search is
-        column-outer: chunking regions would re-sweep the whole packed store per
-        chunk, while chunking samples keeps a single sweep.
-
-        Args:
-            contig: Contig name.
-            starts: 0-based start positions of the query regions.
-            ends: 0-based, exclusive end positions of the query regions.
-            samples: Sample names selecting (and reordering) a subset.
-            max_mem: Approximate byte budget for one chunk's payload. ``None``
-                yields a single chunk covering every sample.
-
-        Returns:
-            A :class:`RangesStream` whose ``chunks`` generator yields
-            :class:`RangesChunk` in ascending ``sample_start`` order.
-
-        Raises:
-            ValueError: If ``max_mem`` cannot fit a single sample's payload, or
-                if the contig's largest deletion overflows the max-end key
-                packing width.
-        """
-        plan = self._ranges_chunk_plan(contig, starts, ends, samples, max_mem)
-
-        def _gen() -> "Iterator[RangesChunk]":
-            for s0 in range(0, plan.n_samples, plan.per):
-                s1 = min(s0 + plan.per, plan.n_samples)
-                d = plan.reader.find_ranges_chunk(
-                    plan.query, s0 * plan.ploidy, s1 * plan.ploidy
-                )
-                cs = s1 - s0
-                shape = (cs, plan.ploidy, plan.n_regions, 2)
-                yield RangesChunk(
-                    sample_start=s0,
-                    n_samples=cs,
-                    vk_snp_range=np.asarray(d["vk_snp_range"]).reshape(shape),
-                    vk_indel_range=np.asarray(d["vk_indel_range"]).reshape(shape),
-                    max_end_keys=np.asarray(d["max_end_keys"], np.int64),
-                )
-
-        return self._ranges_stream(plan, _gen())
-
     def _find_ranges_chunked_sparse(
         self,
         contig: str,
@@ -441,20 +359,20 @@ class _BatchQueryMixin:
         samples: "ArrayLike | None" = None,
         *,
         max_mem: int | None = None,
-    ) -> "RangesStream[SparseRangesChunk]":
+    ) -> "RangesStream":
         """Sparse, chunked, memory-bounded ``_find_ranges``.
 
-        Identical to :meth:`_find_ranges_chunked` in header, chunking and
-        arguments; each chunk carries only the non-empty
-        ``(region, sample, ploid)`` windows, region-major, as CSR. Build a
-        region-CSR cache from this rather than from the dense stream: at cohort
-        scale under 1% of the grid is non-empty, so the dense intermediate is
-        ~128 GB per All of Us chr22 contig and a consumer's first act is to
-        throw ~99.55% of it away.
+        Each chunk carries only the non-empty ``(region, sample, ploid)``
+        windows, region-major, as CSR. At cohort scale under 1% of the grid is
+        non-empty, so the dense stream this replaced ran ~128 GB per All of Us
+        chr22 contig for a payload whose consumer's first act was to throw
+        ~99.55% of it away; it was deleted in #204.
 
-        Chunks partition the SAMPLE axis, so each one is a complete CSR over
-        every region for its samples; merging chunks means interleaving their
-        per-region blocks.
+        The payload is split along the SAMPLE axis -- not the region axis --
+        because the search is column-outer: chunking regions would re-sweep the
+        whole packed store per chunk, while chunking samples keeps a single
+        sweep. Each chunk is therefore a complete CSR over every region for its
+        samples; merging chunks means interleaving their per-region blocks.
 
         Args:
             contig: Contig name.
