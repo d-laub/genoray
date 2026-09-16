@@ -615,3 +615,82 @@ def test_spa_matches_across_n_jobs():
     a = fit_signatures(cat, ref, strategy=Spa(background_sigs=None), n_jobs=1)
     b = fit_signatures(cat, ref, strategy=Spa(background_sigs=None), n_jobs=2)
     assert a.equals(b)
+
+
+def test_assign_signatures_accepts_strategy_on_both_readers():
+    """Both readers must expose the same refit knobs as fit_signatures."""
+    import inspect
+
+    from genoray import SparseVar
+    from genoray._svar2 import SparseVar2
+
+    for cls in (SparseVar, SparseVar2):
+        params = inspect.signature(cls.assign_signatures).parameters
+        assert "strategy" in params, f"{cls.__name__} is missing strategy="
+        assert "criterion" in params, f"{cls.__name__} is missing criterion="
+
+
+def test_assign_signatures_forwards_strategy_to_fit_signatures(monkeypatch):
+    """strategy= must actually reach fit_signatures, not just exist in the signature."""
+    import polars as pl
+
+    from genoray import Spa, SparseVar, SparseVar2
+
+    captured: dict[str, object] = {}
+
+    def fake_fit(catalogue, reference, **kwargs):
+        captured.clear()
+        captured.update(kwargs)
+        return pl.DataFrame({"Sample": ["s1"]})
+
+    class _Stub:
+        def mutation_matrix(self, kind, count="allele"):
+            return pl.DataFrame({"MutationType": ["A"], "s1": [1.0]})
+
+    ref = pl.DataFrame({"MutationType": ["A"], "S1": [1.0]})
+
+    # SparseVar binds fit_signatures at module import time.
+    monkeypatch.setattr("genoray._svar._annotate.fit_signatures", fake_fit)
+    SparseVar.assign_signatures(_Stub(), "SBS96", reference=ref, strategy=Spa())
+    assert isinstance(captured.get("strategy"), Spa)
+    # The legacy trio must NOT be forwarded alongside strategy=, or
+    # fit_signatures raises ValueError.
+    assert "max_delta" not in captured
+    assert "min_activity" not in captured
+    assert "criterion" not in captured
+
+    # SparseVar2 imports fit_signatures inside the method body, so the patch
+    # must land on the source module, not on the reader's module.
+    monkeypatch.setattr("genoray._signatures.fit_signatures", fake_fit)
+    SparseVar2.assign_signatures(_Stub(), "SBS96", reference=ref, strategy=Spa())
+    assert isinstance(captured.get("strategy"), Spa)
+    assert "max_delta" not in captured
+
+
+def test_assign_signatures_forwards_criterion_when_no_strategy(monkeypatch):
+    """The legacy branch must forward criterion=, which was previously unreachable."""
+    import polars as pl
+
+    from genoray import SparseVar, SparseVar2
+
+    captured: dict[str, object] = {}
+
+    def fake_fit(catalogue, reference, **kwargs):
+        captured.clear()
+        captured.update(kwargs)
+        return pl.DataFrame({"Sample": ["s1"]})
+
+    class _Stub:
+        def mutation_matrix(self, kind, count="allele"):
+            return pl.DataFrame({"MutationType": ["A"], "s1": [1.0]})
+
+    ref = pl.DataFrame({"MutationType": ["A"], "S1": [1.0]})
+
+    monkeypatch.setattr("genoray._svar._annotate.fit_signatures", fake_fit)
+    SparseVar.assign_signatures(_Stub(), "SBS96", reference=ref, criterion="bic")
+    assert captured.get("criterion") == "bic"
+    assert captured.get("strategy") is None or "strategy" not in captured
+
+    monkeypatch.setattr("genoray._signatures.fit_signatures", fake_fit)
+    SparseVar2.assign_signatures(_Stub(), "SBS96", reference=ref, criterion="bic")
+    assert captured.get("criterion") == "bic"

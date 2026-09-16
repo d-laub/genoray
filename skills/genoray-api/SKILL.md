@@ -1052,10 +1052,14 @@ act = sv.assign_signatures("SBS96")                  # mutation_matrix + fit_sig
   strand annotation (`annotate_mutations(..., gtf=...)`) and raise
   `ValueError` if the store lacks it. `assign_signatures` does **not** accept
   `"SBS192"`/`"SBS384"` — see below.
-- `assign_signatures(kind, *, reference=None, count="allele", max_delta=0.01, min_activity=0.005, n_jobs=1, backend="loky") -> pl.DataFrame`
+- `assign_signatures(kind, *, reference=None, count="allele", strategy=None, max_delta=0.01, min_activity=0.005, criterion="cosine", n_jobs=1, backend="loky") -> pl.DataFrame`
   — `mutation_matrix(kind, count=...)` then `genoray.fit_signatures(...)`.
   `reference` accepts a `pl.DataFrame`, a TSV path, or `None` (defaults to
-  `genoray.cosmic_signatures(kind)`).
+  `genoray.cosmic_signatures(kind)`). `strategy=`/`max_delta=`/`min_activity=`/
+  `criterion=` are forwarded to `fit_signatures` exactly like the top-level
+  function — pass `strategy=Spa()` for SPA's algorithm, or leave it `None` to
+  use the `max_delta`/`min_activity`/`criterion` forward-selection shorthand
+  (same "cannot combine `strategy=` with the legacy trio" rule applies).
 - Same classification rules as v1 (shared Rust classifier): **DBS78 arises
   only from isolated adjacent same-haplotype SNV pairs** — runs of ≥3
   adjacent SNVs stay as individual SBS96 entries, native MNVs > 2bp are
@@ -1644,6 +1648,7 @@ act = genoray.fit_signatures(cat, ref, strategy=Spa())  # SPA's cosmic_fit, fait
 act = svar.assign_signatures("SBS96")                       # default COSMIC ref
 act = svar.assign_signatures("SBS96", reference=ref, min_activity=0.01)
 act = svar.assign_signatures("SBS96", reference="my_sigs.txt")  # TSV path
+act = svar.assign_signatures("SBS96", strategy=Spa())       # same strategy= as fit_signatures
 ```
 
 Signatures:
@@ -1690,12 +1695,16 @@ Signatures:
     criterion, is scale-invariant and so not a consistent estimator either.
     Roughly an order of magnitude slower per sample than `Forward` (~11-12x
     measured on real COSMIC SBS96, 86 signatures).
-- `SparseVar.assign_signatures(kind, *, reference=None, count="allele", max_delta=0.01, min_activity=0.005, n_jobs=1, backend="loky") -> pl.DataFrame`
+- `SparseVar.assign_signatures(kind, *, reference=None, count="allele", strategy=None, max_delta=0.01, min_activity=0.005, criterion="cosine", n_jobs=1, backend="loky") -> pl.DataFrame`
   — `mutation_matrix(kind, count=...)` then `fit_signatures(...)`. `reference`
   accepts a `pl.DataFrame`, a TSV path, or `None` (defaults to `cosmic_signatures(kind)`).
   Forwards `n_jobs`/`backend` to `fit_signatures` for per-sample parallelism
-  (`n_jobs=1` (default) is serial; `n_jobs=-1` uses all cores). Does **not**
-  accept `strategy=` yet — only the legacy `Forward` shorthand arguments.
+  (`n_jobs=1` (default) is serial; `n_jobs=-1` uses all cores). `strategy=`
+  and `criterion=` are forwarded exactly like `fit_signatures` itself — pass
+  `strategy=Spa()` for SigProfilerAssignment's algorithm, or leave `strategy`
+  `None` (default) and use `max_delta`/`min_activity`/`criterion` to configure
+  the `Forward` shorthand (`strategy=` cannot be combined with those three).
+  `SparseVar2.assign_signatures` has the identical signature.
 
 Out of scope (v1): de novo extraction, opportunity normalization, bootstrap CIs,
 plotting.
