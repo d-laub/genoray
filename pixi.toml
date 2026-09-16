@@ -167,7 +167,12 @@ python = "3.14.*"
 
 [feature.py314.pypi-dependencies]
 # numpy 1.26 has no cp314 wheels; 3.14 requires numpy>=2 (same as py313).
-numpy = ">=2"
+# Floor raised to 2.5 deliberately: numpy 2.5 redefined `numpy.typing.NDArray`
+# as a PEP 695 type alias, which broke every `genoray.VCF`/`genoray.PGEN` use
+# (#211). This is the one environment that exercises that numpy generation —
+# py313 stays at >=2 so the older `types.GenericAlias` spelling keeps coverage
+# too. Do not lower it.
+numpy = ">=2.5"
 
 [feature.sbox.pypi-dependencies]
 fast-histogram = "*"

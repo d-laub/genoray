@@ -34,3 +34,14 @@ def test_tuple_mode_empty():
 
 def test_tuple_mode_dtypes():
     assert GenoDose._dtypes == (np.int8, np.float32)
+
+
+def test_array_mode_subclasses_ndarray():
+    # Regression guard for #211: numpy 2.5 made `numpy.typing.NDArray` a PEP 695
+    # type alias, which cannot be resolved as a class base. Building the mode
+    # classes above already fails at import time under a broken spelling; these
+    # assertions pin the MRO and parse behaviour the base is there to provide.
+    assert issubclass(Geno, np.ndarray)
+    assert issubclass(Dose, np.ndarray)
+    parsed = Geno.parse(np.zeros((3, 2, 5), np.int8))
+    assert isinstance(parsed, np.ndarray) and parsed.dtype == np.int8

@@ -4,7 +4,6 @@ import types
 from typing import Any
 
 import numpy as np
-from numpy.typing import NDArray
 from phantom import Phantom
 
 
@@ -52,8 +51,16 @@ def make_array_mode(
         ns["nbytes_per_variant"] = classmethod(nbytes_per_variant)
         return ns
 
+    # The base is spelled as `np.ndarray[Any, np.dtype[dtype]]` rather than the
+    # equivalent `NDArray[dtype]`: numpy 2.5 redefined `numpy.typing.NDArray` as
+    # a PEP 695 type alias, and resolving a `TypeAliasType` subscription to a
+    # class base fails (see #211). The underlying spelling stays a plain generic
+    # alias on every supported numpy, and produces an identical MRO.
     return types.new_class(
-        name, (NDArray[dtype], Phantom), {"predicate": predicate}, exec_body
+        name,
+        (np.ndarray[Any, np.dtype[dtype]], Phantom),
+        {"predicate": predicate},
+        exec_body,
     )
 
 
