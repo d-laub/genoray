@@ -111,7 +111,8 @@ def test_find_ranges_chunk_matches_find_ranges(svar2_store: Path):
     S = sv.n_samples
     H = S * P
 
-    header = reader.find_ranges_header(reg, None)
+    query = reader.ranges_query(reg, None)
+    header = reader.find_ranges_header(query)
     np.testing.assert_array_equal(
         np.asarray(header["dense_snp_range"]), np.asarray(bundle["dense_snp_range"])
     )
@@ -123,7 +124,7 @@ def test_find_ranges_chunk_matches_find_ranges(svar2_store: Path):
     snp = np.empty((H, R, 2), np.int64)
     indel = np.empty((H, R, 2), np.int64)
     for h in range(H):
-        d = reader.find_ranges_chunk(reg, None, h, h + 1)
+        d = reader.find_ranges_chunk(query, h, h + 1)
         snp[h] = np.asarray(d["vk_snp_range"]).reshape(1, R, 2)
         indel[h] = np.asarray(d["vk_indel_range"]).reshape(1, R, 2)
 
@@ -290,14 +291,15 @@ def test_sparse_chunk_matches_dense_chunk(
     reg = list(zip(starts, ends))
     reader = sv._reader("chr1")
     P, S = sv.ploidy, sv.n_samples
+    query = reader.ranges_query(reg, None)
 
     for hap_lo, hap_hi in [(0, S * P), (0, P), (P, 3 * P), (S * P, S * P)]:
-        d = reader.find_ranges_chunk(reg, None, hap_lo, hap_hi)
+        d = reader.find_ranges_chunk(query, hap_lo, hap_hi)
         shape = ((hap_hi - hap_lo) // P, P, len(reg), 2)
         snp = np.asarray(d["vk_snp_range"]).reshape(shape)
         indel = np.asarray(d["vk_indel_range"]).reshape(shape)
 
-        got = reader.find_ranges_chunk_sparse(reg, None, hap_lo, hap_hi)
+        got = reader.find_ranges_chunk_sparse(query, hap_lo, hap_hi)
         _assert_sparse_matches_dense(got[:6], snp, indel, hap_lo // P, P)
         np.testing.assert_array_equal(
             np.asarray(got[6], np.int64), np.asarray(d["max_end_keys"], np.int64)
@@ -318,7 +320,9 @@ def test_sparse_chunk_cell_ids_ascend_within_each_region(
     reg = [(0, 20), (0, 5)]
     reader = sv._reader("chr1")
     S, P = sv.n_samples, sv.ploidy
-    ptr, cell, *_ = reader.find_ranges_chunk_sparse(reg, None, 0, S * P)
+    ptr, cell, *_ = reader.find_ranges_chunk_sparse(
+        reader.ranges_query(reg, None), 0, S * P
+    )
     ptr = np.asarray(ptr)
     cell = np.asarray(cell)
 
@@ -344,7 +348,7 @@ def test_sparse_chunk_empty_region_yields_no_entries(svar2_singleton_store: Path
     reader = sv._reader("chr1")
     S, P = sv.n_samples, sv.ploidy
     ptr, cell, snp_start, snp_len, indel_start, indel_len, keys = (
-        reader.find_ranges_chunk_sparse([(30, 40)], None, 0, S * P)
+        reader.find_ranges_chunk_sparse(reader.ranges_query([(30, 40)], None), 0, S * P)
     )
     np.testing.assert_array_equal(np.asarray(ptr), np.zeros(2, np.int64))
     for arr in (cell, snp_start, snp_len, indel_start, indel_len):
@@ -360,10 +364,11 @@ def test_sparse_chunk_sample_subset(svar2_singleton_store: Path):
     idxs = sv._sample_idxs(sub)
     P = sv.ploidy
     reg = [(0, 20)]
-    d = reader.find_ranges_chunk(reg, idxs, 0, len(sub) * P)
+    query = reader.ranges_query(reg, idxs)
+    d = reader.find_ranges_chunk(query, 0, len(sub) * P)
     snp = np.asarray(d["vk_snp_range"]).reshape(len(sub), P, 1, 2)
     indel = np.asarray(d["vk_indel_range"]).reshape(len(sub), P, 1, 2)
-    got = reader.find_ranges_chunk_sparse(reg, idxs, 0, len(sub) * P)
+    got = reader.find_ranges_chunk_sparse(query, 0, len(sub) * P)
     _assert_sparse_matches_dense(got[:6], snp, indel, 0, P)
     assert np.asarray(got[1]).max() < len(sub) * P
 
@@ -373,9 +378,9 @@ def test_sparse_chunk_rejects_out_of_bounds_hap_slice(svar2_singleton_store: Pat
     reader = sv._reader("chr1")
     H = sv.n_samples * sv.ploidy
     with pytest.raises(ValueError, match="out of bounds"):
-        reader.find_ranges_chunk_sparse([(0, 20)], None, 0, H + 1)
+        reader.find_ranges_chunk_sparse(reader.ranges_query([(0, 20)], None), 0, H + 1)
     with pytest.raises(ValueError, match="out of bounds"):
-        reader.find_ranges_chunk_sparse([(0, 20)], None, 2, 1)
+        reader.find_ranges_chunk_sparse(reader.ranges_query([(0, 20)], None), 2, 1)
 
 
 def _reassemble_sparse(stream):
@@ -475,3 +480,20 @@ def test_ranges_dataclasses_are_slotted():
         slots = cls.__dict__.get("__slots__")
         assert slots is not None, cls.__name__
         assert set(slots) == {f.name for f in fields(cls)}, cls.__name__
+
+
+def test_ranges_query_rejects_out_of_bounds_sample(svar2_singleton_store: Path):
+    """The selection is validated once, where it is marshalled.
+
+    Left to the chunk calls, an out-of-range index would only be reached when
+    the chunking happened to cover that hap -- so the same query would raise or
+    not depending on ``max_mem``, and would surface as an index panic from
+    inside the search rather than a ``ValueError``.
+    """
+    sv = SparseVar2(svar2_singleton_store)
+    reader = sv._reader("chr1")
+    S = sv.n_samples
+    with pytest.raises(ValueError, match="out of bounds"):
+        reader.ranges_query([(0, 20)], [0, S])
+    # The last valid index is not off-by-one rejected.
+    reader.ranges_query([(0, 20)], [S - 1])

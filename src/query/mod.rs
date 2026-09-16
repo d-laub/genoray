@@ -36,9 +36,10 @@ pub use crate::spine::{KeyRef, SrcKeyRef, VK_SRC_INDEL_BIT, VkElem, pack_vk_src,
 pub use decode::{HapCalls, QueryResult};
 pub use field::{FieldValue, FieldView};
 pub use gather::{
-    BatchResult, BatchResultSplit, HapRanges, MAX_END_SHIFT, PAR_COLUMN_THRESHOLD, RangesBundle,
+    BatchResult, BatchResultSplit, HapRanges, MAX_END_SHIFT, PAR_CELL_THRESHOLD, RangesBundle,
     SparseCell, dense_abs_row, find_ranges, find_ranges_haps, find_ranges_haps_sparse,
     gather_haps_readbound, gather_haps_readbound_src, gather_ranges, overlap_batch, read_ranges,
+    use_parallel,
 };
 pub use reader::{ContigReader, VariantStats};
 pub use union::dense_max_end_keys;

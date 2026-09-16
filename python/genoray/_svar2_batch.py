@@ -151,8 +151,10 @@ class _ChunkPlan:
     """Everything both chunked range streams need before they diverge."""
 
     reader: Any
-    reg: "list[tuple[int, int]]"
-    sample_idxs: "list[int] | None"
+    #: Regions + sample selection, marshalled into Rust ONCE for the whole
+    #: stream. Passing them per chunk re-extracted O(n_regions + n_samples)
+    #: Python objects on every call, for a query that never changes (#205).
+    query: Any
     header: "Mapping[str, Any]"
     per: int
     n_regions: int
@@ -316,10 +318,11 @@ class _BatchQueryMixin:
         cells instead -- far smaller -- but sizing it from a measured fill would
         trade a hard worst-case bound for a heuristic, so the bound stays.
         """
-        reg = self._regions(starts, ends)
-        sample_idxs = self._sample_idxs(samples)
         reader = self._reader(contig)
-        header = reader.find_ranges_header(reg, sample_idxs)
+        query = reader.ranges_query(
+            self._regions(starts, ends), self._sample_idxs(samples)
+        )
+        header = reader.find_ranges_header(query)
 
         n_regions = int(header["n_regions"])
         n_samples = int(header["n_samples"])
@@ -349,8 +352,7 @@ class _BatchQueryMixin:
 
         return _ChunkPlan(
             reader=reader,
-            reg=reg,
-            sample_idxs=sample_idxs,
+            query=query,
             header=header,
             per=per,
             n_regions=n_regions,
@@ -417,7 +419,7 @@ class _BatchQueryMixin:
             for s0 in range(0, plan.n_samples, plan.per):
                 s1 = min(s0 + plan.per, plan.n_samples)
                 d = plan.reader.find_ranges_chunk(
-                    plan.reg, plan.sample_idxs, s0 * plan.ploidy, s1 * plan.ploidy
+                    plan.query, s0 * plan.ploidy, s1 * plan.ploidy
                 )
                 cs = s1 - s0
                 shape = (cs, plan.ploidy, plan.n_regions, 2)
@@ -485,7 +487,7 @@ class _BatchQueryMixin:
                     indel_len,
                     max_end_keys,
                 ) = plan.reader.find_ranges_chunk_sparse(
-                    plan.reg, plan.sample_idxs, s0 * plan.ploidy, s1 * plan.ploidy
+                    plan.query, s0 * plan.ploidy, s1 * plan.ploidy
                 )
                 yield SparseRangesChunk(
                     sample_start=s0,

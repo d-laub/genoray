@@ -7,8 +7,8 @@ use common::{SynthRecord, build_contig};
 use genoray_core::py_query::PyContigReader;
 use genoray_core::query::gather::overlap_batch_src;
 use genoray_core::query::{
-    ContigReader, MAX_END_SHIFT, PAR_COLUMN_THRESHOLD, dense_max_end_keys, find_ranges,
-    find_ranges_haps, gather_ranges, overlap_batch, read_ranges,
+    ContigReader, MAX_END_SHIFT, PAR_CELL_THRESHOLD, dense_max_end_keys, find_ranges,
+    find_ranges_haps, gather_ranges, overlap_batch, read_ranges, use_parallel,
 };
 use genoray_core::search;
 use numpy::{PyArray1, PyArray2, PyArrayMethods};
@@ -280,7 +280,7 @@ fn synth_reader_carrier_subset(out: &std::path::Path) -> ContigReader {
 /// carrying three variants scattered across the hap axis (first hap, an
 /// interior hap, last hap) so per-hap max-end keys actually vary. Built for
 /// `test_max_end_keys_parallel_matches_serial_reduction`, which needs
-/// `n_samples * ploidy >= PAR_COLUMN_THRESHOLD` to force
+/// `use_parallel(n_samples * ploidy, r)` to force
 /// `find_ranges_haps`'s rayon `fold`/`reduce` branch.
 fn synth_reader_many_haps(out: &std::path::Path, n_samples: usize, ploidy: usize) -> ContigReader {
     let sample_names: Vec<String> = (0..n_samples).map(|i| format!("S{i}")).collect();
@@ -476,7 +476,7 @@ fn test_py_read_ranges_dict_matches_overlap_batch_dict() {
 /// growth across all channels, not just the var_key ones.
 ///
 /// The fixture is deliberately small (2 samples x 2 ploidy = 4 columns, well
-/// under `PAR_COLUMN_THRESHOLD`) so the serial path runs on this thread and
+/// under `PAR_CELL_THRESHOLD`) so the serial path runs on this thread and
 /// `search::search_tree_build_count` — a thread-local — stays observable.
 ///
 /// Coverage gap: `synth_reader_wide` has no multi-carrier SNP, so it builds
@@ -733,13 +733,17 @@ fn test_dense_max_end_keys_excludes_uncarried_sample() {
 }
 
 /// The rayon `fold`/`reduce` accumulation of per-region max-end keys (taken
-/// when `n_haps >= PAR_COLUMN_THRESHOLD`) must agree with the serial
-/// single-hap-slice reduction the smaller fixtures above exercise. 32 samples
-/// x ploidy 2 = 64 haps forces the parallel branch for the whole-slice call;
-/// each single-hap call (`hap_hi = hap_lo + 1`) has `n_haps = 1`, well under
-/// the threshold, so it takes the serial path — this compares the two
-/// branches directly instead of trusting the fold/reduce closures by
-/// inspection.
+/// when `use_parallel(n_haps, r)`) must agree with the serial single-hap-slice
+/// reduction the smaller fixtures above exercise. 32 samples x ploidy 2 = 64
+/// haps over `R` replicated regions clears `PAR_CELL_THRESHOLD` and so forces
+/// the parallel branch for the whole-slice call; each single-hap call
+/// (`hap_hi = hap_lo + 1`) carries `R` cells, well under the threshold, so it
+/// takes the serial path — this compares the two branches directly instead of
+/// trusting the fold/reduce closures by inspection.
+///
+/// The regions are replicated rather than distinct so every one of them holds
+/// the same non-zero key: a per-region mismatch in the reduction then shows up
+/// as an inequality rather than hiding among regions that are legitimately 0.
 #[test]
 fn test_max_end_keys_parallel_matches_serial_reduction() {
     let tmp = tempdir().unwrap();
@@ -749,24 +753,33 @@ fn test_max_end_keys_parallel_matches_serial_reduction() {
     let ploidy = 2;
     let reader = synth_reader_many_haps(&out, n_samples, ploidy);
 
-    let regions = vec![(0u32, 1_000u32)];
-    let sample_cols: Vec<usize> = (0..n_samples).collect();
     let h = n_samples * ploidy;
+    // Enough regions that the whole-slice call clears the work gate, and no
+    // more -- the serial reference below is O(h * r).
+    let r = PAR_CELL_THRESHOLD.div_ceil(h);
+    let regions = vec![(0u32, 1_000u32); r];
+    let sample_cols: Vec<usize> = (0..n_samples).collect();
     assert!(
-        h >= PAR_COLUMN_THRESHOLD,
+        use_parallel(h, r),
         "fixture must exercise the parallel branch"
     );
+    assert!(
+        !use_parallel(1, r),
+        "the single-hap reference must stay serial"
+    );
 
-    let mut snp = vec![0i64; h * 2];
-    let mut indel = vec![0i64; h * 2];
+    let mut snp = vec![0i64; h * r * 2];
+    let mut indel = vec![0i64; h * r * 2];
     let whole = find_ranges_haps(&reader, &regions, &sample_cols, 0, h, &mut snp, &mut indel);
 
-    let mut reduced = vec![0u64; 1];
+    let mut reduced = vec![0u64; r];
     for lo in 0..h {
-        let mut s = vec![0i64; 2];
-        let mut i = vec![0i64; 2];
+        let mut s = vec![0i64; r * 2];
+        let mut i = vec![0i64; r * 2];
         let part = find_ranges_haps(&reader, &regions, &sample_cols, lo, lo + 1, &mut s, &mut i);
-        reduced[0] = reduced[0].max(part[0]);
+        for (acc, p) in reduced.iter_mut().zip(part) {
+            *acc = (*acc).max(p);
+        }
     }
     assert_eq!(whole, reduced);
     // Sanity: the fixture actually carries a variant in [0, 1000), so this
@@ -784,7 +797,8 @@ fn test_max_end_keys_parallel_matches_serial_reduction() {
 /// Same fixture and same reasoning as the `find_ranges` guard: `synth_reader`
 /// populates only one of the four `vk_snp` columns, which lets the unfixed
 /// growth tie a per-region allowance, so this uses `synth_reader_wide` (all 4
-/// columns non-empty). 4 columns is well under `PAR_COLUMN_THRESHOLD`, so the
+/// columns non-empty). 4 columns x 16 regions is well under
+/// `PAR_CELL_THRESHOLD`, so the
 /// search half stays on this thread and `search::search_tree_build_count` — a
 /// thread-local — remains observable.
 ///

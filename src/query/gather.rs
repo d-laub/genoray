@@ -195,7 +195,7 @@ pub(crate) fn gather_vk<T: VkElem>(
 /// `SearchTree` once per region (#148). Routing it through `find_ranges`
 /// instead of hoisting inside a duplicated loop is what drops that to one build
 /// per column AND removes the duplicate. Note the search half fans out over
-/// rayon above `PAR_COLUMN_THRESHOLD` haps, so this is no longer
+/// rayon above `PAR_CELL_THRESHOLD` cells, so this is no longer
 /// single-threaded.
 pub fn overlap_batch(reader: &ContigReader, regions: &[(u32, u32)]) -> BatchResult {
     batch_impl::<KeyRef>(reader, regions, None)
@@ -278,10 +278,26 @@ pub struct RangesBundle {
     pub dense_indel_range: Vec<Range<usize>>,
 }
 
-/// Below this many columns the serial path runs instead of rayon's: fork/join
-/// overhead dominates for small batches, and staying on the caller's thread
-/// keeps `search::search_tree_build_count` (a thread-local) observable in tests.
-pub const PAR_COLUMN_THRESHOLD: usize = 64;
+/// Below this many `(region, hap)` cells the serial path runs instead of
+/// rayon's: fork/join overhead dominates for small batches, and staying on the
+/// caller's thread keeps `search::search_tree_build_count` (a thread-local)
+/// observable in tests.
+///
+/// Sized from the serial cost of a cell — two `overlap()` binary searches,
+/// ~4 ns — so this is ~130 us of work, comfortably above a fork/join.
+pub const PAR_CELL_THRESHOLD: usize = 32_768;
+
+/// Whether to fan the per-hap search over rayon.
+///
+/// The unit is WORK (`n_haps * r`), not columns. Gating on `n_haps` alone
+/// ignores that each hap costs `r` overlaps, so a narrow-hap slice over many
+/// regions — exactly what a small `max_mem` produces, since sample chunking is
+/// what `max_mem` divides — fell to the serial path while carrying hundreds of
+/// thousands of cells. Measured at 62 haps x 4000 regions, that cost 4x the
+/// same total work chunked one sample wider (#205).
+pub fn use_parallel(n_haps: usize, r: usize) -> bool {
+    n_haps.saturating_mul(r) >= PAR_CELL_THRESHOLD
+}
 
 /// Bit width reserved for `ext` in the packed max-end key `(pos << SHIFT) | ext`,
 /// where `ext = 1 + deletion_len` so that `end = pos + ext`. Packing the small,
@@ -433,7 +449,7 @@ pub fn find_ranges_haps(
         }
     };
 
-    if n_haps < PAR_COLUMN_THRESHOLD {
+    if !use_parallel(n_haps, r) {
         let mut acc = vec![0u64; r];
         for (h_off, (snp_row, indel_row)) in out_snp
             .chunks_mut(r * 2)
@@ -549,10 +565,10 @@ pub fn find_ranges_haps_sparse(
         v
     };
 
-    // Same threshold as `find_ranges_haps`, for the same reason: below it the
+    // Same gate as `find_ranges_haps`, for the same reason: below it the
     // serial path keeps `search::search_tree_build_count` (a thread-local)
     // observable in tests.
-    let blocks: Vec<Vec<SparseCell>> = if n_haps < PAR_COLUMN_THRESHOLD {
+    let blocks: Vec<Vec<SparseCell>> = if !use_parallel(n_haps, r) {
         (0..n_haps).map(one_hap).collect()
     } else {
         (0..n_haps).into_par_iter().map(one_hap).collect()
@@ -1394,5 +1410,29 @@ mod tests {
 
         assert_eq!(as_u32(&None), &[] as &[u32]);
         assert_eq!(as_bytes(&None), &[] as &[u8]);
+    }
+
+    #[test]
+    fn test_use_parallel_gates_on_work_not_column_count() {
+        // A narrow-hap, wide-region slice is real work: 62 haps x 4000 regions
+        // is 248,000 overlaps. The old column-only rule (`n_haps < 64`) sent it
+        // down the serial path, which measured 4x slower than the same total
+        // work split into chunks one sample wider (#205).
+        assert!(use_parallel(62, 4_000));
+        // Symmetrically, many haps over a single region is not.
+        assert!(!use_parallel(64, 1));
+        // Fixture-scale queries stay serial, keeping the thread-local
+        // `search::search_tree_build_count` observable on the caller's thread.
+        assert!(!use_parallel(4, 16));
+        // The boundary is inclusive on the parallel side.
+        assert!(use_parallel(PAR_CELL_THRESHOLD, 1));
+        assert!(!use_parallel(PAR_CELL_THRESHOLD - 1, 1));
+    }
+
+    #[test]
+    fn test_use_parallel_saturates_instead_of_overflowing() {
+        assert!(use_parallel(usize::MAX, usize::MAX));
+        assert!(!use_parallel(0, usize::MAX));
+        assert!(!use_parallel(usize::MAX, 0));
     }
 }
