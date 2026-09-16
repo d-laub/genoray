@@ -418,3 +418,26 @@ def test_expand_connected_with_no_groups_is_identity():
     from genoray._signatures._spa import _expand_connected
 
     assert _expand_connected([3, 1], ()) == [1, 3]
+
+
+def test_expand_connected_is_order_independent_for_overlapping_groups():
+    """Each group is tested against the original active set, so listing order
+    cannot change the answer."""
+    from genoray._signatures._spa import _expand_connected
+
+    assert _expand_connected([1], ((1, 2), (2, 3))) == [1, 2]
+    assert _expand_connected([1], ((2, 3), (1, 2))) == [1, 2]
+
+
+def test_try_add_rejects_an_improvement_exactly_equal_to_the_cutoff():
+    """SPA's test is strictly greater, so a gain equal to the cutoff is not enough."""
+    from genoray._signatures._common import _distance
+    from genoray._signatures._spa import _reconstruction, _try_add
+
+    W = _identity_ref(3)
+    m = np.array([1000.0, 30.0, 0.0])
+    gain = _distance(m, _reconstruction(W, m, [0]), "l2") - _distance(
+        m, _reconstruction(W, m, [0, 1]), "l2"
+    )
+    # Exactly at the cutoff: strict ">" rejects, ">=" would accept.
+    assert _try_add(W, m, [0], 1, cutoff=gain, metric="l2") == [0]

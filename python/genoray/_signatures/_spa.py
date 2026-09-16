@@ -157,9 +157,17 @@ def _try_add(
 def _expand_connected(
     active: Sequence[int], groups: tuple[tuple[int, ...], ...]
 ) -> list[int]:
-    """SPA's ``add_connected_sigs``: if any group member is active, add them all."""
+    """SPA's ``add_connected_sigs``: if any group member is active, add them all.
+
+    Each group is tested against the *original* active set, not against the
+    set being built. Upstream does the same, and it is what makes the result
+    independent of the order ``groups`` happens to be listed in: expanding
+    against the growing set would let ``((1,2),(2,3))`` reach 3 from 1 while
+    ``((2,3),(1,2))`` would not.
+    """
+    original = frozenset(active)
     out = set(active)
     for group in groups:
-        if out.intersection(group):
+        if original.intersection(group):
             out.update(group)
     return sorted(out)
