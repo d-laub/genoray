@@ -1,3 +1,95 @@
+## 5.0.0 (2026-09-16)
+
+### BREAKING CHANGE
+
+- the `GENORAY_*` environment variables are gone. Every knob is
+now a `genoray.Tuning` field or a CLI flag.
+- SparseVar2.from_vcf no longer takes reader_workers=; pass
+tuning=Tuning(reader_workers=...) instead.
+- an explicit concurrent_chroms that does not fit max_mem
+now raises InsufficientMemory instead of being applied unchecked.
+- `run_conversion_pipeline` takes `tuning=` instead of
+`reader_workers=`.
+- GENORAY_CONCURRENT_CHROMS, GENORAY_READER_WORKERS,
+GENORAY_OVERSHARD, GENORAY_DENSE_CAP, GENORAY_MERGE_THREADS,
+GENORAY_SAMPLE_INTERVAL and GENORAY_TRACE no longer do anything.
+- the GENORAY_LOG environment variable no longer does anything.
+Pass filter directives explicitly, or `--log-filter` to the bench binary.
+- the GENORAY_LOG environment variable is gone along with
+`resolve_log_level`; pass `log_level=` explicitly instead.
+- pipeline tuning will move to this object and the CLI flags that
+mirror it; the GENORAY_* environment variables are being removed.
+
+### Feat
+
+- **signatures**: add burden-aware BIC stop rule to fit_signatures
+- **svar2**: add _find_ranges_chunked_sparse on a generic RangesStream
+- **svar2**: emit sparse region-major ranges from the chunked search
+- **svar2**: add SparseCell and a stable region counting sort
+- **pgen**: add PGEN.var_records for the identity of the variants read
+- **cli**: spell every tuning knob as a flag and widen --log-level
+- **svar2**: take tuning= and log_filter= on the public from_* methods
+- **svar2**: take Tuning at the FFI and report knob provenance
+- **tuning**: add TuningIn and ResolvedTuning with value provenance
+- **logging**: take the stderr filter as an argument, not GENORAY_LOG
+- **logging**: accept Python-convention log level names
+- **tuning**: add the Tuning dataclass for explicit pipeline tuning
+- **svar2**: expose reader_workers on from_vcf and the write CLI
+- **convert**: make reader_workers a planned, logged, overridable knob
+- **budget**: plan concurrent_chroms and reader_workers together
+- **shard**: size work units by record count instead of bp span
+- **shard_exec**: bound the reorder backlog with a byte budget
+- **shard_exec**: add a head-exempt backlog admission gate
+
+### Fix
+
+- build array modes on np.ndarray, not NDArray, for numpy 2.5
+- **svar2**: address whole-branch review fixes for sparse find_ranges
+- **svar2**: exercise the rayon branch and the indel raw-start contract
+- **budget**: stop charging PGEN for a backlog ceiling it never enforces
+- **cli**: accept `--log-level 10`, the spelling of a logging constant
+- **svar2**: budget from_svar1's chunk against the FORMAT fields it carries
+- **vcf**: return the INFO fields get_record_info was asked for
+- **svar2**: drop the duplicated from_svar1 n_format_fields fix
+- **tuning**: type-check tuning= and freeze the CLI flag dataclasses
+- **tuning**: surface previously-silent gaps in scheduling diagnostics
+- **tests**: run the CLI under the module path that exists
+- **budget**: plan an explicit concurrent_chroms instead of stamping it on
+- **bench**: give frontier.sbatch the partition it needs to ever start
+- **test**: make the frontier park assertions independent of core count
+- **shard_exec**: stop a panicking head worker from deadlocking the pool
+- **bench**: give the frontier repro a wall limit its corpus can meet
+- **docs**: correct the S=4,000 max_mem floor and pin all three to the planner
+- **svar2**: make reader_workers tests regression-proof, reject values below 1
+- **types**: count alt_offsets in the per-variant byte floor
+- **svar2**: clamp per-variant bytes so narrow cohorts don't zero the frontier budget
+- **budget**: correct plan_sharded's explicit-reader concurrency seed and law docs
+- **shard_exec**: close a lost-wakeup race in Frontier::wake_all
+
+### Refactor
+
+- **conversion**: adopt grouped arguments in the four sibling pipelines
+- **svar2**: size the monolithic reader from the plan that chose the concurrency
+- drop genoray's pyranges dependency
+- **conversion**: group run_conversion_pipeline's arguments
+- **bench**: drive the sweep with CLI flags and record knob provenance
+- **tests**: use the env-read pattern the guard defines
+- **svar2**: thread ResolvedTuning through the orchestrator
+- **logging**: restore the caller's filter and prove the reload path
+- **tuning**: make an unfinished resolution unrepresentable
+- **tuning**: accept numpy integers and report every inapplicable knob
+- **logging**: narrow parse_log_level's return type and cover its guards
+
+### Perf
+
+- **svar2**: marshal a chunked range query into Rust once per stream
+- **svar2**: gate the range search on work, not column count
+- **svar2**: spill the var_key ledgers to disk instead of retaining them
+- **svar2**: flatten the retained raw FORMAT buffer and charge for it
+- **rvk**: bucket by-scan emission into 64-column blocks
+- **bench**: reader-frontier arms for the wide-cohort repro
+- **svar2**: resolve sample names through a cached lookup
+
 ## 4.0.2 (2026-08-31)
 
 ### Fix
