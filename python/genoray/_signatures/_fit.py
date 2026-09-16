@@ -86,10 +86,10 @@ def _resolve_sig_names(
         index_of[n] for n in (spec.background_sigs or ()) if n in index_of
     )
 
-    if spec.connected_sigs is True:
-        raw_groups: Sequence[Sequence[str]] = SPA_CONNECTED_GROUPS
-    elif spec.connected_sigs is False:
-        raw_groups = ()
+    if isinstance(spec.connected_sigs, (bool, np.bool_)):
+        raw_groups: Sequence[Sequence[str]] = (
+            SPA_CONNECTED_GROUPS if spec.connected_sigs else ()
+        )
     else:
         raw_groups = spec.connected_sigs
 

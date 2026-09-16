@@ -219,10 +219,10 @@ indices, or empty).
 ```
 best = +inf
 loop over layers:
+    present = A, expanded by connected_sigs   # NOT A union {c} -- c joins after expansion
     layer_best = +inf
-    for each candidate c not in A:
-        A_c = A union {c}, expanded by connected_sigs
-        A_add = add_signatures(present=A_c, cutoff=add_penalty)
+    for each candidate c not in present:
+        A_add = add_signatures(present=present, candidate=c, cutoff=add_penalty)
         A_rem = remove_all_single_signatures(A_add, cutoff=remove_penalty,
                                              protected=P)
         pick = A_add if A_rem did not change the support else A_rem
@@ -246,9 +246,9 @@ adds `c` if and only if doing so improves the distance by strictly more than
 `finalRecord` bookkeeping inside it all collapse to:
 
 ```
-d_base = d(A_c)                 # +inf when A_c is empty
-d_new  = d(A_c union {c})
-result = A_c union {c} if d_base - d_new > add_penalty else A_c
+d_base = d(present)                 # +inf when present is empty
+d_new  = d(present union {c})
+result = present union {c} if d_base - d_new > add_penalty else present
 ```
 
 genoray implements that directly rather than porting the general loop, which

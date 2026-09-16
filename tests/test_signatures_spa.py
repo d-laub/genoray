@@ -583,24 +583,21 @@ def test_spa_connected_sigs_force_add_partners():
 
 
 def test_spa_custom_connected_groups():
+    """A user-supplied group pulls Y in; without it Y is never selected."""
     import polars as pl
 
     from genoray import Spa, fit_signatures
 
-    ref = pl.DataFrame(
-        {
-            "MutationType": ["A", "B"],
-            "X": [1.0, 0.0],
-            "Y": [0.0, 1.0],
-        }
+    ref = pl.DataFrame({"MutationType": ["A", "B"], "X": [1.0, 0.0], "Y": [0.0, 1.0]})
+    cat = pl.DataFrame({"MutationType": ["A", "B"], "s1": [1000.0, 30.0]})
+    on = fit_signatures(
+        cat, ref, strategy=Spa(background_sigs=None, connected_sigs=[["X", "Y"]])
     )
-    cat = pl.DataFrame({"MutationType": ["A", "B"], "s1": [1000.0, 0.0]})
-    out = fit_signatures(
-        cat,
-        ref,
-        strategy=Spa(background_sigs=None, connected_sigs=[["X", "Y"]]),
+    off = fit_signatures(
+        cat, ref, strategy=Spa(background_sigs=None, connected_sigs=False)
     )
-    assert out["X"].item() > 0.0
+    assert on["Y"].item() > 0.0
+    assert off["Y"].item() == 0.0
 
 
 def test_spa_matches_across_n_jobs():

@@ -218,11 +218,11 @@ def _fit_one_spa(
     )
 
     # Stage 3: add-remove refinement layers.
-    active = sorted(set(_support(h)) | set(protected))
+    active = _expand_connected(sorted(set(_support(h)) | set(protected)), groups)
     best_d = np.inf
     best_active = active
     while True:
-        present = _expand_connected(active, groups)
+        present = _expand_connected(sorted(set(active) | set(protected)), groups)
         layer_d = np.inf
         layer_active: list[int] | None = None
         for cand in range(n_sigs):

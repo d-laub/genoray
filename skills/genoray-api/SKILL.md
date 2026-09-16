@@ -1688,7 +1688,8 @@ Signatures:
     no RNG), unlike upstream SPA. Recovers more true signatures than
     `Forward` at every burden measured but, like `Forward`'s `"cosine"`
     criterion, is scale-invariant and so not a consistent estimator either.
-    Roughly one to two orders of magnitude slower per sample than `Forward`.
+    Roughly an order of magnitude slower per sample than `Forward` (~11-12x
+    measured on real COSMIC SBS96, 86 signatures).
 - `SparseVar.assign_signatures(kind, *, reference=None, count="allele", max_delta=0.01, min_activity=0.005, n_jobs=1, backend="loky") -> pl.DataFrame`
   — `mutation_matrix(kind, count=...)` then `fit_signatures(...)`. `reference`
   accepts a `pl.DataFrame`, a TSV path, or `None` (defaults to `cosmic_signatures(kind)`).
