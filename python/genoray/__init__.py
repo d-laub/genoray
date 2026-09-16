@@ -28,6 +28,11 @@ __all__ = [
     "fit_signatures",
     "cosmic_signatures",
     "Criterion",
+    "Forward",
+    "Spa",
+    "Strategy",
+    "Metric",
+    "ActivityScale",
 ]
 
 # Public name -> (module path, attribute name | None for the module itself).
@@ -46,6 +51,11 @@ _LAZY: dict[str, tuple[str, str | None]] = {
     "fit_signatures": ("genoray._signatures", "fit_signatures"),
     "cosmic_signatures": ("genoray._signatures", "cosmic_signatures"),
     "Criterion": ("genoray._signatures", "Criterion"),
+    "Forward": ("genoray._signatures", "Forward"),
+    "Spa": ("genoray._signatures", "Spa"),
+    "Strategy": ("genoray._signatures", "Strategy"),
+    "Metric": ("genoray._signatures", "Metric"),
+    "ActivityScale": ("genoray._signatures", "ActivityScale"),
 }
 
 
@@ -63,7 +73,12 @@ if TYPE_CHECKING:  # pragma: no cover
     from . import exprs as exprs
     from ._pgen import PGEN as PGEN
     from ._reference import Reference as Reference
+    from ._signatures import ActivityScale as ActivityScale
     from ._signatures import Criterion as Criterion
+    from ._signatures import Forward as Forward
+    from ._signatures import Metric as Metric
+    from ._signatures import Spa as Spa
+    from ._signatures import Strategy as Strategy
     from ._signatures import cosmic_signatures as cosmic_signatures
     from ._signatures import fit_signatures as fit_signatures
     from ._svar import SparseVar as SparseVar

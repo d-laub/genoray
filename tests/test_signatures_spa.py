@@ -80,3 +80,75 @@ def test_round_conserve_sum_property(seed: int):
     assert out.sum() == pytest.approx(round(x.sum()))
     assert np.all(out >= 0.0), "roundConserveSum produced a negative activity"
     assert np.all(out == np.floor(out))
+
+
+def test_strategy_defaults_match_spa():
+    from genoray import Spa
+
+    s = Spa()
+    assert s.metric == "l2"
+    assert s.initial_remove_penalty == 0.05
+    assert s.add_penalty == 0.05
+    assert s.remove_penalty == 0.01
+    assert s.background_sigs == ("SBS1", "SBS5")
+    assert s.connected_sigs is True
+    assert s.activity_scale == "burden"
+
+
+def test_forward_defaults_match_current_behaviour():
+    from genoray import Forward
+
+    f = Forward()
+    assert f.max_delta == 0.01
+    assert f.min_activity == 0.005
+    assert f.criterion == "cosine"
+
+
+def test_strategies_are_frozen():
+    import dataclasses
+
+    from genoray import Forward, Spa
+
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        Forward().max_delta = 0.2  # type: ignore[misc]
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        Spa().metric = "cosine"  # type: ignore[misc]
+
+
+def test_spa_rejects_unknown_metric():
+    from genoray import Spa
+
+    with pytest.raises(ValueError, match="metric"):
+        Spa(metric="manhattan")  # type: ignore[arg-type]
+
+
+def test_spa_rejects_unknown_activity_scale():
+    from genoray import Spa
+
+    with pytest.raises(ValueError, match="activity_scale"):
+        Spa(activity_scale="fraction")  # type: ignore[arg-type]
+
+
+def test_forward_rejects_unknown_criterion():
+    from genoray import Forward
+
+    with pytest.raises(ValueError, match="criterion"):
+        Forward(criterion="aic")  # type: ignore[arg-type]
+
+
+def test_spa_connected_groups_are_spas():
+    from genoray._signatures._strategy import SPA_CONNECTED_GROUPS
+
+    assert ("SBS2", "SBS13") in SPA_CONNECTED_GROUPS
+    assert ("SBS7a", "SBS7b", "SBS7c", "SBS7d") in SPA_CONNECTED_GROUPS
+    assert ("SBS10a", "SBS10b") in SPA_CONNECTED_GROUPS
+    assert ("SBS17a", "SBS17b") in SPA_CONNECTED_GROUPS
+    assert len(SPA_CONNECTED_GROUPS) == 4
+
+
+def test_strategies_exported_from_genoray():
+    import genoray
+
+    assert "Forward" in genoray.__all__
+    assert "Spa" in genoray.__all__
+    assert genoray.Forward().criterion == "cosine"

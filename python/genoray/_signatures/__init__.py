@@ -31,9 +31,22 @@ from ._cosmic import cosmic_signatures
 from ._fit import fit_signatures
 from ._forward import Criterion
 from ._forward import _fit_one as _fit_one
+from ._strategy import SPA_CONNECTED_GROUPS as SPA_CONNECTED_GROUPS
+from ._strategy import (
+    ActivityScale,
+    Forward,
+    Metric,
+    Spa,
+    Strategy,
+)
 
 __all__ = [
+    "ActivityScale",
     "Criterion",
+    "Forward",
+    "Metric",
+    "Spa",
+    "Strategy",
     "cosmic_signatures",
     "fit_signatures",
 ]
