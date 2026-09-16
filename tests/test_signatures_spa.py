@@ -215,3 +215,134 @@ def test_passing_the_default_value_explicitly_still_conflicts():
     cat, ref = _toy_problem()
     with pytest.raises(ValueError, match="max_delta"):
         fit_signatures(cat, ref, strategy=Spa(), max_delta=0.01)
+
+
+def _identity_ref(n_types: int = 5):
+    """W = identity, so each signature owns exactly one mutation type."""
+    return np.eye(n_types)
+
+
+def test_exposure_burden_scale_sums_to_burden():
+    from genoray._signatures._spa import _exposure
+
+    W = _identity_ref(3)
+    m = np.array([300.0, 700.0, 0.0])
+    h = _exposure(W, m, [0, 1, 2], scale="burden")
+    assert h.sum() == pytest.approx(1000.0)
+    assert np.all(h == np.floor(h))
+
+
+def test_exposure_raw_scale_is_unrounded():
+    from genoray._signatures._spa import _exposure
+
+    W = _identity_ref(3)
+    m = np.array([300.5, 699.5, 0.0])
+    h = _exposure(W, m, [0, 1, 2], scale="raw")
+    assert h[0] == pytest.approx(300.5)
+
+
+def test_exposure_is_full_length_with_zeros_off_support():
+    from genoray._signatures._spa import _exposure
+
+    W = _identity_ref(4)
+    m = np.array([10.0, 20.0, 0.0, 0.0])
+    h = _exposure(W, m, [0, 1], scale="burden")
+    assert h.shape == (4,)
+    assert h[2] == 0.0 and h[3] == 0.0
+
+
+def test_exposure_zero_sample_returns_zeros():
+    from genoray._signatures._spa import _exposure
+
+    W = _identity_ref(3)
+    h = _exposure(W, np.zeros(3), [0, 1, 2], scale="burden")
+    assert np.all(h == 0.0)
+
+
+def test_support_reads_nonzeros():
+    from genoray._signatures._spa import _support
+
+    assert _support(np.array([0.0, 5.0, 0.0, 2.0])) == [1, 3]
+
+
+def test_remove_drops_a_signature_the_data_does_not_need():
+    """S3 explains so little that dropping it costs less than the cutoff."""
+    from genoray._signatures._spa import _exposure, _remove_all_single, _support
+
+    W = _identity_ref(3)
+    m = np.array([600.0, 400.0, 10.0])
+    h = _exposure(W, m, [0, 1, 2], scale="burden")
+    out = _remove_all_single(W, m, h, cutoff=0.05, metric="l2", protected=frozenset())
+    assert _support(out) == [0, 1]
+
+
+def test_remove_keeps_a_signature_the_data_needs():
+    from genoray._signatures._spa import _exposure, _remove_all_single, _support
+
+    W = _identity_ref(3)
+    m = np.array([400.0, 300.0, 300.0])
+    h = _exposure(W, m, [0, 1, 2], scale="burden")
+    out = _remove_all_single(W, m, h, cutoff=0.05, metric="l2", protected=frozenset())
+    assert _support(out) == [0, 1, 2]
+
+
+def test_remove_respects_protected():
+    from genoray._signatures._spa import _exposure, _remove_all_single, _support
+
+    W = _identity_ref(3)
+    m = np.array([600.0, 400.0, 10.0])
+    h = _exposure(W, m, [0, 1, 2], scale="burden")
+    out = _remove_all_single(
+        W, m, h, cutoff=0.05, metric="l2", protected=frozenset({2})
+    )
+    assert 2 in _support(out)
+
+
+def test_protected_is_what_saves_the_signature():
+    """The same sweep, same data: only the protected flag differs."""
+    from genoray._signatures._spa import _exposure, _remove_all_single, _support
+
+    W = _identity_ref(3)
+    m = np.array([600.0, 400.0, 10.0])
+    h = _exposure(W, m, [0, 1, 2], scale="burden")
+    unprotected = _remove_all_single(
+        W, m, h, cutoff=0.05, metric="l2", protected=frozenset()
+    )
+    protected = _remove_all_single(
+        W, m, h, cutoff=0.05, metric="l2", protected=frozenset({2})
+    )
+    assert _support(unprotected) == [0, 1]
+    assert _support(protected) == [0, 1, 2]
+
+
+def test_remove_never_empties_the_support():
+    from genoray._signatures._spa import _exposure, _remove_all_single, _support
+
+    W = _identity_ref(3)
+    m = np.array([1000.0, 0.0, 0.0])
+    h = _exposure(W, m, [0, 1, 2], scale="burden")
+    out = _remove_all_single(W, m, h, cutoff=1.0, metric="l2", protected=frozenset())
+    assert len(_support(out)) >= 1
+
+
+@pytest.mark.parametrize("seed", range(20))
+def test_removal_never_lowers_relative_l2(seed: int):
+    """The claim that lets us skip SPA's negative-difference guard.
+
+    NNLS over a column subset cannot beat NNLS over the superset, so dropping
+    a column can only raise the relative L2 error.
+    """
+    from genoray._signatures._common import _nnls, _rel_l2
+
+    rng = np.random.default_rng(seed)
+    n_types, n_sigs = 24, 8
+    W = rng.random((n_types, n_sigs))
+    W = W / W.sum(axis=0)
+    m = rng.random(n_types) * 1000.0
+
+    full = list(range(n_sigs))
+    base = _rel_l2(m, W[:, full] @ _nnls(W[:, full], m))
+    for drop in full:
+        sub = [i for i in full if i != drop]
+        d = _rel_l2(m, W[:, sub] @ _nnls(W[:, sub], m))
+        assert d >= base - 1e-9, f"dropping {drop} lowered relative L2"
