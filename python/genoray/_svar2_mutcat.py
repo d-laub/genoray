@@ -28,6 +28,7 @@ from genoray._contigs import ContigNormalizer
 # lazy under `from __future__ import annotations`, so they defer cleanly.
 if TYPE_CHECKING:
     from genoray._reference import Reference
+    from genoray._signatures import Criterion, Strategy
 
 
 class _MutcatMixin:
@@ -209,8 +210,10 @@ class _MutcatMixin:
         *,
         reference: "pl.DataFrame | str | Path | None" = None,
         count: Literal["allele", "sample"] = "allele",
+        strategy: "Strategy | None" = None,
         max_delta: float = 0.01,
         min_activity: float = 0.005,
+        criterion: "Criterion" = "cosine",
         n_jobs: int = 1,
         backend: str = "loky",
     ) -> pl.DataFrame:
@@ -225,8 +228,16 @@ class _MutcatMixin:
                 signature columns), a path to a COSMIC-style TSV, or ``None`` to
                 fetch the default COSMIC set via :func:`genoray.cosmic_signatures`.
             count: Counting unit passed to :meth:`mutation_matrix`.
+            strategy: Refit strategy, forwarded to :func:`genoray.fit_signatures`.
+                ``None`` (default) uses forward selection configured by the
+                ``max_delta``/``min_activity``/``criterion`` arguments below.
+                Pass :class:`genoray.Spa` for SigProfilerAssignment's algorithm.
+                The ``max_delta``/``min_activity``/``criterion`` arguments are
+                ignored when ``strategy`` is given.
             max_delta: Forwarded to :func:`genoray.fit_signatures`.
             min_activity: Forwarded to :func:`genoray.fit_signatures`.
+            criterion: Forward-selection stop rule, forwarded to
+                :func:`genoray.fit_signatures`. Ignored when ``strategy`` is given.
             n_jobs: Forwarded to :func:`genoray.fit_signatures` to control per-sample
                 parallelism (``1`` (default) runs serially; ``-1`` uses all cores;
                 process-based ``"loky"`` backend).
@@ -257,11 +268,16 @@ class _MutcatMixin:
             ref = reference
         else:
             ref = _load_signature_file(reference)
+        if strategy is not None:
+            return fit_signatures(
+                catalogue, ref, strategy=strategy, n_jobs=n_jobs, backend=backend
+            )
         return fit_signatures(
             catalogue,
             ref,
             max_delta=max_delta,
             min_activity=min_activity,
+            criterion=criterion,
             n_jobs=n_jobs,
             backend=backend,
         )
