@@ -1,22 +1,28 @@
 """COSMIC mutational-signature refitting.
 
-A sparse forward-selection refit that decomposes a mutation catalogue into
-per-sample activities against a set of reference signatures. Pure
-numpy/scipy/polars; no SigProfiler dependency.
+Decomposes a mutation catalogue into per-sample activities against a set of
+reference signatures. Pure numpy/scipy/polars; no SigProfiler dependency.
 
-The *shape* follows SigProfilerAssignment's ``add_signatures`` -- greedily add
-the signature that most improves the fit, stop once the improvement is too
-small, then prune negligible activities -- but this is not a port, and the
-difference is larger than the defaults. SigProfilerAssignment's ``cosmic_fit``
-does not select forward at all: it runs one NNLS over the *entire* signature set
-and then eliminates backward on relative L2 error. It also scores on relative L2
-rather than cosine, force-includes SBS1/SBS5 as background signatures,
-force-adds known co-occurring partners (``connected_sigs=True``), and rescales
-and integer-rounds activities so they sum to the sample's total burden. None of
-that is reproduced here. See the audit issue for the full comparison.
+Two strategies, selected via ``fit_signatures(strategy=...)``:
 
-See ``fit_signatures``' ``criterion`` argument for the choice of stop rule, and
-why the default is not the statistically consistent one.
+``Forward`` (the default) is genoray's own greedy forward selection from the
+empty set, scored on cosine similarity, with a ``min_activity`` prune.
+
+``Spa`` is a faithful reimplementation of SigProfilerAssignment's
+``cosmic_fit``: one NNLS over the entire signature set, backward elimination
+on relative L2 error, add-remove refinement layers, SBS1/SBS5 force-added as
+background signatures on every layer (their protection decays within a removal
+sweep, so they are not vetoes), force-added co-occurring partners, and
+activities rescaled and integer-rounded to sum to the sample's mutation
+burden. It recovers more true signatures than ``Forward`` at every burden
+measured. ``tests/test_signatures_calibration.py`` checks it against the real
+tool.
+
+Note that ``Forward(criterion="cosine")`` and ``Spa`` are both
+scale-invariant, and therefore blind to mutation burden: neither gains power
+to resolve a real signature as the catalogue grows. Only
+``Forward(criterion="bic")`` is a consistent estimator. Choosing SPA's search
+direction improves recovery; it does not fix that.
 """
 
 from __future__ import annotations

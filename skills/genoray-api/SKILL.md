@@ -24,7 +24,8 @@ description: Use when writing or modifying Python code that imports `genoray` to
 - `genoray.exprs` — polars filter expressions for `.gvi` indexes
 - `genoray.cosmic_signatures` — fetch/cache COSMIC reference signatures
 - `genoray.fit_signatures` — mutation-catalogue signature refit; `strategy=` selects `Forward()` (default, sparse forward selection) or `Spa()` (SigProfilerAssignment-faithful backward elimination)
-- `genoray.Forward` / `genoray.Spa` — `fit_signatures` strategy dataclasses (frozen); `genoray.Strategy` is their union, `genoray.Metric` / `genoray.ActivityScale` are `Spa`'s literal option types, and `genoray.SPA_CONNECTED_GROUPS` holds `Spa`'s four default co-occurring-signature groups
+- `genoray.Forward` / `genoray.Spa` — `fit_signatures` strategy dataclasses (frozen)
+- `genoray.Strategy` / `genoray.Criterion` / `genoray.Metric` / `genoray.ActivityScale` — the associated type aliases; `genoray.SPA_CONNECTED_GROUPS` holds `Spa`'s four default co-occurring-signature groups
 
 Nothing else is public. Anything starting with `_` (e.g. `genoray._vcf`) is
 internal — do not import it from user code.
@@ -1713,6 +1714,33 @@ Signatures:
   raise — `max_delta`/`min_activity`/`criterion` are simply ignored when
   `strategy=` is given).
   `SparseVar2.assign_signatures` has the identical signature.
+
+### Refit strategies
+
+`fit_signatures(strategy=...)` selects the algorithm. Both strategies are
+frozen dataclasses carrying only their own parameters.
+
+- `Forward(max_delta=0.01, min_activity=0.005, criterion="cosine")` — greedy
+  forward selection from the empty set. The default. Activities are **raw
+  NNLS weights and need not sum to the sample's mutation burden.**
+- `Spa(metric="l2", initial_remove_penalty=0.05, add_penalty=0.05,
+  remove_penalty=0.01, background_sigs=("SBS1","SBS5"), connected_sigs=True,
+  activity_scale="burden")` — SigProfilerAssignment's `cosmic_fit`. Every
+  default is SPA's own. Under the default `activity_scale="burden"`,
+  activities are **integer-valued floats summing exactly to the sample's
+  burden**; `activity_scale="raw"` gives unscaled NNLS weights instead.
+
+`background_sigs` names absent from the reference are ignored, so the default
+is inert for DBS78 and ID83. `connected_sigs=True` uses SPA's four SBS groups
+(`genoray.SPA_CONNECTED_GROUPS`: SBS2/13, SBS7a-d, SBS10a/b, SBS17a/b); pass
+your own groups as a sequence of sequences, or `False` to disable.
+
+Neither `Forward(criterion="cosine")` nor `Spa` is burden-aware. For
+whole-genome catalogues where consistency matters, use
+`Forward(criterion="bic")`.
+
+The output schema is unchanged by the strategy: `Sample`, one Float column
+per reference signature, and a trailing `cosine_similarity`.
 
 Out of scope (v1): de novo extraction, opportunity normalization, bootstrap CIs,
 plotting.
