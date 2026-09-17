@@ -9,10 +9,11 @@ refinement layers. Transcribed from SigProfilerAssignment ``main``:
 
 Like SPA, the state carried between stages is a full-length exposure
 *vector*, not an index set, and the active set is read off its nonzeros.
-This matters: both of SPA's inner routines round what they record, so a
-signature whose rescaled activity falls below 0.5 drops out of the support
-without any threshold testing it. Distances, however, are always computed
-from the unrounded NNLS reconstruction.
+This matters: SPA's ``add_signatures`` rounds what it records, so a signature
+whose rescaled activity falls below 0.5 drops out of the support without any
+threshold testing it. Its removal sweep instead rounds only what it *reads*
+and records the winning exposure unrounded; see :func:`_remove_all_single`.
+Distances are always computed from the unrounded NNLS reconstruction.
 """
 
 from __future__ import annotations
@@ -26,6 +27,8 @@ from numpy.typing import NDArray
 from ._common import _cosine, _distance, _nnls, _round_conserve_sum
 
 if TYPE_CHECKING:  # pragma: no cover
+    from typing import Literal
+
     from ._strategy import Spa
 
 
@@ -39,13 +42,16 @@ def _exposure(
     m: NDArray[np.floating],
     active: Sequence[int],
     *,
-    scale: str,
+    scale: Literal["burden", "burden-unrounded", "raw"],
 ) -> NDArray[np.float64]:
     """NNLS over ``active``, scattered into a full-length exposure vector.
 
     With ``scale="burden"`` the weights are renormalized to sum to the
     sample's mutation count and integer-rounded conserving that sum, which is
     how SPA reports every intermediate and final exposure. With
+    ``scale="burden-unrounded"`` the renormalization happens but the rounding
+    does not, which is the exposure SPA records from its removal sweep (its
+    ``np.round`` is commented out at ``single_sample.py:627``). With
     ``scale="raw"`` the raw NNLS weights are returned.
     """
     full = np.zeros(W.shape[1], dtype=np.float64)
@@ -56,9 +62,10 @@ def _exposure(
     total = float(weights.sum())
     if total == 0.0:
         return full
-    if scale == "burden":
-        burden = float(np.sum(m))
-        weights = _round_conserve_sum(weights / total * burden)
+    if scale != "raw":
+        weights = weights / total * float(np.sum(m))
+        if scale == "burden":
+            weights = _round_conserve_sum(weights)
     full[active] = weights
     return full
 
@@ -133,21 +140,32 @@ def _remove_all_single(
     SPA recomputes it: at the top of every pass against the exposure vector
     the sweep *started* from, and again against the winning vector after every
     accepted removal.
+
+    Returns SPA's ``oldExposures`` -- the input rounded with the total
+    conserved -- when no removal is ever accepted: every candidate protected,
+    the best degradation above ``cutoff``, or one signature left at entry. As
+    soon as a removal is accepted it returns instead that pass's winning
+    exposure vector, rescaled to the sample's mutation count and left
+    unrounded, because SPA records ``normalised_weights * sum(genomes)`` with
+    its ``np.round`` commented out (``single_sample.py:610-612``, ``:627``)
+    and only falls back to the rounded input when no removal was ever recorded
+    (``:694-695``). Rounding here would drop low-activity signatures SPA
+    keeps, since callers read the support off this vector's nonzeros.
     """
     h = np.asarray(h, dtype=np.float64)
     active = _support(h)
     if len(active) <= 1:
-        return h.copy()
+        return _round_conserve_sum(h)
 
     base = _distance(m, _reconstruction(W, m, active), metric)
     positions = list(protected)
+    recorded: NDArray[np.float64] | None = None
 
     while len(active) > 1:
         # SPA remaps against the vector the sweep started from, never the
         # current one, so this is `h` on every pass.
         positions = _protected_positions(h, positions)
         best_d = np.inf
-        best_active: list[int] | None = None
         best_h: NDArray[np.float64] | None = None
         for pos, i in enumerate(active):
             if pos in positions:
@@ -156,11 +174,14 @@ def _remove_all_single(
             d = _distance(m, _reconstruction(W, m, cand), metric)
             if d < best_d:
                 best_d = d
-                best_active = cand
-                # Raw weights: only the nonzero pattern is read off this, and
-                # burden rescaling cannot change it. SPA does not round here.
+                # Raw weights: SPA carries the unrounded winner (its np.round
+                # is commented out, single_sample.py:627), and the raw NNLS
+                # weights are a positive rescale of that vector. Both reads of
+                # this vector -- _support and _protected_positions -- test only
+                # zero-ness, which the raw weights preserve. scale="burden"
+                # would not: _round_conserve_sum can zero entries.
                 best_h = _exposure(W, m, cand, scale="raw")
-        if best_active is None or best_h is None:
+        if best_h is None:
             break  # every remaining signature is protected
         if best_d - base > cutoff:
             break
@@ -169,8 +190,9 @@ def _remove_all_single(
         active = _support(best_h)
         base = best_d
         positions = _protected_positions(best_h, positions)
+        recorded = _exposure(W, m, active, scale="burden-unrounded")
 
-    return _exposure(W, m, active, scale="burden")
+    return recorded if recorded is not None else _round_conserve_sum(h)
 
 
 def _try_add(
@@ -228,7 +250,7 @@ def _fit_one_spa(
     m: NDArray[np.floating],
     spec: "Spa",
     *,
-    protected: frozenset[int],
+    protected: Collection[int],
     groups: tuple[tuple[int, ...], ...],
 ) -> tuple[NDArray[np.float64], float]:
     """Refit one sample by SPA's ``cosmic_fit``.

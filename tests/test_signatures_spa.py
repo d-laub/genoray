@@ -527,7 +527,7 @@ def test_spa_zero_count_sample_returns_zeros():
     assert out["cosine_similarity"].item() == 0.0
 
 
-def test_spa_background_sigs_are_kept():
+def test_spa_background_sigs_can_save_a_signature():
     """Protection changes the outcome: S3 explains little, but survives."""
     import polars as pl
 
@@ -738,3 +738,58 @@ def test_protection_decays_after_the_first_accepted_removal():
     # Signature 4 goes on the first pass, while protection is still intact.
     # Signature 5 is nominally protected, and goes anyway on the second.
     assert _support(out) == [0, 3]
+
+
+def test_no_accepted_removal_returns_the_rounded_input():
+    """SPA's nothing-accepted exit hands back `roundConserveSum(H)`: the rounded
+    INPUT, not a re-derived exposure.
+
+    Upstream `remove_all_single_signatures` sets
+    `oldExposures = roundConserveSum(H)` (`single_sample.py:519`) and returns it
+    from the early `Flag = False` path (L522-537) and from the `successList`
+    fallback when no removal was ever recorded (L694-695). Every candidate here
+    is protected, so no removal is ever accepted.
+    """
+    from genoray._signatures._spa import _remove_all_single, _support
+
+    W = np.array(
+        [
+            [0.8086, 0.1533, 0.4503, 0.2862, 0.0915, 0.7988, 0.8538],
+            [0.1660, 0.5037, 0.8473, 0.6360, 0.4675, 0.3951, 0.2463],
+            [0.4821, 0.3249, 0.2749, 0.3481, 0.9220, 0.9816, 0.4083],
+            [0.3377, 0.5833, 0.7417, 0.2799, 0.4149, 0.1156, 0.2288],
+        ]
+    )
+    m = np.array([834.0, 493.0, 635.0, 822.0])
+    h = np.array([1457.0, 1325.0, 0.0, 0.0, 2.0, 0.0, 0.0])
+    out = _remove_all_single(
+        W, m, h, cutoff=1e9, metric="l2", protected=frozenset({0, 1, 4})
+    )
+    assert np.array_equal(out, h)
+    assert _support(out) == [0, 1, 4]
+
+
+def test_accepted_removal_returns_the_unrounded_winner():
+    """SPA's accepted-removal exit returns the winner's full-length
+    `normalised_weights * sum(genomes)` with `np.round` commented out.
+
+    Upstream builds that vector at `single_sample.py:610-612`, leaves the
+    rounding commented out at L627, records it in `successList` at L675-681,
+    and returns it as `H` at L705. Removing signature 2 is accepted here, so
+    the unrounded 1000.2 entries must survive.
+    """
+    from genoray._signatures._spa import _remove_all_single, _support
+
+    W = np.eye(3)
+    m = np.array([1000.0, 1000.0, 0.4])
+    h = np.array([1000.0, 1000.0, 1.0])
+    out = _remove_all_single(W, m, h, cutoff=0.001, metric="l2", protected=frozenset())
+    assert _support(out) == [0, 1]
+    assert out == pytest.approx([1000.2, 1000.2, 0.0])
+    assert not np.array_equal(out, np.round(out))
+
+    # This removal stays well under a looser cutoff: the same winner.
+    looser = _remove_all_single(
+        W, m, h, cutoff=0.05, metric="l2", protected=frozenset()
+    )
+    assert looser == pytest.approx([1000.2, 1000.2, 0.0])
