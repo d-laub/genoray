@@ -98,127 +98,46 @@ def test_find_ranges_out_streaming(svar2_store: Path):
         assert np.asarray(ranges2[k]).base is out[k] or ranges2[k] is out[k]
 
 
-def test_find_ranges_chunk_matches_find_ranges(svar2_store: Path):
-    """Chunked hap slices must reassemble into the region-major bundle exactly."""
-    sv = SparseVar2(svar2_store)
-    starts, ends = [0, 5], [40, 20]
-    reg = list(zip(starts, ends))
-    reader = sv._reader("chr1")
-    bundle = sv._find_ranges("chr1", starts, ends)
+def test_find_ranges_header_matches_bundle(svar2_store: Path):
+    """The stream header's ``O(n_regions)`` arrays must equal the bundle's.
 
-    R = len(reg)
-    P = sv.ploidy
-    S = sv.n_samples
-    H = S * P
-
-    query = reader.ranges_query(reg, None)
-    header = reader.find_ranges_header(query)
-    np.testing.assert_array_equal(
-        np.asarray(header["dense_snp_range"]), np.asarray(bundle["dense_snp_range"])
-    )
-    np.testing.assert_array_equal(
-        np.asarray(header["sample_cols"]), np.asarray(bundle["sample_cols"])
-    )
-
-    # One hap per call: the most adversarial chunking.
-    snp = np.empty((H, R, 2), np.int64)
-    indel = np.empty((H, R, 2), np.int64)
-    for h in range(H):
-        d = reader.find_ranges_chunk(query, h, h + 1)
-        snp[h] = np.asarray(d["vk_snp_range"]).reshape(1, R, 2)
-        indel[h] = np.asarray(d["vk_indel_range"]).reshape(1, R, 2)
-
-    # bundle vk ranges are region-major (R*H, 2); ours are hap-major (H, R, 2).
-    np.testing.assert_array_equal(
-        snp.transpose(1, 0, 2).reshape(R * H, 2),
-        np.asarray(bundle["vk_snp_range"]),
-    )
-    np.testing.assert_array_equal(
-        indel.transpose(1, 0, 2).reshape(R * H, 2),
-        np.asarray(bundle["vk_indel_range"]),
-    )
-
-
-def _reassemble(stream) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    R, P, S = stream.n_regions, stream.ploidy, stream.n_samples
-    snp = np.empty((S, P, R, 2), np.int64)
-    indel = np.empty((S, P, R, 2), np.int64)
-    keys = stream.dense_max_end_keys.copy()
-    for ch in stream.chunks:
-        s0, s1 = ch.sample_start, ch.sample_start + ch.n_samples
-        snp[s0:s1] = ch.vk_snp_range
-        indel[s0:s1] = ch.vk_indel_range
-        np.maximum(keys, ch.max_end_keys, out=keys)
-    return snp, indel, keys
-
-
-@pytest.mark.parametrize("max_mem", [None, 1 << 30, 1])
-def test_chunked_matches_find_ranges(svar2_store: Path, max_mem):
-    """Every chunking, including one sample per chunk, reassembles identically."""
-    sv = SparseVar2(svar2_store)
-    starts, ends = [0, 5], [40, 20]
-    bundle = sv._find_ranges("chr1", starts, ends)
-    R, P, S = 2, sv.ploidy, sv.n_samples
-
-    if max_mem == 1:
-        # 1 byte cannot fit a sample; the API must say so rather than silently
-        # producing a zero-sized chunk.
-        with pytest.raises(ValueError, match="max_mem"):
-            sv._find_ranges_chunked("chr1", starts, ends, max_mem=max_mem)
-        return
-
-    stream = sv._find_ranges_chunked("chr1", starts, ends, max_mem=max_mem)
-    snp, indel, _ = _reassemble(stream)
-    np.testing.assert_array_equal(
-        snp.reshape(S * P, R, 2).transpose(1, 0, 2).reshape(R * S * P, 2),
-        np.asarray(bundle["vk_snp_range"]),
-    )
-    np.testing.assert_array_equal(
-        indel.reshape(S * P, R, 2).transpose(1, 0, 2).reshape(R * S * P, 2),
-        np.asarray(bundle["vk_indel_range"]),
-    )
-
-
-def test_chunked_max_end_keys_unpack_to_variant_ends(svar2_store: Path):
-    """The reduced key unpacks to the end of the highest-position variant.
-
-    The fixture's chr1 carries SNP@2, INS@6 and DEL@11 (ilen -2, so it ends at
-    11 + 1 + 2 = 14). Region [0, 40) therefore ends at 14; region [0, 5) sees
-    only SNP@2, which ends at 3.
+    The chunked stream computes this header once via ``find_ranges_header``,
+    while ``_find_ranges`` builds the same arrays on its own path. Every test
+    below checks a stream against a bundle, so a divergence here would desync
+    the oracle from the thing under test rather than failing loudly.
     """
     sv = SparseVar2(svar2_store)
-    stream = sv._find_ranges_chunked("chr1", [0, 0], [40, 5])
-    _, _, keys = _reassemble(stream)
-    mask = (1 << MAX_END_SHIFT) - 1
-    ends = (keys >> MAX_END_SHIFT) + (keys & mask)
-    assert keys[0] != 0 and keys[1] != 0
-    assert int(ends[0]) == 14
-    assert int(ends[1]) == 3
-
-
-def test_chunked_sample_subset(svar2_store: Path):
-    """A sample subset takes the carriage-probing dense path, not the fast path."""
-    sub = [SparseVar2(svar2_store).available_samples[1]]
-    sv = SparseVar2(svar2_store)
-    bundle = sv._find_ranges("chr1", [0], [40], samples=sub)
-    stream = sv._find_ranges_chunked("chr1", [0], [40], samples=sub)
-    assert stream.n_samples == 1
-    snp, _, keys = _reassemble(stream)
-    np.testing.assert_array_equal(
-        snp.reshape(-1, 2), np.asarray(bundle["vk_snp_range"])
+    starts, ends = [0, 5], [40, 20]
+    reader = sv._reader("chr1")
+    bundle = sv._find_ranges("chr1", starts, ends)
+    header = reader.find_ranges_header(
+        reader.ranges_query(list(zip(starts, ends)), None)
     )
+    for k in (
+        "dense_range",
+        "dense_snp_range",
+        "dense_indel_range",
+        "region_starts",
+        "sample_cols",
+    ):
+        np.testing.assert_array_equal(
+            np.asarray(header[k]), np.asarray(bundle[k]), err_msg=k
+        )
 
-    # Pins the subset path's max-end output to a fixture-derived constant, so
-    # a gross regression in the carriage-probe branch (e.g. it stops firing,
-    # or returns garbage) doesn't go unnoticed. This does NOT verify genuine
-    # per-sample carrier filtering: on this fixture both dense-routed variants
-    # (INS@6, DEL@11) are carried by BOTH samples, so a probe that ignored
-    # `sample_cols` entirely would produce this exact same value. Real
-    # carrier-filtering coverage -- a fixture where the excluded sample's
-    # variant actually differs from the included one's -- lives in
-    # tests/test_ranges_split.rs::test_dense_max_end_keys_excludes_uncarried_sample.
-    expected_key = (11 << MAX_END_SHIFT) | 3  # DEL@11: ext = 1 + del_len(2) = 3, end 14
-    assert int(keys[0]) == expected_key
+
+def _bundle_dense_haps(bundle, n_haps: int, n_regions: int):
+    """Dense hap-major ``(n_haps, R, 2)`` ranges, unfolded from a ``_find_ranges`` bundle.
+
+    The chunked dense stream that used to be this oracle is gone (#204), but
+    ``_find_ranges`` still returns the dense bundle and still reaches it through
+    the same kernel, ``find_ranges_haps`` -- just without the chunking. The
+    bundle is region-major ``(R * n_haps, 2)`` with the hap axis fastest, so
+    unfolding and transposing recovers exactly what the deleted path yielded.
+    """
+    return tuple(
+        np.asarray(bundle[k]).reshape(n_regions, n_haps, 2).transpose(1, 0, 2)
+        for k in ("vk_snp_range", "vk_indel_range")
+    )
 
 
 def _dense_to_sparse(
@@ -292,18 +211,17 @@ def test_sparse_chunk_matches_dense_chunk(
     reader = sv._reader("chr1")
     P, S = sv.ploidy, sv.n_samples
     query = reader.ranges_query(reg, None)
+    all_snp, all_indel = _bundle_dense_haps(
+        sv._find_ranges("chr1", starts, ends), S * P, len(reg)
+    )
 
     for hap_lo, hap_hi in [(0, S * P), (0, P), (P, 3 * P), (S * P, S * P)]:
-        d = reader.find_ranges_chunk(query, hap_lo, hap_hi)
         shape = ((hap_hi - hap_lo) // P, P, len(reg), 2)
-        snp = np.asarray(d["vk_snp_range"]).reshape(shape)
-        indel = np.asarray(d["vk_indel_range"]).reshape(shape)
+        snp = all_snp[hap_lo:hap_hi].reshape(shape)
+        indel = all_indel[hap_lo:hap_hi].reshape(shape)
 
         got = reader.find_ranges_chunk_sparse(query, hap_lo, hap_hi)
         _assert_sparse_matches_dense(got[:6], snp, indel, hap_lo // P, P)
-        np.testing.assert_array_equal(
-            np.asarray(got[6], np.int64), np.asarray(d["max_end_keys"], np.int64)
-        )
 
 
 def test_sparse_chunk_cell_ids_ascend_within_each_region(
@@ -365,9 +283,12 @@ def test_sparse_chunk_sample_subset(svar2_singleton_store: Path):
     P = sv.ploidy
     reg = [(0, 20)]
     query = reader.ranges_query(reg, idxs)
-    d = reader.find_ranges_chunk(query, 0, len(sub) * P)
-    snp = np.asarray(d["vk_snp_range"]).reshape(len(sub), P, 1, 2)
-    indel = np.asarray(d["vk_indel_range"]).reshape(len(sub), P, 1, 2)
+    snp, indel = (
+        a.reshape(len(sub), P, 1, 2)
+        for a in _bundle_dense_haps(
+            sv._find_ranges("chr1", [0], [20], samples=sub), len(sub) * P, 1
+        )
+    )
     got = reader.find_ranges_chunk_sparse(query, 0, len(sub) * P)
     _assert_sparse_matches_dense(got[:6], snp, indel, 0, P)
     assert np.asarray(got[1]).max() < len(sub) * P
@@ -414,22 +335,81 @@ def _reassemble_sparse(stream):
 
 
 @pytest.mark.parametrize("max_mem", [None, 1 << 30, 1 << 8])
-def test_sparse_stream_matches_dense_stream(svar2_singleton_store: Path, max_mem):
+def test_sparse_stream_matches_find_ranges(svar2_singleton_store: Path, max_mem):
     """Every chunking, down to one sample per chunk, reassembles identically.
 
     At two regions and ploidy 2, ``bytes_per_sample`` is 128, so ``1 << 8``
     sizes chunks at exactly one sample -- the most adversarial split, and the
     smallest value that does not raise.
+
+    The reduced ``max_end_keys`` are checked for chunk-invariance against the
+    single-chunk run rather than against a second implementation; what they
+    unpack to in absolute terms is pinned to fixture constants in
+    :func:`test_stream_max_end_keys_unpack_to_variant_ends`.
     """
     sv = SparseVar2(svar2_singleton_store)
     starts, ends = [0, 0], [20, 5]
-    dense = sv._find_ranges_chunked("chr1", starts, ends, max_mem=max_mem)
-    snp, indel, dense_keys = _reassemble(dense)
+    snp, indel = (
+        a.reshape(sv.n_samples, sv.ploidy, 2, 2)
+        for a in _bundle_dense_haps(
+            sv._find_ranges("chr1", starts, ends), sv.n_samples * sv.ploidy, 2
+        )
+    )
 
     sparse = sv._find_ranges_chunked_sparse("chr1", starts, ends, max_mem=max_mem)
     got, sparse_keys = _reassemble_sparse(sparse)
     _assert_sparse_matches_dense(got, snp, indel, 0, sv.ploidy)
-    np.testing.assert_array_equal(sparse_keys, dense_keys)
+    _, whole_keys = _reassemble_sparse(
+        sv._find_ranges_chunked_sparse("chr1", starts, ends)
+    )
+    np.testing.assert_array_equal(sparse_keys, whole_keys)
+
+
+def test_stream_max_end_keys_unpack_to_variant_ends(svar2_store: Path):
+    """The reduced key unpacks to the end of the highest-position variant.
+
+    The fixture's chr1 carries SNP@2, INS@6 and DEL@11 (ilen -2, so it ends at
+    11 + 1 + 2 = 14). Region [0, 40) therefore ends at 14; region [0, 5) sees
+    only SNP@2, which ends at 3.
+    """
+    sv = SparseVar2(svar2_store)
+    _, keys = _reassemble_sparse(
+        sv._find_ranges_chunked_sparse("chr1", [0, 0], [40, 5])
+    )
+    mask = (1 << MAX_END_SHIFT) - 1
+    ends = (keys >> MAX_END_SHIFT) + (keys & mask)
+    assert keys[0] != 0 and keys[1] != 0
+    assert int(ends[0]) == 14
+    assert int(ends[1]) == 3
+
+
+def test_stream_sample_subset_max_end_key(svar2_store: Path):
+    """A sample subset takes the carriage-probing dense path, not the fast path."""
+    sv = SparseVar2(svar2_store)
+    sub = [sv.available_samples[1]]
+    P = sv.ploidy
+    snp, indel = (
+        a.reshape(1, P, 1, 2)
+        for a in _bundle_dense_haps(
+            sv._find_ranges("chr1", [0], [40], samples=sub), P, 1
+        )
+    )
+    stream = sv._find_ranges_chunked_sparse("chr1", [0], [40], samples=sub)
+    assert stream.n_samples == 1
+    got, keys = _reassemble_sparse(stream)
+    _assert_sparse_matches_dense(got, snp, indel, 0, P)
+
+    # Pins the subset path's max-end output to a fixture-derived constant, so
+    # a gross regression in the carriage-probe branch (e.g. it stops firing,
+    # or returns garbage) doesn't go unnoticed. This does NOT verify genuine
+    # per-sample carrier filtering: on this fixture both dense-routed variants
+    # (INS@6, DEL@11) are carried by BOTH samples, so a probe that ignored
+    # `sample_cols` entirely would produce this exact same value. Real
+    # carrier-filtering coverage -- a fixture where the excluded sample's
+    # variant actually differs from the included one's -- lives in
+    # tests/test_ranges_split.rs::test_dense_max_end_keys_excludes_uncarried_sample.
+    expected_key = (11 << MAX_END_SHIFT) | 3  # DEL@11: ext = 1 + del_len(2) = 3, end 14
+    assert int(keys[0]) == expected_key
 
 
 def test_sparse_stream_cell_ids_are_absolute_across_chunks(
@@ -461,8 +441,12 @@ def test_sparse_stream_rejects_unusable_max_mem(svar2_singleton_store: Path):
 def test_sparse_stream_sample_subset(svar2_singleton_store: Path):
     sv = SparseVar2(svar2_singleton_store)
     sub = [sv.available_samples[2], sv.available_samples[5]]
-    dense = sv._find_ranges_chunked("chr1", [0], [20], samples=sub)
-    snp, indel, _ = _reassemble(dense)
+    snp, indel = (
+        a.reshape(2, sv.ploidy, 1, 2)
+        for a in _bundle_dense_haps(
+            sv._find_ranges("chr1", [0], [20], samples=sub), 2 * sv.ploidy, 1
+        )
+    )
     sparse = sv._find_ranges_chunked_sparse("chr1", [0], [20], samples=sub)
     assert sparse.n_samples == 2
     got, _ = _reassemble_sparse(sparse)
@@ -472,9 +456,9 @@ def test_sparse_stream_sample_subset(svar2_singleton_store: Path):
 def test_ranges_dataclasses_are_slotted():
     from dataclasses import fields
 
-    from genoray._svar2_batch import RangesChunk, RangesStream, SparseRangesChunk
+    from genoray._svar2_batch import RangesStream, SparseRangesChunk
 
-    for cls in (RangesChunk, RangesStream, SparseRangesChunk):
+    for cls in (RangesStream, SparseRangesChunk):
         # `cls.__dict__`, not `hasattr`: an inherited `__slots__` would pass
         # hasattr while the class itself still carried a per-instance dict.
         slots = cls.__dict__.get("__slots__")
