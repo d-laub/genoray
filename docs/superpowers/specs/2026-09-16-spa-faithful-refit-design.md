@@ -187,20 +187,30 @@ every entry nonzero, which a vector of ones does deterministically. See
 
 `remove_all_single_signatures(cutoff=initial_remove_penalty)` with **no**
 protected signatures — SPA passes `background_sigs=[]` at this stage, so SBS1
-and SBS5 are removable here and protected only later.
+and SBS5 are removable here. From stage 3 on they are force-added to every
+layer's working set and skipped by candidacy in the removal sweeps, but that
+protection decays within a sweep rather than vetoing removal — see "Protection
+decays, and that is reproduced", below.
 
 ```
+P' = P                              # carried across passes, so it decays
 loop:
     base = d(A)
-    P' = remap(P)                       # see "Protection decays", below
+    P' = remap(P')                  # against h, the sweep's input, never A
     for each position p, signature i in A (skipping p in P'):
         cand = A - {i}
         record the i minimizing d(cand) - base
-    if that minimum > cutoff: stop
+    if nothing is recorded or that minimum > cutoff:
+        return round_conserve_sum(h)    # SPA's oldExposures: the rounded INPUT
     if the winning candidate has exactly one nonzero: accept it and stop
     A = nonzeros of the winning exposure vector; base = d(A)
-    P' = remap(P')                      # against the winning vector
+    P' = remap(P')                  # against the WINNING vector
+return the winning vector, rescaled to sum(m) and left unrounded
 ```
+
+The return value is the rounded *input* whenever nothing is accepted, and the
+winning unrounded exposure vector otherwise; its nonzeros are the active set
+the caller goes on to read.
 
 The cutoff is tested against the degradation relative to the **current** fit,
 not the saturated one, because SPA reassigns `originalSimilarity = record[2]`
@@ -266,6 +276,10 @@ loop over layers:
     best = layer_best; A = layer_pick
 ```
 
+`A_rem` is the support of the vector the removal sweep returns: the winning
+unrounded exposure when a removal was accepted, so an activity below 0.5 stays
+in the support, and the rounded input otherwise.
+
 SPA's own version of the `pick` line is
 `np.nonzero(add)[0].all() == np.nonzero(remove)[0].all() and shapes equal`,
 which looks like a bug but is not load-bearing: the removal sweep can only
@@ -297,11 +311,13 @@ cannot do.
 ### Rounding drives the support
 
 SPA carries an exposure *vector* between stages, not an index set, and derives
-the active set from `np.nonzero(exposures)`. Both `add_signatures` and
-`remove_all_single_signatures` round what they record — `np.round` and
-`roundConserveSum` respectively, after rescaling to the burden. A signature
-whose rescaled activity is under 0.5 therefore rounds to zero and drops out of
-the support on its own, with no threshold ever testing it.
+the active set from `np.nonzero(exposures)`. `add_signatures` rounds what it
+records (`np.round` after rescaling to the burden), and
+`remove_all_single_signatures` rounds what it *reads*: its input becomes
+`roundConserveSum(H)`, and that rounded vector is also what it returns when no
+removal is accepted. A signature whose rescaled activity is under 0.5 therefore
+rounds to zero and drops out of the support on its own, with no threshold ever
+testing it.
 
 This is load-bearing at low burden and invisible at high burden, and it is not
 something an index-set implementation reproduces. genoray's internal
@@ -310,7 +326,8 @@ vector, with `_support(h) = np.nonzero(h)[0]`.
 
 One asymmetry to preserve: distances are computed from the **unrounded** NNLS
 reconstruction (`newSample = np.dot(W1, weights)` uses raw weights), while the
-recorded exposures are rounded. Scoring off the rounded vector would be a
+exposures SPA records are rounded — apart from the removal sweep's accepted
+winner, which is carried unrounded. Scoring off a rounded vector would be a
 divergence.
 
 ### Stage 4: report
@@ -346,8 +363,10 @@ reference are ignored silently — SPA's `get_indeces` does the same, and it is
 what makes the default `("SBS1", "SBS5")` inert for DBS78 and ID83 without a
 special case. `None` disables the prior.
 
-Protected signatures are skipped by the removal loops in stage 3 (`if i in
-background_sig: continue`) but **not** in stage 2.
+From stage 3 on, `background_sigs` are force-added to every layer's working set
+and skipped by candidacy in the removal sweeps, but that protection decays
+within a sweep rather than vetoing removal; in stage 2 they are not protected
+at all. See "Protection decays, and that is reproduced".
 
 **`connected_sigs`** (item 5). `True` uses SPA's groups:
 

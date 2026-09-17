@@ -10,7 +10,7 @@ small, then prune negligible activities -- but this is not a port, and the
 difference is larger than the defaults. SigProfilerAssignment's ``cosmic_fit``
 does not select forward at all: it runs one NNLS over the *entire* signature set
 and then eliminates backward on relative L2 error. It also scores on relative L2
-rather than cosine, force-includes SBS1/SBS5 as protected background signatures,
+rather than cosine, force-includes SBS1/SBS5 as background signatures,
 force-adds known co-occurring partners (``connected_sigs=True``), and rescales
 and integer-rounds activities so they sum to the sample's total burden. None of
 that is reproduced here. See the audit issue for the full comparison.
