@@ -1683,9 +1683,13 @@ Signatures:
     (`solver="nnls"`, `pcawg_rule=False`), pure numpy/scipy/polars with no
     SigProfiler dependency: saturate over every reference signature, prune
     backward on relative L2 error, then refine with add-remove layers.
-    `background_sigs` names are always kept once refinement starts (names
-    absent from `reference` are ignored, which is what makes the SBS1/SBS5
-    default inert on DBS78/ID83 references); `connected_sigs=True` force-adds
+    `background_sigs` names are force-added to the working set at the start of
+    every refinement layer, but they are not absolutely protected from the
+    removal sweeps: SPA's own protection decays partway through a sweep and
+    genoray reproduces that, so a background signature the sample does not
+    need is still dropped (names absent from `reference` are ignored, which is
+    what makes the SBS1/SBS5 default inert on DBS78/ID83 references);
+    `connected_sigs=True` force-adds
     co-occurring SBS partners (e.g. SBS2/SBS13) once any member is selected,
     `False` disables it, or pass your own `Sequence[Sequence[str]]` of
     signature-name groups. Under the default `activity_scale="burden"`,

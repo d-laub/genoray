@@ -192,12 +192,14 @@ and SBS5 are removable here and protected only later.
 ```
 loop:
     base = d(A)
-    for each i in A (skipping protected):
+    P' = remap(P)                       # see "Protection decays", below
+    for each position p, signature i in A (skipping p in P'):
         cand = A - {i}
         record the i minimizing d(cand) - base
     if that minimum > cutoff: stop
     if the winning candidate has exactly one nonzero: accept it and stop
-    A = winning candidate; base = d(A)   # base advances each accepted layer
+    A = nonzeros of the winning exposure vector; base = d(A)
+    P' = remap(P')                      # against the winning vector
 ```
 
 The cutoff is tested against the degradation relative to the **current** fit,
@@ -209,6 +211,39 @@ This is item 3: SPA removes the signature whose removal degrades the fit least,
 while that degradation stays under a threshold. It has no `min_activity`
 analogue and will drop a high-activity signature that is collinear with others.
 `Spa` therefore has no `min_activity` field.
+
+#### Protection decays, and that is reproduced
+
+`remove_all_single_signatures` loops over the **compacted** index space of the
+exposure vector's nonzeros, so it remaps its protected set into that space
+before each pass, via `get_changed_background_sig_idx`. Dropping a protected
+signature whose exposure is zero is deliberate — NNLS has already removed it.
+Feeding the compacted result back in as if it were a full-length index on the
+next call is not. Concretely, for COSMIC SBS96 with `background_sigs =
+("SBS1","SBS5")` (full indices 0 and 4):
+
+```
+pass 1 top:    [0, 4] -> [0, 2]   correct: SBS1 and SBS5 are active
+pass 1 bottom: [0, 2] -> [0]      2 is read as a full index (SBS3), value 0, dropped
+pass 2 onward: [0]    -> [0]      only SBS1 survives, and only because it is column 0
+```
+
+So protection holds for the first removal decision of a sweep and then
+survives only for signatures whose compacted position still equals their full
+index. A background signature the sample does not need is removed.
+
+This was measured against real `cosmic_fit` 1.1.4, not inferred. Upstream's own
+`ss.add_remove_signatures`, called on the same `W` and sample, feeds
+`{SBS1, SBS2, SBS5, SBS13, SBS17b}` into the sweep with
+`background_sigs=[SBS1, SBS5]` and gets `{SBS1, SBS2, SBS17b}` back. Treating
+`background_sigs` as an absolute veto instead retains SBS5 on samples where
+`cosmic_fit` reports it as zero, and drags every other activity down with it
+(SBS7a off by ~900 of 59,000 on the `distinct_high` calibration cell). All
+three cells in `tests/test_signatures_calibration.py` agree with `cosmic_fit`
+to the mutation once this is copied.
+
+`Spa`'s docstring says so, because `background_sigs` does not mean what its
+name suggests.
 
 ### Stage 3: refinement layers
 
@@ -368,6 +403,16 @@ are bit-identical, which SPA cannot guarantee for its own callers.
 SPA's `check_rule_negatives=[1, 16]` with a 1.5x penalty applies only to mm9,
 mm10 and mm39. genoray ships no mouse reference signatures, so the parameter has
 nothing to act on. Not exposed.
+
+### The protected-set remap matches by index, not by exposure value
+
+`get_changed_background_sig_idx` finds a protected signature's new position by
+looking its exposure *value* up in the list of nonzero exposures
+(`list.index`). genoray's `_protected_positions` uses the index directly. The
+two differ only when two active signatures carry exactly the same exposure, in
+which case SPA takes whichever appears first — arbitrary, and it would make the
+result depend on rounding collisions. The decay itself is reproduced faithfully
+(see "Protection decays"); only the tie-breaking is not.
 
 ### Reference columns are renormalized
 

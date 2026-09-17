@@ -693,3 +693,48 @@ def test_assign_signatures_forwards_criterion_when_no_strategy(monkeypatch):
     monkeypatch.setattr("genoray._signatures.fit_signatures", fake_fit)
     SparseVar2.assign_signatures(_Stub(), "SBS96", reference=ref, criterion="bic")
     assert captured.get("criterion") == "bic"
+
+
+def test_protection_holds_for_the_first_removal_decision():
+    """SPA's background protection is real, but only for one decision."""
+    from genoray._signatures._spa import _exposure, _remove_all_single, _support
+
+    W = _identity_ref(6)
+    m = np.array([600.0, 5.0, 5.0, 400.0, 20.0, 10.0])
+    h = _exposure(W, m, [0, 3, 4, 5], scale="burden")
+    assert _support(h) == [0, 3, 4, 5]
+    # Signature 5 is the cheapest removal of the four, so an unprotected sweep
+    # takes it. Protection is what stops the sweep instead.
+    unprotected = _remove_all_single(
+        W, m, h, cutoff=0.0099, metric="l2", protected=frozenset()
+    )
+    protected = _remove_all_single(
+        W, m, h, cutoff=0.0099, metric="l2", protected=frozenset({0, 5})
+    )
+    assert _support(unprotected) == [0, 3, 4]
+    assert _support(protected) == [0, 3, 4, 5]
+
+
+def test_protection_decays_after_the_first_accepted_removal():
+    """Protection is not a veto, and genoray copies that rather than fixing it.
+
+    SPA remaps its protected set into the compacted index space of the
+    exposure vector's nonzeros before each pass, then feeds that compacted
+    result back in as a full-length index on the next one. Protection survives
+    only for a signature whose compacted position still equals its full index.
+    Here signature 0 keeps it and signature 5 loses it. Measured against real
+    SigProfilerAssignment 1.1.4 -- see ``tests/test_signatures_calibration.py``;
+    treating ``protected`` as a veto instead makes ``Spa()`` disagree with
+    ``cosmic_fit`` on both of its distinct-signature cells.
+    """
+    from genoray._signatures._spa import _exposure, _remove_all_single, _support
+
+    W = _identity_ref(6)
+    m = np.array([600.0, 5.0, 5.0, 400.0, 20.0, 10.0])
+    h = _exposure(W, m, [0, 3, 4, 5], scale="burden")
+    out = _remove_all_single(
+        W, m, h, cutoff=0.05, metric="l2", protected=frozenset({0, 5})
+    )
+    # Signature 4 goes on the first pass, while protection is still intact.
+    # Signature 5 is nominally protected, and goes anyway on the second.
+    assert _support(out) == [0, 3]

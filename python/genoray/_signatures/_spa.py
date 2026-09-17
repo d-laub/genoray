@@ -17,7 +17,7 @@ from the unrounded NNLS reconstruction.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -78,6 +78,34 @@ def _reconstruction(
     return W[:, active] @ _nnls(W[:, active], m)
 
 
+def _protected_positions(
+    h: NDArray[np.floating], protected: Collection[int]
+) -> list[int]:
+    """SPA's ``get_changed_background_sig_idx``, transcribed.
+
+    SPA's removal sweep works in the *compacted* index space of the exposure
+    vector's nonzeros, so before each pass it remaps its protected set into
+    that space and drops anything whose exposure is zero. That much is
+    deliberate: a signature NNLS has already zeroed cannot be removed anyway.
+
+    What is not deliberate is that SPA feeds the *compacted* result back in as
+    if it were a full-length index on the next call. A protected signature
+    therefore keeps its protection only while its compacted position happens
+    to equal its full index -- that is, only while every lower-indexed
+    signature is also active. In practice the first column of the reference
+    (SBS1, for COSMIC) survives and the rest do not. See the sweep below and
+    "Divergences from SPA" in the design note; the calibration test against
+    real ``cosmic_fit`` is what forced this to be copied rather than cleaned
+    up.
+
+    SPA matches by exposure *value* rather than by index, which differs from
+    this only when two active signatures carry the same exposure. There its
+    behaviour is arbitrary, so it is not reproduced.
+    """
+    rank = {int(i): k for k, i in enumerate(np.nonzero(h)[0])}
+    return [rank[i] for i in protected if i in rank]
+
+
 def _remove_all_single(
     W: NDArray[np.floating],
     m: NDArray[np.floating],
@@ -85,7 +113,7 @@ def _remove_all_single(
     *,
     cutoff: float,
     metric: str,
-    protected: frozenset[int],
+    protected: Collection[int],
 ) -> NDArray[np.float64]:
     """SPA's ``remove_all_single_signatures``.
 
@@ -98,33 +126,51 @@ def _remove_all_single(
     started from: SPA advances its baseline after every accepted layer.
     Measuring against the original baseline instead makes the prune far too
     permissive.
+
+    ``protected`` is *not* an absolute veto. It is SPA's ``background_sigs``,
+    and SPA's own handling of it decays across the sweep -- see
+    :func:`_protected_positions`. The remap is recomputed at the two points
+    SPA recomputes it: at the top of every pass against the exposure vector
+    the sweep *started* from, and again against the winning vector after every
+    accepted removal.
     """
+    h = np.asarray(h, dtype=np.float64)
     active = _support(h)
     if len(active) <= 1:
-        return np.asarray(h, dtype=np.float64).copy()
+        return h.copy()
 
     base = _distance(m, _reconstruction(W, m, active), metric)
-    scale = "burden"
+    positions = list(protected)
 
     while len(active) > 1:
+        # SPA remaps against the vector the sweep started from, never the
+        # current one, so this is `h` on every pass.
+        positions = _protected_positions(h, positions)
         best_d = np.inf
         best_active: list[int] | None = None
-        for i in active:
-            if i in protected:
+        best_h: NDArray[np.float64] | None = None
+        for pos, i in enumerate(active):
+            if pos in positions:
                 continue
             cand = [j for j in active if j != i]
             d = _distance(m, _reconstruction(W, m, cand), metric)
             if d < best_d:
                 best_d = d
                 best_active = cand
-        if best_active is None:
+                # Raw weights: only the nonzero pattern is read off this, and
+                # burden rescaling cannot change it. SPA does not round here.
+                best_h = _exposure(W, m, cand, scale="raw")
+        if best_active is None or best_h is None:
             break  # every remaining signature is protected
         if best_d - base > cutoff:
             break
-        active = best_active
+        # SPA carries the winning exposure *vector*, so a signature NNLS gave
+        # zero weight leaves the active set here without being removed.
+        active = _support(best_h)
         base = best_d
+        positions = _protected_positions(best_h, positions)
 
-    return _exposure(W, m, active, scale=scale)
+    return _exposure(W, m, active, scale="burden")
 
 
 def _try_add(

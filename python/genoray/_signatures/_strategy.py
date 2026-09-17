@@ -72,9 +72,11 @@ class Spa:
         add_penalty: A candidate must improve the distance by strictly more
             than this to be added during refinement.
         remove_penalty: Cutoff for the removal sweeps during refinement.
-        background_sigs: Signature names always kept once refinement starts.
-            Names absent from the reference are ignored, which is what makes
-            the default inert for DBS78 and ID83. ``None`` disables.
+        background_sigs: Signature names force-added to the working set at the
+            start of every refinement layer. They are *not* absolutely
+            protected from the removal sweeps -- see the class notes. Names
+            absent from the reference are ignored, which is what makes the
+            default inert for DBS78 and ID83. ``None`` disables.
         connected_sigs: Force-add co-occurring partners. ``True`` uses
             :data:`SPA_CONNECTED_GROUPS`; a sequence of groups supplies your
             own; ``False`` disables.
@@ -83,6 +85,19 @@ class Spa:
             ``"raw"`` returns unscaled NNLS weights, as the forward path does.
 
     Notes:
+        ``background_sigs`` protects less than its name suggests, and that is
+        faithful. SPA's removal sweep works in the compacted index space of
+        the exposure vector's nonzeros and remaps its protected set into that
+        space before every pass -- but it then feeds the compacted result back
+        in as if it were a full-length index. Protection therefore holds only
+        for the first removal decision of a sweep, after which it survives
+        only for signatures whose compacted position still equals their full
+        index (in practice, the reference's first column). A background
+        signature the sample does not actually need is dropped. This is copied
+        rather than corrected because ``cosmic_fit`` depends on it: without
+        it, SBS5 is retained on samples where SPA reports it as zero, and the
+        remaining activities shift with it.
+
         Two SPA behaviours are deliberately not reproduced. SPA refuses to
         remove a signature whose removal *improves* the fit; on the default
         ``metric="l2"`` path that branch is unreachable, because NNLS over a
