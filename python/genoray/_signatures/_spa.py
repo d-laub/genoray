@@ -48,7 +48,10 @@ def _exposure(
 
     With ``scale="burden"`` the weights are renormalized to sum to the
     sample's mutation count and integer-rounded conserving that sum, which is
-    how SPA reports every intermediate and final exposure. With
+    how SPA reports its saturated fit, its removal-sweep inputs and exits, and
+    its final exposure. Its add path rounds differently -- ``np.round`` plus a
+    max-element repair (``single_sample.py:314-322``, ``:392-397``) -- which
+    can move a mutation between signatures. With
     ``scale="burden-unrounded"`` the renormalization happens but the rounding
     does not, which is the exposure SPA records from its removal sweep (its
     ``np.round`` is commented out at ``single_sample.py:627``). With
