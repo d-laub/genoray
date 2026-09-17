@@ -41,6 +41,7 @@ from ._strategy import (
 )
 
 __all__ = [
+    "SPA_CONNECTED_GROUPS",
     "ActivityScale",
     "Criterion",
     "Forward",

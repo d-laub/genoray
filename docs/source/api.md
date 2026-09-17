@@ -16,6 +16,8 @@
 .. autofunction:: cosmic_signatures
 
 .. autofunction:: fit_signatures
+
+.. autodata:: SPA_CONNECTED_GROUPS
 ```
 
 ## `genoray.exprs`

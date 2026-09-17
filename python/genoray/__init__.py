@@ -31,6 +31,7 @@ __all__ = [
     "Forward",
     "Spa",
     "Strategy",
+    "SPA_CONNECTED_GROUPS",
     "Metric",
     "ActivityScale",
 ]
@@ -54,6 +55,7 @@ _LAZY: dict[str, tuple[str, str | None]] = {
     "Forward": ("genoray._signatures", "Forward"),
     "Spa": ("genoray._signatures", "Spa"),
     "Strategy": ("genoray._signatures", "Strategy"),
+    "SPA_CONNECTED_GROUPS": ("genoray._signatures", "SPA_CONNECTED_GROUPS"),
     "Metric": ("genoray._signatures", "Metric"),
     "ActivityScale": ("genoray._signatures", "ActivityScale"),
 }
@@ -73,6 +75,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from . import exprs as exprs
     from ._pgen import PGEN as PGEN
     from ._reference import Reference as Reference
+    from ._signatures import SPA_CONNECTED_GROUPS as SPA_CONNECTED_GROUPS
     from ._signatures import ActivityScale as ActivityScale
     from ._signatures import Criterion as Criterion
     from ._signatures import Forward as Forward
