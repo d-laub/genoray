@@ -34,6 +34,7 @@ from ._cosmic import _COSMIC_REGISTRY as _COSMIC_REGISTRY
 from ._cosmic import _KIND_TOKEN as _KIND_TOKEN
 from ._cosmic import _load_signature_file as _load_signature_file
 from ._cosmic import cosmic_signatures
+from ._fit import _UNSET as _UNSET
 from ._fit import fit_signatures
 from ._forward import Criterion
 from ._forward import _fit_one as _fit_one

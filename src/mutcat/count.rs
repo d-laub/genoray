@@ -79,15 +79,32 @@ pub struct Sidecars {
 }
 
 impl Sidecars {
-    /// Open all four mutcat sub-stream sidecars for `paths`'s contig. Any
+    /// Open all four mutcat sub-stream sidecars for `paths`'s contig.
+    ///
+    /// Each is checked against the contig's record counts from `reader`: a
     /// sub-stream with no sidecar on disk opens as an empty `MutcatView`
-    /// (`open_sidecar`'s existing missing-file tolerance).
-    pub fn open(paths: &ContigPaths) -> std::io::Result<Sidecars> {
+    /// (`open_sidecar`'s missing-file tolerance), but only when the reader has
+    /// no records for it. A length mismatch means the sidecar is truncated
+    /// (killed writer) or stale (different variant set) and is reported as an
+    /// error instead of being indexed.
+    pub fn open(paths: &ContigPaths, reader: &ContigReader) -> std::io::Result<Sidecars> {
         Ok(Sidecars {
-            vk_snp: open_sidecar(paths, MutcatSub::VkSnp)?,
-            vk_indel: open_sidecar(paths, MutcatSub::VkIndel)?,
-            dense_snp: open_sidecar(paths, MutcatSub::DenseSnp)?,
-            dense_indel: open_sidecar(paths, MutcatSub::DenseIndel)?,
+            vk_snp: open_sidecar(paths, MutcatSub::VkSnp, reader.vk_snp.positions().len())?,
+            vk_indel: open_sidecar(paths, MutcatSub::VkIndel, reader.vk_indel.positions().len())?,
+            dense_snp: open_sidecar(
+                paths,
+                MutcatSub::DenseSnp,
+                reader
+                    .dense_view(DenseClass::Snp)
+                    .map_or(0, |d| d.n_dense_variants),
+            )?,
+            dense_indel: open_sidecar(
+                paths,
+                MutcatSub::DenseIndel,
+                reader
+                    .dense_view(DenseClass::Indel)
+                    .map_or(0, |d| d.n_dense_variants),
+            )?,
         })
     }
 }

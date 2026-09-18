@@ -79,7 +79,7 @@ fn count_contig_pairs_adjacent_snvs_for_one_sample() {
     write_sidecar(&paths, MutcatSub::VkSnp, &codes, Some(&refs), None).unwrap();
 
     let reader = ContigReader::open(out.to_str().unwrap(), "chr1", 1, 1).unwrap();
-    let sidecars = Sidecars::open(&paths).unwrap();
+    let sidecars = Sidecars::open(&paths, &reader).unwrap();
 
     let mut acc = Array2::<i64>::zeros((1, N_CODES));
     count_contig(&reader, &sidecars, false, &mut acc);
@@ -200,7 +200,7 @@ fn count_is_thread_count_invariant() {
     );
 
     let reader = ContigReader::open(out.to_str().unwrap(), "chr1", 2, 2).unwrap();
-    let sidecars = Sidecars::open(&paths).unwrap();
+    let sidecars = Sidecars::open(&paths, &reader).unwrap();
 
     let run_with_threads = |n_threads: usize| {
         let pool = ThreadPoolBuilder::new()

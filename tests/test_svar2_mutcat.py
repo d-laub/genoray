@@ -454,3 +454,157 @@ def test_annotate_mutations_contigs_all_miss_raises(tmp_path: Path):
     sv = SparseVar2(out)
     with pytest.raises(ValueError, match="resolve to a store contig"):
         sv.annotate_mutations(fa, contigs=["chrZ"])
+
+
+# ---------------------------------------------------------------------------
+# #208: mutation_matrix over an explicit contig subset
+# ---------------------------------------------------------------------------
+
+
+def _two_contig_store(tmp_path: Path):
+    from tests.conftest import build_two_contig_svar2
+
+    sv = build_two_contig_svar2(tmp_path)
+    return sv, tmp_path / "ref.fa"
+
+
+def test_mutation_matrix_contigs_allows_subset_annotation(tmp_path: Path):
+    """Annotating only chr1 must not make chr1's matrix unreachable."""
+    sv, ref = _two_contig_store(tmp_path)
+    sv.annotate_mutations(ref, contigs=["chr1"])
+
+    # The default still means "every contig in the store" -> clean guard.
+    with pytest.raises(ValueError, match="not annotated"):
+        sv.mutation_matrix("SBS96")
+
+    mm = sv.mutation_matrix("SBS96", contigs=["chr1"])
+    assert mm.height == 96
+    assert mm.select(sv.available_samples).sum().sum_horizontal().item() > 0
+
+
+def test_mutation_matrix_contigs_matches_full_annotation(tmp_path: Path):
+    """Scoped counts are stable across annotating the remaining contigs."""
+    sv, ref = _two_contig_store(tmp_path)
+    sv.annotate_mutations(ref, contigs=["chr1"])
+    subset = sv.mutation_matrix("SBS96", contigs=["1"])  # alias
+
+    sv.annotate_mutations(ref)  # annotate everything
+    scoped = sv.mutation_matrix("SBS96", contigs=["chr1"])
+    whole = sv.mutation_matrix("SBS96")
+
+    assert subset.equals(scoped)
+    cols = sv.available_samples
+    assert scoped.select(cols).sum().sum_horizontal().item() < (
+        whole.select(cols).sum().sum_horizontal().item()
+    ), "chr2's counts should stay out of a chr1-scoped matrix"
+
+
+def test_mutation_matrix_contigs_deduplicates_aliases(tmp_path: Path):
+    """Two spellings of one contig must not double-count it."""
+    sv, ref = _two_contig_store(tmp_path)
+    sv.annotate_mutations(ref)
+    once = sv.mutation_matrix("SBS96", contigs=["chr1"])
+    twice = sv.mutation_matrix("SBS96", contigs=["chr1", "1"])
+    assert once.equals(twice)
+
+
+def test_mutation_matrix_contigs_unknown_raises(tmp_path: Path):
+    """A query must not silently drop an unrecognized contig."""
+    sv, _ = _two_contig_store(tmp_path)
+    with pytest.raises(ValueError, match="chrZ"):
+        sv.mutation_matrix("SBS96", contigs=["chrZ"])
+
+
+def test_mutation_matrix_contigs_scopes_strand_guard(tmp_path: Path):
+    """SBS384 over a strand-annotated subset ignores unannotated contigs."""
+    sv, ref = _two_contig_store(tmp_path)
+    sv.annotate_mutations(ref)  # neither contig gets strand.bin
+    assert not sv._is_strand_annotated()
+
+    gtf = tmp_path / "strand1.gtf"
+    gtf.write_text('chr1\ttest\tgene\t1\t40\t.\t+\t.\tgene_id "P";\n')
+    sv.annotate_mutations(ref, gtf=gtf, contigs=["chr1"])
+    assert sv._is_strand_annotated(["chr1"])
+    assert not sv._is_strand_annotated()
+
+    assert sv.mutation_matrix("SBS384", contigs=["chr1"]).height == 384
+    with pytest.raises(ValueError, match="strand"):
+        sv.mutation_matrix("SBS384")
+
+
+def test_assign_signatures_forwards_contigs(monkeypatch):
+    """assign_signatures must pass contigs= through to mutation_matrix."""
+    import polars as pl
+
+    from genoray import SparseVar2
+
+    captured: dict[str, object] = {}
+
+    def fake_fit(catalogue, reference, **kwargs):
+        captured.update(kwargs)
+        return pl.DataFrame({"Sample": ["s1"]})
+
+    class _Stub:
+        def mutation_matrix(self, kind, count="allele", contigs=None):
+            captured["contigs"] = contigs
+            return pl.DataFrame({"MutationType": ["A"], "s1": [1.0]})
+
+    monkeypatch.setattr("genoray._signatures.fit_signatures", fake_fit)
+    ref = pl.DataFrame({"MutationType": ["A"], "S1": [1.0]})
+    SparseVar2.assign_signatures(_Stub(), "SBS96", reference=ref, contigs=["chr1"])
+    assert captured["contigs"] == ["chr1"]
+
+
+# ---------------------------------------------------------------------------
+# #209: durable annotation writes and sidecar integrity
+# ---------------------------------------------------------------------------
+
+
+def test_annotate_mutations_commits_meta_json_via_replace(tmp_path, monkeypatch):
+    """The meta.json stamp must be a same-directory temp + atomic replace."""
+    import os
+
+    sv, ref = _two_contig_store(tmp_path)
+    real_replace = os.replace
+    calls: list[tuple[Path, Path]] = []
+
+    def spy(src, dst):
+        calls.append((Path(src), Path(dst)))
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", spy)
+    sv.annotate_mutations(ref, contigs=["chr1"])
+
+    meta_path = sv.path / "meta.json"
+    assert any(
+        dst == meta_path and src.parent == meta_path.parent for src, dst in calls
+    ), f"meta.json was not committed with a same-directory os.replace: {calls}"
+    assert not (sv.path / "meta.json.tmp").exists()
+    assert json.loads(meta_path.read_text())["mutcat_contigs"] == ["chr1"]
+
+
+def test_reannotating_without_gtf_drops_strand_sidecar(tmp_path: Path):
+    """A gtf-less re-annotation must not leave a stale strand.bin behind."""
+    sv, ref = _two_contig_store(tmp_path)
+    gtf = tmp_path / "strand1.gtf"
+    gtf.write_text('chr1\ttest\tgene\t1\t40\t.\t+\t.\tgene_id "P";\n')
+    sv.annotate_mutations(ref, gtf=gtf, contigs=["chr1"])
+    assert sv._is_strand_annotated(["chr1"])
+
+    sv.annotate_mutations(ref, contigs=["chr1"])  # no gtf
+    assert not sv._is_strand_annotated(["chr1"]), "stale strand.bin survived"
+    with pytest.raises(ValueError, match="strand"):
+        sv.mutation_matrix("SBS384", contigs=["chr1"])
+
+
+def test_truncated_sidecar_raises_clean_error(tmp_path: Path):
+    """A short code.bin (older genoray, killed mid-write) must fail loudly."""
+    sv, ref = _two_contig_store(tmp_path)
+    sv.annotate_mutations(ref, contigs=["chr1"])
+    code = sv.path / "chr1" / "mutcat" / "var_key_snp" / "code.bin"
+    raw = code.read_bytes()
+    assert len(raw) > 0
+    code.write_bytes(raw[:-1])
+
+    with pytest.raises(OSError, match="re-run annotate_mutations"):
+        sv.mutation_matrix("SBS96", contigs=["chr1"])

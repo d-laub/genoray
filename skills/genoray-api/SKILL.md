@@ -1041,28 +1041,39 @@ act = sv.assign_signatures("SBS96")                  # mutation_matrix + fit_sig
   GTF/GFF gene model path; when given, each
   SNV is additionally classified by transcriptional-strand class (from
   `feature == "gene"` footprints) and persisted to a `strand.bin` sidecar,
-  which unlocks the `"SBS192"`/`"SBS384"` catalogs below.
-- `mutation_matrix(kind, *, count="allele"|"sample") -> pl.DataFrame` — a
+  which unlocks the `"SBS192"`/`"SBS384"` catalogs below. Each sidecar and
+  `meta.json` is written atomically (same-directory temp + rename), so a crash
+  never leaves a truncated file; re-running is unconditional and therefore also
+  the recovery path for a missing or suspect sidecar. Re-running without a
+  `gtf=` removes a previously written `strand.bin` (stale strand classes are
+  never kept alongside a fresh gtf-less annotation).
+- `mutation_matrix(kind, *, count="allele"|"sample", contigs=None) -> pl.DataFrame` — a
   `MutationType` column (fixed COSMIC codebook order) plus one column per
   sample. `kind ∈ {"SBS96", "DBS78", "ID83", "SBS192", "SBS384"}`.
   `count="allele"` counts every non-ref allele copy; `count="sample"` counts
-  each category at most once per sample, OR-combined across contigs. **Raises
-  `ValueError`** if called before the store is annotated (no on-disk sidecar
-  for every contig) — annotate first, either via `annotate_mutations` or
+  each category at most once per sample, OR-combined across contigs.
+  `contigs=` restricts the sum to a subset (alternate naming accepted,
+  duplicates collapsed; a name absent from the store raises `ValueError`) and
+  requires only those contigs to be annotated; `None` (default) uses every
+  contig. **Raises `ValueError`** if a contig in scope is not annotated (no
+  on-disk sidecar) — annotate first, either via `annotate_mutations` or
   `from_vcf(..., signatures=True)`. `"SBS192"`/`"SBS384"` additionally require
   strand annotation (`annotate_mutations(..., gtf=...)`) and raise
-  `ValueError` if the store lacks it. `assign_signatures` does **not** accept
-  `"SBS192"`/`"SBS384"` — see below.
-- `assign_signatures(kind, *, reference=None, count="allele", strategy=None, max_delta=0.01, min_activity=0.005, criterion="cosine", n_jobs=1, backend="loky") -> pl.DataFrame`
-  — `mutation_matrix(kind, count=...)` then `genoray.fit_signatures(...)`.
-  `reference` accepts a `pl.DataFrame`, a TSV path, or `None` (defaults to
-  `genoray.cosmic_signatures(kind)`). `strategy=`/`max_delta=`/`min_activity=`/
-  `criterion=` are forwarded to `fit_signatures` exactly like the top-level
-  function — pass `strategy=Spa()` for SPA's algorithm, or leave it `None` to
-  use the `max_delta`/`min_activity`/`criterion` forward-selection shorthand
-  (unlike `fit_signatures`, `assign_signatures` does not raise when both are
-  given — `max_delta`/`min_activity`/`criterion` are simply ignored whenever
-  `strategy=` is not `None`).
+  `ValueError` if the scoped contigs lack it. A sidecar that is truncated or
+  stale (length does not match the store's variant counts) raises `OSError`
+  telling you to re-run `annotate_mutations`. `assign_signatures` does **not**
+  accept `"SBS192"`/`"SBS384"` — see below.
+- `assign_signatures(kind, *, reference=None, count="allele", contigs=None, strategy=None, max_delta=0.01, min_activity=0.005, criterion="cosine", n_jobs=1, backend="loky") -> pl.DataFrame`
+  — `mutation_matrix(kind, count=..., contigs=...)` then
+  `genoray.fit_signatures(...)`. `reference` accepts a `pl.DataFrame`, a TSV
+  path, or `None` (defaults to `genoray.cosmic_signatures(kind)`). `contigs=`
+  (contig subset, alternate naming accepted) is passed through to
+  `mutation_matrix`. `strategy=`/`max_delta=`/`min_activity=`/`criterion=` are
+  forwarded to `fit_signatures` exactly like the top-level function — pass
+  `strategy=Spa()` for SPA's algorithm, or leave it `None` to use the
+  `max_delta`/`min_activity`/`criterion` forward-selection shorthand. Calls
+  `fit_signatures` once, so passing `strategy=` together with any of the three
+  shorthand kwargs raises `ValueError`, exactly like `fit_signatures`.
 - Same classification rules as v1 (shared Rust classifier): **DBS78 arises
   only from isolated adjacent same-haplotype SNV pairs** — runs of ≥3
   adjacent SNVs stay as individual SBS96 entries, native MNVs > 2bp are
@@ -1710,10 +1721,12 @@ Signatures:
   and `criterion=` are forwarded exactly like `fit_signatures` itself — pass
   `strategy=Spa()` for SigProfilerAssignment's algorithm, or leave `strategy`
   `None` (default) and use `max_delta`/`min_activity`/`criterion` to configure
-  the `Forward` shorthand (unlike `fit_signatures`, passing both does not
-  raise — `max_delta`/`min_activity`/`criterion` are simply ignored when
-  `strategy=` is given).
-  `SparseVar2.assign_signatures` has the identical signature.
+  the `Forward` shorthand. Passing `strategy=` together with any of
+  `max_delta`/`min_activity`/`criterion` raises `ValueError`, exactly like
+  `fit_signatures` (omitted kwargs take their defaults).
+  `SparseVar2.assign_signatures` has the identical signature, except that it
+  additionally accepts `contigs=` to restrict the catalogue to a subset of the
+  store's contigs.
 
 ### Refit strategies
 

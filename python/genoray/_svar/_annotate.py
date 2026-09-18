@@ -23,6 +23,7 @@ from .._signatures import (
     cosmic_signatures,
     fit_signatures,
 )
+from .._unset import _UNSET
 from ._io import _open_fmt
 from ._kernels import _nb_af_helper
 
@@ -515,9 +516,9 @@ class SparseVarAnnotateMixin:
         reference: "pl.DataFrame | str | Path | None" = None,
         count: Literal["allele", "sample"] = "allele",
         strategy: "Strategy | None" = None,
-        max_delta: float = 0.01,
-        min_activity: float = 0.005,
-        criterion: "Criterion" = "cosine",
+        max_delta: float = _UNSET,
+        min_activity: float = _UNSET,
+        criterion: "Criterion" = _UNSET,
         n_jobs: int = 1,
         backend: str = "loky",
     ) -> "pl.DataFrame":
@@ -536,12 +537,19 @@ class SparseVarAnnotateMixin:
                 ``None`` (default) uses forward selection configured by the
                 ``max_delta``/``min_activity``/``criterion`` arguments below.
                 Pass :class:`genoray.Spa` for SigProfilerAssignment's algorithm.
-                The ``max_delta``/``min_activity``/``criterion`` arguments are
-                ignored when ``strategy`` is given.
-            max_delta: Forwarded to :func:`genoray.fit_signatures`.
-            min_activity: Forwarded to :func:`genoray.fit_signatures`.
-            criterion: Forward-selection stop rule, forwarded to
-                :func:`genoray.fit_signatures`. Ignored when ``strategy`` is given.
+                Cannot be combined with any of ``max_delta``, ``min_activity``,
+                or ``criterion`` (raises ``ValueError``, matching
+                :func:`genoray.fit_signatures`).
+            max_delta: Shorthand for ``strategy=Forward(max_delta=...)``.
+                Forwarded to :func:`genoray.fit_signatures`. Cannot be combined
+                with ``strategy=``.
+            min_activity: Shorthand for ``strategy=Forward(min_activity=...)``.
+                Forwarded to :func:`genoray.fit_signatures`. Cannot be combined
+                with ``strategy=``.
+            criterion: Shorthand for ``strategy=Forward(criterion=...)``.
+                Forward-selection stop rule, forwarded to
+                :func:`genoray.fit_signatures`. Cannot be combined with
+                ``strategy=``.
             n_jobs: Forwarded to :func:`genoray.fit_signatures` to control per-sample
                 parallelism (``1`` (default) runs serially; ``-1`` uses all cores;
                 process-based ``"loky"`` backend).
@@ -560,13 +568,10 @@ class SparseVarAnnotateMixin:
             ref = reference
         else:
             ref = _load_signature_file(reference)
-        if strategy is not None:
-            return fit_signatures(
-                catalogue, ref, strategy=strategy, n_jobs=n_jobs, backend=backend
-            )
         return fit_signatures(
             catalogue,
             ref,
+            strategy=strategy,
             max_delta=max_delta,
             min_activity=min_activity,
             criterion=criterion,

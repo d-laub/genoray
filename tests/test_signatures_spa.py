@@ -643,7 +643,7 @@ def test_assign_signatures_forwards_strategy_to_fit_signatures(monkeypatch):
         return pl.DataFrame({"Sample": ["s1"]})
 
     class _Stub:
-        def mutation_matrix(self, kind, count="allele"):
+        def mutation_matrix(self, kind, count="allele", contigs=None):
             return pl.DataFrame({"MutationType": ["A"], "s1": [1.0]})
 
     ref = pl.DataFrame({"MutationType": ["A"], "S1": [1.0]})
@@ -652,18 +652,12 @@ def test_assign_signatures_forwards_strategy_to_fit_signatures(monkeypatch):
     monkeypatch.setattr("genoray._svar._annotate.fit_signatures", fake_fit)
     SparseVar.assign_signatures(_Stub(), "SBS96", reference=ref, strategy=Spa())
     assert isinstance(captured.get("strategy"), Spa)
-    # The legacy trio must NOT be forwarded alongside strategy=, or
-    # fit_signatures raises ValueError.
-    assert "max_delta" not in captured
-    assert "min_activity" not in captured
-    assert "criterion" not in captured
 
     # SparseVar2 imports fit_signatures inside the method body, so the patch
     # must land on the source module, not on the reader's module.
     monkeypatch.setattr("genoray._signatures.fit_signatures", fake_fit)
     SparseVar2.assign_signatures(_Stub(), "SBS96", reference=ref, strategy=Spa())
     assert isinstance(captured.get("strategy"), Spa)
-    assert "max_delta" not in captured
 
 
 def test_assign_signatures_forwards_criterion_when_no_strategy(monkeypatch):
@@ -680,7 +674,7 @@ def test_assign_signatures_forwards_criterion_when_no_strategy(monkeypatch):
         return pl.DataFrame({"Sample": ["s1"]})
 
     class _Stub:
-        def mutation_matrix(self, kind, count="allele"):
+        def mutation_matrix(self, kind, count="allele", contigs=None):
             return pl.DataFrame({"MutationType": ["A"], "s1": [1.0]})
 
     ref = pl.DataFrame({"MutationType": ["A"], "S1": [1.0]})
@@ -693,6 +687,54 @@ def test_assign_signatures_forwards_criterion_when_no_strategy(monkeypatch):
     monkeypatch.setattr("genoray._signatures.fit_signatures", fake_fit)
     SparseVar2.assign_signatures(_Stub(), "SBS96", reference=ref, criterion="bic")
     assert captured.get("criterion") == "bic"
+
+
+def test_assign_signatures_defaults_match_fit_signatures():
+    """With no flat args the readers must resolve to fit_signatures' own defaults.
+
+    Pins the sentinel plumbing: a reader-local sentinel would reach `Forward`
+    as a real value and blow up on the first comparison.
+    """
+    from genoray import SparseVar, SparseVar2, fit_signatures
+
+    cat, ref = _toy_problem()
+    expected = fit_signatures(cat, ref)
+
+    class _Stub:
+        def mutation_matrix(self, kind, count="allele", contigs=None):
+            return cat
+
+    for cls in (SparseVar, SparseVar2):
+        out = cls.assign_signatures(_Stub(), "SBS96", reference=ref)
+        assert out.equals(expected), (
+            f"{cls.__name__} defaults diverge from fit_signatures"
+        )
+
+
+@pytest.mark.parametrize(
+    ("kwarg", "value"),
+    [("max_delta", 0.02), ("min_activity", 0.01), ("criterion", "bic")],
+)
+@pytest.mark.parametrize("cls_name", ["SparseVar", "SparseVar2"])
+def test_assign_signatures_rejects_flat_args_alongside_strategy(cls_name, kwarg, value):
+    """Explicitly passing a forward shorthand next to strategy= must raise, not drop.
+
+    The flat kwargs are `_UNSET` by default and forwarded verbatim, so
+    fit_signatures' central conflict check sees exactly what the caller passed.
+    """
+    import genoray
+
+    cat, ref = _toy_problem()
+
+    class _Stub:
+        def mutation_matrix(self, kind, count="allele", contigs=None):
+            return cat
+
+    reader = getattr(genoray, cls_name)
+    with pytest.raises(ValueError, match=kwarg):
+        reader.assign_signatures(
+            _Stub(), "SBS96", reference=ref, strategy=genoray.Spa(), **{kwarg: value}
+        )
 
 
 def test_protection_holds_for_the_first_removal_decision():
