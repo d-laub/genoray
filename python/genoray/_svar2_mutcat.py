@@ -10,6 +10,8 @@ over an in-memory index.
 from __future__ import annotations
 
 import json
+import os
+from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -17,6 +19,8 @@ import numpy as np
 import polars as pl
 
 from genoray._contigs import ContigNormalizer
+
+from genoray._unset import _UNSET
 
 # The mutcat/signature stack is expensive to import -- `genoray._mutcat` pulls
 # in numba (and llvmlite), `_mutcat.strand` pulls in seqpro (numba again, plus
@@ -72,6 +76,12 @@ class _MutcatMixin:
             ``mutcat_strand`` (whether a GTF was supplied). The sidecar files
             themselves are the ground truth checked by :meth:`mutation_matrix`'s
             guards.
+
+            Writes are atomic per file (same-directory temp + rename), so a killed
+            job leaves the previous contents intact rather than a truncated
+            ``meta.json`` or sidecar. Re-running is unconditional (it overwrites the
+            in-scope contigs), so it is also the recovery path for a store whose
+            sidecars are missing or suspect.
         """
         from genoray._mutcat import MUTCAT_VERSION
         from genoray._mutcat.strand import contig_strand_intervals, load_gene_intervals
@@ -111,10 +121,18 @@ class _MutcatMixin:
         meta["mutcat_version"] = MUTCAT_VERSION
         meta["mutcat_contigs"] = scope
         meta["mutcat_strand"] = gtf is not None
-        meta_path.write_text(json.dumps(meta))
+        # Same-directory temp + rename. A kill inside the stamp leaves the old
+        # meta.json (which still parses) instead of a truncated one that would
+        # make every subsequent SparseVar2 open of the store fail.
+        tmp_path = meta_path.with_name(meta_path.name + ".tmp")
+        with open(tmp_path, "w") as f:
+            f.write(json.dumps(meta))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, meta_path)
 
-    def _is_annotated(self) -> bool:
-        """Whether every contig has an on-disk mutcat sidecar.
+    def _is_annotated(self, contigs: "Sequence[str] | None" = None) -> bool:
+        """Whether every contig in ``contigs`` (default: the whole store) is annotated.
 
         Checked directly on disk (not via ``meta.json``) because
         ``from_vcf(..., signatures=True)`` writes sidecars at conversion time
@@ -122,21 +140,23 @@ class _MutcatMixin:
         written by ``annotate_contig`` for every contig (even if empty), so its
         absence is ground truth for "never annotated".
         """
+        scope = self.contigs if contigs is None else contigs
         return all(
             (self.path / contig / "mutcat" / "var_key_snp" / "code.bin").exists()
-            for contig in self.contigs
+            for contig in scope
         )
 
-    def _is_strand_annotated(self) -> bool:
-        """Whether every contig has an on-disk ``strand.bin`` (GTF-annotated).
+    def _is_strand_annotated(self, contigs: "Sequence[str] | None" = None) -> bool:
+        """Whether every contig in ``contigs`` (default: the whole store) has ``strand.bin``.
 
         Ground truth for whether SBS192/SBS384 can be produced. Like
         ``_is_annotated``, checked on disk rather than via ``meta.json`` because
         the file is what the Rust count reads.
         """
+        scope = self.contigs if contigs is None else contigs
         return all(
             (self.path / contig / "mutcat" / "var_key_snp" / "strand.bin").exists()
-            for contig in self.contigs
+            for contig in scope
         )
 
     def mutation_matrix(
@@ -144,6 +164,7 @@ class _MutcatMixin:
         kind: Literal["SBS96", "DBS78", "ID83", "SBS192", "SBS384"],
         *,
         count: Literal["allele", "sample"] = "allele",
+        contigs: "Sequence[str] | None" = None,
     ) -> pl.DataFrame:
         """Build a per-sample mutation count matrix.
 
@@ -158,15 +179,20 @@ class _MutcatMixin:
                 have been run with ``gtf=`` (transcriptional strand annotation).
             count: ``"allele"`` counts every non-ref allele copy; ``"sample"`` counts
                 each category at most once per sample (presence/absence), OR-combined
-                across contigs.
+                across the scoped contigs.
+            contigs: If given, sum only over these contigs (alternate naming accepted,
+                duplicates collapsed) and require only those to be annotated. ``None``
+                (default) sums over every contig in the store. A name absent from the
+                store raises ``ValueError``.
 
         Raises:
-            ValueError: If the store has not been annotated (no on-disk mutcat sidecar for
-                every contig) — calling the underlying Rust ``count_matrix`` on an
+            ValueError: If a contig in scope has not been annotated (no on-disk mutcat
+                sidecar) — calling the underlying Rust ``count_matrix`` on an
                 unannotated contig with SNP records panics across the FFI boundary,
                 so this is checked up front to raise a clean Python exception instead.
-                Also raised for ``"SBS192"``/``"SBS384"`` if the store has not been
-                strand-annotated (no on-disk ``strand.bin`` for every contig).
+                Also raised for ``"SBS192"``/``"SBS384"`` if the scoped contigs have no
+                strand annotation (no on-disk ``strand.bin``), and for a requested
+                contig absent from the store.
         """
         from genoray._mutcat import N_CODES, code_ranges, labels
 
@@ -176,13 +202,19 @@ class _MutcatMixin:
             raise ValueError(
                 f"Unknown count mode {count!r}; choose 'allele' or 'sample'."
             )
-        if not self._is_annotated():
+        if contigs is None:
+            scope = self.contigs
+        else:
+            # pyrefly: ignore [missing-attribute]
+            resolved = self._resolve_contigs(contigs)
+            scope = list(dict.fromkeys(resolved))
+        if not self._is_annotated(scope):
             raise ValueError(
                 "SparseVar2 is not annotated for mutational signatures; call "
                 "annotate_mutations(reference) first, or rebuild with "
                 "from_vcf(..., signatures=True)."
             )
-        if kind in ("SBS192", "SBS384") and not self._is_strand_annotated():
+        if kind in ("SBS192", "SBS384") and not self._is_strand_annotated(scope):
             raise ValueError(
                 f"{kind} requires transcriptional strand annotation; re-run "
                 "annotate_mutations(reference, gtf=...) with a gene model."
@@ -190,7 +222,7 @@ class _MutcatMixin:
 
         per_sample = count == "sample"
         total = np.zeros((self.n_samples, N_CODES), dtype=np.int64)  # type: ignore[missing-attribute]
-        for contig in self.contigs:
+        for contig in scope:
             total += self._readers[contig].count_matrix(
                 str(self.path), contig, per_sample
             )
@@ -210,10 +242,11 @@ class _MutcatMixin:
         *,
         reference: "pl.DataFrame | str | Path | None" = None,
         count: Literal["allele", "sample"] = "allele",
+        contigs: "Sequence[str] | None" = None,
         strategy: "Strategy | None" = None,
-        max_delta: float = 0.01,
-        min_activity: float = 0.005,
-        criterion: "Criterion" = "cosine",
+        max_delta: float = _UNSET,
+        min_activity: float = _UNSET,
+        criterion: "Criterion" = _UNSET,
         n_jobs: int = 1,
         backend: str = "loky",
     ) -> pl.DataFrame:
@@ -228,16 +261,26 @@ class _MutcatMixin:
                 signature columns), a path to a COSMIC-style TSV, or ``None`` to
                 fetch the default COSMIC set via :func:`genoray.cosmic_signatures`.
             count: Counting unit passed to :meth:`mutation_matrix`.
+            contigs: Contig subset to count over, passed through to
+                :meth:`mutation_matrix`. ``None`` (default) uses every contig in the
+                store.
             strategy: Refit strategy, forwarded to :func:`genoray.fit_signatures`.
                 ``None`` (default) uses forward selection configured by the
                 ``max_delta``/``min_activity``/``criterion`` arguments below.
                 Pass :class:`genoray.Spa` for SigProfilerAssignment's algorithm.
-                The ``max_delta``/``min_activity``/``criterion`` arguments are
-                ignored when ``strategy`` is given.
-            max_delta: Forwarded to :func:`genoray.fit_signatures`.
-            min_activity: Forwarded to :func:`genoray.fit_signatures`.
-            criterion: Forward-selection stop rule, forwarded to
-                :func:`genoray.fit_signatures`. Ignored when ``strategy`` is given.
+                Cannot be combined with any of ``max_delta``, ``min_activity``,
+                or ``criterion`` (raises ``ValueError``, matching
+                :func:`genoray.fit_signatures`).
+            max_delta: Shorthand for ``strategy=Forward(max_delta=...)``.
+                Forwarded to :func:`genoray.fit_signatures`. Cannot be combined
+                with ``strategy=``.
+            min_activity: Shorthand for ``strategy=Forward(min_activity=...)``.
+                Forwarded to :func:`genoray.fit_signatures`. Cannot be combined
+                with ``strategy=``.
+            criterion: Shorthand for ``strategy=Forward(criterion=...)``.
+                Forward-selection stop rule, forwarded to
+                :func:`genoray.fit_signatures`. Cannot be combined with
+                ``strategy=``.
             n_jobs: Forwarded to :func:`genoray.fit_signatures` to control per-sample
                 parallelism (``1`` (default) runs serially; ``-1`` uses all cores;
                 process-based ``"loky"`` backend).
@@ -261,20 +304,17 @@ class _MutcatMixin:
                 "reference signature set for refitting. Use mutation_matrix(kind) "
                 "for strand-bias analysis instead."
             )
-        catalogue = self.mutation_matrix(kind, count=count)
+        catalogue = self.mutation_matrix(kind, count=count, contigs=contigs)
         if reference is None:
             ref = cosmic_signatures(kind)
         elif isinstance(reference, pl.DataFrame):
             ref = reference
         else:
             ref = _load_signature_file(reference)
-        if strategy is not None:
-            return fit_signatures(
-                catalogue, ref, strategy=strategy, n_jobs=n_jobs, backend=backend
-            )
         return fit_signatures(
             catalogue,
             ref,
+            strategy=strategy,
             max_delta=max_delta,
             min_activity=min_activity,
             criterion=criterion,

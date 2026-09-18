@@ -9,14 +9,10 @@ import numpy as np
 import polars as pl
 from joblib import Parallel, delayed
 
+from genoray._unset import _UNSET
 from ._forward import Criterion, _fit_one_forward
 from ._spa import _fit_one_spa
 from ._strategy import SPA_CONNECTED_GROUPS, Forward, Spa, Strategy
-
-# Sentinel distinguishing "argument not passed" from "argument passed its
-# default value". Needed so `strategy=Spa(), max_delta=0.01` is still a
-# conflict rather than silently accepted.
-_UNSET: Any = object()
 
 #: Real defaults for the legacy shorthand arguments. Kept here so the
 #: docstring and the resolution agree in one place.

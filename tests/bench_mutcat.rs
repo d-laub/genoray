@@ -219,7 +219,8 @@ fn bench_count_contig() {
     );
 
     let reader = ContigReader::open(out.to_str().unwrap(), "chr1", n_samples, ploidy).unwrap();
-    let sidecars = Sidecars::open(&ContigPaths::new(out.to_str().unwrap(), "chr1")).unwrap();
+    let sidecars =
+        Sidecars::open(&ContigPaths::new(out.to_str().unwrap(), "chr1"), &reader).unwrap();
 
     // warm-up (page in mmaps)
     let mut acc = Array2::<i64>::zeros((n_samples, genoray_core::mutcat::N_CODES));

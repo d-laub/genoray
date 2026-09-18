@@ -53,7 +53,7 @@ impl PyContigReader {
         per_sample: bool,
     ) -> PyResult<Bound<'py, PyArray2<i64>>> {
         let paths = ContigPaths::new(base_out_dir, chrom);
-        let sidecars = Sidecars::open(&paths).map_err(|e| {
+        let sidecars = Sidecars::open(&paths, &self.inner).map_err(|e| {
             pyo3::exceptions::PyIOError::new_err(format!("open sidecar {chrom}: {e}"))
         })?;
         let mut acc = ndarray::Array2::<i64>::zeros((self.inner.n_samples, N_CODES));
