@@ -4,6 +4,7 @@
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 
 use memmap2::MmapMut;
 use rayon::prelude::*;
@@ -44,6 +45,10 @@ struct SampleMutations {
     /// still gets its label written to both calls.
     origins: Vec<Vec<Origin>>,
 }
+
+/// One sample's finished classification, sent from the rayon workers to the
+/// main thread: sample index, per-mutation origins, one label per mutation.
+type SampleResult = (usize, Vec<Vec<Origin>>, Vec<u8>);
 
 fn field_f64(v: FieldValue) -> f64 {
     match v {
@@ -172,42 +177,9 @@ pub fn annotate_contig(
         None => (None, None),
     };
 
-    // Gather + classify in parallel; the mmap writes stay single-threaded.
-    // If `ContigReader` turns out not to be `Sync` (the long-allele LUT reader
-    // is the only suspect), drop `.into_par_iter()` to a plain `(0..n_samples)`
-    // map; correctness is identical.
-    let classified: Vec<(SampleMutations, Vec<u8>)> = (0..n_samples)
-        .into_par_iter()
-        .map(|s| {
-            let g = gather_sample(
-                reader,
-                snp_positions,
-                dense_positions,
-                s,
-                vaf_vk.as_ref(),
-                vaf_dense.as_ref(),
-            );
-            let labels = cluster_sample(&g.muts, cutoffs[s], vaf_cut);
-            (g, labels)
-        })
-        .collect();
-
-    let seen_vk: usize = classified
-        .iter()
-        .map(|(g, _)| {
-            g.origins
-                .iter()
-                .flatten()
-                .filter(|o| matches!(o, Origin::VkCall(_)))
-                .count()
-        })
-        .sum();
-    if seen_vk != vk_calls {
-        return Err(ClusterError::Invalid(format!(
-            "gathered {seen_vk} var_key SNP calls, the stream has {vk_calls}"
-        )));
-    }
-
+    // Stage all four streams at their final lengths and default fills before
+    // classifying, so labels stream straight into the mmaps. Peak buffering is
+    // O(in-flight samples), never the whole contig.
     let vk_indel_calls = reader.vk_indel.offsets.last().copied().unwrap_or(0) as usize;
     let dense_snp_elems = reader
         .dense_snp
@@ -220,48 +192,79 @@ pub fn annotate_contig(
         .map(|d| d.n_dense_variants * n_samples)
         .unwrap_or(0);
 
-    write_values(
+    let mut vk_snp = stage(
         &paths.field_values("format", CLUSTER_CLASS, FieldSub::VkSnp),
         vk_calls,
-        |buf| {
-            buf.fill(NONCLUSTERED);
-            for (g, labels) in &classified {
-                for (i, origins) in g.origins.iter().enumerate() {
-                    for origin in origins {
-                        if let Origin::VkCall(call) = *origin {
-                            buf[call] = labels[i];
-                        }
-                    }
-                }
-            }
-        },
+        |buf| buf.fill(NONCLUSTERED),
     )?;
-    write_values(
+    let vk_indel = stage(
         &paths.field_values("format", CLUSTER_CLASS, FieldSub::VkIndel),
         vk_indel_calls,
         |buf| buf.fill(NOT_ANNOTATED),
     )?;
-    write_values(
+    let mut dense_snp = stage(
         &paths.field_values("format", CLUSTER_CLASS, FieldSub::DenseSnp),
         dense_snp_elems,
-        |buf| {
-            buf.fill(NOT_ANNOTATED);
-            for (sample, (g, labels)) in classified.iter().enumerate() {
-                for (i, origins) in g.origins.iter().enumerate() {
-                    for origin in origins {
-                        if let Origin::DenseCol(col) = *origin {
-                            buf[col * n_samples + sample] = labels[i];
-                        }
-                    }
-                }
-            }
-        },
+        |buf| buf.fill(NOT_ANNOTATED),
     )?;
-    write_values(
+    let dense_indel = stage(
         &paths.field_values("format", CLUSTER_CLASS, FieldSub::DenseIndel),
         dense_indel_elems,
         |buf| buf.fill(NOT_ANNOTATED),
     )?;
+
+    // Gather + classify in parallel but apply each sample on the main thread
+    // as it arrives; the bounded channel keeps in-flight results at
+    // O(threads x one sample). The parallel loop runs on its own scoped
+    // thread because a bounded channel with no concurrent receiver deadlocks:
+    // an inline `for_each_with` would leave the main thread inside the loop,
+    // not draining `rx`.
+    let (tx, rx) = mpsc::sync_channel::<SampleResult>(2 * rayon::current_num_threads().max(1));
+    std::thread::scope(|scope| -> Result<(), ClusterError> {
+        let _ = scope.spawn(move || {
+            (0..n_samples).into_par_iter().for_each_with(tx, |tx, s| {
+                let g = gather_sample(
+                    reader,
+                    snp_positions,
+                    dense_positions,
+                    s,
+                    vaf_vk.as_ref(),
+                    vaf_dense.as_ref(),
+                );
+                let labels = cluster_sample(&g.muts, cutoffs[s], vaf_cut);
+                let _ = tx.send((s, g.origins, labels));
+            });
+        });
+
+        let mut seen_vk = 0usize;
+        for (sample, sites, labels) in rx {
+            for (i, origins) in sites.iter().enumerate() {
+                for origin in origins {
+                    match *origin {
+                        Origin::VkCall(call) => {
+                            vk_snp.buf()[call] = labels[i];
+                            seen_vk += 1;
+                        }
+                        Origin::DenseCol(col) => {
+                            dense_snp.buf()[col * n_samples + sample] = labels[i];
+                        }
+                    }
+                }
+            }
+        }
+        if seen_vk != vk_calls {
+            return Err(ClusterError::Invalid(format!(
+                "gathered {seen_vk} var_key SNP calls, the stream has {vk_calls}"
+            )));
+        }
+        Ok(())
+    })?;
+
+    // Every sample is applied; publish all four streams.
+    vk_snp.commit()?;
+    vk_indel.commit()?;
+    dense_snp.commit()?;
+    dense_indel.commit()?;
     Ok(())
 }
 
@@ -305,20 +308,56 @@ pub fn fill_contig(reader: &ContigReader, paths: &ContigPaths) -> Result<(), Clu
     Ok(())
 }
 
-/// Create `path.tmp` at `len` bytes, hand the mmap to `fill`, then fsync +
-/// rename (the `mutcat::sidecar` pattern). `len == 0` writes an empty file.
-fn write_values(path: &Path, len: usize, fill: impl FnOnce(&mut [u8])) -> io::Result<()> {
+/// A staged `values.bin`: `path.tmp` created at `len` bytes and filled (mmap'd
+/// unless `len == 0`, which has no map), ready for `commit`. Staging lets a
+/// caller fill the file in pieces before it replaces the committed file.
+struct StagedValues {
+    file: File,
+    mm: Option<MmapMut>,
+    path: PathBuf,
+    tmp: PathBuf,
+}
+
+impl StagedValues {
+    /// Mutable view of the staged bytes (empty for a zero-length stream).
+    fn buf(&mut self) -> &mut [u8] {
+        match self.mm.as_mut() {
+            Some(mm) => &mut mm[..],
+            None => &mut [],
+        }
+    }
+
+    /// Flush + fsync and rename the staged file over the destination (the
+    /// `mutcat::sidecar` publish pattern).
+    fn commit(self) -> io::Result<()> {
+        if let Some(mm) = self.mm {
+            mm.flush()?;
+            drop(mm);
+        }
+        self.file.sync_all()?;
+        fs::rename(&self.tmp, &self.path)
+    }
+}
+
+/// Create `path.tmp` at `len` bytes and fill it via `fill`; `len == 0` creates
+/// an empty file and never calls `fill`.
+fn stage(path: &Path, len: usize, fill: impl FnOnce(&mut [u8])) -> io::Result<StagedValues> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
     let tmp = temp_path(path);
     remove_if_exists(&tmp)?;
     if len == 0 {
-        File::create(&tmp)?;
-        return fs::rename(&tmp, path);
+        let file = File::create(&tmp)?;
+        return Ok(StagedValues {
+            file,
+            mm: None,
+            path: path.to_path_buf(),
+            tmp,
+        });
     }
-    // `MmapMut` maps PROT_READ|PROT_WRITE, so the staging file must be
-    // opened for reading as well as writing (`File::create` is write-only).
+    // `MmapMut` maps PROT_READ|PROT_WRITE, so the staging file must be opened
+    // for reading as well as writing (`File::create` is write-only).
     let file = fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -327,13 +366,20 @@ fn write_values(path: &Path, len: usize, fill: impl FnOnce(&mut [u8])) -> io::Re
         .open(&tmp)?;
     file.set_len(len as u64)?;
     // SAFETY: `tmp` is private to this call; nothing else maps or writes it
-    // between `map_mut` and the rename below.
+    // between `map_mut` and the rename in `commit`.
     let mut mm = unsafe { MmapMut::map_mut(&file)? };
     fill(&mut mm[..]);
-    mm.flush()?;
-    drop(mm);
-    file.sync_all()?;
-    fs::rename(&tmp, path)
+    Ok(StagedValues {
+        file,
+        mm: Some(mm),
+        path: path.to_path_buf(),
+        tmp,
+    })
+}
+
+/// Stage, fill in one shot, and publish `path`.
+fn write_values(path: &Path, len: usize, fill: impl FnOnce(&mut [u8])) -> io::Result<()> {
+    stage(path, len, fill)?.commit()
 }
 
 /// `path` with `.tmp` appended to its file name, so staging shares the
@@ -428,5 +474,36 @@ mod tests {
             vec![DOUBLET; 3],
             "both hap calls of the doublet must be labelled"
         );
+    }
+
+    /// More samples than the bounded channel's capacity: every sample must
+    /// still stream through and land in the right slot. An inline
+    /// `for_each_with` over a bounded channel deadlocks here (the main thread
+    /// cannot drain while it is inside the parallel loop).
+    #[test]
+    fn many_samples_stream_through_the_bounded_channel() {
+        use crate::layout;
+        use ndarray::Array1;
+
+        let n_samples = 64usize;
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_str().unwrap();
+        let paths = ContigPaths::new(base, "chr1");
+        let snp = paths.var_key_snp_dir();
+        fs::create_dir_all(&snp).unwrap();
+        // One isolated SNP per sample (gaps of 3 exceed the cutoff of 1), so
+        // every call stays NONCLUSTERED; packed 2-bit codes are all zero.
+        let positions: Vec<u32> = (0..n_samples as u32).map(|s| 100 + 3 * s).collect();
+        fs::write(layout::positions(&snp), bytemuck::cast_slice(&positions)).unwrap();
+        fs::write(layout::alleles(&snp), vec![0u8; n_samples.div_ceil(4)]).unwrap();
+        let offsets = Array1::from_vec((0..=n_samples as u64).collect::<Vec<_>>());
+        ndarray_npy::write_npy(layout::offsets(&snp), &offsets).unwrap();
+
+        let reader = ContigReader::open(base, "chr1", n_samples, 1).unwrap();
+        annotate_contig(&reader, &paths, &vec![1.0; n_samples], None, 0.1).unwrap();
+
+        let values =
+            fs::read(paths.field_values("format", CLUSTER_CLASS, FieldSub::VkSnp)).unwrap();
+        assert_eq!(values, vec![NONCLUSTERED; n_samples]);
     }
 }
