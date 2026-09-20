@@ -13,8 +13,6 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from vcfixture import Number, Seq, Type, VcfBuilder
-
 from genoray import SparseVar2
 from genoray._svar2_clusters import (
     CLUSTER_VERSION,
@@ -27,6 +25,7 @@ from genoray._svar2_clusters import (
     OTHER,
 )
 from genoray._svar2_fields import FormatField
+from vcfixture import Number, Seq, Type, VcfBuilder
 
 
 def _fixture(tmp_path: Path) -> Path:
