@@ -72,6 +72,7 @@ pub mod svar1_reader;
 // import its numpy-array conversion helpers unconditionally, and py_convert.rs
 // itself has zero htslib dependency (pure numpy/pyo3 glue). Stays ungated as
 // shared infra, same reasoning as `streams` above.
+pub mod py_cluster;
 pub mod py_convert;
 pub mod py_mutcat;
 pub mod py_query;
