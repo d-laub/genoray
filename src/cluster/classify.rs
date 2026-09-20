@@ -342,4 +342,20 @@ mod tests {
         let muts = [m(10, 0, Some(0.1)), m(11, 0, Some(0.2))];
         assert_eq!(cluster_sample(&muts, 5.0, 0.1), vec![DOUBLET; 2]);
     }
+
+    #[test]
+    fn wire_codes_are_pinned() {
+        assert_eq!(
+            (
+                NONCLUSTERED,
+                DOUBLET,
+                MBS,
+                OMIKLI,
+                KATAEGIS,
+                OTHER,
+                NOT_ANNOTATED
+            ),
+            (0, 1, 2, 3, 4, 5, 255)
+        );
+    }
 }
