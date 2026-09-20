@@ -56,7 +56,7 @@ thresholds. This spec ports the decision, not the orchestration.
   SNV-context pipeline never sees indels in its clustered file.
 - **Rainfall/IMD plots, matrices per subclass, event-probability KDEs,
   `eventProbability`.**
-- **SVAR1** (`SparseVar`), and **dense sub-streams** (see Storage).
+- **SVAR1** (`SparseVar`).
 - **Write-time classification** (`from_vcf(..., clusters=True)`).
   Clustering needs the complete per-contig per-sample mutation list;
   post-hoc is the honest place for it.
@@ -269,29 +269,32 @@ normal FORMAT field rather than a bespoke per-variant sidecar:
 ```
 {store}/{contig}/fields/format/cluster_class/var_key_snp/values.bin    # u8 per SNP call
 {store}/{contig}/fields/format/cluster_class/var_key_indel/values.bin  # 255 per indel call
+{store}/{contig}/fields/format/cluster_class/dense_snp/values.bin      # u8 per (dense SNP, sample)
+{store}/{contig}/fields/format/cluster_class/dense_indel/values.bin    # 255 per (dense indel, sample)
 ```
 
-- `values.bin` is 1:1 with the var_key call stream, in the same
-  column-major `(sample, ploid)` order the merge produces. Confirmed
+- `var_key_snp/values.bin` is 1:1 with the var_key call stream, in the
+  same column-major `(sample, ploid)` order the merge produces. Confirmed
   against `merge::merge_var_key_field_values` ("field values are staged
   1:1 with calls", `src/merge.rs:553-556`) and
   `FieldView::value_at` ("element `i` is a var_key **call** index",
   `src/query/field.rs:98-102`). Both haplotypes of a carrier sample get
-  the same label; a `1/2` sample has a label per recorded alt.
-- Indel calls get 255. Upstream does not subclassify indels, but the
-  field reader opens all four sub-streams (`py_query_decode.rs`
-  `views: [FieldView; 4]`), so a missing `var_key_indel/values.bin`
-  would misindex — the fill is a correctness requirement, not a
+  the same label; a `1/2` sample has a label per recorded alt. A dense
+  variant carried by both haplotypes is one mutation, labelled once.
+- `dense_snp/values.bin` is one label per `(dense_row, sample)` element in
+  the `dense_row * n_samples + sample` order the reader uses
+  (`FieldView::format_at`, `src/query/field.rs:118-127`); non-carriers
+  get 255. Dense streams cannot be refused: the per-variant cost model
+  routes recurrent variants (and most variants in tiny cohorts) to dense,
+  and the field reader opens all four sub-streams, so a missing or short
+  file misindexes the field.
+- Indel calls and dense indel elements get 255. Upstream does not
+  subclassify indels; the fill is a correctness requirement, not a
   courtesy.
 - Out-of-scope contigs (when `contigs=` is passed) get 255-filled
   `values.bin` files of the right length. Without this, selecting the
   field and decoding an unannotated contig would index an empty view
   and panic across the FFI boundary.
-- v1 refuses stores with any non-empty dense sub-stream
-  (`dense/snp` or `dense/indel` records): their field values are also
-  opened by the reader and would need labels of their own. `ValueError`
-  naming the contig. Every `from_vcf`/`from_vcf_list` cohort store is
-  var_key, which is the target.
 
 `meta.json` additions (stamped last, same atomic-write pattern as
 `_MutcatMixin`):
@@ -313,27 +316,38 @@ the entry up unchanged; `u8` is already a supported storage dtype.
 Re-running is unconditional and overwrites in-scope contigs; a killed
 run leaves no manifest entry (meta is stamped only after every contig's
 files are renamed into place), so partial output is never advertised.
-
 ### Rust
 
 - `src/cluster/mod.rs` — label constants, `CLUSTER_VERSION`,
   `N_LABELS`.
-- `src/cluster/classify.rs` — pure functions over a single sample:
-  - `fn imds(positions: &[u32]) -> Vec<u32>` (Step 2),
-  - `fn cluster_sample(positions: &[u32], vafs: Option<&[f64]>,
-    cutoff: f64, vaf_cut: f64) -> Vec<u8>` (Steps 3–8).
+- `src/cluster/classify.rs` — pure functions over one sample's mutation
+  list:
+  - `struct Mutation { pos: u32, alt: u8, vaf: Option<f64> }` (`alt` is a
+    `decode_snp_2bit` code; `vaf` is `-1.5` for a missing value in VAF
+    mode, `None` in no-VAF mode),
+  - `fn imds(&[Mutation]) -> Vec<f64>` (Step 2, one-mutation sentinel
+    `1e6`),
+  - `fn cluster_sample(&[Mutation], cutoff: f64, vaf_cut: f64) -> Vec<u8>`
+    (Steps 3–8).
   Unit-testable with no I/O; the parity oracle can also drive these
   directly through a test-only binding if useful.
-- `src/cluster/write.rs` — build `values.bin` per sub-stream
-  (temp + rename, `fsync` before rename, mirroring
-  `src/mutcat/sidecar.rs`), deriving per-column byte ranges from
-  `vk_snp.column(col)` so peak buffering is one column, not the whole
-  contig; each written `values.bin` length must equal that sub-stream's
-  total call count (asserted before rename).
+- `src/cluster/write.rs` — gather each sample's mutations from both
+  `vk_snp` (per-call index) and `dense_snp` (`for_each_carried` per hap,
+  dense-column origin), merge and dedupe by `(pos, alt)`; read the VAF
+  field's values from both the `var_key_snp` and `dense_snp` value
+  streams (missing file = absent sub-stream, exactly as the reader
+  treats it); classify; then write all four `values.bin` (temp + rename,
+  `fsync` before rename, mirroring `src/mutcat/sidecar.rs`). The var_key
+  SNP file is written at per-column offsets via mmap so peak buffering
+  is one column, not the whole contig; the other three files are
+  255-filled and then patched at labelled elements. Each written file's
+  length must equal that sub-stream's element count (asserted before
+  rename).
 - `src/py_cluster.rs` — `PyContigReader::annotate_clusters(base_out_dir,
   chrom, cutoffs: PyReadonlyArray1<f64>, vaf: Option<(name, dtype)>,
-  vaf_cut)`; per-sample classification is independent and runs under
-  rayon when the cohort is wide.
+  vaf_cut)`; per-sample gathering and classification are independent and
+  run under rayon when the cohort is wide (sparse write assignment stays
+  single-threaded).
 
 ### Python
 
@@ -353,7 +367,6 @@ files are renamed into place), so partial output is never advertised.
 | missing/unknown sample in a `imd_cutoff` mapping | `ValueError` listing them |
 | non-positive cutoff or `vaf_cut` | `ValueError` |
 | `vaf_field` unknown / not FORMAT / non-float dtype | `ValueError` |
-| any non-empty dense sub-stream | `ValueError` (v1 limitation) |
 | no contigs resolve from `contigs=` | `ValueError` (mutcat semantics) |
 
 ## Deviations from upstream (all deliberate, all documented)
@@ -377,7 +390,9 @@ files are renamed into place), so partial output is never advertised.
 2. **Python end-to-end** (`tests/test_svar2_clusters.py`): tiny VCF →
    `from_vcf` → `annotate_clusters` → `with_fields(["cluster_class"])` →
    `decode`; per-call label order verified against a hand-built
-   expectation; `contigs=` fill; validation errors; atomicity (block a
+   expectation; `contigs=` fill; a tiny-cohort fixture whose recurrent
+   variant routes dense, so labels must cross the var_key/dense split;
+   validation errors; atomicity (block a
    temp path, assert old files survive and meta is unstamped); re-run
    idempotence; a killed-run simulation leaves no manifest entry.
 3. **Upstream parity** (`tests/test_clusters_calibration.py`, guarded by
@@ -408,8 +423,8 @@ codes, optional VAFs), O(calls) for the label vector and O(m log m) for
 sorting the sample's mutations. `values.bin` is written directly at
 per-column offsets via mmap; no store-wide buffer. Classification is
 embarrassingly parallel over samples (rayon). Storage cost: one byte
-per SNP call plus one byte per indel call (the fill), i.e. ~25 % of the
-`positions.bin` stream.
+per SNP call (var_key or dense element) plus the indel fills, i.e.
+roughly 25 % of the `positions.bin` stream for var_key-heavy stores.
 
 ## Future work
 
@@ -424,8 +439,7 @@ per SNP call plus one byte per indel call (the fill), i.e. ~25 % of the
   values 6–9 or a second field.
 - Event group ids (`cluster_group`, u32, per-sample event ordinal) for
   aggregating events.
-- Dense sub-stream support (255-fill or computed labels per dense
-  element) and write-time `from_vcf(..., clusters=True)`.
+- Write-time `from_vcf(..., clusters=True)`.
 - Indel clusteredness (`clustered`/`nonclustered` only, per upstream
   docs).
 
