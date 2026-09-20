@@ -1109,6 +1109,79 @@ sbs192 = sv2.mutation_matrix("SBS192")   # 192 rows: the {T, U} sub-view = SBS38
   publishes no strand-resolved reference set. Use `mutation_matrix` for
   strand-bias analysis.
 
+### Mutation clusters (SigProfilerClusters)
+
+`annotate_clusters` ports SigProfilerClusters' per-mutation subclassification
+(doublet / MBS / omikli / kataegis / other) onto a finished store as the
+`cluster_class` FORMAT field. It is post-hoc only (no write-time flag) and
+needs no reference — the classifier uses no sequence context.
+
+```python
+sv = SparseVar2("out.svar2")
+
+sv.annotate_clusters(imd_cutoff=1000.0)                  # no-VAF mode
+sv.annotate_clusters(imd_cutoff=1000.0, vaf_field="VAF") # VAF mode
+sv.annotate_clusters(imd_cutoff={"S1": 500.0, "S2": 1_000.0}, vaf_field="VAF")
+sv.annotate_clusters(imd_cutoff=1000.0, vaf_field="VAF", contigs=["chr1"])
+
+# The original instance is stale for the new field (`available_fields` is read
+# at construction); re-open the store and opt in before decoding.
+sv = SparseVar2("out.svar2").with_fields(["cluster_class"])
+rag = sv.decode("chr1", [(0, 1_000_000)])
+labels = rag["cluster_class"]   # 1:1 with rag["pos"], the per-call flat order
+```
+
+- Signature: `annotate_clusters(*, imd_cutoff: float | Mapping[str, float], vaf_field: str | None = None, vaf_cut: float = 0.1, contigs: Sequence[str] | None = None) -> None`.
+- `imd_cutoff` — inter-mutational-distance cutoff(s), in bases: a mutation is
+  clustered iff its minimum neighbour distance is `<=` its sample's cutoff.
+  Either one float applied to every sample, or a mapping from sample name to
+  cutoff that must name **every** `available_samples` entry and no others
+  (`ValueError` otherwise); cutoffs must be `> 0`. Cutoffs come from the
+  caller, not the store: upstream derives them per sample by simulation and
+  persists them in `imds.pickle` — feed the same values and every event
+  upstream classifies gets the same label (SigProfilerClusters v1.2.2).
+- `vaf_field` — optional FORMAT field (canonical key or bare name, as in
+  `available_fields`) holding per-call VAF/CCF. When given, VAF consistency
+  participates in the decision tree and failed events are greedily re-split.
+  Must resolve to a FORMAT field with a 2- or 4-byte float dtype
+  (`f16`/`f32`); anything else raises `ValueError`. Missing values are
+  treated as upstream's `-1.5` sentinel. Omit (default `None`) for the no-VAF
+  path.
+- `vaf_cut` — maximum `|delta VAF|` for adjacent mutations to stay in one
+  event (upstream's default `0.1`; `0.25` is its CCF setting). Must be `> 0`.
+- `contigs` — restrict annotation to a subset (alternate naming resolved as
+  in `annotate_mutations`: `chr`-prefixed vs unprefixed and the mito
+  aliases); a name absent from the store raises `ValueError`. Every
+  out-of-scope contig is 255-filled so the field stays decodable there.
+  `None` (default) annotates every contig. Re-running is unconditional.
+- Stamps `meta.json` with `cluster_version` (currently `1`),
+  `cluster_contigs`, `cluster_cutoff`, `cluster_vaf_field`, `cluster_vaf_cut`,
+  and adds the `cluster_class` FORMAT entry (`u8`).
+
+Label codebook — one label per **SNP carrier call** (a `1/2` genotype gets a
+label per recorded alt; indels are never subclassified):
+
+| code | label | upstream |
+|---|---|---|
+| 0 | `nonclustered` | not in the clustered file |
+| 1 | `doublet` | ClassIA |
+| 2 | `mbs` | ClassIB |
+| 3 | `omikli` | ClassIC |
+| 4 | `kataegis` | ClassII |
+| 5 | `other` | ClassIII |
+| 255 | `not_annotated` | out-of-scope contig / non-SNP call |
+
+Read back through the existing field machinery —
+`with_fields(["cluster_class"])` then `decode(contig, ranges)`. The field
+rides the same variant axis as `pos`/`ilen`/`allele`, so
+`rag["cluster_class"]` is in the store's per-call flat order, 1:1 with
+`rag["pos"]`. On disk, `var_key_*` streams store one label per call;
+`dense_*` streams store one per `(dense_row, sample)` in
+`dense_row * n_samples + sample` order, 255 for non-carriers; indel streams
+are 255 throughout. Labels are total over in-scope SNP calls: where upstream
+drops events (clustered singletons, no-VAF failures) genoray writes `other`,
+and non-clustered SNP calls are `nonclustered`.
+
 ### Merge and split by contig
 
 SVAR2 contigs are fully independent on disk, so recombining or subsetting
