@@ -78,7 +78,10 @@ class _ClustersMixin:
             Stamps ``meta.json`` with ``cluster_version``, ``cluster_contigs``,
             ``cluster_cutoff``, ``cluster_vaf_field``, ``cluster_vaf_cut``, and
             the ``cluster_class`` FORMAT entry, after every in-scope contig's
-            files are in place. Re-running is unconditional.
+            files are in place. Re-running is unconditional: the entry is
+            atomically unadvertised before any contig is rewritten and re-added
+            by the final stamp, so a kill mid-run cannot leave the manifest
+            pointing at a mix of old and new label files.
 
         Raises:
             ValueError: Unknown/missing samples in a ``imd_cutoff`` mapping, a
@@ -144,6 +147,24 @@ class _ClustersMixin:
             scope = list(dict.fromkeys(resolved))
             if not scope:
                 raise ValueError("contigs= resolved to no store contigs")
+        meta_path = self.path / "meta.json"
+        if meta_path.exists():
+            # Unadvertise before rewriting any contig: each contig's streams
+            # commit independently, so a kill mid-re-run must not leave
+            # meta.json pointing at a mix of old and new label files. The
+            # final stamp below re-adds the entry (its dedupe keeps it single).
+            meta = json.loads(meta_path.read_text())
+            meta["fields"] = [
+                f
+                for f in meta.get("fields") or []
+                if not (f["name"] == "cluster_class" and f["category"] == "format")
+            ]
+            tmp_path = meta_path.with_name(meta_path.name + ".tmp")
+            with open(tmp_path, "w") as f:
+                f.write(json.dumps(meta))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, meta_path)
 
         for contig in scope:
             self._readers[contig].annotate_clusters(

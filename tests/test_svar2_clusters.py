@@ -250,7 +250,7 @@ def test_validation_errors(tmp_path: Path):
 
 def test_failed_write_leaves_meta_unstamped(tmp_path: Path):
     store = _store(tmp_path)
-    before = (store.path / "meta.json").read_bytes()
+    before = json.loads((store.path / "meta.json").read_text())
     # Block the var_key_snp staging path with a directory so the Rust write
     # fails before anything is renamed into place.
     blocked = (
@@ -260,8 +260,40 @@ def test_failed_write_leaves_meta_unstamped(tmp_path: Path):
     (blocked / "values.bin.tmp").mkdir(exist_ok=True)
     with pytest.raises(OSError):
         store.annotate_clusters(imd_cutoff=1000.0, vaf_field="VAF")
-    assert (store.path / "meta.json").read_bytes() == before
+    assert json.loads((store.path / "meta.json").read_text()) == before
     assert not (blocked / "values.bin").exists()
+
+
+def test_failed_rerun_unadvertises_cluster_class(tmp_path: Path):
+    store = _store(tmp_path)
+    store.annotate_clusters(imd_cutoff=1000.0, vaf_field="VAF")
+    meta = json.loads((store.path / "meta.json").read_text())
+    assert {
+        "name": "cluster_class",
+        "category": "format",
+        "dtype": "u8",
+        "default": None,
+    } in meta["fields"]
+
+    labels_dir = store.path / "chr1" / "fields" / "format" / "cluster_class"
+    committed = (labels_dir / "var_key_snp" / "values.bin").read_bytes()
+
+    # Block the var_key_snp staging path the same way as
+    # test_failed_write_leaves_meta_unstamped, then re-run.
+    blocked = labels_dir / "var_key_snp" / "values.bin.tmp"
+    blocked.mkdir()
+    try:
+        with pytest.raises(OSError):
+            store.annotate_clusters(imd_cutoff=1000.0, vaf_field="VAF")
+    finally:
+        blocked.rmdir()
+
+    meta = json.loads((store.path / "meta.json").read_text())
+    assert not any(
+        f["name"] == "cluster_class" and f["category"] == "format"
+        for f in meta["fields"]
+    )
+    assert (labels_dir / "var_key_snp" / "values.bin").read_bytes() == committed
 
 
 def test_rerun_is_idempotent(tmp_path: Path):
