@@ -15,6 +15,7 @@ from natsort import natsorted
 import genoray._core as _core
 from genoray._contigs import _MITO_ALIASES
 from genoray._svar2_batch import _BatchQueryMixin
+from genoray._svar2_clusters import _ClustersMixin
 from genoray._svar2_decode import _DecodeMixin
 from genoray._svar2_fields import (
     _META_DTYPE,
@@ -335,7 +336,7 @@ def _validate_check_ref(check_ref: str) -> str:
     return check_ref
 
 
-class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
+class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin, _ClustersMixin):
     """Reader for a finished SVAR2 store (M6a skeleton).
 
     Loads the top-level ``meta.json`` and opens one native
