@@ -200,15 +200,32 @@ def _id83_kernel(
         sb = ilen if ilen < 5 else 5
         si = sb - 2  # 0..3
         if is_del:
+            # microhomology (SigProfilerMatrixGenerator): the longer of
+            # 3' = longest prefix of unit[:-1] matching the reference right
+            #      after the deletion, seq[scan + ilen ..]
+            # 5' = longest suffix of unit[1:] matching the reference ending at
+            #      the anchor, seq[.. scan)
             mh = 0
             for kk in range(1, ilen):
                 eq = True
                 for j in range(kk):
-                    if scan + j >= n or seq[scan + j] != buf[us + j]:
+                    q = scan + ilen + j
+                    if q >= n or seq[q] != buf[us + j]:
                         eq = False
                         break
-                if eq:
-                    mh = kk
+                if not eq:
+                    break
+                mh = kk
+            for kk in range(mh + 1, ilen):
+                eq = True
+                for j in range(kk):
+                    q = scan - kk + j
+                    if q < 0 or seq[q] != buf[us + ilen - kk + j]:
+                        eq = False
+                        break
+                if not eq:
+                    break
+                mh = kk
             if mh > 0 and n_rep <= 1:
                 cap = mh_cap[si]
                 m = mh if mh < cap else cap

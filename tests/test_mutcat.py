@@ -3,6 +3,7 @@ from __future__ import annotations
 import numba as nb
 import numpy as np
 import polars as pl
+import pytest
 
 from genoray._mutcat import (
     DBS78,
@@ -335,6 +336,58 @@ def test_id83_insertion_no_repeat_not_mismatch():
     assert code != _REF_MISMATCH
 
 
+# (seq, p0, REF, ALT, expected ID83 label). Expected labels follow
+# SigProfilerMatrixGenerator: microhomology is the longest prefix of the deleted
+# unit matching the reference AFTER the deletion (3'), or the longest suffix
+# matching the reference ending at the anchor (5'), whichever is larger (#220).
+_ID83_DEL_CASES = [
+    ("CCCAGTCAAAACCC", 3, "AGTC", "A", "3:Del:R:0"),  # no repeat, no MH
+    ("CCCAGTCAGGGGCCC", 3, "AGTCA", "A", "4:Del:M:2"),  # 5' MH "CA" beats 3' "G"
+    ("CCCAGTCAGTTTTCC", 3, "AGTCA", "A", "4:Del:M:2"),  # 3' "GT" ties 5' "CA"
+    ("CCCAGTACCC", 3, "AGT", "A", "2:Del:R:0"),  # no repeat, no MH
+    ("CCCAGTGAAA", 3, "AGT", "A", "2:Del:M:1"),  # 3' MH "G"
+    ("GGATCAGTCGGGG", 4, "CAGTC", "C", "4:Del:M:2"),  # 5' MH "TC" (not left-aligned)
+    ("TTTACGTACACGTAGTT", 2, "TACGTAC", "T", "5:Del:M:5"),  # 6bp, 3' MH 5
+    ("TTTACGTACGACGTACTT", 2, "TACGTACG", "T", "5:Del:M:5"),  # 7bp, 3' MH 6 -> cap 5
+    ("CCCAGTGTGTCC", 3, "AGT", "A", "2:Del:R:2"),  # repeat beats MH
+]
+
+
+def _id83_kernel_code(seq: str, p0: int, ref: str, alt: str) -> int:
+    s, r, a = (np.frombuffer(x.encode(), np.uint8) for x in (seq, ref, alt))
+    return int(
+        _id83_codes_for_contig(
+            s,
+            np.array([p0], np.int64),
+            r,
+            np.array([0], np.int64),
+            np.array([len(r)], np.int64),
+            a,
+            np.array([0], np.int64),
+            np.array([len(a)], np.int64),
+        )[0]
+    )
+
+
+@pytest.mark.parametrize(("seq", "p0", "ref", "alt", "label"), _ID83_DEL_CASES)
+def test_id83_deletion_microhomology_kernel(seq, p0, ref, alt, label):
+    assert seq[p0 : p0 + len(ref)] == ref
+    assert _id83_kernel_code(seq, p0, ref, alt) == ID83_INDEX[label]
+
+
+@pytest.mark.parametrize(("seq", "p0", "ref", "alt", "label"), _ID83_DEL_CASES)
+def test_id83_deletion_microhomology_oracle(seq, p0, ref, alt, label):
+    assert seq[p0 : p0 + len(ref)] == ref
+    s = seq.encode()
+
+    def fetch(a: int, b: int) -> bytes:
+        # N-pad outside the contig, like Reference.fetch
+        return b"N" * max(-a, 0) + s[max(a, 0) : b] + b"N" * max(b - len(s), 0)
+
+    code = classify_id83(p0, ref.encode(), alt.encode(), fetch)
+    assert code == ID83_INDEX[label]
+
+
 def test_sbs96_arithmetic_matches_codebook():
     # The vectorized substitution LUT + arithmetic must reproduce SBS96_INDEX
     # for every one of the 96 labels (pyrimidine-folded form, no boundary issues).
@@ -421,12 +474,14 @@ def test_id83_kernel_matches_scalar_random():
         return bytes(out)
 
     refs, alts, p0s = [], [], []
-    for _ in range(300):
+    for _ in range(600):
         p = int(rng.integers(2, len(seq) - 10))
         anchor = bytes(seq[p : p + 1])
-        size = int(rng.integers(1, 5))
+        size = int(rng.integers(1, 8))
         unit = bytes(np.frombuffer(bases, np.uint8)[rng.integers(0, 4, size)])
-        if rng.random() < 0.5:  # deletion
+        if rng.random() < 0.7:  # deletion; mostly REF-consistent to exercise MH
+            if rng.random() < 0.8:
+                unit = bytes(seq[p + 1 : p + 1 + size])
             refs.append(anchor + unit)
             alts.append(anchor)
         else:  # insertion
