@@ -1,3 +1,36 @@
+## 6.0.0 (2026-09-27)
+
+### Feat
+
+- **clusters**: add SparseVar2.annotate_clusters post-hoc API
+- **clusters**: expose PyContigReader.annotate_clusters and fill_cluster_labels
+- **clusters**: write cluster_class sidecar streams from vk+dense mutations
+- **clusters**: port SigProfilerClusters IMD grouping and subclassifier
+- **signatures**: export SPA_CONNECTED_GROUPS
+- **svar**: forward strategy= and criterion= from assign_signatures
+- **signatures**: implement strategy=Spa(), SigProfilerAssignment's cosmic_fit
+- **signatures**: add SPA's single-candidate add and connected-sig expansion
+- **signatures**: add SPA's backward removal sweep
+- **signatures**: accept strategy= on fit_signatures
+- **signatures**: add Forward and Spa strategy objects
+- **signatures**: add relative-L2 scoring and burden-conserving rounding
+
+### Fix
+
+- **mutcat**: compute ID83 deletion microhomology against the flanking sequence
+- **clusters**: unadvertise cluster_class before rewriting labels
+- **clusters**: stream per-sample labels into staged mmaps
+- **mutcat**: atomic annotation writes, sidecar validation, contig scoping
+- **signatures**: record SPA's removal-sweep returns exactly
+- **signatures**: reproduce SPA's decaying background-signature protection
+- **signatures**: keep connected-sig expansion when no candidate remains
+- **signatures**: make connected-sig expansion order-independent
+
+### Refactor
+
+- **signatures**: split _signatures.py into a package
+- **svar2**: delete the dense find_ranges_chunk path
+
 ## 5.0.0 (2026-09-16)
 
 ### BREAKING CHANGE
