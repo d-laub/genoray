@@ -204,22 +204,20 @@ pub fn id83_code(seq: &[u8], pos0: usize, refa: &[u8], alta: &[u8]) -> u8 {
     let si = sb - 2; // 0..3
     let rep;
     if is_del {
-        // microhomology: longest prefix of the unit matching downstream
+        // microhomology (SigProfilerMatrixGenerator): the longer of
+        // 3' = longest prefix of unit[..ilen-1] matching the reference right
+        //      after the deletion, seq[scan + ilen..]
+        // 5' = longest suffix of unit[1..] matching the reference ending at the
+        //      anchor, seq[..scan]
+        let after = &seq[(scan + ilen).min(n)..];
+        let before = &seq[..scan.min(n)];
         let mut mh = 0usize;
-        let mut kk = 1;
-        while kk < ilen {
-            let mut eq = true;
-            let mut j = 0;
-            while j < kk {
-                if scan + j >= n || seq[scan + j] != buf[j] {
-                    eq = false;
-                    break;
-                }
-                j += 1;
-            }
-            if eq {
-                mh = kk;
-            }
+        while mh + 1 < ilen && mh < after.len() && after[mh] == buf[mh] {
+            mh += 1;
+        }
+        let mut kk = mh + 1;
+        while kk < ilen && kk <= before.len() && before[before.len() - kk..] == buf[ilen - kk..] {
+            mh = kk;
             kk += 1;
         }
         if mh > 0 && n_rep <= 1 {
@@ -364,6 +362,49 @@ mod tests {
         // kind Ins=1, base C base_ct=0, rep=n_rep (no -1 for ins).
         let seq = b"ACCCG"; // pos0=0 ('A'); downstream from index1: C C C -> n_rep=3
         assert_eq!(id83_code(seq, 0, b"A", b"AC"), (1 * 2 + 0) * 6 + 3);
+    }
+
+    /// ID83 index of a `N:Del:R:r` / `N:Del:M:m` label (codebook order).
+    fn id83_del_idx(size: usize, kind: u8, k: usize) -> u8 {
+        let si = size.min(5) - 2;
+        let v = match kind {
+            b'R' => 24 + si * 6 + k,
+            _ => 72 + [0, 1, 3, 6][si] + k - 1,
+        };
+        v as u8
+    }
+
+    #[test]
+    fn id83_del_microhomology_matches_sigprofiler() {
+        // (seq, pos0, REF, ALT, size, R|M, count) -- mirrors tests/test_mutcat.py (#220)
+        type Case = (
+            &'static [u8],
+            usize,
+            &'static [u8],
+            &'static [u8],
+            usize,
+            u8,
+            usize,
+        );
+        let cases: [Case; 9] = [
+            (b"CCCAGTCAAAACCC", 3, b"AGTC", b"A", 3, b'R', 0),
+            (b"CCCAGTCAGGGGCCC", 3, b"AGTCA", b"A", 4, b'M', 2),
+            (b"CCCAGTCAGTTTTCC", 3, b"AGTCA", b"A", 4, b'M', 2),
+            (b"CCCAGTACCC", 3, b"AGT", b"A", 2, b'R', 0),
+            (b"CCCAGTGAAA", 3, b"AGT", b"A", 2, b'M', 1),
+            (b"GGATCAGTCGGGG", 4, b"CAGTC", b"C", 4, b'M', 2),
+            (b"TTTACGTACACGTAGTT", 2, b"TACGTAC", b"T", 6, b'M', 5),
+            (b"TTTACGTACGACGTACTT", 2, b"TACGTACG", b"T", 7, b'M', 5),
+            (b"CCCAGTGTGTCC", 3, b"AGT", b"A", 2, b'R', 2),
+        ];
+        for (seq, p, r, a, size, kind, k) in cases {
+            assert_eq!(
+                id83_code(seq, p, r, a),
+                id83_del_idx(size, kind, k),
+                "{}",
+                std::str::from_utf8(seq).unwrap()
+            );
+        }
     }
 
     #[test]

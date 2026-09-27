@@ -103,7 +103,9 @@ def classify_id83(
     # >=2bp: repeat channel unless a microhomology deletion applies
     size = _size_bucket(ilen)
     if is_del:
-        mh = _microhomology_len(indel, window, ilen)
+        after = fetch(scan_start + ilen, scan_start + 2 * ilen)
+        before = fetch(scan_start - ilen, scan_start)
+        mh = _microhomology_len(indel, before, after)
         if mh > 0 and n_rep <= 1:
             mh_cap = {2: 1, 3: 2, 4: 3}.get(ilen, 5)
             return ID83_INDEX[f"{size}:Del:M:{min(mh, mh_cap)}"]
@@ -113,14 +115,18 @@ def classify_id83(
     return ID83_INDEX[f"{size}:{kind}:R:{rep}"]
 
 
-def _microhomology_len(indel: bytes, downstream: bytes, ilen: int) -> int:
-    """Length of partial-match microhomology between the deleted unit and the
-    sequence flanking the deletion (downstream side), capped at ilen-1."""
-    mh = 0
-    for k in range(1, ilen):
-        if downstream[:k] == indel[:k]:
-            mh = max(mh, k)
-    return mh
+def _microhomology_len(indel: bytes, before: bytes, after: bytes) -> int:
+    """SigProfilerMatrixGenerator deletion microhomology, capped at ilen-1.
+
+    ``after`` is the reference right after the deleted bases and ``before`` the
+    reference ending at (and including) the anchor. Returns the longer of the
+    3' MH (prefix of ``indel`` matching ``after``) and the 5' MH (suffix of
+    ``indel`` matching the end of ``before``).
+    """
+    ilen = len(indel)
+    fwd = max((k for k in range(1, ilen) if after[:k] == indel[:k]), default=0)
+    rev = max((k for k in range(1, ilen) if before[-k:] == indel[-k:]), default=0)
+    return max(fwd, rev)
 
 
 def _classify_variants_scalar(index: pl.DataFrame, reference: Reference) -> np.ndarray:
