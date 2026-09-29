@@ -1,3 +1,13 @@
+## 6.0.2 (2026-09-29)
+
+### Fix
+
+- **mutcat**: bump MUTCAT_VERSION to 5 and treat stale sidecars as un-annotated
+
+### Refactor
+
+- **mutcat**: share conversion stamp helper and pin every stamping route
+
 ## 6.0.1 (2026-09-27)
 
 ### Fix
