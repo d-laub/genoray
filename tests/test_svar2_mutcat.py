@@ -12,7 +12,9 @@ import pytest
 from genoray import SparseVar, SparseVar2
 from genoray._mutcat import MUTCAT_VERSION
 from genoray._reference import Reference
+from tests.test_svar2_from_svar1 import _build_svar1
 from tests.test_svar2_from_vcf import _write_ref, _write_vcf
+from tests.test_svar2_from_vcf_list import _ss
 
 
 def test_mutation_matrix_shape_and_labels(tmp_path: Path):
@@ -668,4 +670,44 @@ def test_from_vcf_signatures_true_is_annotated_immediately(tmp_path: Path):
     SparseVar2.from_vcf(out, vcf, ref, threads=1, signatures=True)
     meta = json.loads((out / "meta.json").read_text())
     assert meta["mutcat_version"] == MUTCAT_VERSION
+    assert SparseVar2(out).mutation_matrix("SBS96").height == 96
+
+
+def _sub(d: Path) -> Path:
+    sub = d / "svar1_src"
+    sub.mkdir()
+    return sub
+
+
+@pytest.mark.parametrize(
+    "route", ["from_pgen", "from_vcf_list", "from_svar1", "write_view"]
+)
+def test_every_sidecar_writing_route_stamps_current_version(tmp_path: Path, route: str):
+    ref = _write_ref(tmp_path)
+    vcf = _write_vcf(tmp_path, symbolic=False, indexed=True)
+    out = tmp_path / "out.svar2"
+    if route == "from_pgen":
+        subprocess.run(
+            ["plink2", "--make-pgen", "--vcf", str(vcf), "--out", str(tmp_path / "in")],
+            check=True,
+            capture_output=True,
+        )
+        SparseVar2.from_pgen(out, tmp_path / "in.pgen", ref, threads=1, signatures=True)
+    elif route == "from_vcf_list":
+        single = _ss(tmp_path, "a", "SA", "chr1\t3\t.\tA\tG\t.\t.\t.\tGT\t1|0\n")
+        SparseVar2.from_vcf_list(out, [single], ref, threads=1, signatures=True)
+    elif route == "from_svar1":
+        SparseVar2.from_svar1(
+            out, _build_svar1(_sub(tmp_path)), ref, threads=1, signatures=True
+        )
+    else:
+        src = tmp_path / "src.svar2"
+        SparseVar2.from_vcf(src, vcf, ref, threads=1)
+        sv2 = SparseVar2(src)
+        sv2.write_view(
+            (sv2.contigs[0], 0, 40), sv2.available_samples, out, reference=str(ref)
+        )
+    assert json.loads((out / "meta.json").read_text())["mutcat_version"] == (
+        MUTCAT_VERSION
+    )
     assert SparseVar2(out).mutation_matrix("SBS96").height == 96

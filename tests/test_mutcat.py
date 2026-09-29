@@ -642,7 +642,7 @@ def test_not_annotated_sentinel_and_version():
     # would make this a tautology).
     assert len(set(Sentinel.__members__.values())) == len(Sentinel.__members__)
     # on-disk semantics changed -> version bumped
-    assert MUTCAT_VERSION >= 4
+    assert MUTCAT_VERSION == 5
 
 
 def test_classify_variants_contig_scope(tmp_path):

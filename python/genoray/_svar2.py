@@ -656,7 +656,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin, _ClustersMixin):
             )
         if reference_str is not None:
             # `reference=` recomputes mutcat on the view; stamp it like `from_*`.
-            _stamp_mutcat_meta(Path(output), SparseVar2(output).contigs, strand=False)
+            _stamp_converted_store(output)
 
     @classmethod
     def from_vcf(
@@ -949,7 +949,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin, _ClustersMixin):
                 receiver=rx,
             )
         if signatures:
-            _stamp_mutcat_meta(Path(out), SparseVar2(out).contigs, strand=False)
+            _stamp_converted_store(out)
         return result
 
     @classmethod
@@ -1388,7 +1388,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin, _ClustersMixin):
                 receiver=rx,
             )
         if signatures:
-            _stamp_mutcat_meta(Path(out), SparseVar2(out).contigs, strand=False)
+            _stamp_converted_store(out)
         return result
 
     @classmethod
@@ -1832,7 +1832,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin, _ClustersMixin):
                 receiver=rx,
             )
         if signatures:
-            _stamp_mutcat_meta(Path(out), SparseVar2(out).contigs, strand=False)
+            _stamp_converted_store(out)
         return result
 
     @classmethod
@@ -2107,8 +2107,19 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin, _ClustersMixin):
                 receiver=rx,
             )
         if signatures:
-            _stamp_mutcat_meta(Path(out), SparseVar2(out).contigs, strand=False)
+            _stamp_converted_store(out)
         return result
+
+
+def _stamp_converted_store(path: str | PathLike[str]) -> None:
+    """Stamp the current mutcat version on a store whose sidecars Rust just wrote.
+
+    A crash between the Rust conversion and this stamp leaves a store that reads
+    stale -- safe, and ``annotate_mutations`` recovers it.
+    """
+    path = Path(path)
+    contigs = json.loads((path / "meta.json").read_text())["contigs"]
+    _stamp_mutcat_meta(path, contigs, strand=False)
 
 
 def _find_pvar(pgen: Path) -> Path:
