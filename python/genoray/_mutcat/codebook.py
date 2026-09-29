@@ -149,7 +149,11 @@ SBS96_INDEX = {lbl: SBS96_OFFSET + i for i, lbl in enumerate(SBS96)}
 DBS78_INDEX = {lbl: DBS78_OFFSET + i for i, lbl in enumerate(DBS78)}
 ID83_INDEX = {lbl: ID83_OFFSET + i for i, lbl in enumerate(ID83)}
 
-MUTCAT_VERSION = 4
+# Bumped 4 -> 5 for genoray#220 (6.0.0): the indel classifier's deletion
+# repeat/microhomology codes changed, so every sidecar written under v4 carries
+# wrong ID83 codes. The bump is what makes SparseVar2 treat such stores as
+# un-annotated instead of silently reusing them.
+MUTCAT_VERSION = 5
 
 Kind = Literal["SBS96", "DBS78", "ID83", "SBS192", "SBS384"]
 

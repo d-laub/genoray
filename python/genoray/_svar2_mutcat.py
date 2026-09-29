@@ -35,6 +35,27 @@ if TYPE_CHECKING:
     from genoray._signatures import Criterion, Strategy
 
 
+def _stamp_mutcat_meta(path: Path, contigs: Sequence[str], *, strand: bool) -> None:
+    """Atomically record the mutcat version, scope and strand flag in ``meta.json``.
+
+    Same-directory temp + rename: a kill mid-stamp leaves the old (still
+    parseable) meta.json rather than a truncated one that breaks every open.
+    """
+    from genoray._mutcat import MUTCAT_VERSION
+
+    meta_path = path / "meta.json"
+    meta = json.loads(meta_path.read_text())
+    meta["mutcat_version"] = MUTCAT_VERSION
+    meta["mutcat_contigs"] = list(contigs)
+    meta["mutcat_strand"] = strand
+    tmp_path = meta_path.with_name(meta_path.name + ".tmp")
+    with open(tmp_path, "w") as f:
+        f.write(json.dumps(meta))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, meta_path)
+
+
 class _MutcatMixin:
     """Mutation-catalogue annotation, counting, and signature-assignment methods.
 
@@ -83,7 +104,6 @@ class _MutcatMixin:
             in-scope contigs), so it is also the recovery path for a store whose
             sidecars are missing or suspect.
         """
-        from genoray._mutcat import MUTCAT_VERSION
         from genoray._mutcat.strand import contig_strand_intervals, load_gene_intervals
         from genoray._reference import Reference
 
@@ -116,34 +136,37 @@ class _MutcatMixin:
             else:
                 self._readers[contig].annotate_mutations(str(self.path), contig, seq)
 
-        meta_path = self.path / "meta.json"
-        meta = json.loads(meta_path.read_text())
-        meta["mutcat_version"] = MUTCAT_VERSION
-        meta["mutcat_contigs"] = scope
-        meta["mutcat_strand"] = gtf is not None
-        # Same-directory temp + rename. A kill inside the stamp leaves the old
-        # meta.json (which still parses) instead of a truncated one that would
-        # make every subsequent SparseVar2 open of the store fail.
-        tmp_path = meta_path.with_name(meta_path.name + ".tmp")
-        with open(tmp_path, "w") as f:
-            f.write(json.dumps(meta))
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, meta_path)
+        _stamp_mutcat_meta(self.path, scope, strand=gtf is not None)
 
-    def _is_annotated(self, contigs: "Sequence[str] | None" = None) -> bool:
-        """Whether every contig in ``contigs`` (default: the whole store) is annotated.
+    def _mutcat_version_on_disk(self) -> int | None:
+        """``meta.json``'s ``mutcat_version``; ``None`` if never stamped."""
+        return json.loads((self.path / "meta.json").read_text()).get("mutcat_version")
 
-        Checked directly on disk (not via ``meta.json``) because
-        ``from_vcf(..., signatures=True)`` writes sidecars at conversion time
-        without stamping ``meta.json``; the ``var_key_snp/code.bin`` file is
-        written by ``annotate_contig`` for every contig (even if empty), so its
+    def _has_sidecars(self, contigs: "Sequence[str] | None" = None) -> bool:
+        """Whether every contig in scope has a ``var_key_snp/code.bin`` sidecar.
+
+        ``annotate_contig`` writes it for every contig (even if empty), so its
         absence is ground truth for "never annotated".
         """
         scope = self.contigs if contigs is None else contigs
         return all(
             (self.path / contig / "mutcat" / "var_key_snp" / "code.bin").exists()
             for contig in scope
+        )
+
+    def _is_annotated(self, contigs: "Sequence[str] | None" = None) -> bool:
+        """Whether every contig in scope has sidecars stamped with the current version.
+
+        "Current" is this genoray's ``MUTCAT_VERSION``.
+
+        A missing stamp with sidecars present is stale too: stores converted with
+        ``from_vcf(..., signatures=True)`` before 6.0.2 were never stamped, and all
+        of them predate genoray#220's indel-code fix.
+        """
+        from genoray._mutcat import MUTCAT_VERSION
+
+        return self._mutcat_version_on_disk() == MUTCAT_VERSION and self._has_sidecars(
+            contigs
         )
 
     def _is_strand_annotated(self, contigs: "Sequence[str] | None" = None) -> bool:
@@ -209,6 +232,16 @@ class _MutcatMixin:
             resolved = self._resolve_contigs(contigs)
             scope = list(dict.fromkeys(resolved))
         if not self._is_annotated(scope):
+            from genoray._mutcat import MUTCAT_VERSION
+
+            if self._has_sidecars(scope):
+                found = self._mutcat_version_on_disk()
+                raise ValueError(
+                    "SparseVar2 is not annotated for the current mutation codebook: "
+                    f"its mutcat sidecars are stale (mutcat_version {found}, this "
+                    f"genoray needs {MUTCAT_VERSION}). Re-run "
+                    "annotate_mutations(reference) to recompute them."
+                )
             raise ValueError(
                 "SparseVar2 is not annotated for mutational signatures; call "
                 "annotate_mutations(reference) first, or rebuild with "

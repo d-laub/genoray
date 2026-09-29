@@ -24,7 +24,7 @@ from genoray._svar2_fields import (
     _resolve_fields,
     _resolve_read_fields,
 )
-from genoray._svar2_mutcat import _MutcatMixin
+from genoray._svar2_mutcat import _MutcatMixin, _stamp_mutcat_meta
 from genoray._svar2_ops import Mode, _assert_concat_compatible, _load_meta, _write_store
 from genoray._pipeline_args import FieldSpec, PlanSettings, RegionSpec
 from genoray._tuning import Tuning, resolve_tuning
@@ -654,6 +654,9 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin, _ClustersMixin):
                 log_filter=log_filter,
                 receiver=rx,
             )
+        if reference_str is not None:
+            # `reference=` recomputes mutcat on the view; stamp it like `from_*`.
+            _stamp_mutcat_meta(Path(output), SparseVar2(output).contigs, strand=False)
 
     @classmethod
     def from_vcf(
@@ -919,7 +922,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin, _ClustersMixin):
         from ._logging import write_reporting
 
         with write_reporting(progress, log_level) as (rx, level):
-            return _core.run_conversion_pipeline(
+            result = _core.run_conversion_pipeline(
                 vcf_path=str(source),
                 reference_path=reference_path,
                 output_dir=str(out),
@@ -945,6 +948,9 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin, _ClustersMixin):
                 log_level=level,
                 receiver=rx,
             )
+        if signatures:
+            _stamp_mutcat_meta(Path(out), SparseVar2(out).contigs, strand=False)
+        return result
 
     @classmethod
     def from_pgen(
@@ -1351,7 +1357,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin, _ClustersMixin):
         from ._logging import write_reporting
 
         with write_reporting(progress, log_level) as (rx, level):
-            return _core.run_pgen_conversion_pipeline(
+            result = _core.run_pgen_conversion_pipeline(
                 pgen_path=str(source),
                 pvar_path=str(pvar),
                 reference_path=None if no_reference else str(reference),
@@ -1381,6 +1387,9 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin, _ClustersMixin):
                 log_level=level,
                 receiver=rx,
             )
+        if signatures:
+            _stamp_mutcat_meta(Path(out), SparseVar2(out).contigs, strand=False)
+        return result
 
     @classmethod
     def from_vcf_list(
@@ -1794,7 +1803,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin, _ClustersMixin):
         from ._logging import write_reporting
 
         with write_reporting(progress, log_level) as (rx, level):
-            return _core.run_vcf_list_conversion_pipeline(
+            result = _core.run_vcf_list_conversion_pipeline(
                 vcf_paths=[str(p) for p in paths],
                 reference_path=None if no_reference else str(reference),
                 output_dir=str(out),
@@ -1822,6 +1831,9 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin, _ClustersMixin):
                 log_level=level,
                 receiver=rx,
             )
+        if signatures:
+            _stamp_mutcat_meta(Path(out), SparseVar2(out).contigs, strand=False)
+        return result
 
     @classmethod
     def from_svar1(
@@ -2058,7 +2070,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin, _ClustersMixin):
         from ._logging import write_reporting
 
         with write_reporting(progress, log_level) as (rx, level):
-            return _core.run_svar1_conversion_pipeline(
+            result = _core.run_svar1_conversion_pipeline(
                 svar1_dir=str(source),
                 reference_path=None if no_reference else str(reference),
                 output_dir=str(out),
@@ -2094,6 +2106,9 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin, _ClustersMixin):
                 log_level=level,
                 receiver=rx,
             )
+        if signatures:
+            _stamp_mutcat_meta(Path(out), SparseVar2(out).contigs, strand=False)
+        return result
 
 
 def _find_pvar(pgen: Path) -> Path:

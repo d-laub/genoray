@@ -10,6 +10,7 @@ import pysam
 import pytest
 
 from genoray import SparseVar, SparseVar2
+from genoray._mutcat import MUTCAT_VERSION
 from genoray._reference import Reference
 from tests.test_svar2_from_vcf import _write_ref, _write_vcf
 
@@ -608,3 +609,63 @@ def test_truncated_sidecar_raises_clean_error(tmp_path: Path):
 
     with pytest.raises(OSError, match="re-run annotate_mutations"):
         sv.mutation_matrix("SBS96", contigs=["chr1"])
+
+
+def _annotated_store(tmp_path: Path) -> tuple[Path, Path]:
+    ref = _write_ref(tmp_path)
+    vcf = _write_vcf(tmp_path, symbolic=False, indexed=True)
+    out = tmp_path / "store.svar2"
+    SparseVar2.from_vcf(out, vcf, ref, threads=1)
+    SparseVar2(out).annotate_mutations(ref)
+    return out, ref
+
+
+def _edit_meta(out: Path, **updates: object) -> None:
+    meta_path = out / "meta.json"
+    meta = json.loads(meta_path.read_text())
+    for key, value in updates.items():
+        if value is None:
+            meta.pop(key, None)
+        else:
+            meta[key] = value
+    meta_path.write_text(json.dumps(meta))
+
+
+def test_mutcat_version_is_5():
+    # genoray#220 changed ID83 indel codes; the version is what makes that detectable.
+    assert MUTCAT_VERSION == 5
+
+
+def test_annotate_stamps_current_version(tmp_path: Path):
+    out, _ = _annotated_store(tmp_path)
+    assert (
+        json.loads((out / "meta.json").read_text())["mutcat_version"] == MUTCAT_VERSION
+    )
+
+
+def test_older_version_is_stale_until_reannotated(tmp_path: Path):
+    out, ref = _annotated_store(tmp_path)
+    _edit_meta(out, mutcat_version=MUTCAT_VERSION - 1)
+    sv2 = SparseVar2(out)
+    with pytest.raises(ValueError, match="stale") as exc:
+        sv2.mutation_matrix("ID83")
+    assert "not annotated" in str(exc.value)
+    sv2.annotate_mutations(ref)
+    assert SparseVar2(out).mutation_matrix("ID83").height == 83
+
+
+def test_sidecars_without_version_stamp_are_stale(tmp_path: Path):
+    out, _ = _annotated_store(tmp_path)
+    _edit_meta(out, mutcat_version=None)
+    with pytest.raises(ValueError, match="stale"):
+        SparseVar2(out).mutation_matrix("SBS96")
+
+
+def test_from_vcf_signatures_true_is_annotated_immediately(tmp_path: Path):
+    ref = _write_ref(tmp_path)
+    vcf = _write_vcf(tmp_path, symbolic=False, indexed=True)
+    out = tmp_path / "store_sig.svar2"
+    SparseVar2.from_vcf(out, vcf, ref, threads=1, signatures=True)
+    meta = json.loads((out / "meta.json").read_text())
+    assert meta["mutcat_version"] == MUTCAT_VERSION
+    assert SparseVar2(out).mutation_matrix("SBS96").height == 96
