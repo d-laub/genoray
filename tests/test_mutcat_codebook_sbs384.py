@@ -23,4 +23,4 @@ def test_sbs192_is_tu_view():
 
 
 def test_version_bumped():
-    assert cb.MUTCAT_VERSION == 4
+    assert cb.MUTCAT_VERSION == 5
