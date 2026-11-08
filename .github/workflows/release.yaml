@@ -2,6 +2,14 @@ name: Release
 
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: >-
+          Resume a release whose bump already landed: an existing version tag
+          (e.g. 6.1.0). Skips the commitizen bump and builds/publishes that tag.
+          Leave empty for a normal release.
+        required: false
+        default: ""
 
 jobs:
   bump:
@@ -10,15 +18,35 @@ jobs:
     permissions:
       contents: write
     outputs:
-      version: ${{ steps.cz.outputs.version }}
+      version: ${{ steps.cz.outputs.version || steps.resume.outputs.version }}
     steps:
       - name: Check out
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
           token: ${{ secrets.GH_ACTIONS }}
+      # Resume path: a previous run bumped + tagged but failed before publishing.
+      # Re-dispatching without `tag` would ask commitizen to bump again (nothing to
+      # bump -> failure), and re-running the failed run reuses its stale workflow
+      # definition, so neither recovers. Rebuild the release body from the tag's
+      # CHANGELOG section instead.
+      - name: Resume existing tag
+        id: resume
+        if: inputs.tag != ''
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          git rev-parse -q --verify "refs/tags/$TAG" >/dev/null \
+            || { echo "::error::tag $TAG does not exist"; exit 1; }
+          git show "$TAG:CHANGELOG.md" | awk -v v="$TAG" '
+            $0 ~ "^## " v "( |$)" {on=1; next}
+            on && /^## / {exit}
+            on {print}' > body.md
+          [ -s body.md ] || { echo "::error::no CHANGELOG section for $TAG"; exit 1; }
+          echo "version=$TAG" >> "$GITHUB_OUTPUT"
       - name: Create bump and changelog
         id: cz
+        if: inputs.tag == ''
         uses: commitizen-tools/commitizen-action@338bbd841b75aaee6bf5340e1fa12f6ab58ff9ff # 0.27.1
         with:
           github_token: ${{ secrets.GH_ACTIONS }}
@@ -48,7 +76,8 @@ jobs:
             platform: linux-64
           - runner: ubuntu-24.04-arm
             platform: linux-aarch64
-          - runner: macos-14
+          # macos-14 images were retired (2026-11: "configuration macos-14-arm64 is not supported").
+          - runner: macos-15
             platform: osx-arm64
           # No osx-64 (Intel mac): macos-13 is GitHub's last Intel runner and is now
           # scarce enough to stall releases for tens of minutes. We no longer ship an
