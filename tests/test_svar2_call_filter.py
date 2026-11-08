@@ -72,7 +72,9 @@ def _write_vcf_and_ref(tmp_path: Path, tag: str = "") -> tuple[Path, Path]:
             u = rng.random()
             vaf_s = "." if u < 0.12 else ("0.2" if u < 0.2 else f"{vaf}")
             row.append(f"{h[0]}|{h[1]}:{vaf_s}:{int(rng.integers(5, 60))}")
-        lines.append(f"chr1\t{pos}\t.\t{refa}\t{alt}\t.\t.\t.\tGT:VAF:DP\t" + "\t".join(row))
+        lines.append(
+            f"chr1\t{pos}\t.\t{refa}\t{alt}\t.\t.\t.\tGT:VAF:DP\t" + "\t".join(row)
+        )
     vcf = tmp_path / f"in{tag}.vcf"
     vcf.write_text("\n".join(lines) + "\n")
     gz = tmp_path / f"in{tag}.vcf.gz"
@@ -165,7 +167,9 @@ def test_decode_matches_numpy_oracle(src_env, tmp_path, reroute, scope, keep_mis
         src.available_samples,
         out,
         fields=["VAF", "DP"],
-        call_filter=CallFilter("VAF", ">=", THRESH, samples=scope, keep_missing=keep_missing),
+        call_filter=CallFilter(
+            "VAF", ">=", THRESH, samples=scope, keep_missing=keep_missing
+        ),
         reroute=reroute,
         threads=1,
     )
@@ -193,11 +197,21 @@ def test_filter_field_need_not_be_carried(src_env, tmp_path):
     full = tmp_path / "full.svar2"
     nofield = tmp_path / "nofield.svar2"
     cf = CallFilter("VAF", ">=", THRESH, samples=GATED)
-    src.write_view(("chr1", 0, CONTIG_LEN), src.available_samples, full, fields=["DP"], call_filter=cf)
-    src.write_view(("chr1", 0, CONTIG_LEN), src.available_samples, nofield, call_filter=cf)
+    src.write_view(
+        ("chr1", 0, CONTIG_LEN),
+        src.available_samples,
+        full,
+        fields=["DP"],
+        call_filter=cf,
+    )
+    src.write_view(
+        ("chr1", 0, CONTIG_LEN), src.available_samples, nofield, call_filter=cf
+    )
     ra = SparseVar2(full).decode("chr1", [(0, CONTIG_LEN)])
     rb = SparseVar2(nofield).decode("chr1", [(0, CONTIG_LEN)])
-    np.testing.assert_array_equal(np.asarray(ra["pos"].data), np.asarray(rb["pos"].data))
+    np.testing.assert_array_equal(
+        np.asarray(ra["pos"].data), np.asarray(rb["pos"].data)
+    )
 
 
 def test_subset_samples_and_regions(src_env, tmp_path):
@@ -271,7 +285,9 @@ def test_zero_carrier_variant_is_dropped(tmp_path):
         "##fileformat=VCFv4.2\n##contig=<ID=chr1,length=200>\n"
         '##FORMAT=<ID=GT,Number=1,Type=String,Description="g">\n'
         '##FORMAT=<ID=VAF,Number=1,Type=Float,Description="v">\n'
-        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t" + "\t".join(samples) + "\n"
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t"
+        + "\t".join(samples)
+        + "\n"
     )
     # pos 5 (A->C) rare: S0 only, low VAF -> vanishes. pos 9 (A->C) common, all low
     # VAF in S0..S1 but high elsewhere -> survives as a variant.
@@ -287,17 +303,25 @@ def test_zero_carrier_variant_is_dropped(tmp_path):
     subprocess.run(f"bgzip -c {vcf} > {gz}", shell=True, check=True)
     subprocess.run(["bcftools", "index", str(gz)], check=True)
     sp = tmp_path / "z.svar2"
-    SparseVar2.from_vcf(sp, gz, str(ref), format_fields=[FormatField("VAF", dtype="f32")], threads=1)
+    SparseVar2.from_vcf(
+        sp, gz, str(ref), format_fields=[FormatField("VAF", dtype="f32")], threads=1
+    )
     src = SparseVar2(sp)
     for reroute in (False, True):
         out = tmp_path / f"zv{reroute}.svar2"
         src.write_view(
-            ("chr1", 0, 200), src.available_samples, out, fields=["VAF"],
-            call_filter=CallFilter("VAF", ">=", 0.2), reroute=reroute,
+            ("chr1", 0, 200),
+            src.available_samples,
+            out,
+            fields=["VAF"],
+            call_filter=CallFilter("VAF", ">=", 0.2),
+            reroute=reroute,
         )
         dec = SparseVar2(out).decode("chr1", [(0, 200)])
         pos = _cells(dec, "pos", 1, 10, 2)
-        assert all(5 - 1 not in v and 4 not in v for v in pos.values())  # 0-based pos 4 gone
+        assert all(
+            5 - 1 not in v and 4 not in v for v in pos.values()
+        )  # 0-based pos 4 gone
         assert 8 in pos[(0, 5, 0)]
         assert 8 not in pos[(0, 0, 0)] and 8 not in pos[(0, 1, 1)]
 
@@ -318,13 +342,18 @@ def test_none_is_byte_identical(src_env, tmp_path):
         b = tmp_path / f"b{reroute}.svar2"
         kw = dict(fields=["VAF", "DP"], reference=str(ref), reroute=reroute, threads=1)
         src.write_view(("chr1", 0, CONTIG_LEN), src.available_samples, a, **kw)
-        src.write_view(("chr1", 0, CONTIG_LEN), src.available_samples, b, call_filter=None, **kw)
+        src.write_view(
+            ("chr1", 0, CONTIG_LEN), src.available_samples, b, call_filter=None, **kw
+        )
         assert digest(a) == digest(b)
         # a filter that removes nothing (>= -inf) is also the identity
         c = tmp_path / f"c{reroute}.svar2"
         src.write_view(
-            ("chr1", 0, CONTIG_LEN), src.available_samples, c,
-            call_filter=CallFilter("VAF", ">", -1.0), **kw,
+            ("chr1", 0, CONTIG_LEN),
+            src.available_samples,
+            c,
+            call_filter=CallFilter("VAF", ">", -1.0),
+            **kw,
         )
         assert digest(a) == digest(c)
 
@@ -334,7 +363,9 @@ def test_no_stale_mutcat_without_reference(src_env, tmp_path):
     assert (Path(src.path) / "chr1" / "mutcat").exists()
     out = tmp_path / "v.svar2"
     src.write_view(
-        ("chr1", 0, CONTIG_LEN), src.available_samples, out,
+        ("chr1", 0, CONTIG_LEN),
+        src.available_samples,
+        out,
         call_filter=CallFilter("VAF", ">=", THRESH, samples=GATED),
     )
     assert not (out / "chr1" / "mutcat").exists()
@@ -349,8 +380,12 @@ def test_mutation_matrix_after_reference_recompute(src_env, tmp_path, reroute):
     src, ref, d = src_env
     out = tmp_path / "v.svar2"
     src.write_view(
-        ("chr1", 0, CONTIG_LEN), src.available_samples, out, fields=["VAF"],
-        reference=str(ref), reroute=reroute,
+        ("chr1", 0, CONTIG_LEN),
+        src.available_samples,
+        out,
+        fields=["VAF"],
+        reference=str(ref),
+        reroute=reroute,
         call_filter=CallFilter("VAF", ">=", THRESH, samples=GATED),
     )
     view = SparseVar2(out)
@@ -393,10 +428,17 @@ def test_validation_errors(src_env, tmp_path):
     src, _, _ = src_env
     out = tmp_path / "v.svar2"
     with pytest.raises(ValueError, match="not in this store"):
-        src.write_view(("chr1", 0, 10), src.available_samples, out, call_filter=CallFilter("NOPE", ">=", 1))
+        src.write_view(
+            ("chr1", 0, 10),
+            src.available_samples,
+            out,
+            call_filter=CallFilter("NOPE", ">=", 1),
+        )
     with pytest.raises(ValueError, match="not in"):
         src.write_view(
-            ("chr1", 0, 10), src.available_samples, out,
+            ("chr1", 0, 10),
+            src.available_samples,
+            out,
             call_filter=CallFilter("VAF", ">=", 1, samples=["nope"]),
         )
     with pytest.raises(ValueError, match="op"):
