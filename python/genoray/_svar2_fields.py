@@ -28,6 +28,56 @@ class InfoField:
     default: float | int | None = None
 
 
+CallFilterOp = Literal["<", "<=", ">", ">=", "==", "!="]
+
+
+@dataclass(frozen=True)
+class CallFilter:
+    """A call-level predicate for :meth:`SparseVar2.write_view`.
+
+    A *call* is one carrier haplotype of one variant. A call in an in-scope
+    sample is **kept** iff ``value <op> threshold`` holds, where ``value`` is
+    the stored FORMAT field ``field`` for that sample at that variant; a call
+    that fails is removed from the view -- its genotype entry and every field
+    value it carries. A variant left with no carrier at all is dropped (the
+    existing MAC=0 convention of ``write_view``).
+
+    ``field`` must be a FORMAT field stored in the source (it need not be among
+    the ``fields`` carried to the view).
+
+    ``samples`` scopes the filter: only calls of the named samples are tested;
+    every other sample is untouched. ``None`` (default) applies it to all
+    samples. Names must exist in the source store (a name outside the view's
+    own sample set is harmless).
+
+    ``keep_missing`` fixes the behaviour for missing values, which have no
+    ordering and so cannot be tested: float ``NaN`` and the reserved integer
+    sentinels (``iN`` min / ``uN`` max) are kept when ``True`` (default) and
+    removed when ``False``. If the field was stored with a ``default`` fill,
+    VCF-missing entries already hold that ordinary value and are tested like
+    any other.
+
+    Floats are compared at the field's own precision (``f16`` widens to
+    ``f32``), with ``threshold`` rounded to ``f32`` -- i.e. the same as numpy's
+    ``values >= np.float32(threshold)``. Integers compare exactly.
+    """
+
+    field: str
+    op: CallFilterOp
+    threshold: float
+    samples: "Sequence[str] | None" = None
+    keep_missing: bool = True
+
+    def __post_init__(self) -> None:
+        if self.op not in ("<", "<=", ">", ">=", "==", "!="):
+            raise ValueError(
+                f"CallFilter.op must be one of '<', '<=', '>', '>=', '==', '!='; "
+                f"got {self.op!r}"
+            )
+        if isinstance(self.samples, str):
+            raise TypeError("CallFilter.samples must be a sequence of names, not a str")
+
+
 @dataclass(frozen=True)
 class FormatField:
     """A per-sample FORMAT field to store in the SVAR2 output.

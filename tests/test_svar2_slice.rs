@@ -1059,6 +1059,7 @@ fn run_slice_view_full_coverage_carries_genos_fields_and_mutcat() {
             "info".to_string(),
             None, // log_filter
             None, // receiver
+            None, // call_filter
         )
     })
     .expect("run_slice_view should succeed");
@@ -1124,6 +1125,7 @@ fn run_slice_view_without_reference_skips_mutcat() {
             "info".to_string(),
             None, // log_filter
             None, // receiver
+            None, // call_filter
         )
     })
     .expect("run_slice_view should succeed without a reference");
@@ -1173,6 +1175,7 @@ fn run_slice_view_bad_reference_fails_before_any_output() {
             "info".to_string(),
             None, // log_filter
             None, // receiver
+            None, // call_filter
         )
     });
 
@@ -1227,6 +1230,7 @@ fn run_slice_view_reference_missing_contig_fails_before_any_output() {
             "info".to_string(),
             None, // log_filter
             None, // receiver
+            None, // call_filter
         )
     });
 
@@ -1902,6 +1906,7 @@ fn slice_all_contigs(src: &Path, out: &Path, threads: Option<usize>) {
             "info".to_string(),
             None, // log_filter
             None, // receiver
+            None, // call_filter
         )
     })
     .expect("run_slice_view should succeed");

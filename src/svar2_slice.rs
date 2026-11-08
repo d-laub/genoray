@@ -45,12 +45,163 @@ use crate::field::{FieldCategory, FieldSpec};
 use crate::layout::{self, ContigPaths, FieldSub};
 use crate::max_del;
 use crate::query::ContigReader;
-use crate::query::field::FieldView;
+use crate::query::field::{FieldValue, FieldView};
 use crate::query::reader::OverlapIndex;
 use crate::query::sidecar::{DenseView, as_bytes, as_u32};
 use crate::rvk::{deletion_len, pack_snp_keys, unpack_snp_key_at};
 use crate::svar2_view::{OverlapMode, keeps, query_window, read_n_samples};
 use svar2_codec::{DecodedKey, PAYLOAD_TOP_SHIFT, decode_key, encode_lookup, snp_code_to_key};
+
+/// Comparison operator of a [`CallFilter`] predicate (`value <op> threshold`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CmpOp {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+    Ne,
+}
+
+impl CmpOp {
+    /// Parse the Python-side spelling (`"<"`, `"<="`, `">"`, `">="`, `"=="`, `"!="`).
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "<" => Self::Lt,
+            "<=" => Self::Le,
+            ">" => Self::Gt,
+            ">=" => Self::Ge,
+            "==" => Self::Eq,
+            "!=" => Self::Ne,
+            _ => return None,
+        })
+    }
+
+    #[inline]
+    fn test<T: PartialOrd>(self, v: T, t: T) -> bool {
+        match self {
+            Self::Lt => v < t,
+            Self::Le => v <= t,
+            Self::Gt => v > t,
+            Self::Ge => v >= t,
+            Self::Eq => v == t,
+            Self::Ne => v != t,
+        }
+    }
+}
+
+/// A call-level predicate over one FORMAT field (`write_view(call_filter=...)`).
+///
+/// A call (one carrier haplotype of one variant) in an in-scope sample is KEPT
+/// iff `value <op> threshold` holds, where `value` is that sample's FORMAT
+/// value for the call. A call that fails is removed: its genotype entry and
+/// every carried field value go with it (fields ride the same provenance as the
+/// genotypes). Out-of-scope samples are never touched.
+///
+/// Missing values (float NaN; the integer sentinels `iN::MIN` / `uN::MAX`) have
+/// no ordering, so the predicate is not evaluated: the call is kept iff
+/// `keep_missing`. Float fields are compared at the field's own precision
+/// (`f32`; `f16` widens to `f32`), the threshold being rounded to `f32` first,
+/// so a stored `0.2f32` satisfies `>= 0.2`. Integer fields compare exactly in
+/// `f64`.
+pub struct CallFilter {
+    pub spec: FieldSpec,
+    pub op: CmpOp,
+    pub threshold: f64,
+    pub keep_missing: bool,
+    /// Per ORIGINAL sample column: is the filter applied to this sample?
+    /// `None` = every sample.
+    pub scope: Option<Vec<bool>>,
+}
+
+impl CallFilter {
+    #[inline]
+    fn in_scope(&self, s_orig: usize) -> bool {
+        self.scope.as_ref().is_none_or(|m| m[s_orig])
+    }
+
+    /// Does the call whose FORMAT value is `v` survive the filter?
+    fn passes(&self, v: FieldValue) -> bool {
+        let t = self.threshold;
+        match v {
+            FieldValue::Bool(b) => self.op.test(f64::from(u8::from(b)), t),
+            FieldValue::I8(x) if x == i8::MIN => self.keep_missing,
+            FieldValue::I16(x) if x == i16::MIN => self.keep_missing,
+            FieldValue::I32(x) if x == i32::MIN => self.keep_missing,
+            FieldValue::U8(x) if x == u8::MAX => self.keep_missing,
+            FieldValue::U16(x) if x == u16::MAX => self.keep_missing,
+            FieldValue::U32(x) if x == u32::MAX => self.keep_missing,
+            FieldValue::I8(x) => self.op.test(f64::from(x), t),
+            FieldValue::I16(x) => self.op.test(f64::from(x), t),
+            FieldValue::I32(x) => self.op.test(f64::from(x), t),
+            FieldValue::U8(x) => self.op.test(f64::from(x), t),
+            FieldValue::U16(x) => self.op.test(f64::from(x), t),
+            FieldValue::U32(x) => self.op.test(f64::from(x), t),
+            FieldValue::F16(x) => self.test_f32(x.to_f32()),
+            FieldValue::F32(x) => self.test_f32(x),
+        }
+    }
+
+    #[inline]
+    fn test_f32(&self, x: f32) -> bool {
+        if x.is_nan() {
+            self.keep_missing
+        } else {
+            self.op.test(x, self.threshold as f32)
+        }
+    }
+}
+
+/// Apply `filter` to the gathered var_key calls of one class, in place.
+/// `view` is the SOURCE var_key field sub-stream (indexed by source call).
+/// Returns the number of calls removed.
+fn filter_calls(
+    calls: &mut Vec<GatheredCall>,
+    filter: &CallFilter,
+    view: Option<&FieldView>,
+    sample_orig_idx: &[usize],
+    ploidy: usize,
+) -> usize {
+    let before = calls.len();
+    if before == 0 {
+        return 0;
+    }
+    let view = view.expect("gathered var_key calls need the filter field's var_key sub-stream");
+    calls.retain(|c| {
+        let s_orig = sample_orig_idx[c.col_out / ploidy];
+        !filter.in_scope(s_orig) || filter.passes(view.value_at(c.src))
+    });
+    before - calls.len()
+}
+
+/// Apply `filter` to the gathered dense rows of one class, in place: failing
+/// carriers are struck from `carriers_out`, and a row left with no carrier is
+/// dropped (the existing MAC=0 convention). `view` is the SOURCE dense field
+/// sub-stream (`(row, orig sample)` layout). Returns the carrier entries removed.
+fn filter_rows(
+    rows: &mut Vec<GatheredRow>,
+    filter: &CallFilter,
+    view: Option<&FieldView>,
+    sample_orig_idx: &[usize],
+    ploidy: usize,
+) -> usize {
+    if rows.is_empty() {
+        return 0;
+    }
+    let view = view.expect("gathered dense rows need the filter field's dense sub-stream");
+    let mut removed = 0;
+    for r in rows.iter_mut() {
+        let before = r.carriers_out.len();
+        let src = r.src;
+        r.carriers_out.retain(|&hap| {
+            let s_orig = sample_orig_idx[hap / ploidy];
+            !filter.in_scope(s_orig) || filter.passes(view.format_at(src, s_orig))
+        });
+        removed += before - r.carriers_out.len();
+    }
+    rows.retain(|r| !r.carriers_out.is_empty());
+    removed
+}
 
 /// Which on-disk stream each variant lands in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -430,6 +581,42 @@ pub fn slice_contig(
     info_bits: u64,
     format_bits: u64,
 ) -> Result<usize, ConversionError> {
+    slice_contig_filtered(
+        src_store,
+        out_store,
+        chrom,
+        sample_orig_idx,
+        ploidy,
+        regions,
+        overlap,
+        fields,
+        routing,
+        sidecar_bits_enabled,
+        info_bits,
+        format_bits,
+        None,
+    )
+}
+
+/// [`slice_contig`] with an optional call-level [`CallFilter`] applied between
+/// gather and route. With `call_filter = None` this IS `slice_contig`
+/// (byte-identical output). Returns the number of distinct variants written.
+#[allow(clippy::too_many_arguments)]
+pub fn slice_contig_filtered(
+    src_store: &str,
+    out_store: &str,
+    chrom: &str,
+    sample_orig_idx: &[usize],
+    ploidy: usize,
+    regions: &[(u32, u32)],
+    overlap: OverlapMode,
+    fields: &[FieldSpec],
+    routing: Routing,
+    sidecar_bits_enabled: bool,
+    info_bits: u64,
+    format_bits: u64,
+    call_filter: Option<&CallFilter>,
+) -> Result<usize, ConversionError> {
     let (prov, n_samples_orig) = slice_genos_inner(
         src_store,
         out_store,
@@ -442,6 +629,7 @@ pub fn slice_contig(
         sidecar_bits_enabled,
         info_bits,
         format_bits,
+        call_filter,
     )?;
 
     if !fields.is_empty() {
@@ -489,6 +677,7 @@ pub fn slice_contig_genos(
         false, // sidecar_bits_enabled: genotype-only => no reference sidecar
         0,     // info_bits: no fields
         0,     // format_bits: no fields
+        None,  // call_filter: genotype-only entry point is never filtered
     )?;
     Ok(prov.n_variants)
 }
@@ -520,6 +709,7 @@ fn slice_genos_inner(
     sidecar_bits_enabled: bool,
     info_bits: u64,
     format_bits: u64,
+    call_filter: Option<&CallFilter>,
 ) -> Result<(GenoProvenance, usize), ConversionError> {
     let n_samples_orig = read_n_samples(src_store)?;
     for &s in sample_orig_idx {
@@ -544,7 +734,7 @@ fn slice_genos_inner(
     // ---- gather ----
     let vk_snp_positions = reader.vk_snp.positions();
     let vk_snp_keys = as_bytes(&reader.vk_snp.keys);
-    let vk_snp_g = gather_var_key(
+    let mut vk_snp_g = gather_var_key(
         vk_snp_positions,
         sample_orig_idx,
         ploidy,
@@ -558,7 +748,7 @@ fn slice_genos_inner(
 
     let vk_indel_positions = reader.vk_indel.positions();
     let vk_indel_keys = as_u32(&reader.vk_indel.keys);
-    let vk_indel_g = gather_var_key(
+    let mut vk_indel_g = gather_var_key(
         vk_indel_positions,
         sample_orig_idx,
         ploidy,
@@ -578,7 +768,7 @@ fn slice_genos_inner(
     // `region_hits` once per class, so building here is what keeps the
     // per-region loop inside it tree-free.
     let d_snp_ix = reader.dense_snp_index();
-    let d_snp_g = gather_dense(
+    let mut d_snp_g = gather_dense(
         reader.dense_snp.as_ref(),
         true,
         sample_orig_idx,
@@ -590,7 +780,7 @@ fn slice_genos_inner(
     );
 
     let d_indel_ix = reader.dense_indel_index();
-    let d_indel_g = gather_dense(
+    let mut d_indel_g = gather_dense(
         reader.dense_indel.as_ref(),
         false,
         sample_orig_idx,
@@ -600,6 +790,50 @@ fn slice_genos_inner(
         overlap,
         |qsw, qew| d_indel_ix.overlap(qsw, qew),
     );
+
+    // ---- call filter: strike failing calls BEFORE routing, so the cost model
+    // (Recompute) sees the post-filter carrier counts and the provenance the
+    // field pass re-gathers from only names surviving calls/rows. ----
+    if let Some(f) = call_filter {
+        if f.spec.category != FieldCategory::Format {
+            return Err(ConversionError::Input(format!(
+                "call_filter field {:?} must be a FORMAT field",
+                f.spec.name
+            )));
+        }
+        let src_paths = ContigPaths::new(src_store, chrom);
+        let open = |sub| open_source_field(&src_paths, &f.spec, sub, n_samples_orig);
+        let mut removed = 0;
+        removed += filter_calls(
+            &mut vk_snp_g,
+            f,
+            open(FieldSub::VkSnp)?.as_ref(),
+            sample_orig_idx,
+            ploidy,
+        );
+        removed += filter_calls(
+            &mut vk_indel_g,
+            f,
+            open(FieldSub::VkIndel)?.as_ref(),
+            sample_orig_idx,
+            ploidy,
+        );
+        removed += filter_rows(
+            &mut d_snp_g,
+            f,
+            open(FieldSub::DenseSnp)?.as_ref(),
+            sample_orig_idx,
+            ploidy,
+        );
+        removed += filter_rows(
+            &mut d_indel_g,
+            f,
+            open(FieldSub::DenseIndel)?.as_ref(),
+            sample_orig_idx,
+            ploidy,
+        );
+        tracing::debug!(chrom = %chrom, removed, "call_filter removed calls");
+    }
 
     // ---- route ----
     let mut plan = route(
@@ -1317,6 +1551,72 @@ fn compact_lut(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn spec(dtype: crate::field::StorageDtype) -> FieldSpec {
+        FieldSpec {
+            name: "X".into(),
+            category: FieldCategory::Format,
+            htype: crate::field::HtslibType::Float,
+            dtype,
+            default: None,
+        }
+    }
+
+    fn filt(
+        dtype: crate::field::StorageDtype,
+        op: CmpOp,
+        t: f64,
+        keep_missing: bool,
+    ) -> CallFilter {
+        CallFilter {
+            spec: spec(dtype),
+            op,
+            threshold: t,
+            keep_missing,
+            scope: None,
+        }
+    }
+
+    #[test]
+    fn call_filter_float_threshold_and_missing() {
+        use crate::field::StorageDtype::F32;
+        let f = filt(F32, CmpOp::Ge, 0.2, true);
+        assert!(
+            f.passes(FieldValue::F32(0.2)),
+            "stored 0.2f32 satisfies >= 0.2"
+        );
+        assert!(f.passes(FieldValue::F32(0.5)));
+        assert!(!f.passes(FieldValue::F32(0.19)));
+        assert!(
+            f.passes(FieldValue::F32(f32::NAN)),
+            "missing kept by default"
+        );
+        let g = filt(F32, CmpOp::Ge, 0.2, false);
+        assert!(!g.passes(FieldValue::F32(f32::NAN)));
+    }
+
+    #[test]
+    fn call_filter_integer_sentinels_are_missing() {
+        use crate::field::StorageDtype::{I16, U8};
+        let f = filt(I16, CmpOp::Lt, 10.0, false);
+        assert!(f.passes(FieldValue::I16(-5)));
+        assert!(
+            !f.passes(FieldValue::I16(i16::MIN)),
+            "sentinel is missing, not -32768 < 10"
+        );
+        let g = filt(U8, CmpOp::Gt, 3.0, true);
+        assert!(g.passes(FieldValue::U8(u8::MAX)), "sentinel kept");
+        assert!(!g.passes(FieldValue::U8(2)));
+    }
+
+    #[test]
+    fn call_filter_scope() {
+        use crate::field::StorageDtype::F32;
+        let mut f = filt(F32, CmpOp::Ge, 0.2, true);
+        f.scope = Some(vec![false, true]);
+        assert!(!f.in_scope(0));
+        assert!(f.in_scope(1));
+    }
 
     #[test]
     fn snp_2bit_code_round_trips_through_the_uniform_key_space() {

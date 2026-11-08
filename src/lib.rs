@@ -936,7 +936,7 @@ fn merge_regions(mut regions: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
 #[allow(clippy::type_complexity)]
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (*, store_path, out_dir, regions, fields, merge_overlapping, reference=None, reroute=false, max_threads=None, overwrite=false, log_level="info".to_string(), log_filter=None, receiver=None))]
+#[pyo3(signature = (*, store_path, out_dir, regions, fields, merge_overlapping, reference=None, reroute=false, max_threads=None, overwrite=false, log_level="info".to_string(), log_filter=None, receiver=None, call_filter=None))]
 pub fn run_slice_view(
     py: Python,
     store_path: String,
@@ -951,6 +951,13 @@ pub fn run_slice_view(
     log_level: String,
     log_filter: Option<String>,
     receiver: Option<Py<PyEventReceiver>>,
+    call_filter: Option<(
+        (String, String, String, Option<f64>),
+        String,
+        f64,
+        bool,
+        Option<Vec<String>>,
+    )>,
 ) -> PyResult<()> {
     use crate::error::ConversionError;
     use crate::field::{FieldCategory, FieldSpec, HtslibType, StorageDtype};
@@ -1036,6 +1043,62 @@ pub fn run_slice_view(
             ConversionError::Input("write_view requires at least one sample".to_string()).into(),
         );
     }
+
+    // Call-level filter: `((name, category, dtype, default), op, threshold,
+    // keep_missing, scope_samples)`. Validated here, before any output byte.
+    let call_filter: Option<crate::svar2_slice::CallFilter> = match call_filter {
+        None => None,
+        Some(((name, category, dtype, default), op, threshold, keep_missing, scope)) => {
+            if category != "format" {
+                return Err(ConversionError::Input(format!(
+                    "call_filter field {name:?} must be a FORMAT field; got category {category:?}"
+                ))
+                .into());
+            }
+            let dtype = StorageDtype::from_meta_str(&dtype).ok_or_else(|| {
+                ConversionError::Input(format!(
+                    "call_filter field {name:?} has invalid dtype {dtype:?}"
+                ))
+            })?;
+            let op = crate::svar2_slice::CmpOp::parse(&op).ok_or_else(|| {
+                ConversionError::Input(format!(
+                    "call_filter op must be one of < <= > >= == !=; got {op:?}"
+                ))
+            })?;
+            let htype = match dtype {
+                StorageDtype::F16 | StorageDtype::F32 => HtslibType::Float,
+                _ => HtslibType::Int,
+            };
+            let scope = match scope {
+                None => None,
+                Some(names) => {
+                    let mut mask = vec![false; src_samples.len()];
+                    for n in &names {
+                        let i = src_samples.iter().position(|s| s == n).ok_or_else(|| {
+                            ConversionError::Input(format!(
+                                "call_filter scope sample {n:?} not found in {store_path}"
+                            ))
+                        })?;
+                        mask[i] = true;
+                    }
+                    Some(mask)
+                }
+            };
+            Some(crate::svar2_slice::CallFilter {
+                spec: FieldSpec {
+                    name,
+                    category: FieldCategory::Format,
+                    htype,
+                    dtype,
+                    default,
+                },
+                op,
+                threshold,
+                keep_missing,
+                scope,
+            })
+        }
+    };
 
     // Build the field specs (for the slicer) and resolved fields (for meta.json)
     // from the SAME tuples. The slicer byte-copies at the source dtype, so meta
@@ -1186,7 +1249,7 @@ pub fn run_slice_view(
                         if merge_overlapping {
                             chrom_regions = merge_regions(chrom_regions);
                         }
-                        let n = crate::svar2_slice::slice_contig(
+                        let n = crate::svar2_slice::slice_contig_filtered(
                             &store_path,
                             &out_dir,
                             chrom,
@@ -1199,6 +1262,7 @@ pub fn run_slice_view(
                             sidecar_bits_enabled,
                             info_bits,
                             format_bits,
+                            call_filter.as_ref(),
                         )?;
 
                         // Mutcat is detected purely from `mutcat/*/code.bin` on disk (see
