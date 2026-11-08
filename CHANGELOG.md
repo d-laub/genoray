@@ -1,3 +1,9 @@
+## 6.1.0 (2026-11-08)
+
+### Feat
+
+- **svar2**: call-level FORMAT filter for write_view (CallFilter)
+
 ## 6.0.2 (2026-09-29)
 
 ### Fix
