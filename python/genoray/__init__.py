@@ -22,6 +22,7 @@ __all__ = [
     "SparseVar2",
     "InfoField",
     "FormatField",
+    "CallFilter",
     "DosageField",
     "Tuning",
     "exprs",
@@ -46,6 +47,7 @@ _LAZY: dict[str, tuple[str, str | None]] = {
     "SparseVar2": ("genoray._svar2", "SparseVar2"),
     "InfoField": ("genoray._svar2_fields", "InfoField"),
     "FormatField": ("genoray._svar2_fields", "FormatField"),
+    "CallFilter": ("genoray._svar2_fields", "CallFilter"),
     "DosageField": ("genoray._svar2_fields", "DosageField"),
     "Tuning": ("genoray._tuning", "Tuning"),
     "exprs": ("genoray.exprs", None),
@@ -86,6 +88,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from ._signatures import fit_signatures as fit_signatures
     from ._svar import SparseVar as SparseVar
     from ._svar2 import SparseVar2 as SparseVar2
+    from ._svar2_fields import CallFilter as CallFilter
     from ._svar2_fields import DosageField as DosageField
     from ._svar2_fields import FormatField as FormatField
     from ._svar2_fields import InfoField as InfoField

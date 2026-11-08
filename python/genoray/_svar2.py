@@ -40,7 +40,7 @@ if TYPE_CHECKING:
 
     from numpy.typing import NDArray
 
-    from genoray._svar2_fields import DosageField, FormatField, InfoField
+    from genoray._svar2_fields import CallFilter, DosageField, FormatField, InfoField
 
 
 def _resolve_vcf_sources(sources: "str | Path | Sequence[str | Path]") -> list[Path]:
@@ -488,6 +488,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin, _ClustersMixin):
         *,
         merge_overlapping: bool = False,
         regions_overlap: "Literal['pos', 'record', 'variant']" = "pos",
+        call_filter: "CallFilter | None" = None,
         reroute: "bool | Literal['auto']" = "auto",
         overwrite: bool = False,
         threads: int | None = None,
@@ -534,6 +535,24 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin, _ClustersMixin):
           drop that value; `"auto"` prefers fidelity in that case and takes
           the size-optimal re-route otherwise (genotype-only / INFO-only
           views, which have no per-sample slot to lose).
+
+        `call_filter`: an optional :class:`~genoray.CallFilter` -- a call-level
+        predicate over one FORMAT field, optionally scoped to a set of
+        samples. In scope, a call (one carrier haplotype of one variant) whose
+        value fails ``value <op> threshold`` is removed from the view: its
+        genotype entry and every field value it carries. Samples outside the
+        scope are untouched. Missing values (NaN / integer sentinels) are kept
+        unless ``keep_missing=False``. A variant left with zero carriers in
+        the view is dropped, as for any MAC=0 variant. Works for var_key- and
+        dense-routed variants under every ``reroute`` value (the filter runs
+        before routing, so ``reroute=True``'s cost model sees the post-filter
+        carrier counts). ``call_filter=None`` (default) is byte-identical to a
+        view without the argument. Mutcat is never copied: it exists in the
+        view only when ``reference=`` is given, in which case it is recomputed
+        over the *filtered* calls -- a filtered view cannot carry a stale
+        mutcat. The filter field need not be in ``fields``. Note that with
+        ``reroute="auto"`` and a FORMAT field carried, the view keeps each
+        variant's source representation (see above).
 
         `progress`: if True, render live write progress. Unlike the other
         `from_*` writers, `write_view` has no per-record stream to sample --
@@ -615,6 +634,36 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin, _ClustersMixin):
             for row in regions_df.iter_rows(named=True)
         ]
         reference_str = str(reference) if reference is not None else None
+        call_filter_arg = None
+        if call_filter is not None:
+            sf = self.available_fields.get(call_filter.field)
+            if sf is None:
+                raise ValueError(
+                    f"call_filter field {call_filter.field!r} is not in this "
+                    f"store; available fields: {sorted(self.available_fields)}"
+                )
+            if sf.category != "format":
+                raise ValueError(
+                    f"call_filter field {call_filter.field!r} is a {sf.category} "
+                    "field; only FORMAT (per-sample) fields can filter calls"
+                )
+            scope = None
+            if call_filter.samples is not None:
+                known = set(self.available_samples)
+                missing = [s for s in call_filter.samples if s not in known]
+                if missing:
+                    raise ValueError(
+                        f"call_filter.samples names {len(missing)} sample(s) not in "
+                        f"this store, e.g. {missing[:3]!r}"
+                    )
+                scope = list(dict.fromkeys(call_filter.samples))
+            call_filter_arg = (
+                (sf.name, sf.category, _META_DTYPE[sf.dtype], sf.default),
+                call_filter.op,
+                float(call_filter.threshold),
+                bool(call_filter.keep_missing),
+                scope,
+            )
         if reroute == "auto":
             # A dense->var_key flip stores one value per CARRIER CALL and has
             # no slot for a non-carrier sample's FORMAT value, so re-routing a
@@ -653,6 +702,7 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin, _ClustersMixin):
                 log_level=level,
                 log_filter=log_filter,
                 receiver=rx,
+                call_filter=call_filter_arg,
             )
         if reference_str is not None:
             # `reference=` recomputes mutcat on the view; stamp it like `from_*`.

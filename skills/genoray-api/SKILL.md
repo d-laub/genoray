@@ -19,6 +19,7 @@ description: Use when writing or modifying Python code that imports `genoray` to
 - `genoray.SparseVar` — sparse `.svar` reader/writer
 - `genoray.SparseVar2` — next-gen sparse variant store (VCF/BCF → SVAR2 conversion via `from_vcf` (supports `regions=`/`samples=`/`merge_overlapping=`/`regions_overlap=`), PLINK2 PGEN → SVAR2 conversion via `from_pgen`, N single-sample VCFs/BCFs → one SVAR2 store via a native k-way merge in `from_vcf_list` (`reference`/`no_reference` supported like `from_vcf`, absent sites fill hom-ref; supports `regions=`/`merge_overlapping=`/`regions_overlap=` but **no `samples=`** — the cohort is the file set), SVAR1 (`SparseVar`) → SVAR2 native migration via `from_svar1` (reads no VCF/htslib; biallelic SVAR1 only; supports `regions=`/`samples=`/`merge_overlapping=`/`regions_overlap=` like `from_vcf`/`from_pgen`); range queries via `decode`/`region_counts`/`read_ranges`; mutational-signature support (SBS96/DBS78/ID83) via `annotate_mutations`/`mutation_matrix`/`assign_signatures`, or classify during the write with `from_vcf(signatures=True)`/`from_pgen(signatures=True)`/`from_svar1(signatures=True)`; scalar-numeric INFO/FORMAT field extraction during the write via `from_vcf(info_fields=, format_fields=)`/`from_vcf_list(info_fields=, format_fields=)` (`from_vcf_list` merges INFO first-carrier-wins, FORMAT per-sample); `from_pgen` instead stores per-sample **dosage** tracks as FORMAT fields via `dosages=Sequence[DosageField]` (from the hardcall `.pgen` itself via `source="self"`, or a separate `.pgen`) — it still has no `info_fields=`/`format_fields=` (PGEN has no VCF INFO/FORMAT); `from_svar1` carries SVAR1's existing fields through selectively via `fields=` (`None` default = all, `[]` = none, or a name subset) — read back opt-in via `fields=`/`with_fields`/`available_fields` and attached to `decode`'s result)
 - `genoray.InfoField` / `genoray.FormatField` — frozen dataclasses (`name`, `dtype=None`, `default=None`) configuring a single INFO/FORMAT field for `SparseVar2.from_vcf`; a bare `str` name uses inferred defaults instead
+- `genoray.CallFilter` — frozen dataclass (`field`, `op`, `threshold`, `samples=None`, `keep_missing=True`) passed as `SparseVar2.write_view(call_filter=)`: a call-level predicate over one stored FORMAT field (see "Call-level filtering in `write_view`" below)
 - `genoray.DosageField` — frozen dataclass (`name="dosage"`, `source="self"|Path`, `dtype="f16"|"f32"="f32"`, `default=None`) configuring a PGEN dosage FORMAT field for `SparseVar2.from_pgen`
 - `genoray.Tuning` — frozen dataclass of six explicit scheduling knobs (`concurrent_chroms`, `reader_workers`, `overshard`, `dense_cap`, `merge_threads`, `sample_interval`, all `int | None`) passed as `tuning=` to every `SparseVar2.from_*` writer; replaces the removed legacy environment-variable configuration (see "Tuning" under "SparseVar2 — quick reference", below, and "migrating from environment variables" in `docs/source/svar.md`) — **no environment variable configures genoray**
 - `genoray.exprs` — polars filter expressions for `.gvi` indexes
@@ -1181,6 +1182,41 @@ rides the same variant axis as `pos`/`ilen`/`allele`, so
 are 255 throughout. Labels are total over in-scope SNP calls: where upstream
 drops events (clustered singletons, no-VAF failures) genoray writes `other`,
 and non-clustered SNP calls are `nonclustered`.
+
+### Call-level filtering in `write_view`
+
+`SparseVar2.write_view(..., call_filter=CallFilter(...))` drops individual
+*calls* (one carrier haplotype of one variant) by a FORMAT-field predicate,
+optionally for a named subset of samples only. Everything else in the view is
+unchanged; `call_filter=None` (default) is byte-identical to omitting it.
+
+```python
+from genoray import SparseVar2, CallFilter
+
+sv = SparseVar2("cohort.svar2")          # has FORMAT field VAF
+sv.write_view(
+    regions, sv.available_samples, "clean.svar2",
+    fields=["VAF"], reference="hg38.fa",     # reference= recomputes mutcat
+    call_filter=CallFilter("VAF", ">=", 0.2, samples=ffpe_samples),
+)
+```
+
+- `CallFilter(field, op, threshold, samples=None, keep_missing=True)`: a call in
+  an in-scope sample is **kept** iff `value <op> threshold`
+  (`op` in `< <= > >= == !=`); a failing call loses its genotype entry and every
+  carried field value. `field` must be a stored FORMAT field (not necessarily in
+  `fields=`). `samples` scopes the filter (names must exist in the source; `None`
+  = all samples); samples outside it are untouched.
+- Missing values (float `NaN`; integer sentinels `iN` min / `uN` max) are not
+  tested: kept if `keep_missing=True` (default), removed if `False`. A field
+  stored with a `default` fill has no sentinels -- the fill is an ordinary value.
+- Floats compare at the field's precision (`f16` widens to `f32`), with the
+  threshold rounded to `f32`: same as numpy `vals >= np.float32(thr)`.
+- A variant left with zero carriers is dropped (MAC=0 convention). Works for
+  var_key- and dense-routed variants under `reroute=True/False/"auto"`; the
+  filter runs before routing, so `reroute=True` re-costs on post-filter counts.
+- Mutcat is never copied by `write_view`: without `reference=` the view has
+  none (no stale codes); with `reference=` it is recomputed over the filtered calls.
 
 ### Merge and split by contig
 
